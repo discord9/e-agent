@@ -54,6 +54,11 @@ without an explicit user request.
 - MCP support is limited to local stdio servers, tools only. No remote
   HTTP/SSE MCP, OAuth, resources/prompts, notifications, `listChanged`
   refresh, server restart, or concurrent initialization.
+- Subagents (`delegate` tool) are threads with fully isolated state: fresh
+  history, own background slots, builtin tools only (no MCP, no nested
+  `delegate`). No agent-to-agent messaging, no subagent session persistence.
+  Process-level isolation (subagents as subprocesses) is the planned
+  evolution but not implemented.
 
 ## Commands
 

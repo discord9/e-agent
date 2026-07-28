@@ -48,16 +48,34 @@ are each captured up to 64 KiB, then drained and marked as truncated.
 
 ## Background tasks
 
-The `bash` tool accepts `background: true` to run one command without blocking.
-Only one background task may run at a time; it has the same workspace cwd,
-process-group handling, and per-stream 64 KiB output limit as foreground Bash,
-with a 30-minute timeout. Completions surface as a TUI notification while a
+The `bash` tool accepts `background: true` to run a command without blocking.
+Up to 4 background tasks may run concurrently (bash and subagents share the
+same slots); each has the same workspace cwd, process-group handling, and
+per-stream 64 KiB output limit as foreground Bash, with a 30-minute timeout.
+Completions surface as a TUI notification while a
 turn is active, and the complete output is injected as a clearly labelled user
 message at the next model call — whether that is the next round of an active
 turn or, if the agent is idle, a new turn started by that delivery. In
 one-shot mode a still-running task is reported before exit;
 the process then best-effort terminates its process group. Uninjected background
 results are not persisted in sessions.
+
+## Subagents
+
+The `delegate` tool spawns a subagent with a fresh context to work on a
+self-contained task and returns its final answer. Use it for subtasks whose
+intermediate steps (searching, reading many files, focused edits) would
+clutter the main context.
+
+Each subagent runs on its own OS thread with its own tokio runtime, its own
+background-task slots, and an empty history — it shares no state with the
+parent. It gets only the builtin file/bash tools: no MCP tools and no
+`delegate` itself, so delegation depth is capped at 1 by construction. It is
+limited to 16 tool rounds.
+
+With `background: true` the subagent runs without blocking and its answer is
+delivered as a background task completion (waking an idle agent). Sync mode
+(the default) waits for the answer with a 30-minute ceiling.
 
 ## Compaction
 
@@ -112,6 +130,9 @@ This is deliberately not a daemon, JSONL protocol,
 automatic compaction trigger, database, event store, subagent
 framework, permission framework, plugin host, multi-provider client,
 parallel tool executor, task scheduler, priority system, or concurrency pool.
+Subagents exist but are deliberately minimal: no agent-to-agent messaging,
+no delegation deeper than 1 level, no subagent session persistence, no
+process-level isolation yet (subagents are threads, not subprocesses).
 It does speak MCP to local stdio servers (tools only), but it does NOT do
 remote MCP over HTTP/SSE, OAuth, MCP resources/prompts, server-initiated
 notifications, `listChanged` refresh, server restart on crash, or concurrent
