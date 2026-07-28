@@ -73,12 +73,36 @@ pub enum ModelDeltaKind {
     Reasoning,
 }
 
-/// Token accounting for one provider call, if the provider reports it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
 }
+
+/// One entry in the append-only session history. The model context is
+/// derived from the history: the latest compaction summary plus everything
+/// after it. Older entries stay persisted for display/audit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionEntry {
+    Message {
+        message: Message,
+    },
+    Compaction {
+        summary: String,
+        /// The turn kept verbatim for the model context; not rendered again
+        /// in the TUI (it duplicates messages already before this entry).
+        retained: Vec<Message>,
+    },
+}
+
+impl From<Message> for SessionEntry {
+    fn from(message: Message) -> Self {
+        Self::Message { message }
+    }
+}
+
+/// Token accounting for one provider call, if the provider reports it.
 
 #[async_trait]
 pub trait Model: Send {
@@ -100,7 +124,7 @@ pub trait Tool: Send + Sync {
 pub struct Agent {
     model: Box<dyn Model>,
     tools: Vec<Box<dyn Tool>>,
-    transcript: Vec<Message>,
+    history: Vec<SessionEntry>,
     event_handler: Option<Box<dyn FnMut(AgentEvent) + Send>>,
     max_tool_rounds: usize,
     background_receiver: mpsc::UnboundedReceiver<AgentEvent>,
@@ -120,7 +144,7 @@ impl Agent {
         Self {
             model,
             tools,
-            transcript: Vec::new(),
+            history: Vec::new(),
             event_handler: None,
             max_tool_rounds: MAX_TOOL_ROUNDS,
             background_receiver,
@@ -141,12 +165,42 @@ impl Agent {
         self.event_handler = Some(handler);
     }
 
-    pub fn transcript(&self) -> &[Message] {
-        &self.transcript
+    /// Full append-only history (what is persisted and shown in the TUI).
+    pub fn history(&self) -> &[SessionEntry] {
+        &self.history
+    }
+    pub fn restore_history(&mut self, history: Vec<SessionEntry>) {
+        self.history = history;
     }
 
-    pub fn restore_transcript(&mut self, transcript: Vec<Message>) {
-        self.transcript = transcript;
+    /// Messages sent to the provider: the latest compaction summary plus
+    /// everything after it.
+    pub fn context(&self) -> Vec<Message> {
+        let mut messages = Vec::new();
+        let mut start = 0;
+        if let Some(index) = self
+            .history
+            .iter()
+            .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+        {
+            let SessionEntry::Compaction { summary, retained } = &self.history[index] else {
+                unreachable!()
+            };
+            messages.push(Message::User {
+                content: format!("[compacted summary of earlier conversation]\n{summary}"),
+            });
+            messages.extend(retained.iter().cloned());
+            start = index + 1;
+        }
+        messages.extend(
+            self.history[start..]
+                .iter()
+                .filter_map(|entry| match entry {
+                    SessionEntry::Message { message } => Some(message.clone()),
+                    SessionEntry::Compaction { .. } => None,
+                }),
+        );
+        messages
     }
 
     pub fn subscribe(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
@@ -160,7 +214,7 @@ impl Agent {
     pub async fn run(&mut self, prompt: String) -> anyhow::Result<String> {
         self.drain_background();
         self.inject_pending_background();
-        self.transcript.push(Message::User { content: prompt });
+        self.history.push(Message::User { content: prompt }.into());
         let specs: Vec<_> = self.tools.iter().map(|tool| tool.spec()).collect();
 
         let result = self.run_loop(&specs).await;
@@ -169,13 +223,13 @@ impl Agent {
         result
     }
 
-    /// Summarize everything before the current turn (the messages after the
-    /// last user prompt) into a labelled user message. The current turn is
-    /// kept verbatim, which also guarantees the kept tail never starts with
-    /// an orphaned tool result or unmatched tool call.
+    /// Summarize everything before the current turn and append it as a
+    /// compaction entry. The current turn is kept verbatim inside the entry
+    /// so the derived context still sees it, while the full history stays
+    /// append-only.
     pub async fn compact(&mut self) -> anyhow::Result<String> {
-        let Some(split) = self
-            .transcript
+        let context = self.context();
+        let Some(split) = context
             .iter()
             .rposition(|message| matches!(message, Message::User { .. }))
         else {
@@ -184,7 +238,7 @@ impl Agent {
         if split == 0 {
             anyhow::bail!("nothing to compact");
         }
-        let mut request = self.transcript[..split].to_vec();
+        let mut request = context[..split].to_vec();
         request.push(Message::User {
             content: "Summarize the earlier conversation. Preserve the user's goals, decisions made, files changed, and unfinished work. Be concise and use Chinese or English to match the conversation language.".into(),
         });
@@ -204,12 +258,15 @@ impl Agent {
         let (response, usage) = response;
         self.record_usage(usage);
         let summary = response.content.unwrap_or_default();
-        let mut compacted = vec![Message::User {
-            content: format!("[compacted summary of earlier conversation]\n{summary}"),
-        }];
-        compacted.extend_from_slice(&self.transcript[split..]);
-        self.transcript = compacted;
+        self.history.push(SessionEntry::Compaction {
+            summary: summary.clone(),
+            retained: context[split..].to_vec(),
+        });
         Ok(summary)
+    }
+
+    fn push_message(&mut self, message: Message) {
+        self.history.push(message.into());
     }
 
     fn record_usage(&mut self, usage: Option<Usage>) {
@@ -228,6 +285,7 @@ impl Agent {
             self.drain_background();
             self.inject_pending_background();
             let mut produced_delta = false;
+            let context = self.context();
             let assistant = {
                 let model = &mut self.model;
                 let event_handler = &mut self.event_handler;
@@ -242,15 +300,13 @@ impl Agent {
                         });
                     }
                 };
-                model
-                    .complete(&self.transcript, specs, Some(&mut on_delta))
-                    .await?
+                model.complete(&context, specs, Some(&mut on_delta)).await?
             };
             let (assistant, usage) = assistant;
             self.record_usage(usage);
             if assistant.tool_calls.is_empty() {
                 let answer = assistant.content.clone().unwrap_or_default();
-                self.transcript.push(Message::Assistant(assistant));
+                self.push_message(Message::Assistant(assistant));
                 return Ok(answer);
             }
 
@@ -262,7 +318,7 @@ impl Agent {
             {
                 self.emit(AgentEvent::AssistantText(content.into()));
             }
-            self.transcript.push(Message::Assistant(assistant.clone()));
+            self.push_message(Message::Assistant(assistant.clone()));
             for call in &assistant.tool_calls {
                 self.emit(AgentEvent::ToolCall {
                     name: call.name.clone(),
@@ -279,7 +335,7 @@ impl Agent {
                         Ok(content) | Err(content) => content.clone(),
                     },
                 });
-                self.transcript.push(Message::Tool {
+                self.push_message(Message::Tool {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
                     content: match &result {
@@ -310,7 +366,7 @@ impl Agent {
 
     fn inject_pending_background(&mut self) {
         while let Some((id, output)) = self.pending_background.pop_front() {
-            self.transcript.push(Message::User {
+            self.push_message(Message::User {
                 content: format!("[background task {id} completed]\n{output}"),
             });
         }
@@ -689,7 +745,7 @@ mod tests {
                 },
             ]
         );
-        assert!(agent.transcript().iter().all(|message| !matches!(
+        assert!(agent.context().iter().all(|message| !matches!(
             message,
             Message::Assistant(AssistantMessage { content: Some(content), .. }) if content.contains("thinking")
         )));
@@ -862,15 +918,24 @@ mod tests {
         ];
         transcript.extend(current_turn.clone());
         let mut agent = Agent::new(Box::new(model), vec![]);
-        agent.restore_transcript(transcript);
+        agent.restore_history(transcript.into_iter().map(Into::into).collect());
 
         assert_eq!(agent.compact().await.unwrap(), "summary text");
-        assert_eq!(agent.transcript().len(), current_turn.len() + 1);
+        // Full history is append-only: 10 original entries + 1 compaction.
+        assert_eq!(agent.history().len(), 11);
         assert!(matches!(
-            &agent.transcript()[0],
+            agent.history().last().unwrap(),
+            SessionEntry::Compaction { summary, retained }
+                if summary == "summary text" && *retained == current_turn
+        ));
+        // The derived context is the summary plus the retained current turn.
+        let context = agent.context();
+        assert_eq!(context.len(), current_turn.len() + 1);
+        assert!(matches!(
+            &context[0],
             Message::User { content } if content == "[compacted summary of earlier conversation]\nsummary text"
         ));
-        assert_eq!(&agent.transcript()[1..], current_turn.as_slice());
+        assert_eq!(&context[1..], current_turn.as_slice());
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0].len(), 6);
         assert!(matches!(
@@ -887,9 +952,12 @@ mod tests {
             requests,
         };
         let mut agent = Agent::new(Box::new(model), vec![]);
-        agent.restore_transcript(vec![Message::User {
-            content: "short".into(),
-        }]);
+        agent.restore_history(vec![
+            Message::User {
+                content: "short".into(),
+            }
+            .into(),
+        ]);
         assert!(
             agent
                 .compact()

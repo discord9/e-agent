@@ -18,8 +18,11 @@ When no prompt argument is supplied and stdout is a terminal, e-agent starts
 an interactive TUI (scrollback plus an input line with proper Unicode editing);
 use `--repl` for a plain line-based REPL instead. If stdin is piped, the prompt
 is read from standard input. Sessions persist to
-`.e-agent/sessions/<name>.json` in the workspace (default name `default`) and
-are restored and replayed in the TUI on startup. Optional CLI overrides are `--base-url URL`,
+`.e-agent/sessions/<name>.jsonl` in the workspace (default name `default`) as
+an append-only log of message and compaction entries; the whole history is
+restored and replayed in the TUI on startup, while the model only sees the
+latest compaction summary and everything after it. Legacy `.json` sessions
+are migrated on first load. Optional CLI overrides are `--base-url URL`,
 `--model MODEL`, `--workspace PATH`, `--session NAME`, and `--max-rounds N`.
 
 The available tools are `read_file`, `write_file`, `edit_file`, and `bash`.
@@ -59,9 +62,11 @@ results are not persisted in sessions.
 ## Compaction
 
 Use `/compact` in the TUI or `--repl` to manually summarize earlier history.
-The agent keeps the current turn (everything after the last user prompt)
-intact, summarizes all earlier history, and stores that summary as an
-ordinary user message in the session. Compaction has no automatic trigger.
+The agent summarizes everything before the current turn and appends a
+compaction entry (summary plus the retained turn) to the append-only session
+log; earlier messages stay persisted and visible in the TUI. Subsequent model
+calls use the latest summary plus everything after it. Compaction has no
+automatic trigger.
 
 ## Environment
 

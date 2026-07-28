@@ -72,16 +72,22 @@ async fn run() -> anyhow::Result<()> {
     if let Some(rounds) = max_rounds {
         agent = agent.max_tool_rounds(rounds);
     }
-    agent.restore_transcript(Session::load(&root, &session)?);
+    let loaded = Session::load(&root, &session)?;
+    let legacy = loaded.legacy;
+    agent.restore_history(loaded.entries);
+    let mut persisted = agent.history().len();
+    if legacy {
+        Session::rewrite(&root, &session, agent.history())?;
+    }
 
     if tui_mode {
-        return tui::run(agent, root, session).await;
+        return tui::run(agent, root, session, persisted).await;
     }
     set_stderr_events(&mut agent);
     if repl_mode {
-        return repl(agent, root, session).await;
+        return repl(agent, root, session, persisted).await;
     }
-    let answer = run_and_save(&mut agent, &root, &session, prompt).await?;
+    let answer = run_and_save(&mut agent, &root, &session, &mut persisted, prompt).await?;
     println!("{answer}");
     if let Some(id) = agent.background_task_id() {
         eprintln!(
@@ -135,14 +141,21 @@ async fn run_and_save(
     agent: &mut Agent,
     root: &std::path::Path,
     session: &str,
+    persisted: &mut usize,
     prompt: String,
 ) -> anyhow::Result<String> {
     let result = agent.run(prompt).await;
-    Session::save(root, session, agent.transcript())?;
+    Session::append(root, session, &agent.history()[*persisted..])?;
+    *persisted = agent.history().len();
     result
 }
 
-async fn repl(mut agent: Agent, root: std::path::PathBuf, session: String) -> anyhow::Result<()> {
+async fn repl(
+    mut agent: Agent,
+    root: std::path::PathBuf,
+    session: String,
+    mut persisted: usize,
+) -> anyhow::Result<()> {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let stdin = std::io::stdin();
     loop {
@@ -167,7 +180,8 @@ async fn repl(mut agent: Agent, root: std::path::PathBuf, session: String) -> an
         }
         if line == "/compact" {
             let result = agent.compact().await;
-            Session::save(&root, &session, agent.transcript())?;
+            Session::append(&root, &session, &agent.history()[persisted..])?;
+            persisted = agent.history().len();
             match result {
                 Ok(summary) => println!("compacted: {}", preview(&summary, 500)),
                 Err(error) => eprintln!("e-agent: {error:#}"),
@@ -175,7 +189,7 @@ async fn repl(mut agent: Agent, root: std::path::PathBuf, session: String) -> an
             continue;
         }
         agent.subscribe(sender.clone());
-        match run_and_save(&mut agent, &root, &session, line.to_owned()).await {
+        match run_and_save(&mut agent, &root, &session, &mut persisted, line.to_owned()).await {
             Ok(answer) => println!("{answer}"),
             Err(error) => eprintln!("e-agent: {error:#}"),
         }

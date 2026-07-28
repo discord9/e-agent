@@ -21,17 +21,29 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::agent::{Agent, AgentEvent, Message, Usage, preview};
+use crate::agent::{Agent, AgentEvent, Message, SessionEntry, Usage, preview};
 use crate::session::Session;
 
-pub async fn run(mut agent: Agent, root: PathBuf, session_name: String) -> anyhow::Result<()> {
+pub async fn run(
+    mut agent: Agent,
+    root: PathBuf,
+    session_name: String,
+    mut persisted: usize,
+) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    run_inner(&mut terminal, &mut agent, &root, &session_name).await
+    run_inner(
+        &mut terminal,
+        &mut agent,
+        &root,
+        &session_name,
+        &mut persisted,
+    )
+    .await
 }
 
 struct TerminalGuard;
@@ -53,6 +65,7 @@ async fn run_inner(
     agent: &mut Agent,
     root: &std::path::Path,
     session_name: &str,
+    persisted: &mut usize,
 ) -> anyhow::Result<()> {
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let event_sender = sender.clone();
@@ -60,7 +73,7 @@ async fn run_inner(
         let _ = event_sender.send(event);
     }));
     let mut events = EventStream::new();
-    let mut state = TuiState::from_transcript(agent.transcript());
+    let mut state = TuiState::from_history(agent.history());
     loop {
         draw(terminal, &mut state)?;
         match events.next().await {
@@ -96,7 +109,8 @@ async fn run_inner(
                                 }
                             }
                         }
-                        Session::save(root, session_name, agent.transcript())?;
+                        Session::append(root, session_name, &agent.history()[*persisted..])?;
+                        *persisted = agent.history().len();
                         if matches!(interruption, Some(Interruption::ExitApp)) {
                             return Ok(());
                         }
@@ -115,7 +129,7 @@ async fn run_inner(
                         &mut state,
                         &mut events,
                         &mut receiver,
-                        (root, session_name),
+                        (root, session_name, persisted),
                         prompt,
                     )
                     .await?
@@ -138,9 +152,10 @@ async fn run_request(
     state: &mut TuiState,
     events: &mut EventStream,
     receiver: &mut mpsc::UnboundedReceiver<AgentEvent>,
-    session: (&std::path::Path, &str),
+    session: (&std::path::Path, &str, &mut usize),
     prompt: String,
 ) -> anyhow::Result<bool> {
+    let (root, session_name, persisted) = session;
     state.thinking = true;
     state.streamed = false;
     draw(terminal, state)?;
@@ -159,7 +174,8 @@ async fn run_request(
     if matches!(interruption, Some(Interruption::CancelTurn)) {
         state.push_line("cancelled".into(), LineKind::Dim);
     }
-    Session::save(session.0, session.1, agent.transcript())?;
+    Session::append(root, session_name, &agent.history()[*persisted..])?;
+    *persisted = agent.history().len();
     state.follow();
     draw(terminal, state)?;
     Ok(matches!(interruption, Some(Interruption::ExitApp)))
@@ -356,51 +372,61 @@ enum ActiveStreamLane {
 }
 
 impl TuiState {
-    fn from_transcript(messages: &[Message]) -> Self {
+    fn from_history(entries: &[SessionEntry]) -> Self {
         let mut state = Self::default();
-        for message in messages {
-            match message {
-                Message::User { content } => {
-                    if content.starts_with("[compacted summary of earlier conversation]") {
-                        state.push_line(content.clone(), LineKind::Normal);
-                    } else if content.starts_with("[background task ") {
-                        state.push_line(content.clone(), LineKind::Dim);
-                    } else {
-                        state.push_line(format!("you> {content}"), LineKind::User);
-                    }
+        for entry in entries {
+            match entry {
+                SessionEntry::Message { message } => state.push_message(message),
+                SessionEntry::Compaction { summary, .. } => {
+                    state.push_line(
+                        format!("── compacted: {}", preview(summary, 150)),
+                        LineKind::Dim,
+                    );
                 }
-                Message::Assistant(message) => {
-                    if let Some(reasoning) =
-                        message.reasoning.as_deref().filter(|text| !text.is_empty())
-                    {
-                        state.push_line(
-                            format!("thinking: {}", preview(reasoning, 1000)),
-                            LineKind::Dim,
-                        );
-                    }
-                    if let Some(content) =
-                        message.content.as_deref().filter(|text| !text.is_empty())
-                    {
-                        state.push_line(content.to_owned(), LineKind::Normal);
-                    }
-                    for call in &message.tool_calls {
-                        state.push_tool_call(&call.name, &call.arguments);
-                    }
-                }
-                Message::Tool {
-                    content, is_error, ..
-                } => state.push_line(
-                    format!(
-                        "  {}: {}",
-                        if *is_error { "error" } else { "ok" },
-                        preview(content, 500)
-                    ),
-                    LineKind::Normal,
-                ),
             }
         }
         state.follow();
         state
+    }
+
+    fn push_message(&mut self, message: &Message) {
+        match message {
+            Message::User { content } => {
+                if content.starts_with("[compacted summary of earlier conversation]") {
+                    self.push_line(content.clone(), LineKind::Normal);
+                } else if content.starts_with("[background task ") {
+                    self.push_line(content.clone(), LineKind::Dim);
+                } else {
+                    self.push_line(format!("you> {content}"), LineKind::User);
+                }
+            }
+            Message::Assistant(message) => {
+                if let Some(reasoning) =
+                    message.reasoning.as_deref().filter(|text| !text.is_empty())
+                {
+                    self.push_line(
+                        format!("thinking: {}", preview(reasoning, 1000)),
+                        LineKind::Dim,
+                    );
+                }
+                if let Some(content) = message.content.as_deref().filter(|text| !text.is_empty()) {
+                    self.push_line(content.to_owned(), LineKind::Normal);
+                }
+                for call in &message.tool_calls {
+                    self.push_tool_call(&call.name, &call.arguments);
+                }
+            }
+            Message::Tool {
+                content, is_error, ..
+            } => self.push_line(
+                format!(
+                    "  {}: {}",
+                    if *is_error { "error" } else { "ok" },
+                    preview(content, 500)
+                ),
+                LineKind::Normal,
+            ),
+        }
     }
 
     fn edit_input(&mut self, key: KeyEvent) {
@@ -687,7 +713,8 @@ mod tests {
                 reasoning: None,
             }),
         ];
-        let state = TuiState::from_transcript(&messages);
+        let state =
+            TuiState::from_history(&messages.into_iter().map(Into::into).collect::<Vec<_>>());
         let lines: Vec<_> = state.lines.iter().map(|line| line.text.as_str()).collect();
         assert_eq!(
             lines,
@@ -853,7 +880,8 @@ mod tests {
                 reasoning: Some("plan".into()),
             }),
         ];
-        let state = TuiState::from_transcript(&messages);
+        let state =
+            TuiState::from_history(&messages.into_iter().map(Into::into).collect::<Vec<_>>());
         assert_eq!(state.lines.len(), 4);
         assert_eq!(
             state.lines[0].kind,
@@ -869,5 +897,42 @@ mod tests {
         assert_eq!(state.lines[2].kind, LineKind::Dim);
         assert_eq!(state.lines[3].text, "answer");
         assert_eq!(state.lines[3].kind, LineKind::Normal);
+    }
+
+    #[test]
+    fn replay_shows_compaction_entries_as_single_dim_lines() {
+        let entries = vec![
+            SessionEntry::Message {
+                message: Message::User {
+                    content: "old work".into(),
+                },
+            },
+            SessionEntry::Compaction {
+                summary: "summary of old work".into(),
+                retained: vec![Message::User {
+                    content: "kept".into(),
+                }],
+            },
+            SessionEntry::Message {
+                message: Message::User {
+                    content: "new work".into(),
+                },
+            },
+        ];
+        let state = TuiState::from_history(&entries);
+        let lines: Vec<_> = state
+            .lines
+            .iter()
+            .map(|line| (line.text.as_str(), line.kind))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("you> old work", LineKind::User),
+                ("── compacted: summary of old work", LineKind::Dim),
+                ("you> new work", LineKind::User),
+            ],
+            "retained tail must not be duplicated in the scrollback"
+        );
     }
 }
