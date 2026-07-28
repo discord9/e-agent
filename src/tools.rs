@@ -213,7 +213,15 @@ pub struct BackgroundTasks {
 #[derive(Clone)]
 struct BackgroundSlot {
     id: u64,
+    label: String,
     process_group: Arc<AtomicI32>,
+}
+
+/// A snapshot of one running background task, for display.
+#[derive(Clone, Debug)]
+pub struct BackgroundTaskInfo {
+    pub id: u64,
+    pub label: String,
 }
 
 impl BackgroundTasks {
@@ -230,6 +238,20 @@ impl BackgroundTasks {
     /// agent for tools that hold a shared clone of these slots.
     pub fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
         self.sender = Some(sender);
+    }
+
+    /// Snapshot of currently running background tasks, for the TUI panel.
+    pub fn running(&self) -> Vec<BackgroundTaskInfo> {
+        self.slots
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|slot| BackgroundTaskInfo {
+                id: slot.id,
+                label: slot.label.clone(),
+            })
+            .collect()
     }
 
     /// Start a background bash command. Returns a human-readable "started"
@@ -268,6 +290,7 @@ impl BackgroundTasks {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let slot = BackgroundSlot {
             id,
+            label: label.clone(),
             process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),
         };
         {

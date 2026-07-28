@@ -76,7 +76,7 @@ async fn run() -> anyhow::Result<()> {
     tools.push(Box::new(Delegate::new(
         model.clone(),
         workspace,
-        background,
+        background.clone(),
     )));
     let mut agent = Agent::new(Box::new(model), tools);
     if !mcp_instructions.is_empty() {
@@ -94,7 +94,7 @@ async fn run() -> anyhow::Result<()> {
     }
 
     if tui_mode {
-        return tui::run(agent, root, session, persisted).await;
+        return tui::run(agent, root, session, persisted, background).await;
     }
     set_stderr_events(&mut agent);
     if repl_mode {

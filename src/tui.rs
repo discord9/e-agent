@@ -29,6 +29,7 @@ pub async fn run(
     root: PathBuf,
     session_name: String,
     mut persisted: usize,
+    background: crate::tools::BackgroundTasks,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -42,6 +43,7 @@ pub async fn run(
         &root,
         &session_name,
         &mut persisted,
+        background,
     )
     .await
 }
@@ -66,6 +68,7 @@ async fn run_inner(
     root: &std::path::Path,
     session_name: &str,
     persisted: &mut usize,
+    background: crate::tools::BackgroundTasks,
 ) -> anyhow::Result<()> {
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let event_sender = sender.clone();
@@ -74,6 +77,7 @@ async fn run_inner(
     }));
     let mut events = EventStream::new();
     let mut state = TuiState::from_history(agent.history());
+    state.background = Some(background);
     loop {
         draw(terminal, &mut state)?;
         tokio::select! {
@@ -303,9 +307,23 @@ fn draw<B: ratatui::backend::Backend>(
                 .min((usize::from(frame.area().height) / 3).max(3))
                 .max(3) as u16;
             let queue_height = u16::from(!state.queued.is_empty());
-            let [output, queue_bar, input] = Layout::vertical([
+            let running: Vec<crate::tools::BackgroundTaskInfo> = state
+                .background
+                .as_ref()
+                .map(|background| background.running())
+                .unwrap_or_default();
+            // Panel open: full list. Panel closed but tasks running: a one-line
+            // hint so background work never goes completely unnoticed.
+            let tasks_height = if state.show_tasks {
+                // border (2) + header (1) + one row per task
+                (running.len() as u16 + 3).max(3)
+            } else {
+                u16::from(!running.is_empty())
+            };
+            let [output, queue_bar, tasks_bar, input] = Layout::vertical([
                 Constraint::Min(1),
                 Constraint::Length(queue_height),
+                Constraint::Length(tasks_height),
                 Constraint::Length(input_height),
             ])
             .areas(frame.area());
@@ -322,6 +340,45 @@ fn draw<B: ratatui::backend::Backend>(
                             .add_modifier(Modifier::DIM),
                     )),
                     queue_bar,
+                );
+            }
+            if tasks_height > 0 && !state.show_tasks {
+                // Collapsed hint.
+                frame.render_widget(
+                    Paragraph::new(Line::styled(
+                        format!(
+                            "▸ {} background task(s) running (F2 to view)",
+                            running.len()
+                        ),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    )),
+                    tasks_bar,
+                );
+            }
+            if tasks_height > 0 && state.show_tasks {
+                let mut lines = vec![Line::styled(
+                    if running.is_empty() {
+                        "no background tasks running".to_owned()
+                    } else {
+                        format!("{} background task(s) running", running.len())
+                    },
+                    Style::default().add_modifier(Modifier::BOLD),
+                )];
+                for task in &running {
+                    lines.push(Line::styled(
+                        format!("  #{}: {}", task.id, task.label),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                frame.render_widget(
+                    Paragraph::new(lines).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("tasks (F2 to hide)"),
+                    ),
+                    tasks_bar,
                 );
             }
             let inner_width = usize::from(output.width).max(1);
@@ -467,6 +524,10 @@ struct TuiState {
     /// Arguments of an in-flight edit_file call, rendered as a numbered diff
     /// when its result (which carries the line number) arrives.
     pending_edit: Option<(String, String, String)>,
+    /// Shared background-task slots, for the tasks panel.
+    background: Option<crate::tools::BackgroundTasks>,
+    /// Whether the background-tasks panel is visible.
+    show_tasks: bool,
 }
 
 #[derive(Default)]
@@ -583,6 +644,9 @@ impl TuiState {
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
         match key.code {
+            KeyCode::F(2) => {
+                self.show_tasks = !self.show_tasks;
+            }
             KeyCode::Up
             | KeyCode::Down
             | KeyCode::PageUp
@@ -826,6 +890,17 @@ impl InputBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f2_toggles_tasks_panel() {
+        let mut state = TuiState::default();
+        assert!(!state.show_tasks);
+        let key = || KeyEvent::new(KeyCode::F(2), KeyModifiers::empty());
+        assert_eq!(state.handle_key(key()), None);
+        assert!(state.show_tasks);
+        assert_eq!(state.handle_key(key()), None);
+        assert!(!state.show_tasks);
+    }
 
     #[test]
     fn input_autoheight_and_wrapped_cursor_track_visual_rows() {
