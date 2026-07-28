@@ -62,8 +62,11 @@ pub enum AgentEvent {
         output: String,
     },
     Usage {
-        input_tokens: u64,
-        output_tokens: u64,
+        /// Tokens of the provider call that just finished; `call.input_tokens`
+        /// approximates the context window currently in use.
+        call: Usage,
+        /// Cumulative tokens for this process.
+        session: Usage,
     },
 }
 
@@ -274,8 +277,11 @@ impl Agent {
             self.session_input_tokens += usage.input_tokens;
             self.session_output_tokens += usage.output_tokens;
             self.emit(AgentEvent::Usage {
-                input_tokens: self.session_input_tokens,
-                output_tokens: self.session_output_tokens,
+                call: usage,
+                session: Usage {
+                    input_tokens: self.session_input_tokens,
+                    output_tokens: self.session_output_tokens,
+                },
             });
         }
     }

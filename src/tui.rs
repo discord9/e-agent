@@ -231,8 +231,14 @@ fn draw(
 ) -> io::Result<()> {
     terminal
         .draw(|frame| {
+            let inner_input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
+            let input_rows = state.input.visual_rows(inner_input_width);
+            let input_height = (input_rows + 2)
+                .min((usize::from(frame.area().height) / 3).max(3))
+                .max(3) as u16;
             let [output, input] =
-                Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(frame.area());
+                Layout::vertical([Constraint::Min(1), Constraint::Length(input_height)])
+                    .areas(frame.area());
             let inner_width = usize::from(output.width).max(1);
             let visual: Vec<Line> = state
                 .lines
@@ -267,27 +273,46 @@ fn draw(
             } else {
                 "input"
             };
-            let mut input_block = Block::default().borders(Borders::ALL).title(title);
-            if state.tokens.input_tokens + state.tokens.output_tokens > 0 {
-                input_block = input_block.title(
-                    Line::from(format!(
-                        "↑{} ↓{}",
-                        format_tokens(state.tokens.input_tokens),
-                        format_tokens(state.tokens.output_tokens)
-                    ))
-                    .right_aligned(),
-                );
-            }
+            let input_block = Block::default().borders(Borders::ALL).title(title);
+            let usage = (state.tokens.context > 0).then(|| {
+                format!(
+                    "ctx {} ↑{} ↓{}",
+                    format_tokens(state.tokens.context),
+                    format_tokens(state.tokens.session.input_tokens),
+                    format_tokens(state.tokens.session.output_tokens)
+                )
+            });
+            let (cursor_row, cursor_col) = state.input.wrapped_cursor(inner_input_width);
+            let inner_input_height = usize::from(input.height.saturating_sub(2));
+            let input_scroll = cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
             frame.render_widget(
                 Paragraph::new(state.input.text.as_str())
                     .block(input_block)
-                    .wrap(Wrap { trim: false }),
+                    .wrap(Wrap { trim: false })
+                    .scroll((input_scroll.min(u16::MAX as usize) as u16, 0)),
                 input,
             );
+            if let Some(usage) = usage {
+                let width = UnicodeWidthStr::width(usage.as_str()) as u16 + 1;
+                if input.width > width + 1 {
+                    let area = ratatui::layout::Rect {
+                        x: input.right().saturating_sub(width + 1),
+                        y: input.bottom() - 1,
+                        width,
+                        height: 1,
+                    };
+                    frame.render_widget(
+                        Paragraph::new(usage).style(Style::default().fg(Color::DarkGray)),
+                        area,
+                    );
+                }
+            }
             if !state.thinking {
                 frame.set_cursor_position((
-                    input.x + 1 + state.input.display_width().min(u16::MAX as usize) as u16,
-                    input.y + 1,
+                    input.x + 1 + (cursor_col as u16).min(input.width.saturating_sub(2)),
+                    input.y
+                        + 1
+                        + ((cursor_row - input_scroll) as u16).min(input.height.saturating_sub(2)),
                 ));
             }
         })
@@ -348,7 +373,13 @@ struct TuiState {
     thinking: bool,
     streamed: bool,
     active_lane: Option<ActiveStreamLane>,
-    tokens: Usage,
+    tokens: TokenDisplay,
+}
+
+#[derive(Default)]
+struct TokenDisplay {
+    context: u64,
+    session: Usage,
 }
 
 struct DisplayLine {
@@ -518,13 +549,10 @@ impl TuiState {
                 format!("background task {id} finished: {}", preview(&output, 500)),
                 LineKind::Normal,
             ),
-            AgentEvent::Usage {
-                input_tokens,
-                output_tokens,
-            } => {
-                self.tokens = Usage {
-                    input_tokens,
-                    output_tokens,
+            AgentEvent::Usage { call, session } => {
+                self.tokens = TokenDisplay {
+                    context: call.input_tokens,
+                    session,
                 };
             }
         }
@@ -642,14 +670,45 @@ impl InputBuffer {
             .map_or(self.text.len(), |(index, _)| index)
     }
 
-    fn display_width(&self) -> usize {
-        UnicodeWidthStr::width(&self.text[..self.byte_index()])
+    /// Visual row count of the input at the given cell width, including
+    /// embedded newlines and soft wrapping.
+    fn visual_rows(&self, width: usize) -> usize {
+        hard_wrap(&self.text, width).len()
+    }
+
+    /// Cursor position as (row, column) in visual rows/cells.
+    fn wrapped_cursor(&self, width: usize) -> (usize, usize) {
+        let before = &self.text[..self.byte_index()];
+        let mut row = 0;
+        let mut col = 0;
+        for (index, segment) in before.split('\n').enumerate() {
+            if index > 0 {
+                row += 1;
+            }
+            let segment_width = UnicodeWidthStr::width(segment);
+            row += segment_width / width;
+            col = segment_width % width;
+        }
+        (row, col)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_autoheight_and_wrapped_cursor_track_visual_rows() {
+        let mut input = InputBuffer::default();
+        input.insert("ab\ncdef");
+        assert_eq!(input.visual_rows(10), 2);
+        // "ab" (1 row) + newline + "cdef" wraps to 2 rows at width 3.
+        assert_eq!(input.visual_rows(3), 3);
+        input.end();
+        assert_eq!(input.wrapped_cursor(3), (2, 1));
+        input.home();
+        assert_eq!(input.wrapped_cursor(3), (0, 0));
+    }
 
     #[test]
     fn input_edits_unicode_at_character_boundaries() {
@@ -668,7 +727,7 @@ mod tests {
     fn unicode_cursor_uses_terminal_display_width() {
         let mut input = InputBuffer::default();
         input.insert("你好a");
-        assert_eq!(input.display_width(), 5);
+        assert_eq!(input.wrapped_cursor(80), (0, 5));
     }
 
     #[test]

@@ -130,10 +130,10 @@ fn set_stderr_events(agent: &mut Agent) {
         AgentEvent::BackgroundCompleted { id, output } => {
             eprintln!("background task {id} finished: {}", preview(&output, 500))
         }
-        AgentEvent::Usage {
-            input_tokens,
-            output_tokens,
-        } => eprintln!("\x1b[2mtokens: {input_tokens} in, {output_tokens} out (session)\x1b[0m"),
+        AgentEvent::Usage { call, session } => eprintln!(
+            "\x1b[2mctx {}, session {} in / {} out\x1b[0m",
+            call.input_tokens, session.input_tokens, session.output_tokens
+        ),
     }));
 }
 
