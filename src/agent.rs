@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use tokio::sync::mpsc;
 
 pub const MAX_TOOL_ROUNDS: usize = 32;
+pub const COMPACT_KEEP_LAST: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
@@ -130,6 +131,30 @@ impl Agent {
         self.drain_background();
         self.subscriber = None;
         result
+    }
+
+    pub async fn compact(&mut self) -> anyhow::Result<String> {
+        let mut split = self.transcript.len().saturating_sub(COMPACT_KEEP_LAST);
+        while split < self.transcript.len()
+            && !matches!(&self.transcript[split], Message::User { .. })
+        {
+            split += 1;
+        }
+        if split == 0 || split == self.transcript.len() {
+            anyhow::bail!("nothing to compact");
+        }
+        let mut request = self.transcript[..split].to_vec();
+        request.push(Message::User {
+            content: "Summarize the earlier conversation. Preserve the user's goals, decisions made, files changed, and unfinished work. Be concise and use Chinese or English to match the conversation language.".into(),
+        });
+        let response = self.model.complete(&request, &[]).await?;
+        let summary = response.content.unwrap_or_default();
+        let mut compacted = vec![Message::User {
+            content: format!("[compacted summary of earlier conversation]\n{summary}"),
+        }];
+        compacted.extend_from_slice(&self.transcript[split..]);
+        self.transcript = compacted;
+        Ok(summary)
     }
 
     async fn run_loop(&mut self, specs: &[ToolSpec]) -> anyhow::Result<String> {
@@ -598,5 +623,88 @@ mod tests {
             requests[2].last().unwrap(),
             Message::User { content } if content.starts_with("[background task 1 completed]\n")
         ));
+    }
+
+    #[tokio::test]
+    async fn compacts_a_user_aligned_prefix_without_splitting_tool_results() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some("summary text".into()),
+                tool_calls: vec![],
+            }],
+            requests: requests.clone(),
+        };
+        let tool_call = call("call-1", "echo", r#"{"value":"old"}"#);
+        let tail = vec![
+            Message::User {
+                content: "follow up".into(),
+            },
+            Message::Assistant(AssistantMessage {
+                content: Some("noted".into()),
+                tool_calls: vec![],
+            }),
+            Message::User {
+                content: "recent request".into(),
+            },
+            Message::Assistant(AssistantMessage {
+                content: Some("recent answer".into()),
+                tool_calls: vec![],
+            }),
+        ];
+        let mut transcript = vec![
+            Message::User {
+                content: "original goal".into(),
+            },
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![tool_call.clone()],
+            }),
+            Message::Tool {
+                call_id: tool_call.id,
+                name: "echo".into(),
+                content: "old result".into(),
+                is_error: false,
+            },
+        ];
+        transcript.extend(tail.clone());
+        let mut agent = Agent::new(Box::new(model), vec![]);
+        agent.restore_transcript(transcript);
+
+        assert_eq!(agent.compact().await.unwrap(), "summary text");
+        assert_eq!(agent.transcript().len(), COMPACT_KEEP_LAST + 1);
+        assert!(matches!(
+            &agent.transcript()[0],
+            Message::User { content } if content == "[compacted summary of earlier conversation]\nsummary text"
+        ));
+        assert_eq!(&agent.transcript()[1..], tail.as_slice());
+        assert!(matches!(agent.transcript()[1], Message::User { .. }));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].len(), 4);
+        assert!(matches!(
+            requests[0].last().unwrap(),
+            Message::User { content } if content.contains("Summarize the earlier conversation")
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_to_compact_a_too_short_transcript() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = ScriptedModel {
+            replies: vec![],
+            requests,
+        };
+        let mut agent = Agent::new(Box::new(model), vec![]);
+        agent.restore_transcript(vec![Message::User {
+            content: "short".into(),
+        }]);
+        assert!(
+            agent
+                .compact()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("nothing to compact")
+        );
     }
 }

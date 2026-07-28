@@ -66,6 +66,21 @@ async fn run_inner(
                     return Ok(());
                 }
                 if let Some(prompt) = state.handle_key(key) {
+                    if prompt == "/compact" {
+                        state.thinking = true;
+                        draw(terminal, &state)?;
+                        let result = agent.compact().await;
+                        state.thinking = false;
+                        match result {
+                            Ok(summary) => state
+                                .lines
+                                .push(format!("compacted: {}", preview(&summary, 500))),
+                            Err(error) => state.lines.push(format!("error: {error:#}")),
+                        }
+                        Session::save(root, session_name, agent.transcript())?;
+                        state.follow();
+                        continue;
+                    }
                     state.lines.push(format!("you> {prompt}"));
                     state.follow();
                     agent.subscribe(sender.clone());

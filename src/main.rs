@@ -142,6 +142,15 @@ async fn repl(mut agent: Agent, root: std::path::PathBuf, session: String) -> an
         if line == "/exit" || line == "/quit" {
             break;
         }
+        if line == "/compact" {
+            let result = agent.compact().await;
+            Session::save(&root, &session, agent.transcript())?;
+            match result {
+                Ok(summary) => println!("compacted: {}", preview(&summary, 500)),
+                Err(error) => eprintln!("e-agent: {error:#}"),
+            }
+            continue;
+        }
         agent.subscribe(sender.clone());
         match run_and_save(&mut agent, &root, &session, line.to_owned()).await {
             Ok(answer) => println!("{answer}"),

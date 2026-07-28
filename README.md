@@ -53,6 +53,13 @@ itself. In one-shot mode a still-running task is reported before exit;
 the process then best-effort terminates its process group. Uninjected background
 results are not persisted in sessions.
 
+## Compaction
+
+Use `/compact` in the TUI or `--repl` to manually summarize earlier history.
+The agent keeps the most recent four messages intact, summarizes an older
+user-aligned prefix, and stores that summary as an ordinary user message in the
+session. Compaction has no automatic trigger.
+
 ## Environment
 
 - `OPENAI_API_KEY` — required API key.
@@ -67,7 +74,7 @@ include a preview of the response body.
 ## Non-goals
 
 This is deliberately not a streaming client, daemon, JSONL protocol,
-compaction system, database, event store, subagent
+automatic compaction trigger, database, event store, subagent
 framework, permission framework, MCP/plugin host, multi-provider client,
 parallel tool executor, task scheduler, priority system, or concurrency pool.
 It has one model seam, one tool seam, and a configurable tool-round limit
