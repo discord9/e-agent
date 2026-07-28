@@ -4,7 +4,9 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::agent::{AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, preview};
+use crate::agent::{
+    AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
+};
 
 pub struct OpenAiModel {
     client: reqwest::Client,
@@ -51,16 +53,27 @@ impl Model for OpenAiModel {
         messages: &[Message],
         tools: &[ToolSpec],
         mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
-    ) -> anyhow::Result<AssistantMessage> {
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
         let request = ChatRequest::from_internal(&self.model, messages, tools);
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&request)
-            .send()
-            .await
-            .map_err(request_error)?;
+        let mut retried = false;
+        let response = loop {
+            let result = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .bearer_auth(&self.api_key)
+                .json(&request)
+                .send()
+                .await;
+            match result {
+                // Transient gateway/connectivity hiccup before any bytes were
+                // exchanged; safe to retry once.
+                Err(error) if !retried && (error.is_timeout() || error.is_connect()) => {
+                    retried = true;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                result => break result.map_err(request_error)?,
+            }
+        };
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -68,6 +81,7 @@ impl Model for OpenAiModel {
         }
         let mut content = String::new();
         let mut reasoning = String::new();
+        let mut usage = None;
         let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
         let mut events = response.bytes_stream().eventsource();
         while let Some(event) = events.next().await {
@@ -80,7 +94,13 @@ impl Model for OpenAiModel {
             if let Some(error) = chunk.error {
                 anyhow::bail!("provider stream error: {error}");
             }
+            if let Some(reported) = chunk.usage {
+                usage = Some(reported);
+            }
             for choice in chunk.choices {
+                if let Some(reported) = choice.usage {
+                    usage = Some(reported);
+                }
                 if let Some(delta) = choice.delta.content {
                     content.push_str(&delta);
                     if let Some(callback) = &mut on_delta {
@@ -116,11 +136,11 @@ impl Model for OpenAiModel {
                     }
                 }
                 if choice.finish_reason.is_some() {
-                    return build_assistant(content, reasoning, tool_calls);
+                    return build_assistant(content, reasoning, tool_calls, usage);
                 }
             }
         }
-        build_assistant(content, reasoning, tool_calls)
+        build_assistant(content, reasoning, tool_calls, usage)
     }
 }
 
@@ -264,7 +284,8 @@ fn build_assistant(
     content: String,
     reasoning: String,
     tool_calls: Vec<AccumulatedToolCall>,
-) -> anyhow::Result<AssistantMessage> {
+    usage: Option<StreamUsage>,
+) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
     let tool_calls = tool_calls
         .into_iter()
         .map(|call| {
@@ -278,11 +299,17 @@ fn build_assistant(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(AssistantMessage {
-        content: (!content.is_empty()).then_some(content),
-        tool_calls,
-        reasoning: (!reasoning.is_empty()).then_some(reasoning),
-    })
+    Ok((
+        AssistantMessage {
+            content: (!content.is_empty()).then_some(content),
+            tool_calls,
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+        },
+        usage.map(|usage| Usage {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+        }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -290,12 +317,20 @@ struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
     error: Option<serde_json::Value>,
+    usage: Option<StreamUsage>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct StreamUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 #[derive(Deserialize)]
 struct StreamChoice {
     delta: StreamDelta,
     finish_reason: Option<String>,
+    usage: Option<StreamUsage>,
 }
 
 #[derive(Deserialize, Default)]
@@ -449,7 +484,7 @@ mod tests {
                     json!({"choices":[{"delta":{"content":"hel","reasoning_content":"ignore","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}),
                     json!({"choices":[{"delta":{"content":"lo","tool_calls":[{"index":0,"function":{"arguments":r#"{"command":"p"#}}]},"finish_reason":null}]}),
                     json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":r#"wd"}"#}}]},"finish_reason":null}]}),
-                    json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"tool_calls","usage":{"prompt_tokens":174,"completion_tokens":156}}]}),
                 ],
             )
             .await;
@@ -462,7 +497,7 @@ mod tests {
         )
         .unwrap();
         let mut deltas = Vec::new();
-        let message = model
+        let (message, usage) = model
             .complete(
                 &[Message::User {
                     content: "hello".into(),
@@ -484,6 +519,13 @@ mod tests {
         assert_eq!(message.reasoning.as_deref(), Some("ignore"));
         assert_eq!(message.tool_calls[0].name, "bash");
         assert_eq!(message.tool_calls[0].arguments, r#"{"command":"pwd"}"#);
+        assert_eq!(
+            usage,
+            Some(Usage {
+                input_tokens: 174,
+                output_tokens: 156,
+            })
+        );
     }
 
     #[test]
@@ -508,9 +550,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_request(&mut stream).await;
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut streams = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_request(&mut stream).await;
+                streams.push(stream);
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(streams);
         });
         let mut model = OpenAiModel::with_timeout(
             format!("http://{address}/v1"),
@@ -530,6 +577,44 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn retries_once_after_a_send_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut first).await;
+            let (mut second, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut second).await;
+            reply_sse(
+                &mut second,
+                &[
+                    json!({"choices":[{"delta":{"content":"recovered"},"finish_reason":null}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+                ],
+            )
+            .await;
+        });
+        let mut model = OpenAiModel::with_timeout(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "test-model".into(),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let (message, _) = model
+            .complete(
+                &[Message::User {
+                    content: "hello".into(),
+                }],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(message.content.as_deref(), Some("recovered"));
     }
 
     struct FailingTool;

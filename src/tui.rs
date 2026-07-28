@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::agent::{Agent, AgentEvent, Message, preview};
+use crate::agent::{Agent, AgentEvent, Message, Usage, preview};
 use crate::session::Session;
 
 pub async fn run(mut agent: Agent, root: PathBuf, session_name: String) -> anyhow::Result<()> {
@@ -73,7 +73,7 @@ async fn run_inner(
                         state.thinking = true;
                         state.streamed = false;
                         draw(terminal, &mut state)?;
-                        let (result, exit) = drive(
+                        let (result, interruption) = drive(
                             terminal,
                             &mut state,
                             &mut events,
@@ -97,13 +97,16 @@ async fn run_inner(
                             }
                         }
                         Session::save(root, session_name, agent.transcript())?;
-                        if exit {
+                        if matches!(interruption, Some(Interruption::ExitApp)) {
                             return Ok(());
+                        }
+                        if matches!(interruption, Some(Interruption::CancelTurn)) {
+                            state.push_line("cancelled".into(), LineKind::Dim);
                         }
                         state.follow();
                         continue;
                     }
-                    state.push_line(format!("you> {prompt}"), LineKind::Normal);
+                    state.push_line(format!("you> {prompt}"), LineKind::User);
                     state.follow();
                     agent.subscribe(sender.clone());
                     if run_request(
@@ -141,7 +144,8 @@ async fn run_request(
     state.thinking = true;
     state.streamed = false;
     draw(terminal, state)?;
-    let (result, exit) = drive(terminal, state, events, receiver, agent.run(prompt)).await?;
+    let (result, interruption) =
+        drive(terminal, state, events, receiver, agent.run(prompt)).await?;
     state.thinking = false;
     while let Ok(event) = receiver.try_recv() {
         state.push_agent_event(event);
@@ -152,39 +156,54 @@ async fn run_request(
             Err(error) => state.push_line(format!("error: {error:#}"), LineKind::Normal),
         }
     }
+    if matches!(interruption, Some(Interruption::CancelTurn)) {
+        state.push_line("cancelled".into(), LineKind::Dim);
+    }
     Session::save(session.0, session.1, agent.transcript())?;
     state.follow();
     draw(terminal, state)?;
-    Ok(exit)
+    Ok(matches!(interruption, Some(Interruption::ExitApp)))
+}
+
+enum Interruption {
+    ExitApp,
+    CancelTurn,
 }
 
 /// Pump an agent future to completion while streaming agent events into the
-/// scrollback and keeping the UI responsive. Returns the work result (if it
-/// completed) and whether the user asked to exit.
+/// scrollback and keeping the UI responsive. Scroll and input editing stay
+/// available while work is in flight; Esc/Ctrl-C cancels the turn.
 async fn drive<T>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut TuiState,
     events: &mut EventStream,
     receiver: &mut mpsc::UnboundedReceiver<AgentEvent>,
     work: impl Future<Output = anyhow::Result<T>>,
-) -> anyhow::Result<(Option<anyhow::Result<T>>, bool)> {
+) -> anyhow::Result<(Option<anyhow::Result<T>>, Option<Interruption>)> {
     tokio::pin!(work);
     loop {
         tokio::select! {
-            result = &mut work => return Ok((Some(result), false)),
+            result = &mut work => return Ok((Some(result), None)),
             Some(event) = receiver.recv() => {
                 state.push_agent_event(event);
                 draw(terminal, state)?;
             }
             event = events.next() => match event {
-                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press && is_exit(key) => return Ok((None, true)),
+                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press && is_exit(key) => {
+                    return Ok((None, Some(Interruption::CancelTurn)));
+                }
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
                     state.handle_scroll(key);
+                    state.edit_input(key);
+                    draw(terminal, state)?;
+                }
+                Some(Ok(Event::Paste(text))) => {
+                    state.input.insert(&text);
                     draw(terminal, state)?;
                 }
                 Some(Ok(_)) => {}
-                Some(Err(error)) => return Ok((Some(Err(error.into())), true)),
-                None => return Ok((None, true)),
+                Some(Err(error)) => return Ok((Some(Err(error.into())), Some(Interruption::ExitApp))),
+                None => return Ok((None, Some(Interruption::ExitApp))),
             }
         }
     }
@@ -210,6 +229,7 @@ fn draw(
                             .add_modifier(Modifier::DIM),
                         LineKind::Added => Style::default().bg(Color::Rgb(20, 60, 20)),
                         LineKind::Removed => Style::default().bg(Color::Rgb(70, 20, 20)),
+                        LineKind::User => Style::default().bg(Color::Rgb(45, 45, 60)),
                     };
                     hard_wrap(&line.text, inner_width)
                         .into_iter()
@@ -231,9 +251,20 @@ fn draw(
             } else {
                 "input"
             };
+            let mut input_block = Block::default().borders(Borders::ALL).title(title);
+            if state.tokens.input_tokens + state.tokens.output_tokens > 0 {
+                input_block = input_block.title(
+                    Line::from(format!(
+                        "↑{} ↓{}",
+                        format_tokens(state.tokens.input_tokens),
+                        format_tokens(state.tokens.output_tokens)
+                    ))
+                    .right_aligned(),
+                );
+            }
             frame.render_widget(
                 Paragraph::new(state.input.text.as_str())
-                    .block(Block::default().borders(Borders::ALL).title(title))
+                    .block(input_block)
                     .wrap(Wrap { trim: false }),
                 input,
             );
@@ -245,6 +276,14 @@ fn draw(
             }
         })
         .map(|_| ())
+}
+
+fn format_tokens(count: u64) -> String {
+    if count >= 1000 {
+        format!("{:.1}k", count as f64 / 1000.0)
+    } else {
+        count.to_string()
+    }
 }
 
 fn is_exit(key: KeyEvent) -> bool {
@@ -293,6 +332,7 @@ struct TuiState {
     thinking: bool,
     streamed: bool,
     active_lane: Option<ActiveStreamLane>,
+    tokens: Usage,
 }
 
 struct DisplayLine {
@@ -306,6 +346,7 @@ enum LineKind {
     Dim,
     Added,
     Removed,
+    User,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -325,7 +366,7 @@ impl TuiState {
                     } else if content.starts_with("[background task ") {
                         state.push_line(content.clone(), LineKind::Dim);
                     } else {
-                        state.push_line(format!("you> {content}"), LineKind::Normal);
+                        state.push_line(format!("you> {content}"), LineKind::User);
                     }
                 }
                 Message::Assistant(message) => {
@@ -362,7 +403,7 @@ impl TuiState {
         state
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
+    fn edit_input(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(character)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
@@ -375,6 +416,12 @@ impl TuiState {
             KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => self.input.end(),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
+            _ => {}
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
+        match key.code {
             KeyCode::Up
             | KeyCode::Down
             | KeyCode::PageUp
@@ -386,7 +433,7 @@ impl TuiState {
                 self.input.cursor = 0;
                 return (!prompt.trim().is_empty()).then_some(prompt);
             }
-            _ => {}
+            _ => self.edit_input(key),
         }
         None
     }
@@ -445,6 +492,15 @@ impl TuiState {
                 format!("background task {id} finished: {}", preview(&output, 500)),
                 LineKind::Normal,
             ),
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                self.tokens = Usage {
+                    input_tokens,
+                    output_tokens,
+                };
+            }
         }
         if ends_delta {
             self.streamed = false;

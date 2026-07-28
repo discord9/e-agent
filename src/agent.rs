@@ -49,15 +49,35 @@ pub enum AgentEvent {
     AssistantText(String),
     AssistantDelta(String),
     ReasoningDelta(String),
-    ToolCall { name: String, arguments: String },
-    ToolResult { is_error: bool, content: String },
-    BackgroundCompleted { id: u64, output: String },
+    ToolCall {
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        is_error: bool,
+        content: String,
+    },
+    BackgroundCompleted {
+        id: u64,
+        output: String,
+    },
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelDeltaKind {
     Content,
     Reasoning,
+}
+
+/// Token accounting for one provider call, if the provider reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 #[async_trait]
@@ -67,7 +87,7 @@ pub trait Model: Send {
         messages: &[Message],
         tools: &[ToolSpec],
         on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
-    ) -> anyhow::Result<AssistantMessage>;
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)>;
 }
 
 #[async_trait]
@@ -87,6 +107,8 @@ pub struct Agent {
     pending_background: VecDeque<(u64, String)>,
     subscriber: Option<mpsc::UnboundedSender<AgentEvent>>,
     running_background: Option<u64>,
+    session_input_tokens: u64,
+    session_output_tokens: u64,
 }
 
 impl Agent {
@@ -105,6 +127,8 @@ impl Agent {
             pending_background: VecDeque::new(),
             subscriber: None,
             running_background: None,
+            session_input_tokens: 0,
+            session_output_tokens: 0,
         }
     }
 
@@ -177,6 +201,8 @@ impl Agent {
             };
             model.complete(&request, &[], Some(&mut on_delta)).await?
         };
+        let (response, usage) = response;
+        self.record_usage(usage);
         let summary = response.content.unwrap_or_default();
         let mut compacted = vec![Message::User {
             content: format!("[compacted summary of earlier conversation]\n{summary}"),
@@ -184,6 +210,17 @@ impl Agent {
         compacted.extend_from_slice(&self.transcript[split..]);
         self.transcript = compacted;
         Ok(summary)
+    }
+
+    fn record_usage(&mut self, usage: Option<Usage>) {
+        if let Some(usage) = usage {
+            self.session_input_tokens += usage.input_tokens;
+            self.session_output_tokens += usage.output_tokens;
+            self.emit(AgentEvent::Usage {
+                input_tokens: self.session_input_tokens,
+                output_tokens: self.session_output_tokens,
+            });
+        }
     }
 
     async fn run_loop(&mut self, specs: &[ToolSpec]) -> anyhow::Result<String> {
@@ -209,6 +246,8 @@ impl Agent {
                     .complete(&self.transcript, specs, Some(&mut on_delta))
                     .await?
             };
+            let (assistant, usage) = assistant;
+            self.record_usage(usage);
             if assistant.tool_calls.is_empty() {
                 let answer = assistant.content.clone().unwrap_or_default();
                 self.transcript.push(Message::Assistant(assistant));
@@ -342,9 +381,9 @@ mod tests {
             messages: &[Message],
             _: &[ToolSpec],
             _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
-        ) -> anyhow::Result<AssistantMessage> {
+        ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
             self.requests.lock().unwrap().push(messages.to_vec());
-            Ok(self.replies.remove(0))
+            Ok((self.replies.remove(0), None))
         }
     }
 
@@ -443,24 +482,30 @@ mod tests {
             _: &[Message],
             _: &[ToolSpec],
             mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
-        ) -> anyhow::Result<AssistantMessage> {
+        ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
             self.calls += 1;
             if self.calls == 1 {
                 if let Some(callback) = &mut on_delta {
                     callback(ModelDeltaKind::Reasoning, "thinking");
                     callback(ModelDeltaKind::Content, "streamed");
                 }
-                return Ok(AssistantMessage {
-                    content: Some("streamed".into()),
-                    tool_calls: vec![call("call-1", "echo", r#"{"value":"ok"}"#)],
-                    reasoning: None,
-                });
+                return Ok((
+                    AssistantMessage {
+                        content: Some("streamed".into()),
+                        tool_calls: vec![call("call-1", "echo", r#"{"value":"ok"}"#)],
+                        reasoning: None,
+                    },
+                    None,
+                ));
             }
-            Ok(AssistantMessage {
-                content: Some("final".into()),
-                tool_calls: vec![],
-                reasoning: None,
-            })
+            Ok((
+                AssistantMessage {
+                    content: Some("final".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            ))
         }
     }
 

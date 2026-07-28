@@ -252,6 +252,34 @@ impl Drop for BackgroundTasks {
     }
 }
 
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    process_group: Option<rustix::process::Pid>,
+}
+
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    fn armed(process_group: rustix::process::Pid) -> Self {
+        Self {
+            process_group: Some(process_group),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.process_group = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(process_group) = self.process_group {
+            let _ =
+                rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+        }
+    }
+}
+
 async fn run_bash(
     workspace: &Workspace,
     command: &str,
@@ -281,6 +309,10 @@ async fn run_bash(
     if let Some(slot) = &process_group_slot {
         slot.store(process_group.as_raw_nonzero().get(), Ordering::Release);
     }
+    // Kills the process group if this future is dropped mid-execution
+    // (e.g. the user cancelled the turn).
+    #[cfg(unix)]
+    let mut cancel_guard = ProcessGroupGuard::armed(process_group);
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
     let result = tokio::time::timeout(timeout, async {
@@ -318,6 +350,8 @@ async fn run_bash(
             ));
         }
     };
+    #[cfg(unix)]
+    cancel_guard.disarm();
     if let Some(slot) = &process_group_slot {
         slot.store(0, Ordering::Release);
     }
