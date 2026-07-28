@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 
@@ -70,19 +71,35 @@ async fn run_inner(
                 if let Some(prompt) = state.handle_key(key) {
                     if prompt == "/compact" {
                         state.thinking = true;
+                        state.streamed = false;
                         draw(terminal, &mut state)?;
-                        let result = agent.compact().await;
+                        let (result, exit) = drive(
+                            terminal,
+                            &mut state,
+                            &mut events,
+                            &mut receiver,
+                            agent.compact(),
+                        )
+                        .await?;
                         state.thinking = false;
-                        match result {
-                            Ok(summary) => state.push_line(
-                                format!("compacted: {}", preview(&summary, 500)),
-                                LineKind::Normal,
-                            ),
-                            Err(error) => {
-                                state.push_line(format!("error: {error:#}"), LineKind::Normal)
+                        while let Ok(event) = receiver.try_recv() {
+                            state.push_agent_event(event);
+                        }
+                        if let Some(result) = result {
+                            match result {
+                                Ok(summary) => state.push_final_answer(format!(
+                                    "compacted: {}",
+                                    preview(&summary, 500)
+                                )),
+                                Err(error) => {
+                                    state.push_line(format!("error: {error:#}"), LineKind::Normal)
+                                }
                             }
                         }
                         Session::save(root, session_name, agent.transcript())?;
+                        if exit {
+                            return Ok(());
+                        }
                         state.follow();
                         continue;
                     }
@@ -124,29 +141,7 @@ async fn run_request(
     state.thinking = true;
     state.streamed = false;
     draw(terminal, state)?;
-    let (result, exit) = {
-        let request = agent.run(prompt);
-        tokio::pin!(request);
-        loop {
-            tokio::select! {
-                result = &mut request => break (Some(result), false),
-                Some(event) = receiver.recv() => {
-                    state.push_agent_event(event);
-                    draw(terminal, state)?;
-                }
-                event = events.next() => match event {
-                    Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press && is_exit(key) => break (None, true),
-                    Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
-                        state.handle_scroll(key);
-                        draw(terminal, state)?;
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => break (Some(Err(error.into())), true),
-                    None => break (None, true),
-                }
-            }
-        }
-    };
+    let (result, exit) = drive(terminal, state, events, receiver, agent.run(prompt)).await?;
     state.thinking = false;
     while let Ok(event) = receiver.try_recv() {
         state.push_agent_event(event);
@@ -161,6 +156,38 @@ async fn run_request(
     state.follow();
     draw(terminal, state)?;
     Ok(exit)
+}
+
+/// Pump an agent future to completion while streaming agent events into the
+/// scrollback and keeping the UI responsive. Returns the work result (if it
+/// completed) and whether the user asked to exit.
+async fn drive<T>(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &mut TuiState,
+    events: &mut EventStream,
+    receiver: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    work: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<(Option<anyhow::Result<T>>, bool)> {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            result = &mut work => return Ok((Some(result), false)),
+            Some(event) = receiver.recv() => {
+                state.push_agent_event(event);
+                draw(terminal, state)?;
+            }
+            event = events.next() => match event {
+                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press && is_exit(key) => return Ok((None, true)),
+                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
+                    state.handle_scroll(key);
+                    draw(terminal, state)?;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return Ok((Some(Err(error.into())), true)),
+                None => return Ok((None, true)),
+            }
+        }
+    }
 }
 
 fn draw(

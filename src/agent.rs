@@ -164,7 +164,19 @@ impl Agent {
         request.push(Message::User {
             content: "Summarize the earlier conversation. Preserve the user's goals, decisions made, files changed, and unfinished work. Be concise and use Chinese or English to match the conversation language.".into(),
         });
-        let response = self.model.complete(&request, &[], None).await?;
+        let response = {
+            let model = &mut self.model;
+            let event_handler = &mut self.event_handler;
+            let mut on_delta = |kind: ModelDeltaKind, delta: &str| {
+                if let Some(handler) = event_handler {
+                    handler(match kind {
+                        ModelDeltaKind::Content => AgentEvent::AssistantDelta(delta.into()),
+                        ModelDeltaKind::Reasoning => AgentEvent::ReasoningDelta(delta.into()),
+                    });
+                }
+            };
+            model.complete(&request, &[], Some(&mut on_delta)).await?
+        };
         let summary = response.content.unwrap_or_default();
         let mut compacted = vec![Message::User {
             content: format!("[compacted summary of earlier conversation]\n{summary}"),
