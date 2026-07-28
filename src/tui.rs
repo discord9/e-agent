@@ -1,0 +1,336 @@
+use std::io;
+use std::path::PathBuf;
+
+use crossterm::cursor::Show;
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyModifiers,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use futures_util::StreamExt;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthStr;
+
+use crate::agent::{Agent, AgentEvent, preview};
+use crate::session::Session;
+
+pub async fn run(mut agent: Agent, root: PathBuf, session_name: String) -> anyhow::Result<()> {
+    enable_raw_mode()?;
+    let _guard = TerminalGuard;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    run_inner(&mut terminal, &mut agent, &root, &session_name).await
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            Show
+        );
+    }
+}
+
+async fn run_inner(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    agent: &mut Agent,
+    root: &std::path::Path,
+    session_name: &str,
+) -> anyhow::Result<()> {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let event_sender = sender.clone();
+    agent.set_event_handler(Box::new(move |event| {
+        let _ = event_sender.send(event);
+    }));
+    let mut events = EventStream::new();
+    let mut state = TuiState::default();
+    loop {
+        draw(terminal, &state)?;
+        match events.next().await {
+            Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
+                if is_exit(key) {
+                    return Ok(());
+                }
+                if let Some(prompt) = state.handle_key(key) {
+                    state.lines.push(format!("you> {prompt}"));
+                    state.follow();
+                    agent.subscribe(sender.clone());
+                    if run_request(
+                        terminal,
+                        agent,
+                        &mut state,
+                        &mut events,
+                        &mut receiver,
+                        (root, session_name),
+                        prompt,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            Some(Ok(Event::Paste(text))) => state.input.insert(&text),
+            Some(Ok(_)) => {}
+            Some(Err(error)) => return Err(error.into()),
+            None => return Ok(()),
+        }
+    }
+}
+
+async fn run_request(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    agent: &mut Agent,
+    state: &mut TuiState,
+    events: &mut EventStream,
+    receiver: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    session: (&std::path::Path, &str),
+    prompt: String,
+) -> anyhow::Result<bool> {
+    state.thinking = true;
+    draw(terminal, state)?;
+    let (result, exit) = {
+        let request = agent.run(prompt);
+        tokio::pin!(request);
+        loop {
+            tokio::select! {
+                result = &mut request => break (Some(result), false),
+                Some(event) = receiver.recv() => {
+                    state.push_agent_event(event);
+                    draw(terminal, state)?;
+                }
+                event = events.next() => match event {
+                    Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press && is_exit(key) => break (None, true),
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => break (Some(Err(error.into())), true),
+                    None => break (None, true),
+                }
+            }
+        }
+    };
+    state.thinking = false;
+    while let Ok(event) = receiver.try_recv() {
+        state.push_agent_event(event);
+    }
+    if let Some(result) = result {
+        match result {
+            Ok(answer) => state.lines.push(answer),
+            Err(error) => state.lines.push(format!("error: {error:#}")),
+        }
+    }
+    Session::save(session.0, session.1, agent.transcript())?;
+    state.follow();
+    draw(terminal, state)?;
+    Ok(exit)
+}
+
+fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &TuiState) -> io::Result<()> {
+    terminal
+        .draw(|frame| {
+            let [output, input] =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(frame.area());
+            frame.render_widget(
+                Paragraph::new(state.lines.join("\n"))
+                    .block(Block::default().borders(Borders::ALL).title("e-agent"))
+                    .wrap(Wrap { trim: false })
+                    .scroll((state.scroll.min(u16::MAX as usize) as u16, 0)),
+                output,
+            );
+            let title = if state.thinking {
+                "thinking…"
+            } else {
+                "input"
+            };
+            frame.render_widget(
+                Paragraph::new(state.input.text.as_str())
+                    .block(Block::default().borders(Borders::ALL).title(title))
+                    .wrap(Wrap { trim: false }),
+                input,
+            );
+            if !state.thinking {
+                frame.set_cursor_position((
+                    input.x + 1 + state.input.display_width().min(u16::MAX as usize) as u16,
+                    input.y + 1,
+                ));
+            }
+        })
+        .map(|_| ())
+}
+
+fn is_exit(key: KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+#[derive(Default)]
+struct TuiState {
+    input: InputBuffer,
+    lines: Vec<String>,
+    scroll: usize,
+    thinking: bool,
+}
+
+impl TuiState {
+    fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
+        match key.code {
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                self.input.insert_char(character)
+            }
+            KeyCode::Left => self.input.left(),
+            KeyCode::Right => self.input.right(),
+            KeyCode::Home => self.input.home(),
+            KeyCode::End => self.input.end(),
+            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Delete => self.input.delete(),
+            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Down => self.scroll = self.scroll.saturating_add(1).min(self.lines.len()),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10).min(self.lines.len()),
+            KeyCode::Enter => {
+                let prompt = std::mem::take(&mut self.input.text);
+                self.input.cursor = 0;
+                return (!prompt.trim().is_empty()).then_some(prompt);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn push_agent_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::AssistantText(text) => self.lines.push(text),
+            AgentEvent::ToolCall { name, arguments } => self
+                .lines
+                .push(format!("tool: {name} {}", preview(&arguments, 200))),
+            AgentEvent::ToolResult { is_error, content } => self.lines.push(format!(
+                "  {}: {}",
+                if is_error { "error" } else { "ok" },
+                preview(&content, 500)
+            )),
+            AgentEvent::BackgroundCompleted { id, output } => self.lines.push(format!(
+                "background task {id} finished: {}",
+                preview(&output, 500)
+            )),
+        }
+        self.follow();
+    }
+
+    fn follow(&mut self) {
+        self.scroll = self.lines.len().saturating_sub(1);
+    }
+}
+
+#[derive(Default)]
+struct InputBuffer {
+    text: String,
+    cursor: usize,
+}
+
+impl InputBuffer {
+    fn insert(&mut self, text: &str) {
+        let byte = self.byte_index();
+        self.text.insert_str(byte, text);
+        self.cursor += text.chars().count();
+    }
+
+    fn insert_char(&mut self, character: char) {
+        self.insert(&character.to_string());
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.text.chars().count());
+    }
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+    fn end(&mut self) {
+        self.cursor = self.text.chars().count();
+    }
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            let end = self.byte_index();
+            self.cursor -= 1;
+            self.text.drain(self.byte_index()..end);
+        }
+    }
+    fn delete(&mut self) {
+        let start = self.byte_index();
+        if start < self.text.len() {
+            let end = self.text[start..]
+                .char_indices()
+                .nth(1)
+                .map_or(self.text.len(), |(index, _)| start + index);
+            self.text.drain(start..end);
+        }
+    }
+    fn byte_index(&self) -> usize {
+        self.text
+            .char_indices()
+            .nth(self.cursor)
+            .map_or(self.text.len(), |(index, _)| index)
+    }
+
+    fn display_width(&self) -> usize {
+        UnicodeWidthStr::width(&self.text[..self.byte_index()])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_edits_unicode_at_character_boundaries() {
+        let mut input = InputBuffer::default();
+        input.insert("你好a");
+        input.left();
+        input.backspace();
+        input.insert("世");
+        input.end();
+        input.delete();
+        assert_eq!(input.text, "你世a");
+        assert_eq!(input.cursor, 3);
+    }
+
+    #[test]
+    fn unicode_cursor_uses_terminal_display_width() {
+        let mut input = InputBuffer::default();
+        input.insert("你好a");
+        assert_eq!(input.display_width(), 5);
+    }
+
+    #[test]
+    fn scrolling_is_bounded_and_events_append_echo_lines() {
+        let mut state = TuiState {
+            lines: vec!["one".into(), "two".into()],
+            ..Default::default()
+        };
+        state.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(state.scroll, 2);
+        state.push_agent_event(AgentEvent::ToolResult {
+            is_error: false,
+            content: "done".into(),
+        });
+        assert_eq!(state.lines.last().unwrap(), "  ok: done");
+        assert_eq!(state.scroll, 2);
+    }
+}

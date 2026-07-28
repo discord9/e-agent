@@ -1,11 +1,12 @@
-use std::fmt;
-
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
+use tokio::sync::mpsc;
 
 pub const MAX_TOOL_ROUNDS: usize = 32;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     User {
         content: String,
@@ -19,13 +20,13 @@ pub enum Message {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -39,16 +40,13 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
-#[derive(Debug)]
-pub struct ModelError(pub String);
-
-impl fmt::Display for ModelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentEvent {
+    AssistantText(String),
+    ToolCall { name: String, arguments: String },
+    ToolResult { is_error: bool, content: String },
+    BackgroundCompleted { id: u64, output: String },
 }
-
-impl std::error::Error for ModelError {}
 
 #[async_trait]
 pub trait Model: Send {
@@ -56,61 +54,119 @@ pub trait Model: Send {
         &mut self,
         messages: &[Message],
         tools: &[ToolSpec],
-    ) -> Result<AssistantMessage, ModelError>;
+    ) -> anyhow::Result<AssistantMessage>;
 }
 
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn execute(&self, arguments: Value) -> Result<String, String>;
+    fn set_event_sender(&mut self, _sender: mpsc::UnboundedSender<AgentEvent>) {}
 }
 
 pub struct Agent {
     model: Box<dyn Model>,
     tools: Vec<Box<dyn Tool>>,
     transcript: Vec<Message>,
-    print_tool_calls: bool,
+    event_handler: Option<Box<dyn FnMut(AgentEvent) + Send>>,
+    max_tool_rounds: usize,
+    background_receiver: mpsc::UnboundedReceiver<AgentEvent>,
+    pending_background: VecDeque<(u64, String)>,
+    subscriber: Option<mpsc::UnboundedSender<AgentEvent>>,
+    running_background: Option<u64>,
 }
 
 impl Agent {
-    pub fn new(model: Box<dyn Model>, tools: Vec<Box<dyn Tool>>) -> Self {
+    pub fn new(model: Box<dyn Model>, mut tools: Vec<Box<dyn Tool>>) -> Self {
+        let (background_sender, background_receiver) = mpsc::unbounded_channel();
+        for tool in &mut tools {
+            tool.set_event_sender(background_sender.clone());
+        }
         Self {
             model,
             tools,
             transcript: Vec::new(),
-            print_tool_calls: false,
+            event_handler: None,
+            max_tool_rounds: MAX_TOOL_ROUNDS,
+            background_receiver,
+            pending_background: VecDeque::new(),
+            subscriber: None,
+            running_background: None,
         }
     }
 
-    pub fn print_tool_calls(mut self, enabled: bool) -> Self {
-        self.print_tool_calls = enabled;
+    pub fn max_tool_rounds(mut self, rounds: usize) -> Self {
+        self.max_tool_rounds = rounds;
         self
     }
 
-    pub async fn run(&mut self, prompt: String) -> Result<String, ModelError> {
+    pub fn set_event_handler(&mut self, handler: Box<dyn FnMut(AgentEvent) + Send>) {
+        self.event_handler = Some(handler);
+    }
+
+    pub fn transcript(&self) -> &[Message] {
+        &self.transcript
+    }
+
+    pub fn restore_transcript(&mut self, transcript: Vec<Message>) {
+        self.transcript = transcript;
+    }
+
+    pub fn subscribe(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
+        self.subscriber = Some(sender);
+    }
+
+    pub fn background_task_id(&self) -> Option<u64> {
+        self.running_background
+    }
+
+    pub async fn run(&mut self, prompt: String) -> anyhow::Result<String> {
+        self.drain_background();
+        self.inject_pending_background();
         self.transcript.push(Message::User { content: prompt });
         let specs: Vec<_> = self.tools.iter().map(|tool| tool.spec()).collect();
 
-        for _ in 0..MAX_TOOL_ROUNDS {
-            let assistant = self.model.complete(&self.transcript, &specs).await?;
+        let result = self.run_loop(&specs).await;
+        self.drain_background();
+        self.subscriber = None;
+        result
+    }
+
+    async fn run_loop(&mut self, specs: &[ToolSpec]) -> anyhow::Result<String> {
+        for _ in 0..self.max_tool_rounds {
+            self.drain_background();
+            self.inject_pending_background();
+            let assistant = self.model.complete(&self.transcript, specs).await?;
             if assistant.tool_calls.is_empty() {
                 let answer = assistant.content.clone().unwrap_or_default();
                 self.transcript.push(Message::Assistant(assistant));
                 return Ok(answer);
             }
 
+            if let Some(content) = assistant
+                .content
+                .as_deref()
+                .filter(|content| !content.is_empty())
+            {
+                self.emit(AgentEvent::AssistantText(content.into()));
+            }
             self.transcript.push(Message::Assistant(assistant.clone()));
             for call in &assistant.tool_calls {
-                if self.print_tool_calls {
-                    eprintln!("tool: {} {}", call.name, preview(&call.arguments, 200));
-                }
+                self.emit(AgentEvent::ToolCall {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                });
                 let result = self.execute_call(call).await;
-                if self.print_tool_calls {
-                    match &result {
-                        Ok(content) => eprintln!("  ok: {}", preview(content, 500)),
-                        Err(error) => eprintln!("  error: {}", preview(error, 500)),
-                    }
+                if result.is_ok() && call.name == "bash" && is_background_call(call) {
+                    self.running_background =
+                        started_task_id(result.as_deref().unwrap_or_default());
                 }
+                self.emit(AgentEvent::ToolResult {
+                    is_error: result.is_err(),
+                    content: match &result {
+                        Ok(content) | Err(content) => content.clone(),
+                    },
+                });
                 self.transcript.push(Message::Tool {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
@@ -122,9 +178,7 @@ impl Agent {
             }
         }
 
-        Err(ModelError(format!(
-            "tool call limit ({MAX_TOOL_ROUNDS}) reached"
-        )))
+        anyhow::bail!("tool call limit ({}) reached", self.max_tool_rounds)
     }
 
     async fn execute_call(&self, call: &ToolCall) -> Result<String, String> {
@@ -135,9 +189,57 @@ impl Agent {
         };
         tool.execute(arguments).await
     }
+
+    fn emit(&mut self, event: AgentEvent) {
+        if let Some(handler) = &mut self.event_handler {
+            handler(event);
+        }
+    }
+
+    fn inject_pending_background(&mut self) {
+        while let Some((id, output)) = self.pending_background.pop_front() {
+            self.transcript.push(Message::User {
+                content: format!("[background task {id} completed]\n{output}"),
+            });
+        }
+    }
+
+    fn drain_background(&mut self) {
+        while let Ok(AgentEvent::BackgroundCompleted { id, output }) =
+            self.background_receiver.try_recv()
+        {
+            if self.running_background == Some(id) {
+                self.running_background = None;
+            }
+            let event = AgentEvent::BackgroundCompleted {
+                id,
+                output: output.clone(),
+            };
+            self.pending_background.push_back((id, output));
+            if let Some(subscriber) = &self.subscriber {
+                let _ = subscriber.send(event);
+            }
+        }
+    }
 }
 
-fn preview(text: &str, max_chars: usize) -> String {
+fn is_background_call(call: &ToolCall) -> bool {
+    serde_json::from_str::<Value>(&call.arguments)
+        .ok()
+        .and_then(|value| value.get("background").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn started_task_id(output: &str) -> Option<u64> {
+    output
+        .strip_prefix("started background task ")?
+        .split_once(':')?
+        .0
+        .parse()
+        .ok()
+}
+
+pub fn preview(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let head: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
@@ -166,7 +268,7 @@ mod tests {
             &mut self,
             messages: &[Message],
             _: &[ToolSpec],
-        ) -> Result<AssistantMessage, ModelError> {
+        ) -> anyhow::Result<AssistantMessage> {
             self.requests.lock().unwrap().push(messages.to_vec());
             Ok(self.replies.remove(0))
         }
@@ -203,6 +305,56 @@ mod tests {
 
         async fn execute(&self, _: Value) -> Result<String, String> {
             Err("execution failed".into())
+        }
+    }
+
+    struct ScriptedBackgroundTool {
+        sender: Option<mpsc::UnboundedSender<AgentEvent>>,
+    }
+
+    #[async_trait]
+    impl Tool for ScriptedBackgroundTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "bash".into(),
+                description: "background test".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(&self, arguments: Value) -> Result<String, String> {
+            assert_eq!(arguments["background"], true);
+            let sender = self.sender.clone().unwrap();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let _ = sender.send(AgentEvent::BackgroundCompleted {
+                    id: 1,
+                    output: "exit code: 0\nstdout:\ndone\nstderr:\n".into(),
+                });
+            });
+            Ok("started background task 1: echo done".into())
+        }
+
+        fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
+            self.sender = Some(sender);
+        }
+    }
+
+    struct SlowEchoTool;
+
+    #[async_trait]
+    impl Tool for SlowEchoTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "slow_echo".into(),
+                description: "sleeps, then echoes".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(&self, arguments: Value) -> Result<String, String> {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(arguments["value"].to_string())
         }
     }
 
@@ -314,6 +466,137 @@ mod tests {
         assert!(matches!(
             &requests[2][4],
             Message::Tool { is_error: true, content, .. } if content == "execution failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn emits_assistant_tool_and_result_events_in_order() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = ScriptedModel {
+            replies: vec![
+                AssistantMessage {
+                    content: Some("working".into()),
+                    tool_calls: vec![call("call-1", "echo", r#"{"value":"ok"}"#)],
+                },
+                AssistantMessage {
+                    content: Some("final".into()),
+                    tool_calls: vec![],
+                },
+            ],
+            requests,
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(Box::new(model), vec![Box::new(EchoTool)]);
+        let captured = events.clone();
+        agent.set_event_handler(Box::new(move |event| captured.lock().unwrap().push(event)));
+
+        assert_eq!(agent.run("hello".into()).await.unwrap(), "final");
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                AgentEvent::AssistantText("working".into()),
+                AgentEvent::ToolCall {
+                    name: "echo".into(),
+                    arguments: r#"{"value":"ok"}"#.into(),
+                },
+                AgentEvent::ToolResult {
+                    is_error: false,
+                    content: "\"ok\"".into(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn injects_background_completion_before_the_next_prompt_and_forwards_it() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = ScriptedModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![call(
+                        "background-1",
+                        "bash",
+                        r#"{"command":"echo done","background":true}"#,
+                    )],
+                },
+                AssistantMessage {
+                    content: Some("started".into()),
+                    tool_calls: vec![],
+                },
+                AssistantMessage {
+                    content: Some("next".into()),
+                    tool_calls: vec![],
+                },
+            ],
+            requests: requests.clone(),
+        };
+        let mut agent = Agent::new(
+            Box::new(model),
+            vec![Box::new(ScriptedBackgroundTool { sender: None })],
+        );
+        assert_eq!(agent.run("first".into()).await.unwrap(), "started");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        agent.subscribe(sender);
+        assert_eq!(agent.run("second".into()).await.unwrap(), "next");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AgentEvent::BackgroundCompleted { id: 1, .. })
+        ));
+        let requests = requests.lock().unwrap();
+        assert!(matches!(
+            &requests[1][2],
+            Message::Tool { content, is_error: false, .. } if content.starts_with("started background task 1:")
+        ));
+        assert!(matches!(
+            &requests[2][4],
+            Message::User { content } if content.starts_with("[background task 1 completed]\n")
+        ));
+        assert!(matches!(
+            &requests[2][5],
+            Message::User { content } if content == "second"
+        ));
+    }
+
+    #[tokio::test]
+    async fn injects_background_completion_mid_loop_before_the_next_model_call() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = ScriptedModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![call(
+                        "background-1",
+                        "bash",
+                        r#"{"command":"echo done","background":true}"#,
+                    )],
+                },
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![call("call-2", "slow_echo", r#"{"value":"ok"}"#)],
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                },
+            ],
+            requests: requests.clone(),
+        };
+        let mut agent = Agent::new(
+            Box::new(model),
+            vec![
+                Box::new(ScriptedBackgroundTool { sender: None }),
+                Box::new(SlowEchoTool),
+            ],
+        );
+
+        assert_eq!(agent.run("go".into()).await.unwrap(), "done");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(matches!(
+            requests[2].last().unwrap(),
+            Message::User { content } if content.starts_with("[background task 1 completed]\n")
         ));
     }
 }

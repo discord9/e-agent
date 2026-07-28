@@ -1,27 +1,29 @@
-mod agent;
-mod model;
-mod tools;
-mod workspace;
-
 use std::io::{IsTerminal, Read, Write};
 
-use agent::Agent;
-use model::OpenAiModel;
-use tools::builtins;
-use workspace::Workspace;
+use anyhow::{Context, anyhow};
+use e_agent::agent::{Agent, AgentEvent, preview};
+use e_agent::model::OpenAiModel;
+use e_agent::session::Session;
+use e_agent::tools::builtins;
+use e_agent::tui;
+use e_agent::workspace::Workspace;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     if let Err(error) = run().await {
-        eprintln!("e-agent: {error}");
+        eprintln!("e-agent: {error:#}");
         std::process::exit(1);
     }
+    Ok(())
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> anyhow::Result<()> {
     let mut base_url = None;
     let mut model = None;
     let mut workspace = None;
+    let mut session = "default".to_owned();
+    let mut max_rounds = None;
+    let mut repl_mode = false;
     let mut prompt = Vec::new();
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -29,49 +31,109 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--base-url" => base_url = Some(next_value(&mut arguments, "--base-url")?),
             "--model" => model = Some(next_value(&mut arguments, "--model")?),
             "--workspace" => workspace = Some(next_value(&mut arguments, "--workspace")?),
+            "--session" => session = next_value(&mut arguments, "--session")?,
+            "--max-rounds" => {
+                max_rounds = Some(
+                    next_value(&mut arguments, "--max-rounds")?
+                        .parse::<usize>()
+                        .context("--max-rounds must be a positive integer")?,
+                )
+            }
+            "--repl" => repl_mode = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: e-agent [--base-url URL] [--model MODEL] [--workspace PATH] [PROMPT]"
+                    "usage: e-agent [--base-url URL] [--model MODEL] [--workspace PATH] [--session NAME] [--max-rounds N] [--repl] [PROMPT]"
                 );
                 return Ok(());
             }
             value => prompt.push(value.to_owned()),
         }
     }
-    let interactive = prompt.is_empty() && std::io::stdin().is_terminal();
-    let prompt = if !prompt.is_empty() {
-        prompt.join(" ")
-    } else if interactive {
-        String::new()
-    } else {
+    let tui_mode = prompt.is_empty() && std::io::stdout().is_terminal() && !repl_mode;
+    let prompt = if prompt.is_empty() && !tui_mode && !repl_mode {
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input)?;
         input
+    } else {
+        prompt.join(" ")
     };
-    if !interactive && prompt.trim().is_empty() {
-        return Err("a prompt argument or stdin content is required".into());
+    if !tui_mode && !repl_mode && prompt.trim().is_empty() {
+        return Err(anyhow!("a prompt argument or stdin content is required"));
     }
     let workspace = Workspace::new(match workspace {
         Some(path) => path.into(),
         None => std::env::current_dir()?,
-    })?;
+    })
+    .map_err(anyhow::Error::msg)
+    .context("cannot open workspace")?;
+    let root = workspace.root().to_path_buf();
     let model = OpenAiModel::from_env(base_url, model)?;
-    let mut agent = Agent::new(Box::new(model), builtins(workspace)).print_tool_calls(true);
-    if interactive {
-        return repl(agent).await;
+    let mut agent = Agent::new(Box::new(model), builtins(workspace));
+    if let Some(rounds) = max_rounds {
+        agent = agent.max_tool_rounds(rounds);
     }
-    println!("{}", agent.run(prompt).await?);
+    agent.restore_transcript(Session::load(&root, &session)?);
+
+    if tui_mode {
+        return tui::run(agent, root, session).await;
+    }
+    set_stderr_events(&mut agent);
+    if repl_mode {
+        return repl(agent, root, session).await;
+    }
+    let answer = run_and_save(&mut agent, &root, &session, prompt).await?;
+    println!("{answer}");
+    if let Some(id) = agent.background_task_id() {
+        eprintln!(
+            "background task {id} still running; result will be delivered in the next session's first turn"
+        );
+    }
     Ok(())
 }
 
-async fn repl(mut agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
+fn set_stderr_events(agent: &mut Agent) {
+    agent.set_event_handler(Box::new(|event| match event {
+        AgentEvent::AssistantText(text) => eprintln!("assistant: {}", preview(&text, 500)),
+        AgentEvent::ToolCall { name, arguments } => {
+            eprintln!("tool: {name} {}", preview(&arguments, 200))
+        }
+        AgentEvent::ToolResult { is_error, content } => eprintln!(
+            "  {}: {}",
+            if is_error { "error" } else { "ok" },
+            preview(&content, 500)
+        ),
+        AgentEvent::BackgroundCompleted { id, output } => {
+            eprintln!("background task {id} finished: {}", preview(&output, 500))
+        }
+    }));
+}
+
+async fn run_and_save(
+    agent: &mut Agent,
+    root: &std::path::Path,
+    session: &str,
+    prompt: String,
+) -> anyhow::Result<String> {
+    let result = agent.run(prompt).await;
+    Session::save(root, session, agent.transcript())?;
+    result
+}
+
+async fn repl(mut agent: Agent, root: std::path::PathBuf, session: String) -> anyhow::Result<()> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let stdin = std::io::stdin();
     loop {
         print!("e-agent> ");
         std::io::stdout().flush()?;
         let mut line = String::new();
-        if stdin.read_line(&mut line)? == 0 {
-            break;
+        match stdin.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                eprintln!("e-agent: ignored invalid UTF-8 input");
+                continue;
+            }
+            Err(error) => return Err(error.into()),
         }
         let line = line.trim();
         if line.is_empty() {
@@ -80,16 +142,20 @@ async fn repl(mut agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
         if line == "/exit" || line == "/quit" {
             break;
         }
-        match agent.run(line.to_owned()).await {
+        agent.subscribe(sender.clone());
+        match run_and_save(&mut agent, &root, &session, line.to_owned()).await {
             Ok(answer) => println!("{answer}"),
-            Err(error) => eprintln!("e-agent: {error}"),
+            Err(error) => eprintln!("e-agent: {error:#}"),
+        }
+        while let Ok(AgentEvent::BackgroundCompleted { id, output }) = receiver.try_recv() {
+            eprintln!("background task {id} finished: {}", preview(&output, 500));
         }
     }
     Ok(())
 }
 
-fn next_value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+fn next_value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<String> {
     arguments
         .next()
-        .ok_or_else(|| format!("{flag} requires a value"))
+        .ok_or_else(|| anyhow!("{flag} requires a value"))
 }

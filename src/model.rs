@@ -1,7 +1,8 @@
+use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::agent::{AssistantMessage, Message, Model, ModelError, ToolCall, ToolSpec};
+use crate::agent::{AssistantMessage, Message, Model, ToolCall, ToolSpec, preview};
 
 pub struct OpenAiModel {
     client: reqwest::Client,
@@ -11,9 +12,8 @@ pub struct OpenAiModel {
 }
 
 impl OpenAiModel {
-    pub fn from_env(base_url: Option<String>, model: Option<String>) -> Result<Self, ModelError> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| ModelError("OPENAI_API_KEY is required".into()))?;
+    pub fn from_env(base_url: Option<String>, model: Option<String>) -> anyhow::Result<Self> {
+        let api_key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY is required")?;
         let base_url = base_url
             .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
             .unwrap_or_else(|| "https://api.openai.com/v1".into());
@@ -28,11 +28,11 @@ impl OpenAiModel {
         api_key: String,
         model: String,
         timeout: Duration,
-    ) -> Result<Self, ModelError> {
+    ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
-            .map_err(|error| ModelError(format!("cannot create HTTP client: {error}")))?;
+            .context("cannot create HTTP client")?;
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').into(),
@@ -48,7 +48,7 @@ impl Model for OpenAiModel {
         &mut self,
         messages: &[Message],
         tools: &[ToolSpec],
-    ) -> Result<AssistantMessage, ModelError> {
+    ) -> anyhow::Result<AssistantMessage> {
         let request = ChatRequest::from_internal(&self.model, messages, tools);
         let response = self
             .client
@@ -58,25 +58,24 @@ impl Model for OpenAiModel {
             .send()
             .await
             .map_err(request_error)?;
-        if !response.status().is_success() {
-            return Err(ModelError(format!(
-                "provider returned HTTP {}",
-                response.status()
-            )));
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("provider returned HTTP {status}: {}", preview(&body, 500));
         }
         response
             .json::<ChatResponse>()
             .await
-            .map_err(request_error)?
+            .context("cannot decode provider response")?
             .into_assistant()
     }
 }
 
-fn request_error(error: reqwest::Error) -> ModelError {
+fn request_error(error: reqwest::Error) -> anyhow::Error {
     if error.is_timeout() {
-        ModelError("provider request timed out".into())
+        anyhow!("provider request timed out")
     } else {
-        ModelError(format!("provider request failed: {error}"))
+        anyhow::Error::new(error).context("provider request failed")
     }
 }
 
@@ -130,13 +129,13 @@ impl WireMessage {
             Message::Assistant(message) => Self {
                 role: "assistant",
                 content: message.content.clone(),
-                tool_calls: Some(
+                tool_calls: (!message.tool_calls.is_empty()).then(|| {
                     message
                         .tool_calls
                         .iter()
                         .map(WireToolCall::from_internal)
-                        .collect(),
-                ),
+                        .collect()
+                }),
                 tool_call_id: None,
             },
             Message::Tool {
@@ -216,12 +215,12 @@ struct ResponseMessage {
 }
 
 impl ChatResponse {
-    fn into_assistant(self) -> Result<AssistantMessage, ModelError> {
+    fn into_assistant(self) -> anyhow::Result<AssistantMessage> {
         let message = self
             .choices
             .into_iter()
             .next()
-            .ok_or_else(|| ModelError("provider response has no choices".into()))?
+            .ok_or_else(|| anyhow!("provider response has no choices"))?
             .message;
         Ok(AssistantMessage {
             content: message.content,
@@ -286,6 +285,21 @@ mod tests {
         );
         assert_eq!(value["messages"][1]["content"], "ERROR: not found");
         assert_eq!(value["messages"][1]["tool_call_id"], "call-1");
+    }
+
+    #[test]
+    fn omits_empty_tool_calls_on_plain_assistant_messages() {
+        let request = ChatRequest::from_internal(
+            "test-model",
+            &[Message::Assistant(AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+            })],
+            &[],
+        );
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["messages"][0]["content"], "done");
+        assert!(value["messages"][0].get("tool_calls").is_none());
     }
 
     #[test]
@@ -369,7 +383,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.0.contains("timed out"));
+        assert!(format!("{error:#}").contains("timed out"));
     }
 
     struct FailingTool;

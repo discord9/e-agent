@@ -1,4 +1,6 @@
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -6,7 +8,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use crate::agent::{Tool, ToolSpec};
+use crate::agent::{AgentEvent, Tool, ToolSpec, preview};
 use crate::workspace::Workspace;
 
 const READ_LIMIT: usize = 64 * 1024;
@@ -26,6 +28,7 @@ pub fn builtins(workspace: Workspace) -> Vec<Box<dyn Tool>> {
         Box::new(Bash {
             workspace,
             timeout: Duration::from_secs(30),
+            background: BackgroundTasks::new(Duration::from_secs(30 * 60)),
         }),
     ]
 }
@@ -120,75 +123,174 @@ impl Tool for EditFile {
 struct Bash {
     workspace: Workspace,
     timeout: Duration,
+    background: BackgroundTasks,
 }
 
 #[async_trait]
 impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
-        spec(
-            "bash",
-            "Run a shell command with the workspace as its current directory.",
-            json!({"command": {"type": "string", "description": "shell command"}}),
-        )
+        ToolSpec {
+            name: "bash".into(),
+            description: "Run a shell command with the workspace as its current directory.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "shell command"},
+                    "background": {"type": "boolean", "description": "run without blocking; completion is delivered as an event and injected into the next model turn"}
+                },
+                "required": ["command"]
+            }),
+        }
     }
 
     async fn execute(&self, arguments: Value) -> Result<String, String> {
         let command = required_string(&arguments, "command")?;
-        let mut process = Command::new("/bin/bash");
-        process
-            .arg("-lc")
-            .arg(command)
-            .current_dir(self.workspace.root())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        process.process_group(0);
-        let mut child = process
-            .spawn()
-            .map_err(|error| format!("failed to start shell: {error}"))?;
-        #[cfg(unix)]
-        let process_group = rustix::process::Pid::from_raw(
-            child
-                .id()
-                .ok_or("bash exited before its process group was recorded")? as i32,
-        )
-        .ok_or("bash returned an invalid process id")?;
-        let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
-        let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
-        let result = tokio::time::timeout(self.timeout, async {
-            let (stdout, stderr, status) =
-                tokio::join!(capture(stdout), capture(stderr), child.wait());
-            Ok::<_, std::io::Error>((stdout?, stderr?, status?))
-        })
-        .await;
-        let (stdout, stderr, status) = match result {
-            Ok(result) => result.map_err(|error| format!("shell I/O failed: {error}"))?,
-            Err(_) => {
-                #[cfg(unix)]
-                match rustix::process::kill_process_group(
-                    process_group,
-                    rustix::process::Signal::KILL,
-                ) {
-                    Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-                    Err(error) => {
-                        return Err(format!("failed to kill bash process group: {error}"));
-                    }
-                }
-                #[cfg(not(unix))]
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(format!(
-                    "command timed out after {} seconds",
-                    self.timeout.as_secs_f64()
-                ));
-            }
-        };
-        let text = format_output(status.code(), &stdout, &stderr);
-        if status.success() {
-            Ok(text)
-        } else {
-            Err(text)
+        if optional_bool(&arguments, "background")? {
+            return self
+                .background
+                .start(self.workspace.clone(), command.to_owned());
         }
+        run_bash(&self.workspace, command, self.timeout, None).await
+    }
+
+    fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
+        self.background.sender = Some(sender);
+    }
+}
+
+struct BackgroundTasks {
+    next_id: AtomicU64,
+    running: Arc<AtomicBool>,
+    process_group: Arc<AtomicI32>,
+    sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    timeout: Duration,
+}
+
+impl BackgroundTasks {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            running: Arc::new(AtomicBool::new(false)),
+            process_group: Arc::new(AtomicI32::new(0)),
+            sender: None,
+            timeout,
+        }
+    }
+
+    fn start(&self, workspace: Workspace, command: String) -> Result<String, String> {
+        let sender = self
+            .sender
+            .clone()
+            .ok_or("background task delivery is unavailable")?;
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("a background task is already running".into());
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let started = format!("started background task {id}: {}", preview(&command, 100));
+        let running = self.running.clone();
+        let process_group = self.process_group.clone();
+        let timeout = self.timeout;
+        tokio::spawn(async move {
+            let output = match run_bash(&workspace, &command, timeout, Some(process_group)).await {
+                Ok(output) | Err(output) => output,
+            };
+            running.store(false, Ordering::Release);
+            let _ = sender.send(AgentEvent::BackgroundCompleted { id, output });
+        });
+        Ok(started)
+    }
+}
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(process_group) =
+            rustix::process::Pid::from_raw(self.process_group.load(Ordering::Acquire))
+        {
+            let _ =
+                rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+async fn run_bash(
+    workspace: &Workspace,
+    command: &str,
+    timeout: Duration,
+    process_group_slot: Option<Arc<AtomicI32>>,
+) -> Result<String, String> {
+    let mut process = Command::new("/bin/bash");
+    process
+        .arg("-lc")
+        .arg(command)
+        .current_dir(workspace.root())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    process.process_group(0);
+    let mut child = process
+        .spawn()
+        .map_err(|error| format!("failed to start shell: {error}"))?;
+    #[cfg(unix)]
+    let process_group = rustix::process::Pid::from_raw(
+        child
+            .id()
+            .ok_or("bash exited before its process group was recorded")? as i32,
+    )
+    .ok_or("bash returned an invalid process id")?;
+    #[cfg(unix)]
+    if let Some(slot) = &process_group_slot {
+        slot.store(process_group.as_raw_nonzero().get(), Ordering::Release);
+    }
+    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+    let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
+    let result = tokio::time::timeout(timeout, async {
+        let (stdout, stderr, status) = tokio::join!(capture(stdout), capture(stderr), child.wait());
+        Ok::<_, std::io::Error>((stdout?, stderr?, status?))
+    })
+    .await;
+    let (stdout, stderr, status) = match result {
+        Ok(result) => result.map_err(|error| format!("shell I/O failed: {error}"))?,
+        Err(_) => {
+            #[cfg(unix)]
+            let kill_error = match rustix::process::kill_process_group(
+                process_group,
+                rustix::process::Signal::KILL,
+            ) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => None,
+                Err(error) => Some(error),
+            };
+            #[cfg(unix)]
+            let _ = child.wait().await;
+            #[cfg(not(unix))]
+            let _ = child.kill().await;
+            #[cfg(not(unix))]
+            let _ = child.wait().await;
+            if let Some(slot) = &process_group_slot {
+                slot.store(0, Ordering::Release);
+            }
+            #[cfg(unix)]
+            if let Some(error) = kill_error {
+                return Err(format!("failed to kill bash process group: {error}"));
+            }
+            return Err(format!(
+                "exit code: signal\nstdout:\n\nstderr:\n\n[command timed out after {} seconds]",
+                timeout.as_secs_f64()
+            ));
+        }
+    };
+    if let Some(slot) = &process_group_slot {
+        slot.store(0, Ordering::Release);
+    }
+    let text = format_output(status.code(), &stdout, &stderr);
+    if status.success() {
+        Ok(text)
+    } else {
+        Err(text)
     }
 }
 
@@ -207,6 +309,20 @@ fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, Stri
         .get(name)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("`{name}` must be a string"))
+}
+
+fn optional_bool(arguments: &Value, name: &str) -> Result<bool, String> {
+    arguments
+        .as_object()
+        .ok_or("tool arguments must be a JSON object")?
+        .get(name)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("`{name}` must be a boolean"))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(false))
 }
 
 struct Captured {
@@ -324,6 +440,7 @@ mod tests {
         let tool = Bash {
             workspace: Workspace::new(temp.path()).unwrap(),
             timeout: Duration::from_millis(100),
+            background: BackgroundTasks::new(Duration::from_secs(30 * 60)),
         };
         assert!(
             tool.execute(json!({"command": "sleep 30 & echo $! > child.pid; wait"}))
@@ -339,5 +456,66 @@ mod tests {
             .status()
             .unwrap();
         assert!(!status.success(), "background child survived timeout");
+    }
+
+    fn background_bash(
+        temp: &tempfile::TempDir,
+        timeout: Duration,
+    ) -> (Bash, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut bash = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(30),
+            background: BackgroundTasks::new(timeout),
+        };
+        bash.set_event_sender(sender);
+        (bash, receiver)
+    }
+
+    #[tokio::test]
+    async fn allows_only_one_background_task_at_a_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bash, _) = background_bash(&temp, Duration::from_secs(1));
+        assert!(
+            bash.execute(json!({"command": "sleep 1", "background": true}))
+                .await
+                .unwrap()
+                .starts_with("started background task 1:")
+        );
+        assert!(
+            bash.execute(json!({"command": "true", "background": true}))
+                .await
+                .unwrap_err()
+                .contains("already running")
+        );
+    }
+
+    #[tokio::test]
+    async fn background_timeout_is_delivered_as_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bash, mut receiver) = background_bash(&temp, Duration::from_millis(50));
+        bash.execute(
+            json!({"command": "sleep 30 & echo $! > child.pid; wait", "background": true}),
+        )
+        .await
+        .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            AgentEvent::BackgroundCompleted { output, .. } if output.contains("timed out")
+        ));
+        let pid = std::fs::read_to_string(temp.path().join("child.pid")).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !std::process::Command::new("/bin/kill")
+                .arg("-0")
+                .arg(pid.trim())
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 }
