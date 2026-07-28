@@ -15,8 +15,11 @@ const READ_LIMIT: usize = 64 * 1024;
 const DEFAULT_READ_LINES: usize = 2000;
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
-pub fn builtins(workspace: Workspace) -> Vec<Box<dyn Tool>> {
-    vec![
+/// Built-in tools plus the shared background-task slots, exposed so that
+/// other tools (e.g. delegate) can schedule background work too.
+pub fn builtins(workspace: Workspace) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
+    let background = BackgroundTasks::new(Duration::from_secs(30 * 60));
+    let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(ReadFile {
             workspace: workspace.clone(),
         }),
@@ -29,9 +32,10 @@ pub fn builtins(workspace: Workspace) -> Vec<Box<dyn Tool>> {
         Box::new(Bash {
             workspace,
             timeout: Duration::from_secs(30),
-            background: BackgroundTasks::new(Duration::from_secs(30 * 60)),
+            background: background.clone(),
         }),
-    ]
+    ];
+    (tools, background)
 }
 
 struct ReadFile {
@@ -144,14 +148,16 @@ impl Tool for EditFile {
             return Err("`old` must not be empty".into());
         }
         let content = self.workspace.read_to_string(path)?;
-        let matches = content.match_indices(old).count();
-        if matches != 1 {
+        let count = content.match_indices(old).count();
+        if count != 1 {
             return Err(format!(
-                "expected `old` exactly once, found {matches} occurrences"
+                "expected `old` exactly once, found {count} occurrences"
             ));
         }
+        let start = content.match_indices(old).next().unwrap().0;
+        let line = content[..start].matches('\n').count() + 1;
         self.workspace.write(path, content.replacen(old, new, 1))?;
-        Ok("file edited".into())
+        Ok(format!("file edited (line {line})"))
     }
 }
 
@@ -196,8 +202,9 @@ impl Tool for Bash {
 /// Maximum number of concurrently running background tasks.
 pub const MAX_BACKGROUND: usize = 4;
 
-struct BackgroundTasks {
-    next_id: AtomicU64,
+#[derive(Clone)]
+pub struct BackgroundTasks {
+    next_id: Arc<AtomicU64>,
     slots: Arc<std::sync::Mutex<Vec<Option<BackgroundSlot>>>>,
     sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
     timeout: Duration,
@@ -212,23 +219,50 @@ struct BackgroundSlot {
 impl BackgroundTasks {
     fn new(timeout: Duration) -> Self {
         Self {
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
             slots: Arc::new(std::sync::Mutex::new(vec![None; MAX_BACKGROUND])),
             sender: None,
             timeout,
         }
     }
 
-    fn start(&self, workspace: Workspace, command: String) -> Result<String, String> {
+    /// Start a background bash command. Returns a human-readable "started"
+    /// message containing the task id, or an error if all slots are in use.
+    pub fn start(&self, workspace: Workspace, command: String) -> Result<String, String> {
+        let process_group = Arc::new(AtomicI32::new(0));
+        let pg = process_group.clone();
+        let timeout = self.timeout;
+        self.spawn(preview(&command, 100), Some(process_group), move || {
+            let workspace = workspace.clone();
+            async move {
+                match run_bash(&workspace, &command, timeout, Some(pg)).await {
+                    Ok(output) | Err(output) => output,
+                }
+            }
+        })
+    }
+
+    /// Allocate a slot and spawn a background future. Completion is delivered
+    /// as [`AgentEvent::BackgroundCompleted`]. `process_group` is only used
+    /// for kill-on-drop cleanup; pass `None` for non-process tasks.
+    pub fn spawn<F, Fut>(
+        &self,
+        label: String,
+        process_group: Option<Arc<AtomicI32>>,
+        work: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = String> + Send + 'static,
+    {
         let sender = self
             .sender
             .clone()
             .ok_or("background task delivery is unavailable")?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let process_group = Arc::new(AtomicI32::new(0));
         let slot = BackgroundSlot {
             id,
-            process_group: process_group.clone(),
+            process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),
         };
         {
             let mut slots = self.slots.lock().unwrap();
@@ -240,13 +274,10 @@ impl BackgroundTasks {
             };
             *empty = Some(slot);
         }
-        let started = format!("started background task {id}: {}", preview(&command, 100));
+        let started = format!("started background task {id}: {label}");
         let slots = self.slots.clone();
-        let timeout = self.timeout;
         tokio::spawn(async move {
-            let output = match run_bash(&workspace, &command, timeout, Some(process_group)).await {
-                Ok(output) | Err(output) => output,
-            };
+            let output = work().await;
             slots
                 .lock()
                 .unwrap()
@@ -498,7 +529,10 @@ mod tests {
                 .unwrap_err()
                 .contains("found 2")
         );
-        assert_eq!(edit(&temp, "two", "x").await.unwrap(), "file edited");
+        assert_eq!(
+            edit(&temp, "two", "x").await.unwrap(),
+            "file edited (line 1)"
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), "one x one");
     }
 

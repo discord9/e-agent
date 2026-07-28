@@ -8,6 +8,7 @@ use crate::agent::{
     AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
 };
 
+#[derive(Clone)]
 pub struct OpenAiModel {
     client: reqwest::Client,
     base_url: String,

@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod delegate;
 pub mod mcp;
 pub mod model;
 pub mod session;

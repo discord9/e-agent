@@ -98,6 +98,24 @@ async fn run_inner(
                 {
                     return Ok(());
                 }
+                while let Some(next) = state.next_queued() {
+                    state.push_line(format!("you> {next}"), LineKind::User);
+                    state.follow();
+                    agent.subscribe(sender.clone());
+                    if run_request(
+                        terminal,
+                        agent,
+                        &mut state,
+                        &mut events,
+                        &mut receiver,
+                        (root, session_name, persisted),
+                        next,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                }
             }
             event = events.next() => match event {
             Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
@@ -158,6 +176,24 @@ async fn run_inner(
                     .await?
                     {
                         return Ok(());
+                    }
+                    while let Some(next) = state.next_queued() {
+                        state.push_line(format!("you> {next}"), LineKind::User);
+                        state.follow();
+                        agent.subscribe(sender.clone());
+                        if run_request(
+                            terminal,
+                            agent,
+                            &mut state,
+                            &mut events,
+                            &mut receiver,
+                            (root, session_name, persisted),
+                            next,
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -233,8 +269,14 @@ async fn drive<T>(
                     return Ok((None, Some(Interruption::CancelTurn)));
                 }
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
-                    state.handle_scroll(key);
-                    state.edit_input(key);
+                    if key.code == KeyCode::Enter {
+                        if let Some(prompt) = state.take_input() {
+                            state.queued.push(prompt);
+                        }
+                    } else {
+                        state.handle_scroll(key);
+                        state.edit_input(key);
+                    }
                     draw(terminal, state)?;
                 }
                 Some(Ok(Event::Paste(text))) => {
@@ -260,9 +302,28 @@ fn draw<B: ratatui::backend::Backend>(
             let input_height = (input_rows + 2)
                 .min((usize::from(frame.area().height) / 3).max(3))
                 .max(3) as u16;
-            let [output, input] =
-                Layout::vertical([Constraint::Min(1), Constraint::Length(input_height)])
-                    .areas(frame.area());
+            let queue_height = u16::from(!state.queued.is_empty());
+            let [output, queue_bar, input] = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(queue_height),
+                Constraint::Length(input_height),
+            ])
+            .areas(frame.area());
+            if queue_height == 1 {
+                frame.render_widget(
+                    Paragraph::new(Line::styled(
+                        format!(
+                            "queued ({}): {}",
+                            state.queued.len(),
+                            preview(&state.queued[0], 60)
+                        ),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    )),
+                    queue_bar,
+                );
+            }
             let inner_width = usize::from(output.width).max(1);
             let visual: Vec<Line> = state
                 .lines
@@ -276,6 +337,7 @@ fn draw<B: ratatui::backend::Backend>(
                         LineKind::Added => Style::default().bg(Color::Rgb(20, 60, 20)),
                         LineKind::Removed => Style::default().bg(Color::Rgb(70, 20, 20)),
                         LineKind::User => Style::default().bg(Color::Rgb(45, 45, 60)),
+                        LineKind::ToolCall => Style::default().bg(Color::Rgb(38, 38, 50)),
                     };
                     hard_wrap(&line.text, inner_width)
                         .into_iter()
@@ -334,14 +396,12 @@ fn draw<B: ratatui::backend::Backend>(
                     );
                 }
             }
-            if !state.thinking {
-                frame.set_cursor_position((
-                    input.x + 1 + (cursor_col as u16).min(input.width.saturating_sub(2)),
-                    input.y
-                        + 1
-                        + ((cursor_row - input_scroll) as u16).min(input.height.saturating_sub(2)),
-                ));
-            }
+            frame.set_cursor_position((
+                input.x + 1 + (cursor_col as u16).min(input.width.saturating_sub(2)),
+                input.y
+                    + 1
+                    + ((cursor_row - input_scroll) as u16).min(input.height.saturating_sub(2)),
+            ));
         })
         .map(|_| ())
 }
@@ -401,6 +461,12 @@ struct TuiState {
     streamed: bool,
     active_lane: Option<ActiveStreamLane>,
     tokens: TokenDisplay,
+    /// Prompts submitted while a turn is in flight; drained (never persisted)
+    /// once the current turn ends.
+    queued: Vec<String>,
+    /// Arguments of an in-flight edit_file call, rendered as a numbered diff
+    /// when its result (which carries the line number) arrives.
+    pending_edit: Option<(String, String, String)>,
 }
 
 #[derive(Default)]
@@ -421,6 +487,7 @@ enum LineKind {
     Added,
     Removed,
     User,
+    ToolCall,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -479,14 +546,21 @@ impl TuiState {
             }
             Message::Tool {
                 content, is_error, ..
-            } => self.push_line(
-                format!(
-                    "  {}: {}",
-                    if *is_error { "error" } else { "ok" },
-                    preview(content, 500)
-                ),
-                LineKind::Normal,
-            ),
+            } => self.push_tool_result(content, *is_error),
+        }
+    }
+
+    fn take_input(&mut self) -> Option<String> {
+        let prompt = std::mem::take(&mut self.input.text);
+        self.input.cursor = 0;
+        (!prompt.trim().is_empty()).then_some(prompt)
+    }
+
+    fn next_queued(&mut self) -> Option<String> {
+        if self.queued.is_empty() {
+            None
+        } else {
+            Some(self.queued.remove(0))
         }
     }
 
@@ -515,11 +589,7 @@ impl TuiState {
             | KeyCode::PageDown
             | KeyCode::Home
             | KeyCode::End => self.handle_scroll(key),
-            KeyCode::Enter => {
-                let prompt = std::mem::take(&mut self.input.text);
-                self.input.cursor = 0;
-                return (!prompt.trim().is_empty()).then_some(prompt);
-            }
+            KeyCode::Enter => return self.take_input(),
             _ => self.edit_input(key),
         }
         None
@@ -567,14 +637,9 @@ impl TuiState {
                 }
             }
             AgentEvent::ToolCall { name, arguments } => self.push_tool_call(&name, &arguments),
-            AgentEvent::ToolResult { is_error, content } => self.push_line(
-                format!(
-                    "  {}: {}",
-                    if is_error { "error" } else { "ok" },
-                    preview(&content, 500)
-                ),
-                LineKind::Normal,
-            ),
+            AgentEvent::ToolResult { is_error, content } => {
+                self.push_tool_result(&content, is_error)
+            }
             AgentEvent::BackgroundCompleted { id, output } => self.push_line(
                 format!("background task {id} finished: {}", preview(&output, 500)),
                 LineKind::Normal,
@@ -617,28 +682,57 @@ impl TuiState {
         if name == "edit_file"
             && let Some((path, old, new)) = parse_edit_arguments(arguments)
         {
-            self.push_line(format!("tool: edit_file {path}"), LineKind::Normal);
-            self.push_diff_side(&old, "- ", LineKind::Removed);
-            self.push_diff_side(&new, "+ ", LineKind::Added);
+            self.pending_edit = Some((path.clone(), old, new));
+            self.push_line(format!("tool: edit_file {path}"), LineKind::ToolCall);
             return;
         }
         self.push_line(
             format!("tool: {name} {}", preview(arguments, 200)),
+            LineKind::ToolCall,
+        );
+    }
+
+    fn push_tool_result(&mut self, content: &str, is_error: bool) {
+        if let Some((_, old, new)) = self.pending_edit.take()
+            && !is_error
+        {
+            let line = parse_edited_line(content);
+            self.push_diff_side(&old, "- ", LineKind::Removed, line);
+            self.push_diff_side(&new, "+ ", LineKind::Added, line);
+            return;
+        }
+        self.push_line(
+            format!(
+                "  {}: {}",
+                if is_error { "error" } else { "ok" },
+                preview(content, 500)
+            ),
             LineKind::Normal,
         );
     }
 
-    fn push_diff_side(&mut self, text: &str, prefix: &str, kind: LineKind) {
+    fn push_diff_side(&mut self, text: &str, prefix: &str, kind: LineKind, start: Option<usize>) {
         const DIFF_LINE_LIMIT: usize = 30;
         let mut lines = text.lines();
+        let mut number = start.unwrap_or(0);
         for line in lines.by_ref().take(DIFF_LINE_LIMIT) {
-            self.push_line(format!("{prefix}{line}"), kind);
+            let label = start.map_or_else(String::new, |_| format!("{number:>4} "));
+            self.push_line(format!("{prefix}{label}{line}"), kind);
+            number += 1;
         }
         let remaining = lines.count();
         if remaining > 0 {
             self.push_line(format!("{prefix}… ({remaining} more lines)"), kind);
         }
     }
+}
+
+fn parse_edited_line(content: &str) -> Option<usize> {
+    content
+        .strip_prefix("file edited (line ")?
+        .strip_suffix(')')?
+        .parse()
+        .ok()
 }
 
 fn parse_edit_arguments(arguments: &str) -> Option<(String, String, String)> {
@@ -953,12 +1047,34 @@ mod tests {
     }
 
     #[test]
-    fn edit_file_tool_calls_render_as_a_colored_diff() {
+    fn prompts_submitted_while_thinking_queue_and_drain_in_order() {
+        let mut state = TuiState::default();
+        state.input.insert("first");
+        let first = state.take_input().unwrap();
+        state.queued.push(first);
+        state.input.insert("second");
+        let second = state.take_input().unwrap();
+        state.queued.push(second);
+        assert!(state.input.text.is_empty());
+        assert_eq!(state.next_queued().unwrap(), "first");
+        assert_eq!(state.next_queued().unwrap(), "second");
+        assert!(state.next_queued().is_none());
+    }
+
+    #[test]
+    fn edit_file_tool_calls_render_as_a_numbered_diff_on_result() {
         let mut state = TuiState::default();
         state.push_agent_event(AgentEvent::ToolCall {
             name: "edit_file".into(),
             arguments: r#"{"path":"src/a.rs","old":"fn a() {}\nfn b() {}","new":"fn a() { 1 }"}"#
                 .into(),
+        });
+        assert_eq!(state.lines.len(), 1);
+        assert_eq!(state.lines[0].text, "tool: edit_file src/a.rs");
+        assert_eq!(state.lines[0].kind, LineKind::ToolCall);
+        state.push_agent_event(AgentEvent::ToolResult {
+            is_error: false,
+            content: "file edited (line 7)".into(),
         });
         let lines: Vec<_> = state
             .lines
@@ -968,10 +1084,10 @@ mod tests {
         assert_eq!(
             lines,
             [
-                ("tool: edit_file src/a.rs", LineKind::Normal),
-                ("- fn a() {}", LineKind::Removed),
-                ("- fn b() {}", LineKind::Removed),
-                ("+ fn a() { 1 }", LineKind::Added),
+                ("tool: edit_file src/a.rs", LineKind::ToolCall),
+                ("-    7 fn a() {}", LineKind::Removed),
+                ("-    8 fn b() {}", LineKind::Removed),
+                ("+    7 fn a() { 1 }", LineKind::Added),
             ]
         );
 
@@ -982,6 +1098,7 @@ mod tests {
         });
         assert_eq!(state.lines.len(), 1);
         assert!(state.lines[0].text.starts_with("tool: edit_file not json"));
+        assert_eq!(state.lines[0].kind, LineKind::ToolCall);
     }
 
     #[test]

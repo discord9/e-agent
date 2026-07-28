@@ -2,6 +2,7 @@ use std::io::{IsTerminal, Read, Write};
 
 use anyhow::{Context, anyhow};
 use e_agent::agent::{Agent, AgentEvent, preview};
+use e_agent::delegate::Delegate;
 use e_agent::mcp;
 use e_agent::model::OpenAiModel;
 use e_agent::session::Session;
@@ -69,9 +70,10 @@ async fn run() -> anyhow::Result<()> {
     .context("cannot open workspace")?;
     let root = workspace.root().to_path_buf();
     let model = OpenAiModel::from_env(base_url, model)?;
-    let mut tools = builtins(workspace);
+    let (mut tools, _background) = builtins(workspace.clone());
     let (mcp_tools, mcp_instructions) = mcp::connect_all(&root).await;
     tools.extend(mcp_tools);
+    tools.push(Box::new(Delegate::new(model.clone(), workspace)));
     let mut agent = Agent::new(Box::new(model), tools);
     if !mcp_instructions.is_empty() {
         agent.set_context_prefix(mcp_instructions.join("\n\n"));

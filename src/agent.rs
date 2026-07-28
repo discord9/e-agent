@@ -276,6 +276,11 @@ impl Agent {
         &self.running_background
     }
 
+    /// Names of the registered tools (for tests and diagnostics).
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.iter().map(|tool| tool.spec().name).collect()
+    }
+
     /// Wait for the next background task completion. Used by the TUI to
     /// wake an idle agent. The event is also queued for injection into the
     /// next model call.
@@ -420,7 +425,7 @@ impl Agent {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 });
-                let result = self.execute_call(call).await;
+                let result = Self::execute_on(&self.tools, call).await;
                 if result.is_ok()
                     && call.name == "bash"
                     && is_background_call(call)
@@ -448,10 +453,13 @@ impl Agent {
         anyhow::bail!("tool call limit ({}) reached", self.max_tool_rounds)
     }
 
-    async fn execute_call(&self, call: &ToolCall) -> Result<String, String> {
+    /// Execute a tool call against a tool list. Associated function (not a
+    /// method) so the returned future does not borrow `&self`, keeping
+    /// `Agent::run` futures `Send` for use in `tokio::spawn`.
+    async fn execute_on(tools: &[Box<dyn Tool>], call: &ToolCall) -> Result<String, String> {
         let arguments = serde_json::from_str(&call.arguments)
             .map_err(|error| format!("invalid JSON arguments: {error}"))?;
-        let Some(tool) = self.tools.iter().find(|tool| tool.spec().name == call.name) else {
+        let Some(tool) = tools.iter().find(|tool| tool.spec().name == call.name) else {
             return Err(format!("unknown tool: {}", call.name));
         };
         tool.execute(arguments).await
