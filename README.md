@@ -69,7 +69,8 @@ session. Compaction has no automatic trigger.
 
 Errors print their causal chain (for example `cannot decode provider
 response: error decoding response body: ...`), and provider HTTP failures
-include a preview of the response body.
+include a preview of the response body. Provider requests time out after
+600 seconds in total, since non-streaming reasoning responses can be slow.
 
 ## Non-goals
 

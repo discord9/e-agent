@@ -20,7 +20,7 @@ impl OpenAiModel {
         let model = model
             .or_else(|| std::env::var("OPENAI_MODEL").ok())
             .unwrap_or_else(|| "gpt-4o-mini".into());
-        Self::with_timeout(base_url, api_key, model, Duration::from_secs(60))
+        Self::with_timeout(base_url, api_key, model, Duration::from_secs(600))
     }
 
     fn with_timeout(

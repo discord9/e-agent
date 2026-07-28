@@ -130,6 +130,10 @@ async fn run_request(
                 }
                 event = events.next() => match event {
                     Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press && is_exit(key) => break (None, true),
+                    Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
+                        state.handle_scroll(key);
+                        draw(terminal, state)?;
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => break (Some(Err(error.into())), true),
                     None => break (None, true),
@@ -213,10 +217,9 @@ impl TuiState {
             KeyCode::End => self.input.end(),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
-            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Down => self.scroll = self.scroll.saturating_add(1).min(self.lines.len()),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10).min(self.lines.len()),
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                self.handle_scroll(key)
+            }
             KeyCode::Enter => {
                 let prompt = std::mem::take(&mut self.input.text);
                 self.input.cursor = 0;
@@ -227,7 +230,22 @@ impl TuiState {
         None
     }
 
+    fn handle_scroll(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Down => self.scroll = self.scroll.saturating_add(1).min(self.lines.len()),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10).min(self.lines.len()),
+            _ => {}
+        }
+    }
+
+    fn at_bottom(&self) -> bool {
+        self.scroll >= self.lines.len().saturating_sub(1)
+    }
+
     fn push_agent_event(&mut self, event: AgentEvent) {
+        let at_bottom = self.at_bottom();
         match event {
             AgentEvent::AssistantText(text) => self.lines.push(text),
             AgentEvent::ToolCall { name, arguments } => self
@@ -243,7 +261,9 @@ impl TuiState {
                 preview(&output, 500)
             )),
         }
-        self.follow();
+        if at_bottom {
+            self.follow();
+        }
     }
 
     fn follow(&mut self) {
@@ -331,6 +351,21 @@ mod tests {
         let mut input = InputBuffer::default();
         input.insert("你好a");
         assert_eq!(input.display_width(), 5);
+    }
+
+    #[test]
+    fn new_events_do_not_yank_a_scrolled_up_view() {
+        let mut state = TuiState {
+            lines: vec!["one".into(), "two".into()],
+            ..Default::default()
+        };
+        state.follow();
+        state.scroll = 0;
+        state.push_agent_event(AgentEvent::AssistantText("three".into()));
+        assert_eq!(state.scroll, 0);
+        state.scroll = state.lines.len() - 1;
+        state.push_agent_event(AgentEvent::AssistantText("four".into()));
+        assert_eq!(state.scroll, state.lines.len() - 1);
     }
 
     #[test]
