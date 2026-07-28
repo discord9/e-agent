@@ -549,9 +549,12 @@ impl TuiState {
                 format!("background task {id} finished: {}", preview(&output, 500)),
                 LineKind::Normal,
             ),
-            AgentEvent::Usage { call, session } => {
+            AgentEvent::Usage {
+                context_input,
+                session,
+            } => {
                 self.tokens = TokenDisplay {
-                    context: call.input_tokens,
+                    context: context_input,
                     session,
                 };
             }

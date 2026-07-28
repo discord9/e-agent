@@ -62,9 +62,10 @@ pub enum AgentEvent {
         output: String,
     },
     Usage {
-        /// Tokens of the provider call that just finished; `call.input_tokens`
-        /// approximates the context window currently in use.
-        call: Usage,
+        /// Input tokens of the most recent regular turn, approximating the
+        /// context window currently in use. Compaction calls do not refresh
+        /// this (their input is the pre-compaction context).
+        context_input: u64,
         /// Cumulative tokens for this process.
         session: Usage,
     },
@@ -136,6 +137,7 @@ pub struct Agent {
     running_background: Option<u64>,
     session_input_tokens: u64,
     session_output_tokens: u64,
+    last_context_input: u64,
 }
 
 impl Agent {
@@ -156,6 +158,7 @@ impl Agent {
             running_background: None,
             session_input_tokens: 0,
             session_output_tokens: 0,
+            last_context_input: 0,
         }
     }
 
@@ -259,7 +262,7 @@ impl Agent {
             model.complete(&request, &[], Some(&mut on_delta)).await?
         };
         let (response, usage) = response;
-        self.record_usage(usage);
+        self.record_usage(usage, false);
         let summary = response.content.unwrap_or_default();
         self.history.push(SessionEntry::Compaction {
             summary: summary.clone(),
@@ -272,12 +275,15 @@ impl Agent {
         self.history.push(message.into());
     }
 
-    fn record_usage(&mut self, usage: Option<Usage>) {
+    fn record_usage(&mut self, usage: Option<Usage>, refresh_context: bool) {
         if let Some(usage) = usage {
             self.session_input_tokens += usage.input_tokens;
             self.session_output_tokens += usage.output_tokens;
+            if refresh_context {
+                self.last_context_input = usage.input_tokens;
+            }
             self.emit(AgentEvent::Usage {
-                call: usage,
+                context_input: self.last_context_input,
                 session: Usage {
                     input_tokens: self.session_input_tokens,
                     output_tokens: self.session_output_tokens,
@@ -309,7 +315,7 @@ impl Agent {
                 model.complete(&context, specs, Some(&mut on_delta)).await?
             };
             let (assistant, usage) = assistant;
-            self.record_usage(usage);
+            self.record_usage(usage, true);
             if assistant.tool_calls.is_empty() {
                 let answer = assistant.content.clone().unwrap_or_default();
                 self.push_message(Message::Assistant(assistant));
