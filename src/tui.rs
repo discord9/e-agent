@@ -17,7 +17,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -285,10 +285,13 @@ fn draw(
             let (cursor_row, cursor_col) = state.input.wrapped_cursor(inner_input_width);
             let inner_input_height = usize::from(input.height.saturating_sub(2));
             let input_scroll = cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
+            let input_lines: Vec<Line> = hard_wrap(&state.input.text, inner_input_width)
+                .into_iter()
+                .map(Line::from)
+                .collect();
             frame.render_widget(
-                Paragraph::new(state.input.text.as_str())
+                Paragraph::new(input_lines)
                     .block(input_block)
-                    .wrap(Wrap { trim: false })
                     .scroll((input_scroll.min(u16::MAX as usize) as u16, 0)),
                 input,
             );
@@ -677,9 +680,12 @@ impl InputBuffer {
     }
 
     /// Visual row count of the input at the given cell width, including
-    /// embedded newlines and soft wrapping.
+    /// embedded newlines and soft wrapping. Reserves a row for the cursor
+    /// when the text ends exactly at a row boundary.
     fn visual_rows(&self, width: usize) -> usize {
-        hard_wrap(&self.text, width).len()
+        hard_wrap(&self.text, width)
+            .len()
+            .max(self.wrapped_cursor(width).0 + 1)
     }
 
     /// Cursor position as (row, column) in visual rows/cells.
@@ -714,6 +720,10 @@ mod tests {
         assert_eq!(input.wrapped_cursor(3), (2, 1));
         input.home();
         assert_eq!(input.wrapped_cursor(3), (0, 0));
+        // Exactly full row: reserve one more row so the cursor stays visible.
+        let mut input = InputBuffer::default();
+        input.insert("ab");
+        assert_eq!(input.visual_rows(2), 2);
     }
 
     #[test]
