@@ -67,6 +67,7 @@ impl Model for OpenAiModel {
             anyhow::bail!("provider returned HTTP {status}: {}", preview(&body, 500));
         }
         let mut content = String::new();
+        let mut reasoning = String::new();
         let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
         let mut events = response.bytes_stream().eventsource();
         while let Some(event) = events.next().await {
@@ -89,10 +90,11 @@ impl Model for OpenAiModel {
                         );
                     }
                 }
-                if let Some(delta) = choice.delta.reasoning_content
-                    && let Some(callback) = &mut on_delta
-                {
-                    callback(ModelDeltaKind::Reasoning, &delta);
+                if let Some(delta) = choice.delta.reasoning_content {
+                    reasoning.push_str(&delta);
+                    if let Some(callback) = &mut on_delta {
+                        callback(ModelDeltaKind::Reasoning, &delta);
+                    }
                 }
                 for call in choice.delta.tool_calls.unwrap_or_default() {
                     while tool_calls.len() <= call.index {
@@ -114,11 +116,11 @@ impl Model for OpenAiModel {
                     }
                 }
                 if choice.finish_reason.is_some() {
-                    return build_assistant(content, tool_calls);
+                    return build_assistant(content, reasoning, tool_calls);
                 }
             }
         }
-        build_assistant(content, tool_calls)
+        build_assistant(content, reasoning, tool_calls)
     }
 }
 
@@ -260,6 +262,7 @@ struct AccumulatedToolCall {
 
 fn build_assistant(
     content: String,
+    reasoning: String,
     tool_calls: Vec<AccumulatedToolCall>,
 ) -> anyhow::Result<AssistantMessage> {
     let tool_calls = tool_calls
@@ -278,6 +281,7 @@ fn build_assistant(
     Ok(AssistantMessage {
         content: (!content.is_empty()).then_some(content),
         tool_calls,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
     })
 }
 
@@ -343,6 +347,7 @@ mod tests {
                         name: "read_file".into(),
                         arguments: r#"{"path":"a.txt"}"#.into(),
                     }],
+                    reasoning: None,
                 }),
                 Message::Tool {
                     call_id: "call-1".into(),
@@ -371,6 +376,7 @@ mod tests {
             &[Message::Assistant(AssistantMessage {
                 content: Some("done".into()),
                 tool_calls: vec![],
+                reasoning: None,
             })],
             &[],
         );
@@ -475,8 +481,26 @@ mod tests {
             ]
         );
         assert_eq!(message.content.as_deref(), Some("hello"));
+        assert_eq!(message.reasoning.as_deref(), Some("ignore"));
         assert_eq!(message.tool_calls[0].name, "bash");
         assert_eq!(message.tool_calls[0].arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn wire_messages_never_echo_reasoning() {
+        let request = ChatRequest::from_internal(
+            "test-model",
+            &[Message::Assistant(AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: Some("secret thinking".into()),
+            })],
+            &[],
+        );
+        let value = serde_json::to_value(request).unwrap();
+        let message = &value["messages"][0];
+        assert!(message.get("reasoning").is_none());
+        assert!(message.get("reasoning_content").is_none());
     }
 
     #[tokio::test]

@@ -79,5 +79,5 @@ automatic compaction trigger, database, event store, subagent
 framework, permission framework, MCP/plugin host, multi-provider client,
 parallel tool executor, task scheduler, priority system, or concurrency pool.
 It has one model seam, one tool seam, and a configurable tool-round limit
-(default 32). Reasoning-model `reasoning_content` is display-only; it is never
-persisted in a transcript/session or sent back to the API.
+(default 32). Reasoning-model `reasoning_content` is persisted in the session
+for display/audit; it is never sent back to the API.

@@ -75,9 +75,16 @@ mod tests {
     fn round_trips_messages_and_missing_session_is_empty() {
         let temp = tempfile::tempdir().unwrap();
         assert!(Session::load(temp.path(), "missing").unwrap().is_empty());
-        let messages = vec![Message::User {
-            content: "hello".into(),
-        }];
+        let messages = vec![
+            Message::User {
+                content: "hello".into(),
+            },
+            Message::Assistant(crate::agent::AssistantMessage {
+                content: Some("answer".into()),
+                tool_calls: vec![],
+                reasoning: Some("thinking".into()),
+            }),
+        ];
         Session::save(temp.path(), "work", &messages).unwrap();
         assert_eq!(Session::load(temp.path(), "work").unwrap(), messages);
     }

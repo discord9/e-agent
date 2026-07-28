@@ -25,6 +25,10 @@ pub enum Message {
 pub struct AssistantMessage {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Model reasoning, persisted for display/audit only. Never sent back
+    /// to the provider (see WireMessage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -433,11 +437,13 @@ mod tests {
                 return Ok(AssistantMessage {
                     content: Some("streamed".into()),
                     tool_calls: vec![call("call-1", "echo", r#"{"value":"ok"}"#)],
+                    reasoning: None,
                 });
             }
             Ok(AssistantMessage {
                 content: Some("final".into()),
                 tool_calls: vec![],
+                reasoning: None,
             })
         }
     }
@@ -458,10 +464,12 @@ mod tests {
                 AssistantMessage {
                     content: None,
                     tool_calls: vec![call("call-1", "echo", r#"{"value":"ok"}"#)],
+                    reasoning: None,
                 },
                 AssistantMessage {
                     content: Some("final answer".into()),
                     tool_calls: vec![],
+                    reasoning: None,
                 },
             ],
             requests: requests.clone(),
@@ -490,10 +498,12 @@ mod tests {
                 AssistantMessage {
                     content: Some("first".into()),
                     tool_calls: vec![],
+                    reasoning: None,
                 },
                 AssistantMessage {
                     content: Some("second".into()),
                     tool_calls: vec![],
+                    reasoning: None,
                 },
             ],
             requests: requests.clone(),
@@ -527,14 +537,17 @@ mod tests {
                 AssistantMessage {
                     content: None,
                     tool_calls: vec![call("bad-json", "fail", "not json")],
+                    reasoning: None,
                 },
                 AssistantMessage {
                     content: None,
                     tool_calls: vec![call("failed", "fail", "{}")],
+                    reasoning: None,
                 },
                 AssistantMessage {
                     content: Some("recovered".into()),
                     tool_calls: vec![],
+                    reasoning: None,
                 },
             ],
             requests: requests.clone(),
@@ -561,10 +574,12 @@ mod tests {
                 AssistantMessage {
                     content: Some("working".into()),
                     tool_calls: vec![call("call-1", "echo", r#"{"value":"ok"}"#)],
+                    reasoning: None,
                 },
                 AssistantMessage {
                     content: Some("final".into()),
                     tool_calls: vec![],
+                    reasoning: None,
                 },
             ],
             requests,
@@ -631,14 +646,17 @@ mod tests {
                         "bash",
                         r#"{"command":"echo done","background":true}"#,
                     )],
+                    reasoning: None,
                 },
                 AssistantMessage {
                     content: Some("started".into()),
                     tool_calls: vec![],
+                    reasoning: None,
                 },
                 AssistantMessage {
                     content: Some("next".into()),
                     tool_calls: vec![],
+                    reasoning: None,
                 },
             ],
             requests: requests.clone(),
@@ -683,14 +701,17 @@ mod tests {
                         "bash",
                         r#"{"command":"echo done","background":true}"#,
                     )],
+                    reasoning: None,
                 },
                 AssistantMessage {
                     content: None,
                     tool_calls: vec![call("call-2", "slow_echo", r#"{"value":"ok"}"#)],
+                    reasoning: None,
                 },
                 AssistantMessage {
                     content: Some("done".into()),
                     tool_calls: vec![],
+                    reasoning: None,
                 },
             ],
             requests: requests.clone(),
@@ -719,6 +740,7 @@ mod tests {
             replies: vec![AssistantMessage {
                 content: Some("summary text".into()),
                 tool_calls: vec![],
+                reasoning: None,
             }],
             requests: requests.clone(),
         };
@@ -730,6 +752,7 @@ mod tests {
             Message::Assistant(AssistantMessage {
                 content: Some("noted".into()),
                 tool_calls: vec![],
+                reasoning: None,
             }),
             Message::User {
                 content: "recent request".into(),
@@ -737,6 +760,7 @@ mod tests {
             Message::Assistant(AssistantMessage {
                 content: Some("recent answer".into()),
                 tool_calls: vec![],
+                reasoning: None,
             }),
         ];
         let mut transcript = vec![
@@ -746,6 +770,7 @@ mod tests {
             Message::Assistant(AssistantMessage {
                 content: None,
                 tool_calls: vec![tool_call.clone()],
+                reasoning: None,
             }),
             Message::Tool {
                 call_id: tool_call.id,

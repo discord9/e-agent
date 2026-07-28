@@ -61,7 +61,7 @@ async fn run_inner(
     let mut events = EventStream::new();
     let mut state = TuiState::from_transcript(agent.transcript());
     loop {
-        draw(terminal, &state)?;
+        draw(terminal, &mut state)?;
         match events.next().await {
             Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
                 if is_exit(key) {
@@ -70,7 +70,7 @@ async fn run_inner(
                 if let Some(prompt) = state.handle_key(key) {
                     if prompt == "/compact" {
                         state.thinking = true;
-                        draw(terminal, &state)?;
+                        draw(terminal, &mut state)?;
                         let result = agent.compact().await;
                         state.thinking = false;
                         match result {
@@ -159,33 +159,41 @@ async fn run_request(
     Ok(exit)
 }
 
-fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &TuiState) -> io::Result<()> {
+fn draw(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &mut TuiState,
+) -> io::Result<()> {
     terminal
         .draw(|frame| {
             let [output, input] =
                 Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(frame.area());
+            let paragraph = Paragraph::new(
+                state
+                    .lines
+                    .iter()
+                    .flat_map(|line| {
+                        let style = if line.dim {
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM)
+                        } else {
+                            Style::default()
+                        };
+                        line.text
+                            .split('\n')
+                            .map(move |segment| Line::styled(segment, style))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .block(Block::default().borders(Borders::ALL).title("e-agent"))
+            .wrap(Wrap { trim: false });
+            let width = output.width.saturating_sub(2);
+            let height = usize::from(output.height.saturating_sub(2));
+            let max_scroll = wrapped_rows(&state.lines, width).saturating_sub(height);
+            state.max_scroll = max_scroll;
+            state.scroll = state.scroll.min(max_scroll);
             frame.render_widget(
-                Paragraph::new(
-                    state
-                        .lines
-                        .iter()
-                        .map(|line| {
-                            Line::styled(
-                                line.text.as_str(),
-                                if line.dim {
-                                    Style::default()
-                                        .fg(Color::DarkGray)
-                                        .add_modifier(Modifier::DIM)
-                                } else {
-                                    Style::default()
-                                },
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .block(Block::default().borders(Borders::ALL).title("e-agent"))
-                .wrap(Wrap { trim: false })
-                .scroll((state.scroll.min(u16::MAX as usize) as u16, 0)),
+                paragraph.scroll((state.scroll.min(u16::MAX as usize) as u16, 0)),
                 output,
             );
             let title = if state.thinking {
@@ -214,11 +222,26 @@ fn is_exit(key: KeyEvent) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
+/// Approximate rendered rows for the scrollback. Each entry is split on
+/// embedded newlines first; every visual segment then occupies at least one
+/// row. Word-wrapping slack can make the real total slightly larger, so this
+/// estimate errs on the high side (blank rows at the bottom are acceptable;
+/// hidden content is not).
+fn wrapped_rows(lines: &[DisplayLine], width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .flat_map(|line| line.text.split('\n'))
+        .map(|segment| UnicodeWidthStr::width(segment) / width + 1)
+        .sum()
+}
+
 #[derive(Default)]
 struct TuiState {
     input: InputBuffer,
     lines: Vec<DisplayLine>,
     scroll: usize,
+    max_scroll: usize,
     thinking: bool,
     streamed: bool,
     active_lane: Option<ActiveStreamLane>,
@@ -241,9 +264,20 @@ impl TuiState {
         for message in messages {
             match message {
                 Message::User { content } => {
-                    state.push_line(format!("you> {content}"), false);
+                    if content.starts_with("[compacted summary of earlier conversation]")
+                        || content.starts_with("[background task ")
+                    {
+                        state.push_line(content.clone(), true);
+                    } else {
+                        state.push_line(format!("you> {content}"), false);
+                    }
                 }
                 Message::Assistant(message) => {
+                    if let Some(reasoning) =
+                        message.reasoning.as_deref().filter(|text| !text.is_empty())
+                    {
+                        state.push_line(format!("thinking: {}", preview(reasoning, 1000)), true);
+                    }
                     if let Some(content) =
                         message.content.as_deref().filter(|text| !text.is_empty())
                     {
@@ -301,15 +335,15 @@ impl TuiState {
     fn handle_scroll(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Down => self.scroll = self.scroll.saturating_add(1).min(self.lines.len()),
+            KeyCode::Down => self.scroll = self.scroll.saturating_add(1).min(self.max_scroll),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10).min(self.lines.len()),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10).min(self.max_scroll),
             _ => {}
         }
     }
 
     fn at_bottom(&self) -> bool {
-        self.scroll >= self.lines.len().saturating_sub(1)
+        self.scroll >= self.max_scroll
     }
 
     fn push_agent_event(&mut self, event: AgentEvent) {
@@ -363,7 +397,8 @@ impl TuiState {
     }
 
     fn follow(&mut self) {
-        self.scroll = self.lines.len().saturating_sub(1);
+        // Clamped to the real bottom (wrapped rows minus viewport) in draw().
+        self.scroll = usize::MAX;
     }
 
     fn push_final_answer(&mut self, answer: String) {
@@ -488,6 +523,7 @@ mod tests {
                     name: "read_file".into(),
                     arguments: r#"{"path":"README.md"}"#.into(),
                 }],
+                reasoning: None,
             }),
             Message::Tool {
                 call_id: "call-1".into(),
@@ -498,6 +534,7 @@ mod tests {
             Message::Assistant(crate::agent::AssistantMessage {
                 content: Some("done".into()),
                 tool_calls: vec![],
+                reasoning: None,
             }),
         ];
         let state = TuiState::from_transcript(&messages);
@@ -512,7 +549,7 @@ mod tests {
                 "done",
             ]
         );
-        assert_eq!(state.scroll, state.lines.len() - 1);
+        assert_eq!(state.scroll, usize::MAX);
     }
 
     #[test]
@@ -528,15 +565,15 @@ mod tests {
                     dim: false,
                 },
             ],
+            max_scroll: 2,
             ..Default::default()
         };
-        state.follow();
         state.scroll = 0;
         state.push_agent_event(AgentEvent::AssistantText("three".into()));
         assert_eq!(state.scroll, 0);
-        state.scroll = state.lines.len() - 1;
+        state.scroll = state.max_scroll;
         state.push_agent_event(AgentEvent::AssistantText("four".into()));
-        assert_eq!(state.scroll, state.lines.len() - 1);
+        assert_eq!(state.scroll, usize::MAX);
     }
 
     #[test]
@@ -552,6 +589,7 @@ mod tests {
                     dim: false,
                 },
             ],
+            max_scroll: 2,
             ..Default::default()
         };
         state.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
@@ -561,6 +599,47 @@ mod tests {
             content: "done".into(),
         });
         assert_eq!(state.lines.last().unwrap().text, "  ok: done");
-        assert_eq!(state.scroll, 2);
+        assert_eq!(state.scroll, usize::MAX);
+    }
+
+    #[test]
+    fn wrapped_rows_counts_embedded_newlines_and_wrapping() {
+        let lines = vec![
+            DisplayLine {
+                text: "short".into(),
+                dim: false,
+            },
+            DisplayLine {
+                text: "one\ntwo\nthree".into(),
+                dim: false,
+            },
+            DisplayLine {
+                text: "x".repeat(25),
+                dim: false,
+            },
+        ];
+        // 1 + 3 + ceil(25/10)+1 hard-wrap estimate
+        assert_eq!(wrapped_rows(&lines, 10), 1 + 3 + 3);
+    }
+
+    #[test]
+    fn replay_marks_internal_messages_and_reasoning_dim() {
+        let messages = vec![
+            Message::User {
+                content: "[background task 1 completed]\nexit code: 0".into(),
+            },
+            Message::Assistant(crate::agent::AssistantMessage {
+                content: Some("answer".into()),
+                tool_calls: vec![],
+                reasoning: Some("plan".into()),
+            }),
+        ];
+        let state = TuiState::from_transcript(&messages);
+        assert_eq!(state.lines.len(), 3);
+        assert!(state.lines[0].dim);
+        assert_eq!(state.lines[1].text, "thinking: plan");
+        assert!(state.lines[1].dim);
+        assert_eq!(state.lines[2].text, "answer");
+        assert!(!state.lines[2].dim);
     }
 }
