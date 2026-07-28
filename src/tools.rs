@@ -226,6 +226,12 @@ impl BackgroundTasks {
         }
     }
 
+    /// Set the channel used to deliver background completions. Called by the
+    /// agent for tools that hold a shared clone of these slots.
+    pub fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
+        self.sender = Some(sender);
+    }
+
     /// Start a background bash command. Returns a human-readable "started"
     /// message containing the task id, or an error if all slots are in use.
     pub fn start(&self, workspace: Workspace, command: String) -> Result<String, String> {

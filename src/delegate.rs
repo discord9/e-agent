@@ -20,11 +20,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent, Tool, ToolSpec, preview};
 use crate::model::OpenAiModel;
-use crate::tools::builtins;
+use crate::tools::{BackgroundTasks, builtins};
 use crate::workspace::Workspace;
 
 /// Maximum rounds a subagent may take before giving up.
@@ -35,15 +34,17 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub struct Delegate {
     model: OpenAiModel,
     workspace: Workspace,
-    sender: Option<mpsc::UnboundedSender<AgentEvent>>,
+    /// Shared background slots (with bash): a background delegate occupies
+    /// one slot and its completion is delivered as a background completion.
+    background: BackgroundTasks,
 }
 
 impl Delegate {
-    pub fn new(model: OpenAiModel, workspace: Workspace) -> Self {
+    pub fn new(model: OpenAiModel, workspace: Workspace, background: BackgroundTasks) -> Self {
         Self {
             model,
             workspace,
-            sender: None,
+            background,
         }
     }
 
@@ -114,21 +115,16 @@ impl Tool for Delegate {
             .unwrap_or(false);
 
         if background {
-            let sender = self
-                .sender
-                .clone()
-                .ok_or("background delegate delivery is unavailable")?;
             let model = self.model.clone();
             let workspace = self.workspace.clone();
             let label = preview(&task, 100);
-            // Reuse the next background id for a consistent user-facing label.
-            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
-            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            std::thread::spawn(move || {
-                let output = Self::run_on_thread(model, workspace, task);
-                let _ = sender.send(AgentEvent::BackgroundCompleted { id, output });
+            // run_on_thread blocks on thread::join, so push it onto the
+            // blocking thread pool to keep the executor responsive.
+            return self.background.spawn(label, None, move || async move {
+                tokio::task::spawn_blocking(move || Self::run_on_thread(model, workspace, task))
+                    .await
+                    .unwrap_or_else(|error| format!("subagent blocking task failed: {error}"))
             });
-            return Ok(format!("started background task {id}: {label}"));
         }
 
         let model = self.model.clone();
@@ -142,8 +138,8 @@ impl Tool for Delegate {
         }
     }
 
-    fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
-        self.sender = Some(sender);
+    fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
+        self.background.set_event_sender(sender);
     }
 }
 
@@ -154,7 +150,8 @@ mod tests {
     fn delegate(workspace: &std::path::Path) -> Delegate {
         let workspace = Workspace::new(workspace).unwrap();
         let model = OpenAiModel::from_env(None, None).unwrap();
-        Delegate::new(model, workspace)
+        let (_, background) = builtins(workspace.clone());
+        Delegate::new(model, workspace, background)
     }
 
     #[tokio::test]
@@ -179,7 +176,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_requires_event_sender() {
+    async fn background_fails_without_event_sender() {
+        // BackgroundTasks without set_event_sender cannot deliver results.
         let temp = tempfile::tempdir().unwrap();
         let delegate = delegate(temp.path());
         assert!(

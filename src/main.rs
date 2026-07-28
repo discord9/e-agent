@@ -70,10 +70,14 @@ async fn run() -> anyhow::Result<()> {
     .context("cannot open workspace")?;
     let root = workspace.root().to_path_buf();
     let model = OpenAiModel::from_env(base_url, model)?;
-    let (mut tools, _background) = builtins(workspace.clone());
+    let (mut tools, background) = builtins(workspace.clone());
     let (mcp_tools, mcp_instructions) = mcp::connect_all(&root).await;
     tools.extend(mcp_tools);
-    tools.push(Box::new(Delegate::new(model.clone(), workspace)));
+    tools.push(Box::new(Delegate::new(
+        model.clone(),
+        workspace,
+        background,
+    )));
     let mut agent = Agent::new(Box::new(model), tools);
     if !mcp_instructions.is_empty() {
         agent.set_context_prefix(mcp_instructions.join("\n\n"));
