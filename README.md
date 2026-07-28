@@ -19,7 +19,7 @@ an interactive TUI (scrollback plus an input line with proper Unicode editing);
 use `--repl` for a plain line-based REPL instead. If stdin is piped, the prompt
 is read from standard input. Sessions persist to
 `.e-agent/sessions/<name>.json` in the workspace (default name `default`) and
-are restored on startup. Optional CLI overrides are `--base-url URL`,
+are restored and replayed in the TUI on startup. Optional CLI overrides are `--base-url URL`,
 `--model MODEL`, `--workspace PATH`, `--session NAME`, and `--max-rounds N`.
 
 The available tools are `read_file`, `write_file`, `edit_file`, and `bash`.

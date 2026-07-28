@@ -20,7 +20,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
-use crate::agent::{Agent, AgentEvent, preview};
+use crate::agent::{Agent, AgentEvent, Message, preview};
 use crate::session::Session;
 
 pub async fn run(mut agent: Agent, root: PathBuf, session_name: String) -> anyhow::Result<()> {
@@ -59,7 +59,7 @@ async fn run_inner(
         let _ = event_sender.send(event);
     }));
     let mut events = EventStream::new();
-    let mut state = TuiState::default();
+    let mut state = TuiState::from_transcript(agent.transcript());
     loop {
         draw(terminal, &state)?;
         match events.next().await {
@@ -236,6 +236,42 @@ enum ActiveStreamLane {
 }
 
 impl TuiState {
+    fn from_transcript(messages: &[Message]) -> Self {
+        let mut state = Self::default();
+        for message in messages {
+            match message {
+                Message::User { content } => {
+                    state.push_line(format!("you> {content}"), false);
+                }
+                Message::Assistant(message) => {
+                    if let Some(content) =
+                        message.content.as_deref().filter(|text| !text.is_empty())
+                    {
+                        state.push_line(content.to_owned(), false);
+                    }
+                    for call in &message.tool_calls {
+                        state.push_line(
+                            format!("tool: {} {}", call.name, preview(&call.arguments, 200)),
+                            false,
+                        );
+                    }
+                }
+                Message::Tool {
+                    content, is_error, ..
+                } => state.push_line(
+                    format!(
+                        "  {}: {}",
+                        if *is_error { "error" } else { "ok" },
+                        preview(content, 500)
+                    ),
+                    false,
+                ),
+            }
+        }
+        state.follow();
+        state
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
         match key.code {
             KeyCode::Char(character)
@@ -437,6 +473,46 @@ mod tests {
         assert!(state.lines[0].dim);
         assert_eq!(state.lines[1].text, "hello");
         assert!(!state.lines[1].dim);
+    }
+
+    #[test]
+    fn restored_transcript_is_replayed_as_tui_lines() {
+        let messages = vec![
+            Message::User {
+                content: "hello".into(),
+            },
+            Message::Assistant(crate::agent::AssistantMessage {
+                content: Some("checking".into()),
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                }],
+            }),
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "read_file".into(),
+                content: "contents".into(),
+                is_error: false,
+            },
+            Message::Assistant(crate::agent::AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+            }),
+        ];
+        let state = TuiState::from_transcript(&messages);
+        let lines: Vec<_> = state.lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "you> hello",
+                "checking",
+                r#"tool: read_file {"path":"README.md"}"#,
+                "  ok: contents",
+                "done",
+            ]
+        );
+        assert_eq!(state.scroll, state.lines.len() - 1);
     }
 
     #[test]
