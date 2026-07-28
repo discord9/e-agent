@@ -74,15 +74,19 @@ async fn run_inner(
                         let result = agent.compact().await;
                         state.thinking = false;
                         match result {
-                            Ok(summary) => state
-                                .push_line(format!("compacted: {}", preview(&summary, 500)), false),
-                            Err(error) => state.push_line(format!("error: {error:#}"), false),
+                            Ok(summary) => state.push_line(
+                                format!("compacted: {}", preview(&summary, 500)),
+                                LineKind::Normal,
+                            ),
+                            Err(error) => {
+                                state.push_line(format!("error: {error:#}"), LineKind::Normal)
+                            }
                         }
                         Session::save(root, session_name, agent.transcript())?;
                         state.follow();
                         continue;
                     }
-                    state.push_line(format!("you> {prompt}"), false);
+                    state.push_line(format!("you> {prompt}"), LineKind::Normal);
                     state.follow();
                     agent.subscribe(sender.clone());
                     if run_request(
@@ -150,7 +154,7 @@ async fn run_request(
     if let Some(result) = result {
         match result {
             Ok(answer) => state.push_final_answer(answer),
-            Err(error) => state.push_line(format!("error: {error:#}"), false),
+            Err(error) => state.push_line(format!("error: {error:#}"), LineKind::Normal),
         }
     }
     Session::save(session.0, session.1, agent.transcript())?;
@@ -172,12 +176,13 @@ fn draw(
                 .lines
                 .iter()
                 .flat_map(|line| {
-                    let style = if line.dim {
-                        Style::default()
+                    let style = match line.kind {
+                        LineKind::Normal => Style::default(),
+                        LineKind::Dim => Style::default()
                             .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM)
-                    } else {
-                        Style::default()
+                            .add_modifier(Modifier::DIM),
+                        LineKind::Added => Style::default().bg(Color::Rgb(20, 60, 20)),
+                        LineKind::Removed => Style::default().bg(Color::Rgb(70, 20, 20)),
                     };
                     hard_wrap(&line.text, inner_width)
                         .into_iter()
@@ -265,7 +270,15 @@ struct TuiState {
 
 struct DisplayLine {
     text: String,
-    dim: bool,
+    kind: LineKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineKind {
+    Normal,
+    Dim,
+    Added,
+    Removed,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -281,29 +294,29 @@ impl TuiState {
             match message {
                 Message::User { content } => {
                     if content.starts_with("[compacted summary of earlier conversation]") {
-                        state.push_line(content.clone(), false);
+                        state.push_line(content.clone(), LineKind::Normal);
                     } else if content.starts_with("[background task ") {
-                        state.push_line(content.clone(), true);
+                        state.push_line(content.clone(), LineKind::Dim);
                     } else {
-                        state.push_line(format!("you> {content}"), false);
+                        state.push_line(format!("you> {content}"), LineKind::Normal);
                     }
                 }
                 Message::Assistant(message) => {
                     if let Some(reasoning) =
                         message.reasoning.as_deref().filter(|text| !text.is_empty())
                     {
-                        state.push_line(format!("thinking: {}", preview(reasoning, 1000)), true);
+                        state.push_line(
+                            format!("thinking: {}", preview(reasoning, 1000)),
+                            LineKind::Dim,
+                        );
                     }
                     if let Some(content) =
                         message.content.as_deref().filter(|text| !text.is_empty())
                     {
-                        state.push_line(content.to_owned(), false);
+                        state.push_line(content.to_owned(), LineKind::Normal);
                     }
                     for call in &message.tool_calls {
-                        state.push_line(
-                            format!("tool: {} {}", call.name, preview(&call.arguments, 200)),
-                            false,
-                        );
+                        state.push_tool_call(&call.name, &call.arguments);
                     }
                 }
                 Message::Tool {
@@ -314,7 +327,7 @@ impl TuiState {
                         if *is_error { "error" } else { "ok" },
                         preview(content, 500)
                     ),
-                    false,
+                    LineKind::Normal,
                 ),
             }
         }
@@ -374,12 +387,12 @@ impl TuiState {
             AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
         );
         match event {
-            AgentEvent::AssistantText(text) => self.push_line(text, false),
+            AgentEvent::AssistantText(text) => self.push_line(text, LineKind::Normal),
             AgentEvent::AssistantDelta(text) => {
                 if self.active_lane == Some(ActiveStreamLane::Content) {
                     self.lines.last_mut().unwrap().text.push_str(&text);
                 } else {
-                    self.push_line(text, false);
+                    self.push_line(text, LineKind::Normal);
                     self.streamed = true;
                     self.active_lane = Some(ActiveStreamLane::Content);
                 }
@@ -388,24 +401,22 @@ impl TuiState {
                 if self.active_lane == Some(ActiveStreamLane::Reasoning) {
                     self.lines.last_mut().unwrap().text.push_str(&text);
                 } else {
-                    self.push_line(format!("thinking: {text}"), true);
+                    self.push_line(format!("thinking: {text}"), LineKind::Dim);
                     self.active_lane = Some(ActiveStreamLane::Reasoning);
                 }
             }
-            AgentEvent::ToolCall { name, arguments } => {
-                self.push_line(format!("tool: {name} {}", preview(&arguments, 200)), false)
-            }
+            AgentEvent::ToolCall { name, arguments } => self.push_tool_call(&name, &arguments),
             AgentEvent::ToolResult { is_error, content } => self.push_line(
                 format!(
                     "  {}: {}",
                     if is_error { "error" } else { "ok" },
                     preview(&content, 500)
                 ),
-                false,
+                LineKind::Normal,
             ),
             AgentEvent::BackgroundCompleted { id, output } => self.push_line(
                 format!("background task {id} finished: {}", preview(&output, 500)),
-                false,
+                LineKind::Normal,
             ),
         }
         if ends_delta {
@@ -424,14 +435,49 @@ impl TuiState {
 
     fn push_final_answer(&mut self, answer: String) {
         if !self.streamed {
-            self.push_line(answer, false);
+            self.push_line(answer, LineKind::Normal);
         }
     }
 
-    fn push_line(&mut self, text: String, dim: bool) {
-        self.lines.push(DisplayLine { text, dim });
-        self.active_lane = None;
+    fn push_line(&mut self, text: String, kind: LineKind) {
+        self.lines.push(DisplayLine { text, kind });
     }
+
+    fn push_tool_call(&mut self, name: &str, arguments: &str) {
+        if name == "edit_file"
+            && let Some((path, old, new)) = parse_edit_arguments(arguments)
+        {
+            self.push_line(format!("tool: edit_file {path}"), LineKind::Normal);
+            self.push_diff_side(&old, "- ", LineKind::Removed);
+            self.push_diff_side(&new, "+ ", LineKind::Added);
+            return;
+        }
+        self.push_line(
+            format!("tool: {name} {}", preview(arguments, 200)),
+            LineKind::Normal,
+        );
+    }
+
+    fn push_diff_side(&mut self, text: &str, prefix: &str, kind: LineKind) {
+        const DIFF_LINE_LIMIT: usize = 30;
+        let mut lines = text.lines();
+        for line in lines.by_ref().take(DIFF_LINE_LIMIT) {
+            self.push_line(format!("{prefix}{line}"), kind);
+        }
+        let remaining = lines.count();
+        if remaining > 0 {
+            self.push_line(format!("{prefix}… ({remaining} more lines)"), kind);
+        }
+    }
+}
+
+fn parse_edit_arguments(arguments: &str) -> Option<(String, String, String)> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    Some((
+        value.get("path")?.as_str()?.to_owned(),
+        value.get("old")?.as_str()?.to_owned(),
+        value.get("new")?.as_str()?.to_owned(),
+    ))
 }
 
 #[derive(Default)]
@@ -526,9 +572,9 @@ mod tests {
         state.push_final_answer("hello".into());
         assert_eq!(state.lines.len(), 2);
         assert_eq!(state.lines[0].text, "thinking: plan more");
-        assert!(state.lines[0].dim);
+        assert_eq!(state.lines[0].kind, LineKind::Dim);
         assert_eq!(state.lines[1].text, "hello");
-        assert!(!state.lines[1].dim);
+        assert_eq!(state.lines[1].kind, LineKind::Normal);
     }
 
     #[test]
@@ -579,11 +625,11 @@ mod tests {
             lines: vec![
                 DisplayLine {
                     text: "one".into(),
-                    dim: false,
+                    kind: LineKind::Normal,
                 },
                 DisplayLine {
                     text: "two".into(),
-                    dim: false,
+                    kind: LineKind::Normal,
                 },
             ],
             max_scroll: 2,
@@ -603,11 +649,11 @@ mod tests {
             lines: vec![
                 DisplayLine {
                     text: "one".into(),
-                    dim: false,
+                    kind: LineKind::Normal,
                 },
                 DisplayLine {
                     text: "two".into(),
-                    dim: false,
+                    kind: LineKind::Normal,
                 },
             ],
             max_scroll: 42,
@@ -631,11 +677,11 @@ mod tests {
             lines: vec![
                 DisplayLine {
                     text: "one".into(),
-                    dim: false,
+                    kind: LineKind::Normal,
                 },
                 DisplayLine {
                     text: "two".into(),
-                    dim: false,
+                    kind: LineKind::Normal,
                 },
             ],
             max_scroll: 2,
@@ -656,25 +702,57 @@ mod tests {
         let lines = vec![
             DisplayLine {
                 text: "short".into(),
-                dim: false,
+                kind: LineKind::Normal,
             },
             DisplayLine {
                 text: "one\ntwo\nthree".into(),
-                dim: false,
+                kind: LineKind::Normal,
             },
             DisplayLine {
                 text: "x".repeat(25),
-                dim: false,
+                kind: LineKind::Normal,
             },
         ];
         // 1 + 3 + exact hard wrap of 25 cells at width 10
         assert_eq!(wrapped_rows(&lines, 10), 1 + 3 + 3);
         let cjk = vec![DisplayLine {
             text: "你好世界".into(),
-            dim: false,
+            kind: LineKind::Normal,
         }];
         // Each CJK char is 2 cells: "你好" then "世界" at width 5.
         assert_eq!(wrapped_rows(&cjk, 5), 2);
+    }
+
+    #[test]
+    fn edit_file_tool_calls_render_as_a_colored_diff() {
+        let mut state = TuiState::default();
+        state.push_agent_event(AgentEvent::ToolCall {
+            name: "edit_file".into(),
+            arguments: r#"{"path":"src/a.rs","old":"fn a() {}\nfn b() {}","new":"fn a() { 1 }"}"#
+                .into(),
+        });
+        let lines: Vec<_> = state
+            .lines
+            .iter()
+            .map(|line| (line.text.as_str(), line.kind))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("tool: edit_file src/a.rs", LineKind::Normal),
+                ("- fn a() {}", LineKind::Removed),
+                ("- fn b() {}", LineKind::Removed),
+                ("+ fn a() { 1 }", LineKind::Added),
+            ]
+        );
+
+        let mut state = TuiState::default();
+        state.push_agent_event(AgentEvent::ToolCall {
+            name: "edit_file".into(),
+            arguments: "not json".into(),
+        });
+        assert_eq!(state.lines.len(), 1);
+        assert!(state.lines[0].text.starts_with("tool: edit_file not json"));
     }
 
     #[test]
@@ -694,11 +772,19 @@ mod tests {
         ];
         let state = TuiState::from_transcript(&messages);
         assert_eq!(state.lines.len(), 4);
-        assert!(state.lines[0].dim, "background completion stays dim");
-        assert!(!state.lines[1].dim, "compacted summary uses normal color");
+        assert_eq!(
+            state.lines[0].kind,
+            LineKind::Dim,
+            "background completion stays dim"
+        );
+        assert_eq!(
+            state.lines[1].kind,
+            LineKind::Normal,
+            "compacted summary uses normal color"
+        );
         assert_eq!(state.lines[2].text, "thinking: plan");
-        assert!(state.lines[2].dim);
+        assert_eq!(state.lines[2].kind, LineKind::Dim);
         assert_eq!(state.lines[3].text, "answer");
-        assert!(!state.lines[3].dim);
+        assert_eq!(state.lines[3].kind, LineKind::Normal);
     }
 }
