@@ -44,9 +44,17 @@ pub struct ToolSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentEvent {
     AssistantText(String),
+    AssistantDelta(String),
+    ReasoningDelta(String),
     ToolCall { name: String, arguments: String },
     ToolResult { is_error: bool, content: String },
     BackgroundCompleted { id: u64, output: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelDeltaKind {
+    Content,
+    Reasoning,
 }
 
 #[async_trait]
@@ -55,6 +63,7 @@ pub trait Model: Send {
         &mut self,
         messages: &[Message],
         tools: &[ToolSpec],
+        on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
     ) -> anyhow::Result<AssistantMessage>;
 }
 
@@ -147,7 +156,7 @@ impl Agent {
         request.push(Message::User {
             content: "Summarize the earlier conversation. Preserve the user's goals, decisions made, files changed, and unfinished work. Be concise and use Chinese or English to match the conversation language.".into(),
         });
-        let response = self.model.complete(&request, &[]).await?;
+        let response = self.model.complete(&request, &[], None).await?;
         let summary = response.content.unwrap_or_default();
         let mut compacted = vec![Message::User {
             content: format!("[compacted summary of earlier conversation]\n{summary}"),
@@ -161,17 +170,36 @@ impl Agent {
         for _ in 0..self.max_tool_rounds {
             self.drain_background();
             self.inject_pending_background();
-            let assistant = self.model.complete(&self.transcript, specs).await?;
+            let mut produced_delta = false;
+            let assistant = {
+                let model = &mut self.model;
+                let event_handler = &mut self.event_handler;
+                let mut on_delta = |kind: ModelDeltaKind, delta: &str| {
+                    if kind == ModelDeltaKind::Content {
+                        produced_delta = true;
+                    }
+                    if let Some(handler) = event_handler {
+                        handler(match kind {
+                            ModelDeltaKind::Content => AgentEvent::AssistantDelta(delta.into()),
+                            ModelDeltaKind::Reasoning => AgentEvent::ReasoningDelta(delta.into()),
+                        });
+                    }
+                };
+                model
+                    .complete(&self.transcript, specs, Some(&mut on_delta))
+                    .await?
+            };
             if assistant.tool_calls.is_empty() {
                 let answer = assistant.content.clone().unwrap_or_default();
                 self.transcript.push(Message::Assistant(assistant));
                 return Ok(answer);
             }
 
-            if let Some(content) = assistant
-                .content
-                .as_deref()
-                .filter(|content| !content.is_empty())
+            if !produced_delta
+                && let Some(content) = assistant
+                    .content
+                    .as_deref()
+                    .filter(|content| !content.is_empty())
             {
                 self.emit(AgentEvent::AssistantText(content.into()));
             }
@@ -293,6 +321,7 @@ mod tests {
             &mut self,
             messages: &[Message],
             _: &[ToolSpec],
+            _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
         ) -> anyhow::Result<AssistantMessage> {
             self.requests.lock().unwrap().push(messages.to_vec());
             Ok(self.replies.remove(0))
@@ -380,6 +409,36 @@ mod tests {
         async fn execute(&self, arguments: Value) -> Result<String, String> {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             Ok(arguments["value"].to_string())
+        }
+    }
+
+    struct DeltaModel {
+        calls: usize,
+    }
+
+    #[async_trait]
+    impl Model for DeltaModel {
+        async fn complete(
+            &mut self,
+            _: &[Message],
+            _: &[ToolSpec],
+            mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+        ) -> anyhow::Result<AssistantMessage> {
+            self.calls += 1;
+            if self.calls == 1 {
+                if let Some(callback) = &mut on_delta {
+                    callback(ModelDeltaKind::Reasoning, "thinking");
+                    callback(ModelDeltaKind::Content, "streamed");
+                }
+                return Ok(AssistantMessage {
+                    content: Some("streamed".into()),
+                    tool_calls: vec![call("call-1", "echo", r#"{"value":"ok"}"#)],
+                });
+            }
+            Ok(AssistantMessage {
+                content: Some("final".into()),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -530,6 +589,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn emits_deltas_without_duplicate_assistant_text() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(Box::new(DeltaModel { calls: 0 }), vec![Box::new(EchoTool)]);
+        let captured = events.clone();
+        agent.set_event_handler(Box::new(move |event| captured.lock().unwrap().push(event)));
+        assert_eq!(agent.run("hello".into()).await.unwrap(), "final");
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                AgentEvent::ReasoningDelta("thinking".into()),
+                AgentEvent::AssistantDelta("streamed".into()),
+                AgentEvent::ToolCall {
+                    name: "echo".into(),
+                    arguments: r#"{"value":"ok"}"#.into(),
+                },
+                AgentEvent::ToolResult {
+                    is_error: false,
+                    content: "\"ok\"".into(),
+                },
+            ]
+        );
+        assert!(agent.transcript().iter().all(|message| !matches!(
+            message,
+            Message::Assistant(AssistantMessage { content: Some(content), .. }) if content.contains("thinking")
+        )));
     }
 
     #[tokio::test]

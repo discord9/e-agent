@@ -92,9 +92,28 @@ async fn run() -> anyhow::Result<()> {
 }
 
 fn set_stderr_events(agent: &mut Agent) {
-    agent.set_event_handler(Box::new(|event| match event {
+    let mut streaming = false;
+    let mut reasoning = false;
+    agent.set_event_handler(Box::new(move |event| match event {
         AgentEvent::AssistantText(text) => eprintln!("assistant: {}", preview(&text, 500)),
+        AgentEvent::AssistantDelta(text) => {
+            if reasoning {
+                eprintln!();
+                reasoning = false;
+            }
+            eprint!("{text}");
+            streaming = true;
+        }
+        AgentEvent::ReasoningDelta(text) => {
+            eprint!("\x1b[2m{text}\x1b[0m");
+            reasoning = true;
+        }
         AgentEvent::ToolCall { name, arguments } => {
+            if streaming || reasoning {
+                eprintln!();
+                streaming = false;
+                reasoning = false;
+            }
             eprintln!("tool: {name} {}", preview(&arguments, 200))
         }
         AgentEvent::ToolResult { is_error, content } => eprintln!(

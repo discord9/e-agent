@@ -1,6 +1,6 @@
 # e-agent
 
-e-agent is a small, non-streaming Rust coding agent for OpenAI-compatible
+e-agent is a small streaming Rust coding agent for OpenAI-compatible
 `/chat/completions` APIs. It sends a prompt to a model, executes requested tools
 one at a time inside a workspace, returns each result to the model, and prints
 the model's final answer.
@@ -70,14 +70,14 @@ session. Compaction has no automatic trigger.
 Errors print their causal chain (for example `cannot decode provider
 response: error decoding response body: ...`), and provider HTTP failures
 include a preview of the response body. Provider requests time out after
-600 seconds in total, since non-streaming reasoning responses can be slow.
+600 seconds in total, including the complete streaming response body.
 
 ## Non-goals
 
-This is deliberately not a streaming client, daemon, JSONL protocol,
+This is deliberately not a daemon, JSONL protocol,
 automatic compaction trigger, database, event store, subagent
 framework, permission framework, MCP/plugin host, multi-provider client,
 parallel tool executor, task scheduler, priority system, or concurrency pool.
 It has one model seam, one tool seam, and a configurable tool-round limit
-(default 32). Reasoning-model `reasoning_content` is displayed nowhere and
-never sent back to the API.
+(default 32). Reasoning-model `reasoning_content` is display-only; it is never
+persisted in a transcript/session or sent back to the API.

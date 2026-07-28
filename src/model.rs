@@ -1,8 +1,10 @@
 use anyhow::{Context, anyhow};
+use eventsource_stream::Eventsource;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::agent::{AssistantMessage, Message, Model, ToolCall, ToolSpec, preview};
+use crate::agent::{AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, preview};
 
 pub struct OpenAiModel {
     client: reqwest::Client,
@@ -48,6 +50,7 @@ impl Model for OpenAiModel {
         &mut self,
         messages: &[Message],
         tools: &[ToolSpec],
+        mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
     ) -> anyhow::Result<AssistantMessage> {
         let request = ChatRequest::from_internal(&self.model, messages, tools);
         let response = self
@@ -63,11 +66,59 @@ impl Model for OpenAiModel {
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!("provider returned HTTP {status}: {}", preview(&body, 500));
         }
-        response
-            .json::<ChatResponse>()
-            .await
-            .context("cannot decode provider response")?
-            .into_assistant()
+        let mut content = String::new();
+        let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
+        let mut events = response.bytes_stream().eventsource();
+        while let Some(event) = events.next().await {
+            let event = event.context("cannot parse provider event")?;
+            if event.data == "[DONE]" {
+                break;
+            }
+            let chunk: StreamChunk =
+                serde_json::from_str(&event.data).context("cannot decode provider stream chunk")?;
+            if let Some(error) = chunk.error {
+                anyhow::bail!("provider stream error: {error}");
+            }
+            for choice in chunk.choices {
+                if let Some(delta) = choice.delta.content {
+                    content.push_str(&delta);
+                    if let Some(callback) = &mut on_delta {
+                        callback(
+                            ModelDeltaKind::Content,
+                            &content[content.len() - delta.len()..],
+                        );
+                    }
+                }
+                if let Some(delta) = choice.delta.reasoning_content
+                    && let Some(callback) = &mut on_delta
+                {
+                    callback(ModelDeltaKind::Reasoning, &delta);
+                }
+                for call in choice.delta.tool_calls.unwrap_or_default() {
+                    while tool_calls.len() <= call.index {
+                        tool_calls.push(AccumulatedToolCall::default());
+                    }
+                    let target = &mut tool_calls[call.index];
+                    if let Some(id) = call.id {
+                        target.id = id;
+                    }
+                    if let Some(name) = call
+                        .function
+                        .as_ref()
+                        .and_then(|function| function.name.as_ref())
+                    {
+                        target.name = name.clone();
+                    }
+                    if let Some(arguments) = call.function.and_then(|function| function.arguments) {
+                        target.arguments.push_str(&arguments);
+                    }
+                }
+                if choice.finish_reason.is_some() {
+                    return build_assistant(content, tool_calls);
+                }
+            }
+        }
+        build_assistant(content, tool_calls)
     }
 }
 
@@ -84,6 +135,7 @@ struct ChatRequest<'a> {
     model: String,
     messages: Vec<WireMessage>,
     tools: Vec<WireTool<'a>>,
+    stream: bool,
 }
 
 impl<'a> ChatRequest<'a> {
@@ -102,6 +154,7 @@ impl<'a> ChatRequest<'a> {
                     },
                 })
                 .collect(),
+            stream: true,
         }
     }
 }
@@ -198,44 +251,68 @@ struct WireFunctionCall {
     arguments: String,
 }
 
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
+#[derive(Default)]
+struct AccumulatedToolCall {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
-#[derive(Deserialize)]
-struct Choice {
-    message: ResponseMessage,
-}
-
-#[derive(Deserialize)]
-struct ResponseMessage {
-    content: Option<String>,
-    tool_calls: Option<Vec<WireToolCall>>,
-}
-
-impl ChatResponse {
-    fn into_assistant(self) -> anyhow::Result<AssistantMessage> {
-        let message = self
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("provider response has no choices"))?
-            .message;
-        Ok(AssistantMessage {
-            content: message.content,
-            tool_calls: message
-                .tool_calls
-                .unwrap_or_default()
-                .into_iter()
-                .map(|call| ToolCall {
-                    id: call.id,
-                    name: call.function.name,
-                    arguments: call.function.arguments,
-                })
-                .collect(),
+fn build_assistant(
+    content: String,
+    tool_calls: Vec<AccumulatedToolCall>,
+) -> anyhow::Result<AssistantMessage> {
+    let tool_calls = tool_calls
+        .into_iter()
+        .map(|call| {
+            if call.id.is_empty() || call.name.is_empty() {
+                anyhow::bail!("provider stream returned an incomplete tool call");
+            }
+            Ok(ToolCall {
+                id: call.id,
+                name: call.name,
+                arguments: call.arguments,
+            })
         })
-    }
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(AssistantMessage {
+        content: (!content.is_empty()).then_some(content),
+        tool_calls,
+    })
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    error: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct StreamToolCall {
+    index: usize,
+    id: Option<String>,
+    function: Option<StreamFunction>,
+}
+
+#[derive(Deserialize)]
+struct StreamFunction {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[cfg(test)]
@@ -302,20 +379,6 @@ mod tests {
         assert!(value["messages"][0].get("tool_calls").is_none());
     }
 
-    #[test]
-    fn parses_provider_tool_calls() {
-        let response: ChatResponse = serde_json::from_value(json!({
-            "choices": [{"message": {"content": null, "tool_calls": [{
-                "id": "call-1", "type": "function",
-                "function": {"name": "bash", "arguments": r#"{"command":"pwd"}"#}
-            }]}}]
-        }))
-        .unwrap();
-        let message = response.into_assistant().unwrap();
-        assert_eq!(message.tool_calls[0].name, "bash");
-        assert_eq!(message.tool_calls[0].arguments, r#"{"command":"pwd"}"#);
-    }
-
     async fn read_request(stream: &mut TcpStream) -> serde_json::Value {
         let mut bytes = Vec::new();
         let header_end = loop {
@@ -348,14 +411,72 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
-    async fn reply(stream: &mut TcpStream, body: serde_json::Value) {
-        let body = serde_json::to_vec(&body).unwrap();
+    async fn reply_sse(stream: &mut TcpStream, chunks: &[serde_json::Value]) {
+        let mut body = Vec::new();
+        for chunk in chunks {
+            body.extend_from_slice(
+                format!("data: {}\n\n", serde_json::to_string(chunk).unwrap()).as_bytes(),
+            );
+        }
+        body.extend_from_slice(b"data: [DONE]\n\n");
         let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(header.as_bytes()).await.unwrap();
-        stream.write_all(&body).await.unwrap();
+        for chunk in body.chunks(7) {
+            stream.write_all(chunk).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_accumulates_text_and_tool_call_fragments() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert_eq!(request["stream"], true);
+            reply_sse(
+                &mut stream,
+                &[
+                    json!({"choices":[{"delta":{"content":"hel","reasoning_content":"ignore","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}),
+                    json!({"choices":[{"delta":{"content":"lo","tool_calls":[{"index":0,"function":{"arguments":r#"{"command":"p"#}}]},"finish_reason":null}]}),
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":r#"wd"}"#}}]},"finish_reason":null}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+                ],
+            )
+            .await;
+        });
+        let mut model = OpenAiModel::with_timeout(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "test-model".into(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let mut deltas = Vec::new();
+        let message = model
+            .complete(
+                &[Message::User {
+                    content: "hello".into(),
+                }],
+                &[],
+                Some(&mut |kind, delta| deltas.push((kind, delta.to_owned()))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas,
+            [
+                (ModelDeltaKind::Content, "hel".into()),
+                (ModelDeltaKind::Reasoning, "ignore".into()),
+                (ModelDeltaKind::Content, "lo".into()),
+            ]
+        );
+        assert_eq!(message.content.as_deref(), Some("hello"));
+        assert_eq!(message.tool_calls[0].name, "bash");
+        assert_eq!(message.tool_calls[0].arguments, r#"{"command":"pwd"}"#);
     }
 
     #[tokio::test]
@@ -380,6 +501,7 @@ mod tests {
                     content: "hello".into(),
                 }],
                 &[],
+                None,
             )
             .await
             .unwrap_err();
@@ -410,19 +532,22 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             let first_request = read_request(&mut first).await;
-            reply(
+            reply_sse(
                 &mut first,
-                json!({"choices": [{"message": {"content": null, "tool_calls": [{
-                    "id": "call-fail", "type": "function",
-                    "function": {"name": "fail", "arguments": "{}"}
-                }]}}]}),
+                &[
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-fail","type":"function","function":{"name":"fail","arguments":"{}"}}]},"finish_reason":null}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+                ],
             )
             .await;
             let (mut second, _) = listener.accept().await.unwrap();
             let second_request = read_request(&mut second).await;
-            reply(
+            reply_sse(
                 &mut second,
-                json!({"choices": [{"message": {"content": "final answer"}}]}),
+                &[
+                    json!({"choices":[{"delta":{"content":"final answer"},"finish_reason":null}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+                ],
             )
             .await;
             (first_request, second_request)

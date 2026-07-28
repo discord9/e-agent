@@ -14,6 +14,8 @@ use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
@@ -73,15 +75,14 @@ async fn run_inner(
                         state.thinking = false;
                         match result {
                             Ok(summary) => state
-                                .lines
-                                .push(format!("compacted: {}", preview(&summary, 500))),
-                            Err(error) => state.lines.push(format!("error: {error:#}")),
+                                .push_line(format!("compacted: {}", preview(&summary, 500)), false),
+                            Err(error) => state.push_line(format!("error: {error:#}"), false),
                         }
                         Session::save(root, session_name, agent.transcript())?;
                         state.follow();
                         continue;
                     }
-                    state.lines.push(format!("you> {prompt}"));
+                    state.push_line(format!("you> {prompt}"), false);
                     state.follow();
                     agent.subscribe(sender.clone());
                     if run_request(
@@ -117,6 +118,7 @@ async fn run_request(
     prompt: String,
 ) -> anyhow::Result<bool> {
     state.thinking = true;
+    state.streamed = false;
     draw(terminal, state)?;
     let (result, exit) = {
         let request = agent.run(prompt);
@@ -147,8 +149,8 @@ async fn run_request(
     }
     if let Some(result) = result {
         match result {
-            Ok(answer) => state.lines.push(answer),
-            Err(error) => state.lines.push(format!("error: {error:#}")),
+            Ok(answer) => state.push_final_answer(answer),
+            Err(error) => state.push_line(format!("error: {error:#}"), false),
         }
     }
     Session::save(session.0, session.1, agent.transcript())?;
@@ -163,10 +165,27 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &TuiState)
             let [output, input] =
                 Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(frame.area());
             frame.render_widget(
-                Paragraph::new(state.lines.join("\n"))
-                    .block(Block::default().borders(Borders::ALL).title("e-agent"))
-                    .wrap(Wrap { trim: false })
-                    .scroll((state.scroll.min(u16::MAX as usize) as u16, 0)),
+                Paragraph::new(
+                    state
+                        .lines
+                        .iter()
+                        .map(|line| {
+                            Line::styled(
+                                line.text.as_str(),
+                                if line.dim {
+                                    Style::default()
+                                        .fg(Color::DarkGray)
+                                        .add_modifier(Modifier::DIM)
+                                } else {
+                                    Style::default()
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .block(Block::default().borders(Borders::ALL).title("e-agent"))
+                .wrap(Wrap { trim: false })
+                .scroll((state.scroll.min(u16::MAX as usize) as u16, 0)),
                 output,
             );
             let title = if state.thinking {
@@ -198,9 +217,22 @@ fn is_exit(key: KeyEvent) -> bool {
 #[derive(Default)]
 struct TuiState {
     input: InputBuffer,
-    lines: Vec<String>,
+    lines: Vec<DisplayLine>,
     scroll: usize,
     thinking: bool,
+    streamed: bool,
+    active_lane: Option<ActiveStreamLane>,
+}
+
+struct DisplayLine {
+    text: String,
+    dim: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ActiveStreamLane {
+    Reasoning,
+    Content,
 }
 
 impl TuiState {
@@ -246,20 +278,48 @@ impl TuiState {
 
     fn push_agent_event(&mut self, event: AgentEvent) {
         let at_bottom = self.at_bottom();
+        let ends_delta = matches!(
+            &event,
+            AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
+        );
         match event {
-            AgentEvent::AssistantText(text) => self.lines.push(text),
-            AgentEvent::ToolCall { name, arguments } => self
-                .lines
-                .push(format!("tool: {name} {}", preview(&arguments, 200))),
-            AgentEvent::ToolResult { is_error, content } => self.lines.push(format!(
-                "  {}: {}",
-                if is_error { "error" } else { "ok" },
-                preview(&content, 500)
-            )),
-            AgentEvent::BackgroundCompleted { id, output } => self.lines.push(format!(
-                "background task {id} finished: {}",
-                preview(&output, 500)
-            )),
+            AgentEvent::AssistantText(text) => self.push_line(text, false),
+            AgentEvent::AssistantDelta(text) => {
+                if self.active_lane == Some(ActiveStreamLane::Content) {
+                    self.lines.last_mut().unwrap().text.push_str(&text);
+                } else {
+                    self.push_line(text, false);
+                    self.streamed = true;
+                    self.active_lane = Some(ActiveStreamLane::Content);
+                }
+            }
+            AgentEvent::ReasoningDelta(text) => {
+                if self.active_lane == Some(ActiveStreamLane::Reasoning) {
+                    self.lines.last_mut().unwrap().text.push_str(&text);
+                } else {
+                    self.push_line(format!("thinking: {text}"), true);
+                    self.active_lane = Some(ActiveStreamLane::Reasoning);
+                }
+            }
+            AgentEvent::ToolCall { name, arguments } => {
+                self.push_line(format!("tool: {name} {}", preview(&arguments, 200)), false)
+            }
+            AgentEvent::ToolResult { is_error, content } => self.push_line(
+                format!(
+                    "  {}: {}",
+                    if is_error { "error" } else { "ok" },
+                    preview(&content, 500)
+                ),
+                false,
+            ),
+            AgentEvent::BackgroundCompleted { id, output } => self.push_line(
+                format!("background task {id} finished: {}", preview(&output, 500)),
+                false,
+            ),
+        }
+        if ends_delta {
+            self.streamed = false;
+            self.active_lane = None;
         }
         if at_bottom {
             self.follow();
@@ -268,6 +328,17 @@ impl TuiState {
 
     fn follow(&mut self) {
         self.scroll = self.lines.len().saturating_sub(1);
+    }
+
+    fn push_final_answer(&mut self, answer: String) {
+        if !self.streamed {
+            self.push_line(answer, false);
+        }
+    }
+
+    fn push_line(&mut self, text: String, dim: bool) {
+        self.lines.push(DisplayLine { text, dim });
+        self.active_lane = None;
     }
 }
 
@@ -354,9 +425,33 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_and_content_deltas_use_separate_lines_without_final_duplicate() {
+        let mut state = TuiState::default();
+        state.push_agent_event(AgentEvent::ReasoningDelta("plan".into()));
+        state.push_agent_event(AgentEvent::ReasoningDelta(" more".into()));
+        state.push_agent_event(AgentEvent::AssistantDelta("hel".into()));
+        state.push_agent_event(AgentEvent::AssistantDelta("lo".into()));
+        state.push_final_answer("hello".into());
+        assert_eq!(state.lines.len(), 2);
+        assert_eq!(state.lines[0].text, "thinking: plan more");
+        assert!(state.lines[0].dim);
+        assert_eq!(state.lines[1].text, "hello");
+        assert!(!state.lines[1].dim);
+    }
+
+    #[test]
     fn new_events_do_not_yank_a_scrolled_up_view() {
         let mut state = TuiState {
-            lines: vec!["one".into(), "two".into()],
+            lines: vec![
+                DisplayLine {
+                    text: "one".into(),
+                    dim: false,
+                },
+                DisplayLine {
+                    text: "two".into(),
+                    dim: false,
+                },
+            ],
             ..Default::default()
         };
         state.follow();
@@ -371,7 +466,16 @@ mod tests {
     #[test]
     fn scrolling_is_bounded_and_events_append_echo_lines() {
         let mut state = TuiState {
-            lines: vec!["one".into(), "two".into()],
+            lines: vec![
+                DisplayLine {
+                    text: "one".into(),
+                    dim: false,
+                },
+                DisplayLine {
+                    text: "two".into(),
+                    dim: false,
+                },
+            ],
             ..Default::default()
         };
         state.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
@@ -380,7 +484,7 @@ mod tests {
             is_error: false,
             content: "done".into(),
         });
-        assert_eq!(state.lines.last().unwrap(), "  ok: done");
+        assert_eq!(state.lines.last().unwrap().text, "  ok: done");
         assert_eq!(state.scroll, 2);
     }
 }
