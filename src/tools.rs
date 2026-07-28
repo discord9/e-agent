@@ -1,6 +1,6 @@
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -193,20 +193,27 @@ impl Tool for Bash {
     }
 }
 
+/// Maximum number of concurrently running background tasks.
+pub const MAX_BACKGROUND: usize = 4;
+
 struct BackgroundTasks {
     next_id: AtomicU64,
-    running: Arc<AtomicBool>,
-    process_group: Arc<AtomicI32>,
+    slots: Arc<std::sync::Mutex<Vec<Option<BackgroundSlot>>>>,
     sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
     timeout: Duration,
+}
+
+#[derive(Clone)]
+struct BackgroundSlot {
+    id: u64,
+    process_group: Arc<AtomicI32>,
 }
 
 impl BackgroundTasks {
     fn new(timeout: Duration) -> Self {
         Self {
             next_id: AtomicU64::new(1),
-            running: Arc::new(AtomicBool::new(false)),
-            process_group: Arc::new(AtomicI32::new(0)),
+            slots: Arc::new(std::sync::Mutex::new(vec![None; MAX_BACKGROUND])),
             sender: None,
             timeout,
         }
@@ -217,23 +224,33 @@ impl BackgroundTasks {
             .sender
             .clone()
             .ok_or("background task delivery is unavailable")?;
-        if self
-            .running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err("a background task is already running".into());
-        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let process_group = Arc::new(AtomicI32::new(0));
+        let slot = BackgroundSlot {
+            id,
+            process_group: process_group.clone(),
+        };
+        {
+            let mut slots = self.slots.lock().unwrap();
+            let empty = slots.iter_mut().find(|slot| slot.is_none());
+            let Some(empty) = empty else {
+                return Err(format!(
+                    "all {MAX_BACKGROUND} background task slots are in use"
+                ));
+            };
+            *empty = Some(slot);
+        }
         let started = format!("started background task {id}: {}", preview(&command, 100));
-        let running = self.running.clone();
-        let process_group = self.process_group.clone();
+        let slots = self.slots.clone();
         let timeout = self.timeout;
         tokio::spawn(async move {
             let output = match run_bash(&workspace, &command, timeout, Some(process_group)).await {
                 Ok(output) | Err(output) => output,
             };
-            running.store(false, Ordering::Release);
+            slots
+                .lock()
+                .unwrap()
+                .retain(|slot| slot.as_ref().map(|slot| slot.id != id).unwrap_or(true));
             let _ = sender.send(AgentEvent::BackgroundCompleted { id, output });
         });
         Ok(started)
@@ -243,11 +260,15 @@ impl BackgroundTasks {
 impl Drop for BackgroundTasks {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(process_group) =
-            rustix::process::Pid::from_raw(self.process_group.load(Ordering::Acquire))
-        {
-            let _ =
-                rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+        for slot in self.slots.lock().unwrap().iter().flatten() {
+            if let Some(process_group) =
+                rustix::process::Pid::from_raw(slot.process_group.load(Ordering::Acquire))
+            {
+                let _ = rustix::process::kill_process_group(
+                    process_group,
+                    rustix::process::Signal::KILL,
+                );
+            }
         }
     }
 }
@@ -638,20 +659,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allows_only_one_background_task_at_a_time() {
+    async fn allows_up_to_max_background_tasks() {
         let temp = tempfile::tempdir().unwrap();
-        let (bash, _) = background_bash(&temp, Duration::from_secs(1));
-        assert!(
-            bash.execute(json!({"command": "sleep 1", "background": true}))
-                .await
-                .unwrap()
-                .starts_with("started background task 1:")
-        );
+        let (bash, _) = background_bash(&temp, Duration::from_secs(10));
+        for id in 1..=MAX_BACKGROUND {
+            assert!(
+                bash.execute(json!({"command": "sleep 10", "background": true}))
+                    .await
+                    .unwrap()
+                    .starts_with(&format!("started background task {id}:"))
+            );
+        }
         assert!(
             bash.execute(json!({"command": "true", "background": true}))
                 .await
                 .unwrap_err()
-                .contains("already running")
+                .contains("background task slots are in use")
         );
     }
 

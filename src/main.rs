@@ -96,9 +96,10 @@ async fn run() -> anyhow::Result<()> {
     }
     let answer = run_and_save(&mut agent, &root, &session, &mut persisted, prompt).await?;
     println!("{answer}");
-    if let Some(id) = agent.background_task_id() {
+    if !agent.background_task_ids().is_empty() {
         eprintln!(
-            "background task {id} still running; result will be delivered in the next session's first turn"
+            "background tasks {:?} still running; results will be delivered in the next session's first turn",
+            agent.background_task_ids()
         );
     }
     Ok(())

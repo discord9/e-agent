@@ -47,9 +47,9 @@ without an explicit user request.
   display/audit only and is never echoed back to the API
   (OpenAI/Kimi convention; Anthropic thinking blocks would be a wire-level
   change, not an agent-level one).
-- Background task completions are injected only at model-call boundaries
-  within an active turn or at the start of the next turn; an idle agent
-  never starts a new turn by itself.
+- Background task completions are injected at model-call boundaries within
+  an active turn. When the agent is idle (TUI/REPL), a completion is
+  delivered as a user message that starts a new turn.
 - No task scheduler, priorities, or worker/concurrency pool.
 - MCP support is limited to local stdio servers, tools only. No remote
   HTTP/SSE MCP, OAuth, resources/prompts, notifications, `listChanged`

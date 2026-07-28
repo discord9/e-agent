@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use tokio::sync::mpsc;
 
 pub const MAX_TOOL_ROUNDS: usize = 32;
@@ -178,7 +178,7 @@ pub struct Agent {
     background_receiver: mpsc::UnboundedReceiver<AgentEvent>,
     pending_background: VecDeque<(u64, String)>,
     subscriber: Option<mpsc::UnboundedSender<AgentEvent>>,
-    running_background: Option<u64>,
+    running_background: HashSet<u64>,
     session_input_tokens: u64,
     session_output_tokens: u64,
     last_context_input: u64,
@@ -202,7 +202,7 @@ impl Agent {
             background_receiver,
             pending_background: VecDeque::new(),
             subscriber: None,
-            running_background: None,
+            running_background: HashSet::new(),
             session_input_tokens: 0,
             session_output_tokens: 0,
             last_context_input: 0,
@@ -272,14 +272,39 @@ impl Agent {
         self.subscriber = Some(sender);
     }
 
-    pub fn background_task_id(&self) -> Option<u64> {
-        self.running_background
+    pub fn background_task_ids(&self) -> &HashSet<u64> {
+        &self.running_background
+    }
+
+    /// Wait for the next background task completion. Used by the TUI to
+    /// wake an idle agent. The event is also queued for injection into the
+    /// next model call.
+    pub async fn next_background_completion(&mut self) -> Option<(u64, String)> {
+        loop {
+            match self.background_receiver.recv().await {
+                Some(AgentEvent::BackgroundCompleted { id, output }) => {
+                    self.running_background.remove(&id);
+                    self.pending_background.push_back((id, output.clone()));
+                    if let Some(subscriber) = &self.subscriber {
+                        let _ = subscriber.send(AgentEvent::BackgroundCompleted {
+                            id,
+                            output: output.clone(),
+                        });
+                    }
+                    return Some((id, output));
+                }
+                Some(_) => {}
+                None => return None,
+            }
+        }
     }
 
     pub async fn run(&mut self, prompt: String) -> anyhow::Result<String> {
         self.drain_background();
         self.inject_pending_background();
-        self.history.push(Message::User { content: prompt }.into());
+        if !prompt.is_empty() {
+            self.history.push(Message::User { content: prompt }.into());
+        }
         let specs: Vec<_> = self.tools.iter().map(|tool| tool.spec()).collect();
 
         let result = self.run_loop(&specs).await;
@@ -396,9 +421,12 @@ impl Agent {
                     arguments: call.arguments.clone(),
                 });
                 let result = self.execute_call(call).await;
-                if result.is_ok() && call.name == "bash" && is_background_call(call) {
-                    self.running_background =
-                        started_task_id(result.as_deref().unwrap_or_default());
+                if result.is_ok()
+                    && call.name == "bash"
+                    && is_background_call(call)
+                    && let Some(id) = started_task_id(result.as_deref().unwrap_or_default())
+                {
+                    self.running_background.insert(id);
                 }
                 self.emit(AgentEvent::ToolResult {
                     is_error: result.is_err(),
@@ -447,9 +475,7 @@ impl Agent {
         while let Ok(AgentEvent::BackgroundCompleted { id, output }) =
             self.background_receiver.try_recv()
         {
-            if self.running_background == Some(id) {
-                self.running_background = None;
-            }
+            self.running_background.remove(&id);
             let event = AgentEvent::BackgroundCompleted {
                 id,
                 output: output.clone(),

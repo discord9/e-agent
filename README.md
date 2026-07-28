@@ -54,8 +54,8 @@ process-group handling, and per-stream 64 KiB output limit as foreground Bash,
 with a 30-minute timeout. Completions surface as a TUI notification while a
 turn is active, and the complete output is injected as a clearly labelled user
 message at the next model call — whether that is the next round of an active
-turn or the start of the next turn. An idle agent never starts a new turn by
-itself. In one-shot mode a still-running task is reported before exit;
+turn or, if the agent is idle, a new turn started by that delivery. In
+one-shot mode a still-running task is reported before exit;
 the process then best-effort terminates its process group. Uninjected background
 results are not persisted in sessions.
 

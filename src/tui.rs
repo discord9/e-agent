@@ -76,7 +76,30 @@ async fn run_inner(
     let mut state = TuiState::from_history(agent.history());
     loop {
         draw(terminal, &mut state)?;
-        match events.next().await {
+        tokio::select! {
+            // Background task completed while idle: inject it as a new turn.
+            Some((id, output)) = agent.next_background_completion() => {
+                state.push_line(
+                    format!("background task {id} completed:\n{}", preview(&output, 500)),
+                    LineKind::Dim,
+                );
+                state.follow();
+                agent.subscribe(sender.clone());
+                if run_request(
+                    terminal,
+                    agent,
+                    &mut state,
+                    &mut events,
+                    &mut receiver,
+                    (root, session_name, persisted),
+                    String::new(),
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
+            event = events.next() => match event {
             Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
                 if is_exit(key) {
                     return Ok(());
@@ -142,6 +165,7 @@ async fn run_inner(
             Some(Ok(_)) => {}
             Some(Err(error)) => return Err(error.into()),
             None => return Ok(()),
+        }
         }
     }
 }
@@ -225,10 +249,10 @@ async fn drive<T>(
     }
 }
 
-fn draw(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+fn draw<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
     state: &mut TuiState,
-) -> io::Result<()> {
+) -> Result<(), B::Error> {
     terminal
         .draw(|frame| {
             let inner_input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
@@ -724,6 +748,26 @@ mod tests {
         let mut input = InputBuffer::default();
         input.insert("ab");
         assert_eq!(input.visual_rows(2), 2);
+    }
+
+    #[test]
+    fn cursor_sits_at_the_insertion_point() {
+        let backend = ratatui::backend::TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        state.input.insert("abc");
+        state.input.left();
+        state.input.left();
+        draw(&mut terminal, &mut state).unwrap();
+        let position = terminal.backend().cursor_position();
+        // border at column 0, content starts at column 1, cursor between a/b -> on 'b'
+        assert_eq!((position.x, position.y), (2, 8));
+
+        state.input.end();
+        draw(&mut terminal, &mut state).unwrap();
+        let position = terminal.backend().cursor_position();
+        // end of text: one cell past 'c', which is where the next char lands
+        assert_eq!((position.x, position.y), (4, 8));
     }
 
     #[test]
