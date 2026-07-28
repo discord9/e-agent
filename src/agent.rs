@@ -6,6 +6,44 @@ use tokio::sync::mpsc;
 
 pub const MAX_TOOL_ROUNDS: usize = 32;
 
+/// Insert a synthetic error result for every tool call left unanswered by an
+/// interrupted turn (cancel, provider error, crash), so the derived context
+/// always satisfies the provider's tool_call/tool-result pairing rule.
+fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
+    fn flush(pending: &mut Vec<ToolCall>, out: &mut Vec<Message>) {
+        for call in pending.drain(..) {
+            out.push(Message::Tool {
+                call_id: call.id,
+                name: call.name,
+                content: "[turn interrupted before a tool result was produced]".into(),
+                is_error: true,
+            });
+        }
+    }
+
+    let mut out = Vec::with_capacity(messages.len());
+    let mut pending: Vec<ToolCall> = Vec::new();
+    for message in messages {
+        match &message {
+            Message::Tool { call_id, .. } => {
+                pending.retain(|call| &call.id != call_id);
+                out.push(message);
+            }
+            Message::Assistant(assistant) => {
+                flush(&mut pending, &mut out);
+                pending = assistant.tool_calls.clone();
+                out.push(message);
+            }
+            Message::User { .. } => {
+                flush(&mut pending, &mut out);
+                out.push(message);
+            }
+        }
+    }
+    flush(&mut pending, &mut out);
+    out
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     User {
@@ -138,6 +176,9 @@ pub struct Agent {
     session_input_tokens: u64,
     session_output_tokens: u64,
     last_context_input: u64,
+    /// MCP server instructions, prepended to the context on every model call.
+    /// Not persisted in sessions.
+    context_prefix: Option<String>,
 }
 
 impl Agent {
@@ -159,7 +200,14 @@ impl Agent {
             session_input_tokens: 0,
             session_output_tokens: 0,
             last_context_input: 0,
+            context_prefix: None,
         }
+    }
+
+    /// Extra context (e.g. MCP server instructions) prepended to every model
+    /// call as a user message. Not persisted in sessions.
+    pub fn set_context_prefix(&mut self, prefix: String) {
+        self.context_prefix = Some(prefix);
     }
 
     pub fn max_tool_rounds(mut self, rounds: usize) -> Self {
@@ -183,6 +231,11 @@ impl Agent {
     /// everything after it.
     pub fn context(&self) -> Vec<Message> {
         let mut messages = Vec::new();
+        if let Some(prefix) = &self.context_prefix {
+            messages.push(Message::User {
+                content: prefix.clone(),
+            });
+        }
         let mut start = 0;
         if let Some(index) = self
             .history
@@ -206,7 +259,7 @@ impl Agent {
                     SessionEntry::Compaction { .. } => None,
                 }),
         );
-        messages
+        repair_tool_pairs(messages)
     }
 
     pub fn subscribe(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
@@ -953,6 +1006,44 @@ mod tests {
         assert!(matches!(
             requests[0].last().unwrap(),
             Message::User { content } if content.contains("Summarize the earlier conversation")
+        ));
+    }
+
+    #[tokio::test]
+    async fn context_repairs_unanswered_tool_calls_from_interrupted_turns() {
+        let interrupted = vec![
+            Message::User {
+                content: "do things".into(),
+            },
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![
+                    call("call-1", "bash", r#"{"command":"make"}"#),
+                    call("call-2", "bash", r#"{"command":"make test"}"#),
+                ],
+                reasoning: None,
+            }),
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "bash".into(),
+                content: "built".into(),
+                is_error: false,
+            },
+        ];
+        let mut agent = Agent::new(
+            Box::new(ScriptedModel {
+                replies: vec![],
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            vec![],
+        );
+        agent.restore_history(interrupted.into_iter().map(Into::into).collect());
+        let context = agent.context();
+        assert_eq!(context.len(), 4);
+        assert!(matches!(
+            &context[3],
+            Message::Tool { call_id, is_error: true, content, .. }
+                if call_id == "call-2" && content.contains("interrupted")
         ));
     }
 

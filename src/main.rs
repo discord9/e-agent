@@ -2,6 +2,7 @@ use std::io::{IsTerminal, Read, Write};
 
 use anyhow::{Context, anyhow};
 use e_agent::agent::{Agent, AgentEvent, preview};
+use e_agent::mcp;
 use e_agent::model::OpenAiModel;
 use e_agent::session::Session;
 use e_agent::tools::builtins;
@@ -68,7 +69,16 @@ async fn run() -> anyhow::Result<()> {
     .context("cannot open workspace")?;
     let root = workspace.root().to_path_buf();
     let model = OpenAiModel::from_env(base_url, model)?;
-    let mut agent = Agent::new(Box::new(model), builtins(workspace));
+    let mut tools = builtins(workspace);
+    let (mcp_tools, mcp_instructions) = mcp::connect_all(&root).await;
+    tools.extend(mcp_tools);
+    let mut agent = Agent::new(Box::new(model), tools);
+    if !mcp_instructions.is_empty() {
+        agent.set_context_prefix(format!(
+            "[MCP server instructions]\n\n{}",
+            mcp_instructions.join("\n\n")
+        ));
+    }
     if let Some(rounds) = max_rounds {
         agent = agent.max_tool_rounds(rounds);
     }
