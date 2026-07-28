@@ -51,6 +51,9 @@ without an explicit user request.
   within an active turn or at the start of the next turn; an idle agent
   never starts a new turn by itself.
 - No task scheduler, priorities, or worker/concurrency pool.
+- MCP support is limited to local stdio servers, tools only. No remote
+  HTTP/SSE MCP, OAuth, resources/prompts, notifications, `listChanged`
+  refresh, server restart, or concurrent initialization.
 
 ## Commands
 

@@ -195,6 +195,12 @@ struct WireMessage {
 impl WireMessage {
     fn from_internal(message: &Message) -> Self {
         match message {
+            Message::System { content } => Self {
+                role: "system",
+                content: Some(content.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
             Message::User { content } => Self {
                 role: "user",
                 content: Some(content.clone()),

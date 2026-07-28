@@ -74,10 +74,7 @@ async fn run() -> anyhow::Result<()> {
     tools.extend(mcp_tools);
     let mut agent = Agent::new(Box::new(model), tools);
     if !mcp_instructions.is_empty() {
-        agent.set_context_prefix(format!(
-            "[MCP server instructions]\n\n{}",
-            mcp_instructions.join("\n\n")
-        ));
+        agent.set_context_prefix(mcp_instructions.join("\n\n"));
     }
     if let Some(rounds) = max_rounds {
         agent = agent.max_tool_rounds(rounds);

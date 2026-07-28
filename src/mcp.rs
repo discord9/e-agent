@@ -348,3 +348,112 @@ pub async fn connect_all(workspace_root: &Path) -> (Vec<Box<dyn Tool>>, Vec<Stri
     }
     (tools, instructions)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal fake MCP server as a bash script: reads NDJSON lines from
+    /// stdin, responds to initialize / tools/list / tools/call.
+    const FAKE_SERVER: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  case "$line" in
+    *initialize*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake"},"instructions":"fake instructions"}}\n' "$id"
+      ;;
+    *tools/list*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}\n' "$id"
+      ;;
+    *tools/call*)
+      text=$(printf '%s' "$line" | grep -o '"text":"[^"]*"' | head -1 | cut -d'"' -f4)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"you said: %s"}]}}\n' "$id" "$text"
+      ;;
+  esac
+done
+"#;
+
+    fn fake_server_config() -> McpServerConfig {
+        McpServerConfig {
+            command: vec!["/bin/bash".into(), "-c".into(), FAKE_SERVER.into()],
+            env: HashMap::new(),
+            cwd: None,
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_lists_tools_and_calls_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let (server, instructions) = McpServer::connect("fake", &fake_server_config(), temp.path())
+            .await
+            .unwrap();
+        assert_eq!(instructions.as_deref(), Some("fake instructions"));
+
+        let list = server.list_tools().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["name"], "echo");
+
+        let output = server
+            .call_tool("echo", json!({"text": "hello"}))
+            .await
+            .unwrap();
+        assert_eq!(output, "you said: hello");
+    }
+
+    #[tokio::test]
+    async fn missing_config_file_returns_default() {
+        let temp = tempfile::tempdir().unwrap();
+        // Isolate from any real user-level config.
+        // SAFETY: tests in this module run in the same process; setting
+        // XDG_CONFIG_HOME here could race with other tests reading the env,
+        // but no other test in this crate depends on it.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join("no-such-dir"));
+        }
+        let config = load_config(temp.path()).unwrap();
+        assert!(config.mcp.is_empty());
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_config_is_loaded() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join(".e-agent.json"),
+            r#"{"mcp":{"fake":{"command":["/bin/bash","-c","true"]}}}"#,
+        )
+        .unwrap();
+        let config = load_config(temp.path()).unwrap();
+        assert!(config.mcp.contains_key("fake"));
+        assert!(config.mcp["fake"].enabled);
+    }
+
+    #[tokio::test]
+    async fn connect_all_exposes_prefixed_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join(".e-agent.json"),
+            r#"{"mcp":{"fake":{"command":["/bin/bash","-c","PLACEHOLDER"]}}}"#,
+        )
+        .unwrap();
+        let script = std::fs::read_to_string(temp.path().join(".e-agent.json")).unwrap();
+        std::fs::write(
+            temp.path().join(".e-agent.json"),
+            script.replace(
+                "PLACEHOLDER",
+                &FAKE_SERVER.replace('"', "\\\"").replace('\n', "\\n"),
+            ),
+        )
+        .unwrap();
+        let (tools, instructions) = connect_all(temp.path()).await;
+        assert_eq!(instructions.len(), 1);
+        assert!(instructions[0].contains("fake instructions"));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].spec().name, "fake_echo");
+        let output = tools[0].execute(json!({"text": "hi"})).await.unwrap();
+        assert_eq!(output, "you said: hi");
+    }
+}

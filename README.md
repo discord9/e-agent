@@ -68,6 +68,32 @@ log; earlier messages stay persisted and visible in the TUI. Subsequent model
 calls use the latest summary plus everything after it. Compaction has no
 automatic trigger.
 
+## MCP (local servers)
+
+e-agent can connect to local MCP servers over stdio and expose their tools
+to the model with a `<server>_<tool>` name prefix. Configuration is read from
+the first existing of `<workspace>/.e-agent.json` or
+`~/.config/e-agent/config.json`:
+
+```json
+{
+  "mcp": {
+    "engram": {
+      "command": ["/path/to/engram", "mcp", "--tools=agent"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Each entry spawns `command` with the workspace as its current directory
+(override with `cwd`), plus optional `env`. Servers are connected one at a
+time at startup; a server that fails to start is skipped with a warning and
+does not abort the session. Server-provided instructions (from the MCP
+`initialize` response) are prepended to the model context as a system
+message on every call, but are not persisted in sessions. Only tools are
+supported — no resources, prompts, or server-initiated notifications.
+
 ## Environment
 
 - `OPENAI_API_KEY` — required API key.
@@ -84,8 +110,12 @@ include a preview of the response body. Provider requests time out after
 
 This is deliberately not a daemon, JSONL protocol,
 automatic compaction trigger, database, event store, subagent
-framework, permission framework, MCP/plugin host, multi-provider client,
+framework, permission framework, plugin host, multi-provider client,
 parallel tool executor, task scheduler, priority system, or concurrency pool.
+It does speak MCP to local stdio servers (tools only), but it does NOT do
+remote MCP over HTTP/SSE, OAuth, MCP resources/prompts, server-initiated
+notifications, `listChanged` refresh, server restart on crash, or concurrent
+server initialization.
 It has one model seam, one tool seam, and a configurable tool-round limit
 (default 32). Reasoning-model `reasoning_content` is persisted in the session
 for display/audit; it is never sent back to the API.

@@ -422,6 +422,9 @@ impl TuiState {
 
     fn push_message(&mut self, message: &Message) {
         match message {
+            Message::System { content } => {
+                self.push_line(format!("system: {}", preview(content, 500)), LineKind::Dim);
+            }
             Message::User { content } => {
                 if content.starts_with("[compacted summary of earlier conversation]") {
                     self.push_line(content.clone(), LineKind::Normal);

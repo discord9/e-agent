@@ -34,7 +34,7 @@ fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
                 pending = assistant.tool_calls.clone();
                 out.push(message);
             }
-            Message::User { .. } => {
+            Message::System { .. } | Message::User { .. } => {
                 flush(&mut pending, &mut out);
                 out.push(message);
             }
@@ -46,6 +46,12 @@ fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
+    /// System-prompt-style context (e.g. MCP server instructions). Sent to
+    /// the provider with role "system". Persisted if it ever lands in
+    /// history, but the current MCP context prefix is kept out of history.
+    System {
+        content: String,
+    },
     User {
         content: String,
     },
@@ -232,7 +238,7 @@ impl Agent {
     pub fn context(&self) -> Vec<Message> {
         let mut messages = Vec::new();
         if let Some(prefix) = &self.context_prefix {
-            messages.push(Message::User {
+            messages.push(Message::System {
                 content: prefix.clone(),
             });
         }
