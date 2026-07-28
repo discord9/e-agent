@@ -18,7 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::{Agent, AgentEvent, Message, preview};
 use crate::session::Session;
@@ -167,29 +167,27 @@ fn draw(
         .draw(|frame| {
             let [output, input] =
                 Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(frame.area());
-            let paragraph = Paragraph::new(
-                state
-                    .lines
-                    .iter()
-                    .flat_map(|line| {
-                        let style = if line.dim {
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::DIM)
-                        } else {
-                            Style::default()
-                        };
-                        line.text
-                            .split('\n')
-                            .map(move |segment| Line::styled(segment, style))
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .block(Block::default().borders(Borders::ALL).title("e-agent"))
-            .wrap(Wrap { trim: false });
-            let width = output.width.saturating_sub(2);
-            let height = usize::from(output.height.saturating_sub(2));
-            let max_scroll = wrapped_rows(&state.lines, width).saturating_sub(height);
+            let inner_width = usize::from(output.width).max(1);
+            let visual: Vec<Line> = state
+                .lines
+                .iter()
+                .flat_map(|line| {
+                    let style = if line.dim {
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default()
+                    };
+                    hard_wrap(&line.text, inner_width)
+                        .into_iter()
+                        .map(move |row| Line::styled(row, style))
+                })
+                .collect();
+            let total_rows = visual.len();
+            let paragraph = Paragraph::new(visual);
+            let height = usize::from(output.height);
+            let max_scroll = total_rows.saturating_sub(height);
             state.max_scroll = max_scroll;
             state.scroll = state.scroll.min(max_scroll);
             frame.render_widget(
@@ -222,17 +220,35 @@ fn is_exit(key: KeyEvent) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
-/// Approximate rendered rows for the scrollback. Each entry is split on
-/// embedded newlines first; every visual segment then occupies at least one
-/// row. Word-wrapping slack can make the real total slightly larger, so this
-/// estimate errs on the high side (blank rows at the bottom are acceptable;
-/// hidden content is not).
+/// Hard-wrap text at `width` terminal cells (char-boundary safe, CJK-aware).
+/// Rendering and scroll accounting share this function so bottom-following
+/// is exact instead of estimated.
+fn hard_wrap(text: &str, width: usize) -> Vec<&str> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for logical in text.split('\n') {
+        let mut start = 0;
+        let mut used = 0;
+        for (index, character) in logical.char_indices() {
+            let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if used > 0 && used + char_width > width {
+                rows.push(&logical[start..index]);
+                start = index;
+                used = 0;
+            }
+            used += char_width;
+        }
+        rows.push(&logical[start..]);
+    }
+    rows
+}
+
+#[cfg(test)]
 fn wrapped_rows(lines: &[DisplayLine], width: u16) -> usize {
     let width = usize::from(width.max(1));
     lines
         .iter()
-        .flat_map(|line| line.text.split('\n'))
-        .map(|segment| UnicodeWidthStr::width(segment) / width + 1)
+        .map(|line| hard_wrap(&line.text, width).len())
         .sum()
 }
 
@@ -264,9 +280,9 @@ impl TuiState {
         for message in messages {
             match message {
                 Message::User { content } => {
-                    if content.starts_with("[compacted summary of earlier conversation]")
-                        || content.starts_with("[background task ")
-                    {
+                    if content.starts_with("[compacted summary of earlier conversation]") {
+                        state.push_line(content.clone(), false);
+                    } else if content.starts_with("[background task ") {
                         state.push_line(content.clone(), true);
                     } else {
                         state.push_line(format!("you> {content}"), false);
@@ -618,8 +634,14 @@ mod tests {
                 dim: false,
             },
         ];
-        // 1 + 3 + ceil(25/10)+1 hard-wrap estimate
+        // 1 + 3 + exact hard wrap of 25 cells at width 10
         assert_eq!(wrapped_rows(&lines, 10), 1 + 3 + 3);
+        let cjk = vec![DisplayLine {
+            text: "你好世界".into(),
+            dim: false,
+        }];
+        // Each CJK char is 2 cells: "你好" then "世界" at width 5.
+        assert_eq!(wrapped_rows(&cjk, 5), 2);
     }
 
     #[test]
@@ -628,6 +650,9 @@ mod tests {
             Message::User {
                 content: "[background task 1 completed]\nexit code: 0".into(),
             },
+            Message::User {
+                content: "[compacted summary of earlier conversation]\nwe did things".into(),
+            },
             Message::Assistant(crate::agent::AssistantMessage {
                 content: Some("answer".into()),
                 tool_calls: vec![],
@@ -635,11 +660,12 @@ mod tests {
             }),
         ];
         let state = TuiState::from_transcript(&messages);
-        assert_eq!(state.lines.len(), 3);
-        assert!(state.lines[0].dim);
-        assert_eq!(state.lines[1].text, "thinking: plan");
-        assert!(state.lines[1].dim);
-        assert_eq!(state.lines[2].text, "answer");
-        assert!(!state.lines[2].dim);
+        assert_eq!(state.lines.len(), 4);
+        assert!(state.lines[0].dim, "background completion stays dim");
+        assert!(!state.lines[1].dim, "compacted summary uses normal color");
+        assert_eq!(state.lines[2].text, "thinking: plan");
+        assert!(state.lines[2].dim);
+        assert_eq!(state.lines[3].text, "answer");
+        assert!(!state.lines[3].dim);
     }
 }
