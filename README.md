@@ -24,8 +24,11 @@ are restored and replayed in the TUI on startup. Optional CLI overrides are `--b
 
 The available tools are `read_file`, `write_file`, `edit_file`, and `bash`.
 The three file tools use a capability-relative directory rooted at the
-canonical workspace (the current directory by default). Tool calls and their
-results are displayed as they happen; the final answer ends the turn.
+canonical workspace (the current directory by default). `read_file` pages long
+files by 1-indexed lines (optional `offset`/`limit`, default 2000 lines per
+read, capped at 64 KiB) and prints a continuation hint when more lines remain.
+Tool calls and their results are displayed as they happen; the final answer
+ends the turn.
 
 ## Safety boundaries
 
@@ -56,9 +59,9 @@ results are not persisted in sessions.
 ## Compaction
 
 Use `/compact` in the TUI or `--repl` to manually summarize earlier history.
-The agent keeps the most recent four messages intact, summarizes an older
-user-aligned prefix, and stores that summary as an ordinary user message in the
-session. Compaction has no automatic trigger.
+The agent keeps the current turn (everything after the last user prompt)
+intact, summarizes all earlier history, and stores that summary as an
+ordinary user message in the session. Compaction has no automatic trigger.
 
 ## Environment
 

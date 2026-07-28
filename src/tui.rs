@@ -331,13 +331,16 @@ impl TuiState {
             }
             KeyCode::Left => self.input.left(),
             KeyCode::Right => self.input.right(),
-            KeyCode::Home => self.input.home(),
-            KeyCode::End => self.input.end(),
+            KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => self.input.home(),
+            KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => self.input.end(),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
-            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
-                self.handle_scroll(key)
-            }
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => self.handle_scroll(key),
             KeyCode::Enter => {
                 let prompt = std::mem::take(&mut self.input.text);
                 self.input.cursor = 0;
@@ -354,6 +357,8 @@ impl TuiState {
             KeyCode::Down => self.scroll = self.scroll.saturating_add(1).min(self.max_scroll),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10).min(self.max_scroll),
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::End => self.follow(),
             _ => {}
         }
     }
@@ -590,6 +595,34 @@ mod tests {
         state.scroll = state.max_scroll;
         state.push_agent_event(AgentEvent::AssistantText("four".into()));
         assert_eq!(state.scroll, usize::MAX);
+    }
+
+    #[test]
+    fn home_and_end_jump_to_session_edges() {
+        let mut state = TuiState {
+            lines: vec![
+                DisplayLine {
+                    text: "one".into(),
+                    dim: false,
+                },
+                DisplayLine {
+                    text: "two".into(),
+                    dim: false,
+                },
+            ],
+            max_scroll: 42,
+            ..Default::default()
+        };
+        state.scroll = 10;
+        state.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(state.scroll, 0);
+        state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(state.scroll, usize::MAX);
+        state.input.insert("xy");
+        state.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(state.input.cursor, 0);
+        state.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(state.input.cursor, 2);
     }
 
     #[test]

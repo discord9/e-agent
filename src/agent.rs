@@ -5,7 +5,6 @@ use std::collections::VecDeque;
 use tokio::sync::mpsc;
 
 pub const MAX_TOOL_ROUNDS: usize = 32;
-pub const COMPACT_KEEP_LAST: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
@@ -146,14 +145,19 @@ impl Agent {
         result
     }
 
+    /// Summarize everything before the current turn (the messages after the
+    /// last user prompt) into a labelled user message. The current turn is
+    /// kept verbatim, which also guarantees the kept tail never starts with
+    /// an orphaned tool result or unmatched tool call.
     pub async fn compact(&mut self) -> anyhow::Result<String> {
-        let mut split = self.transcript.len().saturating_sub(COMPACT_KEEP_LAST);
-        while split < self.transcript.len()
-            && !matches!(&self.transcript[split], Message::User { .. })
-        {
-            split += 1;
-        }
-        if split == 0 || split == self.transcript.len() {
+        let Some(split) = self
+            .transcript
+            .iter()
+            .rposition(|message| matches!(message, Message::User { .. }))
+        else {
+            anyhow::bail!("nothing to compact");
+        };
+        if split == 0 {
             anyhow::bail!("nothing to compact");
         }
         let mut request = self.transcript[..split].to_vec();
@@ -734,7 +738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compacts_a_user_aligned_prefix_without_splitting_tool_results() {
+    async fn compacts_everything_before_the_current_turn() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let model = ScriptedModel {
             replies: vec![AssistantMessage {
@@ -745,17 +749,29 @@ mod tests {
             requests: requests.clone(),
         };
         let tool_call = call("call-1", "echo", r#"{"value":"old"}"#);
-        let tail = vec![
-            Message::User {
-                content: "follow up".into(),
-            },
-            Message::Assistant(AssistantMessage {
-                content: Some("noted".into()),
-                tool_calls: vec![],
-                reasoning: None,
-            }),
+        let current_turn = vec![
             Message::User {
                 content: "recent request".into(),
+            },
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![
+                    call("call-2", "bash", r#"{"command":"make"}"#),
+                    call("call-3", "bash", r#"{"command":"make test"}"#),
+                ],
+                reasoning: None,
+            }),
+            Message::Tool {
+                call_id: "call-2".into(),
+                name: "bash".into(),
+                content: "building".into(),
+                is_error: false,
+            },
+            Message::Tool {
+                call_id: "call-3".into(),
+                name: "bash".into(),
+                content: "still building".into(),
+                is_error: false,
             },
             Message::Assistant(AssistantMessage {
                 content: Some("recent answer".into()),
@@ -778,21 +794,28 @@ mod tests {
                 content: "old result".into(),
                 is_error: false,
             },
+            Message::User {
+                content: "follow up".into(),
+            },
+            Message::Assistant(AssistantMessage {
+                content: Some("noted".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
         ];
-        transcript.extend(tail.clone());
+        transcript.extend(current_turn.clone());
         let mut agent = Agent::new(Box::new(model), vec![]);
         agent.restore_transcript(transcript);
 
         assert_eq!(agent.compact().await.unwrap(), "summary text");
-        assert_eq!(agent.transcript().len(), COMPACT_KEEP_LAST + 1);
+        assert_eq!(agent.transcript().len(), current_turn.len() + 1);
         assert!(matches!(
             &agent.transcript()[0],
             Message::User { content } if content == "[compacted summary of earlier conversation]\nsummary text"
         ));
-        assert_eq!(&agent.transcript()[1..], tail.as_slice());
-        assert!(matches!(agent.transcript()[1], Message::User { .. }));
+        assert_eq!(&agent.transcript()[1..], current_turn.as_slice());
         let requests = requests.lock().unwrap();
-        assert_eq!(requests[0].len(), 4);
+        assert_eq!(requests[0].len(), 6);
         assert!(matches!(
             requests[0].last().unwrap(),
             Message::User { content } if content.contains("Summarize the earlier conversation")

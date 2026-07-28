@@ -12,6 +12,7 @@ use crate::agent::{AgentEvent, Tool, ToolSpec, preview};
 use crate::workspace::Workspace;
 
 const READ_LIMIT: usize = 64 * 1024;
+const DEFAULT_READ_LINES: usize = 2000;
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
 pub fn builtins(workspace: Workspace) -> Vec<Box<dyn Tool>> {
@@ -42,19 +43,51 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         spec(
             "read_file",
-            "Read a UTF-8-ish file from the workspace.",
-            json!({"path": {"type": "string", "description": "relative file path"}}),
+            "Read a UTF-8-ish file from the workspace. Lines are 1-indexed; long files are paged, \
+             use `offset` to continue reading.",
+            json!({
+                "path": {"type": "string", "description": "relative file path"},
+                "offset": {"type": "integer", "description": "first line to read, 1-indexed (default 1)"},
+                "limit": {"type": "integer", "description": format!("maximum lines to read (default {DEFAULT_READ_LINES})")}
+            }),
+            &["path"],
         )
     }
 
     async fn execute(&self, arguments: Value) -> Result<String, String> {
-        let bytes = self.workspace.read(required_string(&arguments, "path")?)?;
-        let truncated = bytes.len() > READ_LIMIT;
-        let mut text = String::from_utf8_lossy(&bytes[..bytes.len().min(READ_LIMIT)]).into_owned();
-        if truncated {
-            text.push_str("\n...[truncated]");
+        let offset = optional_usize(&arguments, "offset")?.unwrap_or(1);
+        if offset == 0 {
+            return Err("`offset` must be >= 1".into());
         }
-        Ok(text)
+        let limit = optional_usize(&arguments, "limit")?.unwrap_or(DEFAULT_READ_LINES);
+        if limit == 0 {
+            return Err("`limit` must be >= 1".into());
+        }
+        let bytes = self.workspace.read(required_string(&arguments, "path")?)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let total = lines.len();
+        let page: Vec<&str> = lines.iter().skip(offset - 1).take(limit).copied().collect();
+        let mut output = page.join("\n");
+        if output.len() > READ_LIMIT {
+            output.truncate(READ_LIMIT);
+            output.push_str("\n...[truncated]");
+        }
+        if offset > total && offset > 1 {
+            output = format!("[offset {offset} is past end of file ({total} lines)]");
+        } else {
+            let end = offset - 1 + page.len();
+            if end < total {
+                output.push_str(&format!(
+                    "\n[showing lines {offset}-{end} of {total}; use offset {} to continue]",
+                    end + 1
+                ));
+            }
+        }
+        if output.is_empty() {
+            output = "[empty file]".into();
+        }
+        Ok(output)
     }
 }
 
@@ -72,6 +105,7 @@ impl Tool for WriteFile {
                 "path": {"type": "string", "description": "relative file path"},
                 "content": {"type": "string", "description": "file contents"}
             }),
+            &["path", "content"],
         )
     }
 
@@ -98,6 +132,7 @@ impl Tool for EditFile {
                 "old": {"type": "string", "description": "exact existing text"},
                 "new": {"type": "string", "description": "replacement text"}
             }),
+            &["path", "old", "new"],
         )
     }
 
@@ -294,11 +329,11 @@ async fn run_bash(
     }
 }
 
-fn spec(name: &str, description: &str, properties: Value) -> ToolSpec {
+fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> ToolSpec {
     ToolSpec {
         name: name.into(),
         description: description.into(),
-        parameters: json!({"type": "object", "properties": properties, "required": properties.as_object().unwrap().keys().collect::<Vec<_>>() }),
+        parameters: json!({"type": "object", "properties": properties, "required": required}),
     }
 }
 
@@ -309,6 +344,20 @@ fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, Stri
         .get(name)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("`{name}` must be a string"))
+}
+
+fn optional_usize(arguments: &Value, name: &str) -> Result<Option<usize>, String> {
+    arguments
+        .as_object()
+        .ok_or("tool arguments must be a JSON object")?
+        .get(name)
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| format!("`{name}` must be a non-negative integer"))
+        })
+        .transpose()
 }
 
 fn optional_bool(arguments: &Value, name: &str) -> Result<bool, String> {
@@ -396,6 +445,88 @@ mod tests {
         );
         assert_eq!(edit(&temp, "two", "x").await.unwrap(), "file edited");
         assert_eq!(std::fs::read_to_string(path).unwrap(), "one x one");
+    }
+
+    async fn read(temp: &tempfile::TempDir, arguments: Value) -> Result<String, String> {
+        ReadFile {
+            workspace: Workspace::new(temp.path()).unwrap(),
+        }
+        .execute(arguments)
+        .await
+    }
+
+    #[tokio::test]
+    async fn read_pages_lines_with_a_continuation_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("file.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        assert_eq!(
+            read(&temp, json!({"path": "file.txt", "limit": 2}))
+                .await
+                .unwrap(),
+            "a\nb\n[showing lines 1-2 of 5; use offset 3 to continue]"
+        );
+        assert_eq!(
+            read(&temp, json!({"path": "file.txt", "offset": 3, "limit": 2}))
+                .await
+                .unwrap(),
+            "c\nd\n[showing lines 3-4 of 5; use offset 5 to continue]"
+        );
+        assert_eq!(
+            read(&temp, json!({"path": "file.txt", "offset": 5}))
+                .await
+                .unwrap(),
+            "e"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_reports_offset_past_end_and_empty_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("file.txt"), "a\nb\n").unwrap();
+        assert_eq!(
+            read(&temp, json!({"path": "file.txt", "offset": 9}))
+                .await
+                .unwrap(),
+            "[offset 9 is past end of file (2 lines)]"
+        );
+        std::fs::write(temp.path().join("empty.txt"), "").unwrap();
+        assert_eq!(
+            read(&temp, json!({"path": "empty.txt"})).await.unwrap(),
+            "[empty file]"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_truncates_long_lines_to_the_byte_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("file.txt"), "x".repeat(READ_LIMIT + 1)).unwrap();
+        let output = read(&temp, json!({"path": "file.txt"})).await.unwrap();
+        assert!(output.ends_with("\n...[truncated]"));
+        assert_eq!(output.len(), READ_LIMIT + "\n...[truncated]".len());
+    }
+
+    #[tokio::test]
+    async fn read_rejects_invalid_paging_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("file.txt"), "a\n").unwrap();
+        assert!(
+            read(&temp, json!({"path": "file.txt", "offset": 0}))
+                .await
+                .unwrap_err()
+                .contains(">= 1")
+        );
+        assert!(
+            read(&temp, json!({"path": "file.txt", "limit": 0}))
+                .await
+                .unwrap_err()
+                .contains(">= 1")
+        );
+        assert!(
+            read(&temp, json!({"path": "file.txt", "offset": "x"}))
+                .await
+                .unwrap_err()
+                .contains("non-negative integer")
+        );
     }
 
     #[tokio::test]
