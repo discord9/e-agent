@@ -1,4 +1,4 @@
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -126,7 +126,7 @@ impl Model for OpenAiModel {
 
 fn request_error(error: reqwest::Error) -> anyhow::Error {
     if error.is_timeout() {
-        anyhow!("provider request timed out")
+        anyhow::Error::new(error).context("provider request timed out")
     } else {
         anyhow::Error::new(error).context("provider request failed")
     }
