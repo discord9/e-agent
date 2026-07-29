@@ -135,6 +135,10 @@ impl Palette {
                 .fg(self.violet)
                 .bg(self.element)
                 .add_modifier(Modifier::BOLD),
+            LineKind::Thinking => Style::default()
+                .fg(self.violet)
+                .bg(self.background)
+                .add_modifier(Modifier::DIM),
         }
     }
 
@@ -1212,6 +1216,10 @@ enum LineKind {
     ToolError,
     /// Full-width banner marking where a compaction happened in the log.
     Compaction,
+    /// Model reasoning ("thinking: …"); a faint violet so it reads as
+    /// secondary yet stays distinct from the dark body text and from the
+    /// neutral grey of `Dim` system notices.
+    Thinking,
 }
 
 #[derive(Clone, Copy)]
@@ -1306,7 +1314,7 @@ impl TuiState {
                 {
                     self.push_line(
                         format!("thinking: {}", preview(reasoning, 1000)),
-                        LineKind::Dim,
+                        LineKind::Thinking,
                     );
                 }
                 if let Some(content) = message.content.as_deref().filter(|text| !text.is_empty()) {
@@ -1573,7 +1581,7 @@ impl TuiState {
                 if self.active_lane == Some(ActiveStreamLane::Reasoning) {
                     self.lines.last_mut().unwrap().text.push_str(&text);
                 } else {
-                    self.push_line(format!("thinking: {text}"), LineKind::Dim);
+                    self.push_line(format!("thinking: {text}"), LineKind::Thinking);
                     self.active_lane = Some(ActiveStreamLane::Reasoning);
                 }
             }
@@ -2344,7 +2352,7 @@ mod tests {
         state.push_final_answer("hello".into());
         assert_eq!(state.lines.len(), 2);
         assert_eq!(state.lines[0].text, "thinking: plan more");
-        assert_eq!(state.lines[0].kind, LineKind::Dim);
+        assert_eq!(state.lines[0].kind, LineKind::Thinking);
         assert_eq!(state.lines[1].text, "hello");
         assert_eq!(state.lines[1].kind, LineKind::Normal);
     }
@@ -2362,7 +2370,7 @@ mod tests {
         let thinking: Vec<_> = state
             .lines
             .iter()
-            .filter(|line| line.kind == LineKind::Dim)
+            .filter(|line| line.kind == LineKind::Thinking)
             .collect();
         assert_eq!(thinking.len(), 1, "reasoning must stay on one line");
         assert_eq!(thinking[0].text, "thinking: plan more");
@@ -2644,7 +2652,7 @@ mod tests {
             "compacted summary stays a muted notice"
         );
         assert_eq!(state.lines[2].text, "thinking: plan");
-        assert_eq!(state.lines[2].kind, LineKind::Dim);
+        assert_eq!(state.lines[2].kind, LineKind::Thinking);
         assert_eq!(state.lines[3].text, "answer");
         assert_eq!(state.lines[3].kind, LineKind::Normal);
     }
