@@ -163,7 +163,8 @@ async fn run() -> anyhow::Result<()> {
         // Persist immediately so a crash-before-first-turn cannot inject
         // the same notice again on the next launch.
         Session::append(&root, &session, std::slice::from_ref(&entry))?;
-        agent.restore_history(vec![entry]);
+        // Append (NOT restore_history, which would wipe the resumed history).
+        agent.push_entry(entry);
     }
     let mut persisted = agent.history().len();
     if legacy {

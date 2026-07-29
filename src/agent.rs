@@ -265,8 +265,18 @@ impl Agent {
     pub fn history(&self) -> &[SessionEntry] {
         &self.history
     }
+
+    /// Replace the whole history (session resume). To ADD one entry to an
+    /// already-loaded history, use [`Self::push_entry`] — calling this again
+    /// would wipe the restored entries.
     pub fn restore_history(&mut self, history: Vec<SessionEntry>) {
         self.history = history;
+    }
+
+    /// Append a single entry to the history (e.g. a startup notice injected
+    /// after resume).
+    pub fn push_entry(&mut self, entry: SessionEntry) {
+        self.history.push(entry);
     }
 
     /// Messages sent to the provider: the latest compaction summary plus
