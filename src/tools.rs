@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reqwest::header::HeaderValue;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -14,18 +16,53 @@ use crate::workspace::Workspace;
 const READ_LIMIT: usize = 64 * 1024;
 const DEFAULT_READ_LINES: usize = 2000;
 const OUTPUT_LIMIT: usize = 64 * 1024;
+const WEB_SEARCH_ENDPOINT: &str = "https://api.exa.ai/context";
+const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+const WEB_SEARCH_QUERY_LIMIT: usize = 2000;
+const WEB_SEARCH_TOKENS: u16 = 5000;
+const WEB_SEARCH_ERROR_PREVIEW_LIMIT: usize = 8 * 1024;
+const WEB_SEARCH_RESPONSE_LIMIT: usize = 128 * 1024;
 
 /// Built-in tools plus the shared background-task slots, exposed so that
 /// other tools (e.g. delegate) can schedule background work too.
 pub fn builtins(workspace: Workspace) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
+    builtins_with_exa_key(workspace, std::env::var("EXA_API_KEY").ok())
+}
+
+/// Builtin tools bound to an existing background-task registry.
+///
+/// Subagents use this path so their bash completions reach the parent while
+/// retaining the same optional web-search capability as the main agent.
+pub fn builtins_with_background(
+    workspace: Workspace,
+    background: BackgroundTasks,
+) -> Vec<Box<dyn Tool>> {
+    tools_with_background_and_exa_key(workspace, background, std::env::var("EXA_API_KEY").ok())
+}
+
+fn builtins_with_exa_key(
+    workspace: Workspace,
+    exa_api_key: Option<String>,
+) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
     let background = BackgroundTasks::new(Duration::from_secs(30 * 60));
-    let mut tools = file_tools(&workspace);
-    tools.push(Box::new(Bash {
-        workspace,
-        timeout: Duration::from_secs(30),
-        background: background.clone(),
-    }));
+    let tools = tools_with_background_and_exa_key(workspace, background.clone(), exa_api_key);
     (tools, background)
+}
+
+fn tools_with_background_and_exa_key(
+    workspace: Workspace,
+    background: BackgroundTasks,
+    exa_api_key: Option<String>,
+) -> Vec<Box<dyn Tool>> {
+    let mut tools = file_tools(&workspace);
+    tools.push(bash_tool(workspace, background));
+    if let Some(key) = exa_api_key
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty())
+    {
+        tools.push(Box::new(WebSearch::new(key)));
+    }
+    tools
 }
 
 /// File tools only; the bash tool is added by the caller so it can be
@@ -52,6 +89,172 @@ pub fn bash_tool(workspace: Workspace, background: BackgroundTasks) -> Box<dyn T
         timeout: Duration::from_secs(30),
         background,
     })
+}
+
+struct WebSearch {
+    api_key: String,
+    client: reqwest::Client,
+    endpoint: String,
+    timeout: Duration,
+}
+
+#[derive(Deserialize)]
+struct ExaContextResponse {
+    response: String,
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
+}
+
+impl WebSearch {
+    fn new(api_key: String) -> Self {
+        Self {
+            api_key,
+            client: web_search_client(),
+            endpoint: WEB_SEARCH_ENDPOINT.into(),
+            timeout: WEB_SEARCH_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(api_key: String, endpoint: String, timeout: Duration) -> Self {
+        Self {
+            api_key,
+            client: web_search_client(),
+            endpoint,
+            timeout,
+        }
+    }
+}
+
+fn web_search_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .expect("web search client configuration is valid")
+}
+
+#[async_trait]
+impl Tool for WebSearch {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "web_search".into(),
+            description: "Search public web documentation and code examples. Never include secrets, private source code, internal URLs, or personal data in the query.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "A specific public-web research query."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String, String> {
+        let query = required_string(&arguments, "query")?.trim();
+        if query.is_empty() {
+            return Err("`query` must not be empty".into());
+        }
+        if query.chars().count() > WEB_SEARCH_QUERY_LIMIT {
+            return Err(format!(
+                "`query` must be at most {WEB_SEARCH_QUERY_LIMIT} characters"
+            ));
+        }
+        let mut api_key: HeaderValue = self
+            .api_key
+            .parse()
+            .map_err(|_| "web search API key is invalid".to_string())?;
+        api_key.set_sensitive(true);
+
+        let mut response = self
+            .client
+            .post(&self.endpoint)
+            .timeout(self.timeout)
+            .header("x-api-key", api_key)
+            .json(&json!({"query": query, "tokensNum": WEB_SEARCH_TOKENS}))
+            .send()
+            .await
+            .map_err(|_| "web search request failed".to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let (body, truncated) =
+                read_response_prefix(&mut response, WEB_SEARCH_ERROR_PREVIEW_LIMIT)
+                    .await
+                    .map_err(|_| format!("web search failed with status {status}"))?;
+            let mut context = truncate_utf8(
+                String::from_utf8_lossy(&body).into_owned(),
+                WEB_SEARCH_ERROR_PREVIEW_LIMIT,
+            );
+            if truncated {
+                context = truncate_utf8(
+                    format!("{context}\n...[truncated]"),
+                    WEB_SEARCH_ERROR_PREVIEW_LIMIT,
+                );
+            }
+            let error = if context.is_empty() {
+                format!("web search failed with status {status}")
+            } else {
+                format!("web search failed with status {status}: {context}")
+            };
+            return Err(redact_api_key(error, &self.api_key));
+        }
+
+        let (body, truncated) = read_response_prefix(&mut response, WEB_SEARCH_RESPONSE_LIMIT)
+            .await
+            .map_err(|_| "web search response body failed".to_string())?;
+        if truncated {
+            return Err(format!(
+                "web search response body exceeds {WEB_SEARCH_RESPONSE_LIMIT} bytes"
+            ));
+        }
+        let context: ExaContextResponse = serde_json::from_slice(&body)
+            .map_err(|_| "web search returned malformed JSON or no response".to_string())?;
+        let _ = context.request_id;
+        Ok(truncate_utf8(
+            redact_api_key(context.response, &self.api_key),
+            OUTPUT_LIMIT,
+        ))
+    }
+}
+
+async fn read_response_prefix(
+    response: &mut reqwest::Response,
+    limit: usize,
+) -> Result<(Vec<u8>, bool), reqwest::Error> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        let room = limit.saturating_sub(bytes.len());
+        if chunk.len() > room {
+            bytes.extend_from_slice(&chunk[..room]);
+            return Ok((bytes, true));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((bytes, false))
+}
+
+fn truncate_utf8(mut text: String, limit: usize) -> String {
+    if text.len() <= limit {
+        return text;
+    }
+    let marker = "\n...[truncated]";
+    let mut end = limit.saturating_sub(marker.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    if limit >= marker.len() {
+        text.push_str(marker);
+    }
+    text
+}
+
+fn redact_api_key(text: String, api_key: &str) -> String {
+    text.replace(api_key, "[redacted]")
 }
 
 struct ReadFile {
@@ -602,9 +805,322 @@ fn format_output(code: Option<i32>, stdout: &Captured, stderr: &Captured) -> Str
 mod tests {
     use std::time::Duration;
 
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use super::*;
+
+    fn web_search(endpoint: String) -> WebSearch {
+        WebSearch::for_test("test-api-key".into(), endpoint, Duration::from_secs(1))
+    }
+
+    fn http_response(status: &str, body: impl AsRef<[u8]>) -> Vec<u8> {
+        let body = body.as_ref();
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn redirect_response(location: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        let header_end = loop {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "client closed before completing its request");
+            request.extend_from_slice(&buffer[..count]);
+            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        while request.len() < header_end + content_length {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "client closed before sending its request body");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        request
+    }
+
+    async fn web_server(
+        response: Vec<u8>,
+        delay: Duration,
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/context", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let _ = socket.write_all(&response).await;
+            request
+        });
+        (endpoint, task)
+    }
+
+    #[test]
+    fn web_search_spec_exposes_only_query() {
+        assert_eq!(
+            WebSearch::new("key".into()).spec(),
+            ToolSpec {
+                name: "web_search".into(),
+                description: "Search public web documentation and code examples. Never include secrets, private source code, internal URLs, or personal data in the query.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "A specific public-web research query."
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn web_search_registration_requires_a_nonempty_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+        let local_tools = vec![
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "edit_file".to_string(),
+            "bash".to_string(),
+        ];
+        for key in [None, Some("   ".into())] {
+            let (tools, _) = builtins_with_exa_key(workspace.clone(), key);
+            let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
+            assert_eq!(names, local_tools);
+        }
+        let (tools, _) = builtins_with_exa_key(workspace, Some(" key ".into()));
+        let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
+        assert_eq!(
+            names,
+            ["read_file", "write_file", "edit_file", "bash", "web_search"].map(String::from)
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_sends_the_expected_request_and_returns_response() {
+        let (endpoint, server) = web_server(
+            http_response(
+                "200 OK",
+                br#"{"response":"public test-api-key context","requestId":"id"}"#,
+            ),
+            Duration::ZERO,
+        )
+        .await;
+        let result = web_search(endpoint)
+            .execute(json!({"query": "  Rust ownership docs  "}))
+            .await
+            .unwrap();
+        assert_eq!(result, "public [redacted] context");
+
+        let request = server.await.unwrap();
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        assert!(headers.starts_with("POST /context HTTP/1.1\r\n"));
+        assert!(headers.contains("x-api-key: test-api-key\r\n"));
+        assert!(headers.contains("content-type: application/json\r\n"));
+        let body: Value = serde_json::from_slice(&request[header_end..]).unwrap();
+        assert_eq!(
+            body,
+            json!({"query": "Rust ownership docs", "tokensNum": 5000})
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_validates_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/context", listener.local_addr().unwrap());
+        let tool = web_search(endpoint.clone());
+        for arguments in [
+            json!({"query": ""}),
+            json!({"query": "   "}),
+            json!({"query": 7}),
+            json!({"query": "界".repeat(WEB_SEARCH_QUERY_LIMIT + 1)}),
+        ] {
+            assert!(tool.execute(arguments).await.is_err());
+        }
+        let invalid_key_tool =
+            WebSearch::for_test("invalid\nkey".into(), endpoint, Duration::from_secs(1));
+        let error = invalid_key_tool
+            .execute(json!({"query": "public query"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "web search API key is invalid");
+        assert!(!error.contains("invalid\nkey"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_provider_errors_are_bounded_and_redact_the_key() {
+        for status in [
+            "401 Unauthorized",
+            "402 Payment Required",
+            "429 Too Many Requests",
+            "500 Internal Server Error",
+        ] {
+            let (endpoint, server) = web_server(
+                http_response(
+                    status,
+                    format!("provider error for test-api-key ({status})"),
+                ),
+                Duration::ZERO,
+            )
+            .await;
+            let error = web_search(endpoint)
+                .execute(json!({"query": "public query"}))
+                .await
+                .unwrap_err();
+            assert!(error.contains(status.split_whitespace().next().unwrap()));
+            assert!(error.contains("provider error"));
+            assert!(!error.contains("test-api-key"));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn web_search_does_not_follow_redirects() {
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("http://{}/context", second.local_addr().unwrap());
+        let (endpoint, first) = web_server(redirect_response(&location), Duration::ZERO).await;
+
+        let error = web_search(endpoint)
+            .execute(json!({"query": "public query"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("302"));
+        first.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second.accept())
+                .await
+                .is_err(),
+            "redirect target received a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_handles_malformed_missing_and_unavailable_responses() {
+        for body in [
+            br#"{"response":"unterminated"#.as_slice(),
+            br#"{}"#.as_slice(),
+        ] {
+            let (endpoint, server) =
+                web_server(http_response("200 OK", body), Duration::ZERO).await;
+            assert!(
+                web_search(endpoint)
+                    .execute(json!({"query": "public query"}))
+                    .await
+                    .unwrap_err()
+                    .contains("malformed JSON or no response")
+            );
+            server.await.unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/context", listener.local_addr().unwrap());
+        drop(listener);
+        assert_eq!(
+            web_search(endpoint)
+                .execute(json!({"query": "public query"}))
+                .await
+                .unwrap_err(),
+            "web search request failed"
+        );
+
+        let (endpoint, server) = web_server(
+            http_response("200 OK", br#"{"response":"late"}"#),
+            Duration::from_millis(250),
+        )
+        .await;
+        let timeout_tool =
+            WebSearch::for_test("test-api-key".into(), endpoint, Duration::from_millis(25));
+        assert_eq!(
+            timeout_tool
+                .execute(json!({"query": "public query"}))
+                .await
+                .unwrap_err(),
+            "web search request failed"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_search_caps_success_and_error_bodies() {
+        let response = json!({"response": "界".repeat(OUTPUT_LIMIT / 2)}).to_string();
+        let (endpoint, server) =
+            web_server(http_response("200 OK", response), Duration::ZERO).await;
+        let result = web_search(endpoint)
+            .execute(json!({"query": "public query"}))
+            .await
+            .unwrap();
+        assert!(result.len() <= OUTPUT_LIMIT);
+        assert!(result.is_char_boundary(result.len()));
+        assert!(result.ends_with("\n...[truncated]"));
+        server.await.unwrap();
+
+        let response = json!({"response": "x".repeat(WEB_SEARCH_RESPONSE_LIMIT * 2)}).to_string();
+        let (endpoint, server) =
+            web_server(http_response("200 OK", response), Duration::ZERO).await;
+        assert!(
+            web_search(endpoint)
+                .execute(json!({"query": "public query"}))
+                .await
+                .unwrap_err()
+                .contains("response body exceeds")
+        );
+        server.await.unwrap();
+
+        let (endpoint, server) = web_server(
+            http_response(
+                "500 Internal Server Error",
+                "e".repeat(WEB_SEARCH_ERROR_PREVIEW_LIMIT * 2),
+            ),
+            Duration::ZERO,
+        )
+        .await;
+        let error = web_search(endpoint)
+            .execute(json!({"query": "public query"}))
+            .await
+            .unwrap_err();
+        assert!(
+            error.len()
+                <= "web search failed with status 500 Internal Server Error: ".len()
+                    + WEB_SEARCH_ERROR_PREVIEW_LIMIT
+        );
+        assert!(error.ends_with("\n...[truncated]"));
+        server.await.unwrap();
+    }
 
     async fn edit(temp: &tempfile::TempDir, old: &str, new: &str) -> Result<String, String> {
         EditFile {

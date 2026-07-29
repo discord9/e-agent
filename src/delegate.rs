@@ -5,10 +5,11 @@
 //! keeps all subagent state (history, pending background results, token
 //! counts) fully isolated from the parent agent.
 //!
-//! The subagent gets the builtin file/bash tools (no MCP tools, no `delegate`
-//! itself — depth is capped at 1 by construction). In background mode the
-//! answer is delivered as a [`AgentEvent::BackgroundCompleted`] through the
-//! parent's event channel, waking an idle agent (see Slice 1).
+//! The subagent gets the builtin file/bash tools and, when configured, public
+//! web search (no MCP tools, no `delegate` itself — depth is capped at 1 by
+//! construction). In background mode the answer is delivered as a
+//! [`AgentEvent::BackgroundCompleted`] through the parent's event channel,
+//! waking an idle agent (see Slice 1).
 //!
 //! Every background subagent is exposed through a [`LiveSession`] handle
 //! (see `handle.rs`): frontends attach to it for a full live view and can
@@ -186,8 +187,7 @@ impl Delegate {
                 Err(error) => return format!("cannot build subagent runtime: {error}"),
             };
             runtime.block_on(async move {
-                let mut tools = crate::tools::file_tools(&workspace);
-                tools.push(crate::tools::bash_tool(workspace, background));
+                let tools = crate::tools::builtins_with_background(workspace, background);
                 let mut agent =
                     Agent::new(Box::new(model), tools).max_tool_rounds(SUBAGENT_MAX_ROUNDS);
                 // A bare single-user-message request is rejected by some
@@ -197,7 +197,7 @@ impl Delegate {
                 agent.set_context_prefix(format!(
                     "You are a subagent inside the e-agent coding assistant (running on the \
                      `{role}` model). Work autonomously on the delegated task with the \
-                     file/bash tools, then return a concise final answer."
+                     file/bash tools and, when configured, public web search, then return a concise final answer."
                 ));
                 let (sink, mut source) = match steering {
                     Some((sink, source)) => {
@@ -347,7 +347,7 @@ impl Tool for Delegate {
             "Spawn a subagent with a fresh context to work on a task and return its \
                 final answer. Use this for self-contained subtasks (searching, reading many files, \
                 focused edits) whose intermediate steps would clutter your own context. The \
-                subagent has the file and bash tools but cannot delegate further."
+                subagent has the file and bash tools and, when configured, public web search, but cannot delegate further."
                 .to_owned();
         let model = self.subagent_model.name();
         description.push_str(&format!(" The subagent runs on the `{model}` model."));

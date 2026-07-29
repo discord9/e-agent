@@ -97,7 +97,11 @@ Keys in the TUI: Esc always leaves the current view — it detaches from a
 subagent view, closes the tasks panel, or (at the plain idle prompt) quits
 the app; it never cancels a turn. Ctrl-C cancels the in-flight turn.
 
-The available tools are `read_file`, `write_file`, `edit_file`, and `bash`.
+The four always-present tools are `read_file`, `write_file`, `edit_file`, and
+`bash`. When `EXA_API_KEY` is set to a non-whitespace value, `web_search` is a
+fifth tool that searches public documentation and code examples through the Exa
+Context API. OpenCode's own Exa configuration is not inherited; export
+`EXA_API_KEY` for e-agent.
 The three file tools use a capability-relative directory rooted at the
 canonical workspace (the current directory by default). `read_file` pages long
 files by 1-indexed lines (optional `offset`/`limit`, default 2000 lines per
@@ -117,6 +121,14 @@ not sandboxed: commands can access files outside the workspace, environment
 variables, and the network. On Unix, timed-out commands are killed as a process
 group; on non-Unix platforms only the direct child is killed. stdout and stderr
 are each captured up to 64 KiB, then drained and marked as truncated.
+
+Every `web_search` query is disclosed to Exa, a third party. Never include
+credentials, tokens, private repository contents, customer data, personal data,
+private issue text, or internal URLs. Returned text is untrusted web content:
+it may contain prompt injection, insecure code, or false claims. The tool does
+not open links, execute returned code, or fetch arbitrary URLs. This guidance
+is not a sandbox and cannot guarantee that a model will not disclose sensitive
+context.
 
 ## Background tasks
 
@@ -142,9 +154,9 @@ clutter the main context.
 
 Each subagent runs on its own OS thread with its own tokio runtime, its own
 background-task slots, and an empty history — it shares no state with the
-parent. It gets only the builtin file/bash tools: no MCP tools and no
-`delegate` itself, so delegation depth is capped at 1 by construction. It is
-limited to 32 tool rounds.
+parent. It gets the same builtins as its parent: file/bash tools and, when
+configured, `web_search`; no MCP tools and no `delegate` itself, so delegation
+depth is capped at 1 by construction. It is limited to 32 tool rounds.
 
 With `background: true` the subagent runs without blocking and its answer is
 delivered as a background task completion (waking an idle agent). Sync mode
@@ -197,6 +209,8 @@ supported — no resources, prompts, or server-initiated notifications.
 - `OPENAI_API_KEY` — required in environment-variable mode.
 - `OPENAI_BASE_URL` — API base URL, default: `https://api.openai.com/v1`.
 - `OPENAI_MODEL` — model name, default: `gpt-4o-mini`.
+- `EXA_API_KEY` — optional; a non-whitespace value enables `web_search` through
+  Exa Context.
 - `RUST_BACKTRACE=1` — optional; appends a backtrace to printed error chains.
 
 TOML config is optional. When present, it supplies the selected provider
@@ -229,3 +243,6 @@ It has one model seam and one tool seam. Main-agent tool rounds are unlimited
 unless `--max-rounds` sets an explicit cap; subagents remain capped at 32.
 Reasoning-model `reasoning_content` is persisted in the session for
 display/audit; it is never sent back to the API.
+Web search deliberately has no browser, crawler, URL fetch, citations, domain
+filters, multiple providers or provider trait, retries, cache, background
+search, or remote MCP support.
