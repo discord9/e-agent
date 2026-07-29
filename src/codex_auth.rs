@@ -433,6 +433,7 @@ fn usable_account(tokens: &Tokens) -> anyhow::Result<String> {
         .clone()
         .filter(|v| !v.is_empty())
         .or_else(|| jwt_metadata(&tokens.id_token).and_then(|m| m.account_id))
+        .or_else(|| jwt_metadata(&tokens.access_token).and_then(|m| m.account_id))
         .ok_or_else(|| anyhow!("ChatGPT login has no usable account id; run `e-agent login` again"))
 }
 
@@ -598,6 +599,17 @@ mod tests {
             ) & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn usable_account_falls_back_to_access_token_claim() {
+        let tokens = Tokens {
+            id_token: jwt(serde_json::json!({"exp": 2_000_000_000i64})),
+            access_token: jwt(serde_json::json!({ACCOUNT_CLAIM: "access-account"})),
+            refresh_token: "refresh".into(),
+            account_id: None,
+        };
+        assert_eq!(usable_account(&tokens).unwrap(), "access-account");
     }
 
     #[test]
