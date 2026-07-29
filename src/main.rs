@@ -1,7 +1,7 @@
 use std::io::{IsTerminal, Read, Write};
 
 use anyhow::{Context, anyhow};
-use e_agent::agent::{Agent, AgentEvent, preview};
+use e_agent::agent::{Agent, AgentEvent, Model, preview};
 use e_agent::config::Config;
 use e_agent::delegate::Delegate;
 use e_agent::mcp;
@@ -109,6 +109,7 @@ async fn run() -> anyhow::Result<()> {
             OpenAiModel::from_env(base_url, model)?
         }
     };
+    let model_name = model.name().to_owned();
     let (mut tools, background) = builtins(workspace.clone());
     let mcp_servers = config.map(|config| config.mcp).unwrap_or_default();
     let (mcp_tools, mcp_instructions) = mcp::connect_all(mcp_servers, &root).await;
@@ -140,6 +141,7 @@ async fn run() -> anyhow::Result<()> {
             persisted,
             background,
             subagent_sessions,
+            model_name,
         )
         .await;
     }

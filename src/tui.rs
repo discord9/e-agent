@@ -15,14 +15,14 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::agent::{Agent, AgentEvent, Message, SessionEntry, Usage, preview};
+use crate::agent::{Agent, AgentEvent, Message, SessionEntry, preview};
 use crate::delegate::Sessions;
 use crate::handle::SessionHandle;
 use crate::session::Session;
@@ -226,6 +226,7 @@ pub async fn run(
     mut persisted: usize,
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
+    model_name: String,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -233,16 +234,28 @@ pub async fn run(
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    let labels = InputLabels {
+        session: session_name,
+        model: model_name,
+        cwd: root.display().to_string(),
+    };
     run_inner(
         &mut terminal,
         &mut agent,
         &root,
-        &session_name,
+        &labels,
         &mut persisted,
         background,
         sessions,
     )
     .await
+}
+
+/// Text painted around the input box border (session id, model, cwd).
+struct InputLabels {
+    session: String,
+    model: String,
+    cwd: String,
 }
 
 struct TerminalGuard;
@@ -263,7 +276,7 @@ async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent: &mut Agent,
     root: &std::path::Path,
-    session_name: &str,
+    labels: &InputLabels,
     persisted: &mut usize,
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
@@ -287,7 +300,10 @@ async fn run_inner(
     });
     let mut events = EventStream::new();
     let mut state = TuiState::from_history(agent.history());
-    state.session_id = session_name.to_owned();
+    state.session_id = labels.session.clone();
+    state.model_name = labels.model.clone();
+    state.cwd = labels.cwd.clone();
+
     state.background = Some(background);
     let probe = sessions.clone();
     state.attachable = Some(Box::new(move |id| probe.get(id).is_some()));
@@ -313,7 +329,7 @@ async fn run_inner(
                     terminal,
                     agent,
                     &mut ui,
-                    (root, session_name, persisted),
+                    (root, &labels.session, persisted),
                     String::new(),
                 )
                 .await?
@@ -335,7 +351,7 @@ async fn run_inner(
                         terminal,
                         agent,
                         &mut ui,
-                        (root, session_name, persisted),
+                        (root, &labels.session, persisted),
                         next,
                     )
                     .await?
@@ -405,7 +421,7 @@ async fn run_inner(
                                 }
                             }
                         }
-                        Session::append(root, session_name, &agent.history()[*persisted..])?;
+                        Session::append(root, &labels.session, &agent.history()[*persisted..])?;
                         *persisted = agent.history().len();
                         if matches!(interruption, Some(Interruption::ExitApp)) {
                             return Ok(());
@@ -430,7 +446,7 @@ async fn run_inner(
                         terminal,
                         agent,
                         &mut ui,
-                        (root, session_name, persisted),
+                        (root, &labels.session, persisted),
                         prompt,
                     )
                     .await?
@@ -452,7 +468,7 @@ async fn run_inner(
                             terminal,
                             agent,
                             &mut ui,
-                            (root, session_name, persisted),
+                            (root, &labels.session, persisted),
                             next,
                         )
                         .await?
@@ -820,18 +836,31 @@ fn draw<B: ratatui::backend::Backend>(
                 ));
                 return;
             }
+            // Input-box chrome: top-left = status, top-right = session id,
+            // bottom-left = model (agent role goes here later), bottom-right =
+            // cwd + context tokens.
             let title = match state.busy {
-                Some(BusyState::Thinking) => format!("{} · thinking…", state.session_id),
-                Some(BusyState::Compacting) => format!("{} · compaction…", state.session_id),
-                None => state.session_id.clone(),
+                Some(BusyState::Thinking) => "thinking…".to_owned(),
+                Some(BusyState::Compacting) => "compaction…".to_owned(),
+                None => String::new(),
             };
-            let input_block = SOLARIZED_LIGHT.block(title);
-            let usage = (state.tokens.context > 0).then(|| {
+            let input_block = SOLARIZED_LIGHT
+                .block(title)
+                .title_top(
+                    Line::from(state.session_id.clone())
+                        .alignment(Alignment::Right)
+                        .style(Style::default().fg(SOLARIZED_LIGHT.muted)),
+                )
+                .title_bottom(
+                    Line::from(state.model_name.clone())
+                        .alignment(Alignment::Left)
+                        .style(Style::default().fg(SOLARIZED_LIGHT.violet)),
+                );
+            let usage = (state.tokens_context > 0).then(|| {
                 format!(
-                    "ctx {} ↑{} ↓{}",
-                    format_tokens(state.tokens.context),
-                    format_tokens(state.tokens.session.input_tokens),
-                    format_tokens(state.tokens.session.output_tokens)
+                    "{} · ctx {}",
+                    state.cwd,
+                    format_tokens(state.tokens_context)
                 )
             });
             let (cursor_row, cursor_col) = state.input.wrapped_cursor(inner_input_width);
@@ -959,6 +988,8 @@ struct TuiState {
     /// This session's id, shown in the input border (so it can be resumed
     /// later with --session).
     session_id: String,
+    model_name: String,
+    cwd: String,
     input: InputBuffer,
     lines: Vec<DisplayLine>,
     scroll: usize,
@@ -966,7 +997,7 @@ struct TuiState {
     busy: Option<BusyState>,
     streamed: bool,
     active_lane: Option<ActiveStreamLane>,
-    tokens: TokenDisplay,
+    tokens_context: u64,
     /// Prompts submitted while a turn is in flight; drained (never persisted)
     /// once the current turn ends.
     queued: Vec<String>,
@@ -1027,12 +1058,6 @@ impl AttachedView {
             _ => {}
         }
     }
-}
-
-#[derive(Default)]
-struct TokenDisplay {
-    context: u64,
-    session: Usage,
 }
 
 struct DisplayLine {
@@ -1338,14 +1363,8 @@ impl TuiState {
                 format!("background task {id} finished: {}", preview(&output, 500)),
                 LineKind::Dim,
             ),
-            AgentEvent::Usage {
-                context_input,
-                session,
-            } => {
-                self.tokens = TokenDisplay {
-                    context: context_input,
-                    session,
-                };
+            AgentEvent::Usage { context_input, .. } => {
+                self.tokens_context = context_input;
             }
         }
         if ends_delta {

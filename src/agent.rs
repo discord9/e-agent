@@ -158,6 +158,11 @@ pub trait Model: Send {
         tools: &[ToolSpec],
         on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
     ) -> anyhow::Result<(AssistantMessage, Option<Usage>)>;
+
+    /// Display name for the UI (e.g. input-box label). Defaults to "?".
+    fn name(&self) -> &str {
+        "?"
+    }
 }
 
 #[async_trait]

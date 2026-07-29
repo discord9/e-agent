@@ -67,6 +67,10 @@ impl OpenAiModel {
 
 #[async_trait::async_trait]
 impl Model for OpenAiModel {
+    fn name(&self) -> &str {
+        &self.model
+    }
+
     async fn complete(
         &mut self,
         messages: &[Message],
