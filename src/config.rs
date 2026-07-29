@@ -350,7 +350,7 @@ model = "k3"
 [providers.chatgpt]
 auth = "chatgpt"
 [models."chatgpt/codex"]
-model = "gpt-5.2-codex"
+model = "gpt-5.6-sol"
 "#,
         );
         let resolved = Config::from_path(&good)

@@ -39,8 +39,8 @@ do not accept an API key or base URL:
 [providers.chatgpt]
 auth = "chatgpt"
 
-[models."chatgpt/gpt-5.2-codex"]
-model = "gpt-5.2-codex"
+[models."chatgpt/gpt-5.6-sol"]
+model = "gpt-5.6-sol"
 reasoning_effort = "high"
 ```
 
