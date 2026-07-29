@@ -2,6 +2,7 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -35,6 +36,8 @@ struct UiEvent {
     session: u64,
     event: AgentEvent,
 }
+
+type UiEventStream = futures_util::stream::Peekable<EventStream>;
 
 /// The one built-in look for the deliberately small TUI. This mirrors the
 /// adjusted Solarized Light OpenCode theme instead of offering a theme system.
@@ -298,7 +301,7 @@ async fn run_inner(
             }
         }
     });
-    let mut events = EventStream::new();
+    let mut events = EventStream::new().peekable();
     let mut state = TuiState::from_history(agent.history());
     state.session_id = labels.session.clone();
     state.model_name = labels.model.clone();
@@ -381,6 +384,10 @@ async fn run_inner(
                 if state.attached.is_some() {
                     if key.code == KeyCode::Esc {
                         state.detach();
+                    } else if is_scroll_key(key) {
+                        let attached = state.attached.as_mut().unwrap();
+                        attached.state.handle_scroll(key);
+                        drain_ready_scroll_keys(&mut events, &mut attached.state).await;
                     } else {
                         let width = attached_input_width(terminal)?;
                         state.handle_attached_key(key, width);
@@ -390,7 +397,10 @@ async fn run_inner(
                 if is_exit(key) {
                     return Ok(());
                 }
-                if let Some(prompt) = state.handle_key(key) {
+                if is_scroll_key(key) {
+                    state.handle_scroll(key);
+                    drain_ready_scroll_keys(&mut events, &mut state).await;
+                } else if let Some(prompt) = state.handle_key(key) {
                     if prompt == "/compact" {
                         state.busy = Some(BusyState::Compacting);
                         state.streamed = false;
@@ -496,7 +506,7 @@ async fn run_inner(
 /// Bundles the per-run UI plumbing so `run_request` stays readable.
 struct Ui<'a> {
     state: &'a mut TuiState,
-    events: &'a mut EventStream,
+    events: &'a mut UiEventStream,
     inbox: &'a mut mpsc::UnboundedReceiver<UiEvent>,
     sessions: &'a Sessions,
     sender: &'a mpsc::UnboundedSender<UiEvent>,
@@ -557,7 +567,7 @@ enum Interruption {
 async fn drive<T>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut TuiState,
-    events: &mut EventStream,
+    events: &mut UiEventStream,
     inbox: &mut mpsc::UnboundedReceiver<UiEvent>,
     sessions: &Sessions,
     sender: &mpsc::UnboundedSender<UiEvent>,
@@ -617,8 +627,14 @@ async fn drive<T>(
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
                     && state.attached.is_some() =>
                 {
-                    let width = attached_input_width(terminal)?;
-                    state.handle_attached_key(key, width);
+                    if is_scroll_key(key) {
+                        let attached = state.attached.as_mut().unwrap();
+                        attached.state.handle_scroll(key);
+                        drain_ready_scroll_keys(events, &mut attached.state).await;
+                    } else {
+                        let width = attached_input_width(terminal)?;
+                        state.handle_attached_key(key, width);
+                    }
                     draw(terminal, state)?;
                 }
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
@@ -629,8 +645,10 @@ async fn drive<T>(
                         if let Some(prompt) = state.take_input() {
                             state.queued.push(prompt);
                         }
-                    } else {
+                    } else if is_scroll_key(key) {
                         state.handle_scroll(key);
+                        drain_ready_scroll_keys(events, state).await;
+                    } else {
                         state.edit_input(key);
                     }
                     draw(terminal, state)?;
@@ -936,6 +954,48 @@ fn format_tokens(count: u64) -> String {
         format!("{:.1}k", count as f64 / 1000.0)
     } else {
         count.to_string()
+    }
+}
+
+fn is_scroll_key(key: KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End
+    )
+}
+
+/// Apply a consecutive scroll-key burst until the stream stays quiet briefly.
+/// Peeking preserves the first unrelated event for the normal event loop.
+async fn drain_ready_scroll_keys<S>(
+    events: &mut futures_util::stream::Peekable<S>,
+    state: &mut TuiState,
+) where
+    S: futures_util::Stream<Item = io::Result<Event>> + Unpin,
+{
+    loop {
+        let Ok(next) = tokio::time::timeout(
+            Duration::from_millis(4),
+            std::pin::Pin::new(&mut *events).peek(),
+        )
+        .await
+        else {
+            break;
+        };
+        let Some(Ok(Event::Key(key))) = next else {
+            break;
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press || !is_scroll_key(*key) {
+            break;
+        }
+        let Some(Ok(Event::Key(key))) = events.next().await else {
+            unreachable!("peeked scroll key must remain available")
+        };
+        state.handle_scroll(key);
     }
 }
 
@@ -1724,6 +1784,100 @@ mod tests {
         assert_eq!(input.visual_rows(2), 2);
     }
 
+    #[tokio::test]
+    async fn ready_scroll_keys_are_coalesced_without_consuming_following_input() {
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let page_down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        let typing = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        let mut events = futures_util::stream::iter(vec![
+            Ok::<_, io::Error>(Event::Key(down)),
+            Ok(Event::Key(page_down)),
+            Ok(Event::Key(typing)),
+        ])
+        .peekable();
+        let mut state = TuiState {
+            max_scroll: 20,
+            ..Default::default()
+        };
+
+        state.handle_scroll(down);
+        drain_ready_scroll_keys(&mut events, &mut state).await;
+        assert_eq!(state.scroll, 12, "the ready scroll run is applied in order");
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(Event::Key(key))) if key == typing
+        ));
+
+        let mut step = 0;
+        let delayed_scroll = futures_util::stream::poll_fn(move |cx| match step {
+            0 => {
+                step = 1;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+            1 => {
+                step = 2;
+                std::task::Poll::Ready(Some(Ok::<_, io::Error>(Event::Key(down))))
+            }
+            _ => std::task::Poll::Ready(None),
+        });
+        let mut events = delayed_scroll
+            .chain(futures_util::stream::iter(vec![Ok(Event::Key(typing))]))
+            .peekable();
+        let mut state = TuiState {
+            max_scroll: 20,
+            ..Default::default()
+        };
+        state.handle_scroll(down);
+        drain_ready_scroll_keys(&mut events, &mut state).await;
+        assert_eq!(state.scroll, 2, "a woken scroll key joins the quiet window");
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(Event::Key(key))) if key == typing
+        ));
+
+        let (handle, _sink, _source) = crate::handle::session_channel();
+        let mut parent = TuiState {
+            scroll: 7,
+            ..Default::default()
+        };
+        parent.attach(1, "task".into(), Arc::new(handle));
+        let mut events = futures_util::stream::iter(vec![
+            Ok::<_, io::Error>(Event::Key(down)),
+            Ok(Event::Key(typing)),
+        ])
+        .peekable();
+        {
+            let attached = parent.attached.as_mut().unwrap();
+            attached.state.max_scroll = 20;
+            attached.state.scroll = 0;
+            attached.state.handle_scroll(down);
+            drain_ready_scroll_keys(&mut events, &mut attached.state).await;
+            assert_eq!(attached.state.scroll, 2);
+        }
+        assert_eq!(
+            parent.scroll, 7,
+            "attached coalescing leaves main scroll alone"
+        );
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(Event::Key(key))) if key == typing
+        ));
+
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Release,
+        );
+        let mut events =
+            futures_util::stream::iter(vec![Ok::<_, io::Error>(Event::Key(release))]).peekable();
+        drain_ready_scroll_keys(&mut events, &mut state).await;
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(Event::Key(key))) if key == release
+        ));
+    }
+
     #[test]
     fn cursor_sits_at_the_insertion_point() {
         let backend = ratatui::backend::TestBackend::new(20, 10);
@@ -1759,6 +1913,83 @@ mod tests {
         );
         assert_eq!(buffer[(0, 0)].bg, SOLARIZED_LIGHT.background);
         assert_eq!(buffer[(0, 9)].bg, SOLARIZED_LIGHT.panel);
+    }
+
+    #[test]
+    fn scrolling_redraw_keeps_blank_scrollback_cells_on_solarized_surfaces() {
+        let backend = ratatui::backend::TestBackend::new(12, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState {
+            lines: vec![
+                DisplayLine {
+                    text: "  leading and trailing  ".into(),
+                    kind: LineKind::Normal,
+                },
+                DisplayLine {
+                    text: "   ".into(),
+                    kind: LineKind::ToolCall,
+                },
+                DisplayLine {
+                    text: "+    7 wrapped diff text  ".into(),
+                    kind: LineKind::Added,
+                },
+                DisplayLine {
+                    text: "-    8 trailing   ".into(),
+                    kind: LineKind::Removed,
+                },
+            ],
+            ..Default::default()
+        };
+
+        state.follow();
+        draw(&mut terminal, &mut state).unwrap();
+        state.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        draw(&mut terminal, &mut state).unwrap();
+        assert_eq!(state.scroll, 0);
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].bg,
+            SOLARIZED_LIGHT.background,
+            "the leading blank cell on a normal line is repainted"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(0, 2)].bg,
+            SOLARIZED_LIGHT.element,
+            "all-space tool line has its semantic surface"
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        draw(&mut terminal, &mut state).unwrap();
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        draw(&mut terminal, &mut state).unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].bg,
+            SOLARIZED_LIGHT.element,
+            "scrolling reuses the terminal and repaints the all-space row"
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        draw(&mut terminal, &mut state).unwrap();
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        draw(&mut terminal, &mut state).unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].bg,
+            SOLARIZED_LIGHT.background,
+            "scrolling back up clears the tool surface from the leading blank cell"
+        );
+        state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        draw(&mut terminal, &mut state).unwrap();
+
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(12)
+                .take(5)
+                .flatten()
+                .all(|cell| cell.bg != Color::Reset),
+            "every output scrollback cell stays on an explicit Solarized surface after scrolling"
+        );
     }
 
     #[test]
