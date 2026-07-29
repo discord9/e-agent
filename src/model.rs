@@ -159,7 +159,12 @@ impl Model for OpenAiModel {
                 if let Some(reported) = choice.usage {
                     usage = Some(reported);
                 }
-                if let Some(delta) = choice.delta.content {
+                // Providers (kimi k3) interleave empty `content: ""` /
+                // `reasoning_content: ""` chunks into the stream. Forwarding
+                // them would flip the TUI's active stream lane and scatter a
+                // single reasoning/content line into many fragments, so skip
+                // empty deltas at the source.
+                if let Some(delta) = choice.delta.content.filter(|delta| !delta.is_empty()) {
                     content.push_str(&delta);
                     if let Some(callback) = &mut on_delta {
                         callback(
@@ -168,7 +173,11 @@ impl Model for OpenAiModel {
                         );
                     }
                 }
-                if let Some(delta) = choice.delta.reasoning_content {
+                if let Some(delta) = choice
+                    .delta
+                    .reasoning_content
+                    .filter(|delta| !delta.is_empty())
+                {
                     reasoning.push_str(&delta);
                     if let Some(callback) = &mut on_delta {
                         callback(ModelDeltaKind::Reasoning, &delta);

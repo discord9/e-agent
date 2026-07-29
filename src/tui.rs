@@ -552,7 +552,12 @@ async fn run_request(
 ) -> anyhow::Result<bool> {
     let (root, session_name, persisted) = session;
     ui.state.busy = Some(BusyState::thinking());
+    // Reset the per-turn stream state. A turn that ended on a plain text
+    // answer leaves active_lane = Content (no tool result reset it); without
+    // clearing it here the next turn's first delta would append onto the
+    // `you> …` user line, dyeing the whole reply in the user color.
     ui.state.streamed = false;
+    ui.state.active_lane = None;
     draw(terminal, ui.state)?;
     // Agent::run keeps turning until the model has reacted to every
     // background completion that arrived along the way, so one drive()
@@ -1259,7 +1264,7 @@ impl BusyState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ActiveStreamLane {
     Reasoning,
     Content,
@@ -1553,7 +1558,9 @@ impl TuiState {
                 self.push_line(format!("you> {text}"), LineKind::User);
             }
             AgentEvent::AssistantText(text) => self.push_line(text, LineKind::Normal),
-            AgentEvent::AssistantDelta(text) => {
+            // Empty deltas carry nothing; letting them flip the active lane
+            // would fragment a single line into many pieces.
+            AgentEvent::AssistantDelta(text) if !text.is_empty() => {
                 if self.active_lane == Some(ActiveStreamLane::Content) {
                     self.lines.last_mut().unwrap().text.push_str(&text);
                 } else {
@@ -1562,7 +1569,7 @@ impl TuiState {
                     self.active_lane = Some(ActiveStreamLane::Content);
                 }
             }
-            AgentEvent::ReasoningDelta(text) => {
+            AgentEvent::ReasoningDelta(text) if !text.is_empty() => {
                 if self.active_lane == Some(ActiveStreamLane::Reasoning) {
                     self.lines.last_mut().unwrap().text.push_str(&text);
                 } else {
@@ -1570,6 +1577,7 @@ impl TuiState {
                     self.active_lane = Some(ActiveStreamLane::Reasoning);
                 }
             }
+            AgentEvent::AssistantDelta(_) | AgentEvent::ReasoningDelta(_) => {}
             AgentEvent::ToolCall { name, arguments } => self.push_tool_call(&name, &arguments),
             AgentEvent::ToolResult { is_error, content } => {
                 self.push_tool_result(&content, is_error)
@@ -2339,6 +2347,61 @@ mod tests {
         assert_eq!(state.lines[0].kind, LineKind::Dim);
         assert_eq!(state.lines[1].text, "hello");
         assert_eq!(state.lines[1].kind, LineKind::Normal);
+    }
+
+    #[test]
+    fn empty_content_delta_does_not_split_the_reasoning_line() {
+        // kimi interleaves empty `content: ""` chunks into the reasoning
+        // stream. Each one must NOT flip the active lane, or the reasoning
+        // text scatters across many `thinking: ` lines.
+        let mut state = TuiState::default();
+        state.push_agent_event(AgentEvent::AssistantDelta("".into()));
+        state.push_agent_event(AgentEvent::ReasoningDelta("plan".into()));
+        state.push_agent_event(AgentEvent::AssistantDelta("".into()));
+        state.push_agent_event(AgentEvent::ReasoningDelta(" more".into()));
+        let thinking: Vec<_> = state
+            .lines
+            .iter()
+            .filter(|line| line.kind == LineKind::Dim)
+            .collect();
+        assert_eq!(thinking.len(), 1, "reasoning must stay on one line");
+        assert_eq!(thinking[0].text, "thinking: plan more");
+    }
+
+    #[test]
+    fn reply_after_plain_text_turn_does_not_append_to_the_user_line() {
+        // A turn ending on a plain text answer leaves active_lane = Content
+        // (no ToolCall/ToolResult reset it). run_request clears it per turn;
+        // simulate that reset, then the next turn's first delta must start a
+        // fresh Normal line instead of appending onto the `you> …` line.
+        let mut state = TuiState::default();
+        // turn 1: plain text answer, lane left as Content.
+        state.push_agent_event(AgentEvent::AssistantDelta("first answer".into()));
+        assert_eq!(state.active_lane, Some(ActiveStreamLane::Content));
+        // user submits the next prompt; run_request then resets the lane.
+        state.push_line("you> next question".into(), LineKind::User);
+        state.streamed = false;
+        state.active_lane = None; // the per-turn reset in run_request
+        // turn 2's first delta must open its own line.
+        state.push_agent_event(AgentEvent::AssistantDelta("second answer".into()));
+        assert_eq!(state.lines[1].text, "you> next question");
+        assert_eq!(state.lines[1].kind, LineKind::User);
+        assert_eq!(state.lines[2].text, "second answer");
+        assert_eq!(state.lines[2].kind, LineKind::Normal);
+    }
+
+    #[test]
+    fn without_a_lane_reset_the_reply_would_append_to_the_user_line() {
+        // Pin the failure mode the run_request reset prevents: a stale
+        // Content lane makes the next delta append onto the `you> …` line,
+        // keeping its User kind (the "reply dyed as user input" bug).
+        let mut state = TuiState::default();
+        state.push_agent_event(AgentEvent::AssistantDelta("first answer".into()));
+        state.push_line("you> next question".into(), LineKind::User);
+        // NO lane reset (the bug): the stale Content lane appends.
+        state.push_agent_event(AgentEvent::AssistantDelta("second".into()));
+        assert_eq!(state.lines[1].text, "you> next questionsecond");
+        assert_eq!(state.lines[1].kind, LineKind::User);
     }
 
     #[test]
