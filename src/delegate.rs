@@ -397,8 +397,10 @@ impl Tool for Delegate {
         let model = self.subagent_model.name();
         description.push_str(&format!(" The subagent runs on the `{model}` model."));
         description.push_str(
-            " With `background: true` it runs without blocking; the answer arrives as a \
-                background task completion.",
+            " With `background: true` it runs without blocking; the answer arrives \
+                automatically as a `[background task N completed]` message. Do not poll, \
+                sleep, or re-check a background task — just dispatch it and wait; the \
+                completion arrives on its own.",
         );
         if self.persist_root.is_some() {
             description.push_str(
