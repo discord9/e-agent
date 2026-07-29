@@ -231,8 +231,15 @@ impl Session {
     /// the user what died with the previous process. One JSON line per
     /// task; `clear_background_task` removes the line on completion, so a
     /// surviving line always means "the process died with this running".
-    pub fn record_background_start(root: &Path, id: u64, label: &str) -> anyhow::Result<()> {
-        let path = root.join(".e-agent/sessions/background.jsonl");
+    /// Records are scoped per session: a task started in session A is only
+    /// reported back when session A is resumed, never to another session.
+    pub fn record_background_start(
+        root: &Path,
+        session: &str,
+        id: u64,
+        label: &str,
+    ) -> anyhow::Result<()> {
+        let path = background_record_path(root, session)?;
         let directory = path.parent().unwrap();
         std::fs::create_dir_all(directory)?;
         let created = !path.exists();
@@ -254,8 +261,10 @@ impl Session {
     }
 
     /// Forget one task: its completion arrived while the process was alive.
-    pub fn clear_background_task(root: &Path, id: u64) {
-        let path = root.join(".e-agent/sessions/background.jsonl");
+    pub fn clear_background_task(root: &Path, session: &str, id: u64) {
+        let Ok(path) = background_record_path(root, session) else {
+            return;
+        };
         let Ok(file) = std::fs::File::open(&path) else {
             return;
         };
@@ -284,9 +293,12 @@ impl Session {
     /// Tasks recorded by a previous process that died before their
     /// completion arrived. Consumes the file; the caller injects the
     /// returned labels into the new session so the model can react
-    /// (re-run the commands, apologize, ...).
-    pub fn take_unfinished_background(root: &Path) -> Vec<String> {
-        let path = root.join(".e-agent/sessions/background.jsonl");
+    /// (re-run the commands, apologize, ...). Only this session's own
+    /// records are returned; other sessions' files are untouched.
+    pub fn take_unfinished_background(root: &Path, session: &str) -> Vec<String> {
+        let Ok(path) = background_record_path(root, session) else {
+            return Vec::new();
+        };
         let Ok(file) = std::fs::File::open(&path) else {
             return Vec::new();
         };
@@ -305,6 +317,19 @@ impl Session {
         let _ = std::fs::remove_file(&path);
         labels
     }
+}
+
+fn background_record_path(root: &Path, session: &str) -> anyhow::Result<std::path::PathBuf> {
+    if session.is_empty()
+        || !session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        anyhow::bail!("invalid session name for background record: {session:?}");
+    }
+    Ok(root
+        .join(".e-agent/sessions")
+        .join(format!("{session}.background.jsonl")))
 }
 
 fn session_path(root: &Path, name: &str, extension: &str) -> anyhow::Result<std::path::PathBuf> {
@@ -465,25 +490,27 @@ mod tests {
     fn background_record_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
         // Nothing recorded: nothing to report.
-        assert!(Session::take_unfinished_background(temp.path()).is_empty());
+        assert!(Session::take_unfinished_background(temp.path(), "a").is_empty());
 
-        Session::record_background_start(temp.path(), 1, "sleep 100").unwrap();
-        Session::record_background_start(temp.path(), 2, "cargo build").unwrap();
+        Session::record_background_start(temp.path(), "a", 1, "sleep 100").unwrap();
+        Session::record_background_start(temp.path(), "a", 2, "cargo build").unwrap();
+        // Records are scoped per session: session b sees none of a's tasks.
+        assert!(Session::take_unfinished_background(temp.path(), "b").is_empty());
         // Task 1 completes while we are alive: only task 2 stays on record.
-        Session::clear_background_task(temp.path(), 1);
+        Session::clear_background_task(temp.path(), "a", 1);
         assert_eq!(
-            Session::take_unfinished_background(temp.path()),
+            Session::take_unfinished_background(temp.path(), "a"),
             vec!["task 2: cargo build".to_string()]
         );
         // take consumes the file: a second launch has nothing to report.
-        assert!(Session::take_unfinished_background(temp.path()).is_empty());
+        assert!(Session::take_unfinished_background(temp.path(), "a").is_empty());
         // Clearing the last recorded task removes the file entirely.
-        Session::record_background_start(temp.path(), 3, "x").unwrap();
-        Session::clear_background_task(temp.path(), 3);
+        Session::record_background_start(temp.path(), "a", 3, "x").unwrap();
+        Session::clear_background_task(temp.path(), "a", 3);
         assert!(
             !temp
                 .path()
-                .join(".e-agent/sessions/background.jsonl")
+                .join(".e-agent/sessions/a.background.jsonl")
                 .exists()
         );
     }

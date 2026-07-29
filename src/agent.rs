@@ -206,9 +206,9 @@ pub struct Agent {
     /// session handle is gone.
     observers: Vec<crate::handle::SessionSink>,
     running_background: HashSet<u64>,
-    /// Workspace root used to record in-flight background tasks, so a later
-    /// launch can report what died with this process. None in tests.
-    background_record_root: Option<std::path::PathBuf>,
+    /// Workspace root + session name used to record in-flight background
+    /// tasks, so resuming the same session can report what died. None in tests.
+    background_record: Option<(std::path::PathBuf, String)>,
     session_input_tokens: u64,
     session_output_tokens: u64,
     last_context_input: u64,
@@ -239,7 +239,7 @@ impl Agent {
             subscriber: None,
             observers: Vec::new(),
             running_background: HashSet::new(),
-            background_record_root: None,
+            background_record: None,
             session_input_tokens: 0,
             session_output_tokens: 0,
             last_context_input: 0,
@@ -253,10 +253,10 @@ impl Agent {
         self.context_prefix = Some(prefix);
     }
 
-    /// Record in-flight background tasks under this workspace root, so a
-    /// later launch can report what died with this process.
-    pub fn record_background_tasks_in(&mut self, root: std::path::PathBuf) {
-        self.background_record_root = Some(root);
+    /// Record in-flight background tasks under this workspace root + session,
+    /// so resuming the same session later can report what died with this process.
+    pub fn record_background_tasks_in(&mut self, root: std::path::PathBuf, session: &str) {
+        self.background_record = Some((root, session.to_owned()));
     }
 
     /// Cap the number of tool-call rounds per turn. None (the default) means
@@ -364,8 +364,8 @@ impl Agent {
             match self.background_receiver.recv().await {
                 Some(AgentEvent::BackgroundCompleted { id, output }) => {
                     self.running_background.remove(&id);
-                    if let Some(root) = &self.background_record_root {
-                        crate::session::Session::clear_background_task(root, id);
+                    if let Some((root, session)) = &self.background_record {
+                        crate::session::Session::clear_background_task(root, session, id);
                     }
                     self.pending_background.push_back((id, output.clone()));
                     // No fanout here either: idle and mid-turn completions
@@ -556,13 +556,15 @@ impl Agent {
                     && let Some(id) = started_task_id(result.as_deref().unwrap_or_default())
                 {
                     self.running_background.insert(id);
-                    if let Some(root) = &self.background_record_root {
+                    if let Some((root, session)) = &self.background_record {
                         let command = serde_json::from_str::<Value>(&call.arguments)
                             .ok()
                             .and_then(|args| args["command"].as_str().map(str::to_owned))
                             .unwrap_or_else(|| call.arguments.clone());
                         let label = crate::agent::preview(&command, 100);
-                        let _ = crate::session::Session::record_background_start(root, id, &label);
+                        let _ = crate::session::Session::record_background_start(
+                            root, session, id, &label,
+                        );
                     }
                 }
                 self.emit(AgentEvent::ToolResult {
@@ -622,8 +624,8 @@ impl Agent {
         {
             self.running_background.remove(&id);
             // The task finished while we were alive; forget its record.
-            if let Some(root) = &self.background_record_root {
-                crate::session::Session::clear_background_task(root, id);
+            if let Some((root, session)) = &self.background_record {
+                crate::session::Session::clear_background_task(root, session, id);
             }
             self.pending_background.push_back((id, output.clone()));
             // Notify only the per-turn subscriber (the TUI's live display).
@@ -1612,11 +1614,11 @@ mod tests {
             Box::new(model),
             vec![Box::new(ScriptedBackgroundTool { sender: None })],
         );
-        agent.record_background_tasks_in(temp.path().to_path_buf());
+        agent.record_background_tasks_in(temp.path().to_path_buf(), "test");
         assert_eq!(agent.run("go".into()).await.unwrap(), "started");
         // Task recorded while in flight (its completion arrives 10ms after
         // start; the first run finished before that).
-        let record = temp.path().join(".e-agent/sessions/background.jsonl");
+        let record = temp.path().join(".e-agent/sessions/test.background.jsonl");
         assert!(record.exists());
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         // The follow-up run drains the completion and clears the record.

@@ -182,8 +182,8 @@ async fn run() -> anyhow::Result<()> {
     let loaded = Session::load(&root, &session)?;
     let legacy = loaded.legacy;
     agent.restore_history(loaded.entries);
-    agent.record_background_tasks_in(root.clone());
-    let unfinished = Session::take_unfinished_background(&root);
+    agent.record_background_tasks_in(root.clone(), &session);
+    let unfinished = Session::take_unfinished_background(&root, &session);
     if !unfinished.is_empty() {
         let notice = format!(
             "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
