@@ -856,13 +856,22 @@ fn draw<B: ratatui::backend::Backend>(
                 Some(attached) => &mut attached.state,
                 None => state,
             };
+            // Body text (Normal) is parsed as markdown line-by-line so code
+            // fences track state across lines; other kinds keep flat styling.
+            let mut markdown = crate::markdown::MarkdownLines::new();
             let visual: Vec<Line> = scroll_state
                 .lines
                 .iter()
                 .flat_map(|line| {
-                    hard_wrap(&line.text, inner_width)
-                        .into_iter()
-                        .map(move |row| styled_scroll_line(row, line.kind))
+                    if line.kind == LineKind::Normal {
+                        let spans = markdown.render_line(&line.text);
+                        crate::markdown::wrap_spans(&spans, inner_width)
+                    } else {
+                        hard_wrap(&line.text, inner_width)
+                            .into_iter()
+                            .map(move |row| styled_scroll_line(row, line.kind))
+                            .collect()
+                    }
                 })
                 .collect();
             let total_rows = visual.len();
@@ -2212,6 +2221,31 @@ mod tests {
                 .all(|cell| cell.bg != Color::Reset),
             "every output scrollback cell stays on an explicit Solarized surface after scrolling"
         );
+    }
+
+    #[test]
+    fn draw_renders_normal_lines_as_markdown() {
+        // A heading, an inline-code line, and a fenced code block all get
+        // their markdown styles, and every painted cell keeps an explicit
+        // Solarized background (no Reset leaking through the markdown path).
+        let backend = ratatui::backend::TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        state.push_line("## Summary".into(), LineKind::Normal);
+        state.push_line("run `cargo test` now".into(), LineKind::Normal);
+        state.push_line("```".into(), LineKind::Normal);
+        state.push_line("let x = 1;".into(), LineKind::Normal);
+        state.push_line("```".into(), LineKind::Normal);
+        draw(&mut terminal, &mut state).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer.content().iter().all(|cell| cell.bg != Color::Reset),
+            "markdown path must keep explicit Solarized backgrounds"
+        );
+        // The code-block line sits on the element (panel) background.
+        let code_row_y = 3; // "## Summary", inline line, fence, then code
+        assert_eq!(buffer[(0, code_row_y)].bg, SOLARIZED_LIGHT.element);
     }
 
     #[test]

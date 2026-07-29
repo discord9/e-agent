@@ -2,6 +2,7 @@ pub mod agent;
 pub mod config;
 pub mod delegate;
 pub mod handle;
+pub mod markdown;
 pub mod mcp;
 pub mod model;
 pub mod session;
