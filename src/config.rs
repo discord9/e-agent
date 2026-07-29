@@ -87,6 +87,17 @@ impl Config {
         }
     }
 
+    /// Resolve every routed role to its model (role name -> resolved model).
+    pub fn resolve_roles(&self) -> anyhow::Result<HashMap<String, ResolvedModel>> {
+        let mut resolved = HashMap::new();
+        for role in self.roles.keys() {
+            if let Some(model) = self.resolve_role(role)? {
+                resolved.insert(role.clone(), model);
+            }
+        }
+        Ok(resolved)
+    }
+
     fn resolve_profile(&self, profile: &str) -> anyhow::Result<ResolvedModel> {
         let provider_name = profile
             .split_once('/')

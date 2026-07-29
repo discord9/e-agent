@@ -111,6 +111,11 @@ pub struct Delegate {
     /// task id — task ids restart at 1 every process and would collide
     /// across restarts.
     persist_root: Option<std::path::PathBuf>,
+    /// Per-role models from `[roles]` (role name -> model). A role not
+    /// present here falls back to `subagent_model`.
+    role_models: std::collections::HashMap<String, ConfiguredModel>,
+    /// Workspace root used to read role templates (`.e-agent/agents/<role>.md`).
+    roles_root: Option<std::path::PathBuf>,
 }
 
 /// Where a subagent writes its own session file.
@@ -121,6 +126,13 @@ pub struct PersistConfig {
     session_id: String,
 }
 
+/// A delegated task plus the role template (if any) that shapes the
+/// subagent's system prompt.
+struct DelegatedTask {
+    task: String,
+    role_prompt: Option<String>,
+}
+
 impl Delegate {
     pub fn new(model: ConfiguredModel, workspace: Workspace, background: BackgroundTasks) -> Self {
         Self {
@@ -129,6 +141,8 @@ impl Delegate {
             background,
             sessions: Sessions::default(),
             persist_root: None,
+            role_models: std::collections::HashMap::new(),
+            roles_root: None,
         }
     }
 
@@ -136,6 +150,23 @@ impl Delegate {
     /// `[roles] subagent = "…"`). Without this they share the main model.
     pub fn with_subagent_model(mut self, model: ConfiguredModel) -> Self {
         self.subagent_model = model;
+        self
+    }
+
+    /// Route specific roles onto their own models (`[roles] <role> = "…"`).
+    /// A role without an entry uses the subagent (or main) model.
+    pub fn with_role_models(
+        mut self,
+        role_models: std::collections::HashMap<String, ConfiguredModel>,
+    ) -> Self {
+        self.role_models = role_models;
+        self
+    }
+
+    /// Enable role templates: the workspace root that holds
+    /// `.e-agent/agents/<role>.md`. Without this, `delegate` has no roles.
+    pub fn with_roles_root(mut self, root: std::path::PathBuf) -> Self {
+        self.roles_root = Some(root);
         self
     }
 
@@ -168,12 +199,13 @@ impl Delegate {
         model: ConfiguredModel,
         workspace: Workspace,
         background: BackgroundTasks,
-        task: String,
+        task: DelegatedTask,
         steering: Option<(SessionSink, SessionSource)>,
         persist: Option<PersistConfig>,
         resume_entries: Option<Vec<crate::agent::SessionEntry>>,
     ) -> String {
-        let role = model.name().to_owned();
+        let DelegatedTask { task, role_prompt } = task;
+        let model_name = model.name().to_owned();
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -191,13 +223,22 @@ impl Delegate {
                 let mut agent = Agent::new(Box::new(model), tools);
                 // A bare single-user-message request is rejected by some
                 // providers (kimi k3 answers HTTP 403 to `msgs=1`); give the
-                // subagent a minimal system prompt so its first call always
-                // carries a system + user pair.
-                let mut instructions = format!(
-                    "You are a subagent inside the e-agent coding assistant (running on the \
-                     `{role}` model). Work autonomously on the delegated task with the \
-                     file/bash tools and, when configured, public web search, then return a concise final answer."
-                );
+                // subagent a system prompt so its first call always carries a
+                // system + user pair. A role template (.e-agent/agents/<role>.md)
+                // takes the lead when delegated with one.
+                let mut instructions = match role_prompt {
+                    Some(template) => format!(
+                        "{template}\n\nYou are running as a subagent inside the e-agent coding \
+                         assistant (on the `{model_name}` model). Work autonomously on the \
+                         delegated task with the file/bash tools and, when configured, public \
+                         web search, then return a concise final answer."
+                    ),
+                    None => format!(
+                        "You are a subagent inside the e-agent coding assistant (running on the \
+                         `{model_name}` model). Work autonomously on the delegated task with the \
+                         file/bash tools and, when configured, public web search, then return a concise final answer."
+                    ),
+                };
                 if let Some(content) = agents_instructions {
                     instructions.push_str("\n\n## AGENTS.md\n\n");
                     instructions.push_str(&content);
@@ -366,6 +407,22 @@ impl Tool for Delegate {
                 new turns append to the same session file, instead of starting fresh.",
             );
         }
+        let roles = self
+            .roles_root
+            .as_deref()
+            .map(crate::roles::available_roles)
+            .unwrap_or_default();
+        if !roles.is_empty() {
+            description.push_str(&format!(
+                " Pass `role` to give the subagent a specialized persona/model; available roles: {}.",
+                roles.join(", ")
+            ));
+        }
+        let role_property = if roles.is_empty() {
+            json!({"type": "string", "description": "specialized role for the subagent"})
+        } else {
+            json!({"type": "string", "enum": roles, "description": "specialized role for the subagent"})
+        };
         ToolSpec {
             name: "delegate".into(),
             description,
@@ -373,6 +430,7 @@ impl Tool for Delegate {
                 "type": "object",
                 "properties": {
                     "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"},
+                    "role": role_property,
                     "background": {"type": "boolean", "description": "run without blocking; the answer arrives as a background completion (default false)"},
                     "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"}
                 },
@@ -396,6 +454,42 @@ impl Tool for Delegate {
             .and_then(|args| args.get("background"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let role = arguments
+            .as_object()
+            .and_then(|args| args.get("role"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        // Resolve the role: its model ([roles] <role> > subagent > main) and
+        // its prompt template (.e-agent/agents/<role>.md). An unknown role is
+        // rejected unless no roles are configured at all.
+        let (model, role_prompt) = match role.as_deref() {
+            Some(role) => {
+                let root = self
+                    .roles_root
+                    .as_deref()
+                    .ok_or("roles are not configured (no workspace roles root)")?;
+                let prompt = crate::roles::role_prompt(root, role)
+                    .map_err(|error| format!("cannot read role `{role}`: {error}"))?
+                    .ok_or_else(|| {
+                        let available = crate::roles::available_roles(root);
+                        format!(
+                            "unknown role `{role}` (available: {})",
+                            if available.is_empty() {
+                                "none".into()
+                            } else {
+                                available.join(", ")
+                            }
+                        )
+                    })?;
+                let model = self
+                    .role_models
+                    .get(role)
+                    .cloned()
+                    .unwrap_or_else(|| self.subagent_model.clone());
+                (model, Some(prompt))
+            }
+            None => (self.subagent_model.clone(), None),
+        };
         let resume = arguments
             .as_object()
             .and_then(|args| args.get("resume"))
@@ -422,7 +516,6 @@ impl Tool for Delegate {
         };
 
         if background {
-            let model = self.subagent_model.clone();
             let workspace = self.workspace.clone();
             let background = self.background.clone();
             let label = preview(&task, 100);
@@ -460,7 +553,7 @@ impl Tool for Delegate {
                             model,
                             workspace,
                             background,
-                            task,
+                            DelegatedTask { task, role_prompt },
                             Some((sink, source)),
                             persist,
                             resume_entries,
@@ -476,7 +569,6 @@ impl Tool for Delegate {
             );
         }
 
-        let model = self.subagent_model.clone();
         let workspace = self.workspace.clone();
         let background = self.background.clone();
         let (resume_id, resume_entries) = match resume {
@@ -519,7 +611,7 @@ impl Tool for Delegate {
                         model,
                         workspace,
                         background,
-                        task,
+                        DelegatedTask { task, role_prompt },
                         Some((sink, source)),
                         persist,
                         resume_entries,
@@ -683,6 +775,38 @@ mod tests {
         let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
         assert!(!names.contains(&"delegate".to_owned()));
         assert!(names.contains(&"bash".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn role_requires_a_roles_root_and_a_known_role() {
+        let temp = tempfile::tempdir().unwrap();
+        // No roles root: any role is rejected.
+        let plain = delegate(temp.path());
+        assert!(
+            plain
+                .execute(json!({"task": "hi", "role": "fixer"}))
+                .await
+                .unwrap_err()
+                .contains("roles are not configured")
+        );
+
+        // Roles root set, but the requested role has no template file.
+        let rooted = delegate(temp.path()).with_roles_root(temp.path().to_path_buf());
+        let error = rooted
+            .execute(json!({"task": "hi", "role": "fixer"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("unknown role `fixer`"), "{error}");
+
+        // A template on disk makes the role valid (its spec lists it).
+        let directory = temp.path().join(".e-agent/agents");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("fixer.md"), "You fix things.").unwrap();
+        let spec = rooted.spec();
+        let roles = spec.parameters["properties"]["role"]["enum"]
+            .as_array()
+            .unwrap();
+        assert_eq!(roles, &vec![json!("fixer")]);
     }
 
     #[tokio::test]

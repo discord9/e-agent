@@ -7,6 +7,7 @@ pub mod handle;
 pub mod markdown;
 pub mod mcp;
 pub mod model;
+pub mod roles;
 pub mod session;
 pub mod tools;
 pub mod tui;

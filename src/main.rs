@@ -112,14 +112,17 @@ async fn run() -> anyhow::Result<()> {
         }
     };
     let config = Config::load()?;
-    let (main_resolved, role_resolved) = match &config {
+    let (main_resolved, role_resolved, all_roles) = match &config {
         Some(config) => (
             Some(config.resolve(profile.as_deref())?),
             config
                 .resolve_role("subagent")
                 .context("cannot resolve [roles] subagent profile")?,
+            config
+                .resolve_roles()
+                .context("cannot resolve [roles] profiles")?,
         ),
-        None => (None, None),
+        None => (None, None, std::collections::HashMap::new()),
     };
     if matches!(
         main_resolved.as_ref().map(|value| value.auth),
@@ -133,9 +136,9 @@ async fn run() -> anyhow::Result<()> {
     let needs_chatgpt = main_resolved
         .as_ref()
         .is_some_and(|value| value.auth == AuthMode::ChatGpt)
-        || role_resolved
-            .as_ref()
-            .is_some_and(|value| value.auth == AuthMode::ChatGpt);
+        || all_roles
+            .values()
+            .any(|value| value.auth == AuthMode::ChatGpt);
     let auth = needs_chatgpt.then(CodexAuth::load).transpose()?;
     let model = match main_resolved {
         Some(configured) => configured_model(configured, auth.as_ref(), base_url, model)?,
@@ -152,12 +155,18 @@ async fn run() -> anyhow::Result<()> {
     let subagent_model = role_resolved
         .map(|resolved| configured_model(resolved, auth.as_ref(), None, None))
         .transpose()?;
+    let mut role_models = std::collections::HashMap::new();
+    for (role, resolved) in all_roles {
+        role_models.insert(role, configured_model(resolved, auth.as_ref(), None, None)?);
+    }
     let (mut tools, background) = builtins(workspace.clone());
     let mcp_servers = config.map(|config| config.mcp).unwrap_or_default();
     let (mcp_tools, mcp_instructions) = mcp::connect_all(mcp_servers, &root).await;
     tools.extend(mcp_tools);
-    let mut delegate =
-        Delegate::new(model.clone(), workspace, background.clone()).persist_sessions(root.clone());
+    let mut delegate = Delegate::new(model.clone(), workspace, background.clone())
+        .persist_sessions(root.clone())
+        .with_role_models(role_models)
+        .with_roles_root(root.clone());
     if let Some(subagent_model) = subagent_model {
         let name = subagent_model.name().to_owned();
         delegate = delegate.with_subagent_model(subagent_model);
@@ -169,6 +178,11 @@ async fn run() -> anyhow::Result<()> {
     tools.push(Box::new(delegate));
     let mut agent = Agent::new(Box::new(model), tools);
     let mut context = Vec::new();
+    // The main agent's orchestrator template (.e-agent/agents/main.md) leads;
+    // it tells the model to decompose work and delegate to the named roles.
+    if let Some(orchestrator) = e_agent::roles::role_prompt(&root, e_agent::roles::MAIN_ROLE)? {
+        context.push(orchestrator);
+    }
     if let Some(instructions) = agents_instructions {
         context.push(format!("## AGENTS.md\n\n{instructions}"));
     }
