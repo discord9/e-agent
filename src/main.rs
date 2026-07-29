@@ -112,6 +112,17 @@ async fn run() -> anyhow::Result<()> {
         }
     };
     let config = Config::load()?;
+    // Web search reads EXA_API_KEY from the process env (tools.rs and
+    // subagents pick it up there). When unset, fall back to the `[web_search]`
+    // config section by injecting it into the env once at startup — this keeps
+    // the key's single transport mechanism and avoids threading it through
+    // every tools constructor. Startup is single-threaded, so set_var is safe.
+    if std::env::var_os("EXA_API_KEY").is_none()
+        && let Some(config) = &config
+        && let Some(key) = config.web_search_key()?
+    {
+        unsafe { std::env::set_var("EXA_API_KEY", key) };
+    }
     let (main_resolved, role_resolved, all_roles) = match &config {
         Some(config) => (
             Some(config.resolve(profile.as_deref())?),

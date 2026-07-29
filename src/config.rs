@@ -19,8 +19,17 @@ pub struct Config {
     /// exists; new roles are added where they are spawned.
     #[serde(default)]
     roles: HashMap<String, String>,
+    /// Optional `[web_search]` credentials for the Exa `web_search` tool.
+    #[serde(default)]
+    web_search: Option<WebSearch>,
     #[serde(skip)]
     path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct WebSearch {
+    api_key_file: Option<PathBuf>,
+    api_key_env: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +105,33 @@ impl Config {
             }
         }
         Ok(resolved)
+    }
+
+    /// The Exa web-search API key from `[web_search]`, or None when the
+    /// section is absent. Process env `EXA_API_KEY` always wins over this
+    /// (callers check it first). Exactly one of `api_key_file` / `api_key_env`
+    /// must be set when the section is present.
+    pub fn web_search_key(&self) -> anyhow::Result<Option<String>> {
+        let Some(web_search) = &self.web_search else {
+            return Ok(None);
+        };
+        let key = match (&web_search.api_key_file, &web_search.api_key_env) {
+            (Some(_), Some(_)) => {
+                bail!("[web_search] must set exactly one of `api_key_file` or `api_key_env`")
+            }
+            (None, None) => {
+                bail!("[web_search] requires exactly one of `api_key_file` or `api_key_env`")
+            }
+            (Some(file), None) => self.read_key_file("web_search", file)?,
+            (None, Some(variable)) => std::env::var(variable)
+                .with_context(|| format!("api_key_env `{variable}` for [web_search] is not set"))?
+                .trim()
+                .to_owned(),
+        };
+        if key.is_empty() {
+            bail!("credential for [web_search] is empty");
+        }
+        Ok(Some(key))
     }
 
     fn resolve_profile(&self, profile: &str) -> anyhow::Result<ResolvedModel> {
@@ -245,6 +281,75 @@ reasoning_effort = "max"
         assert_eq!(resolved.model, "k3");
         assert_eq!(resolved.api_key, "key");
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn web_search_key_from_file_env_or_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("exa-key"), "  exa-secret\n").unwrap();
+
+        // Absent section: no key.
+        let bare = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "exa-key"
+[models."kimi/k3"]
+model = "k3"
+"#,
+        );
+        assert_eq!(
+            Config::from_path(&bare).unwrap().web_search_key().unwrap(),
+            None
+        );
+
+        // api_key_file (relative to the config file's directory).
+        let with_file = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "exa-key"
+[models."kimi/k3"]
+model = "k3"
+[web_search]
+api_key_file = "exa-key"
+"#,
+        );
+        assert_eq!(
+            Config::from_path(&with_file)
+                .unwrap()
+                .web_search_key()
+                .unwrap(),
+            Some("exa-secret".to_owned())
+        );
+
+        // Both set: rejected.
+        let both = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "exa-key"
+[models."kimi/k3"]
+model = "k3"
+[web_search]
+api_key_file = "exa-key"
+api_key_env = "SOME_VAR"
+"#,
+        );
+        assert!(
+            Config::from_path(&both)
+                .unwrap()
+                .web_search_key()
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one")
+        );
     }
 
     #[test]
