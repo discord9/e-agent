@@ -331,13 +331,12 @@ async fn run_inner(
     loop {
         draw(terminal, &mut state)?;
         tokio::select! {
-            // Background task completed while idle: inject it as a new turn.
-            Some((id, output)) = agent.next_background_completion() => {
-                state.push_line(
-                    format!("background task {id} completed:\n{}", preview(&output, 500)),
-                    LineKind::Dim,
-                );
-                state.follow();
+            // Background task completed while idle: fold it into the model
+            // context and kick off a turn immediately so the agent reacts
+            // without waiting for the user's next message. No display line
+            // here — the turn boundary emits the completion as a UserPrompt
+            // which renders as the dim "finished" line.
+            Some((_id, _output)) = agent.next_background_completion() => {
                 agent.subscribe(forward.clone());
                 let mut ui = Ui {
                     state: &mut state,
