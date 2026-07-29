@@ -45,35 +45,6 @@ fn default_true() -> bool {
     true
 }
 
-/// Top-level config file structure (`.e-agent.json` or
-/// `~/.config/e-agent/config.json`).
-#[derive(Debug, Default, Deserialize)]
-pub struct Config {
-    #[serde(default)]
-    pub mcp: HashMap<String, McpServerConfig>,
-}
-
-/// Load MCP server configurations from the first existing of:
-/// `<workspace>/.e-agent.json`, `~/.config/e-agent/config.json`.
-pub fn load_config(workspace_root: &Path) -> anyhow::Result<Config> {
-    let mut candidates = vec![workspace_root.join(".e-agent.json")];
-    if let Some(config_dir) = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-    {
-        candidates.push(config_dir.join("e-agent/config.json"));
-    }
-    for path in candidates {
-        if path.is_file() {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("cannot read config {}", path.display()))?;
-            return serde_json::from_str(&text)
-                .with_context(|| format!("cannot parse config {}", path.display()));
-        }
-    }
-    Ok(Config::default())
-}
-
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
 /// One running MCP server connection.
@@ -284,18 +255,15 @@ impl Tool for McpTool {
 
 /// Connect to all configured MCP servers, list their tools, and return
 /// (tools, system-prompt instructions). Failures are logged as warnings and
-/// do not abort startup.
-pub async fn connect_all(workspace_root: &Path) -> (Vec<Box<dyn Tool>>, Vec<String>) {
-    let config = match load_config(workspace_root) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("e-agent: warning: {error:#}");
-            return (Vec::new(), Vec::new());
-        }
-    };
+/// do not abort startup. Server definitions come from the unified TOML
+/// config (`[mcp.<name>]` sections, see config.rs).
+pub async fn connect_all(
+    servers: HashMap<String, McpServerConfig>,
+    workspace_root: &Path,
+) -> (Vec<Box<dyn Tool>>, Vec<String>) {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     let mut instructions = Vec::new();
-    for (name, server_config) in config.mcp {
+    for (name, server_config) in servers {
         if !server_config.enabled {
             continue;
         }
@@ -402,53 +370,10 @@ done
     }
 
     #[tokio::test]
-    async fn missing_config_file_returns_default() {
-        let temp = tempfile::tempdir().unwrap();
-        // Isolate from any real user-level config.
-        // SAFETY: tests in this module run in the same process; setting
-        // XDG_CONFIG_HOME here could race with other tests reading the env,
-        // but no other test in this crate depends on it.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join("no-such-dir"));
-        }
-        let config = load_config(temp.path()).unwrap();
-        assert!(config.mcp.is_empty());
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
-    }
-
-    #[tokio::test]
-    async fn workspace_config_is_loaded() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp.path().join(".e-agent.json"),
-            r#"{"mcp":{"fake":{"command":["/bin/bash","-c","true"]}}}"#,
-        )
-        .unwrap();
-        let config = load_config(temp.path()).unwrap();
-        assert!(config.mcp.contains_key("fake"));
-        assert!(config.mcp["fake"].enabled);
-    }
-
-    #[tokio::test]
     async fn connect_all_exposes_prefixed_tools() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp.path().join(".e-agent.json"),
-            r#"{"mcp":{"fake":{"command":["/bin/bash","-c","PLACEHOLDER"]}}}"#,
-        )
-        .unwrap();
-        let script = std::fs::read_to_string(temp.path().join(".e-agent.json")).unwrap();
-        std::fs::write(
-            temp.path().join(".e-agent.json"),
-            script.replace(
-                "PLACEHOLDER",
-                &FAKE_SERVER.replace('"', "\\\"").replace('\n', "\\n"),
-            ),
-        )
-        .unwrap();
-        let (tools, instructions) = connect_all(temp.path()).await;
+        let servers = HashMap::from([("fake".to_owned(), fake_server_config())]);
+        let (tools, instructions) = connect_all(servers, temp.path()).await;
         assert_eq!(instructions.len(), 1);
         assert!(instructions[0].contains("fake instructions"));
         assert_eq!(tools.len(), 1);

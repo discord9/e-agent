@@ -89,7 +89,8 @@ async fn run() -> anyhow::Result<()> {
             id
         }
     };
-    let model = match Config::load()? {
+    let config = Config::load()?;
+    let model = match &config {
         Some(config) => {
             let configured = config.resolve(profile.as_deref())?;
             OpenAiModel::new(
@@ -109,7 +110,8 @@ async fn run() -> anyhow::Result<()> {
         }
     };
     let (mut tools, background) = builtins(workspace.clone());
-    let (mcp_tools, mcp_instructions) = mcp::connect_all(&root).await;
+    let mcp_servers = config.map(|config| config.mcp).unwrap_or_default();
+    let (mcp_tools, mcp_instructions) = mcp::connect_all(mcp_servers, &root).await;
     tools.extend(mcp_tools);
     let delegate =
         Delegate::new(model.clone(), workspace, background.clone()).persist_sessions(root.clone());

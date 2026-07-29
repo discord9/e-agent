@@ -139,19 +139,17 @@ automatic trigger.
 ## MCP (local servers)
 
 e-agent can connect to local MCP servers over stdio and expose their tools
-to the model with a `<server>_<tool>` name prefix. Configuration is read from
-the first existing of `<workspace>/.e-agent.json` or
-`~/.config/e-agent/config.json`:
+to the model with a `<server>_<tool>` name prefix. Servers are declared in
+the same TOML config file as model profiles
+(`$XDG_CONFIG_HOME/e-agent/config.toml`, falling back to
+`~/.config/e-agent/config.toml`):
 
-```json
-{
-  "mcp": {
-    "engram": {
-      "command": ["/path/to/engram", "mcp", "--tools=agent"],
-      "enabled": true
-    }
-  }
-}
+```toml
+[mcp.engram]
+command = ["/path/to/engram", "mcp", "--tools=agent"]
+enabled = true        # optional, default true
+# cwd = "/other/dir"  # optional, defaults to the workspace root
+# env = { KEY = "value" }
 ```
 
 Each entry spawns `command` with the workspace as its current directory

@@ -11,6 +11,9 @@ pub struct Config {
     providers: HashMap<String, Provider>,
     #[serde(default)]
     models: HashMap<String, ModelProfile>,
+    /// MCP server definitions (`[mcp.<name>]`), shared with mcp.rs.
+    #[serde(default)]
+    pub mcp: HashMap<String, crate::mcp::McpServerConfig>,
     #[serde(skip)]
     path: PathBuf,
 }
