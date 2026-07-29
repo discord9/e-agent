@@ -174,6 +174,16 @@ impl Delegate {
                 let (tools, _) = builtins(workspace);
                 let mut agent =
                     Agent::new(Box::new(model), tools).max_tool_rounds(SUBAGENT_MAX_ROUNDS);
+                // A bare single-user-message request is rejected by some
+                // providers (kimi k3 answers HTTP 403 to `msgs=1`); give the
+                // subagent a minimal system prompt so its first call always
+                // carries a system + user pair.
+                agent.set_context_prefix(
+                    "You are a subagent inside the e-agent coding assistant. Work \
+                     autonomously on the delegated task with the file/bash tools, \
+                     then return a concise final answer."
+                        .into(),
+                );
                 let (sink, mut source) = match steering {
                     Some((sink, source)) => {
                         agent.observe(sink.clone());
