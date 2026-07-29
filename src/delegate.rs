@@ -27,9 +27,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::{Agent, AgentEvent, Tool, ToolSpec, preview};
+use crate::agent::{Agent, AgentEvent, Message, SessionEntry, Tool, ToolSpec, preview};
 use crate::handle::{SessionHandle, SessionSink, SessionSource, Steer, session_channel};
 use crate::model::OpenAiModel;
+use crate::session::Session;
 use crate::tools::{BackgroundTasks, builtins};
 use crate::workspace::Workspace;
 
@@ -84,6 +85,29 @@ async fn next_prompt(source: &mut SessionSource, pending: &mut Vec<String>) -> O
     }
 }
 
+/// Append the history entries produced since the last call to the parent
+/// session file, wrapped in a system marker naming the subagent. The file
+/// is append-only, so concurrent subagents (and the main agent) can share
+/// it safely. Best-effort: a persistence failure is logged, not fatal.
+fn persist_turn(persist: &PersistConfig, agent: &Agent, persisted: &mut usize, label: &str) {
+    let new_entries = &agent.history()[*persisted..];
+    if new_entries.is_empty() {
+        return;
+    }
+    let mut entries = Vec::with_capacity(new_entries.len() + 1);
+    entries.push(SessionEntry::Message {
+        message: Message::System {
+            content: format!("[subagent transcript: {label}]"),
+        },
+    });
+    entries.extend(new_entries.iter().cloned());
+    if let Err(error) = Session::append(&persist.root, &persist.session, &entries) {
+        eprintln!("e-agent: cannot persist subagent transcript: {error:#}");
+        return;
+    }
+    *persisted = agent.history().len();
+}
+
 pub struct Delegate {
     model: OpenAiModel,
     workspace: Workspace,
@@ -92,6 +116,17 @@ pub struct Delegate {
     background: BackgroundTasks,
     /// Live handles of background subagents, for the TUI attach view.
     sessions: Sessions,
+    /// Where completed subagent histories are persisted (None = in-memory
+    /// only, e.g. tests). Persisting into the parent's session file makes a
+    /// finished subagent's full transcript visible after restart.
+    persist: Option<PersistConfig>,
+}
+
+/// Target file for completed subagent transcripts.
+#[derive(Clone)]
+pub struct PersistConfig {
+    root: std::path::PathBuf,
+    session: String,
 }
 
 impl Delegate {
@@ -101,7 +136,14 @@ impl Delegate {
             workspace,
             background,
             sessions: Sessions::default(),
+            persist: None,
         }
+    }
+
+    /// Persist completed subagent histories into the parent's session file.
+    pub fn persist_into(mut self, root: std::path::PathBuf, session: String) -> Self {
+        self.persist = Some(PersistConfig { root, session });
+        self
     }
 
     /// Live session handles (background mode only), for attach views.
@@ -121,6 +163,7 @@ impl Delegate {
         workspace: Workspace,
         task: String,
         steering: Option<(SessionSink, SessionSource)>,
+        persist: Option<PersistConfig>,
     ) -> String {
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -143,8 +186,11 @@ impl Delegate {
                 };
                 // Prompts stashed while a turn was running, in arrival order.
                 let mut pending: Vec<String> = Vec::new();
+                let task_label = preview(&task, 60);
                 let mut prompt = task;
                 let mut last_answer = String::new();
+                // History entries already persisted (per-turn incremental).
+                let mut persisted_len = 0usize;
                 loop {
                     let result = {
                         let run = agent.run(prompt);
@@ -193,6 +239,12 @@ impl Delegate {
                         Ok(answer) => answer,
                         Err(error) => format!("subagent failed: {error:#}"),
                     };
+                    // Persist this turn's entries (append-only) so the full
+                    // transcript survives restarts; entries are tagged with
+                    // the subagent's label for display.
+                    if let Some(persist) = &persist {
+                        persist_turn(persist, &agent, &mut persisted_len, &task_label);
+                    }
                     // Turn ended. Without steering we are done; with steering
                     // wait for the next queued prompt or channel close.
                     let Some(source) = source.as_mut() else {
@@ -263,6 +315,7 @@ impl Tool for Delegate {
             let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
             let slot_in_hook = slot.clone();
             let slot_in_work = slot.clone();
+            let persist = self.persist.clone();
             // run_on_thread blocks on thread::join, so push it onto the
             // blocking thread pool to keep the executor responsive.
             return self.background.spawn_with_id(
@@ -274,7 +327,7 @@ impl Tool for Delegate {
                 },
                 move || async move {
                     let output = tokio::task::spawn_blocking(move || {
-                        Self::run_on_thread(model, workspace, task, Some((sink, source)))
+                        Self::run_on_thread(model, workspace, task, Some((sink, source)), persist)
                     })
                     .await
                     .unwrap_or_else(|error| format!("subagent blocking task failed: {error}"));
@@ -288,8 +341,10 @@ impl Tool for Delegate {
 
         let model = self.model.clone();
         let workspace = self.workspace.clone();
-        let handle =
-            tokio::task::spawn_blocking(move || Self::run_on_thread(model, workspace, task, None));
+        let persist = self.persist.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            Self::run_on_thread(model, workspace, task, None, persist)
+        });
         match tokio::time::timeout(SYNC_TIMEOUT, handle).await {
             Ok(Ok(answer)) => Ok(answer),
             Ok(Err(error)) => Err(format!("subagent thread failed: {error}")),
