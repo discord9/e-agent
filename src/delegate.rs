@@ -404,12 +404,52 @@ impl Tool for Delegate {
             root,
             session_id: crate::session::new_id_prefixed("sub-"),
         });
-        let handle = tokio::task::spawn_blocking(move || {
-            Self::run_on_thread(model, workspace, background, task, None, persist)
-        });
-        match tokio::time::timeout(SYNC_TIMEOUT, handle).await {
+        // Even a synchronous subagent occupies a shared slot and registers a
+        // live session, so it shows up in the task panel (F2) and can be
+        // attached while the main agent is blocked waiting for it.
+        let label = preview(&task, 100);
+        let (handle, sink, source) = session_channel();
+        let session: Arc<dyn SessionHandle> = Arc::new(handle.clone());
+        let sessions = self.sessions.clone();
+        let sessions_in_work = self.sessions.clone();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
+        let slot_in_hook = slot.clone();
+        let slot_in_work = slot.clone();
+        // Block until the subagent finishes (this is the synchronous mode).
+        // spawn_silent keeps it visible in the task panel without emitting
+        // a duplicate completion event (the answer is the tool result).
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<String>();
+        let started = self.background.spawn_silent(
+            label,
+            None,
+            move |id| {
+                sessions.insert(id, session);
+                *slot_in_hook.lock().unwrap() = Some(id);
+            },
+            move || async move {
+                let output = tokio::task::spawn_blocking(move || {
+                    Self::run_on_thread(
+                        model,
+                        workspace,
+                        background,
+                        task,
+                        Some((sink, source)),
+                        persist,
+                    )
+                })
+                .await
+                .unwrap_or_else(|error| format!("subagent blocking task failed: {error}"));
+                if let Some(id) = *slot_in_work.lock().unwrap() {
+                    sessions_in_work.remove(id);
+                }
+                let _ = done_tx.send(output.clone());
+                output
+            },
+        );
+        started?;
+        match tokio::time::timeout(SYNC_TIMEOUT, done_rx).await {
             Ok(Ok(answer)) => Ok(answer),
-            Ok(Err(error)) => Err(format!("subagent thread failed: {error}")),
+            Ok(Err(_)) => Err("subagent result channel closed".into()),
             Err(_) => Err("subagent timed out after 30 minutes".into()),
         }
     }

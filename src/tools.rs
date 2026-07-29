@@ -324,6 +324,41 @@ impl BackgroundTasks {
             .sender
             .clone()
             .ok_or("background task delivery is unavailable")?;
+        self.spawn_inner(label, process_group, on_id, work, move |id, output| {
+            let _ = sender.send(AgentEvent::BackgroundCompleted { id, output });
+        })
+    }
+
+    /// Spawn a task that occupies a slot and runs to completion but does
+    /// NOT send a completion event. Used by synchronous delegate: the
+    /// subagent must be visible in the task panel, but its answer is
+    /// returned as the tool result, so a completion notice would duplicate.
+    pub fn spawn_silent<F, Fut>(
+        &self,
+        label: String,
+        process_group: Option<Arc<AtomicI32>>,
+        on_id: impl FnOnce(u64),
+        work: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = String> + Send + 'static,
+    {
+        self.spawn_inner(label, process_group, on_id, work, |_, _| {})
+    }
+
+    fn spawn_inner<F, Fut>(
+        &self,
+        label: String,
+        process_group: Option<Arc<AtomicI32>>,
+        on_id: impl FnOnce(u64),
+        work: F,
+        on_complete: impl FnOnce(u64, String) + Send + 'static,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = String> + Send + 'static,
+    {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let slot = BackgroundSlot {
             id,
@@ -349,7 +384,7 @@ impl BackgroundTasks {
                 .lock()
                 .unwrap()
                 .retain(|slot| slot.as_ref().map(|slot| slot.id != id).unwrap_or(true));
-            let _ = sender.send(AgentEvent::BackgroundCompleted { id, output });
+            on_complete(id, output);
         });
         Ok(started)
     }
