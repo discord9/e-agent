@@ -150,6 +150,21 @@ async fn run() -> anyhow::Result<()> {
     let loaded = Session::load(&root, &session)?;
     let legacy = loaded.legacy;
     agent.restore_history(loaded.entries);
+    agent.record_background_tasks_in(root.clone());
+    let unfinished = Session::take_unfinished_background(&root);
+    if !unfinished.is_empty() {
+        let notice = format!(
+            "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
+            unfinished.len(),
+            unfinished.join("\n")
+        );
+        let entry: e_agent::agent::SessionEntry =
+            e_agent::agent::Message::User { content: notice }.into();
+        // Persist immediately so a crash-before-first-turn cannot inject
+        // the same notice again on the next launch.
+        Session::append(&root, &session, std::slice::from_ref(&entry))?;
+        agent.restore_history(vec![entry]);
+    }
     let mut persisted = agent.history().len();
     if legacy {
         Session::rewrite(&root, &session, agent.history())?;

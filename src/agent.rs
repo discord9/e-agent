@@ -197,6 +197,9 @@ pub struct Agent {
     /// session handle is gone.
     observers: Vec<crate::handle::SessionSink>,
     running_background: HashSet<u64>,
+    /// Workspace root used to record in-flight background tasks, so a later
+    /// launch can report what died with this process. None in tests.
+    background_record_root: Option<std::path::PathBuf>,
     session_input_tokens: u64,
     session_output_tokens: u64,
     last_context_input: u64,
@@ -227,6 +230,7 @@ impl Agent {
             subscriber: None,
             observers: Vec::new(),
             running_background: HashSet::new(),
+            background_record_root: None,
             session_input_tokens: 0,
             session_output_tokens: 0,
             last_context_input: 0,
@@ -238,6 +242,12 @@ impl Agent {
     /// call as a user message. Not persisted in sessions.
     pub fn set_context_prefix(&mut self, prefix: String) {
         self.context_prefix = Some(prefix);
+    }
+
+    /// Record in-flight background tasks under this workspace root, so a
+    /// later launch can report what died with this process.
+    pub fn record_background_tasks_in(&mut self, root: std::path::PathBuf) {
+        self.background_record_root = Some(root);
     }
 
     /// Cap the number of tool-call rounds per turn. None (the default) means
@@ -329,6 +339,9 @@ impl Agent {
             match self.background_receiver.recv().await {
                 Some(AgentEvent::BackgroundCompleted { id, output }) => {
                     self.running_background.remove(&id);
+                    if let Some(root) = &self.background_record_root {
+                        crate::session::Session::clear_background_task(root, id);
+                    }
                     self.pending_background.push_back((id, output.clone()));
                     // No fanout here either: idle and mid-turn completions
                     // both land in the session log as a user message at the
@@ -518,6 +531,14 @@ impl Agent {
                     && let Some(id) = started_task_id(result.as_deref().unwrap_or_default())
                 {
                     self.running_background.insert(id);
+                    if let Some(root) = &self.background_record_root {
+                        let command = serde_json::from_str::<Value>(&call.arguments)
+                            .ok()
+                            .and_then(|args| args["command"].as_str().map(str::to_owned))
+                            .unwrap_or_else(|| call.arguments.clone());
+                        let label = crate::agent::preview(&command, 100);
+                        let _ = crate::session::Session::record_background_start(root, id, &label);
+                    }
                 }
                 self.emit(AgentEvent::ToolResult {
                     is_error: result.is_err(),
@@ -575,6 +596,10 @@ impl Agent {
             self.background_receiver.try_recv()
         {
             self.running_background.remove(&id);
+            // The task finished while we were alive; forget its record.
+            if let Some(root) = &self.background_record_root {
+                crate::session::Session::clear_background_task(root, id);
+            }
             self.pending_background.push_back((id, output.clone()));
             // Notify only the per-turn subscriber (the TUI's live display).
             // The long-lived observers' log gets this completion at the
@@ -1527,5 +1552,52 @@ mod tests {
         };
         let mut agent = Agent::new(Box::new(model), vec![Box::new(PreWired)]);
         assert_eq!(agent.run("go".into()).await.unwrap(), "done");
+    }
+
+    #[tokio::test]
+    async fn records_and_clears_background_tasks_under_the_workspace() {
+        // A background start is recorded on disk; its completion clears the
+        // record, so only tasks that die WITH the process remain for the
+        // next launch to report.
+        let temp = tempfile::tempdir().unwrap();
+        let model = ScriptedModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![call(
+                        "background-1",
+                        "bash",
+                        r#"{"command":"echo done","background":true}"#,
+                    )],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("started".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("reacted".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        };
+        let mut agent = Agent::new(
+            Box::new(model),
+            vec![Box::new(ScriptedBackgroundTool { sender: None })],
+        );
+        agent.record_background_tasks_in(temp.path().to_path_buf());
+        assert_eq!(agent.run("go".into()).await.unwrap(), "started");
+        // Task recorded while in flight (its completion arrives 10ms after
+        // start; the first run finished before that).
+        let record = temp.path().join(".e-agent/sessions/background.jsonl");
+        assert!(record.exists());
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        // The follow-up run drains the completion and clears the record.
+        assert_eq!(agent.run("next".into()).await.unwrap(), "reacted");
+        assert!(!record.exists());
     }
 }
