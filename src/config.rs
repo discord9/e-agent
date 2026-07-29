@@ -83,6 +83,7 @@ pub struct ResolvedModel {
     pub model: String,
     pub reasoning_effort: Option<String>,
     pub auth: AuthMode,
+    pub display: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,6 +226,7 @@ impl Config {
                 model,
                 reasoning_effort,
                 auth: AuthMode::ChatGpt,
+                display: profile.to_owned(),
             });
         }
         let base_url = provider
@@ -257,6 +259,7 @@ impl Config {
             model,
             reasoning_effort,
             auth: AuthMode::ApiKey,
+            display: profile.to_owned(),
         })
     }
 
@@ -365,6 +368,7 @@ reasoning_effort = "max"
         let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
         assert_eq!(resolved.base_url, "https://api.kimi.com/coding/v1");
         assert_eq!(resolved.model, "k3");
+        assert_eq!(resolved.display, "kimi/k3");
         assert_eq!(resolved.api_key, "key");
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("max"));
     }
@@ -460,6 +464,7 @@ subagent = "kimi/k2"
         let config = Config::from_path(&path).unwrap();
         let subagent = config.resolve_role("subagent").unwrap().unwrap();
         assert_eq!(subagent.model, "k2");
+        assert_eq!(subagent.display, "kimi/k2");
         assert!(config.resolve_role("reviewer").unwrap().is_none());
     }
 
@@ -667,6 +672,7 @@ model = "gpt-5.6-sol"
             .resolve(Some("chatgpt/codex"))
             .unwrap();
         assert_eq!(resolved.auth, AuthMode::ChatGpt);
+        assert_eq!(resolved.display, "chatgpt/codex");
         for field in [
             "base_url = \"https://example.test\"",
             "api_key_file = \"key\"",

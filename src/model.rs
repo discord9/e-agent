@@ -12,17 +12,48 @@ use crate::codex::CodexModel;
 /// The two concrete model wires e-agent supports. Keeping this enum concrete
 /// preserves the existing `Model` seam while making delegated clones exact.
 #[derive(Clone)]
-pub enum ConfiguredModel {
+pub enum ConfiguredModelKind {
     Chat(OpenAiModel),
     Codex(CodexModel),
+}
+
+/// A configured model with an optional display name (profile key) for UI
+/// rendering. `name()` always returns the wire model name; `display_name()`
+/// returns the profile key when set, falling back to the wire name.
+#[derive(Clone)]
+pub struct ConfiguredModel {
+    pub kind: ConfiguredModelKind,
+    pub display: Option<String>,
+}
+
+impl ConfiguredModel {
+    pub fn chat(model: OpenAiModel) -> Self {
+        Self {
+            kind: ConfiguredModelKind::Chat(model),
+            display: None,
+        }
+    }
+
+    pub fn codex(model: CodexModel) -> Self {
+        Self {
+            kind: ConfiguredModelKind::Codex(model),
+            display: None,
+        }
+    }
+
+    /// UI-friendly display name: the profile key when configured, otherwise
+    /// the wire model name.
+    pub fn display_name(&self) -> &str {
+        self.display.as_deref().unwrap_or_else(|| self.name())
+    }
 }
 
 #[async_trait::async_trait]
 impl Model for ConfiguredModel {
     fn name(&self) -> &str {
-        match self {
-            Self::Chat(model) => model.name(),
-            Self::Codex(model) => model.name(),
+        match &self.kind {
+            ConfiguredModelKind::Chat(model) => model.name(),
+            ConfiguredModelKind::Codex(model) => model.name(),
         }
     }
     async fn complete(
@@ -31,9 +62,9 @@ impl Model for ConfiguredModel {
         tools: &[ToolSpec],
         on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
     ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
-        match self {
-            Self::Chat(model) => model.complete(messages, tools, on_delta).await,
-            Self::Codex(model) => model.complete(messages, tools, on_delta).await,
+        match &mut self.kind {
+            ConfiguredModelKind::Chat(model) => model.complete(messages, tools, on_delta).await,
+            ConfiguredModelKind::Codex(model) => model.complete(messages, tools, on_delta).await,
         }
     }
 }

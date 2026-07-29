@@ -2,7 +2,7 @@ use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
-use e_agent::agent::{Agent, AgentEvent, Model, preview};
+use e_agent::agent::{Agent, AgentEvent, preview};
 use e_agent::codex::CodexModel;
 use e_agent::codex_auth::{CodexAuth, login, logout};
 use e_agent::config::Config;
@@ -159,10 +159,10 @@ async fn run() -> anyhow::Result<()> {
                     "--profile requires a config file at $XDG_CONFIG_HOME/e-agent/config.toml or $HOME/.config/e-agent/config.toml"
                 ));
             }
-            ConfiguredModel::Chat(OpenAiModel::from_env(base_url, model)?)
+            ConfiguredModel::chat(OpenAiModel::from_env(base_url, model)?)
         }
     };
-    let model_name = model.name().to_owned();
+    let model_name = model.display_name().to_owned();
     let subagent_model = role_resolved
         .map(|resolved| configured_model(resolved, auth.as_ref(), None, None))
         .transpose()?;
@@ -194,7 +194,7 @@ async fn run() -> anyhow::Result<()> {
         .with_roles_root(root.clone())
         .with_sandbox(sandbox);
     if let Some(subagent_model) = subagent_model {
-        let name = subagent_model.name().to_owned();
+        let name = subagent_model.display_name().to_owned();
         delegate = delegate.with_subagent_model(subagent_model);
         if !tui_mode {
             eprintln!("e-agent: subagent model {name}");
@@ -409,18 +409,27 @@ fn configured_model(
     base_url: Option<String>,
     model: Option<String>,
 ) -> anyhow::Result<ConfiguredModel> {
+    let display = Some(resolved.display);
     match resolved.auth {
-        AuthMode::ApiKey => Ok(ConfiguredModel::Chat(OpenAiModel::new(
-            base_url.unwrap_or(resolved.base_url),
-            resolved.api_key,
-            model.unwrap_or(resolved.model),
-            resolved.reasoning_effort,
-        )?)),
-        AuthMode::ChatGpt => Ok(ConfiguredModel::Codex(CodexModel::new(
-            auth.cloned()
-                .ok_or_else(|| anyhow!("ChatGPT auth was not initialized"))?,
-            model.unwrap_or(resolved.model),
-            resolved.reasoning_effort,
-        )?)),
+        AuthMode::ApiKey => {
+            let mut cm = ConfiguredModel::chat(OpenAiModel::new(
+                base_url.unwrap_or(resolved.base_url),
+                resolved.api_key,
+                model.unwrap_or(resolved.model),
+                resolved.reasoning_effort,
+            )?);
+            cm.display = display;
+            Ok(cm)
+        }
+        AuthMode::ChatGpt => {
+            let mut cm = ConfiguredModel::codex(CodexModel::new(
+                auth.cloned()
+                    .ok_or_else(|| anyhow!("ChatGPT auth was not initialized"))?,
+                model.unwrap_or(resolved.model),
+                resolved.reasoning_effort,
+            )?);
+            cm.display = display;
+            Ok(cm)
+        }
     }
 }

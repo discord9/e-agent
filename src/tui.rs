@@ -16,8 +16,8 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::buffer::{Buffer, CellDiffOption, CellWidth};
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::buffer::{CellDiffOption, CellWidth};
+use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -741,309 +741,300 @@ async fn drive<T>(
     }
 }
 
-fn draw<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
+fn draw<'a, B: ratatui::backend::Backend>(
+    terminal: &'a mut Terminal<B>,
     state: &mut TuiState,
-) -> Result<(), B::Error> {
-    terminal
-        .draw(|frame| {
-            // Paint first, then every region below paints its own surface. This
-            // keeps the alternate screen free of terminal-default holes.
-            frame.render_widget(
-                Block::default().style(SOLARIZED_LIGHT.screen_style()),
-                frame.area(),
-            );
-            let attached = state.attached.is_some();
-            let inner_input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
-            let input_rows = if let Some(attached) = &state.attached {
-                attached.input.visual_rows(inner_input_width)
-            } else {
-                state.input.visual_rows(inner_input_width)
-            };
-            let input_height = (input_rows + 2)
-                .min((usize::from(frame.area().height) / 3).max(3))
-                .max(3) as u16;
-            let queue_height = if attached || state.queued.is_empty() {
-                0
-            } else {
-                // One row per queued prompt, so every pending message is
-                // visible (not just the head).
-                state.queued.len() as u16
-            };
-            let running: Vec<crate::tools::BackgroundTaskInfo> = state
-                .background
-                .as_ref()
-                .map(|background| background.running())
-                .unwrap_or_default();
-            // Panel open: full list. Panel closed but tasks running: a one-line
-            // hint so background work never goes completely unnoticed.
-            const OUTPUT_LINES: usize = 8;
-            let selected_output = if state.show_tasks {
-                running
-                    .get(state.task_cursor)
-                    .map(|task| String::from_utf8_lossy(&task.output).into_owned())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let output_line_count = selected_output.lines().count().min(OUTPUT_LINES);
-            let tasks_height = if state.show_tasks {
-                // border (2) + header (1) + one row per task + output tail
-                (running.len() as u16 + 3 + output_line_count as u16).max(3)
-            } else {
-                u16::from(!running.is_empty())
-            };
-            let [output, queue_bar, tasks_bar, input] = Layout::vertical([
-                Constraint::Min(1),
-                Constraint::Length(queue_height),
-                Constraint::Length(tasks_height),
-                Constraint::Length(input_height),
-            ])
-            .areas(frame.area());
-            if queue_height > 0 {
-                let queued_lines: Vec<Line> = state
-                    .queued
-                    .iter()
-                    .enumerate()
-                    .map(|(index, prompt)| {
-                        Line::styled(
-                            format!("queued {}: {}", index + 1, preview(prompt, 60)),
-                            SOLARIZED_LIGHT.queue_style(),
-                        )
-                    })
-                    .collect();
-                frame.render_widget(
-                    Paragraph::new(queued_lines).style(SOLARIZED_LIGHT.queue_style()),
-                    queue_bar,
-                );
-            }
-            if tasks_height > 0 && !state.show_tasks {
-                // Collapsed hint.
-                frame.render_widget(
-                    Paragraph::new(Line::styled(
-                        format!(
-                            "▸ {} background task(s) running (F2 to view)",
-                            running.len()
-                        ),
-                        Style::default()
-                            .fg(SOLARIZED_LIGHT.yellow)
-                            .bg(SOLARIZED_LIGHT.panel)
-                            .add_modifier(Modifier::DIM),
-                    ))
-                    .style(SOLARIZED_LIGHT.panel_style()),
-                    tasks_bar,
-                );
-            }
-            if tasks_height > 0 && state.show_tasks {
-                let attachable = |id: u64| {
-                    state
-                        .attached
-                        .as_ref()
-                        .is_some_and(|attached| attached.id == id)
-                        || state
-                            .attachable
-                            .as_ref()
-                            .is_some_and(|attachable| attachable(id))
-                };
-                let mut lines = vec![Line::styled(
-                    if running.is_empty() {
-                        "no background tasks running".to_owned()
-                    } else {
-                        format!("{} background task(s) running", running.len())
-                    },
-                    Style::default()
-                        .fg(SOLARIZED_LIGHT.text)
-                        .bg(SOLARIZED_LIGHT.panel)
-                        .add_modifier(Modifier::BOLD),
-                )];
-                for (index, task) in running.iter().enumerate() {
-                    let mut style = Style::default()
-                        .fg(SOLARIZED_LIGHT.muted)
-                        .bg(SOLARIZED_LIGHT.panel);
-                    if index == state.task_cursor && attachable(task.id) {
-                        style = Style::default()
-                            .fg(SOLARIZED_LIGHT.text)
-                            .bg(SOLARIZED_LIGHT.selection)
-                            .add_modifier(Modifier::BOLD);
-                    }
-                    let hint = if attachable(task.id) {
-                        ""
-                    } else {
-                        "  (no view)"
-                    };
-                    let row = if let Some(role) = &task.role {
-                        format!("  #{}: [{}] {}{}", task.id, role, task.label, hint)
-                    } else {
-                        format!("  #{}: {}{}", task.id, task.label, hint)
-                    };
-                    lines.push(Line::styled(row, style));
-                }
-                if !selected_output.is_empty() {
-                    let skip = selected_output.lines().count().saturating_sub(OUTPUT_LINES);
-                    for line in selected_output.lines().skip(skip) {
-                        lines.push(Line::styled(
-                            format!("  │ {}", preview(line, 120)),
-                            Style::default()
-                                .fg(SOLARIZED_LIGHT.muted)
-                                .bg(SOLARIZED_LIGHT.panel)
-                                .add_modifier(Modifier::DIM),
-                        ));
-                    }
-                }
-                frame.render_widget(
-                    Paragraph::new(lines)
-                        .style(SOLARIZED_LIGHT.panel_style())
-                        .block(SOLARIZED_LIGHT.block("tasks (F2 hide · Enter attach · x cancel)")),
-                    tasks_bar,
-                );
-            }
-            let inner_width = usize::from(output.width).max(1);
-            // The scrollback rendered depends on whether we are attached to
-            // a session view; the rendering pipeline is identical.
-            let scroll_state: &mut TuiState = match &mut state.attached {
-                Some(attached) => &mut attached.state,
-                None => state,
-            };
-            // Body text (Normal) is parsed as markdown line-by-line so code
-            // fences track state across lines; other kinds keep flat styling.
-            let mut markdown = crate::markdown::MarkdownLines::new();
-            let visual: Vec<Line> = scroll_state
-                .lines
+) -> Result<ratatui::CompletedFrame<'a>, B::Error> {
+    terminal.draw(|frame| {
+        // Paint first, then every region below paints its own surface. This
+        // keeps the alternate screen free of terminal-default holes.
+        frame.render_widget(
+            Block::default().style(SOLARIZED_LIGHT.screen_style()),
+            frame.area(),
+        );
+        let attached = state.attached.is_some();
+        let inner_input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
+        let input_rows = if let Some(attached) = &state.attached {
+            attached.input.visual_rows(inner_input_width)
+        } else {
+            state.input.visual_rows(inner_input_width)
+        };
+        let input_height = (input_rows + 2)
+            .min((usize::from(frame.area().height) / 3).max(3))
+            .max(3) as u16;
+        let queue_height = if attached || state.queued.is_empty() {
+            0
+        } else {
+            // One row per queued prompt, so every pending message is
+            // visible (not just the head).
+            state.queued.len() as u16
+        };
+        let running: Vec<crate::tools::BackgroundTaskInfo> = state
+            .background
+            .as_ref()
+            .map(|background| background.running())
+            .unwrap_or_default();
+        // Panel open: full list. Panel closed but tasks running: a one-line
+        // hint so background work never goes completely unnoticed.
+        const OUTPUT_LINES: usize = 8;
+        let selected_output = if state.show_tasks {
+            running
+                .get(state.task_cursor)
+                .map(|task| String::from_utf8_lossy(&task.output).into_owned())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let output_line_count = selected_output.lines().count().min(OUTPUT_LINES);
+        let tasks_height = if state.show_tasks {
+            // border (2) + header (1) + one row per task + output tail
+            (running.len() as u16 + 3 + output_line_count as u16).max(3)
+        } else {
+            u16::from(!running.is_empty())
+        };
+        let [output, queue_bar, tasks_bar, input] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(queue_height),
+            Constraint::Length(tasks_height),
+            Constraint::Length(input_height),
+        ])
+        .areas(frame.area());
+        if queue_height > 0 {
+            let queued_lines: Vec<Line> = state
+                .queued
                 .iter()
-                .flat_map(|line| {
-                    if line.kind == LineKind::Normal {
-                        // A Normal line may embed newlines (replayed content,
-                        // a non-streamed final answer); split them so each
-                        // becomes its own visual row. The code-fence state
-                        // still carries across these segments.
-                        line.text
-                            .split('\n')
-                            .flat_map(|segment| {
-                                let spans = markdown.render_line(segment);
-                                crate::markdown::wrap_spans(&spans, inner_width)
-                            })
-                            .collect::<Vec<Line>>()
-                    } else {
-                        hard_wrap(&line.text, inner_width)
-                            .into_iter()
-                            .map(move |row| styled_scroll_line(row, line.kind))
-                            .collect()
-                    }
+                .enumerate()
+                .map(|(index, prompt)| {
+                    Line::styled(
+                        format!("queued {}: {}", index + 1, preview(prompt, 60)),
+                        SOLARIZED_LIGHT.queue_style(),
+                    )
                 })
                 .collect();
-            let total_rows = visual.len();
-            let paragraph = Paragraph::new(visual).style(SOLARIZED_LIGHT.screen_style());
-            let height = usize::from(output.height);
-            let max_scroll = total_rows.saturating_sub(height);
-            scroll_state.max_scroll = max_scroll;
-            scroll_state.scroll = scroll_state.scroll.min(max_scroll);
             frame.render_widget(
-                paragraph.scroll((scroll_state.scroll.min(u16::MAX as usize) as u16, 0)),
-                output,
+                Paragraph::new(queued_lines).style(SOLARIZED_LIGHT.queue_style()),
+                queue_bar,
             );
-            force_wide_trailing_cell_updates(frame.buffer_mut(), output);
-            if let Some(attached) = &mut state.attached {
-                let status = if attached.finished {
-                    "finished"
+        }
+        if tasks_height > 0 && !state.show_tasks {
+            // Collapsed hint.
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    format!(
+                        "▸ {} background task(s) running (F2 to view)",
+                        running.len()
+                    ),
+                    Style::default()
+                        .fg(SOLARIZED_LIGHT.yellow)
+                        .bg(SOLARIZED_LIGHT.panel)
+                        .add_modifier(Modifier::DIM),
+                ))
+                .style(SOLARIZED_LIGHT.panel_style()),
+                tasks_bar,
+            );
+        }
+        if tasks_height > 0 && state.show_tasks {
+            let attachable = |id: u64| {
+                state
+                    .attached
+                    .as_ref()
+                    .is_some_and(|attached| attached.id == id)
+                    || state
+                        .attachable
+                        .as_ref()
+                        .is_some_and(|attachable| attachable(id))
+            };
+            let mut lines = vec![Line::styled(
+                if running.is_empty() {
+                    "no background tasks running".to_owned()
                 } else {
-                    "running"
+                    format!("{} background task(s) running", running.len())
+                },
+                Style::default()
+                    .fg(SOLARIZED_LIGHT.text)
+                    .bg(SOLARIZED_LIGHT.panel)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            for (index, task) in running.iter().enumerate() {
+                let mut style = Style::default()
+                    .fg(SOLARIZED_LIGHT.muted)
+                    .bg(SOLARIZED_LIGHT.panel);
+                if index == state.task_cursor && attachable(task.id) {
+                    style = Style::default()
+                        .fg(SOLARIZED_LIGHT.text)
+                        .bg(SOLARIZED_LIGHT.selection)
+                        .add_modifier(Modifier::BOLD);
+                }
+                let hint = if attachable(task.id) {
+                    ""
+                } else {
+                    "  (no view)"
                 };
-                let block = SOLARIZED_LIGHT
-                    .block(format!(
-                        "subagent #{}: {} ({}) — Esc detach · Enter steer · Ctrl-C interrupt",
-                        attached.id,
-                        preview(&attached.label, 40),
-                        status
-                    ))
-                    .title_top(
-                        Line::from(attached.state.session_id.clone())
-                            .alignment(Alignment::Right)
-                            .style(Style::default().fg(SOLARIZED_LIGHT.muted)),
-                    )
-                    .title_bottom({
-                        let spans = model_role_spans(
-                            &attached.state.model_name,
-                            attached.state.role_name.as_deref(),
-                        );
-                        Line::from(spans).alignment(Alignment::Left)
-                    });
-                let (cursor_row, cursor_col) = attached.input.wrapped_cursor(inner_input_width);
-                let inner_input_height = usize::from(input.height.saturating_sub(2));
-                attached.input_scroll =
-                    cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
-                let input_lines: Vec<Line> = hard_wrap(&attached.input.text, inner_input_width)
-                    .into_iter()
-                    .map(|line| Line::styled(line, SOLARIZED_LIGHT.panel_style()))
-                    .collect();
-                frame.render_widget(
-                    Paragraph::new(input_lines)
-                        .style(SOLARIZED_LIGHT.panel_style())
-                        .block(block)
-                        .scroll((attached.input_scroll.min(u16::MAX as usize) as u16, 0)),
-                    input,
-                );
-                {
-                    let usage = cwd_usage_text(&attached.state.cwd, attached.state.tokens_context);
-                    let width = UnicodeWidthStr::width(usage.as_str()) as u16 + 1;
-                    if input.width > width + 1 {
-                        let area = ratatui::layout::Rect {
-                            x: input.right().saturating_sub(width + 1),
-                            y: input.bottom() - 1,
-                            width,
-                            height: 1,
-                        };
-                        frame.render_widget(
-                            Paragraph::new(usage).style(
-                                Style::default()
-                                    .fg(SOLARIZED_LIGHT.orange)
-                                    .bg(SOLARIZED_LIGHT.panel),
-                            ),
-                            area,
-                        );
+                let row = if let Some(role) = &task.role {
+                    format!("  #{}: [{}] {}{}", task.id, role, task.label, hint)
+                } else {
+                    format!("  #{}: {}{}", task.id, task.label, hint)
+                };
+                lines.push(Line::styled(row, style));
+            }
+            if !selected_output.is_empty() {
+                let skip = selected_output.lines().count().saturating_sub(OUTPUT_LINES);
+                for line in selected_output.lines().skip(skip) {
+                    lines.push(Line::styled(
+                        format!("  │ {}", preview(line, 120)),
+                        Style::default()
+                            .fg(SOLARIZED_LIGHT.muted)
+                            .bg(SOLARIZED_LIGHT.panel)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
+            }
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .style(SOLARIZED_LIGHT.panel_style())
+                    .block(SOLARIZED_LIGHT.block("tasks (F2 hide  Enter attach  x cancel)")),
+                tasks_bar,
+            );
+        }
+        let inner_width = usize::from(output.width).max(1);
+        // The scrollback rendered depends on whether we are attached to
+        // a session view; the rendering pipeline is identical.
+        let scroll_state: &mut TuiState = match &mut state.attached {
+            Some(attached) => &mut attached.state,
+            None => state,
+        };
+        // Body text (Normal) is parsed as markdown line-by-line so code
+        // fences track state across lines; other kinds keep flat styling.
+        let mut markdown = crate::markdown::MarkdownLines::new();
+        let visual: Vec<Line> = scroll_state
+            .lines
+            .iter()
+            .flat_map(|line| {
+                if line.kind == LineKind::Normal {
+                    // A Normal line may embed newlines (replayed content,
+                    // a non-streamed final answer); split them so each
+                    // becomes its own visual row. The code-fence state
+                    // still carries across these segments.
+                    line.text
+                        .split('\n')
+                        .flat_map(|segment| {
+                            let spans = markdown.render_line(segment);
+                            crate::markdown::wrap_spans(&spans, inner_width)
+                        })
+                        .collect::<Vec<Line>>()
+                } else {
+                    hard_wrap(&line.text, inner_width)
+                        .into_iter()
+                        .map(move |row| styled_scroll_line(row, line.kind))
+                        .collect()
+                }
+            })
+            .collect();
+        let total_rows = visual.len();
+        let height = usize::from(output.height);
+        let max_scroll = total_rows.saturating_sub(height);
+        scroll_state.max_scroll = max_scroll;
+        scroll_state.scroll = scroll_state.scroll.min(max_scroll);
+        {
+            let buf = frame.buffer_mut();
+            buf.set_style(output, SOLARIZED_LIGHT.screen_style());
+            let scroll_offset = scroll_state.scroll;
+            for (row_idx, line) in visual.iter().enumerate().skip(scroll_offset) {
+                let y = output.y + (row_idx - scroll_offset) as u16;
+                if y >= output.bottom() {
+                    break;
+                }
+                buf.set_line(output.x, y, line, output.width);
+            }
+            // Fix trailing cells of wide glyphs: they were reset to
+            // Cell::EMPTY by set_stringn but must keep the correct style
+            // (matching the wide glyph's style) so the diff can emit them.
+            for y in output.y..output.bottom() {
+                let mut x = output.x;
+                while x < output.right() {
+                    let width = buf[(x, y)].cell_width();
+                    if width > 1 {
+                        let glyph_style = buf[(x, y)].style();
+                        let last = (x + width).min(output.right());
+                        for cx in x + 1..last {
+                            let cell = &mut buf[(cx, y)];
+                            cell.set_symbol(" ").set_style(glyph_style);
+                            cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                        }
+                        x += width;
+                    } else {
+                        x += 1;
                     }
                 }
-                frame.set_cursor_position((
-                    input.x + 1 + (cursor_col as u16).min(input.width.saturating_sub(2)),
-                    input.y
-                        + 1
-                        + ((cursor_row - attached.input_scroll) as u16)
-                            .min(input.height.saturating_sub(2)),
-                ));
-                return;
             }
-            // Input-box chrome: top-left = status, top-right = session id,
-            // bottom-left = model (agent role goes here later), bottom-right =
-            // cwd + context tokens.
-            let title = state.busy.map_or(String::new(), BusyState::title);
-            let input_block = SOLARIZED_LIGHT
-                .block(title)
+        }
+        if let Some(attached) = &mut state.attached {
+            let status = if attached.finished {
+                "finished"
+            } else {
+                "running"
+            };
+            let block = SOLARIZED_LIGHT
+                .block(format!(
+                    "subagent #{}: {} ({}) — Esc detach  Enter steer  Ctrl-C interrupt",
+                    attached.id,
+                    preview(&attached.label, 40),
+                    status
+                ))
                 .title_top(
-                    Line::from(state.session_id.clone())
+                    Line::from(attached.state.session_id.clone())
                         .alignment(Alignment::Right)
                         .style(Style::default().fg(SOLARIZED_LIGHT.muted)),
                 )
                 .title_bottom({
-                    let spans = model_role_spans(&state.model_name, state.role_name.as_deref());
+                    let spans = model_role_spans(
+                        &attached.state.model_name,
+                        attached.state.role_name.as_deref(),
+                    );
                     Line::from(spans).alignment(Alignment::Left)
                 });
-            // cwd is always shown; the context-token count appears once the
-            // first turn has reported usage.
-            let usage = cwd_usage_text(&state.cwd, state.tokens_context);
-            let (cursor_row, cursor_col) = state.input.wrapped_cursor(inner_input_width);
+            let (cursor_row, cursor_col) = attached.input.wrapped_cursor(inner_input_width);
             let inner_input_height = usize::from(input.height.saturating_sub(2));
-            let input_scroll = cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
-            let input_lines: Vec<Line> = hard_wrap(&state.input.text, inner_input_width)
+            attached.input_scroll = cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
+            let input_lines: Vec<Line> = hard_wrap(&attached.input.text, inner_input_width)
                 .into_iter()
                 .map(|line| Line::styled(line, SOLARIZED_LIGHT.panel_style()))
                 .collect();
-            frame.render_widget(
-                Paragraph::new(input_lines)
-                    .style(SOLARIZED_LIGHT.panel_style())
-                    .block(input_block)
-                    .scroll((input_scroll.min(u16::MAX as usize) as u16, 0)),
-                input,
-            );
+            let inner = block.inner(input);
+            frame.render_widget(block, input);
             {
+                let buf = frame.buffer_mut();
+                buf.set_style(inner, SOLARIZED_LIGHT.panel_style());
+                let scroll_offset = attached.input_scroll;
+                for (row_idx, line_text) in input_lines.iter().enumerate().skip(scroll_offset) {
+                    let y = inner.y + (row_idx - scroll_offset) as u16;
+                    if y >= inner.bottom() {
+                        break;
+                    }
+                    buf.set_line(inner.x, y, line_text, inner.width);
+                }
+                // Fix trailing cells of wide glyphs.
+                for y in inner.y..inner.bottom() {
+                    let mut x = inner.x;
+                    while x < inner.right() {
+                        let width = buf[(x, y)].cell_width();
+                        if width > 1 {
+                            let glyph_style = buf[(x, y)].style();
+                            let last = (x + width).min(inner.right());
+                            for cx in x + 1..last {
+                                let cell = &mut buf[(cx, y)];
+                                cell.set_symbol(" ").set_style(glyph_style);
+                                cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                            }
+                            x += width;
+                        } else {
+                            x += 1;
+                        }
+                    }
+                }
+            }
+            {
+                let usage = cwd_usage_text(&attached.state.cwd, attached.state.tokens_context);
                 let width = UnicodeWidthStr::width(usage.as_str()) as u16 + 1;
                 if input.width > width + 1 {
                     let area = ratatui::layout::Rect {
@@ -1066,24 +1057,93 @@ fn draw<B: ratatui::backend::Backend>(
                 input.x + 1 + (cursor_col as u16).min(input.width.saturating_sub(2)),
                 input.y
                     + 1
-                    + ((cursor_row - input_scroll) as u16).min(input.height.saturating_sub(2)),
+                    + ((cursor_row - attached.input_scroll) as u16)
+                        .min(input.height.saturating_sub(2)),
             ));
-        })
-        .map(|_| ())
-}
-
-/// Ratatui's diff skips the cells covered by wide glyphs. Always emit the
-/// following visible cell so it cannot retain terminal-default attributes.
-fn force_wide_trailing_cell_updates(buffer: &mut Buffer, area: Rect) {
-    for y in area.y..area.bottom() {
-        for x in area.x..area.right() {
-            let width = buffer[(x, y)].cell_width();
-            let trailing = x.saturating_add(width);
-            if width > 1 && trailing < area.right() {
-                buffer[(trailing, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
+            return;
+        }
+        // Input-box chrome: top-left = status, top-right = session id,
+        // bottom-left = model (agent role goes here later), bottom-right =
+        // cwd + context tokens.
+        let title = state.busy.map_or(String::new(), BusyState::title);
+        let input_block = SOLARIZED_LIGHT
+            .block(title)
+            .title_top(
+                Line::from(state.session_id.clone())
+                    .alignment(Alignment::Right)
+                    .style(Style::default().fg(SOLARIZED_LIGHT.muted)),
+            )
+            .title_bottom({
+                let spans = model_role_spans(&state.model_name, state.role_name.as_deref());
+                Line::from(spans).alignment(Alignment::Left)
+            });
+        // cwd is always shown; the context-token count appears once the
+        // first turn has reported usage.
+        let usage = cwd_usage_text(&state.cwd, state.tokens_context);
+        let (cursor_row, cursor_col) = state.input.wrapped_cursor(inner_input_width);
+        let inner_input_height = usize::from(input.height.saturating_sub(2));
+        let input_scroll = cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
+        let input_lines: Vec<Line> = hard_wrap(&state.input.text, inner_input_width)
+            .into_iter()
+            .map(|line| Line::styled(line, SOLARIZED_LIGHT.panel_style()))
+            .collect();
+        let inner = input_block.inner(input);
+        frame.render_widget(input_block, input);
+        {
+            let buf = frame.buffer_mut();
+            buf.set_style(inner, SOLARIZED_LIGHT.panel_style());
+            let scroll_offset = input_scroll;
+            for (row_idx, line_text) in input_lines.iter().enumerate().skip(scroll_offset) {
+                let y = inner.y + (row_idx - scroll_offset) as u16;
+                if y >= inner.bottom() {
+                    break;
+                }
+                buf.set_line(inner.x, y, line_text, inner.width);
+            }
+            // Fix trailing cells of wide glyphs.
+            for y in inner.y..inner.bottom() {
+                let mut x = inner.x;
+                while x < inner.right() {
+                    let width = buf[(x, y)].cell_width();
+                    if width > 1 {
+                        let glyph_style = buf[(x, y)].style();
+                        let last = (x + width).min(inner.right());
+                        for cx in x + 1..last {
+                            let cell = &mut buf[(cx, y)];
+                            cell.set_symbol(" ").set_style(glyph_style);
+                            cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                        }
+                        x += width;
+                    } else {
+                        x += 1;
+                    }
+                }
             }
         }
-    }
+        {
+            let width = UnicodeWidthStr::width(usage.as_str()) as u16 + 1;
+            if input.width > width + 1 {
+                let area = ratatui::layout::Rect {
+                    x: input.right().saturating_sub(width + 1),
+                    y: input.bottom() - 1,
+                    width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(usage).style(
+                        Style::default()
+                            .fg(SOLARIZED_LIGHT.orange)
+                            .bg(SOLARIZED_LIGHT.panel),
+                    ),
+                    area,
+                );
+            }
+        }
+        frame.set_cursor_position((
+            input.x + 1 + (cursor_col as u16).min(input.width.saturating_sub(2)),
+            input.y + 1 + ((cursor_row - input_scroll) as u16).min(input.height.saturating_sub(2)),
+        ));
+    })
 }
 
 /// Keep wrapping text-only so scroll accounting is unchanged, then add the
@@ -1120,7 +1180,7 @@ fn format_tokens(count: u64) -> String {
 }
 
 /// Build the bottom-left title spans for the input block: model name (violet)
-/// with an optional ` · role` suffix (muted). Shared by the main and attached
+/// with an optional ` role` suffix (muted). Shared by the main and attached
 /// views. Returns an empty vec when `model_name` is empty.
 fn model_role_spans(model_name: &str, role_name: Option<&str>) -> Vec<Span<'static>> {
     if model_name.is_empty() {
@@ -1132,7 +1192,7 @@ fn model_role_spans(model_name: &str, role_name: Option<&str>) -> Vec<Span<'stat
     )];
     if let Some(role) = role_name {
         spans.push(Span::styled(
-            format!(" · {role}"),
+            format!(" {role}"),
             Style::default().fg(SOLARIZED_LIGHT.muted),
         ));
     }
@@ -1145,7 +1205,7 @@ fn model_role_spans(model_name: &str, role_name: Option<&str>) -> Vec<Span<'stat
 fn cwd_usage_text(cwd: &str, tokens_context: u64) -> String {
     let cwd = shorten_home(cwd);
     if tokens_context > 0 {
-        format!("{} · ctx {}", cwd, format_tokens(tokens_context))
+        format!("{} ctx {}", cwd, format_tokens(tokens_context))
     } else {
         cwd.into_owned()
     }
@@ -2323,20 +2383,99 @@ mod tests {
     }
 
     #[test]
-    fn wide_scroll_line_forces_its_following_visible_cell_to_update() {
+    fn wide_char_backspace_leaves_no_stale_trailing_cell_in_input() {
+        // Regression: typing then deleting a wide char in the input area.
+        // Frame 1: type "好" (wide, covering inner.x and x+1), draw.
+        // Frame 2: backspace (input empty), draw.  The trailing cell that
+        // was covered by 好 in frame 1 must carry the panel background.
+        //
+        // NOTE: this assertion also passes on the old Paragraph-based code
+        // because the input Block repaints the entire frame area every draw
+        // (set_style all-area paint already fixes bg).  The real regression
+        // is in the scrollback area (Scenario B below) where no Block exists.
         let backend = ratatui::backend::TestBackend::new(12, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = TuiState::default();
-        state.push_line("你好".into(), LineKind::Normal);
 
+        state.input.insert("好");
+        draw(&mut terminal, &mut state).unwrap();
+        state.input.backspace();
         draw(&mut terminal, &mut state).unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(2, 0)].diff_option, CellDiffOption::AlwaysUpdate);
-        assert_eq!(buffer[(4, 0)].diff_option, CellDiffOption::AlwaysUpdate);
-        assert_eq!(buffer[(1, 0)].diff_option, CellDiffOption::None);
+        // inner content row = y=6 (input.y=5 + 1 border)
+        // 好 was at inner.x=1 → trailing cell at x=2
+        let trailing = &buffer[(2, 6)];
+        assert_eq!(
+            trailing.bg, SOLARIZED_LIGHT.panel,
+            "trailing cell of deleted wide char in input must get panel bg"
+        );
+        let sym = trailing.symbol();
+        assert!(
+            sym.is_empty() || sym == " ",
+            "trailing cell must be blank, got {sym:?}"
+        );
     }
 
+    #[test]
+    fn wide_scroll_lines_leave_no_stale_trailing_cells() {
+        // Regression: in the scrollback area (no Block repaint), trailing
+        // cells of wide glyphs must carry the line's background style so
+        // the buffer diff can emit them when the glyph is later replaced.
+        //
+        // The diff iterator never visits trailing cells of wide glyphs
+        // (they are skipped by cell_width logic).  When a wide glyph IS
+        // later replaced by narrower text, the trailing state mechanism
+        // emits those cells from the *current* frame buffer.  In the old
+        // code those cells were Cell::EMPTY (bg = Color::Reset), so the
+        // terminal showed a black box.  The fixup re-styles them with the
+        // glyph's own background before the diff runs.
+        //
+        // We test this by verifying that trailing cells in the completed
+        // (backend) buffer have the line's Solarized bg after a single
+        // draw, which the old code never achieved because EMPTY cells
+        // were skipped by the diff and never reached the backend.
+        let backend = ratatui::backend::TestBackend::new(12, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+
+        state.push_line("你好数据".into(), LineKind::Normal);
+
+        // Capture the CompletedFrame to check the rendered buffer.
+        // The CompletedFrame.buffer is the non-current buffer after
+        // swap_buffers — it holds exactly what the frame rendered.
+        let completed = draw(&mut terminal, &mut state).unwrap();
+        let frame_buf = completed.buffer;
+
+        // The trailing cells (odd x positions) must carry the Normal
+        // line's background style AND be marked AlwaysUpdate so the
+        // diff can emit them when a wide glyph is later replaced.
+        // In the old code the Paragraph.render_line never reset
+        // trailing cells (they kept the area bg), so the bg assertion
+        // alone would pass.  But the old force_wide_trailing_cell_updates
+        // helper marked x+width (the cell AFTER the glyph) instead of
+        // the *covered* trailing cells, so the diff_option on the
+        // actual trailing cells was None rather than AlwaysUpdate.
+        let line_bg = SOLARIZED_LIGHT.background;
+        for trailing_x in [1, 3, 5, 7] {
+            assert_eq!(
+                frame_buf[(trailing_x, 0)].bg,
+                line_bg,
+                "trailing cell ({trailing_x}, 0) in frame buffer must have line bg, not Reset"
+            );
+            assert_eq!(
+                frame_buf[(trailing_x, 0)].diff_option,
+                CellDiffOption::AlwaysUpdate,
+                "trailing cell ({trailing_x}, 0) must have AlwaysUpdate, old code set it on x+width instead"
+            );
+        }
+
+        // The glyph cells themselves must still be visible.
+        assert_eq!(frame_buf[(0, 0)].symbol(), "你");
+        assert_eq!(frame_buf[(2, 0)].symbol(), "好");
+        assert_eq!(frame_buf[(4, 0)].symbol(), "数");
+        assert_eq!(frame_buf[(6, 0)].symbol(), "据");
+    }
     #[test]
     fn cursor_sits_at_the_insertion_point() {
         let backend = ratatui::backend::TestBackend::new(20, 10);
@@ -2484,12 +2623,12 @@ mod tests {
         };
         let bottom = row_text(11);
         assert!(
-            bottom.contains("deepseek-v4-flash · fixer"),
-            "bottom-left shows model · role, got: {bottom:?}"
+            bottom.contains("deepseek-v4-flash fixer"),
+            "bottom-left shows model role, got: {bottom:?}"
         );
         assert!(
-            bottom.contains("/repo · ctx 1.5k"),
-            "bottom-right shows cwd · ctx, got: {bottom:?}"
+            bottom.contains("/repo ctx 1.5k"),
+            "bottom-right shows cwd ctx, got: {bottom:?}"
         );
         let top = row_text(9);
         assert!(
@@ -2520,7 +2659,7 @@ mod tests {
         );
         assert_eq!(
             cwd_usage_text(&format!("{home}/work"), 1_500),
-            "~/work · ctx 1.5k",
+            "~/work ctx 1.5k",
             "token count still appended after shortening"
         );
     }

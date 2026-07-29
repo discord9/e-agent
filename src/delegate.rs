@@ -27,7 +27,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::{Agent, AgentEvent, Model, Tool, ToolSpec, preview};
+use crate::agent::{Agent, AgentEvent, Tool, ToolSpec, preview};
 use crate::handle::{SessionHandle, SessionSink, SessionSource, Steer, session_channel};
 use crate::model::ConfiguredModel;
 use crate::session::Session;
@@ -241,7 +241,7 @@ impl Delegate {
             role_prompt,
             sandbox,
         } = task;
-        let model_name = model.name().to_owned();
+        let model_name = model.display_name().to_owned();
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -431,7 +431,7 @@ impl Tool for Delegate {
                 focused edits) whose intermediate steps would clutter your own context. The \
                 subagent has the file and bash tools and, when configured, public web search, but cannot delegate further."
                 .to_owned();
-        let model = self.subagent_model.name();
+        let model = self.subagent_model.display_name();
         description.push_str(&format!(" The subagent runs on the `{model}` model."));
         description.push_str(
             " With `background: true` it runs without blocking; the answer arrives \
@@ -587,7 +587,7 @@ impl Tool for Delegate {
             });
             // run_on_thread blocks on thread::join, so push it onto the
             // blocking thread pool to keep the executor responsive.
-            let model_name = model.name().to_string();
+            let model_name = model.display_name().to_string();
             let role_name = role.clone();
             let cwd = workspace.root().display().to_string();
             let persist_session_id = persist
@@ -664,7 +664,7 @@ impl Tool for Delegate {
         // Block until the subagent finishes (this is the synchronous mode).
         // spawn_silent keeps it visible in the task panel without emitting
         // a duplicate completion event (the answer is the tool result).
-        let model_name = model.name().to_string();
+        let model_name = model.display_name().to_string();
         let role_name = role.clone();
         let cwd = workspace.root().display().to_string();
         let persist_session_id = persist
@@ -797,7 +797,7 @@ mod tests {
         let workspace = Workspace::new(workspace).unwrap();
         // Construct the model with a dummy key directly: no request is ever
         // sent, and tests must not depend on (or mutate) process env.
-        let model = ConfiguredModel::Chat(
+        let model = ConfiguredModel::chat(
             crate::model::OpenAiModel::new(
                 "http://localhost".into(),
                 "test-key".into(),
