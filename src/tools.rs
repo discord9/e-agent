@@ -410,7 +410,7 @@ impl Tool for Bash {
                 .background
                 .start(self.workspace.clone(), command.to_owned());
         }
-        run_bash(&self.workspace, command, self.timeout, None).await
+        run_bash(&self.workspace, command, self.timeout, None, None).await
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
@@ -430,11 +430,29 @@ pub struct BackgroundTasks {
     timeout: Duration,
 }
 
+/// A live, read-only snapshot of a background task's combined stdout+stderr
+/// tail (capped at 16KB), shared between the running `bash` capture and the
+/// TUI panel. Only `BackgroundTasks::start` attaches one.
+pub type OutputSlot = Arc<std::sync::Mutex<Vec<u8>>>;
+
+const SLOT_LIMIT: usize = 16 * 1024;
+
+fn slot_append(slot: &OutputSlot, chunk: &[u8]) {
+    let mut bytes = slot.lock().unwrap();
+    bytes.extend_from_slice(chunk);
+    if bytes.len() > SLOT_LIMIT {
+        let excess = bytes.len() - SLOT_LIMIT;
+        bytes.drain(..excess);
+    }
+}
+
 #[derive(Clone)]
 struct RunningTask {
     id: u64,
     label: String,
     process_group: Arc<AtomicI32>,
+    handle: Arc<tokio::task::JoinHandle<()>>,
+    output: Option<OutputSlot>,
 }
 
 /// A snapshot of one running background task, for display.
@@ -442,6 +460,8 @@ struct RunningTask {
 pub struct BackgroundTaskInfo {
     pub id: u64,
     pub label: String,
+    /// Combined stdout/stderr tail so far; empty for non-bash tasks.
+    pub output: Vec<u8>,
 }
 
 impl BackgroundTasks {
@@ -469,24 +489,52 @@ impl BackgroundTasks {
             .map(|task| BackgroundTaskInfo {
                 id: task.id,
                 label: task.label.clone(),
+                output: task
+                    .output
+                    .as_ref()
+                    .map(|slot| slot.lock().unwrap().clone())
+                    .unwrap_or_default(),
             })
             .collect()
+    }
+
+    /// Cancel a running background task. Aborting its future drops any
+    /// in-flight `run_bash`, which kills the process group via its guard.
+    /// Returns the cancelled task's label, or `None` if no such task.
+    pub fn cancel(&self, id: u64) -> Option<String> {
+        let task = {
+            let mut running = self.running.lock().unwrap();
+            let index = running.iter().position(|task| task.id == id)?;
+            running.remove(index)
+        };
+        task.handle.abort();
+        Some(task.label)
     }
 
     /// Start a background bash command. Returns a human-readable "started"
     /// message containing the task id.
     pub fn start(&self, workspace: Workspace, command: String) -> Result<String, String> {
         let process_group = Arc::new(AtomicI32::new(0));
+        let output: OutputSlot = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pg = process_group.clone();
+        let slot = output.clone();
         let timeout = self.timeout;
-        self.spawn(preview(&command, 100), Some(process_group), move || {
-            let workspace = workspace.clone();
-            async move {
-                match run_bash(&workspace, &command, timeout, Some(pg)).await {
+        let running = self.running.clone();
+        self.spawn_with_id(
+            preview(&command, 100),
+            Some(process_group),
+            move |id| {
+                let mut running = running.lock().unwrap();
+                if let Some(task) = running.iter_mut().find(|task| task.id == id) {
+                    task.output = Some(output);
+                }
+            },
+            move || async move {
+                match run_bash(&workspace, &command, timeout, Some(pg), Some(slot)).await {
                     Ok(output) | Err(output) => output,
                 }
-            }
-        })
+            },
+        )
     }
 
     /// Register and spawn a background future. Completion is delivered as
@@ -559,19 +607,28 @@ impl BackgroundTasks {
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let started = format!("started background task {id}: {label}");
         self.running.lock().unwrap().push(RunningTask {
             id,
             label: label.clone(),
             process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),
+            handle: Arc::new(tokio::spawn(async {})),
+            output: None,
         });
         on_id(id);
-        let started = format!("started background task {id}: {label}");
         let running = self.running.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let output = work().await;
             running.lock().unwrap().retain(|task| task.id != id);
             on_complete(id, output);
         });
+        self.running
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|task| task.id == id)
+            .unwrap()
+            .handle = Arc::new(handle);
         Ok(started)
     }
 }
@@ -625,6 +682,7 @@ async fn run_bash(
     command: &str,
     timeout: Duration,
     process_group_slot: Option<Arc<AtomicI32>>,
+    output_slot: Option<OutputSlot>,
 ) -> Result<String, String> {
     let mut process = Command::new("/bin/bash");
     process
@@ -656,7 +714,11 @@ async fn run_bash(
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
     let result = tokio::time::timeout(timeout, async {
-        let (stdout, stderr, status) = tokio::join!(capture(stdout), capture(stderr), child.wait());
+        let (stdout, stderr, status) = tokio::join!(
+            capture(stdout, output_slot.clone()),
+            capture(stderr, output_slot),
+            child.wait()
+        );
         Ok::<_, std::io::Error>((stdout?, stderr?, status?))
     })
     .await;
@@ -753,7 +815,10 @@ struct Captured {
     truncated: bool,
 }
 
-async fn capture(mut reader: impl AsyncRead + Unpin) -> std::io::Result<Captured> {
+async fn capture(
+    mut reader: impl AsyncRead + Unpin,
+    slot: Option<OutputSlot>,
+) -> std::io::Result<Captured> {
     let mut bytes = Vec::new();
     let mut buffer = [0; 8192];
     let mut truncated = false;
@@ -761,6 +826,9 @@ async fn capture(mut reader: impl AsyncRead + Unpin) -> std::io::Result<Captured
         let count = reader.read(&mut buffer).await?;
         if count == 0 {
             return Ok(Captured { bytes, truncated });
+        }
+        if let Some(slot) = &slot {
+            slot_append(slot, &buffer[..count]);
         }
         let room = OUTPUT_LIMIT.saturating_sub(bytes.len());
         bytes.extend_from_slice(&buffer[..count.min(room)]);
@@ -1242,7 +1310,7 @@ mod tests {
         async fn captured(bytes: Vec<u8>) -> Captured {
             let (mut writer, reader) = tokio::io::duplex(1024);
             tokio::spawn(async move { writer.write_all(&bytes).await.unwrap() });
-            capture(reader).await.unwrap()
+            capture(reader, None).await.unwrap()
         }
         let stdout = captured(vec![b'o'; OUTPUT_LIMIT + 1]).await;
         let stderr = captured(vec![b'e'; OUTPUT_LIMIT + 1]).await;
@@ -1343,6 +1411,62 @@ mod tests {
                 .status()
                 .unwrap()
                 .success()
+        );
+    }
+
+    #[tokio::test]
+    async fn background_task_output_is_visible_while_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bash, _receiver) = background_bash(&temp, Duration::from_secs(10));
+        bash.execute(json!({
+            "command": "echo hello; sleep 30",
+            "background": true
+        }))
+        .await
+        .unwrap();
+        let mut saw = String::new();
+        for _ in 0..50 {
+            let running = bash.background.running();
+            assert_eq!(running.len(), 1);
+            saw = String::from_utf8_lossy(&running[0].output).into_owned();
+            if saw.contains("hello") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(saw.contains("hello"), "output slot never filled: {saw:?}");
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_the_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bash, _receiver) = background_bash(&temp, Duration::from_secs(30));
+        bash.execute(json!({
+            "command": "sleep 30 & echo $! > child.pid; wait",
+            "background": true
+        }))
+        .await
+        .unwrap();
+        let id = bash.background.running()[0].id;
+        for _ in 0..50 {
+            if temp.path().join("child.pid").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = std::fs::read_to_string(temp.path().join("child.pid")).unwrap();
+        let label = bash.background.cancel(id).unwrap();
+        assert!(label.contains("sleep 30"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(bash.background.running().is_empty());
+        assert!(
+            !std::process::Command::new("/bin/kill")
+                .arg("-0")
+                .arg(pid.trim())
+                .status()
+                .unwrap()
+                .success(),
+            "background child survived cancel"
         );
     }
 }

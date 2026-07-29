@@ -401,6 +401,8 @@ async fn run_inner(
                         attach_to_task(&mut state, task_id, &sessions, &sender);
                     } else if key.code == KeyCode::Esc || key.code == KeyCode::F(2) {
                         state.show_tasks = false;
+                    } else if key.code == KeyCode::Char('x') {
+                        state.cancel_selected_task();
                     } else if let Some(attached) = &mut state.attached {
                         let width = attached_input_width(terminal)?;
                         AttachedView::edit_input(&mut attached.input, key, width);
@@ -662,6 +664,8 @@ async fn drive<T>(
                         attach_to_task(state, task_id, sessions, sender);
                     } else if key.code == KeyCode::F(2) {
                         state.show_tasks = false;
+                    } else if key.code == KeyCode::Char('x') {
+                        state.cancel_selected_task();
                     } else if key.code == KeyCode::Enter {
                         // Enter on a non-attachable task: nothing to attach.
                     } else if let Some(attached) = &mut state.attached {
@@ -760,9 +764,19 @@ fn draw<B: ratatui::backend::Backend>(
                 .unwrap_or_default();
             // Panel open: full list. Panel closed but tasks running: a one-line
             // hint so background work never goes completely unnoticed.
+            const OUTPUT_LINES: usize = 8;
+            let selected_output = if state.show_tasks {
+                running
+                    .get(state.task_cursor)
+                    .map(|task| String::from_utf8_lossy(&task.output).into_owned())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let output_line_count = selected_output.lines().count().min(OUTPUT_LINES);
             let tasks_height = if state.show_tasks {
-                // border (2) + header (1) + one row per task
-                (running.len() as u16 + 3).max(3)
+                // border (2) + header (1) + one row per task + output tail
+                (running.len() as u16 + 3 + output_line_count as u16).max(3)
             } else {
                 u16::from(!running.is_empty())
             };
@@ -849,10 +863,22 @@ fn draw<B: ratatui::backend::Backend>(
                         style,
                     ));
                 }
+                if !selected_output.is_empty() {
+                    let skip = selected_output.lines().count().saturating_sub(OUTPUT_LINES);
+                    for line in selected_output.lines().skip(skip) {
+                        lines.push(Line::styled(
+                            format!("  │ {}", preview(line, 120)),
+                            Style::default()
+                                .fg(SOLARIZED_LIGHT.muted)
+                                .bg(SOLARIZED_LIGHT.panel)
+                                .add_modifier(Modifier::DIM),
+                        ));
+                    }
+                }
                 frame.render_widget(
                     Paragraph::new(lines)
                         .style(SOLARIZED_LIGHT.panel_style())
-                        .block(SOLARIZED_LIGHT.block("tasks (F2 hide · Enter attach)")),
+                        .block(SOLARIZED_LIGHT.block("tasks (F2 hide · Enter attach · x cancel)")),
                     tasks_bar,
                 );
             }
@@ -1571,6 +1597,28 @@ impl TuiState {
             _ => {}
         }
         None
+    }
+
+    /// `x` in the tasks panel cancels the selected background task, unless it
+    /// is an attachable subagent session (those steer through their own view).
+    fn cancel_selected_task(&mut self) {
+        let running = self
+            .background
+            .as_ref()
+            .map(|background| background.running())
+            .unwrap_or_default();
+        let Some(task) = running.get(self.task_cursor.min(running.len().saturating_sub(1))) else {
+            return;
+        };
+        if self.attachable.as_ref().is_some_and(|probe| probe(task.id)) {
+            return;
+        }
+        if let Some(label) = self.background.as_ref().and_then(|b| b.cancel(task.id)) {
+            self.push_line(
+                format!("cancelled task #{}: {}", task.id, label),
+                LineKind::Dim,
+            );
+        }
     }
 
     fn handle_scroll(&mut self, key: KeyEvent) {
