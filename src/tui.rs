@@ -17,7 +17,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -34,6 +34,124 @@ use crate::session::Session;
 struct UiEvent {
     session: u64,
     event: AgentEvent,
+}
+
+/// The one built-in look for the deliberately small TUI. This mirrors the
+/// adjusted Solarized Light OpenCode theme instead of offering a theme system.
+#[derive(Clone, Copy)]
+struct Palette {
+    ink: Color,
+    background: Color,
+    panel: Color,
+    element: Color,
+    selection: Color,
+    subtle: Color,
+    text: Color,
+    muted: Color,
+    blue: Color,
+    cyan: Color,
+    violet: Color,
+    green: Color,
+    yellow: Color,
+    orange: Color,
+    red: Color,
+    diff_added_background: Color,
+    diff_removed_background: Color,
+    diff_added_line_number_background: Color,
+    diff_removed_line_number_background: Color,
+}
+
+const SOLARIZED_LIGHT: Palette = Palette {
+    ink: Color::Rgb(0, 43, 54),                                     // #002b36
+    background: Color::Rgb(253, 246, 227),                          // #fdf6e3
+    panel: Color::Rgb(248, 240, 218),                               // #f8f0da
+    element: Color::Rgb(238, 232, 213),                             // #eee8d5
+    selection: Color::Rgb(230, 223, 200),                           // #e6dfc8
+    subtle: Color::Rgb(216, 207, 184),                              // #d8cfb8
+    text: Color::Rgb(101, 123, 131),                                // #657b83
+    muted: Color::Rgb(147, 161, 161),                               // #93a1a1
+    blue: Color::Rgb(38, 139, 210),                                 // #268bd2
+    cyan: Color::Rgb(42, 161, 152),                                 // #2aa198
+    violet: Color::Rgb(108, 113, 196),                              // #6c71c4
+    green: Color::Rgb(133, 153, 0),                                 // #859900
+    yellow: Color::Rgb(181, 137, 0),                                // #b58900
+    orange: Color::Rgb(203, 75, 22),                                // #cb4b16
+    red: Color::Rgb(220, 50, 47),                                   // #dc322f
+    diff_added_background: Color::Rgb(238, 243, 210),               // #eef3d2
+    diff_removed_background: Color::Rgb(246, 221, 213),             // #f6ddd5
+    diff_added_line_number_background: Color::Rgb(227, 235, 189),   // #e3ebbd
+    diff_removed_line_number_background: Color::Rgb(239, 207, 199), // #efcfc7
+};
+
+impl Palette {
+    fn screen_style(self) -> Style {
+        Style::default().bg(self.background).fg(self.text)
+    }
+
+    fn panel_style(self) -> Style {
+        Style::default().bg(self.panel).fg(self.text)
+    }
+
+    fn block(self, title: impl Into<Line<'static>>) -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .style(self.panel_style())
+            .border_style(Style::default().fg(self.subtle).bg(self.panel))
+            .title_style(Style::default().fg(self.blue).add_modifier(Modifier::BOLD))
+    }
+
+    fn line_style(self, kind: LineKind) -> Style {
+        match kind {
+            LineKind::Normal => self.screen_style(),
+            LineKind::Dim => Style::default()
+                .fg(self.muted)
+                .bg(self.background)
+                .add_modifier(Modifier::DIM),
+            LineKind::User => Style::default()
+                .fg(self.cyan)
+                .bg(self.background)
+                .add_modifier(Modifier::BOLD),
+            LineKind::ToolCall => Style::default()
+                .fg(self.violet)
+                .bg(self.element)
+                .add_modifier(Modifier::BOLD),
+            LineKind::ToolResult => Style::default().fg(self.green).bg(self.background),
+            LineKind::ToolError => Style::default()
+                .fg(self.red)
+                .bg(self.background)
+                .add_modifier(Modifier::BOLD),
+            LineKind::Added => Style::default()
+                .fg(self.green)
+                .bg(self.diff_added_background),
+            LineKind::Removed => Style::default()
+                .fg(self.red)
+                .bg(self.diff_removed_background),
+        }
+    }
+
+    fn diff_line_number_style(self, kind: LineKind) -> Option<Style> {
+        match kind {
+            LineKind::Added => Some(
+                Style::default()
+                    .fg(self.green)
+                    .bg(self.diff_added_line_number_background),
+            ),
+            LineKind::Removed => Some(
+                Style::default()
+                    .fg(self.red)
+                    .bg(self.diff_removed_line_number_background),
+            ),
+            _ => None,
+        }
+    }
+
+    fn queue_style(self) -> Style {
+        Style::default()
+            .fg(self.ink)
+            .bg(self.blue)
+            .add_modifier(Modifier::BOLD)
+    }
 }
 
 /// Bridge a session handle's event stream into the shared UI channel,
@@ -258,7 +376,7 @@ async fn run_inner(
                 }
                 if let Some(prompt) = state.handle_key(key) {
                     if prompt == "/compact" {
-                        state.thinking = true;
+                        state.busy = Some(BusyState::Compacting);
                         state.streamed = false;
                         draw(terminal, &mut state)?;
                         let (result, interruption) = drive(
@@ -271,7 +389,7 @@ async fn run_inner(
                             agent.compact(),
                         )
                         .await?;
-                        state.thinking = false;
+                        state.busy = None;
                         while let Ok(event) = inbox.try_recv() {
                             state.push_event(event);
                         }
@@ -282,7 +400,8 @@ async fn run_inner(
                                     preview(&summary, 500)
                                 )),
                                 Err(error) => {
-                                    state.push_line(format!("error: {error:#}"), LineKind::Normal)
+                                    state
+                                        .push_line(format!("error: {error:#}"), LineKind::ToolError)
                                 }
                             }
                         }
@@ -375,7 +494,7 @@ async fn run_request(
     prompt: String,
 ) -> anyhow::Result<bool> {
     let (root, session_name, persisted) = session;
-    ui.state.thinking = true;
+    ui.state.busy = Some(BusyState::Thinking);
     ui.state.streamed = false;
     draw(terminal, ui.state)?;
     let (result, interruption) = drive(
@@ -388,7 +507,7 @@ async fn run_request(
         agent.run(prompt),
     )
     .await?;
-    ui.state.thinking = false;
+    ui.state.busy = None;
     while let Ok(event) = ui.inbox.try_recv() {
         ui.state.push_event(event);
     }
@@ -397,7 +516,7 @@ async fn run_request(
             Ok(answer) => ui.state.push_final_answer(answer),
             Err(error) => ui
                 .state
-                .push_line(format!("error: {error:#}"), LineKind::Normal),
+                .push_line(format!("error: {error:#}"), LineKind::ToolError),
         }
     }
     if matches!(interruption, Some(Interruption::CancelTurn)) {
@@ -522,6 +641,12 @@ fn draw<B: ratatui::backend::Backend>(
 ) -> Result<(), B::Error> {
     terminal
         .draw(|frame| {
+            // Paint first, then every region below paints its own surface. This
+            // keeps the alternate screen free of terminal-default holes.
+            frame.render_widget(
+                Block::default().style(SOLARIZED_LIGHT.screen_style()),
+                frame.area(),
+            );
             let attached = state.attached.is_some();
             let inner_input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
             let input_rows = if let Some(attached) = &state.attached {
@@ -561,10 +686,9 @@ fn draw<B: ratatui::backend::Backend>(
                             state.queued.len(),
                             preview(&state.queued[0], 60)
                         ),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                    )),
+                        SOLARIZED_LIGHT.queue_style(),
+                    ))
+                    .style(SOLARIZED_LIGHT.queue_style()),
                     queue_bar,
                 );
             }
@@ -577,9 +701,11 @@ fn draw<B: ratatui::backend::Backend>(
                             running.len()
                         ),
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(SOLARIZED_LIGHT.yellow)
+                            .bg(SOLARIZED_LIGHT.panel)
                             .add_modifier(Modifier::DIM),
-                    )),
+                    ))
+                    .style(SOLARIZED_LIGHT.panel_style()),
                     tasks_bar,
                 );
             }
@@ -600,12 +726,20 @@ fn draw<B: ratatui::backend::Backend>(
                     } else {
                         format!("{} background task(s) running", running.len())
                     },
-                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(SOLARIZED_LIGHT.text)
+                        .bg(SOLARIZED_LIGHT.panel)
+                        .add_modifier(Modifier::BOLD),
                 )];
                 for (index, task) in running.iter().enumerate() {
-                    let mut style = Style::default().fg(Color::DarkGray);
+                    let mut style = Style::default()
+                        .fg(SOLARIZED_LIGHT.muted)
+                        .bg(SOLARIZED_LIGHT.panel);
                     if index == state.task_cursor && attachable(task.id) {
-                        style = Style::default().bg(Color::Rgb(45, 45, 60));
+                        style = Style::default()
+                            .fg(SOLARIZED_LIGHT.text)
+                            .bg(SOLARIZED_LIGHT.selection)
+                            .add_modifier(Modifier::BOLD);
                     }
                     let hint = if attachable(task.id) {
                         ""
@@ -618,11 +752,9 @@ fn draw<B: ratatui::backend::Backend>(
                     ));
                 }
                 frame.render_widget(
-                    Paragraph::new(lines).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("tasks (F2 hide · Enter attach)"),
-                    ),
+                    Paragraph::new(lines)
+                        .style(SOLARIZED_LIGHT.panel_style())
+                        .block(SOLARIZED_LIGHT.block("tasks (F2 hide · Enter attach)")),
                     tasks_bar,
                 );
             }
@@ -637,23 +769,13 @@ fn draw<B: ratatui::backend::Backend>(
                 .lines
                 .iter()
                 .flat_map(|line| {
-                    let style = match line.kind {
-                        LineKind::Normal => Style::default(),
-                        LineKind::Dim => Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                        LineKind::Added => Style::default().bg(Color::Rgb(20, 60, 20)),
-                        LineKind::Removed => Style::default().bg(Color::Rgb(70, 20, 20)),
-                        LineKind::User => Style::default().bg(Color::Rgb(45, 45, 60)),
-                        LineKind::ToolCall => Style::default().bg(Color::Rgb(38, 38, 50)),
-                    };
                     hard_wrap(&line.text, inner_width)
                         .into_iter()
-                        .map(move |row| Line::styled(row, style))
+                        .map(move |row| styled_scroll_line(row, line.kind))
                 })
                 .collect();
             let total_rows = visual.len();
-            let paragraph = Paragraph::new(visual);
+            let paragraph = Paragraph::new(visual).style(SOLARIZED_LIGHT.screen_style());
             let height = usize::from(output.height);
             let max_scroll = total_rows.saturating_sub(height);
             scroll_state.max_scroll = max_scroll;
@@ -668,7 +790,7 @@ fn draw<B: ratatui::backend::Backend>(
                 } else {
                     "running"
                 };
-                let block = Block::default().borders(Borders::ALL).title(format!(
+                let block = SOLARIZED_LIGHT.block(format!(
                     "subagent #{}: {} ({}) — Esc detach · Enter steer · Ctrl-C interrupt",
                     attached.id,
                     preview(&attached.label, 40),
@@ -680,10 +802,11 @@ fn draw<B: ratatui::backend::Backend>(
                     cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
                 let input_lines: Vec<Line> = hard_wrap(&attached.input.text, inner_input_width)
                     .into_iter()
-                    .map(Line::from)
+                    .map(|line| Line::styled(line, SOLARIZED_LIGHT.panel_style()))
                     .collect();
                 frame.render_widget(
                     Paragraph::new(input_lines)
+                        .style(SOLARIZED_LIGHT.panel_style())
                         .block(block)
                         .scroll((attached.input_scroll.min(u16::MAX as usize) as u16, 0)),
                     input,
@@ -697,12 +820,12 @@ fn draw<B: ratatui::backend::Backend>(
                 ));
                 return;
             }
-            let title = if state.thinking {
-                format!("{} · thinking…", state.session_id)
-            } else {
-                state.session_id.clone()
+            let title = match state.busy {
+                Some(BusyState::Thinking) => format!("{} · thinking…", state.session_id),
+                Some(BusyState::Compacting) => format!("{} · compaction…", state.session_id),
+                None => state.session_id.clone(),
             };
-            let input_block = Block::default().borders(Borders::ALL).title(title);
+            let input_block = SOLARIZED_LIGHT.block(title);
             let usage = (state.tokens.context > 0).then(|| {
                 format!(
                     "ctx {} ↑{} ↓{}",
@@ -716,10 +839,11 @@ fn draw<B: ratatui::backend::Backend>(
             let input_scroll = cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
             let input_lines: Vec<Line> = hard_wrap(&state.input.text, inner_input_width)
                 .into_iter()
-                .map(Line::from)
+                .map(|line| Line::styled(line, SOLARIZED_LIGHT.panel_style()))
                 .collect();
             frame.render_widget(
                 Paragraph::new(input_lines)
+                    .style(SOLARIZED_LIGHT.panel_style())
                     .block(input_block)
                     .scroll((input_scroll.min(u16::MAX as usize) as u16, 0)),
                 input,
@@ -734,7 +858,11 @@ fn draw<B: ratatui::backend::Backend>(
                         height: 1,
                     };
                     frame.render_widget(
-                        Paragraph::new(usage).style(Style::default().fg(Color::DarkGray)),
+                        Paragraph::new(usage).style(
+                            Style::default()
+                                .fg(SOLARIZED_LIGHT.orange)
+                                .bg(SOLARIZED_LIGHT.panel),
+                        ),
                         area,
                     );
                 }
@@ -747,6 +875,31 @@ fn draw<B: ratatui::backend::Backend>(
             ));
         })
         .map(|_| ())
+}
+
+/// Keep wrapping text-only so scroll accounting is unchanged, then add the
+/// small amount of semantic paint needed for the row being rendered.
+fn styled_scroll_line(row: &str, kind: LineKind) -> Line<'static> {
+    let style = SOLARIZED_LIGHT.line_style(kind);
+    let numbered_diff = matches!(kind, LineKind::Added | LineKind::Removed)
+        && row.len() >= 7
+        && matches!(row.as_bytes().first(), Some(b'+' | b'-'))
+        && row.as_bytes()[1] == b' '
+        && row.as_bytes()[2..6]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b' ')
+        && row.as_bytes()[6] == b' ';
+    if numbered_diff {
+        let number_style = SOLARIZED_LIGHT
+            .diff_line_number_style(kind)
+            .expect("numbered diff has an added or removed kind");
+        Line::from(vec![
+            Span::styled(row[..7].to_owned(), number_style),
+            Span::styled(row[7..].to_owned(), style),
+        ])
+    } else {
+        Line::styled(row.to_owned(), style)
+    }
 }
 
 fn format_tokens(count: u64) -> String {
@@ -810,7 +963,7 @@ struct TuiState {
     lines: Vec<DisplayLine>,
     scroll: usize,
     max_scroll: usize,
-    thinking: bool,
+    busy: Option<BusyState>,
     streamed: bool,
     active_lane: Option<ActiveStreamLane>,
     tokens: TokenDisplay,
@@ -895,6 +1048,14 @@ enum LineKind {
     Removed,
     User,
     ToolCall,
+    ToolResult,
+    ToolError,
+}
+
+#[derive(Clone, Copy)]
+enum BusyState {
+    Thinking,
+    Compacting,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -927,9 +1088,9 @@ impl TuiState {
                 self.push_line(format!("system: {}", preview(content, 500)), LineKind::Dim);
             }
             Message::User { content } => {
-                if content.starts_with("[compacted summary of earlier conversation]") {
-                    self.push_line(content.clone(), LineKind::Normal);
-                } else if content.starts_with("[background task ") {
+                if content.starts_with("[compacted summary of earlier conversation]")
+                    || content.starts_with("[background task ")
+                {
                     self.push_line(content.clone(), LineKind::Dim);
                 } else {
                     self.push_line(format!("you> {content}"), LineKind::User);
@@ -1175,7 +1336,7 @@ impl TuiState {
             }
             AgentEvent::BackgroundCompleted { id, output } => self.push_line(
                 format!("background task {id} finished: {}", preview(&output, 500)),
-                LineKind::Normal,
+                LineKind::Dim,
             ),
             AgentEvent::Usage {
                 context_input,
@@ -1240,7 +1401,11 @@ impl TuiState {
                 if is_error { "error" } else { "ok" },
                 preview(content, 500)
             ),
-            LineKind::Normal,
+            if is_error {
+                LineKind::ToolError
+            } else {
+                LineKind::ToolResult
+            },
         );
     }
 
@@ -1559,6 +1724,130 @@ mod tests {
     }
 
     #[test]
+    fn draw_paints_the_entire_terminal_with_theme_backgrounds() {
+        let backend = ratatui::backend::TestBackend::new(32, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        state.push_line("assistant text".into(), LineKind::Normal);
+        draw(&mut terminal, &mut state).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer.content().iter().all(|cell| cell.bg != Color::Reset),
+            "every cell should have an explicit Solarized surface"
+        );
+        assert_eq!(buffer[(0, 0)].bg, SOLARIZED_LIGHT.background);
+        assert_eq!(buffer[(0, 9)].bg, SOLARIZED_LIGHT.panel);
+    }
+
+    #[test]
+    fn draw_uses_semantic_solarized_message_styles() {
+        let backend = ratatui::backend::TestBackend::new(50, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState {
+            lines: vec![
+                DisplayLine {
+                    text: "normal".into(),
+                    kind: LineKind::Normal,
+                },
+                DisplayLine {
+                    text: "dim".into(),
+                    kind: LineKind::Dim,
+                },
+                DisplayLine {
+                    text: "user".into(),
+                    kind: LineKind::User,
+                },
+                DisplayLine {
+                    text: "tool".into(),
+                    kind: LineKind::ToolCall,
+                },
+                DisplayLine {
+                    text: "ok".into(),
+                    kind: LineKind::ToolResult,
+                },
+                DisplayLine {
+                    text: "error".into(),
+                    kind: LineKind::ToolError,
+                },
+                DisplayLine {
+                    text: "+    7 added".into(),
+                    kind: LineKind::Added,
+                },
+                DisplayLine {
+                    text: "-    7 removed".into(),
+                    kind: LineKind::Removed,
+                },
+            ],
+            ..Default::default()
+        };
+        draw(&mut terminal, &mut state).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].fg, SOLARIZED_LIGHT.text);
+        assert_eq!(buffer[(0, 1)].fg, SOLARIZED_LIGHT.muted);
+        assert!(buffer[(0, 1)].modifier.contains(Modifier::DIM));
+        assert_eq!(buffer[(0, 2)].fg, SOLARIZED_LIGHT.cyan);
+        assert_eq!(buffer[(0, 3)].bg, SOLARIZED_LIGHT.element);
+        assert_eq!(buffer[(0, 3)].fg, SOLARIZED_LIGHT.violet);
+        assert_eq!(buffer[(0, 4)].fg, SOLARIZED_LIGHT.green);
+        assert_eq!(buffer[(0, 5)].fg, SOLARIZED_LIGHT.red);
+        assert_eq!(buffer[(7, 6)].bg, SOLARIZED_LIGHT.diff_added_background);
+        assert_eq!(
+            buffer[(0, 6)].bg,
+            SOLARIZED_LIGHT.diff_added_line_number_background
+        );
+        assert_eq!(buffer[(7, 7)].bg, SOLARIZED_LIGHT.diff_removed_background);
+        assert_eq!(
+            buffer[(0, 7)].bg,
+            SOLARIZED_LIGHT.diff_removed_line_number_background
+        );
+    }
+
+    #[test]
+    fn queued_bar_is_bold_high_contrast_and_fills_its_row() {
+        let backend = ratatui::backend::TestBackend::new(50, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        state.queued.push("follow up".into());
+        draw(&mut terminal, &mut state).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // input is three rows high; with one queue row, the banner sits at y=6.
+        let first = &buffer[(0, 6)];
+        assert_eq!(first.fg, SOLARIZED_LIGHT.ink);
+        assert_eq!(first.bg, SOLARIZED_LIGHT.blue);
+        assert!(first.modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(49, 6)].bg, SOLARIZED_LIGHT.blue);
+    }
+
+    #[test]
+    fn input_title_distinguishes_compaction_from_model_thinking() {
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState {
+            busy: Some(BusyState::Thinking),
+            ..Default::default()
+        };
+        draw(&mut terminal, &mut state).unwrap();
+        let thinking_title: String = terminal.backend().buffer().content()[7 * 40..8 * 40]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(thinking_title.contains("thinking…"));
+        assert!(!thinking_title.contains("compaction…"));
+
+        state.busy = Some(BusyState::Compacting);
+        draw(&mut terminal, &mut state).unwrap();
+        let compaction_title: String = terminal.backend().buffer().content()[7 * 40..8 * 40]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(compaction_title.contains("compaction…"));
+        assert!(!compaction_title.contains("thinking…"));
+    }
+
+    #[test]
     fn input_edits_unicode_at_character_boundaries() {
         let mut input = InputBuffer::default();
         input.insert("你好a");
@@ -1711,7 +2000,15 @@ mod tests {
             content: "done".into(),
         });
         assert_eq!(state.lines.last().unwrap().text, "  ok: done");
+        assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolResult);
         assert_eq!(state.scroll, usize::MAX);
+
+        state.push_agent_event(AgentEvent::ToolResult {
+            is_error: true,
+            content: "failed".into(),
+        });
+        assert_eq!(state.lines.last().unwrap().text, "  error: failed");
+        assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolError);
     }
 
     #[test]
@@ -1820,8 +2117,8 @@ mod tests {
         );
         assert_eq!(
             state.lines[1].kind,
-            LineKind::Normal,
-            "compacted summary uses normal color"
+            LineKind::Dim,
+            "compacted summary stays a muted notice"
         );
         assert_eq!(state.lines[2].text, "thinking: plan");
         assert_eq!(state.lines[2].kind, LineKind::Dim);
