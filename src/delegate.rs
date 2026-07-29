@@ -233,7 +233,15 @@ impl Delegate {
                     };
                     last_answer = match result {
                         Ok(answer) => answer,
-                        Err(error) => format!("subagent failed: {error:#}"),
+                        Err(error) => {
+                            // Surface the failure in the session log so an
+                            // attached view shows it instead of going blank.
+                            let message = format!("subagent failed: {error:#}");
+                            if let Some(sink) = &sink {
+                                sink.emit(AgentEvent::AssistantText(message.clone()));
+                            }
+                            message
+                        }
                     };
                     // Persist this turn's entries (append-only) so the full
                     // transcript survives restarts; entries are tagged with
