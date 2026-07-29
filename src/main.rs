@@ -11,6 +11,7 @@ use e_agent::delegate::Delegate;
 use e_agent::mcp;
 use e_agent::model::{ConfiguredModel, OpenAiModel};
 use e_agent::session::Session;
+use e_agent::session_store::SessionStore;
 use e_agent::tools::builtins;
 use e_agent::tui;
 use e_agent::workspace::Workspace;
@@ -123,6 +124,14 @@ async fn run() -> anyhow::Result<()> {
     {
         unsafe { std::env::set_var("EXA_API_KEY", key) };
     }
+    let store = SessionStore::connect(
+        config
+            .as_ref()
+            .map(|c| &c.session)
+            .unwrap_or(&Default::default()),
+        &session,
+    )
+    .await?;
     let (main_resolved, role_resolved, all_roles) = match &config {
         Some(config) => (
             Some(config.resolve(profile.as_deref())?),
@@ -208,7 +217,8 @@ async fn run() -> anyhow::Result<()> {
         .with_subagent_context_window(subagent_context_window)
         .with_roles_root(root.clone())
         .with_sandbox(sandbox)
-        .record_background_tasks_in(root.clone(), &session);
+        .record_background_tasks_in(root.clone(), &session)
+        .with_persist_store(store.clone());
     if let Some(subagent_model) = subagent_model {
         let name = subagent_model.display_name().to_owned();
         delegate = delegate.with_subagent_model(subagent_model);
@@ -239,7 +249,7 @@ async fn run() -> anyhow::Result<()> {
     if let Some(rounds) = max_rounds {
         agent = agent.max_tool_rounds(rounds);
     }
-    let loaded = Session::load(&root, &session)?;
+    let loaded = store.load(&root, &session).await?;
     let legacy = loaded.legacy;
     agent.restore_history(loaded.entries);
     agent.record_background_tasks_in(root.clone(), &session);
@@ -255,13 +265,15 @@ async fn run() -> anyhow::Result<()> {
         };
         // Persist immediately so a crash-before-first-turn cannot inject
         // the same notice again on the next launch.
-        Session::append(&root, &session, std::slice::from_ref(&entry))?;
+        store
+            .append(&root, &session, std::slice::from_ref(&entry))
+            .await?;
         // Append (NOT restore_history, which would wipe the resumed history).
         agent.push_entry(entry);
     }
     let mut persisted = agent.history().len();
     if legacy {
-        Session::rewrite(&root, &session, agent.history())?;
+        store.rewrite(&root, &session, agent.history()).await?;
     }
 
     if let Some(window) = main_context_window {
@@ -273,6 +285,7 @@ async fn run() -> anyhow::Result<()> {
             agent,
             root,
             session,
+            store,
             persisted,
             background,
             subagent_sessions,
@@ -284,9 +297,9 @@ async fn run() -> anyhow::Result<()> {
     }
     set_stderr_events(&mut agent);
     if repl_mode {
-        return repl(agent, root, session, persisted).await;
+        return repl(agent, root, session, store, persisted).await;
     }
-    let answer = run_and_save(&mut agent, &root, &session, &mut persisted, prompt).await?;
+    let answer = run_and_save(&mut agent, &store, &root, &session, &mut persisted, prompt).await?;
     println!("{answer}");
     if !agent.background_task_ids().is_empty() {
         eprintln!(
@@ -348,13 +361,16 @@ fn set_stderr_events(agent: &mut Agent) {
 
 async fn run_and_save(
     agent: &mut Agent,
+    store: &SessionStore,
     root: &std::path::Path,
     session: &str,
     persisted: &mut usize,
     prompt: String,
 ) -> anyhow::Result<String> {
     let result = agent.run(prompt).await;
-    Session::append(root, session, &agent.history()[*persisted..])?;
+    store
+        .append(root, session, &agent.history()[*persisted..])
+        .await?;
     *persisted = agent.history().len();
     result
 }
@@ -363,6 +379,7 @@ async fn repl(
     mut agent: Agent,
     root: std::path::PathBuf,
     session: String,
+    store: SessionStore,
     mut persisted: usize,
 ) -> anyhow::Result<()> {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -389,7 +406,9 @@ async fn repl(
         }
         if line == "/compact" {
             let result = agent.compact().await;
-            Session::append(&root, &session, &agent.history()[persisted..])?;
+            store
+                .append(&root, &session, &agent.history()[persisted..])
+                .await?;
             persisted = agent.history().len();
             match result {
                 Ok(summary) => println!("compacted: {}", preview(&summary, 500)),
@@ -398,7 +417,16 @@ async fn repl(
             continue;
         }
         agent.subscribe(sender.clone());
-        match run_and_save(&mut agent, &root, &session, &mut persisted, line.to_owned()).await {
+        match run_and_save(
+            &mut agent,
+            &store,
+            &root,
+            &session,
+            &mut persisted,
+            line.to_owned(),
+        )
+        .await
+        {
             Ok(answer) => println!("{answer}"),
             Err(error) => eprintln!("e-agent: {error:#}"),
         }

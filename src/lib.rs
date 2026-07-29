@@ -11,6 +11,7 @@ pub mod roles;
 pub mod session;
 #[cfg(feature = "greptime")]
 pub mod session_greptime;
+pub mod session_store;
 pub mod tools;
 pub mod tui;
 pub mod workspace;

@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use crate::agent::{Agent, AgentEvent, Tool, ToolSpec, preview};
 use crate::handle::{SessionHandle, SessionSink, SessionSource, Steer, session_channel};
 use crate::model::ConfiguredModel;
-use crate::session::Session;
+use crate::session_store::SessionStore;
 use crate::tools::BackgroundTasks;
 use crate::workspace::Workspace;
 /// Metadata about a live subagent session, stored alongside its handle in
@@ -89,12 +89,16 @@ fn next_queued_prompt(source: &mut SessionSource, pending: &mut Vec<String>) -> 
 /// subagent's own session file (`subagent-<task-id>`). Every subagent has
 /// its own file, so no marker or locking is needed. Best-effort: a
 /// persistence failure is logged, not fatal.
-fn persist_turn(persist: &PersistConfig, agent: &Agent, persisted: &mut usize) {
+async fn persist_turn(persist: &PersistConfig, agent: &Agent, persisted: &mut usize) {
     let new_entries = &agent.history()[*persisted..];
     if new_entries.is_empty() {
         return;
     }
-    if let Err(error) = Session::append(&persist.root, &persist.session_id, new_entries) {
+    if let Err(error) = persist
+        .store
+        .append(&persist.root, &persist.session_id, new_entries)
+        .await
+    {
         eprintln!("e-agent: cannot persist subagent transcript: {error:#}");
         return;
     }
@@ -132,6 +136,9 @@ pub struct Delegate {
     /// subagent delegates are recorded alongside bash background tasks and
     /// trigger the "killed on exit" notice on restart.
     record_in: Option<(std::path::PathBuf, String)>,
+    /// Session storage backend for subagent persistence.
+    persist_store: SessionStore,
+
 }
 
 /// Where a subagent writes its own session file.
@@ -140,6 +147,9 @@ pub struct PersistConfig {
     root: std::path::PathBuf,
     /// This subagent's session id, assigned at spawn time.
     session_id: String,
+    /// Session storage backend. JSONL by default (the enum is stateless for
+    /// that variant so cloning is cheap).
+    store: SessionStore,
 }
 
 /// Task-panel title for a delegation: the caller's `label` wins (trimmed,
@@ -175,6 +185,8 @@ impl Delegate {
             roles_root: None,
             sandbox: None,
             record_in: None,
+            persist_store: SessionStore::Jsonl,
+
         }
     }
 
@@ -235,6 +247,12 @@ impl Delegate {
     /// a fresh session id under the workspace sessions directory.
     pub fn persist_sessions(mut self, root: std::path::PathBuf) -> Self {
         self.persist_root = Some(root);
+        self
+    }
+
+    /// Set the session storage backend for subagent persistence.
+    pub fn with_persist_store(mut self, store: SessionStore) -> Self {
+        self.persist_store = store;
         self
     }
 
@@ -458,7 +476,7 @@ impl Delegate {
                     // transcript survives restarts; entries are tagged with
                     // the subagent's label for display.
                     if let Some(persist) = &persist {
-                        persist_turn(persist, &agent, &mut persisted_len);
+                        persist_turn(persist, &agent, &mut persisted_len).await;
                     }
                     // Turn ended. Prompts stashed mid-turn still get their
                     // own follow-up turns; once those are drained the
@@ -658,7 +676,10 @@ impl Tool for Delegate {
                     .persist_root
                     .clone()
                     .ok_or("`resume` requires subagent session persistence (disabled in tests)")?;
-                let loaded = crate::session::Session::load(&root, &id)
+                let loaded = self
+                    .persist_store
+                    .load(&root, &id)
+                    .await
                     .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
                 if loaded.entries.is_empty() {
                     return Err(format!("no such subagent session: `{id}`"));
@@ -705,9 +726,11 @@ impl Tool for Delegate {
                 Some((id, entries)) => (Some(id), Some(entries)),
                 None => (None, None),
             };
+            let store = self.persist_store.clone();
             let persist = self.persist_root.clone().map(|root| PersistConfig {
                 root,
                 session_id: resume_id.unwrap_or_else(|| crate::session::new_id_prefixed("sub-")),
+                store: store.clone(),
             });
             // run_on_thread blocks on thread::join, so push it onto the
             // blocking thread pool to keep the executor responsive.
@@ -794,6 +817,7 @@ impl Tool for Delegate {
         let persist = self.persist_root.clone().map(|root| PersistConfig {
             root,
             session_id: resume_id.unwrap_or_else(|| crate::session::new_id_prefixed("sub-")),
+            store: self.persist_store.clone(),
         });
         // Even a synchronous subagent is registered as a running task with a
         // live session, so it shows up in the task panel (F2) and can be

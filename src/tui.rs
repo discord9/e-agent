@@ -27,7 +27,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::agent::{Agent, AgentEvent, Message, SessionEntry, preview};
 use crate::delegate::Sessions;
 use crate::handle::SessionHandle;
-use crate::session::Session;
+use crate::session_store::SessionStore;
 
 /// Events on the shared UI channel are tagged by session id: `0` is the
 /// main agent, anything else is an attached background session. The TUI
@@ -249,6 +249,7 @@ pub async fn run(
     mut agent: Agent,
     root: PathBuf,
     session_name: String,
+    store: SessionStore,
     mut persisted: usize,
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
@@ -274,6 +275,7 @@ pub async fn run(
         &root,
         &labels,
         &mut persisted,
+        store,
         background,
         sessions,
         context_window,
@@ -327,6 +329,7 @@ async fn run_inner(
     root: &std::path::Path,
     labels: &InputLabels,
     persisted: &mut usize,
+    store: SessionStore,
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
     context_window: Option<u64>,
@@ -380,6 +383,7 @@ async fn run_inner(
                     terminal,
                     agent,
                     &mut ui,
+                    &store,
                     (root, &labels.session, persisted),
                     String::new(),
                 )
@@ -402,6 +406,7 @@ async fn run_inner(
                         terminal,
                         agent,
                         &mut ui,
+                        &store,
                         (root, &labels.session, persisted),
                         next,
                     )
@@ -487,7 +492,7 @@ async fn run_inner(
                                 }
                             }
                         }
-                        Session::append(root, &labels.session, &agent.history()[*persisted..])?;
+                        store.append(root, &labels.session, &agent.history()[*persisted..]).await?;
                         *persisted = agent.history().len();
                         if matches!(interruption, Some(Interruption::ExitApp)) {
                             return Ok(());
@@ -516,6 +521,7 @@ async fn run_inner(
                         terminal,
                         agent,
                         &mut ui,
+                        &store,
                         (root, &labels.session, persisted),
                         prompt,
                     )
@@ -538,6 +544,7 @@ async fn run_inner(
                             terminal,
                             agent,
                             &mut ui,
+                            &store,
                             (root, &labels.session, persisted),
                             next,
                         )
@@ -579,6 +586,7 @@ async fn run_request(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent: &mut Agent,
     ui: &mut Ui<'_>,
+    store: &SessionStore,
     session: (&std::path::Path, &str, &mut usize),
     prompt: String,
 ) -> anyhow::Result<bool> {
@@ -620,7 +628,9 @@ async fn run_request(
         ui.state.push_line("cancelled".into(), LineKind::Dim);
         ui.state.collapse_queue();
     }
-    Session::append(root, session_name, &agent.history()[*persisted..])?;
+    store
+        .append(root, session_name, &agent.history()[*persisted..])
+        .await?;
     *persisted = agent.history().len();
     ui.state.follow();
     draw(terminal, ui.state)?;

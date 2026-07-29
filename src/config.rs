@@ -4,6 +4,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 
+#[derive(Deserialize, Default)]
+#[serde(tag = "backend", rename_all = "lowercase")]
+pub enum SessionBackend {
+    #[default]
+    Jsonl,
+    Greptime {
+        /// tokio-postgres connection string, e.g. "host=127.0.0.1 port=4002 dbname=public"
+        conn: String,
+    },
+}
+
 #[derive(Deserialize)]
 pub struct Config {
     default: Option<String>,
@@ -17,6 +28,10 @@ pub struct Config {
     /// Built-in role -> model profile routing (`[roles]`). Roles fall back
     /// to the main profile when not routed. Currently only `subagent`
     /// exists; new roles are added where they are spawned.
+
+    /// Session storage backend. Defaults to JSONL files.
+    #[serde(default)]
+    pub session: SessionBackend,
     #[serde(default)]
     roles: HashMap<String, String>,
     /// Optional `[web_search]` credentials for the Exa `web_search` tool.
@@ -383,6 +398,67 @@ fn config_paths() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_session_backend_config() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("key"), "key").unwrap();
+
+        // Default (no [session] section) -> Jsonl
+        let path = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+"#,
+        );
+        let config = Config::from_path(&path).unwrap();
+        assert!(matches!(config.session, SessionBackend::Jsonl));
+
+        // Explicit jsonl
+        let path = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[session]
+backend = "jsonl"
+"#,
+        );
+        let config = Config::from_path(&path).unwrap();
+        assert!(matches!(config.session, SessionBackend::Jsonl));
+
+        // Greptime with connection string
+        let path = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[session]
+backend = "greptime"
+conn = "host=127.0.0.1 port=4002 dbname=public"
+"#,
+        );
+        let config = Config::from_path(&path).unwrap();
+        match &config.session {
+            SessionBackend::Greptime { conn } => {
+                assert_eq!(conn, "host=127.0.0.1 port=4002 dbname=public");
+            }
+            _ => panic!("expected Greptime backend"),
+        }
+    }
 
     fn write_config(dir: &Path, contents: &str) -> PathBuf {
         let path = dir.join("config.toml");

@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS session_entries (
 )
 "#;
 
-
 /// Monotonic real-time nanosecond timestamp. Uses wall clock but guarantees
 /// strict ordering within a process: if two entries land in the same
 /// nanosecond (or the clock goes backwards), the later one gets prev+1.
@@ -149,9 +148,8 @@ impl GreptimeSession {
 
         let mut entries = Vec::with_capacity(pairs.len());
         for (seq, payload) in pairs {
-            let entry: SessionEntry = serde_json::from_str(payload).with_context(|| {
-                format!("cannot decode session {} seq {seq}", self.session_id)
-            })?;
+            let entry: SessionEntry = serde_json::from_str(payload)
+                .with_context(|| format!("cannot decode session {} seq {seq}", self.session_id))?;
             entries.push(entry);
         }
         Ok(entries)
@@ -175,14 +173,7 @@ impl GreptimeSession {
                         (session_id, seq, event_time, entry_kind, payload,
                          schema_version, agent_role, is_error)
                        VALUES ($1, $2, $3, $4, $5, 1, 'main', $6)"#,
-                    &[
-                        &self.session_id,
-                        &seq,
-                        &ts,
-                        &kind,
-                        &payload.as_str(),
-                        &err,
-                    ],
+                    &[&self.session_id, &seq, &ts, &kind, &payload.as_str(), &err],
                 )
                 .await
                 .with_context(|| format!("cannot append session {} seq {seq}", self.session_id))?;
@@ -230,14 +221,11 @@ impl GreptimeSession {
         Ok(())
     }
 
-
     /// Number of entries in the next append batch.
     pub fn next_seq(&self) -> i64 {
         self.next_seq
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
