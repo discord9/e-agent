@@ -227,6 +227,19 @@ async fn run_inner(
             }
             event = events.next() => match event {
             Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
+                // Tasks panel open: navigation keys belong to the panel
+                // (also while attached, so another session can be picked).
+                if state.show_tasks {
+                    if let Some(task_id) = state.handle_tasks_panel_key(key) {
+                        attach_to_task(&mut state, task_id, &sessions, &sender);
+                    } else if key.code == KeyCode::Esc || key.code == KeyCode::F(2) {
+                        state.show_tasks = false;
+                    } else if let Some(attached) = &mut state.attached {
+                        let width = attached_input_width(terminal)?;
+                        AttachedView::edit_input(&mut attached.input, key, width);
+                    }
+                    continue;
+                }
                 // Attached to a session view: Esc detaches; scroll and
                 // steering keys are handled there (the main agent is idle
                 // here so there is no turn to cancel).
@@ -237,18 +250,6 @@ async fn run_inner(
                         let width = attached_input_width(terminal)?;
                         state.handle_attached_key(key, width);
                     }
-                    continue;
-                }
-                if state.show_tasks
-                    && let Some(task_id) = state.handle_tasks_panel_key(key)
-                {
-                    attach_to_task(&mut state, task_id, &sessions, &sender);
-                    continue;
-                }
-                // Idle with the tasks panel open: Esc closes the panel
-                // (leave-the-current-view) instead of quitting the app.
-                if key.code == KeyCode::Esc && state.show_tasks {
-                    state.show_tasks = false;
                     continue;
                 }
                 if is_exit(key) {
@@ -458,27 +459,37 @@ async fn drive<T>(
                     }
                 }
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
-                    && state.attached.is_some() =>
-                {
-                    let width = attached_input_width(terminal)?;
-                    state.handle_attached_key(key, width);
-                    draw(terminal, state)?;
-                }
-                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
                     && state.show_tasks =>
                 {
                     if let Some(task_id) = state.handle_tasks_panel_key(key) {
                         attach_to_task(state, task_id, sessions, sender);
+                    } else if key.code == KeyCode::F(2) {
+                        state.show_tasks = false;
                     } else if key.code == KeyCode::Enter {
-                        // Enter on a non-subagent task: nothing to attach.
+                        // Enter on a non-attachable task: nothing to attach.
+                    } else if let Some(attached) = &mut state.attached {
+                        // Panel open while attached: remaining keys edit the
+                        // steering input (panel already consumed nav keys).
+                        let width = attached_input_width(terminal)?;
+                        AttachedView::edit_input(&mut attached.input, key, width);
                     } else {
                         state.handle_scroll(key);
                         state.edit_input(key);
                     }
                     draw(terminal, state)?;
                 }
+                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
+                    && state.attached.is_some() =>
+                {
+                    let width = attached_input_width(terminal)?;
+                    state.handle_attached_key(key, width);
+                    draw(terminal, state)?;
+                }
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
-                    if key.code == KeyCode::Enter {
+                    if key.code == KeyCode::F(2) {
+                        state.show_tasks = true;
+                        state.task_cursor = 0;
+                    } else if key.code == KeyCode::Enter {
                         if let Some(prompt) = state.take_input() {
                             state.queued.push(prompt);
                         }
@@ -979,11 +990,16 @@ impl TuiState {
         self.attached = None;
     }
 
-    /// Keys pressed while attached: scroll keys move the attached
-    /// scrollback, Enter steers the session (queues a prompt for its next
-    /// turn), Ctrl-C cancels its in-flight turn, everything else edits the
-    /// steering input.
+    /// Keys pressed while attached: F2 toggles the tasks panel (so another
+    /// session can be selected), scroll keys move the attached scrollback,
+    /// Enter steers the session (queues a prompt for its next turn), Ctrl-C
+    /// cancels its in-flight turn, everything else edits the steering input.
     fn handle_attached_key(&mut self, key: KeyEvent, input_width: usize) {
+        if key.code == KeyCode::F(2) {
+            self.show_tasks = !self.show_tasks;
+            self.task_cursor = 0;
+            return;
+        }
         let Some(attached) = &mut self.attached else {
             return;
         };
@@ -1349,6 +1365,38 @@ mod tests {
         assert!(state.show_tasks);
         assert_eq!(state.handle_key(key()), None);
         assert!(!state.show_tasks);
+    }
+
+    #[test]
+    fn f2_toggles_the_panel_while_attached() {
+        let (handle, _sink, _source) = crate::handle::session_channel();
+        let mut state = TuiState::default();
+        state.attach(7, "demo".into(), Arc::new(handle));
+        assert!(!state.show_tasks);
+        state.handle_attached_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()), 80);
+        assert!(state.show_tasks, "F2 opens the panel while attached");
+        assert!(state.attached.is_some(), "attach view is kept");
+        state.handle_attached_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()), 80);
+        assert!(!state.show_tasks);
+    }
+
+    #[test]
+    fn tasks_panel_nav_clamps_cursor_and_ignores_non_nav_keys() {
+        // Panel nav does not need real running tasks to test cursor
+        // movement: with no background set the cursor just stays put and
+        // plain characters fall through.
+        let mut state = TuiState {
+            show_tasks: true,
+            ..Default::default()
+        };
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::empty());
+        assert_eq!(state.handle_tasks_panel_key(down), None);
+        assert_eq!(state.task_cursor, 0, "no tasks: cursor stays at 0");
+        assert_eq!(state.handle_tasks_panel_key(up), None);
+        assert_eq!(state.task_cursor, 0);
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
+        assert_eq!(state.handle_tasks_panel_key(a), None);
     }
 
     #[test]
