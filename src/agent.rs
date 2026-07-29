@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 /// Insert a synthetic error result for every tool call left unanswered by an
 /// interrupted turn (cancel, provider error, crash), so the derived context
@@ -176,10 +176,11 @@ pub struct Agent {
     background_receiver: mpsc::UnboundedReceiver<AgentEvent>,
     pending_background: VecDeque<(u64, String)>,
     subscriber: Option<mpsc::UnboundedSender<AgentEvent>>,
-    /// Long-lived broadcast subscribers (e.g. a TUI attach view). Unlike
+    /// Long-lived session sinks (e.g. a TUI view). Unlike
     /// `event_handler` and `subscriber` (per-turn), these survive across
-    /// turns and receive every emitted event.
-    observers: Vec<broadcast::Sender<AgentEvent>>,
+    /// turns and receive every emitted event. Sinks are dropped once their
+    /// session handle is gone.
+    observers: Vec<crate::handle::SessionSink>,
     running_background: HashSet<u64>,
     session_input_tokens: u64,
     session_output_tokens: u64,
@@ -277,17 +278,17 @@ impl Agent {
         self.subscriber = Some(sender);
     }
 
-    /// Register a long-lived broadcast observer receiving every event
-    /// (text, tool calls, background completions) across all turns. Used by
-    /// the TUI attach view to follow a subagent without owning it.
-    pub fn observe(&mut self, sender: broadcast::Sender<AgentEvent>) {
-        self.observers.push(sender);
+    /// Register a long-lived session sink receiving every event (text,
+    /// tool calls, background completions) across all turns. The matching
+    /// `LiveSession` handle lets a frontend snapshot and follow this agent
+    /// without owning it.
+    pub fn observe(&mut self, sink: crate::handle::SessionSink) {
+        self.observers.push(sink);
     }
 
     fn fanout(&self, event: &AgentEvent) {
-        for sender in &self.observers {
-            // Lagged receivers simply miss events; the view can re-snapshot.
-            let _ = sender.send(event.clone());
+        for sink in &self.observers {
+            sink.emit(event.clone());
         }
     }
 
@@ -495,8 +496,8 @@ impl Agent {
         if let Some(handler) = &mut self.event_handler {
             handler(event.clone());
         }
-        // Drop observers whose receiver side is gone (e.g. detached view).
-        self.observers.retain(|sender| sender.receiver_count() > 0);
+        // Drop sinks whose session handle is gone (e.g. detached view).
+        self.observers.retain(|sink| sink.is_alive());
         self.fanout(&event);
     }
 

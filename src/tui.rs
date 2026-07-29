@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -22,45 +23,46 @@ use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::{Agent, AgentEvent, Message, SessionEntry, Usage, preview};
-use crate::delegate::SubagentSessions;
+use crate::delegate::Sessions;
+use crate::handle::SessionHandle;
 use crate::session::Session;
 
-/// Internal event wrapper so one channel can carry both the main agent's
-/// events and an attached subagent's events without ambiguity.
-#[derive(Clone, Debug)]
-enum TuiEvent {
-    Main(AgentEvent),
-    Sub(AgentEvent),
-}
-
-/// Both ends of the TUI event channel, passed around as one argument.
-struct EventPipe {
-    sender: mpsc::UnboundedSender<TuiEvent>,
-    receiver: mpsc::UnboundedReceiver<TuiEvent>,
-}
-
-/// Wrap the TUI event channel as the plain `AgentEvent` forwarder the
-/// agent's `subscribe` expects (main-agent events only). Call once and
-/// clone the returned sender for every turn.
-fn main_forwarder(sender: mpsc::UnboundedSender<TuiEvent>) -> mpsc::UnboundedSender<AgentEvent> {
-    let (forward, mut inbox) = mpsc::unbounded_channel::<AgentEvent>();
+/// Bridge a session handle's event stream into one shared UI channel. The
+/// returned receiver replays `snapshot` (already-emitted events) and then
+/// follows the live stream until the session ends or the UI goes away.
+fn bridge(
+    handle: &dyn SessionHandle,
+    snapshot: Vec<AgentEvent>,
+) -> mpsc::UnboundedReceiver<AgentEvent> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    for event in snapshot {
+        if sender.send(event).is_err() {
+            return receiver;
+        }
+    }
+    let mut stream = handle.subscribe();
     tokio::spawn(async move {
-        while let Some(event) = inbox.recv().await {
-            if sender.send(TuiEvent::Main(event)).is_err() {
-                break;
+        loop {
+            match stream.recv().await {
+                Ok(event) => {
+                    if sender.send(event).is_err() {
+                        break;
+                    }
+                }
+                // Lagged: events were missed. The view keeps streaming new
+                // ones; a re-attach restores full fidelity from the log.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
-    forward
+    receiver
 }
 
-/// Attach the TUI to a running subagent task: replay its event log into a
-/// fresh view and bridge its live broadcast stream into `TuiEvent::Sub`.
-fn attach_to_task(state: &mut TuiState, task_id: u64, sender: &mpsc::UnboundedSender<TuiEvent>) {
-    let Some(sessions) = &state.subagent_sessions else {
-        return;
-    };
-    let Some(session) = sessions.get(task_id) else {
+/// Attach the TUI to a background task's session: replay its event log into
+/// a fresh view and follow its live stream from now on.
+fn attach_to_task(state: &mut TuiState, task_id: u64, sessions: &Sessions) {
+    let Some(handle) = sessions.get(task_id) else {
         return;
     };
     let label = state
@@ -74,24 +76,15 @@ fn attach_to_task(state: &mut TuiState, task_id: u64, sender: &mpsc::UnboundedSe
         })
         .map(|task| task.label)
         .unwrap_or_default();
-    state.attach(task_id, label, session.snapshot());
-    let mut stream = session.subscribe();
-    let sender = sender.clone();
-    tokio::spawn(async move {
-        loop {
-            match stream.recv().await {
-                Ok(event) => {
-                    if sender.send(TuiEvent::Sub(event)).is_err() {
-                        break;
-                    }
-                }
-                // Lagged: events were missed. The view keeps streaming new
-                // ones; a re-attach restores full fidelity from the log.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    state.attach(task_id, label, handle);
+}
+
+/// Width of the attached steering input's content area (frame minus its
+/// borders), matching what draw() renders into.
+fn attached_input_width(
+    terminal: &Terminal<CrosstermBackend<io::Stdout>>,
+) -> anyhow::Result<usize> {
+    Ok(usize::from(terminal.size()?.width.saturating_sub(2)).max(1))
 }
 
 pub async fn run(
@@ -100,7 +93,7 @@ pub async fn run(
     session_name: String,
     mut persisted: usize,
     background: crate::tools::BackgroundTasks,
-    subagent_sessions: SubagentSessions,
+    sessions: Sessions,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -115,7 +108,7 @@ pub async fn run(
         &session_name,
         &mut persisted,
         background,
-        subagent_sessions,
+        sessions,
     )
     .await
 }
@@ -141,19 +134,37 @@ async fn run_inner(
     session_name: &str,
     persisted: &mut usize,
     background: crate::tools::BackgroundTasks,
-    subagent_sessions: SubagentSessions,
+    sessions: Sessions,
 ) -> anyhow::Result<()> {
-    let (sender, receiver) = mpsc::unbounded_channel::<TuiEvent>();
-    let mut pipe = EventPipe { sender, receiver };
-    let event_sender = pipe.sender.clone();
-    agent.set_event_handler(Box::new(move |event| {
-        let _ = event_sender.send(TuiEvent::Main(event));
-    }));
+    // One UI channel carrying every session's events. Main-agent events are
+    // tagged by absence of a matching attached view (see push_event).
+    let (sender, mut inbox) = mpsc::unbounded_channel::<AgentEvent>();
+    let (main_handle, main_sink, _main_source) = crate::handle::session_channel();
+    let main_sink_sender = sender.clone();
+    tokio::spawn(async move {
+        let mut stream = bridge(&main_handle, main_handle.snapshot());
+        while let Some(event) = stream.recv().await {
+            if main_sink_sender.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    agent.observe(main_sink);
+    // Per-turn event forwarder (deltas bypass the session log).
+    let (forward, mut forward_inbox) = mpsc::unbounded_channel::<AgentEvent>();
+    let forward_sender = sender.clone();
+    tokio::spawn(async move {
+        while let Some(event) = forward_inbox.recv().await {
+            if forward_sender.send(event).is_err() {
+                break;
+            }
+        }
+    });
     let mut events = EventStream::new();
     let mut state = TuiState::from_history(agent.history());
     state.background = Some(background);
-    state.subagent_sessions = Some(subagent_sessions);
-    let forwarder = main_forwarder(pipe.sender.clone());
+    let probe = sessions.clone();
+    state.attachable = Some(Box::new(move |id| probe.get(id).is_some()));
     loop {
         draw(terminal, &mut state)?;
         tokio::select! {
@@ -164,13 +175,17 @@ async fn run_inner(
                     LineKind::Dim,
                 );
                 state.follow();
-                agent.subscribe(forwarder.clone());
+                agent.subscribe(forward.clone());
+                let mut ui = Ui {
+                    state: &mut state,
+                    events: &mut events,
+                    inbox: &mut inbox,
+                    sessions: &sessions,
+                };
                 if run_request(
                     terminal,
                     agent,
-                    &mut state,
-                    &mut events,
-                    &mut pipe,
+                    &mut ui,
                     (root, session_name, persisted),
                     String::new(),
                 )
@@ -181,13 +196,17 @@ async fn run_inner(
                 while let Some(next) = state.next_queued() {
                     state.push_line(format!("you> {next}"), LineKind::User);
                     state.follow();
-                    agent.subscribe(forwarder.clone());
+                    agent.subscribe(forward.clone());
+                    let mut ui = Ui {
+                        state: &mut state,
+                        events: &mut events,
+                        inbox: &mut inbox,
+                        sessions: &sessions,
+                    };
                     if run_request(
                         terminal,
                         agent,
-                        &mut state,
-                        &mut events,
-                        &mut pipe,
+                        &mut ui,
                         (root, session_name, persisted),
                         next,
                     )
@@ -199,21 +218,22 @@ async fn run_inner(
             }
             event = events.next() => match event {
             Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
-                // Attached to a subagent view: Esc detaches, other keys
-                // scroll the attached scrollback; the main agent is idle
-                // here so there is no turn to cancel.
+                // Attached to a session view: Esc detaches; scroll and
+                // steering keys are handled there (the main agent is idle
+                // here so there is no turn to cancel).
                 if state.attached.is_some() {
                     if key.code == KeyCode::Esc {
                         state.detach();
                     } else {
-                        state.handle_attached_key(key);
+                        let width = attached_input_width(terminal)?;
+                        state.handle_attached_key(key, width);
                     }
                     continue;
                 }
                 if state.show_tasks
                     && let Some(task_id) = state.handle_tasks_panel_key(key)
                 {
-                    attach_to_task(&mut state, task_id, &pipe.sender);
+                    attach_to_task(&mut state, task_id, &sessions);
                     continue;
                 }
                 // Idle with the tasks panel open: Esc closes the panel
@@ -234,13 +254,14 @@ async fn run_inner(
                             terminal,
                             &mut state,
                             &mut events,
-                            &mut pipe,
+                            &mut inbox,
+                            &sessions,
                             agent.compact(),
                         )
                         .await?;
                         state.thinking = false;
-                        while let Ok(event) = pipe.receiver.try_recv() {
-                            state.push_tui_event(event);
+                        while let Ok(event) = inbox.try_recv() {
+                            state.push_event(event);
                         }
                         if let Some(result) = result {
                             match result {
@@ -266,13 +287,17 @@ async fn run_inner(
                     }
                     state.push_line(format!("you> {prompt}"), LineKind::User);
                     state.follow();
-                    agent.subscribe(forwarder.clone());
+                    agent.subscribe(forward.clone());
+                    let mut ui = Ui {
+                        state: &mut state,
+                        events: &mut events,
+                        inbox: &mut inbox,
+                        sessions: &sessions,
+                    };
                     if run_request(
                         terminal,
                         agent,
-                        &mut state,
-                        &mut events,
-                        &mut pipe,
+                        &mut ui,
                         (root, session_name, persisted),
                         prompt,
                     )
@@ -283,13 +308,17 @@ async fn run_inner(
                     while let Some(next) = state.next_queued() {
                         state.push_line(format!("you> {next}"), LineKind::User);
                         state.follow();
-                        agent.subscribe(forwarder.clone());
+                        agent.subscribe(forward.clone());
+                        let mut ui = Ui {
+                            state: &mut state,
+                            events: &mut events,
+                            inbox: &mut inbox,
+                            sessions: &sessions,
+                        };
                         if run_request(
                             terminal,
                             agent,
-                            &mut state,
-                            &mut events,
-                            &mut pipe,
+                            &mut ui,
                             (root, session_name, persisted),
                             next,
                         )
@@ -300,7 +329,13 @@ async fn run_inner(
                     }
                 }
             }
-            Some(Ok(Event::Paste(text))) => state.input.insert(&text),
+            Some(Ok(Event::Paste(text))) => {
+                if let Some(attached) = &mut state.attached {
+                    attached.input.insert(&text);
+                } else {
+                    state.input.insert(&text);
+                }
+            }
             Some(Ok(_)) => {}
             Some(Err(error)) => return Err(error.into()),
             None => return Ok(()),
@@ -309,37 +344,53 @@ async fn run_inner(
     }
 }
 
+/// Bundles the per-run UI plumbing so `run_request` stays readable.
+struct Ui<'a> {
+    state: &'a mut TuiState,
+    events: &'a mut EventStream,
+    inbox: &'a mut mpsc::UnboundedReceiver<AgentEvent>,
+    sessions: &'a Sessions,
+}
+
 async fn run_request(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent: &mut Agent,
-    state: &mut TuiState,
-    events: &mut EventStream,
-    pipe: &mut EventPipe,
+    ui: &mut Ui<'_>,
     session: (&std::path::Path, &str, &mut usize),
     prompt: String,
 ) -> anyhow::Result<bool> {
     let (root, session_name, persisted) = session;
-    state.thinking = true;
-    state.streamed = false;
-    draw(terminal, state)?;
-    let (result, interruption) = drive(terminal, state, events, pipe, agent.run(prompt)).await?;
-    state.thinking = false;
-    while let Ok(event) = pipe.receiver.try_recv() {
-        state.push_tui_event(event);
+    ui.state.thinking = true;
+    ui.state.streamed = false;
+    draw(terminal, ui.state)?;
+    let (result, interruption) = drive(
+        terminal,
+        ui.state,
+        ui.events,
+        ui.inbox,
+        ui.sessions,
+        agent.run(prompt),
+    )
+    .await?;
+    ui.state.thinking = false;
+    while let Ok(event) = ui.inbox.try_recv() {
+        ui.state.push_event(event);
     }
     if let Some(result) = result {
         match result {
-            Ok(answer) => state.push_final_answer(answer),
-            Err(error) => state.push_line(format!("error: {error:#}"), LineKind::Normal),
+            Ok(answer) => ui.state.push_final_answer(answer),
+            Err(error) => ui
+                .state
+                .push_line(format!("error: {error:#}"), LineKind::Normal),
         }
     }
     if matches!(interruption, Some(Interruption::CancelTurn)) {
-        state.push_line("cancelled".into(), LineKind::Dim);
+        ui.state.push_line("cancelled".into(), LineKind::Dim);
     }
     Session::append(root, session_name, &agent.history()[*persisted..])?;
     *persisted = agent.history().len();
-    state.follow();
-    draw(terminal, state)?;
+    ui.state.follow();
+    draw(terminal, ui.state)?;
     Ok(matches!(interruption, Some(Interruption::ExitApp)))
 }
 
@@ -348,27 +399,28 @@ enum Interruption {
     CancelTurn,
 }
 
-/// Pump an agent future to completion while streaming agent events into the
-/// scrollback and keeping the UI responsive. Scroll and input editing stay
-/// available while work is in flight; Ctrl-C cancels the turn (Esc only
-/// leaves the current view: detach from a subagent or close the panel).
+/// Pump an agent future to completion while streaming session events into
+/// the scrollback and keeping the UI responsive. Scroll and input editing
+/// stay available while work is in flight; Ctrl-C cancels the turn (Esc
+/// only leaves the current view: detach from a session or close the panel).
 async fn drive<T>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut TuiState,
     events: &mut EventStream,
-    pipe: &mut EventPipe,
+    inbox: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    sessions: &Sessions,
     work: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<(Option<anyhow::Result<T>>, Option<Interruption>)> {
     tokio::pin!(work);
     loop {
         tokio::select! {
             result = &mut work => return Ok((Some(result), None)),
-            Some(event) = pipe.receiver.recv() => {
-                state.push_tui_event(event);
+            Some(event) = inbox.recv() => {
+                state.push_event(event);
                 draw(terminal, state)?;
             }
             event = events.next() => match event {
-                // Attached: Esc detaches from the subagent view instead of
+                // Attached: Esc detaches from the session view instead of
                 // cancelling the in-flight turn.
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
                     && key.code == KeyCode::Esc
@@ -393,14 +445,15 @@ async fn drive<T>(
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
                     && state.attached.is_some() =>
                 {
-                    state.handle_attached_key(key);
+                    let width = attached_input_width(terminal)?;
+                    state.handle_attached_key(key, width);
                     draw(terminal, state)?;
                 }
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
                     && state.show_tasks =>
                 {
                     if let Some(task_id) = state.handle_tasks_panel_key(key) {
-                        attach_to_task(state, task_id, &pipe.sender);
+                        attach_to_task(state, task_id, sessions);
                     } else if key.code == KeyCode::Enter {
                         // Enter on a non-subagent task: nothing to attach.
                     } else {
@@ -421,7 +474,11 @@ async fn drive<T>(
                     draw(terminal, state)?;
                 }
                 Some(Ok(Event::Paste(text))) => {
-                    state.input.insert(&text);
+                    if let Some(attached) = &mut state.attached {
+                        attached.input.insert(&text);
+                    } else {
+                        state.input.insert(&text);
+                    }
                     draw(terminal, state)?;
                 }
                 Some(Ok(_)) => {}
@@ -440,8 +497,8 @@ fn draw<B: ratatui::backend::Backend>(
         .draw(|frame| {
             let attached = state.attached.is_some();
             let inner_input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
-            let input_rows = if attached {
-                1
+            let input_rows = if let Some(attached) = &state.attached {
+                attached.input.visual_rows(inner_input_width)
             } else {
                 state.input.visual_rows(inner_input_width)
             };
@@ -502,9 +559,13 @@ fn draw<B: ratatui::backend::Backend>(
             if tasks_height > 0 && state.show_tasks {
                 let attachable = |id: u64| {
                     state
-                        .subagent_sessions
+                        .attached
                         .as_ref()
-                        .is_some_and(|sessions| sessions.get(id).is_some())
+                        .is_some_and(|attached| attached.id == id)
+                        || state
+                            .attachable
+                            .as_ref()
+                            .is_some_and(|attachable| attachable(id))
                 };
                 let mut lines = vec![Line::styled(
                     if running.is_empty() {
@@ -540,7 +601,7 @@ fn draw<B: ratatui::backend::Backend>(
             }
             let inner_width = usize::from(output.width).max(1);
             // The scrollback rendered depends on whether we are attached to
-            // a subagent view; the rendering pipeline is identical.
+            // a session view; the rendering pipeline is identical.
             let scroll_state: &mut TuiState = match &mut state.attached {
                 Some(attached) => &mut attached.state,
                 None => state,
@@ -574,26 +635,39 @@ fn draw<B: ratatui::backend::Backend>(
                 paragraph.scroll((scroll_state.scroll.min(u16::MAX as usize) as u16, 0)),
                 output,
             );
-            if let Some(attached) = &state.attached {
+            if let Some(attached) = &mut state.attached {
                 let status = if attached.finished {
                     "finished"
                 } else {
                     "running"
                 };
                 let block = Block::default().borders(Borders::ALL).title(format!(
-                    "subagent #{} ({}) — Esc to detach",
-                    attached.id, status
+                    "subagent #{}: {} ({}) — Esc detach · Enter steer · Ctrl-C interrupt",
+                    attached.id,
+                    preview(&attached.label, 40),
+                    status
                 ));
+                let (cursor_row, cursor_col) = attached.input.wrapped_cursor(inner_input_width);
+                let inner_input_height = usize::from(input.height.saturating_sub(2));
+                attached.input_scroll =
+                    cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
+                let input_lines: Vec<Line> = hard_wrap(&attached.input.text, inner_input_width)
+                    .into_iter()
+                    .map(Line::from)
+                    .collect();
                 frame.render_widget(
-                    Paragraph::new(Line::styled(
-                        preview(&attached.label, inner_input_width.saturating_sub(1)),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                    ))
-                    .block(block),
+                    Paragraph::new(input_lines)
+                        .block(block)
+                        .scroll((attached.input_scroll.min(u16::MAX as usize) as u16, 0)),
                     input,
                 );
+                frame.set_cursor_position((
+                    input.x + 1 + (cursor_col as u16).min(input.width.saturating_sub(2)),
+                    input.y
+                        + 1
+                        + ((cursor_row - attached.input_scroll) as u16)
+                            .min(input.height.saturating_sub(2)),
+                ));
                 return;
             }
             let title = if state.thinking {
@@ -718,27 +792,58 @@ struct TuiState {
     pending_edit: Option<(String, String, String)>,
     /// Shared background-task slots, for the tasks panel.
     background: Option<crate::tools::BackgroundTasks>,
-    /// Live subagent sessions (for attach), shared with the delegate tool.
-    subagent_sessions: Option<crate::delegate::SubagentSessions>,
+    /// Probe for whether a background task has an attachable session
+    /// (wired to the session registry by the runner).
+    attachable: Option<Box<dyn Fn(u64) -> bool + Send>>,
     /// Whether the background-tasks panel is visible.
     show_tasks: bool,
     /// Cursor (index into the running-task list) for attach selection.
     task_cursor: usize,
-    /// Attached subagent view; when set, draw renders this instead of the
+    /// Attached session view; when set, draw renders this instead of the
     /// main scrollback and Esc detaches instead of cancelling the turn.
     attached: Option<Box<AttachedView>>,
 }
 
-/// A live view into a running background subagent: its own scrollback
+/// A live view into a running background session: its own scrollback
 /// rebuilt from the event stream, rendered with the same pipeline as the
-/// main view.
+/// main view. While attached you can steer the session through its handle:
+/// Enter queues a prompt for its next turn, Ctrl-C cancels its in-flight
+/// turn.
 struct AttachedView {
     id: u64,
     label: String,
     state: TuiState,
-    /// Set once the subagent's completion event has arrived (view becomes
-    /// a static record; further events are impossible).
+    /// The session seam: snapshot/subscribe/send_input/cancel.
+    handle: Arc<dyn SessionHandle>,
+    /// Input buffer for steering prompts.
+    input: InputBuffer,
+    /// Vertical scroll of the steering input (multi-line).
+    input_scroll: usize,
+    /// Set once the session's completion event has arrived (view becomes a
+    /// static record; further events are impossible).
     finished: bool,
+}
+
+impl AttachedView {
+    /// Input editing on the attached steering buffer. Vertical arrow keys
+    /// stay scroll keys (see handle_attached_key), so a multi-line buffer
+    /// edits at the cursor without vertical movement.
+    fn edit_input(input: &mut InputBuffer, key: KeyEvent, _width: usize) {
+        match key.code {
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                input.insert_char(character)
+            }
+            KeyCode::Left => input.left(),
+            KeyCode::Right => input.right(),
+            KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => input.home(),
+            KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => input.end(),
+            KeyCode::Backspace => input.backspace(),
+            KeyCode::Delete => input.delete(),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Default)]
@@ -836,12 +941,11 @@ impl TuiState {
         }
     }
 
-    /// Attach to a running subagent task: snapshot its event log into a
-    /// fresh scrollback and follow its live stream from now on. The caller
-    /// must bridge the session's broadcast receiver into `TuiEvent::Sub`.
-    fn attach(&mut self, id: u64, label: String, snapshot: Vec<AgentEvent>) {
+    /// Attach to a background session: snapshot its event log into a fresh
+    /// scrollback and follow its live stream from now on (see `bridge`).
+    fn attach(&mut self, id: u64, label: String, handle: Arc<dyn SessionHandle>) {
         let mut state = TuiState::default();
-        for event in snapshot {
+        for event in handle.snapshot() {
             state.push_agent_event(event);
         }
         state.follow();
@@ -849,6 +953,9 @@ impl TuiState {
             id,
             label,
             state,
+            handle,
+            input: InputBuffer::default(),
+            input_scroll: 0,
             finished: false,
         }));
     }
@@ -857,33 +964,50 @@ impl TuiState {
         self.attached = None;
     }
 
-    /// Scroll keys while attached operate on the subagent's scrollback.
-    fn handle_attached_key(&mut self, key: KeyEvent) {
-        if let Some(attached) = &mut self.attached {
-            attached.state.handle_scroll(key);
+    /// Keys pressed while attached: scroll keys move the attached
+    /// scrollback, Enter steers the session (queues a prompt for its next
+    /// turn), Ctrl-C cancels its in-flight turn, everything else edits the
+    /// steering input.
+    fn handle_attached_key(&mut self, key: KeyEvent, input_width: usize) {
+        let Some(attached) = &mut self.attached else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => attached.state.handle_scroll(key),
+            KeyCode::Enter => {
+                let prompt = std::mem::take(&mut attached.input.text);
+                attached.input.cursor = 0;
+                if !prompt.trim().is_empty() && !attached.finished {
+                    attached
+                        .state
+                        .push_line(format!("you> {prompt}"), LineKind::User);
+                    attached.state.follow();
+                    attached.handle.send_input(prompt);
+                }
+            }
+            _ if is_cancel(key) && !attached.finished => attached.handle.cancel(),
+            _ => AttachedView::edit_input(&mut attached.input, key, input_width),
         }
     }
 
-    /// Route a wrapped event to the main scrollback or the attached view.
-    fn push_tui_event(&mut self, event: TuiEvent) {
-        match event {
-            TuiEvent::Main(event) => {
-                // The subagent's own completion is delivered to the main
-                // agent; use it to mark the attached view as finished.
-                if let AgentEvent::BackgroundCompleted { id, .. } = &event
-                    && let Some(attached) = &mut self.attached
-                    && attached.id == *id
-                {
-                    attached.finished = true;
-                }
-                self.push_agent_event(event);
-            }
-            TuiEvent::Sub(event) => {
-                if let Some(attached) = &mut self.attached {
-                    attached.state.push_agent_event(event);
-                }
-            }
+    /// Route an event to the main scrollback or the attached view. The one
+    /// event that belongs to both is `BackgroundCompleted` of the attached
+    /// session: the main agent sees it as a completion, the attached view
+    /// uses it to mark itself finished.
+    fn push_event(&mut self, event: AgentEvent) {
+        if let AgentEvent::BackgroundCompleted { id, .. } = &event
+            && let Some(attached) = &mut self.attached
+            && attached.id == *id
+        {
+            attached.finished = true;
+            attached.state.push_agent_event(event.clone());
         }
+        self.push_agent_event(event);
     }
 
     fn edit_input(&mut self, key: KeyEvent) {
@@ -941,9 +1065,11 @@ impl TuiState {
             }
             KeyCode::Enter => {
                 let task = running.get(self.task_cursor)?;
-                // Only subagent (delegate) tasks have a session to attach.
-                let sessions = self.subagent_sessions.as_ref()?;
-                sessions.get(task.id)?;
+                // Only tasks with a live session handle can be attached.
+                let attachable = self.attachable.as_ref()?;
+                if !attachable(task.id) {
+                    return None;
+                }
                 return Some(task.id);
             }
             _ => {}
@@ -1195,30 +1321,23 @@ mod tests {
     }
 
     #[test]
-    fn attached_view_replays_snapshot_and_follows_stream() {
+    fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
+        let (handle, sink, _source) = crate::handle::session_channel();
         let mut state = TuiState::default();
-        state.attach(
-            7,
-            "demo task".into(),
-            vec![
-                AgentEvent::AssistantDelta("partial".into()),
-                AgentEvent::ToolCall {
-                    name: "bash".into(),
-                    arguments: r#"{"command":"ls"}"#.into(),
-                },
-                AgentEvent::ToolResult {
-                    is_error: false,
-                    content: "files".into(),
-                },
-            ],
-        );
-        // Live stream events land in the attached view, not the main one.
-        state.push_tui_event(TuiEvent::Sub(AgentEvent::AssistantDelta(
-            "streamed answer".into(),
-        )));
-        state.push_tui_event(TuiEvent::Main(AgentEvent::AssistantText("main".into())));
-        let attached = state.attached.as_ref().unwrap();
-        let lines: Vec<_> = attached
+        sink.emit(AgentEvent::AssistantDelta("partial".into()));
+        sink.emit(AgentEvent::ToolCall {
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        });
+        sink.emit(AgentEvent::ToolResult {
+            is_error: false,
+            content: "files".into(),
+        });
+        state.attach(7, "demo task".into(), Arc::new(handle));
+        let lines: Vec<_> = state
+            .attached
+            .as_ref()
+            .unwrap()
             .state
             .lines
             .iter()
@@ -1226,46 +1345,90 @@ mod tests {
             .collect();
         assert_eq!(
             lines,
-            [
-                "partial",
-                r#"tool: bash {"command":"ls"}"#,
-                "  ok: files",
-                "streamed answer",
-            ]
+            ["partial", r#"tool: bash {"command":"ls"}"#, "  ok: files",]
         );
-        assert_eq!(state.lines.last().unwrap().text, "main");
-        assert!(!attached.finished);
-        // The subagent's completion arrives on the MAIN channel.
-        state.push_tui_event(TuiEvent::Main(AgentEvent::BackgroundCompleted {
+        // The session's completion arrives as a main-channel event and
+        // flips the attached view to finished.
+        assert!(!state.attached.as_ref().unwrap().finished);
+        state.push_event(AgentEvent::BackgroundCompleted {
             id: 7,
             output: "done".into(),
-        }));
+        });
         assert!(state.attached.as_ref().unwrap().finished);
+        assert_eq!(
+            state
+                .attached
+                .as_ref()
+                .unwrap()
+                .state
+                .lines
+                .last()
+                .unwrap()
+                .text,
+            "background task 7 finished: done"
+        );
         state.detach();
         assert!(state.attached.is_none());
     }
 
     #[test]
+    fn attached_enter_steers_and_ctrl_c_cancels_through_the_handle() {
+        let (handle, _sink, mut source) = crate::handle::session_channel();
+        let mut state = TuiState::default();
+        state.attach(7, "demo task".into(), Arc::new(handle));
+        {
+            let attached = state.attached.as_mut().unwrap();
+            attached.input.insert("please also check tests");
+        }
+        state.handle_attached_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), 80);
+        assert_eq!(
+            source.try_recv(),
+            Some(crate::handle::Steer::Prompt(
+                "please also check tests".into()
+            ))
+        );
+        // The steering prompt echoes into the attached scrollback.
+        assert_eq!(
+            state
+                .attached
+                .as_ref()
+                .unwrap()
+                .state
+                .lines
+                .last()
+                .unwrap()
+                .text,
+            "you> please also check tests"
+        );
+        state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
+        assert_eq!(source.try_recv(), Some(crate::handle::Steer::Cancel));
+        // Finished sessions no longer accept steering.
+        state.push_event(AgentEvent::BackgroundCompleted {
+            id: 7,
+            output: "done".into(),
+        });
+        state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
+        assert_eq!(source.try_recv(), None);
+    }
+
+    #[test]
     fn attached_view_scrolls_independently() {
+        let (handle, _sink, _source) = crate::handle::session_channel();
         let mut state = TuiState {
             scroll: 2,
             ..Default::default()
         };
-        state.attach(
-            1,
-            "task".into(),
-            vec![AgentEvent::AssistantText("x".into())],
-        );
+        state.attach(1, "task".into(), Arc::new(handle));
         {
             let attached = state.attached.as_mut().unwrap();
             attached.state.max_scroll = 9;
             attached.state.scroll = 5;
         }
         // Scrolling while attached moves the subagent view only.
-        state.handle_attached_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        state.handle_attached_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()), 80);
         assert_eq!(state.scroll, 2, "main scroll untouched");
         assert_eq!(state.attached.as_ref().unwrap().state.scroll, 4);
-        state.handle_attached_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        state.handle_attached_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), 80);
         assert_eq!(state.attached.as_ref().unwrap().state.scroll, 5);
     }
 

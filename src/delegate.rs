@@ -10,6 +10,11 @@
 //! answer is delivered as a [`AgentEvent::BackgroundCompleted`] through the
 //! parent's event channel, waking an idle agent (see Slice 1).
 //!
+//! Every background subagent is exposed through a [`LiveSession`] handle
+//! (see `handle.rs`): frontends attach to it for a full live view and can
+//! steer it (queue prompts / cancel the in-flight turn). Sync delegates
+//! stay single-turn and handle-less.
+//!
 //! Future evolution: the thread boundary is deliberately the same shape as a
 //! process boundary — swapping `std::thread::spawn` for a spawned
 //! `e-agent --subagent` subprocess with a stdio JSONL protocol is the
@@ -21,9 +26,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
 
 use crate::agent::{Agent, AgentEvent, Tool, ToolSpec, preview};
+use crate::handle::{SessionHandle, SessionSink, SessionSource, Steer, session_channel};
 use crate::model::OpenAiModel;
 use crate::tools::{BackgroundTasks, builtins};
 use crate::workspace::Workspace;
@@ -33,65 +38,49 @@ use crate::workspace::Workspace;
 const SUBAGENT_MAX_ROUNDS: usize = 32;
 /// Ceiling for a synchronous delegate call.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// Broadcast capacity per subagent session. The TUI view follows in real
-/// time; a lagged receiver simply misses events (it holds the history too).
-const SESSION_EVENT_CAPACITY: usize = 256;
 
-/// Live view into one running subagent session: a replayable event log plus
-/// a broadcast stream of new events. The TUI attach mode snapshots the log
-/// on entry and then follows the stream, rebuilding its scrollback the same
-/// way the main view does.
-#[derive(Clone)]
-pub struct SubagentSession {
-    log: Arc<Mutex<Vec<AgentEvent>>>,
-    events: broadcast::Sender<AgentEvent>,
-}
-
-impl SubagentSession {
-    fn new() -> Self {
-        let (events, _) = broadcast::channel(SESSION_EVENT_CAPACITY);
-        Self {
-            log: Arc::new(Mutex::new(Vec::new())),
-            events,
-        }
-    }
-
-    /// Snapshot of every event the subagent has emitted so far.
-    pub fn snapshot(&self) -> Vec<AgentEvent> {
-        self.log.lock().unwrap().clone()
-    }
-
-    /// Stream of events from now on (broadcast; lagging misses events).
-    pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
-        self.events.subscribe()
-    }
-
-    fn emit(&self, event: AgentEvent) {
-        self.log.lock().unwrap().push(event.clone());
-        // No receivers is fine — the log already holds the record.
-        let _ = self.events.send(event);
-    }
-}
-
-/// Registry of live subagent sessions, keyed by background-task id (the
-/// same unified id sequence shared with background bash). Entries are
-/// removed when the subagent finishes.
+/// Registry of live session handles, keyed by background-task id (the same
+/// unified id sequence shared with background bash). Background subagents
+/// register their handle here so the TUI can attach; entries are removed
+/// when the subagent finishes.
 #[derive(Clone, Default)]
-pub struct SubagentSessions {
-    sessions: Arc<Mutex<std::collections::HashMap<u64, SubagentSession>>>,
+pub struct Sessions {
+    sessions: Arc<Mutex<std::collections::HashMap<u64, Arc<dyn SessionHandle>>>>,
 }
 
-impl SubagentSessions {
-    pub fn get(&self, id: u64) -> Option<SubagentSession> {
+impl Sessions {
+    pub fn get(&self, id: u64) -> Option<Arc<dyn SessionHandle>> {
         self.sessions.lock().unwrap().get(&id).cloned()
     }
 
-    fn insert(&self, id: u64, session: SubagentSession) {
-        self.sessions.lock().unwrap().insert(id, session);
+    pub fn insert(&self, id: u64, handle: Arc<dyn SessionHandle>) {
+        self.sessions.lock().unwrap().insert(id, handle);
     }
 
-    fn remove(&self, id: u64) {
+    pub fn remove(&self, id: u64) {
         self.sessions.lock().unwrap().remove(&id);
+    }
+}
+
+/// Pick the next prompt for a steerable subagent: stashed prompts first
+/// (arrival order), then whatever is queued in the channel, then block until
+/// a prompt arrives or the channel closes (None = shut down).
+async fn next_prompt(source: &mut SessionSource, pending: &mut Vec<String>) -> Option<String> {
+    if !pending.is_empty() {
+        return Some(pending.remove(0));
+    }
+    while let Some(message) = source.try_recv() {
+        if let Steer::Prompt(text) = message {
+            return Some(text);
+        }
+    }
+    loop {
+        match source.recv().await {
+            Some(Steer::Prompt(text)) => return Some(text),
+            // A stray cancel while idle is meaningless; keep waiting.
+            Some(Steer::Cancel) => continue,
+            None => return None,
+        }
     }
 }
 
@@ -101,8 +90,8 @@ pub struct Delegate {
     /// Shared background slots (with bash): a background delegate occupies
     /// one slot and its completion is delivered as a background completion.
     background: BackgroundTasks,
-    /// Live sessions of background subagents, for the TUI attach view.
-    sessions: SubagentSessions,
+    /// Live handles of background subagents, for the TUI attach view.
+    sessions: Sessions,
 }
 
 impl Delegate {
@@ -111,25 +100,27 @@ impl Delegate {
             model,
             workspace,
             background,
-            sessions: SubagentSessions::default(),
+            sessions: Sessions::default(),
         }
     }
 
-    /// Live subagent sessions (background mode only), for attach views.
-    pub fn sessions(&self) -> SubagentSessions {
+    /// Live session handles (background mode only), for attach views.
+    pub fn sessions(&self) -> Sessions {
         self.sessions.clone()
     }
 
     /// Run `task` on a dedicated thread with a fresh agent and return the
     /// final answer. Used by both sync and background execution so the two
-    /// modes share one code path. When `session` is given, the subagent's
-    /// events are mirrored into it for live viewing (the attach view
-    /// rebuilds its scrollback from the event stream).
+    /// modes share one code path. With a `steering` pair the subagent's
+    /// events are mirrored into the session (frontends rebuild their view
+    /// from snapshot + stream) and it accepts steering — queued prompts
+    /// become fresh turns, cancel drops the in-flight turn. Sync mode
+    /// passes None and keeps the original single-turn behaviour.
     fn run_on_thread(
         model: OpenAiModel,
         workspace: Workspace,
         task: String,
-        session: Option<SubagentSession>,
+        steering: Option<(SessionSink, SessionSource)>,
     ) -> String {
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -143,12 +134,77 @@ impl Delegate {
                 let (tools, _) = builtins(workspace);
                 let mut agent =
                     Agent::new(Box::new(model), tools).max_tool_rounds(SUBAGENT_MAX_ROUNDS);
-                if let Some(session) = session {
-                    agent.set_event_handler(Box::new(move |event| session.emit(event)));
-                }
-                match agent.run(task).await {
-                    Ok(answer) => answer,
-                    Err(error) => format!("subagent failed: {error:#}"),
+                let (sink, mut source) = match steering {
+                    Some((sink, source)) => {
+                        agent.observe(sink.clone());
+                        (Some(sink), Some(source))
+                    }
+                    None => (None, None),
+                };
+                // Prompts stashed while a turn was running, in arrival order.
+                let mut pending: Vec<String> = Vec::new();
+                let mut prompt = task;
+                let mut last_answer = String::new();
+                loop {
+                    let result = {
+                        let run = agent.run(prompt);
+                        tokio::pin!(run);
+                        match source.as_mut() {
+                            // Sync mode: no steering, just run to completion.
+                            None => run.await,
+                            Some(source) => {
+                                let mut cancelled = false;
+                                let result = loop {
+                                    tokio::select! {
+                                        result = &mut run => break Some(result),
+                                        message = source.recv() => match message {
+                                            // Cancel: drop the in-flight turn
+                                            // (bash subprocesses are killed via
+                                            // their process-group guard on
+                                            // drop); completed rounds stay in
+                                            // history.
+                                            Some(Steer::Cancel) => {
+                                                cancelled = true;
+                                                break None;
+                                            }
+                                            // Prompt mid-turn: stash it; the
+                                            // post-turn drain picks it up.
+                                            Some(Steer::Prompt(text)) => {
+                                                pending.push(text);
+                                            }
+                                            None => break Some(run.await),
+                                        },
+                                    }
+                                };
+                                if cancelled {
+                                    if let Some(sink) = &sink {
+                                        sink.emit(AgentEvent::AssistantText(
+                                            "[turn cancelled by user]".into(),
+                                        ));
+                                    }
+                                    Ok(String::new())
+                                } else {
+                                    result.expect("run completed")
+                                }
+                            }
+                        }
+                    };
+                    last_answer = match result {
+                        Ok(answer) => answer,
+                        Err(error) => format!("subagent failed: {error:#}"),
+                    };
+                    // Turn ended. Without steering we are done; with steering
+                    // wait for the next queued prompt or channel close.
+                    let Some(source) = source.as_mut() else {
+                        return last_answer;
+                    };
+                    prompt = match next_prompt(source, &mut pending).await {
+                        Some(text) => text,
+                        None => return last_answer,
+                    };
+                    if let Some(sink) = &sink {
+                        sink.emit(AgentEvent::AssistantText(format!("[steer] {prompt}")));
+                    }
                 }
             })
         })
@@ -200,8 +256,8 @@ impl Tool for Delegate {
             let model = self.model.clone();
             let workspace = self.workspace.clone();
             let label = preview(&task, 100);
-            let session = SubagentSession::new();
-            let registered = session.clone();
+            let (handle, sink, source) = session_channel();
+            let session: Arc<dyn SessionHandle> = Arc::new(handle.clone());
             let sessions = self.sessions.clone();
             let sessions_in_work = self.sessions.clone();
             let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
@@ -213,12 +269,12 @@ impl Tool for Delegate {
                 label,
                 None,
                 move |id| {
-                    sessions.insert(id, registered);
+                    sessions.insert(id, session);
                     *slot_in_hook.lock().unwrap() = Some(id);
                 },
                 move || async move {
                     let output = tokio::task::spawn_blocking(move || {
-                        Self::run_on_thread(model, workspace, task, Some(session))
+                        Self::run_on_thread(model, workspace, task, Some((sink, source)))
                     })
                     .await
                     .unwrap_or_else(|error| format!("subagent blocking task failed: {error}"));
@@ -251,30 +307,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_log_replays_and_streams() {
-        let session = SubagentSession::new();
-        session.emit(AgentEvent::AssistantText("one".into()));
-        let mut receiver = session.subscribe();
-        session.emit(AgentEvent::AssistantText("two".into()));
-        // A late joiner sees the full log plus can follow the stream.
-        assert_eq!(
-            session.snapshot(),
-            vec![
-                AgentEvent::AssistantText("one".into()),
-                AgentEvent::AssistantText("two".into()),
-            ]
-        );
-        assert_eq!(
-            receiver.try_recv().unwrap(),
-            AgentEvent::AssistantText("two".into())
-        );
-    }
-
-    #[test]
     fn registry_tracks_live_sessions() {
-        let sessions = SubagentSessions::default();
+        let sessions = Sessions::default();
         assert!(sessions.get(1).is_none());
-        sessions.insert(1, SubagentSession::new());
+        let (handle, _sink, _source) = session_channel();
+        sessions.insert(1, Arc::new(handle));
         assert!(sessions.get(1).is_some());
         sessions.remove(1);
         assert!(sessions.get(1).is_none());
