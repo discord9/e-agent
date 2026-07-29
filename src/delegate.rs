@@ -568,14 +568,21 @@ mod tests {
 
     fn delegate(workspace: &std::path::Path) -> Delegate {
         let workspace = Workspace::new(workspace).unwrap();
-        let model = OpenAiModel::from_env(None, None).unwrap();
+        // Construct the model with a dummy key directly: no request is ever
+        // sent, and tests must not depend on (or mutate) process env.
+        let model = OpenAiModel::new(
+            "http://localhost".into(),
+            "test-key".into(),
+            "test-model".into(),
+            None,
+        )
+        .unwrap();
         let (_, background) = builtins(workspace.clone());
         Delegate::new(model, workspace, background)
     }
 
     #[tokio::test]
     async fn rejects_empty_task() {
-        unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
         let temp = tempfile::tempdir().unwrap();
         let delegate = delegate(temp.path());
         assert!(
@@ -610,7 +617,6 @@ mod tests {
 
     #[tokio::test]
     async fn resume_requires_persistence_and_an_existing_session() {
-        unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
         // No persistence configured: nothing to resume from.
         let temp = tempfile::tempdir().unwrap();
         let no_persist = delegate(temp.path());
@@ -665,7 +671,6 @@ mod tests {
 
     #[tokio::test]
     async fn spec_disallows_nested_delegation_by_design() {
-        unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::new(temp.path()).unwrap();
         let (tools, _) = builtins(workspace);
