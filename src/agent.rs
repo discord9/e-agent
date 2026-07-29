@@ -2,9 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
-use tokio::sync::mpsc;
-
-pub const MAX_TOOL_ROUNDS: usize = 32;
+use tokio::sync::{broadcast, mpsc};
 
 /// Insert a synthetic error result for every tool call left unanswered by an
 /// interrupted turn (cancel, provider error, crash), so the derived context
@@ -174,10 +172,14 @@ pub struct Agent {
     tools: Vec<Box<dyn Tool>>,
     history: Vec<SessionEntry>,
     event_handler: Option<Box<dyn FnMut(AgentEvent) + Send>>,
-    max_tool_rounds: usize,
+    max_tool_rounds: Option<usize>,
     background_receiver: mpsc::UnboundedReceiver<AgentEvent>,
     pending_background: VecDeque<(u64, String)>,
     subscriber: Option<mpsc::UnboundedSender<AgentEvent>>,
+    /// Long-lived broadcast subscribers (e.g. a TUI attach view). Unlike
+    /// `event_handler` and `subscriber` (per-turn), these survive across
+    /// turns and receive every emitted event.
+    observers: Vec<broadcast::Sender<AgentEvent>>,
     running_background: HashSet<u64>,
     session_input_tokens: u64,
     session_output_tokens: u64,
@@ -198,10 +200,11 @@ impl Agent {
             tools,
             history: Vec::new(),
             event_handler: None,
-            max_tool_rounds: MAX_TOOL_ROUNDS,
+            max_tool_rounds: None,
             background_receiver,
             pending_background: VecDeque::new(),
             subscriber: None,
+            observers: Vec::new(),
             running_background: HashSet::new(),
             session_input_tokens: 0,
             session_output_tokens: 0,
@@ -216,8 +219,10 @@ impl Agent {
         self.context_prefix = Some(prefix);
     }
 
+    /// Cap the number of tool-call rounds per turn. None (the default) means
+    /// unlimited: a turn runs until the model stops calling tools.
     pub fn max_tool_rounds(mut self, rounds: usize) -> Self {
-        self.max_tool_rounds = rounds;
+        self.max_tool_rounds = Some(rounds);
         self
     }
 
@@ -272,6 +277,20 @@ impl Agent {
         self.subscriber = Some(sender);
     }
 
+    /// Register a long-lived broadcast observer receiving every event
+    /// (text, tool calls, background completions) across all turns. Used by
+    /// the TUI attach view to follow a subagent without owning it.
+    pub fn observe(&mut self, sender: broadcast::Sender<AgentEvent>) {
+        self.observers.push(sender);
+    }
+
+    fn fanout(&self, event: &AgentEvent) {
+        for sender in &self.observers {
+            // Lagged receivers simply miss events; the view can re-snapshot.
+            let _ = sender.send(event.clone());
+        }
+    }
+
     pub fn background_task_ids(&self) -> &HashSet<u64> {
         &self.running_background
     }
@@ -290,12 +309,14 @@ impl Agent {
                 Some(AgentEvent::BackgroundCompleted { id, output }) => {
                     self.running_background.remove(&id);
                     self.pending_background.push_back((id, output.clone()));
+                    let event = AgentEvent::BackgroundCompleted {
+                        id,
+                        output: output.clone(),
+                    };
                     if let Some(subscriber) = &self.subscriber {
-                        let _ = subscriber.send(AgentEvent::BackgroundCompleted {
-                            id,
-                            output: output.clone(),
-                        });
+                        let _ = subscriber.send(event.clone());
                     }
+                    self.fanout(&event);
                     return Some((id, output));
                 }
                 Some(_) => {}
@@ -382,7 +403,14 @@ impl Agent {
     }
 
     async fn run_loop(&mut self, specs: &[ToolSpec]) -> anyhow::Result<String> {
-        for _ in 0..self.max_tool_rounds {
+        let mut rounds = 0usize;
+        loop {
+            if let Some(limit) = self.max_tool_rounds
+                && rounds >= limit
+            {
+                anyhow::bail!("tool call limit ({limit}) reached");
+            }
+            rounds += 1;
             self.drain_background();
             self.inject_pending_background();
             let mut produced_delta = false;
@@ -449,8 +477,6 @@ impl Agent {
                 });
             }
         }
-
-        anyhow::bail!("tool call limit ({}) reached", self.max_tool_rounds)
     }
 
     /// Execute a tool call against a tool list. Associated function (not a
@@ -467,8 +493,11 @@ impl Agent {
 
     fn emit(&mut self, event: AgentEvent) {
         if let Some(handler) = &mut self.event_handler {
-            handler(event);
+            handler(event.clone());
         }
+        // Drop observers whose receiver side is gone (e.g. detached view).
+        self.observers.retain(|sender| sender.receiver_count() > 0);
+        self.fanout(&event);
     }
 
     fn inject_pending_background(&mut self) {
@@ -490,8 +519,9 @@ impl Agent {
             };
             self.pending_background.push_back((id, output));
             if let Some(subscriber) = &self.subscriber {
-                let _ = subscriber.send(event);
+                let _ = subscriber.send(event.clone());
             }
+            self.fanout(&event);
         }
     }
 }

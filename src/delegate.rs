@@ -16,10 +16,12 @@
 //! planned path to stronger isolation. MCP tools can be added later by
 //! letting the subagent run `mcp::connect_all` inside its own runtime.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
 use crate::agent::{Agent, AgentEvent, Tool, ToolSpec, preview};
 use crate::model::OpenAiModel;
@@ -30,6 +32,67 @@ use crate::workspace::Workspace;
 const SUBAGENT_MAX_ROUNDS: usize = 16;
 /// Ceiling for a synchronous delegate call.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Broadcast capacity per subagent session. The TUI view follows in real
+/// time; a lagged receiver simply misses events (it holds the history too).
+const SESSION_EVENT_CAPACITY: usize = 256;
+
+/// Live view into one running subagent session: a replayable event log plus
+/// a broadcast stream of new events. The TUI attach mode snapshots the log
+/// on entry and then follows the stream, rebuilding its scrollback the same
+/// way the main view does.
+#[derive(Clone)]
+pub struct SubagentSession {
+    log: Arc<Mutex<Vec<AgentEvent>>>,
+    events: broadcast::Sender<AgentEvent>,
+}
+
+impl SubagentSession {
+    fn new() -> Self {
+        let (events, _) = broadcast::channel(SESSION_EVENT_CAPACITY);
+        Self {
+            log: Arc::new(Mutex::new(Vec::new())),
+            events,
+        }
+    }
+
+    /// Snapshot of every event the subagent has emitted so far.
+    pub fn snapshot(&self) -> Vec<AgentEvent> {
+        self.log.lock().unwrap().clone()
+    }
+
+    /// Stream of events from now on (broadcast; lagging misses events).
+    pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
+        self.events.subscribe()
+    }
+
+    fn emit(&self, event: AgentEvent) {
+        self.log.lock().unwrap().push(event.clone());
+        // No receivers is fine — the log already holds the record.
+        let _ = self.events.send(event);
+    }
+}
+
+/// Registry of live subagent sessions, keyed by background-task id (the
+/// same unified id sequence shared with background bash). Entries are
+/// removed when the subagent finishes.
+#[derive(Clone, Default)]
+pub struct SubagentSessions {
+    sessions: Arc<Mutex<std::collections::HashMap<u64, SubagentSession>>>,
+}
+
+impl SubagentSessions {
+    pub fn get(&self, id: u64) -> Option<SubagentSession> {
+        self.sessions.lock().unwrap().get(&id).cloned()
+    }
+
+    fn insert(&self, id: u64, session: SubagentSession) {
+        self.sessions.lock().unwrap().insert(id, session);
+    }
+
+    fn remove(&self, id: u64) {
+        self.sessions.lock().unwrap().remove(&id);
+    }
+}
 
 pub struct Delegate {
     model: OpenAiModel,
@@ -37,6 +100,8 @@ pub struct Delegate {
     /// Shared background slots (with bash): a background delegate occupies
     /// one slot and its completion is delivered as a background completion.
     background: BackgroundTasks,
+    /// Live sessions of background subagents, for the TUI attach view.
+    sessions: SubagentSessions,
 }
 
 impl Delegate {
@@ -45,13 +110,26 @@ impl Delegate {
             model,
             workspace,
             background,
+            sessions: SubagentSessions::default(),
         }
+    }
+
+    /// Live subagent sessions (background mode only), for attach views.
+    pub fn sessions(&self) -> SubagentSessions {
+        self.sessions.clone()
     }
 
     /// Run `task` on a dedicated thread with a fresh agent and return the
     /// final answer. Used by both sync and background execution so the two
-    /// modes share one code path.
-    fn run_on_thread(model: OpenAiModel, workspace: Workspace, task: String) -> String {
+    /// modes share one code path. When `session` is given, the subagent's
+    /// events are mirrored into it for live viewing (the attach view
+    /// rebuilds its scrollback from the event stream).
+    fn run_on_thread(
+        model: OpenAiModel,
+        workspace: Workspace,
+        task: String,
+        session: Option<SubagentSession>,
+    ) -> String {
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -64,6 +142,9 @@ impl Delegate {
                 let (tools, _) = builtins(workspace);
                 let mut agent =
                     Agent::new(Box::new(model), tools).max_tool_rounds(SUBAGENT_MAX_ROUNDS);
+                if let Some(session) = session {
+                    agent.set_event_handler(Box::new(move |event| session.emit(event)));
+                }
                 match agent.run(task).await {
                     Ok(answer) => answer,
                     Err(error) => format!("subagent failed: {error:#}"),
@@ -118,19 +199,40 @@ impl Tool for Delegate {
             let model = self.model.clone();
             let workspace = self.workspace.clone();
             let label = preview(&task, 100);
+            let session = SubagentSession::new();
+            let registered = session.clone();
+            let sessions = self.sessions.clone();
+            let sessions_in_work = self.sessions.clone();
+            let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
+            let slot_in_hook = slot.clone();
+            let slot_in_work = slot.clone();
             // run_on_thread blocks on thread::join, so push it onto the
             // blocking thread pool to keep the executor responsive.
-            return self.background.spawn(label, None, move || async move {
-                tokio::task::spawn_blocking(move || Self::run_on_thread(model, workspace, task))
+            return self.background.spawn_with_id(
+                label,
+                None,
+                move |id| {
+                    sessions.insert(id, registered);
+                    *slot_in_hook.lock().unwrap() = Some(id);
+                },
+                move || async move {
+                    let output = tokio::task::spawn_blocking(move || {
+                        Self::run_on_thread(model, workspace, task, Some(session))
+                    })
                     .await
-                    .unwrap_or_else(|error| format!("subagent blocking task failed: {error}"))
-            });
+                    .unwrap_or_else(|error| format!("subagent blocking task failed: {error}"));
+                    if let Some(id) = *slot_in_work.lock().unwrap() {
+                        sessions_in_work.remove(id);
+                    }
+                    output
+                },
+            );
         }
 
         let model = self.model.clone();
         let workspace = self.workspace.clone();
         let handle =
-            tokio::task::spawn_blocking(move || Self::run_on_thread(model, workspace, task));
+            tokio::task::spawn_blocking(move || Self::run_on_thread(model, workspace, task, None));
         match tokio::time::timeout(SYNC_TIMEOUT, handle).await {
             Ok(Ok(answer)) => Ok(answer),
             Ok(Err(error)) => Err(format!("subagent thread failed: {error}")),
@@ -146,6 +248,36 @@ impl Tool for Delegate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_log_replays_and_streams() {
+        let session = SubagentSession::new();
+        session.emit(AgentEvent::AssistantText("one".into()));
+        let mut receiver = session.subscribe();
+        session.emit(AgentEvent::AssistantText("two".into()));
+        // A late joiner sees the full log plus can follow the stream.
+        assert_eq!(
+            session.snapshot(),
+            vec![
+                AgentEvent::AssistantText("one".into()),
+                AgentEvent::AssistantText("two".into()),
+            ]
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::AssistantText("two".into())
+        );
+    }
+
+    #[test]
+    fn registry_tracks_live_sessions() {
+        let sessions = SubagentSessions::default();
+        assert!(sessions.get(1).is_none());
+        sessions.insert(1, SubagentSession::new());
+        assert!(sessions.get(1).is_some());
+        sessions.remove(1);
+        assert!(sessions.get(1).is_none());
+    }
 
     fn delegate(workspace: &std::path::Path) -> Delegate {
         let workspace = Workspace::new(workspace).unwrap();

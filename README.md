@@ -23,7 +23,8 @@ an append-only log of message and compaction entries; the whole history is
 restored and replayed in the TUI on startup, while the model only sees the
 latest compaction summary and everything after it. Legacy `.json` sessions
 are migrated on first load. Optional CLI overrides are `--base-url URL`,
-`--model MODEL`, `--workspace PATH`, `--session NAME`, and `--max-rounds N`.
+`--model MODEL`, `--workspace PATH`, `--session NAME`, and `--max-rounds N`
+(tool-call rounds are unlimited by default; the flag sets an explicit cap).
 
 The available tools are `read_file`, `write_file`, `edit_file`, and `bash`.
 The three file tools use a capability-relative directory rooted at the
@@ -55,7 +56,8 @@ per-stream 64 KiB output limit as foreground Bash, with a 30-minute timeout.
 Completions surface as a TUI notification while a
 turn is active, and the complete output is injected as a clearly labelled user
 message at the next model call — whether that is the next round of an active
-turn or, if the agent is idle, a new turn started by that delivery. In
+turn or, if the agent is idle, a new turn started by that delivery. F2 toggles
+a tasks panel listing what is running. In
 one-shot mode a still-running task is reported before exit;
 the process then best-effort terminates its process group. Uninjected background
 results are not persisted in sessions.
@@ -76,6 +78,15 @@ limited to 16 tool rounds.
 With `background: true` the subagent runs without blocking and its answer is
 delivered as a background task completion (waking an idle agent). Sync mode
 (the default) waits for the answer with a 30-minute ceiling.
+
+A running background subagent can be watched live in the TUI: open the tasks
+panel with F2, select it with Up/Down, and press Enter to attach. The
+attached view replays everything the subagent has done so far and then
+follows its stream (text, tool calls, results) with the same rendering as the
+main view; the footer shows the task and whether it is still running. Esc
+detaches back to the main view (it never cancels the main turn), and the
+subagent keeps running after detach. Attaching is read-only; bash tasks have
+no event stream and cannot be attached.
 
 ## Compaction
 

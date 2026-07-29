@@ -73,11 +73,9 @@ async fn run() -> anyhow::Result<()> {
     let (mut tools, background) = builtins(workspace.clone());
     let (mcp_tools, mcp_instructions) = mcp::connect_all(&root).await;
     tools.extend(mcp_tools);
-    tools.push(Box::new(Delegate::new(
-        model.clone(),
-        workspace,
-        background.clone(),
-    )));
+    let delegate = Delegate::new(model.clone(), workspace, background.clone());
+    let subagent_sessions = delegate.sessions();
+    tools.push(Box::new(delegate));
     let mut agent = Agent::new(Box::new(model), tools);
     if !mcp_instructions.is_empty() {
         agent.set_context_prefix(mcp_instructions.join("\n\n"));
@@ -94,7 +92,15 @@ async fn run() -> anyhow::Result<()> {
     }
 
     if tui_mode {
-        return tui::run(agent, root, session, persisted, background).await;
+        return tui::run(
+            agent,
+            root,
+            session,
+            persisted,
+            background,
+            subagent_sessions,
+        )
+        .await;
     }
     set_stderr_events(&mut agent);
     if repl_mode {

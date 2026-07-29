@@ -283,6 +283,23 @@ impl BackgroundTasks {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
+        self.spawn_with_id(label, process_group, |_| {}, work)
+    }
+
+    /// Like [`Self::spawn`], but invokes `on_id` with the allocated task id
+    /// before the work starts (so callers can register per-task state under
+    /// the same id).
+    pub fn spawn_with_id<F, Fut>(
+        &self,
+        label: String,
+        process_group: Option<Arc<AtomicI32>>,
+        on_id: impl FnOnce(u64),
+        work: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = String> + Send + 'static,
+    {
         let sender = self
             .sender
             .clone()
@@ -303,6 +320,7 @@ impl BackgroundTasks {
             };
             *empty = Some(slot);
         }
+        on_id(id);
         let started = format!("started background task {id}: {label}");
         let slots = self.slots.clone();
         tokio::spawn(async move {
