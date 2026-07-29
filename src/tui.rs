@@ -16,7 +16,8 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::buffer::{Buffer, CellDiffOption, CellWidth};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -884,6 +885,7 @@ fn draw<B: ratatui::backend::Backend>(
                 paragraph.scroll((scroll_state.scroll.min(u16::MAX as usize) as u16, 0)),
                 output,
             );
+            force_wide_trailing_cell_updates(frame.buffer_mut(), output);
             if let Some(attached) = &mut state.attached {
                 let status = if attached.finished {
                     "finished"
@@ -988,6 +990,20 @@ fn draw<B: ratatui::backend::Backend>(
             ));
         })
         .map(|_| ())
+}
+
+/// Ratatui's diff skips the cells covered by wide glyphs. Always emit the
+/// following visible cell so it cannot retain terminal-default attributes.
+fn force_wide_trailing_cell_updates(buffer: &mut Buffer, area: Rect) {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let width = buffer[(x, y)].cell_width();
+            let trailing = x.saturating_add(width);
+            if width > 1 && trailing < area.right() {
+                buffer[(trailing, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
+        }
+    }
 }
 
 /// Keep wrapping text-only so scroll accounting is unchanged, then add the
@@ -2084,6 +2100,21 @@ mod tests {
             events.next().await,
             Some(Ok(Event::Key(key))) if key == release
         ));
+    }
+
+    #[test]
+    fn wide_scroll_line_forces_its_following_visible_cell_to_update() {
+        let backend = ratatui::backend::TestBackend::new(12, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        state.push_line("你好".into(), LineKind::Normal);
+
+        draw(&mut terminal, &mut state).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(2, 0)].diff_option, CellDiffOption::AlwaysUpdate);
+        assert_eq!(buffer[(4, 0)].diff_option, CellDiffOption::AlwaysUpdate);
+        assert_eq!(buffer[(1, 0)].diff_option, CellDiffOption::None);
     }
 
     #[test]
