@@ -216,6 +216,12 @@ async fn run_inner(
                     attach_to_task(&mut state, task_id, &pipe.sender);
                     continue;
                 }
+                // Idle with the tasks panel open: Esc closes the panel
+                // (leave-the-current-view) instead of quitting the app.
+                if key.code == KeyCode::Esc && state.show_tasks {
+                    state.show_tasks = false;
+                    continue;
+                }
                 if is_exit(key) {
                     return Ok(());
                 }
@@ -344,7 +350,8 @@ enum Interruption {
 
 /// Pump an agent future to completion while streaming agent events into the
 /// scrollback and keeping the UI responsive. Scroll and input editing stay
-/// available while work is in flight; Esc/Ctrl-C cancels the turn.
+/// available while work is in flight; Ctrl-C cancels the turn (Esc only
+/// leaves the current view: detach from a subagent or close the panel).
 async fn drive<T>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut TuiState,
@@ -370,8 +377,18 @@ async fn drive<T>(
                     state.detach();
                     draw(terminal, state)?;
                 }
-                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press && is_exit(key) => {
+                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press && is_cancel(key) => {
                     return Ok((None, Some(Interruption::CancelTurn)));
+                }
+                // Not attached: Esc during a turn only closes the tasks
+                // panel (leave-the-current-view), it never cancels the turn.
+                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
+                    && key.code == KeyCode::Esc =>
+                {
+                    if state.show_tasks {
+                        state.show_tasks = false;
+                        draw(terminal, state)?;
+                    }
                 }
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
                     && state.attached.is_some() =>
@@ -639,9 +656,16 @@ fn format_tokens(count: u64) -> String {
     }
 }
 
+/// Keys that exit the app from the idle prompt.
 fn is_exit(key: KeyEvent) -> bool {
-    key.code == KeyCode::Esc
-        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    key.code == KeyCode::Esc || is_cancel(key)
+}
+
+/// Keys that cancel an in-flight turn. Esc is intentionally NOT here: it is
+/// reserved for "leave the current view" (detach from a subagent, close the
+/// tasks panel) so its meaning is consistent everywhere.
+fn is_cancel(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 /// Hard-wrap text at `width` terminal cells (char-boundary safe, CJK-aware).

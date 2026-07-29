@@ -26,6 +26,10 @@ are migrated on first load. Optional CLI overrides are `--base-url URL`,
 `--model MODEL`, `--workspace PATH`, `--session NAME`, and `--max-rounds N`
 (tool-call rounds are unlimited by default; the flag sets an explicit cap).
 
+Keys in the TUI: Esc always leaves the current view — it detaches from a
+subagent view, closes the tasks panel, or (at the plain idle prompt) quits
+the app; it never cancels a turn. Ctrl-C cancels the in-flight turn.
+
 The available tools are `read_file`, `write_file`, `edit_file`, and `bash`.
 The three file tools use a capability-relative directory rooted at the
 canonical workspace (the current directory by default). `read_file` pages long
@@ -73,7 +77,7 @@ Each subagent runs on its own OS thread with its own tokio runtime, its own
 background-task slots, and an empty history — it shares no state with the
 parent. It gets only the builtin file/bash tools: no MCP tools and no
 `delegate` itself, so delegation depth is capped at 1 by construction. It is
-limited to 16 tool rounds.
+limited to 32 tool rounds (same as the main agent).
 
 With `background: true` the subagent runs without blocking and its answer is
 delivered as a background task completion (waking an idle agent). Sync mode

@@ -28,8 +28,9 @@ use crate::model::OpenAiModel;
 use crate::tools::{BackgroundTasks, builtins};
 use crate::workspace::Workspace;
 
-/// Maximum rounds a subagent may take before giving up.
-const SUBAGENT_MAX_ROUNDS: usize = 16;
+/// Maximum rounds a subagent may take before giving up. Aligned with the
+/// main agent's MAX_TOOL_ROUNDS.
+const SUBAGENT_MAX_ROUNDS: usize = 32;
 /// Ceiling for a synchronous delegate call.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Broadcast capacity per subagent session. The TUI view follows in real
