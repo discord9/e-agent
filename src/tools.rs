@@ -25,8 +25,11 @@ const WEB_SEARCH_RESPONSE_LIMIT: usize = 128 * 1024;
 
 /// Built-in tools plus the shared background-task registry, exposed so that
 /// other tools (e.g. delegate) can schedule background work too.
-pub fn builtins(workspace: Workspace) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
-    builtins_with_exa_key(workspace, std::env::var("EXA_API_KEY").ok())
+pub fn builtins(
+    workspace: Workspace,
+    sandbox: Option<crate::config::Sandbox>,
+) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
+    builtins_with_exa_key(workspace, std::env::var("EXA_API_KEY").ok(), sandbox)
 }
 
 /// Builtin tools bound to an existing background-task registry.
@@ -36,16 +39,24 @@ pub fn builtins(workspace: Workspace) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
 pub fn builtins_with_background(
     workspace: Workspace,
     background: BackgroundTasks,
+    sandbox: Option<crate::config::Sandbox>,
 ) -> Vec<Box<dyn Tool>> {
-    tools_with_background_and_exa_key(workspace, background, std::env::var("EXA_API_KEY").ok())
+    tools_with_background_and_exa_key(
+        workspace,
+        background,
+        std::env::var("EXA_API_KEY").ok(),
+        sandbox,
+    )
 }
 
 fn builtins_with_exa_key(
     workspace: Workspace,
     exa_api_key: Option<String>,
+    sandbox: Option<crate::config::Sandbox>,
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
-    let background = BackgroundTasks::new(Duration::from_secs(30 * 60));
-    let tools = tools_with_background_and_exa_key(workspace, background.clone(), exa_api_key);
+    let background = BackgroundTasks::new(Duration::from_secs(30 * 60), sandbox.clone());
+    let tools =
+        tools_with_background_and_exa_key(workspace, background.clone(), exa_api_key, sandbox);
     (tools, background)
 }
 
@@ -53,9 +64,10 @@ fn tools_with_background_and_exa_key(
     workspace: Workspace,
     background: BackgroundTasks,
     exa_api_key: Option<String>,
+    sandbox: Option<crate::config::Sandbox>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools = file_tools(&workspace);
-    tools.push(bash_tool(workspace, background));
+    tools.push(bash_tool(workspace, background, sandbox));
     if let Some(key) = exa_api_key
         .map(|key| key.trim().to_owned())
         .filter(|key| !key.is_empty())
@@ -83,11 +95,16 @@ pub fn file_tools(workspace: &Workspace) -> Vec<Box<dyn Tool>> {
 }
 
 /// A bash tool bound to a shared background-task registry.
-pub fn bash_tool(workspace: Workspace, background: BackgroundTasks) -> Box<dyn Tool> {
+pub fn bash_tool(
+    workspace: Workspace,
+    background: BackgroundTasks,
+    sandbox: Option<crate::config::Sandbox>,
+) -> Box<dyn Tool> {
     Box::new(Bash {
         workspace,
         timeout: Duration::from_secs(30),
         background,
+        sandbox,
     })
 }
 
@@ -384,6 +401,7 @@ struct Bash {
     workspace: Workspace,
     timeout: Duration,
     background: BackgroundTasks,
+    sandbox: Option<crate::config::Sandbox>,
 }
 
 #[async_trait]
@@ -410,7 +428,15 @@ impl Tool for Bash {
                 .background
                 .start(self.workspace.clone(), command.to_owned());
         }
-        run_bash(&self.workspace, command, self.timeout, None, None).await
+        run_bash(
+            &self.workspace,
+            command,
+            self.timeout,
+            None,
+            None,
+            self.sandbox.as_ref(),
+        )
+        .await
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
@@ -428,6 +454,7 @@ pub struct BackgroundTasks {
     running: Arc<std::sync::Mutex<Vec<RunningTask>>>,
     sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
     timeout: Duration,
+    sandbox: Option<crate::config::Sandbox>,
 }
 
 /// A live, read-only snapshot of a background task's combined stdout+stderr
@@ -467,12 +494,13 @@ pub struct BackgroundTaskInfo {
 }
 
 impl BackgroundTasks {
-    fn new(timeout: Duration) -> Self {
+    fn new(timeout: Duration, sandbox: Option<crate::config::Sandbox>) -> Self {
         Self {
             next_id: Arc::new(AtomicU64::new(1)),
             running: Arc::new(std::sync::Mutex::new(Vec::new())),
             sender: None,
             timeout,
+            sandbox,
         }
     }
 
@@ -523,6 +551,7 @@ impl BackgroundTasks {
         let slot = output.clone();
         let timeout = self.timeout;
         let running = self.running.clone();
+        let sandbox = self.sandbox.clone();
         self.spawn_with_id(
             preview(&command, 100),
             None,
@@ -534,7 +563,16 @@ impl BackgroundTasks {
                 }
             },
             move || async move {
-                match run_bash(&workspace, &command, timeout, Some(pg), Some(slot)).await {
+                match run_bash(
+                    &workspace,
+                    &command,
+                    timeout,
+                    Some(pg),
+                    Some(slot),
+                    sandbox.as_ref(),
+                )
+                .await
+                {
                     Ok(output) | Err(output) => output,
                 }
             },
@@ -699,19 +737,102 @@ async fn run_bash(
     timeout: Duration,
     process_group_slot: Option<Arc<AtomicI32>>,
     output_slot: Option<OutputSlot>,
+    sandbox: Option<&crate::config::Sandbox>,
 ) -> Result<String, String> {
-    let mut process = Command::new("/bin/bash");
+    // Build the command: bare bash, or wrapped in bwrap when sandboxed.
+    // bwrap is a *construction tool*, so we spell out the policy explicitly:
+    // system dirs read-only, workspace writable (per config), /tmp scratch,
+    // no new privileges, TIOCSTI blocked, die with the parent. Network is
+    // shared by default (agents often need to fetch); config can disable it.
+    let mut process = match sandbox {
+        Some(sandbox) => {
+            let root = workspace.root();
+            let workspace_bind = if sandbox.workspace_writable {
+                "--bind"
+            } else {
+                "--ro-bind"
+            };
+            let root_str = root.to_string_lossy().into_owned();
+            // Order matters: the /home tmpfs must be mounted BEFORE the
+            // workspace bind, or the tmpfs would shadow a workspace that
+            // lives under /home.
+            let mut args: Vec<String> = vec![
+                "--dev-bind".into(),
+                "/dev".into(),
+                "/dev".into(),
+                "--proc".into(),
+                "/proc".into(),
+                "--ro-bind".into(),
+                "/usr".into(),
+                "/usr".into(),
+                "--ro-bind".into(),
+                "/bin".into(),
+                "/bin".into(),
+                "--ro-bind".into(),
+                "/lib".into(),
+                "/lib".into(),
+                "--ro-bind".into(),
+                "/lib64".into(),
+                "/lib64".into(),
+                "--ro-bind-try".into(),
+                "/etc".into(),
+                "/etc".into(),
+                "--tmpfs".into(),
+                "/tmp".into(),
+                "--tmpfs".into(),
+                "/home".into(),
+                workspace_bind.into(),
+                root_str.clone(),
+                root_str.clone(),
+                "--setenv".into(),
+                "HOME".into(),
+                root_str.clone(),
+                "--unshare-pid".into(),
+                "--unshare-ipc".into(),
+                "--unshare-uts".into(),
+                "--new-session".into(),
+                "--die-with-parent".into(),
+                "--chdir".into(),
+                root_str,
+            ];
+            if !sandbox.network {
+                args.push("--unshare-net".into());
+            }
+            args.push("/bin/bash".into());
+            args.push("-lc".into());
+            args.push(command.to_owned());
+            let mut cmd = Command::new("bwrap");
+            cmd.args(args);
+            cmd
+        }
+        None => {
+            let mut cmd = Command::new("/bin/bash");
+            cmd.arg("-lc").arg(command);
+            cmd
+        }
+    };
     process
-        .arg("-lc")
-        .arg(command)
         .current_dir(workspace.root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
     process.process_group(0);
-    let mut child = process
-        .spawn()
-        .map_err(|error| format!("failed to start shell: {error}"))?;
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(error) if sandbox.is_some() && error.kind() == std::io::ErrorKind::NotFound => {
+            // bwrap not installed: fall back to a bare shell rather than fail.
+            return Box::pin(run_bash(
+                workspace,
+                command,
+                timeout,
+                process_group_slot,
+                output_slot,
+                None,
+            ))
+            .await;
+        }
+        Err(error) => return Err(format!("failed to start shell: {error}")),
+    };
     #[cfg(unix)]
     let process_group = rustix::process::Pid::from_raw(
         child
@@ -976,11 +1097,11 @@ mod tests {
             "bash".to_string(),
         ];
         for key in [None, Some("   ".into())] {
-            let (tools, _) = builtins_with_exa_key(workspace.clone(), key);
+            let (tools, _) = builtins_with_exa_key(workspace.clone(), key, None);
             let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
             assert_eq!(names, local_tools);
         }
-        let (tools, _) = builtins_with_exa_key(workspace, Some(" key ".into()));
+        let (tools, _) = builtins_with_exa_key(workspace, Some(" key ".into()), None);
         let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
         assert_eq!(
             names,
@@ -1345,7 +1466,8 @@ mod tests {
         let tool = Bash {
             workspace: Workspace::new(temp.path()).unwrap(),
             timeout: Duration::from_millis(100),
-            background: BackgroundTasks::new(Duration::from_secs(30 * 60)),
+            background: BackgroundTasks::new(Duration::from_secs(30 * 60), None),
+            sandbox: None,
         };
         assert!(
             tool.execute(json!({"command": "sleep 30 & echo $! > child.pid; wait"}))
@@ -1371,10 +1493,77 @@ mod tests {
         let mut bash = Bash {
             workspace: Workspace::new(temp.path()).unwrap(),
             timeout: Duration::from_secs(30),
-            background: BackgroundTasks::new(timeout),
+            background: BackgroundTasks::new(timeout, None),
+            sandbox: None,
         };
         bash.set_event_sender(sender);
         (bash, receiver)
+    }
+
+    fn sandbox() -> Option<crate::config::Sandbox> {
+        // Only run when bwrap is actually installed and user namespaces work.
+        std::process::Command::new("bwrap")
+            .args(["--unshare-all", "--ro-bind", "/", "/", "/bin/true"])
+            .status()
+            .ok()
+            .filter(|status| status.success())
+            .map(|_| crate::config::Sandbox {
+                enabled: true,
+                network: true,
+                workspace_writable: true,
+            })
+    }
+
+    #[tokio::test]
+    async fn sandbox_allows_workspace_writes_but_not_outside() {
+        let Some(sandbox) = sandbox() else {
+            eprintln!("bwrap unavailable; skipping sandbox test");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let tool = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(10),
+            background: BackgroundTasks::new(Duration::from_secs(30), None),
+            sandbox: Some(sandbox),
+        };
+        // Writing inside the workspace succeeds.
+        tool.execute(json!({"command": "echo hi > inside.txt"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("inside.txt")).unwrap(),
+            "hi\n"
+        );
+        // Writing outside the workspace (/tmp is a fresh tmpfs, /usr is ro)
+        // must not touch the host: /usr is read-only inside the sandbox.
+        let result = tool
+            .execute(json!({"command": "touch /usr/e_agent_sandbox_escape 2>&1"}))
+            .await;
+        assert!(result.is_err(), "write to /usr should fail inside sandbox");
+        assert!(!std::path::Path::new("/usr/e_agent_sandbox_escape").exists());
+    }
+
+    #[tokio::test]
+    async fn sandbox_can_disable_network() {
+        let Some(mut sandbox) = sandbox() else {
+            eprintln!("bwrap unavailable; skipping sandbox test");
+            return;
+        };
+        sandbox.network = false;
+        let temp = tempfile::tempdir().unwrap();
+        let tool = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(10),
+            background: BackgroundTasks::new(Duration::from_secs(30), None),
+            sandbox: Some(sandbox),
+        };
+        // No loopback either in a fresh net namespace: connecting anywhere fails.
+        let result = tool
+            .execute(json!({"command": "exec 3<>/dev/tcp/127.0.0.1/80 && echo NET_OK || echo NET_BLOCKED"}))
+            .await
+            .unwrap();
+        assert!(result.contains("NET_BLOCKED"), "{result}");
     }
 
     #[tokio::test]

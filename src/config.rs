@@ -22,8 +22,29 @@ pub struct Config {
     /// Optional `[web_search]` credentials for the Exa `web_search` tool.
     #[serde(default)]
     web_search: Option<WebSearch>,
+    /// Optional `[sandbox]` bwrap wrapper for the bash tool.
+    #[serde(default)]
+    sandbox: Option<Sandbox>,
     #[serde(skip)]
     path: PathBuf,
+}
+
+/// Runtime sandbox configuration for the bash tool, from `[sandbox]`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct Sandbox {
+    /// Master switch. Absent section or `enabled = false` means no sandbox.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allow network access inside the sandbox (default true).
+    #[serde(default = "default_true")]
+    pub network: bool,
+    /// Mount the workspace read-write inside the sandbox (default true).
+    #[serde(default = "default_true")]
+    pub workspace_writable: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -132,6 +153,11 @@ impl Config {
             bail!("credential for [web_search] is empty");
         }
         Ok(Some(key))
+    }
+
+    /// The bash sandbox, only when `[sandbox] enabled = true`. Otherwise None.
+    pub fn sandbox(&self) -> Option<Sandbox> {
+        self.sandbox.clone().filter(|sandbox| sandbox.enabled)
     }
 
     fn resolve_profile(&self, profile: &str) -> anyhow::Result<ResolvedModel> {

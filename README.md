@@ -62,6 +62,18 @@ model = "k2"
 subagent = "kimi/k2"
 ```
 
+The `bash` tool can be sandboxed with `bubblewrap` when it is installed. The
+sandbox is off unless explicitly enabled:
+
+```toml
+[sandbox]
+enabled = true
+# network = false            # unshare the network namespace (default: shared)
+# workspace_writable = false # mount the workspace read-only (default: writable)
+```
+
+See "Safety boundaries" for what the sandbox does and does not constrain.
+
 Then run:
 
 ```sh
@@ -100,10 +112,11 @@ at the idle prompt. On exit, e-agent prints `e-agent --session <id>` so the
 session can be resumed from the same workspace.
 
 The four always-present tools are `read_file`, `write_file`, `edit_file`, and
-`bash`. When `EXA_API_KEY` is set to a non-whitespace value, `web_search` is a
-fifth tool that searches public documentation and code examples through the Exa
-Context API. OpenCode's own Exa configuration is not inherited; export
-`EXA_API_KEY` for e-agent.
+`bash`. `web_search` is a fifth tool that searches public documentation and
+code examples through the Exa Context API; it is enabled when `EXA_API_KEY` is
+set to a non-whitespace value, or when `[web_search]` sets `api_key_file` /
+`api_key_env` in the config (process env wins). OpenCode's own Exa
+configuration is not inherited.
 The three file tools use a capability-relative directory rooted at the
 canonical workspace (the current directory by default). At startup, e-agent
 loads a non-empty `AGENTS.md` from that workspace root into the system context
@@ -122,11 +135,22 @@ symlinks that remain inside the workspace and rejects symlink escapes. It does
 not constrain hardlink inode origins, does not make a read-then-write sequence
 atomic, and is not a sandbox for the whole process.
 
-`bash` runs `/bin/bash -lc` with the workspace as its current directory. It is
-not sandboxed: commands can access files outside the workspace, environment
-variables, and the network. On Unix, timed-out commands are killed as a process
-group; on non-Unix platforms only the direct child is killed. stdout and stderr
-are each captured up to 64 KiB, then drained and marked as truncated.
+`bash` runs `/bin/bash -lc` with the workspace as its current directory. By
+default it is not sandboxed: commands can access files outside the workspace,
+environment variables, and the network. On Unix, timed-out commands are killed
+as a process group; on non-Unix platforms only the direct child is killed.
+stdout and stderr are each captured up to 64 KiB, then drained and marked as
+truncated.
+
+Optional sandboxing is available when `bubblewrap` (`bwrap`) is installed and
+`[sandbox] enabled = true` is set in the config. Every `bash` call — main agent
+and subagents alike — is then wrapped in `bwrap`: system directories are
+mounted read-only, the workspace is mounted read-write (`workspace_writable =
+false` makes it read-only), `/tmp` and `/home` are fresh tmpfs, PID/IPC/UTS
+namespaces are unshared, and TIOCSTI is blocked via `--new-session`. Network
+stays available by default; `network = false` unshares it. If `bwrap` is not
+installed, commands fall back to running unsandboxed. The sandbox constrains
+the spawned command, not the agent process itself.
 
 Every `web_search` query is disclosed to Exa, a third party. Never include
 credentials, tokens, private repository contents, customer data, personal data,

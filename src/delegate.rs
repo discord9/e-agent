@@ -126,6 +126,8 @@ pub struct Delegate {
     role_models: std::collections::HashMap<String, ConfiguredModel>,
     /// Workspace root used to read role templates (`.e-agent/agents/<role>.md`).
     roles_root: Option<std::path::PathBuf>,
+    /// Optional bwrap sandbox inherited by every subagent's bash tool.
+    sandbox: Option<crate::config::Sandbox>,
 }
 
 /// Where a subagent writes its own session file.
@@ -152,6 +154,7 @@ fn task_label(label: Option<&str>, role: Option<&str>, task: &str) -> String {
 struct DelegatedTask {
     task: String,
     role_prompt: Option<String>,
+    sandbox: Option<crate::config::Sandbox>,
 }
 
 impl Delegate {
@@ -164,6 +167,7 @@ impl Delegate {
             persist_root: None,
             role_models: std::collections::HashMap::new(),
             roles_root: None,
+            sandbox: None,
         }
     }
 
@@ -188,6 +192,13 @@ impl Delegate {
     /// `.e-agent/agents/<role>.md`. Without this, `delegate` has no roles.
     pub fn with_roles_root(mut self, root: std::path::PathBuf) -> Self {
         self.roles_root = Some(root);
+        self
+    }
+
+    /// Sandbox every subagent's bash tool with the same bwrap policy as the
+    /// main agent.
+    pub fn with_sandbox(mut self, sandbox: Option<crate::config::Sandbox>) -> Self {
+        self.sandbox = sandbox;
         self
     }
 
@@ -225,7 +236,11 @@ impl Delegate {
         persist: Option<PersistConfig>,
         resume_entries: Option<Vec<crate::agent::SessionEntry>>,
     ) -> String {
-        let DelegatedTask { task, role_prompt } = task;
+        let DelegatedTask {
+            task,
+            role_prompt,
+            sandbox,
+        } = task;
         let model_name = model.name().to_owned();
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -240,7 +255,8 @@ impl Delegate {
                     .read_to_string("AGENTS.md")
                     .ok()
                     .filter(|content| !content.trim().is_empty());
-                let tools = crate::tools::builtins_with_background(workspace, background);
+                let tools =
+                    crate::tools::builtins_with_background(workspace, background, sandbox);
                 let mut agent = Agent::new(Box::new(model), tools);
                 // A bare single-user-message request is rejected by some
                 // providers (kimi k3 answers HTTP 403 to `msgs=1`); give the
@@ -548,6 +564,7 @@ impl Tool for Delegate {
         if background {
             let workspace = self.workspace.clone();
             let background = self.background.clone();
+            let sandbox = self.sandbox.clone();
             /* label computed above */
             let (handle, sink, source) = session_channel();
             let session: Arc<dyn SessionHandle> = Arc::new(handle.clone());
@@ -599,7 +616,11 @@ impl Tool for Delegate {
                             model,
                             workspace,
                             background,
-                            DelegatedTask { task, role_prompt },
+                            DelegatedTask {
+                                task,
+                                role_prompt,
+                                sandbox,
+                            },
                             Some((sink, source)),
                             persist,
                             resume_entries,
@@ -617,6 +638,7 @@ impl Tool for Delegate {
 
         let workspace = self.workspace.clone();
         let background = self.background.clone();
+        let sandbox = self.sandbox.clone();
         let (resume_id, resume_entries) = match resume {
             Some((id, entries)) => (Some(id), Some(entries)),
             None => (None, None),
@@ -672,7 +694,11 @@ impl Tool for Delegate {
                         model,
                         workspace,
                         background,
-                        DelegatedTask { task, role_prompt },
+                        DelegatedTask {
+                            task,
+                            role_prompt,
+                            sandbox,
+                        },
                         Some((sink, source)),
                         persist,
                         resume_entries,
@@ -773,7 +799,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let (_, background) = builtins(workspace.clone());
+        let (_, background) = builtins(workspace.clone(), None);
         Delegate::new(model, workspace, background)
     }
 
@@ -869,7 +895,7 @@ mod tests {
     async fn spec_disallows_nested_delegation_by_design() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::new(temp.path()).unwrap();
-        let (tools, _) = builtins(workspace);
+        let (tools, _) = builtins(workspace, None);
         let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
         assert!(!names.contains(&"delegate".to_owned()));
         assert!(names.contains(&"bash".to_owned()));
@@ -929,7 +955,7 @@ mod tests {
         // pin the wiring used by run_on_thread.
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::new(temp.path()).unwrap();
-        let (_, mut parent_background) = builtins(workspace.clone());
+        let (_, mut parent_background) = builtins(workspace.clone(), None);
         let (parent_sender, mut parent_receiver) =
             tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         parent_background.set_event_sender(parent_sender);

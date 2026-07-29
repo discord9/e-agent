@@ -41,7 +41,8 @@ without an explicit user request.
   replayed to either provider wire.
 - Tool errors return to the model as `role:"tool"` messages; they never
   crash the agent loop.
-- File tools stay cap-std capability-relative; `bash` is NOT sandboxed
+- File tools stay cap-std capability-relative; `bash` is not sandboxed by
+  default, but can be wrapped in `bwrap` via `[sandbox] enabled = true`
   (see README "Safety boundaries").
 - Errors: anyhow chains displayed with `{:#}`; model-facing tool errors
   stay plain strings.

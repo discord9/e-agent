@@ -170,14 +170,21 @@ async fn run() -> anyhow::Result<()> {
     for (role, resolved) in all_roles {
         role_models.insert(role, configured_model(resolved, auth.as_ref(), None, None)?);
     }
-    let (mut tools, background) = builtins(workspace.clone());
+    // The bash sandbox ([sandbox] in config) wraps every bash call — main
+    // agent and subagents alike — in bwrap when enabled.
+    let sandbox = config.as_ref().and_then(|config| config.sandbox());
+    if sandbox.is_some() && !tui_mode {
+        eprintln!("e-agent: bash sandboxed with bwrap");
+    }
+    let (mut tools, background) = builtins(workspace.clone(), sandbox.clone());
     let mcp_servers = config.map(|config| config.mcp).unwrap_or_default();
     let (mcp_tools, mcp_instructions) = mcp::connect_all(mcp_servers, &root).await;
     tools.extend(mcp_tools);
     let mut delegate = Delegate::new(model.clone(), workspace, background.clone())
         .persist_sessions(root.clone())
         .with_role_models(role_models)
-        .with_roles_root(root.clone());
+        .with_roles_root(root.clone())
+        .with_sandbox(sandbox);
     if let Some(subagent_model) = subagent_model {
         let name = subagent_model.name().to_owned();
         delegate = delegate.with_subagent_model(subagent_model);

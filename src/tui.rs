@@ -2530,7 +2530,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(50, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         let (_, mut background) =
-            crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap());
+            crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         background.set_event_sender(sender);
         background
