@@ -502,8 +502,6 @@ impl Agent {
         if let Some(handler) = &mut self.event_handler {
             handler(event.clone());
         }
-        // Drop sinks whose session handle is gone (e.g. detached view).
-        self.observers.retain(|sink| sink.is_alive());
         self.fanout(&event);
     }
 
@@ -851,6 +849,48 @@ mod tests {
         assert_eq!(agent.run("hello".into()).await.unwrap(), "final");
         assert_eq!(
             *events.lock().unwrap(),
+            vec![
+                AgentEvent::AssistantText("working".into()),
+                AgentEvent::ToolCall {
+                    name: "echo".into(),
+                    arguments: r#"{"value":"ok"}"#.into(),
+                },
+                AgentEvent::ToolResult {
+                    is_error: false,
+                    content: "\"ok\"".into(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_events_survive_without_any_subscriber() {
+        // Regression: sinks used to be dropped when no broadcast receiver
+        // existed (TUI not attached yet), wiping the session log — an
+        // attach then saw an empty snapshot.
+        let (handle, sink, _source) = crate::handle::session_channel();
+        use crate::handle::SessionHandle as _;
+        let model = ScriptedModel {
+            replies: vec![
+                AssistantMessage {
+                    content: Some("working".into()),
+                    tool_calls: vec![call("call-1", "echo", r#"{"value":"ok"}"#)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ],
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut agent = Agent::new(Box::new(model), vec![Box::new(EchoTool)]);
+        agent.observe(sink);
+        // No handle.subscribe() call: nobody is listening live.
+        assert_eq!(agent.run("hello".into()).await.unwrap(), "done");
+        assert_eq!(
+            handle.snapshot(),
             vec![
                 AgentEvent::AssistantText("working".into()),
                 AgentEvent::ToolCall {
