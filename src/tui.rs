@@ -269,7 +269,10 @@ pub async fn run(
     drop(terminal);
     drop(_guard);
     match result {
-        Ok(()) => std::process::exit(0),
+        Ok(()) => {
+            eprintln!("e-agent: resume with: e-agent --session {}", labels.session);
+            std::process::exit(0);
+        }
         Err(error) => {
             eprintln!("error: {error:#}");
             std::process::exit(1);

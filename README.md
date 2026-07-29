@@ -95,7 +95,9 @@ precedence over the selected profile values.
 
 Keys in the TUI: Esc always leaves the current view — it detaches from a
 subagent view, closes the tasks panel, or (at the plain idle prompt) quits
-the app; it never cancels a turn. Ctrl-C cancels the in-flight turn.
+the app; it never cancels a turn. Ctrl-C cancels the in-flight turn and quits
+at the idle prompt. On exit, e-agent prints `e-agent --session <id>` so the
+session can be resumed from the same workspace.
 
 The four always-present tools are `read_file`, `write_file`, `edit_file`, and
 `bash`. When `EXA_API_KEY` is set to a non-whitespace value, `web_search` is a
