@@ -144,6 +144,12 @@ impl Model for CodexModel {
                         }
                     }
                 }
+                "response.reasoning_summary_part.added" if !reasoning.is_empty() => {
+                    reasoning.push_str("\n\n");
+                    if let Some(callback) = &mut on_delta {
+                        callback(ModelDeltaKind::Reasoning, "\n\n");
+                    }
+                }
                 "response.output_item.done" => {
                     let item = value.get("item").unwrap_or(&value);
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
@@ -344,7 +350,10 @@ mod tests {
             assert!(request.contains("originator: codex_cli_rs"));
             let body = concat!(
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
-                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"why\"}\n\n",
+                "data: {\"type\":\"response.reasoning_summary_part.added\",\"summary_index\":0}\n\n",
+                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Planning**\"}\n\n",
+                "data: {\"type\":\"response.reasoning_summary_part.added\",\"summary_index\":1}\n\n",
+                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Working**\"}\n\n",
                 "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\",\"arguments\":\"{}\"}}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\n\n"
             );
@@ -367,7 +376,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(message.content.as_deref(), Some("hi"));
-        assert_eq!(message.reasoning.as_deref(), Some("why"));
+        assert_eq!(
+            message.reasoning.as_deref(),
+            Some("**Planning**\n\n**Working**")
+        );
         assert_eq!(message.tool_calls[0].id, "c1");
         assert_eq!(
             usage,
@@ -376,7 +388,15 @@ mod tests {
                 output_tokens: 4
             })
         );
-        assert_eq!(deltas.len(), 2);
+        assert_eq!(
+            deltas,
+            [
+                (ModelDeltaKind::Content, "hi".into()),
+                (ModelDeltaKind::Reasoning, "**Planning**".into()),
+                (ModelDeltaKind::Reasoning, "\n\n".into()),
+                (ModelDeltaKind::Reasoning, "**Working**".into()),
+            ]
+        );
     }
 
     async fn sse_failure(body: String) -> anyhow::Error {
