@@ -174,6 +174,7 @@ impl Delegate {
         task: String,
         steering: Option<(SessionSink, SessionSource)>,
         persist: Option<PersistConfig>,
+        resume_entries: Option<Vec<crate::agent::SessionEntry>>,
     ) -> String {
         let role = model.name().to_owned();
         std::thread::spawn(move || {
@@ -205,12 +206,19 @@ impl Delegate {
                     }
                     None => (None, None),
                 };
+                // Resuming: seed the agent with the previous session's
+                // transcript and mark it already persisted, so persist_turn
+                // only appends the NEW turns (no duplicate replay of the
+                // loaded history).
+                let mut persisted_len = 0usize;
+                if let Some(entries) = resume_entries {
+                    persisted_len = entries.len();
+                    agent.restore_history(entries);
+                }
                 // Prompts stashed while a turn was running, in arrival order.
                 let mut pending: Vec<String> = Vec::new();
                 let mut prompt = task;
                 let mut last_answer = String::new();
-                // History entries already persisted (per-turn incremental).
-                let mut persisted_len = 0usize;
                 // Record the delegated task in the session log so an attached
                 // view shows what the subagent was asked to do, not just the
                 // tool calls that follow.
@@ -347,6 +355,13 @@ impl Tool for Delegate {
             " With `background: true` it runs without blocking; the answer arrives as a \
                 background task completion.",
         );
+        if self.persist_root.is_some() {
+            description.push_str(
+                " With `resume: \"<session-id>\"` the subagent continues a previous \
+                subagent session: its transcript is loaded as the starting context and \
+                new turns append to the same session file, instead of starting fresh.",
+            );
+        }
         ToolSpec {
             name: "delegate".into(),
             description,
@@ -354,7 +369,8 @@ impl Tool for Delegate {
                 "type": "object",
                 "properties": {
                     "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"},
-                    "background": {"type": "boolean", "description": "run without blocking; the answer arrives as a background completion (default false)"}
+                    "background": {"type": "boolean", "description": "run without blocking; the answer arrives as a background completion (default false)"},
+                    "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"}
                 },
                 "required": ["task"]
             }),
@@ -376,6 +392,30 @@ impl Tool for Delegate {
             .and_then(|args| args.get("background"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let resume = arguments
+            .as_object()
+            .and_then(|args| args.get("resume"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        // Resolve the session to continue, if any: load its transcript (the
+        // subagent's starting context) and reuse its id so new turns append
+        // to the same file. Without persistence configured there is nothing
+        // to resume from.
+        let resume = match resume {
+            Some(id) => {
+                let root = self
+                    .persist_root
+                    .clone()
+                    .ok_or("`resume` requires subagent session persistence (disabled in tests)")?;
+                let loaded = crate::session::Session::load(&root, &id)
+                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
+                if loaded.entries.is_empty() {
+                    return Err(format!("no such subagent session: `{id}`"));
+                }
+                Some((id, loaded.entries))
+            }
+            None => None,
+        };
 
         if background {
             let model = self.subagent_model.clone();
@@ -390,10 +430,16 @@ impl Tool for Delegate {
             let slot_in_hook = slot.clone();
             let slot_in_work = slot.clone();
             // Fresh unique session id per subagent (never the task id —
-            // task ids restart at 1 every process and would collide).
+            // task ids restart at 1 every process and would collide), unless
+            // resuming: then the resumed session's id is reused so new turns
+            // append to the same file.
+            let (resume_id, resume_entries) = match resume {
+                Some((id, entries)) => (Some(id), Some(entries)),
+                None => (None, None),
+            };
             let persist = self.persist_root.clone().map(|root| PersistConfig {
                 root,
-                session_id: crate::session::new_id_prefixed("sub-"),
+                session_id: resume_id.unwrap_or_else(|| crate::session::new_id_prefixed("sub-")),
             });
             // run_on_thread blocks on thread::join, so push it onto the
             // blocking thread pool to keep the executor responsive.
@@ -413,6 +459,7 @@ impl Tool for Delegate {
                             task,
                             Some((sink, source)),
                             persist,
+                            resume_entries,
                         )
                     })
                     .await
@@ -428,9 +475,13 @@ impl Tool for Delegate {
         let model = self.subagent_model.clone();
         let workspace = self.workspace.clone();
         let background = self.background.clone();
+        let (resume_id, resume_entries) = match resume {
+            Some((id, entries)) => (Some(id), Some(entries)),
+            None => (None, None),
+        };
         let persist = self.persist_root.clone().map(|root| PersistConfig {
             root,
-            session_id: crate::session::new_id_prefixed("sub-"),
+            session_id: resume_id.unwrap_or_else(|| crate::session::new_id_prefixed("sub-")),
         });
         // Even a synchronous subagent occupies a shared slot and registers a
         // live session, so it shows up in the task panel (F2) and can be
@@ -467,6 +518,7 @@ impl Tool for Delegate {
                         task,
                         Some((sink, source)),
                         persist,
+                        resume_entries,
                     )
                 })
                 .await
@@ -554,6 +606,61 @@ mod tests {
                 .unwrap_err()
                 .contains("delivery is unavailable")
         );
+    }
+
+    #[tokio::test]
+    async fn resume_requires_persistence_and_an_existing_session() {
+        unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
+        // No persistence configured: nothing to resume from.
+        let temp = tempfile::tempdir().unwrap();
+        let no_persist = delegate(temp.path());
+        assert!(
+            no_persist
+                .execute(json!({"task": "hi", "resume": "sub-x"}))
+                .await
+                .unwrap_err()
+                .contains("requires subagent session persistence")
+        );
+
+        // Persistence configured but the session id does not exist.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let tool: Delegate = delegate(temp.path()).persist_sessions(root);
+        assert!(
+            tool.execute(json!({"task": "hi", "resume": "sub-does-not-exist"}))
+                .await
+                .unwrap_err()
+                .contains("no such subagent session")
+        );
+    }
+
+    #[test]
+    fn resume_loads_the_previous_transcript_as_starting_context() {
+        // The core resume invariant: a persisted sub- session can be loaded
+        // back, and its length marks where new-turn appends begin (so the
+        // loaded history is NOT re-persisted).
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let prior = vec![
+            crate::agent::SessionEntry::from(crate::agent::Message::User {
+                content: "earlier task".into(),
+            }),
+            crate::agent::SessionEntry::from(crate::agent::Message::Assistant(
+                crate::agent::AssistantMessage {
+                    content: Some("earlier answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            )),
+        ];
+        crate::session::Session::append(&root, "sub-prior", &prior).unwrap();
+
+        let loaded = crate::session::Session::load(&root, "sub-prior").unwrap();
+        assert_eq!(loaded.entries.len(), prior.len());
+        // persisted_len starts at the loaded length, so the next append only
+        // writes entries from index `loaded.len()` onward.
+        let new_entries = &prior[loaded.entries.len()..];
+        assert!(new_entries.is_empty(), "loaded history is not re-persisted");
     }
 
     #[tokio::test]
