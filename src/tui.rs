@@ -440,18 +440,14 @@ async fn run_inner(
                         }
                         if let Some(result) = result {
                             match result {
-                                Ok(summary) => {
+                                Ok(_summary) => {
+                                    // The summary already streamed live via
+                                    // the session observer; the closing
+                                    // banner is all the closure it needs.
                                     state.push_line(
                                         compaction_banner("compaction"),
                                         LineKind::Compaction,
                                     );
-                                    // If the summary streamed live (via the
-                                    // session observer) it is already in the
-                                    // scrollback; only print when the stream
-                                    // never arrived, and show it in full.
-                                    if !state.streamed {
-                                        state.push_final_answer(summary);
-                                    }
                                 }
                                 Err(error) => {
                                     state
