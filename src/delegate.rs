@@ -304,6 +304,34 @@ impl Delegate {
     }
 }
 
+/// Cancels a synchronous subagent when the future blocked on it is dropped
+/// (the parent turn was cancelled). Mirrors [`crate::tools::ProcessGroupGuard`]:
+/// armed right after spawn, disarmed on the normal completion path, so only
+/// an actual drop-while-blocked fires the cancel.
+struct SubagentCancelGuard {
+    handle: Option<Arc<dyn SessionHandle>>,
+}
+
+impl SubagentCancelGuard {
+    fn armed(handle: Arc<dyn SessionHandle>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.handle = None;
+    }
+}
+
+impl Drop for SubagentCancelGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.cancel();
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for Delegate {
     fn spec(&self) -> ToolSpec {
@@ -410,6 +438,10 @@ impl Tool for Delegate {
         let label = preview(&task, 100);
         let (handle, sink, source) = session_channel();
         let session: Arc<dyn SessionHandle> = Arc::new(handle.clone());
+        // A second handle for the cancel guard: dropping the blocked-on
+        // `execute` future (the parent turn was cancelled) cancels the
+        // subagent, so it cannot outlive its turn as an orphan.
+        let cancel_handle: Arc<dyn SessionHandle> = Arc::new(handle.clone());
         let sessions = self.sessions.clone();
         let sessions_in_work = self.sessions.clone();
         let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
@@ -447,11 +479,18 @@ impl Tool for Delegate {
             },
         );
         started?;
-        match tokio::time::timeout(SYNC_TIMEOUT, done_rx).await {
+        // RAII: if this `execute` future is dropped while blocked on the
+        // subagent (the parent turn was cancelled), cancel the subagent so
+        // it stops instead of running on as an orphan. Normal completion
+        // disarms the guard before returning.
+        let mut cancel_guard = SubagentCancelGuard::armed(cancel_handle);
+        let result = match tokio::time::timeout(SYNC_TIMEOUT, done_rx).await {
             Ok(Ok(answer)) => Ok(answer),
             Ok(Err(_)) => Err("subagent result channel closed".into()),
             Err(_) => Err("subagent timed out after 30 minutes".into()),
-        }
+        };
+        cancel_guard.disarm();
+        result
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
