@@ -1,4 +1,5 @@
-use std::io::{IsTerminal, Read, Write};
+use std::io::{ErrorKind, IsTerminal, Read, Write};
+use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use e_agent::agent::{Agent, AgentEvent, Model, preview};
@@ -92,6 +93,7 @@ async fn run() -> anyhow::Result<()> {
     .map_err(anyhow::Error::msg)
     .context("cannot open workspace")?;
     let root = workspace.root().to_path_buf();
+    let agents_instructions = read_agents(&root)?;
     // Migrate pre-session-id files (the old implicit `default` session and
     // task-id-named subagent files) to unique ids before anything loads.
     for (old, new) in e_agent::session::migrate_legacy(&root) {
@@ -166,8 +168,13 @@ async fn run() -> anyhow::Result<()> {
     let subagent_sessions = delegate.sessions();
     tools.push(Box::new(delegate));
     let mut agent = Agent::new(Box::new(model), tools);
-    if !mcp_instructions.is_empty() {
-        agent.set_context_prefix(mcp_instructions.join("\n\n"));
+    let mut context = Vec::new();
+    if let Some(instructions) = agents_instructions {
+        context.push(format!("## AGENTS.md\n\n{instructions}"));
+    }
+    context.extend(mcp_instructions);
+    if !context.is_empty() {
+        agent.set_context_prefix(context.join("\n\n"));
     }
     if let Some(rounds) = max_rounds {
         agent = agent.max_tool_rounds(rounds);
@@ -334,6 +341,15 @@ async fn repl(
         }
     }
     Ok(())
+}
+
+fn read_agents(root: &Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(root.join("AGENTS.md")) {
+        Ok(content) if content.trim().is_empty() => Ok(None),
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("cannot read workspace AGENTS.md"),
+    }
 }
 
 fn next_value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<String> {

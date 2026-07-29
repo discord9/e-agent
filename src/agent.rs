@@ -44,9 +44,9 @@ fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
-    /// System-prompt-style context (e.g. MCP server instructions). Sent to
-    /// the provider with role "system". Persisted if it ever lands in
-    /// history, but the current MCP context prefix is kept out of history.
+    /// System-prompt-style context (e.g. AGENTS.md or MCP instructions). Sent
+    /// to the provider with role "system". Persisted if it ever lands in
+    /// history, but the current context prefix is kept out of history.
     System {
         content: String,
     },
@@ -212,7 +212,7 @@ pub struct Agent {
     session_input_tokens: u64,
     session_output_tokens: u64,
     last_context_input: u64,
-    /// MCP server instructions, prepended to the context on every model call.
+    /// Workspace and server instructions prepended to every model call.
     /// Not persisted in sessions.
     context_prefix: Option<String>,
 }
@@ -247,8 +247,8 @@ impl Agent {
         }
     }
 
-    /// Extra context (e.g. MCP server instructions) prepended to every model
-    /// call as a user message. Not persisted in sessions.
+    /// Extra system context prepended to every model call. Not persisted in
+    /// sessions.
     pub fn set_context_prefix(&mut self, prefix: String) {
         self.context_prefix = Some(prefix);
     }

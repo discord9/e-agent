@@ -103,9 +103,13 @@ fifth tool that searches public documentation and code examples through the Exa
 Context API. OpenCode's own Exa configuration is not inherited; export
 `EXA_API_KEY` for e-agent.
 The three file tools use a capability-relative directory rooted at the
-canonical workspace (the current directory by default). `read_file` pages long
-files by 1-indexed lines (optional `offset`/`limit`, default 2000 lines per
-read, capped at 64 KiB) and prints a continuation hint when more lines remain.
+canonical workspace (the current directory by default). At startup, e-agent
+loads a non-empty `AGENTS.md` from that workspace root into the system context
+for both the main agent and delegated subagents. It does not search parent or
+nested directories, and the instructions are not persisted in sessions.
+`read_file` pages long files by 1-indexed lines (optional `offset`/`limit`,
+default 2000 lines per read, capped at 64 KiB) and prints a continuation hint
+when more lines remain.
 Tool calls and their results are displayed as they happen; the final answer
 ends the turn.
 
@@ -231,7 +235,8 @@ framework, permission framework, plugin host, generic provider/auth framework,
 parallel tool executor, task scheduler, priority system, or concurrency pool.
 It deliberately does not fetch provider/model catalogs (including
 models.dev), generate configuration, cache provider metadata, or infer
-context windows; TOML profiles are local static settings only.
+context windows; TOML profiles are local static settings only. `AGENTS.md`
+loading is workspace-root-only: there is no parent/nested discovery or merging.
 Subagents exist but are deliberately minimal: no agent-to-agent messaging,
 no delegation deeper than 1 level, no subagent session persistence, no
 process-level isolation yet (subagents are threads, not subprocesses).

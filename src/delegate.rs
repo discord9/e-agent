@@ -187,6 +187,10 @@ impl Delegate {
                 Err(error) => return format!("cannot build subagent runtime: {error}"),
             };
             runtime.block_on(async move {
+                let agents_instructions = workspace
+                    .read_to_string("AGENTS.md")
+                    .ok()
+                    .filter(|content| !content.trim().is_empty());
                 let tools = crate::tools::builtins_with_background(workspace, background);
                 let mut agent =
                     Agent::new(Box::new(model), tools).max_tool_rounds(SUBAGENT_MAX_ROUNDS);
@@ -194,11 +198,16 @@ impl Delegate {
                 // providers (kimi k3 answers HTTP 403 to `msgs=1`); give the
                 // subagent a minimal system prompt so its first call always
                 // carries a system + user pair.
-                agent.set_context_prefix(format!(
+                let mut instructions = format!(
                     "You are a subagent inside the e-agent coding assistant (running on the \
                      `{role}` model). Work autonomously on the delegated task with the \
                      file/bash tools and, when configured, public web search, then return a concise final answer."
-                ));
+                );
+                if let Some(content) = agents_instructions {
+                    instructions.push_str("\n\n## AGENTS.md\n\n");
+                    instructions.push_str(&content);
+                }
+                agent.set_context_prefix(instructions);
                 let (sink, mut source) = match steering {
                     Some((sink, source)) => {
                         agent.observe(sink.clone());
