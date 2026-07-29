@@ -66,7 +66,11 @@ impl Sessions {
 /// Pick the next prompt for a steerable subagent: stashed prompts first
 /// (arrival order), then whatever is queued in the channel, then block until
 /// a prompt arrives or the channel closes (None = shut down).
-async fn next_prompt(source: &mut SessionSource, pending: &mut Vec<String>) -> Option<String> {
+/// Take the next already-queued prompt (stashed mid-turn), if any, without
+/// blocking. Returns None when nothing is queued — the caller treats that
+/// as "subagent done", because the session handle keeps the steer channel
+/// open until the work returns, so blocking here would never see `None`.
+fn next_queued_prompt(source: &mut SessionSource, pending: &mut Vec<String>) -> Option<String> {
     if !pending.is_empty() {
         return Some(pending.remove(0));
     }
@@ -75,14 +79,7 @@ async fn next_prompt(source: &mut SessionSource, pending: &mut Vec<String>) -> O
             return Some(text);
         }
     }
-    loop {
-        match source.recv().await {
-            Some(Steer::Prompt(text)) => return Some(text),
-            // A stray cancel while idle is meaningless; keep waiting.
-            Some(Steer::Cancel) => continue,
-            None => return None,
-        }
-    }
+    None
 }
 
 /// Append the history entries produced since the last call to the
@@ -259,12 +256,18 @@ impl Delegate {
                     if let Some(persist) = &persist {
                         persist_turn(persist, &agent, &mut persisted_len);
                     }
-                    // Turn ended. Without steering we are done; with steering
-                    // wait for the next queued prompt or channel close.
+                    // Turn ended. Prompts stashed mid-turn still get their
+                    // own follow-up turns; once those are drained the
+                    // subagent is done. We must NOT block waiting for new
+                    // steer messages here: the session handle is held by the
+                    // registry until this work returns, so the steer channel
+                    // never closes and waiting would deadlock (the completion
+                    // event would never reach the parent).
                     let Some(source) = source.as_mut() else {
                         return last_answer;
                     };
-                    prompt = match next_prompt(source, &mut pending).await {
+                    // Drain only already-queued prompts (non-blocking).
+                    prompt = match next_queued_prompt(source, &mut pending) {
                         Some(text) => text,
                         None => return last_answer,
                     };
