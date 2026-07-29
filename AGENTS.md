@@ -70,3 +70,21 @@ cargo build
 ```
 
 All four must pass before a change is considered done.
+
+## Session event semantics (main agent == subagent)
+
+Every session — main or subagent — must observe the SAME event-production
+contract through `Agent::emit` → fanout to `event_handler` + all `observers`:
+
+- ToolCall / ToolResult / AssistantText / Usage always go through `emit`.
+- Streaming deltas (AssistantDelta / ReasoningDelta) in `run_loop` fan out to
+  BOTH the per-turn handler and every session observer — a session with no
+  live subscriber still records them (the log is the source of truth for
+  late attach / snapshot replay).
+- The ONLY intentional asymmetry: `compact()` deltas go to the handler only,
+  because compaction is background maintenance and must not paint over a
+  session's visible scrollback.
+- Never drop a SessionSink based on live-receiver count — a session with no
+  attached view has zero receivers but its log must keep filling.
+- A failed turn emits its error as an event too; a session must never fail
+  silently into an empty log.
