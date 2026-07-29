@@ -184,6 +184,11 @@ pub struct Agent {
     max_tool_rounds: Option<usize>,
     background_receiver: mpsc::UnboundedReceiver<AgentEvent>,
     pending_background: VecDeque<(u64, String)>,
+    /// Set when completions were folded into the history at a turn's end
+    /// without the model reacting to them (they arrived mid-turn). Cleared
+    /// once a turn starts with them already in the context. Lets the TUI
+    /// run a follow-up turn so the agent responds promptly.
+    unanswered_background: bool,
     subscriber: Option<mpsc::UnboundedSender<AgentEvent>>,
     /// Long-lived session sinks (e.g. a TUI view). Unlike
     /// `event_handler` and `subscriber` (per-turn), these survive across
@@ -213,6 +218,7 @@ impl Agent {
             max_tool_rounds: None,
             background_receiver,
             pending_background: VecDeque::new(),
+            unanswered_background: false,
             subscriber: None,
             observers: Vec::new(),
             running_background: HashSet::new(),
@@ -305,6 +311,14 @@ impl Agent {
         &self.running_background
     }
 
+    /// Whether the most recent turn folded background completions into the
+    /// history that the model has not reacted to yet. The TUI checks this
+    /// after a turn and, when true, runs a follow-up empty turn so the agent
+    /// responds to the completion instead of waiting for the user.
+    pub fn has_unanswered_background(&self) -> bool {
+        self.unanswered_background
+    }
+
     /// Names of the registered tools (for tests and diagnostics).
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.iter().map(|tool| tool.spec().name).collect()
@@ -334,6 +348,9 @@ impl Agent {
     pub async fn run(&mut self, prompt: String) -> anyhow::Result<String> {
         self.drain_background();
         self.inject_pending_background();
+        // The turn starts with any pending completion already in the
+        // context, so the model is about to react to it.
+        self.unanswered_background = false;
         if !prompt.is_empty() {
             self.history.push(Message::User { content: prompt }.into());
         }
@@ -341,6 +358,14 @@ impl Agent {
 
         let result = self.run_loop(&specs).await;
         self.drain_background();
+        // Completions that arrived during this turn were drained into
+        // pending but the loop ended before injecting them; fold them into
+        // the history now so the finished line renders immediately instead
+        // of waiting for the next prompt. The model has NOT seen them yet,
+        // so flag for a follow-up turn.
+        let had_mid_turn_completions = !self.pending_background.is_empty();
+        self.inject_pending_background();
+        self.unanswered_background = had_mid_turn_completions;
         self.subscriber = None;
         result
     }
@@ -590,6 +615,9 @@ mod tests {
     struct ScriptedModel {
         replies: Vec<AssistantMessage>,
         requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        /// Optional per-call latency, to let a background completion land
+        /// while a model call is in flight.
+        delay: Option<std::time::Duration>,
     }
 
     #[async_trait]
@@ -601,6 +629,9 @@ mod tests {
             _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
         ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
             self.requests.lock().unwrap().push(messages.to_vec());
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
             Ok((self.replies.remove(0), None))
         }
     }
@@ -752,6 +783,7 @@ mod tests {
                 },
             ],
             requests: requests.clone(),
+            delay: None,
         };
         let mut agent = Agent::new(Box::new(model), vec![Box::new(EchoTool)]);
 
@@ -786,6 +818,7 @@ mod tests {
                 },
             ],
             requests: requests.clone(),
+            delay: None,
         };
         let mut agent = Agent::new(Box::new(model), vec![]);
 
@@ -830,6 +863,7 @@ mod tests {
                 },
             ],
             requests: requests.clone(),
+            delay: None,
         };
         let mut agent = Agent::new(Box::new(model), vec![Box::new(FailingTool)]);
 
@@ -862,6 +896,7 @@ mod tests {
                 },
             ],
             requests,
+            delay: None,
         };
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut agent = Agent::new(Box::new(model), vec![Box::new(EchoTool)]);
@@ -906,6 +941,7 @@ mod tests {
                 },
             ],
             requests: Arc::new(Mutex::new(Vec::new())),
+            delay: None,
         };
         let mut agent = Agent::new(Box::new(model), vec![Box::new(EchoTool)]);
         agent.observe(sink);
@@ -986,6 +1022,7 @@ mod tests {
                 },
             ],
             requests: Arc::new(Mutex::new(Vec::new())),
+            delay: None,
         };
         let mut agent = Agent::new(
             Box::new(model),
@@ -1066,6 +1103,7 @@ mod tests {
                 },
             ],
             requests: requests.clone(),
+            delay: None,
         };
         let mut agent = Agent::new(
             Box::new(model),
@@ -1121,6 +1159,7 @@ mod tests {
                 },
             ],
             requests: requests.clone(),
+            delay: None,
         };
         let mut agent = Agent::new(
             Box::new(model),
@@ -1140,6 +1179,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_arriving_during_the_final_tool_call_is_injected_at_turn_end() {
+        // Regression: a completion that landed while the LAST tool call of a
+        // turn was still executing was drained into pending but never
+        // injected (run_loop had no next round), so the finished line and
+        // the model's reaction both waited for the next user prompt. run()
+        // must inject at turn end and flag it for a follow-up turn.
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = ScriptedModel {
+            replies: vec![
+                // Round 1: launch the background task.
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![call(
+                        "background-1",
+                        "bash",
+                        r#"{"command":"echo done","background":true}"#,
+                    )],
+                    reasoning: None,
+                },
+                // Round 2: the model finishes with no tool call. Its call
+                // is delayed past the background completion (10ms), which
+                // therefore lands mid-turn; with no further rounds, only
+                // turn-end injection keeps it from stranding until the next
+                // prompt.
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ],
+            requests: requests.clone(),
+            delay: Some(std::time::Duration::from_millis(30)),
+        };
+        let mut agent = Agent::new(
+            Box::new(model),
+            vec![Box::new(ScriptedBackgroundTool { sender: None })],
+        );
+        let (handle, sink, _source) = crate::handle::session_channel();
+        use crate::handle::SessionHandle;
+        agent.observe(sink);
+
+        assert_eq!(agent.run("go".into()).await.unwrap(), "done");
+        // The completion is in the history as a user message...
+        assert!(agent.history().iter().any(|entry| matches!(
+            entry,
+            crate::agent::SessionEntry::Message {
+                message: Message::User { content },
+            } if content.starts_with("[background task 1 completed]\n")
+        )));
+        // ...the observer log shows it exactly once (the finished line)...
+        assert_eq!(
+            handle
+                .snapshot()
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::UserPrompt(t) if t.starts_with("[background task 1 completed]")))
+                .count(),
+            1
+        );
+        // ...and it is flagged as unanswered so the TUI runs a follow-up
+        // turn instead of waiting for the user.
+        assert!(agent.has_unanswered_background());
+    }
+
+    #[tokio::test]
     async fn compacts_everything_before_the_current_turn() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let model = ScriptedModel {
@@ -1149,6 +1252,7 @@ mod tests {
                 reasoning: None,
             }],
             requests: requests.clone(),
+            delay: None,
         };
         let tool_call = call("call-1", "echo", r#"{"value":"old"}"#);
         let current_turn = vec![
@@ -1258,6 +1362,7 @@ mod tests {
             Box::new(ScriptedModel {
                 replies: vec![],
                 requests: Arc::new(Mutex::new(Vec::new())),
+                delay: None,
             }),
             vec![],
         );
@@ -1277,6 +1382,7 @@ mod tests {
         let model = ScriptedModel {
             replies: vec![],
             requests,
+            delay: None,
         };
         let mut agent = Agent::new(Box::new(model), vec![]);
         agent.restore_history(vec![
