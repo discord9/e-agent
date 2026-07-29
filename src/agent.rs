@@ -425,15 +425,23 @@ impl Agent {
             let assistant = {
                 let model = &mut self.model;
                 let event_handler = &mut self.event_handler;
+                let observers = &self.observers;
                 let mut on_delta = |kind: ModelDeltaKind, delta: &str| {
                     if kind == ModelDeltaKind::Content {
                         produced_delta = true;
                     }
+                    let event = match kind {
+                        ModelDeltaKind::Content => AgentEvent::AssistantDelta(delta.into()),
+                        ModelDeltaKind::Reasoning => AgentEvent::ReasoningDelta(delta.into()),
+                    };
                     if let Some(handler) = event_handler {
-                        handler(match kind {
-                            ModelDeltaKind::Content => AgentEvent::AssistantDelta(delta.into()),
-                            ModelDeltaKind::Reasoning => AgentEvent::ReasoningDelta(delta.into()),
-                        });
+                        handler(event.clone());
+                    }
+                    // Subagents stream to their session log too, so an
+                    // attached view shows live thinking/output instead of a
+                    // frozen screen during a long reasoning call.
+                    for sink in observers {
+                        sink.emit(event.clone());
                     }
                 };
                 model.complete(&context, specs, Some(&mut on_delta)).await?
