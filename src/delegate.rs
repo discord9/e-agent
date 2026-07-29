@@ -34,9 +34,6 @@ use crate::session::Session;
 use crate::tools::BackgroundTasks;
 use crate::workspace::Workspace;
 
-/// Maximum rounds a subagent may take before giving up. Aligned with the
-/// main agent's MAX_TOOL_ROUNDS.
-const SUBAGENT_MAX_ROUNDS: usize = 32;
 /// Ceiling for a synchronous delegate call.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -191,8 +188,7 @@ impl Delegate {
                     .ok()
                     .filter(|content| !content.trim().is_empty());
                 let tools = crate::tools::builtins_with_background(workspace, background);
-                let mut agent =
-                    Agent::new(Box::new(model), tools).max_tool_rounds(SUBAGENT_MAX_ROUNDS);
+                let mut agent = Agent::new(Box::new(model), tools);
                 // A bare single-user-message request is rejected by some
                 // providers (kimi k3 answers HTTP 403 to `msgs=1`); give the
                 // subagent a minimal system prompt so its first call always

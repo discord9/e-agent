@@ -165,7 +165,7 @@ history. It shares the parent's running-task registry so nested background bash
 commands stay visible and report completion to the parent. It gets the same
 builtins as its parent: file/bash tools and, when
 configured, `web_search`; no MCP tools and no `delegate` itself, so delegation
-depth is capped at 1 by construction. It is limited to 32 tool rounds.
+depth is capped at 1 by construction. Tool rounds are unlimited.
 
 With `background: true` the subagent runs without blocking and its answer is
 delivered as a background task completion (waking an idle agent). Sync mode
@@ -250,7 +250,7 @@ remote MCP over HTTP/SSE, MCP OAuth, MCP resources/prompts, server-initiated
 notifications, `listChanged` refresh, server restart on crash, or concurrent
 server initialization.
 It has one model seam and one tool seam. Main-agent tool rounds are unlimited
-unless `--max-rounds` sets an explicit cap; subagents remain capped at 32.
+unless `--max-rounds` sets an explicit cap; subagent tool rounds are unlimited.
 Reasoning-model `reasoning_content` is persisted in the session for
 display/audit; it is never sent back to the API.
 Web search deliberately has no browser, crawler, URL fetch, citations, domain
