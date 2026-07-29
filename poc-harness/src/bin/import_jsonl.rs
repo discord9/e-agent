@@ -84,6 +84,33 @@ async fn import_file(client: &reqwest::Client, path: &Path) -> Result<usize> {
     Ok(total)
 }
 
+async fn db_entry_count(client: &reqwest::Client, session_id: &str) -> Result<i64> {
+    let resp = client
+        .post(format!("{HTTP_SQL}?format=json"))
+        .form(&[
+            ("sql", format!(
+                "SELECT COALESCE(last_value(seq ORDER BY event_time ASC), -1) AS last_seq \
+                 FROM session_entries WHERE session_id = '{session_id}' GROUP BY session_id"
+            ).as_str()),
+            ("db", DB),
+        ])
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    Ok(resp["data"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|r| r["last_seq"].as_i64())
+        .map(|v| v + 1) // last_seq is 0-based, count is 1-based
+        .unwrap_or(0))
+}
+
+fn jsonl_line_count(path: &Path) -> Result<usize> {
+    let content = std::fs::read_to_string(path)?;
+    Ok(content.lines().filter(|l| !l.trim().is_empty()).count())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let dir = std::env::args()
@@ -92,6 +119,7 @@ async fn main() -> Result<()> {
     let client = reqwest::Client::new();
     let mut total_entries = 0;
     let mut total_files = 0;
+    let mut skipped = 0;
 
     let mut paths: Vec<_> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok())
@@ -102,16 +130,31 @@ async fn main() -> Result<()> {
 
     for path in &paths {
         let name = path.file_name().unwrap().to_string_lossy();
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+        let file_lines = jsonl_line_count(path)?;
+
+        if file_lines == 0 {
+            println!("  skip {name} (empty)");
+            continue;
+        }
+
+        let db_count = db_entry_count(&client, stem).await.unwrap_or(0);
+        if db_count >= file_lines as i64 {
+            println!("  skip {name} (already imported: {db_count}/{file_lines})");
+            skipped += 1;
+            continue;
+        }
+
         match import_file(&client, path).await {
             Ok(0) => println!("  skip {name} (empty)"),
             Ok(n) => {
-                println!("  {name}: {n} entries");
+                println!("  {name}: {n} entries (was {db_count} in db)");
                 total_entries += n;
                 total_files += 1;
             }
             Err(e) => eprintln!("  FAIL {name}: {e:#}"),
         }
     }
-    println!("\nImported {total_entries} entries from {total_files} files");
+    println!("\nImported {total_entries} entries from {total_files} files, skipped {skipped} already-imported");
     Ok(())
 }
