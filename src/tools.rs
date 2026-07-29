@@ -23,7 +23,7 @@ const WEB_SEARCH_TOKENS: u16 = 5000;
 const WEB_SEARCH_ERROR_PREVIEW_LIMIT: usize = 8 * 1024;
 const WEB_SEARCH_RESPONSE_LIMIT: usize = 128 * 1024;
 
-/// Built-in tools plus the shared background-task slots, exposed so that
+/// Built-in tools plus the shared background-task registry, exposed so that
 /// other tools (e.g. delegate) can schedule background work too.
 pub fn builtins(workspace: Workspace) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
     builtins_with_exa_key(workspace, std::env::var("EXA_API_KEY").ok())
@@ -66,8 +66,8 @@ fn tools_with_background_and_exa_key(
 }
 
 /// File tools only; the bash tool is added by the caller so it can be
-/// bound to a shared [`BackgroundTasks`] (subagents share the parent's
-/// slots so their background completions reach the parent agent).
+/// bound to shared [`BackgroundTasks`] (subagents share the parent's
+/// registry so their background completions reach the parent agent).
 pub fn file_tools(workspace: &Workspace) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(ReadFile {
@@ -422,19 +422,16 @@ impl Tool for Bash {
     }
 }
 
-/// Maximum number of concurrently running background tasks.
-pub const MAX_BACKGROUND: usize = 4;
-
 #[derive(Clone)]
 pub struct BackgroundTasks {
     next_id: Arc<AtomicU64>,
-    slots: Arc<std::sync::Mutex<Vec<Option<BackgroundSlot>>>>,
+    running: Arc<std::sync::Mutex<Vec<RunningTask>>>,
     sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
     timeout: Duration,
 }
 
 #[derive(Clone)]
-struct BackgroundSlot {
+struct RunningTask {
     id: u64,
     label: String,
     process_group: Arc<AtomicI32>,
@@ -451,34 +448,33 @@ impl BackgroundTasks {
     fn new(timeout: Duration) -> Self {
         Self {
             next_id: Arc::new(AtomicU64::new(1)),
-            slots: Arc::new(std::sync::Mutex::new(vec![None; MAX_BACKGROUND])),
+            running: Arc::new(std::sync::Mutex::new(Vec::new())),
             sender: None,
             timeout,
         }
     }
 
     /// Set the channel used to deliver background completions. Called by the
-    /// agent for tools that hold a shared clone of these slots.
+    /// agent for tools that hold a shared clone of this registry.
     pub fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
         self.sender = Some(sender);
     }
 
     /// Snapshot of currently running background tasks, for the TUI panel.
     pub fn running(&self) -> Vec<BackgroundTaskInfo> {
-        self.slots
+        self.running
             .lock()
             .unwrap()
             .iter()
-            .flatten()
-            .map(|slot| BackgroundTaskInfo {
-                id: slot.id,
-                label: slot.label.clone(),
+            .map(|task| BackgroundTaskInfo {
+                id: task.id,
+                label: task.label.clone(),
             })
             .collect()
     }
 
     /// Start a background bash command. Returns a human-readable "started"
-    /// message containing the task id, or an error if all slots are in use.
+    /// message containing the task id.
     pub fn start(&self, workspace: Workspace, command: String) -> Result<String, String> {
         let process_group = Arc::new(AtomicI32::new(0));
         let pg = process_group.clone();
@@ -493,9 +489,9 @@ impl BackgroundTasks {
         })
     }
 
-    /// Allocate a slot and spawn a background future. Completion is delivered
-    /// as [`AgentEvent::BackgroundCompleted`]. `process_group` is only used
-    /// for kill-on-drop cleanup; pass `None` for non-process tasks.
+    /// Register and spawn a background future. Completion is delivered as
+    /// [`AgentEvent::BackgroundCompleted`]. `process_group` is only used for
+    /// kill-on-drop cleanup; pass `None` for non-process tasks.
     pub fn spawn<F, Fut>(
         &self,
         label: String,
@@ -532,9 +528,9 @@ impl BackgroundTasks {
         })
     }
 
-    /// Spawn a task that occupies a slot and runs to completion but does
-    /// NOT send a completion event. Used by synchronous delegate: the
-    /// subagent must be visible in the task panel, but its answer is
+    /// Spawn a registered task that runs to completion but does NOT send a
+    /// completion event. Used by synchronous delegate: the subagent must be
+    /// visible in the task panel, but its answer is
     /// returned as the tool result, so a completion notice would duplicate.
     pub fn spawn_silent<F, Fut>(
         &self,
@@ -563,30 +559,17 @@ impl BackgroundTasks {
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let slot = BackgroundSlot {
+        self.running.lock().unwrap().push(RunningTask {
             id,
             label: label.clone(),
             process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),
-        };
-        {
-            let mut slots = self.slots.lock().unwrap();
-            let empty = slots.iter_mut().find(|slot| slot.is_none());
-            let Some(empty) = empty else {
-                return Err(format!(
-                    "all {MAX_BACKGROUND} background task slots are in use"
-                ));
-            };
-            *empty = Some(slot);
-        }
+        });
         on_id(id);
         let started = format!("started background task {id}: {label}");
-        let slots = self.slots.clone();
+        let running = self.running.clone();
         tokio::spawn(async move {
             let output = work().await;
-            slots
-                .lock()
-                .unwrap()
-                .retain(|slot| slot.as_ref().map(|slot| slot.id != id).unwrap_or(true));
+            running.lock().unwrap().retain(|task| task.id != id);
             on_complete(id, output);
         });
         Ok(started)
@@ -596,9 +579,9 @@ impl BackgroundTasks {
 impl Drop for BackgroundTasks {
     fn drop(&mut self) {
         #[cfg(unix)]
-        for slot in self.slots.lock().unwrap().iter().flatten() {
+        for task in self.running.lock().unwrap().iter() {
             if let Some(process_group) =
-                rustix::process::Pid::from_raw(slot.process_group.load(Ordering::Acquire))
+                rustix::process::Pid::from_raw(task.process_group.load(Ordering::Acquire))
             {
                 let _ = rustix::process::kill_process_group(
                     process_group,
@@ -1311,22 +1294,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allows_up_to_max_background_tasks() {
+    async fn completed_background_tasks_leave_the_running_registry() {
         let temp = tempfile::tempdir().unwrap();
-        let (bash, _) = background_bash(&temp, Duration::from_secs(10));
-        for id in 1..=MAX_BACKGROUND {
+        let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+        for id in 1..=8 {
             assert!(
-                bash.execute(json!({"command": "sleep 10", "background": true}))
+                bash.execute(json!({"command": "true", "background": true}))
                     .await
                     .unwrap()
                     .starts_with(&format!("started background task {id}:"))
             );
         }
+        for _ in 0..8 {
+            receiver.recv().await.unwrap();
+        }
+        assert!(bash.background.running().is_empty());
         assert!(
             bash.execute(json!({"command": "true", "background": true}))
                 .await
-                .unwrap_err()
-                .contains("background task slots are in use")
+                .unwrap()
+                .starts_with("started background task 9:")
         );
     }
 

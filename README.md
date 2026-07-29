@@ -139,9 +139,11 @@ context.
 ## Background tasks
 
 The `bash` tool accepts `background: true` to run a command without blocking.
-Up to 4 background tasks may run concurrently (bash and subagents share the
-same slots); each has the same workspace cwd, process-group handling, and
-per-stream 64 KiB output limit as foreground Bash, with a 30-minute timeout.
+Bash tasks and subagents share one running-task registry with no built-in
+concurrency limit. Each bash task starts a process and each subagent starts an
+OS thread, so callers remain responsible for resource use. Background bash has
+the same workspace cwd, process-group handling, and per-stream 64 KiB output
+limit as foreground Bash, with a 30-minute timeout.
 Completions surface as a TUI notification while a
 turn is active, and the complete output is injected as a clearly labelled user
 message at the next model call — whether that is the next round of an active
@@ -158,9 +160,10 @@ self-contained task and returns its final answer. Use it for subtasks whose
 intermediate steps (searching, reading many files, focused edits) would
 clutter the main context.
 
-Each subagent runs on its own OS thread with its own tokio runtime, its own
-background-task slots, and an empty history — it shares no state with the
-parent. It gets the same builtins as its parent: file/bash tools and, when
+Each subagent runs on its own OS thread with its own tokio runtime and an empty
+history. It shares the parent's running-task registry so nested background bash
+commands stay visible and report completion to the parent. It gets the same
+builtins as its parent: file/bash tools and, when
 configured, `web_search`; no MCP tools and no `delegate` itself, so delegation
 depth is capped at 1 by construction. It is limited to 32 tool rounds.
 

@@ -1,9 +1,8 @@
 //! `delegate` tool: spawn a subagent with a fresh context to work on a task.
 //!
 //! Each subagent runs on its own OS thread with its own current-thread
-//! tokio runtime, its own background-task slots, and an empty history. This
-//! keeps all subagent state (history, pending background results, token
-//! counts) fully isolated from the parent agent.
+//! tokio runtime and an empty history. Its agent state (history, pending
+//! background results, token counts) is isolated from the parent.
 //!
 //! The subagent gets the builtin file/bash tools and, when configured, public
 //! web search (no MCP tools, no `delegate` itself — depth is capped at 1 by
@@ -104,8 +103,8 @@ pub struct Delegate {
     /// on the main model.
     subagent_model: ConfiguredModel,
     workspace: Workspace,
-    /// Shared background slots (with bash): a background delegate occupies
-    /// one slot and its completion is delivered as a background completion.
+    /// Shared running-task registry: background delegates and bash commands
+    /// stay visible together and deliver completions through the parent.
     background: BackgroundTasks,
     /// Live handles of background subagents, for the TUI attach view.
     sessions: Sessions,
@@ -164,8 +163,8 @@ impl Delegate {
     /// passes None and keeps the original single-turn behaviour.
     ///
     /// The subagent's bash tool shares the parent's `background` registry,
-    /// so a background bash command started by a subagent occupies a shared
-    /// slot, shows up in the parent's task panel, and delivers its
+    /// so a background bash command started by a subagent shows up in the
+    /// parent's task panel and delivers its
     /// completion to the PARENT agent — it survives the subagent's end
     /// instead of being silently killed and forgotten.
     fn run_on_thread(
@@ -492,7 +491,7 @@ impl Tool for Delegate {
             root,
             session_id: resume_id.unwrap_or_else(|| crate::session::new_id_prefixed("sub-")),
         });
-        // Even a synchronous subagent occupies a shared slot and registers a
+        // Even a synchronous subagent is registered as a running task with a
         // live session, so it shows up in the task panel (F2) and can be
         // attached while the main agent is blocked waiting for it.
         let label = preview(&task, 100);

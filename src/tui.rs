@@ -1164,7 +1164,7 @@ struct TuiState {
     /// Arguments of an in-flight edit_file call, rendered as a numbered diff
     /// when its result (which carries the line number) arrives.
     pending_edit: Option<(String, String, String)>,
-    /// Shared background-task slots, for the tasks panel.
+    /// Shared running-task registry, for the tasks panel.
     background: Option<crate::tools::BackgroundTasks>,
     /// Probe for whether a background task has an attachable session
     /// (wired to the session registry by the runner).
