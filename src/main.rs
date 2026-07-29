@@ -158,8 +158,9 @@ async fn run() -> anyhow::Result<()> {
             unfinished.len(),
             unfinished.join("\n")
         );
-        let entry: e_agent::agent::SessionEntry =
-            e_agent::agent::Message::User { content: notice }.into();
+        let entry = e_agent::agent::SessionEntry::Notice {
+            text: notice.clone(),
+        };
         // Persist immediately so a crash-before-first-turn cannot inject
         // the same notice again on the next launch.
         Session::append(&root, &session, std::slice::from_ref(&entry))?;
@@ -205,6 +206,9 @@ fn set_stderr_events(agent: &mut Agent) {
         // Steering prompts are recorded by the session handle; the stderr
         // frontend never sends any, so nothing to print.
         AgentEvent::UserPrompt(_) => {}
+        AgentEvent::Notice(text) => {
+            eprintln!("{}", text);
+        }
         AgentEvent::AssistantText(text) => eprintln!("assistant: {}", preview(&text, 500)),
         AgentEvent::AssistantDelta(text) => {
             if reasoning {

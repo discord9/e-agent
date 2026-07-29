@@ -1271,6 +1271,9 @@ impl TuiState {
         for entry in entries {
             match entry {
                 SessionEntry::Message { message } => state.push_message(message),
+                SessionEntry::Notice { text } => {
+                    state.push_line(text.clone(), LineKind::Dim);
+                }
                 SessionEntry::Compaction { summary, .. } => {
                     state.push_line(compaction_banner("compaction"), LineKind::Compaction);
                     state.push_line(
@@ -1290,13 +1293,7 @@ impl TuiState {
                 self.push_line(format!("system: {}", preview(content, 500)), LineKind::Dim);
             }
             Message::User { content } => {
-                if content.starts_with("[compacted summary of earlier conversation]")
-                    || content.starts_with("[background task ")
-                {
-                    self.push_line(content.clone(), LineKind::Dim);
-                } else {
-                    self.push_line(format!("you> {content}"), LineKind::User);
-                }
+                self.push_line(format!("you> {content}"), LineKind::User);
             }
             Message::Assistant(message) => {
                 if let Some(reasoning) =
@@ -1549,23 +1546,11 @@ impl TuiState {
             AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
         );
         match event {
+            AgentEvent::Notice(text) => {
+                self.push_line(text, LineKind::Dim);
+            }
             AgentEvent::UserPrompt(text) => {
-                // Background completions arrive as `[background task N
-                // completed]` user messages at the turn boundary; render
-                // them as the dim finished line. Regular prompts show as
-                // user input (in the main view the input loop already
-                // printed them, but this path is also the session snapshot
-                // replay for attached views).
-                if let Some(rest) = text.strip_prefix("[background task ")
-                    && let Some((id, output)) = rest.split_once(" completed]\n")
-                {
-                    self.push_line(
-                        format!("background task {id} finished: {}", preview(output, 500)),
-                        LineKind::Dim,
-                    );
-                } else {
-                    self.push_line(format!("you> {text}"), LineKind::User);
-                }
+                self.push_line(format!("you> {text}"), LineKind::User);
             }
             AgentEvent::AssistantText(text) => self.push_line(text, LineKind::Normal),
             AgentEvent::AssistantDelta(text) => {
@@ -1890,17 +1875,18 @@ mod tests {
     }
 
     #[test]
-    fn background_completion_user_message_renders_as_finished_line() {
-        // The turn-boundary `[background task N completed]` user message is
-        // the single persistent notification; the main view renders it dim.
+    fn background_completion_notice_renders_as_dim_line() {
+        // The turn-boundary completion is a structured Notice event (not a
+        // UserPrompt with a magic prefix); the main view renders it dim.
         let mut state = TuiState::default();
-        state.push_agent_event(AgentEvent::UserPrompt(
+        state.push_agent_event(AgentEvent::Notice(
             "[background task 2 completed]\nall good".into(),
         ));
         assert_eq!(
             state.lines.last().unwrap().text,
-            "background task 2 finished: all good"
+            "[background task 2 completed]\nall good"
         );
+        assert_eq!(state.lines.last().unwrap().kind, LineKind::Dim);
         // A regular user prompt still renders as user input.
         state.push_agent_event(AgentEvent::UserPrompt("hello".into()));
         assert_eq!(state.lines.last().unwrap().text, "you> hello");
@@ -2567,21 +2553,22 @@ mod tests {
 
     #[test]
     fn replay_marks_internal_messages_and_reasoning_dim() {
-        let messages = vec![
-            Message::User {
-                content: "[background task 1 completed]\nexit code: 0".into(),
+        let entries = vec![
+            SessionEntry::Notice {
+                text: "[background task 1 completed]\nexit code: 0".into(),
             },
-            Message::User {
-                content: "[compacted summary of earlier conversation]\nwe did things".into(),
+            SessionEntry::Notice {
+                text: "[compacted summary of earlier conversation]\nwe did things".into(),
             },
-            Message::Assistant(crate::agent::AssistantMessage {
-                content: Some("answer".into()),
-                tool_calls: vec![],
-                reasoning: Some("plan".into()),
-            }),
+            SessionEntry::Message {
+                message: Message::Assistant(crate::agent::AssistantMessage {
+                    content: Some("answer".into()),
+                    tool_calls: vec![],
+                    reasoning: Some("plan".into()),
+                }),
+            },
         ];
-        let state =
-            TuiState::from_history(&messages.into_iter().map(Into::into).collect::<Vec<_>>());
+        let state = TuiState::from_history(&entries);
         assert_eq!(state.lines.len(), 4);
         assert_eq!(
             state.lines[0].kind,

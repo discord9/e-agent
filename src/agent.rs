@@ -100,6 +100,9 @@ pub enum AgentEvent {
         is_error: bool,
         content: String,
     },
+    /// A system-injected notice (background completion, task-kill report)
+    /// rendered in the TUI as a dim line.
+    Notice(String),
     /// Emitted on the turn boundary when a background task's completion is
     /// folded into the model context as a `[background task N completed]`
     /// message. Not part of the session event log.
@@ -143,6 +146,12 @@ pub enum SessionEntry {
         /// The turn kept verbatim for the model context; not rendered again
         /// in the TUI (it duplicates messages already before this entry).
         retained: Vec<Message>,
+    },
+    /// A system-injected notice (background completion, task-kill report)
+    /// rendered in the TUI as a dim line and surfaced to the model as a
+    /// user message.
+    Notice {
+        text: String,
     },
 }
 
@@ -309,6 +318,12 @@ impl Agent {
                 .filter_map(|entry| match entry {
                     SessionEntry::Message { message } => Some(message.clone()),
                     SessionEntry::Compaction { .. } => None,
+                    // Notices are system-injected events; surface them to the
+                    // model as user messages so the model reacts to background
+                    // completions and task-death notices.
+                    SessionEntry::Notice { text } => Some(Message::User {
+                        content: text.clone(),
+                    }),
                 }),
         );
         repair_tool_pairs(messages)
@@ -590,14 +605,14 @@ impl Agent {
     fn inject_pending_background(&mut self) {
         while let Some((id, output)) = self.pending_background.pop_front() {
             let text = format!("[background task {id} completed]\n{output}");
-            // The completion joins the history as a user message at this
-            // turn boundary; emit it to the session observers only (their
-            // event log is the TUI's scrollback and the attach snapshot).
-            // The per-turn subscriber is for transient signals (deltas, the
+            // The completion joins the history as a structured Notice entry;
+            // emit it to the session observers only (their event log is the
+            // TUI's scrollback and the attach snapshot). The per-turn
+            // subscriber is for transient signals (deltas, the
             // BackgroundCompleted fired at drain time) — sending this too
             // would render the line twice in the TUI, which listens to both.
-            self.fanout(&AgentEvent::UserPrompt(text.clone()));
-            self.push_message(Message::User { content: text });
+            self.fanout(&AgentEvent::Notice(text.clone()));
+            self.history.push(SessionEntry::Notice { text });
         }
     }
 
@@ -1090,25 +1105,23 @@ mod tests {
         agent.subscribe(sender);
         assert_eq!(agent.run("second".into()).await.unwrap(), "next");
         // Subscriber saw the transient completion exactly once, and the
-        // turn-boundary user message is NOT sent to it (that would render
-        // twice in the TUI, which listens to both paths).
+        // turn-boundary notice is NOT sent to it (that would render twice
+        // in the TUI, which listens to both paths).
         let mut transient = 0;
-        let mut prompt_notifications = 0;
+        let mut notice_notifications = 0;
         while let Ok(event) = receiver.try_recv() {
             match event {
                 AgentEvent::BackgroundCompleted { id: 1, .. } => transient += 1,
-                AgentEvent::UserPrompt(text)
-                    if text.starts_with("[background task 1 completed]") =>
-                {
-                    prompt_notifications += 1
+                AgentEvent::Notice(text) if text.starts_with("[background task 1 completed]") => {
+                    notice_notifications += 1
                 }
                 _ => {}
             }
         }
         assert_eq!(transient, 1);
-        assert_eq!(prompt_notifications, 0);
-        // ...and the observer log holds it once, as the user message, never
-        // as the transient variant.
+        assert_eq!(notice_notifications, 0);
+        // ...and the observer log holds it once, as the Notice, never as
+        // the transient variant.
         let snapshot = handle.snapshot();
         assert!(
             snapshot
@@ -1118,7 +1131,7 @@ mod tests {
         assert_eq!(
             snapshot
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::UserPrompt(text) if text.starts_with("[background task 1 completed]")))
+                .filter(|event| matches!(event, AgentEvent::Notice(text) if text.starts_with("[background task 1 completed]")))
                 .count(),
             1
         );
@@ -1170,6 +1183,8 @@ mod tests {
             &requests[1][2],
             Message::Tool { content, is_error: false, .. } if content.starts_with("started background task 1:")
         ));
+        // The completion is injected as a Notice, which context() surfaces
+        // as a Message::User so the model sees it.
         assert!(matches!(
             &requests[2][4],
             Message::User { content } if content.starts_with("[background task 1 completed]\n")
@@ -1281,19 +1296,17 @@ mod tests {
         // run() keeps going until the model has reacted to the completion;
         // the returned answer is the follow-up turn's.
         assert_eq!(agent.run("go".into()).await.unwrap(), "acknowledged");
-        // The completion is in the history as a user message...
+        // The completion is in the history as a Notice entry...
         assert!(agent.history().iter().any(|entry| matches!(
             entry,
-            crate::agent::SessionEntry::Message {
-                message: Message::User { content },
-            } if content.starts_with("[background task 1 completed]\n")
+            crate::agent::SessionEntry::Notice { text } if text.starts_with("[background task 1 completed]\n")
         )));
         // ...the observer log shows it exactly once (the finished line)...
         assert_eq!(
             handle
                 .snapshot()
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::UserPrompt(t) if t.starts_with("[background task 1 completed]")))
+                .filter(|event| matches!(event, AgentEvent::Notice(t) if t.starts_with("[background task 1 completed]")))
                 .count(),
             1
         );
