@@ -194,6 +194,12 @@ impl Delegate {
                 let mut last_answer = String::new();
                 // History entries already persisted (per-turn incremental).
                 let mut persisted_len = 0usize;
+                // Record the delegated task in the session log so an attached
+                // view shows what the subagent was asked to do, not just the
+                // tool calls that follow.
+                if let Some(sink) = &sink {
+                    sink.emit(AgentEvent::UserPrompt(prompt.clone()));
+                }
                 loop {
                     let result = {
                         let run = agent.run(prompt);
@@ -271,9 +277,8 @@ impl Delegate {
                         Some(text) => text,
                         None => return last_answer,
                     };
-                    if let Some(sink) = &sink {
-                        sink.emit(AgentEvent::AssistantText(format!("[steer] {prompt}")));
-                    }
+                    // The steered prompt is already in the log (send_input
+                    // emits UserPrompt), so no extra echo here.
                 }
             })
         })
