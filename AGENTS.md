@@ -4,9 +4,10 @@ Guidance for coding agents (and humans) working on e-agent.
 
 ## What this is
 
-e-agent is a deliberately minimal Rust coding agent: single crate,
-streaming OpenAI-compatible API, four tools (`read_file`, `write_file`,
-`edit_file`, `bash`), a text REPL, a ratatui TUI, and JSON session persistence.
+e-agent is a deliberately minimal Rust coding agent: single crate, streaming
+OpenAI-compatible Chat Completions plus ChatGPT Codex Responses, four tools
+(`read_file`, `write_file`, `edit_file`, `bash`), a text REPL, a ratatui TUI,
+and JSON session persistence.
 Keep it that way.
 
 ## Prime directive: do not over-design
@@ -35,7 +36,9 @@ without an explicit user request.
 ## Non-negotiables (current scope)
 
 - Single crate: `src/lib.rs` core + `src/main.rs` thin frontend.
-- Streaming `/chat/completions` (SSE) with full transcript replay; `reasoning_content` is persisted for display/audit but never echoed back to the API.
+- Streaming `/chat/completions` and ChatGPT Codex `/responses` (SSE) with full
+  transcript replay; persisted reasoning is display/audit only and is never
+  replayed to either provider wire.
 - Tool errors return to the model as `role:"tool"` messages; they never
   crash the agent loop.
 - File tools stay cap-std capability-relative; `bash` is NOT sandboxed
@@ -52,7 +55,7 @@ without an explicit user request.
   delivered as a user message that starts a new turn.
 - No task scheduler, priorities, or worker/concurrency pool.
 - MCP support is limited to local stdio servers, tools only. No remote
-  HTTP/SSE MCP, OAuth, resources/prompts, notifications, `listChanged`
+  HTTP/SSE MCP, MCP OAuth, resources/prompts, notifications, `listChanged`
   refresh, server restart, or concurrent initialization.
 - Subagents (`delegate` tool) are threads with fully isolated state: fresh
   history, own background slots, builtin tools only (no MCP, no nested

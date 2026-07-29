@@ -1,9 +1,9 @@
 # e-agent
 
 e-agent is a small streaming Rust coding agent for OpenAI-compatible
-`/chat/completions` APIs. It sends a prompt to a model, executes requested tools
-one at a time inside a workspace, returns each result to the model, and prints
-the model's final answer.
+`/chat/completions` APIs and the ChatGPT Codex `/responses` API. It sends a
+prompt to a model, executes requested tools one at a time inside a workspace,
+returns each result to the model, and prints the model's final answer.
 
 ## Run
 
@@ -25,12 +25,30 @@ model = "k3"
 reasoning_effort = "high"
 ```
 
-Provider names are inferred from the part of the profile before `/`. Each
-provider needs exactly one of `api_key_file` or `api_key_env`; key files are
+Provider names are inferred from the part of the profile before `/`. API-key
+providers need exactly one of `api_key_file` or `api_key_env`; key files are
 trimmed and must not be empty. `reasoning_effort` is an optional pass-through
 request field with no CLI or environment override. For Kimi Coding `k3`, its
 canonical values are `low`, `high`, and `max`; omitting it uses Kimi Coding's
 `high` default. Other providers may define different values.
+
+ChatGPT/Codex profiles use the separate Responses API and browser login; they
+do not accept an API key or base URL:
+
+```toml
+[providers.chatgpt]
+auth = "chatgpt"
+
+[models."chatgpt/gpt-5.2-codex"]
+model = "gpt-5.2-codex"
+reasoning_effort = "high"
+```
+
+Run `e-agent login` to complete the browser login, then select that profile as
+usual. `e-agent logout` removes only `$XDG_CONFIG_HOME/e-agent/auth.json` (or
+`$HOME/.config/e-agent/auth.json`). ChatGPT credentials are never stored in a
+workspace session. `--model` is allowed for these profiles; `--base-url` is
+rejected because the Codex endpoint is fixed.
 
 Built-in roles can be routed to a different profile with `[roles]`. The only
 role today is `subagent` (the model the `delegate` tool spawns); unrouted
@@ -195,7 +213,7 @@ include a preview of the response body. Provider requests time out after
 
 This is deliberately not a daemon, JSONL protocol,
 automatic compaction trigger, database, event store, subagent
-framework, permission framework, plugin host, multi-provider client,
+framework, permission framework, plugin host, generic provider/auth framework,
 parallel tool executor, task scheduler, priority system, or concurrency pool.
 It deliberately does not fetch provider/model catalogs (including
 models.dev), generate configuration, cache provider metadata, or infer
@@ -204,7 +222,7 @@ Subagents exist but are deliberately minimal: no agent-to-agent messaging,
 no delegation deeper than 1 level, no subagent session persistence, no
 process-level isolation yet (subagents are threads, not subprocesses).
 It does speak MCP to local stdio servers (tools only), but it does NOT do
-remote MCP over HTTP/SSE, OAuth, MCP resources/prompts, server-initiated
+remote MCP over HTTP/SSE, MCP OAuth, MCP resources/prompts, server-initiated
 notifications, `listChanged` refresh, server restart on crash, or concurrent
 server initialization.
 It has one model seam and one tool seam. Main-agent tool rounds are unlimited

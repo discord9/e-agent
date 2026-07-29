@@ -1,11 +1,14 @@
 use std::io::{IsTerminal, Read, Write};
 
 use anyhow::{Context, anyhow};
-use e_agent::agent::{Agent, AgentEvent, preview};
+use e_agent::agent::{Agent, AgentEvent, Model, preview};
+use e_agent::codex::CodexModel;
+use e_agent::codex_auth::{CodexAuth, login, logout};
 use e_agent::config::Config;
+use e_agent::config::{AuthMode, ResolvedModel};
 use e_agent::delegate::Delegate;
 use e_agent::mcp;
-use e_agent::model::OpenAiModel;
+use e_agent::model::{ConfiguredModel, OpenAiModel};
 use e_agent::session::Session;
 use e_agent::tools::builtins;
 use e_agent::tui;
@@ -21,6 +24,23 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
+    let raw_arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(command) = raw_arguments
+        .first()
+        .filter(|value| *value == "login" || *value == "logout")
+    {
+        if raw_arguments.len() != 1 {
+            return Err(anyhow!("e-agent {command} does not accept arguments"));
+        }
+        if command == "login" {
+            login().await?;
+            println!("ChatGPT login saved.");
+        } else {
+            logout()?;
+            println!("ChatGPT login removed.");
+        }
+        return Ok(());
+    }
     let mut base_url = None;
     let mut model = None;
     let mut profile = None;
@@ -29,7 +49,7 @@ async fn run() -> anyhow::Result<()> {
     let mut max_rounds = None;
     let mut repl_mode = false;
     let mut prompt = Vec::new();
-    let mut arguments = std::env::args().skip(1);
+    let mut arguments = raw_arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--base-url" => base_url = Some(next_value(&mut arguments, "--base-url")?),
@@ -47,7 +67,7 @@ async fn run() -> anyhow::Result<()> {
             "--repl" => repl_mode = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--max-rounds N] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup)"
+                    "usage: e-agent login|logout\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--max-rounds N] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup)"
                 );
                 return Ok(());
             }
@@ -90,41 +110,46 @@ async fn run() -> anyhow::Result<()> {
         }
     };
     let config = Config::load()?;
-    let model = match &config {
-        Some(config) => {
-            let configured = config.resolve(profile.as_deref())?;
-            OpenAiModel::new(
-                base_url.unwrap_or(configured.base_url),
-                configured.api_key,
-                model.unwrap_or(configured.model),
-                configured.reasoning_effort,
-            )?
-        }
+    let (main_resolved, role_resolved) = match &config {
+        Some(config) => (
+            Some(config.resolve(profile.as_deref())?),
+            config
+                .resolve_role("subagent")
+                .context("cannot resolve [roles] subagent profile")?,
+        ),
+        None => (None, None),
+    };
+    if matches!(
+        main_resolved.as_ref().map(|value| value.auth),
+        Some(AuthMode::ChatGpt)
+    ) && base_url.is_some()
+    {
+        return Err(anyhow!(
+            "--base-url cannot be used with a provider using auth = `chatgpt`"
+        ));
+    }
+    let needs_chatgpt = main_resolved
+        .as_ref()
+        .is_some_and(|value| value.auth == AuthMode::ChatGpt)
+        || role_resolved
+            .as_ref()
+            .is_some_and(|value| value.auth == AuthMode::ChatGpt);
+    let auth = needs_chatgpt.then(CodexAuth::load).transpose()?;
+    let model = match main_resolved {
+        Some(configured) => configured_model(configured, auth.as_ref(), base_url, model)?,
         None => {
             if profile.is_some() {
                 return Err(anyhow!(
                     "--profile requires a config file at $XDG_CONFIG_HOME/e-agent/config.toml or $HOME/.config/e-agent/config.toml"
                 ));
             }
-            OpenAiModel::from_env(base_url, model)?
+            ConfiguredModel::Chat(OpenAiModel::from_env(base_url, model)?)
         }
     };
     let model_name = model.name().to_owned();
-    let subagent_model = match &config {
-        Some(config) => config
-            .resolve_role("subagent")
-            .context("cannot resolve [roles] subagent profile")?
-            .map(|resolved| {
-                OpenAiModel::new(
-                    resolved.base_url,
-                    resolved.api_key,
-                    resolved.model,
-                    resolved.reasoning_effort,
-                )
-            })
-            .transpose()?,
-        None => None,
-    };
+    let subagent_model = role_resolved
+        .map(|resolved| configured_model(resolved, auth.as_ref(), None, None))
+        .transpose()?;
     let (mut tools, background) = builtins(workspace.clone());
     let mcp_servers = config.map(|config| config.mcp).unwrap_or_default();
     let (mcp_tools, mcp_instructions) = mcp::connect_all(mcp_servers, &root).await;
@@ -315,4 +340,26 @@ fn next_value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> anyho
     arguments
         .next()
         .ok_or_else(|| anyhow!("{flag} requires a value"))
+}
+
+fn configured_model(
+    resolved: ResolvedModel,
+    auth: Option<&CodexAuth>,
+    base_url: Option<String>,
+    model: Option<String>,
+) -> anyhow::Result<ConfiguredModel> {
+    match resolved.auth {
+        AuthMode::ApiKey => Ok(ConfiguredModel::Chat(OpenAiModel::new(
+            base_url.unwrap_or(resolved.base_url),
+            resolved.api_key,
+            model.unwrap_or(resolved.model),
+            resolved.reasoning_effort,
+        )?)),
+        AuthMode::ChatGpt => Ok(ConfiguredModel::Codex(CodexModel::new(
+            auth.cloned()
+                .ok_or_else(|| anyhow!("ChatGPT auth was not initialized"))?,
+            model.unwrap_or(resolved.model),
+            resolved.reasoning_effort,
+        )?)),
+    }
 }

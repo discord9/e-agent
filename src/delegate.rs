@@ -27,9 +27,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::{Agent, AgentEvent, Tool, ToolSpec, preview};
+use crate::agent::{Agent, AgentEvent, Model, Tool, ToolSpec, preview};
 use crate::handle::{SessionHandle, SessionSink, SessionSource, Steer, session_channel};
-use crate::model::OpenAiModel;
+use crate::model::ConfiguredModel;
 use crate::session::Session;
 use crate::tools::BackgroundTasks;
 use crate::workspace::Workspace;
@@ -101,7 +101,7 @@ fn persist_turn(persist: &PersistConfig, agent: &Agent, persisted: &mut usize) {
 pub struct Delegate {
     /// Subagents run on the role-routed model when configured, otherwise
     /// on the main model.
-    subagent_model: OpenAiModel,
+    subagent_model: ConfiguredModel,
     workspace: Workspace,
     /// Shared background slots (with bash): a background delegate occupies
     /// one slot and its completion is delivered as a background completion.
@@ -125,7 +125,7 @@ pub struct PersistConfig {
 }
 
 impl Delegate {
-    pub fn new(model: OpenAiModel, workspace: Workspace, background: BackgroundTasks) -> Self {
+    pub fn new(model: ConfiguredModel, workspace: Workspace, background: BackgroundTasks) -> Self {
         Self {
             subagent_model: model,
             workspace,
@@ -137,7 +137,7 @@ impl Delegate {
 
     /// Route subagents onto a different model (e.g. a cheaper profile from
     /// `[roles] subagent = "…"`). Without this they share the main model.
-    pub fn with_subagent_model(mut self, model: OpenAiModel) -> Self {
+    pub fn with_subagent_model(mut self, model: ConfiguredModel) -> Self {
         self.subagent_model = model;
         self
     }
@@ -168,7 +168,7 @@ impl Delegate {
     /// completion to the PARENT agent — it survives the subagent's end
     /// instead of being silently killed and forgotten.
     fn run_on_thread(
-        model: OpenAiModel,
+        model: ConfiguredModel,
         workspace: Workspace,
         background: BackgroundTasks,
         task: String,
@@ -570,13 +570,15 @@ mod tests {
         let workspace = Workspace::new(workspace).unwrap();
         // Construct the model with a dummy key directly: no request is ever
         // sent, and tests must not depend on (or mutate) process env.
-        let model = OpenAiModel::new(
-            "http://localhost".into(),
-            "test-key".into(),
-            "test-model".into(),
-            None,
-        )
-        .unwrap();
+        let model = ConfiguredModel::Chat(
+            crate::model::OpenAiModel::new(
+                "http://localhost".into(),
+                "test-key".into(),
+                "test-model".into(),
+                None,
+            )
+            .unwrap(),
+        );
         let (_, background) = builtins(workspace.clone());
         Delegate::new(model, workspace, background)
     }

@@ -1,4 +1,6 @@
 pub mod agent;
+pub mod codex;
+pub mod codex_auth;
 pub mod config;
 pub mod delegate;
 pub mod handle;

@@ -25,6 +25,7 @@ pub struct Config {
 
 #[derive(Deserialize)]
 struct Provider {
+    auth: Option<String>,
     base_url: Option<String>,
     api_key_file: Option<PathBuf>,
     api_key_env: Option<String>,
@@ -42,6 +43,13 @@ pub struct ResolvedModel {
     pub api_key: String,
     pub model: String,
     pub reasoning_effort: Option<String>,
+    pub auth: AuthMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMode {
+    ApiKey,
+    ChatGpt,
 }
 
 impl Config {
@@ -99,6 +107,26 @@ impl Config {
         let provider = self.providers.get(provider_name).ok_or_else(|| {
             anyhow!("provider `{provider_name}` for profile `{profile}` is not defined")
         })?;
+        if let Some(auth) = provider.auth.as_deref() {
+            if auth != "chatgpt" {
+                bail!("provider `{provider_name}` has unsupported auth `{auth}`");
+            }
+            if provider.base_url.is_some()
+                || provider.api_key_file.is_some()
+                || provider.api_key_env.is_some()
+            {
+                bail!(
+                    "provider `{provider_name}` with auth = `chatgpt` cannot set `base_url`, `api_key_file`, or `api_key_env`"
+                );
+            }
+            return Ok(ResolvedModel {
+                base_url: String::new(),
+                api_key: String::new(),
+                model,
+                reasoning_effort,
+                auth: AuthMode::ChatGpt,
+            });
+        }
         let base_url = provider
             .base_url
             .as_deref()
@@ -128,6 +156,7 @@ impl Config {
             api_key,
             model,
             reasoning_effort,
+            auth: AuthMode::ApiKey,
         })
     }
 
@@ -310,5 +339,50 @@ model = "k3"
                 .to_string()
                 .contains("requires exactly one of `api_key_file` or `api_key_env`")
         );
+    }
+
+    #[test]
+    fn resolves_chatgpt_and_rejects_mixed_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let good = write_config(
+            temp.path(),
+            r#"
+[providers.chatgpt]
+auth = "chatgpt"
+[models."chatgpt/codex"]
+model = "gpt-5.2-codex"
+"#,
+        );
+        let resolved = Config::from_path(&good)
+            .unwrap()
+            .resolve(Some("chatgpt/codex"))
+            .unwrap();
+        assert_eq!(resolved.auth, AuthMode::ChatGpt);
+        for field in [
+            "base_url = \"https://example.test\"",
+            "api_key_file = \"key\"",
+            "api_key_env = \"KEY\"",
+        ] {
+            let path = write_config(
+                temp.path(),
+                &format!(
+                    r#"
+[providers.chatgpt]
+auth = "chatgpt"
+{field}
+[models."chatgpt/codex"]
+model = "codex"
+"#
+                ),
+            );
+            assert!(
+                Config::from_path(&path)
+                    .unwrap()
+                    .resolve(Some("chatgpt/codex"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot set")
+            );
+        }
     }
 }

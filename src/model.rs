@@ -7,6 +7,36 @@ use std::time::Duration;
 use crate::agent::{
     AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
 };
+use crate::codex::CodexModel;
+
+/// The two concrete model wires e-agent supports. Keeping this enum concrete
+/// preserves the existing `Model` seam while making delegated clones exact.
+#[derive(Clone)]
+pub enum ConfiguredModel {
+    Chat(OpenAiModel),
+    Codex(CodexModel),
+}
+
+#[async_trait::async_trait]
+impl Model for ConfiguredModel {
+    fn name(&self) -> &str {
+        match self {
+            Self::Chat(model) => model.name(),
+            Self::Codex(model) => model.name(),
+        }
+    }
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        match self {
+            Self::Chat(model) => model.complete(messages, tools, on_delta).await,
+            Self::Codex(model) => model.complete(messages, tools, on_delta).await,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct OpenAiModel {
