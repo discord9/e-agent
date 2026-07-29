@@ -102,10 +102,35 @@ impl Model for OpenAiModel {
                 result => break result.map_err(request_error)?,
             }
         };
+        let mut response = response;
+        // Providers occasionally rate-limit a burst (main agent + a freshly
+        // spawned subagent firing together) with a bare 403 and no body.
+        // Back off and retry a couple of times before giving up.
+        for attempt in 1..=3 {
+            if response.status() != reqwest::StatusCode::FORBIDDEN {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(800 * attempt)).await;
+            response = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .bearer_auth(&self.api_key)
+                .json(&request)
+                .send()
+                .await
+                .map_err(request_error)?;
+        }
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("provider returned HTTP {status}: {}", preview(&body, 500));
+            anyhow::bail!(
+                "provider returned HTTP {status} (model={} effort={:?} msgs={} tools={}): {}",
+                self.model,
+                self.reasoning_effort,
+                messages.len(),
+                tools.len(),
+                preview(&body, 500)
+            );
         }
         let mut content = String::new();
         let mut reasoning = String::new();
