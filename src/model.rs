@@ -14,6 +14,7 @@ pub struct OpenAiModel {
     base_url: String,
     api_key: String,
     model: String,
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiModel {
@@ -25,13 +26,29 @@ impl OpenAiModel {
         let model = model
             .or_else(|| std::env::var("OPENAI_MODEL").ok())
             .unwrap_or_else(|| "gpt-4o-mini".into());
-        Self::with_timeout(base_url, api_key, model, Duration::from_secs(600))
+        Self::with_timeout(base_url, api_key, model, None, Duration::from_secs(600))
+    }
+
+    pub fn new(
+        base_url: String,
+        api_key: String,
+        model: String,
+        reasoning_effort: Option<String>,
+    ) -> anyhow::Result<Self> {
+        Self::with_timeout(
+            base_url,
+            api_key,
+            model,
+            reasoning_effort,
+            Duration::from_secs(600),
+        )
     }
 
     fn with_timeout(
         base_url: String,
         api_key: String,
         model: String,
+        reasoning_effort: Option<String>,
         timeout: Duration,
     ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
@@ -43,6 +60,7 @@ impl OpenAiModel {
             base_url: base_url.trim_end_matches('/').into(),
             api_key,
             model,
+            reasoning_effort,
         })
     }
 }
@@ -55,7 +73,12 @@ impl Model for OpenAiModel {
         tools: &[ToolSpec],
         mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
     ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
-        let request = ChatRequest::from_internal(&self.model, messages, tools);
+        let request = ChatRequest::from_internal(
+            &self.model,
+            self.reasoning_effort.as_deref(),
+            messages,
+            tools,
+        );
         let mut retried = false;
         let response = loop {
             let result = self
@@ -156,15 +179,23 @@ fn request_error(error: reqwest::Error) -> anyhow::Error {
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
     model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     messages: Vec<WireMessage>,
     tools: Vec<WireTool<'a>>,
     stream: bool,
 }
 
 impl<'a> ChatRequest<'a> {
-    fn from_internal(model: &str, messages: &[Message], tools: &'a [ToolSpec]) -> Self {
+    fn from_internal(
+        model: &str,
+        reasoning_effort: Option<&str>,
+        messages: &[Message],
+        tools: &'a [ToolSpec],
+    ) -> Self {
         Self {
             model: model.into(),
+            reasoning_effort: reasoning_effort.map(str::to_owned),
             messages: messages.iter().map(WireMessage::from_internal).collect(),
             tools: tools
                 .iter()
@@ -381,6 +412,7 @@ mod tests {
         }];
         let request = ChatRequest::from_internal(
             "test-model",
+            None,
             &[
                 Message::Assistant(AssistantMessage {
                     content: None,
@@ -415,6 +447,7 @@ mod tests {
     fn omits_empty_tool_calls_on_plain_assistant_messages() {
         let request = ChatRequest::from_internal(
             "test-model",
+            None,
             &[Message::Assistant(AssistantMessage {
                 content: Some("done".into()),
                 tool_calls: vec![],
@@ -425,6 +458,20 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["messages"][0]["content"], "done");
         assert!(value["messages"][0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn serializes_reasoning_effort_at_the_top_level() {
+        let request = ChatRequest::from_internal("test-model", Some("max"), &[], &[]);
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn omits_reasoning_effort_when_unset() {
+        let request = ChatRequest::from_internal("test-model", None, &[], &[]);
+        let value = serde_json::to_value(request).unwrap();
+        assert!(value.get("reasoning_effort").is_none());
     }
 
     async fn read_request(stream: &mut TcpStream) -> serde_json::Value {
@@ -500,6 +547,7 @@ mod tests {
             format!("http://{address}/v1"),
             "test-key".into(),
             "test-model".into(),
+            None,
             Duration::from_secs(1),
         )
         .unwrap();
@@ -539,6 +587,7 @@ mod tests {
     fn wire_messages_never_echo_reasoning() {
         let request = ChatRequest::from_internal(
             "test-model",
+            None,
             &[Message::Assistant(AssistantMessage {
                 content: Some("done".into()),
                 tool_calls: vec![],
@@ -570,6 +619,7 @@ mod tests {
             format!("http://{address}/v1"),
             "test-key".into(),
             "test-model".into(),
+            None,
             Duration::from_millis(50),
         )
         .unwrap();
@@ -608,6 +658,7 @@ mod tests {
             format!("http://{address}/v1"),
             "test-key".into(),
             "test-model".into(),
+            None,
             Duration::from_millis(100),
         )
         .unwrap();
@@ -672,6 +723,7 @@ mod tests {
             format!("http://{address}/v1"),
             "test-key".into(),
             "test-model".into(),
+            None,
             Duration::from_secs(1),
         )
         .unwrap();

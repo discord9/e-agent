@@ -7,6 +7,38 @@ the model's final answer.
 
 ## Run
 
+The usual setup needs no environment variables. Create
+`$XDG_CONFIG_HOME/e-agent/config.toml` (or, when that is unset or absent,
+`$HOME/.config/e-agent/config.toml`):
+
+```toml
+default = "kimi/k3"
+
+[providers.kimi]
+base_url = "https://api.kimi.com/coding/v1"
+api_key_file = "kimi-key" # absolute or relative to this config file
+# Alternatively: api_key_env = "KIMI_API_KEY"
+
+[models."kimi/k3"]
+model = "k3"
+# Optional: Kimi Coding k3 accepts "low", "high", or "max".
+reasoning_effort = "high"
+```
+
+Provider names are inferred from the part of the profile before `/`. Each
+provider needs exactly one of `api_key_file` or `api_key_env`; key files are
+trimmed and must not be empty. `reasoning_effort` is an optional pass-through
+request field with no CLI or environment override. For Kimi Coding `k3`, its
+canonical values are `low`, `high`, and `max`; omitting it uses Kimi Coding's
+`high` default. Other providers may define different values. Then run:
+
+```sh
+cargo run -- "inspect src/main.rs and explain it"
+```
+
+Without a TOML config, e-agent keeps its existing OpenAI environment-variable
+mode:
+
 ```sh
 export OPENAI_API_KEY=...
 export OPENAI_BASE_URL=https://api.openai.com/v1
@@ -23,8 +55,11 @@ an append-only log of message and compaction entries; the whole history is
 restored and replayed in the TUI on startup, while the model only sees the
 latest compaction summary and everything after it. Legacy `.json` sessions
 are migrated on first load. Optional CLI overrides are `--base-url URL`,
-`--model MODEL`, `--workspace PATH`, `--session NAME`, and `--max-rounds N`
+`--model MODEL`, `--profile PROFILE`, `--workspace PATH`, `--session NAME`, and `--max-rounds N`
 (tool-call rounds are unlimited by default; the flag sets an explicit cap).
+`--profile` selects a TOML profile and requires a TOML config. When config is
+used, `--base-url` and `--model` are raw API wire-value overrides and take
+precedence over the selected profile values.
 
 Keys in the TUI: Esc always leaves the current view — it detaches from a
 subagent view, closes the tasks panel, or (at the plain idle prompt) quits
@@ -77,7 +112,7 @@ Each subagent runs on its own OS thread with its own tokio runtime, its own
 background-task slots, and an empty history — it shares no state with the
 parent. It gets only the builtin file/bash tools: no MCP tools and no
 `delegate` itself, so delegation depth is capped at 1 by construction. It is
-limited to 32 tool rounds (same as the main agent).
+limited to 32 tool rounds.
 
 With `background: true` the subagent runs without blocking and its answer is
 delivered as a background task completion (waking an idle agent). Sync mode
@@ -129,10 +164,15 @@ supported — no resources, prompts, or server-initiated notifications.
 
 ## Environment
 
-- `OPENAI_API_KEY` — required API key.
+- `OPENAI_API_KEY` — required in environment-variable mode.
 - `OPENAI_BASE_URL` — API base URL, default: `https://api.openai.com/v1`.
 - `OPENAI_MODEL` — model name, default: `gpt-4o-mini`.
 - `RUST_BACKTRACE=1` — optional; appends a backtrace to printed error chains.
+
+TOML config is optional. When present, it supplies the selected provider
+credential and profile values instead of `OPENAI_*`; see [Run](#run). A
+provider using `api_key_env` reads the variable named by that field (for
+example, `KIMI_API_KEY`).
 
 Errors print their causal chain (for example `cannot decode provider
 response: error decoding response body: ...`), and provider HTTP failures
@@ -145,6 +185,9 @@ This is deliberately not a daemon, JSONL protocol,
 automatic compaction trigger, database, event store, subagent
 framework, permission framework, plugin host, multi-provider client,
 parallel tool executor, task scheduler, priority system, or concurrency pool.
+It deliberately does not fetch provider/model catalogs (including
+models.dev), generate configuration, cache provider metadata, or infer
+context windows; TOML profiles are local static settings only.
 Subagents exist but are deliberately minimal: no agent-to-agent messaging,
 no delegation deeper than 1 level, no subagent session persistence, no
 process-level isolation yet (subagents are threads, not subprocesses).
@@ -152,6 +195,7 @@ It does speak MCP to local stdio servers (tools only), but it does NOT do
 remote MCP over HTTP/SSE, OAuth, MCP resources/prompts, server-initiated
 notifications, `listChanged` refresh, server restart on crash, or concurrent
 server initialization.
-It has one model seam, one tool seam, and a configurable tool-round limit
-(default 32). Reasoning-model `reasoning_content` is persisted in the session
-for display/audit; it is never sent back to the API.
+It has one model seam and one tool seam. Main-agent tool rounds are unlimited
+unless `--max-rounds` sets an explicit cap; subagents remain capped at 32.
+Reasoning-model `reasoning_content` is persisted in the session for
+display/audit; it is never sent back to the API.

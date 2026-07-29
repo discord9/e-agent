@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod config;
 pub mod delegate;
 pub mod handle;
 pub mod mcp;

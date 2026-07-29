@@ -2,6 +2,7 @@ use std::io::{IsTerminal, Read, Write};
 
 use anyhow::{Context, anyhow};
 use e_agent::agent::{Agent, AgentEvent, preview};
+use e_agent::config::Config;
 use e_agent::delegate::Delegate;
 use e_agent::mcp;
 use e_agent::model::OpenAiModel;
@@ -22,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     let mut base_url = None;
     let mut model = None;
+    let mut profile = None;
     let mut workspace = None;
     let mut session: Option<String> = None;
     let mut max_rounds = None;
@@ -32,6 +34,7 @@ async fn run() -> anyhow::Result<()> {
         match argument.as_str() {
             "--base-url" => base_url = Some(next_value(&mut arguments, "--base-url")?),
             "--model" => model = Some(next_value(&mut arguments, "--model")?),
+            "--profile" => profile = Some(next_value(&mut arguments, "--profile")?),
             "--workspace" => workspace = Some(next_value(&mut arguments, "--workspace")?),
             "--session" | "-s" => session = Some(next_value(&mut arguments, "--session")?),
             "--max-rounds" => {
@@ -44,7 +47,7 @@ async fn run() -> anyhow::Result<()> {
             "--repl" => repl_mode = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: e-agent [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--max-rounds N] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup)"
+                    "usage: e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--max-rounds N] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup)"
                 );
                 return Ok(());
             }
@@ -86,7 +89,25 @@ async fn run() -> anyhow::Result<()> {
             id
         }
     };
-    let model = OpenAiModel::from_env(base_url, model)?;
+    let model = match Config::load()? {
+        Some(config) => {
+            let configured = config.resolve(profile.as_deref())?;
+            OpenAiModel::new(
+                base_url.unwrap_or(configured.base_url),
+                configured.api_key,
+                model.unwrap_or(configured.model),
+                configured.reasoning_effort,
+            )?
+        }
+        None => {
+            if profile.is_some() {
+                return Err(anyhow!(
+                    "--profile requires a config file at $XDG_CONFIG_HOME/e-agent/config.toml or $HOME/.config/e-agent/config.toml"
+                ));
+            }
+            OpenAiModel::from_env(base_url, model)?
+        }
+    };
     let (mut tools, background) = builtins(workspace.clone());
     let (mcp_tools, mcp_instructions) = mcp::connect_all(&root).await;
     tools.extend(mcp_tools);
