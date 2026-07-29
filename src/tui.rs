@@ -864,8 +864,17 @@ fn draw<B: ratatui::backend::Backend>(
                 .iter()
                 .flat_map(|line| {
                     if line.kind == LineKind::Normal {
-                        let spans = markdown.render_line(&line.text);
-                        crate::markdown::wrap_spans(&spans, inner_width)
+                        // A Normal line may embed newlines (replayed content,
+                        // a non-streamed final answer); split them so each
+                        // becomes its own visual row. The code-fence state
+                        // still carries across these segments.
+                        line.text
+                            .split('\n')
+                            .flat_map(|segment| {
+                                let spans = markdown.render_line(segment);
+                                crate::markdown::wrap_spans(&spans, inner_width)
+                            })
+                            .collect::<Vec<Line>>()
                     } else {
                         hard_wrap(&line.text, inner_width)
                             .into_iter()
@@ -2246,6 +2255,39 @@ mod tests {
         // The code-block line sits on the element (panel) background.
         let code_row_y = 3; // "## Summary", inline line, fence, then code
         assert_eq!(buffer[(0, code_row_y)].bg, SOLARIZED_LIGHT.element);
+    }
+
+    #[test]
+    fn markdown_preserves_embedded_newlines_across_a_code_block() {
+        // A Normal line embedding newlines must render one visual row per
+        // segment (no collapsed newlines), and the code fence opened on one
+        // segment still applies to the next.
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        state.push_line(
+            "before\n```\ncode line\n```\nafter".into(),
+            LineKind::Normal,
+        );
+        draw(&mut terminal, &mut state).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..40)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        };
+        assert_eq!(row_text(0), "before");
+        assert_eq!(row_text(1), "```");
+        assert_eq!(row_text(2), "code line");
+        assert_eq!(row_text(3), "```");
+        assert_eq!(row_text(4), "after");
+        // The code line keeps the panel background from the still-open fence.
+        assert_eq!(buffer[(0, 2)].bg, SOLARIZED_LIGHT.element);
+        // Lines after the fence close are back on the body background.
+        assert_eq!(buffer[(0, 4)].bg, SOLARIZED_LIGHT.background);
     }
 
     #[test]
