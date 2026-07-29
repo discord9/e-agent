@@ -19,7 +19,20 @@ const OUTPUT_LIMIT: usize = 64 * 1024;
 /// other tools (e.g. delegate) can schedule background work too.
 pub fn builtins(workspace: Workspace) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
     let background = BackgroundTasks::new(Duration::from_secs(30 * 60));
-    let tools: Vec<Box<dyn Tool>> = vec![
+    let mut tools = file_tools(&workspace);
+    tools.push(Box::new(Bash {
+        workspace,
+        timeout: Duration::from_secs(30),
+        background: background.clone(),
+    }));
+    (tools, background)
+}
+
+/// File tools only; the bash tool is added by the caller so it can be
+/// bound to a shared [`BackgroundTasks`] (subagents share the parent's
+/// slots so their background completions reach the parent agent).
+pub fn file_tools(workspace: &Workspace) -> Vec<Box<dyn Tool>> {
+    vec![
         Box::new(ReadFile {
             workspace: workspace.clone(),
         }),
@@ -29,13 +42,16 @@ pub fn builtins(workspace: Workspace) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
         Box::new(EditFile {
             workspace: workspace.clone(),
         }),
-        Box::new(Bash {
-            workspace,
-            timeout: Duration::from_secs(30),
-            background: background.clone(),
-        }),
-    ];
-    (tools, background)
+    ]
+}
+
+/// A bash tool bound to a shared background-task registry.
+pub fn bash_tool(workspace: Workspace, background: BackgroundTasks) -> Box<dyn Tool> {
+    Box::new(Bash {
+        workspace,
+        timeout: Duration::from_secs(30),
+        background,
+    })
 }
 
 struct ReadFile {
@@ -196,6 +212,10 @@ impl Tool for Bash {
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
         self.background.sender = Some(sender);
+    }
+
+    fn has_event_sender(&self) -> bool {
+        self.background.sender.is_some()
     }
 }
 

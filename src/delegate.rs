@@ -31,7 +31,7 @@ use crate::agent::{Agent, AgentEvent, Tool, ToolSpec, preview};
 use crate::handle::{SessionHandle, SessionSink, SessionSource, Steer, session_channel};
 use crate::model::OpenAiModel;
 use crate::session::Session;
-use crate::tools::{BackgroundTasks, builtins};
+use crate::tools::BackgroundTasks;
 use crate::workspace::Workspace;
 
 /// Maximum rounds a subagent may take before giving up. Aligned with the
@@ -161,9 +161,16 @@ impl Delegate {
     /// from snapshot + stream) and it accepts steering — queued prompts
     /// become fresh turns, cancel drops the in-flight turn. Sync mode
     /// passes None and keeps the original single-turn behaviour.
+    ///
+    /// The subagent's bash tool shares the parent's `background` registry,
+    /// so a background bash command started by a subagent occupies a shared
+    /// slot, shows up in the parent's task panel, and delivers its
+    /// completion to the PARENT agent — it survives the subagent's end
+    /// instead of being silently killed and forgotten.
     fn run_on_thread(
         model: OpenAiModel,
         workspace: Workspace,
+        background: BackgroundTasks,
         task: String,
         steering: Option<(SessionSink, SessionSource)>,
         persist: Option<PersistConfig>,
@@ -178,7 +185,8 @@ impl Delegate {
                 Err(error) => return format!("cannot build subagent runtime: {error}"),
             };
             runtime.block_on(async move {
-                let (tools, _) = builtins(workspace);
+                let mut tools = crate::tools::file_tools(&workspace);
+                tools.push(crate::tools::bash_tool(workspace, background));
                 let mut agent =
                     Agent::new(Box::new(model), tools).max_tool_rounds(SUBAGENT_MAX_ROUNDS);
                 // A bare single-user-message request is rejected by some
@@ -344,6 +352,7 @@ impl Tool for Delegate {
         if background {
             let model = self.subagent_model.clone();
             let workspace = self.workspace.clone();
+            let background = self.background.clone();
             let label = preview(&task, 100);
             let (handle, sink, source) = session_channel();
             let session: Arc<dyn SessionHandle> = Arc::new(handle.clone());
@@ -369,7 +378,14 @@ impl Tool for Delegate {
                 },
                 move || async move {
                     let output = tokio::task::spawn_blocking(move || {
-                        Self::run_on_thread(model, workspace, task, Some((sink, source)), persist)
+                        Self::run_on_thread(
+                            model,
+                            workspace,
+                            background,
+                            task,
+                            Some((sink, source)),
+                            persist,
+                        )
                     })
                     .await
                     .unwrap_or_else(|error| format!("subagent blocking task failed: {error}"));
@@ -383,12 +399,13 @@ impl Tool for Delegate {
 
         let model = self.subagent_model.clone();
         let workspace = self.workspace.clone();
+        let background = self.background.clone();
         let persist = self.persist_root.clone().map(|root| PersistConfig {
             root,
             session_id: crate::session::new_id_prefixed("sub-"),
         });
         let handle = tokio::task::spawn_blocking(move || {
-            Self::run_on_thread(model, workspace, task, None, persist)
+            Self::run_on_thread(model, workspace, background, task, None, persist)
         });
         match tokio::time::timeout(SYNC_TIMEOUT, handle).await {
             Ok(Ok(answer)) => Ok(answer),
@@ -405,6 +422,7 @@ impl Tool for Delegate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::builtins;
 
     #[test]
     fn registry_tracks_live_sessions() {
@@ -468,5 +486,35 @@ mod tests {
         let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
         assert!(!names.contains(&"delegate".to_owned()));
         assert!(names.contains(&"bash".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn shared_background_bash_completion_reaches_the_parent_channel() {
+        // A bash tool bound to the parent's BackgroundTasks keeps that
+        // sender when wrapped in an Agent (Agent::new must not retarget
+        // it): a background command's completion arrives on the parent's
+        // channel even after the subagent is dropped. End-to-end subagent
+        // behaviour is covered by agent.rs's shared-sender test; here we
+        // pin the wiring used by run_on_thread.
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+        let (_, mut parent_background) = builtins(workspace.clone());
+        let (parent_sender, mut parent_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        parent_background.set_event_sender(parent_sender);
+
+        let started = parent_background
+            .start(workspace, "echo shared".into())
+            .unwrap();
+        assert!(started.starts_with("started background task"));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), parent_receiver.recv())
+            .await
+            .expect("parent channel got the completion")
+            .unwrap();
+        assert!(matches!(
+            event,
+            AgentEvent::BackgroundCompleted { output, .. } if output.contains("shared")
+        ));
     }
 }

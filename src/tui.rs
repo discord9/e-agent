@@ -72,7 +72,7 @@ const SOLARIZED_LIGHT: Palette = Palette {
     element: Color::Rgb(238, 232, 213),                             // #eee8d5
     selection: Color::Rgb(230, 223, 200),                           // #e6dfc8
     subtle: Color::Rgb(216, 207, 184),                              // #d8cfb8
-    text: Color::Rgb(101, 123, 131),                                // #657b83
+    text: Color::Rgb(0, 43, 54),                                    // #002b36
     muted: Color::Rgb(147, 161, 161),                               // #93a1a1
     blue: Color::Rgb(38, 139, 210),                                 // #268bd2
     cyan: Color::Rgb(42, 161, 152),                                 // #2aa198

@@ -174,6 +174,12 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn execute(&self, arguments: Value) -> Result<String, String>;
     fn set_event_sender(&mut self, _sender: mpsc::UnboundedSender<AgentEvent>) {}
+    /// True when the tool already delivers background completions through a
+    /// channel of its own (e.g. bound to a shared registry); Agent::new
+    /// leaves such tools alone.
+    fn has_event_sender(&self) -> bool {
+        false
+    }
 }
 
 pub struct Agent {
@@ -203,7 +209,12 @@ impl Agent {
     pub fn new(model: Box<dyn Model>, mut tools: Vec<Box<dyn Tool>>) -> Self {
         let (background_sender, background_receiver) = mpsc::unbounded_channel();
         for tool in &mut tools {
-            tool.set_event_sender(background_sender.clone());
+            // Tools already wired to a shared completion channel (e.g. a
+            // subagent's bash bound to the parent's BackgroundTasks) keep
+            // their sender: their completions belong to the parent agent.
+            if !tool.has_event_sender() {
+                tool.set_event_sender(background_sender.clone());
+            }
         }
         Self {
             model,
@@ -1477,5 +1488,44 @@ mod tests {
                 AgentEvent::AssistantDelta("mary".into()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn new_keeps_an_already_wired_event_sender() {
+        // Subagents bind their bash tool to the PARENT's BackgroundTasks
+        // (already wired to the parent's channel). Agent::new must not
+        // retarget such a tool to the subagent's own channel, or the
+        // completion would die with the subagent.
+        struct PreWired;
+        #[async_trait]
+        impl Tool for PreWired {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "prewired".into(),
+                    description: "already has a sender".into(),
+                    parameters: json!({"type": "object"}),
+                }
+            }
+            async fn execute(&self, _: Value) -> Result<String, String> {
+                Ok("ok".into())
+            }
+            fn set_event_sender(&mut self, _: mpsc::UnboundedSender<AgentEvent>) {
+                panic!("Agent::new must not retarget a pre-wired tool");
+            }
+            fn has_event_sender(&self) -> bool {
+                true
+            }
+        }
+        let model = ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        };
+        let mut agent = Agent::new(Box::new(model), vec![Box::new(PreWired)]);
+        assert_eq!(agent.run("go".into()).await.unwrap(), "done");
     }
 }
