@@ -169,6 +169,7 @@ async fn run_inner(
     });
     let mut events = EventStream::new();
     let mut state = TuiState::from_history(agent.history());
+    state.session_id = session_name.to_owned();
     state.background = Some(background);
     let probe = sessions.clone();
     state.attachable = Some(Box::new(move |id| probe.get(id).is_some()));
@@ -697,9 +698,9 @@ fn draw<B: ratatui::backend::Backend>(
                 return;
             }
             let title = if state.thinking {
-                "thinking…"
+                format!("{} · thinking…", state.session_id)
             } else {
-                "input"
+                state.session_id.clone()
             };
             let input_block = Block::default().borders(Borders::ALL).title(title);
             let usage = (state.tokens.context > 0).then(|| {
@@ -802,6 +803,9 @@ fn wrapped_rows(lines: &[DisplayLine], width: u16) -> usize {
 
 #[derive(Default)]
 struct TuiState {
+    /// This session's id, shown in the input border (so it can be resumed
+    /// later with --session).
+    session_id: String,
     input: InputBuffer,
     lines: Vec<DisplayLine>,
     scroll: usize,

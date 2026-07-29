@@ -23,7 +23,7 @@ async fn run() -> anyhow::Result<()> {
     let mut base_url = None;
     let mut model = None;
     let mut workspace = None;
-    let mut session = "default".to_owned();
+    let mut session: Option<String> = None;
     let mut max_rounds = None;
     let mut repl_mode = false;
     let mut prompt = Vec::new();
@@ -33,7 +33,7 @@ async fn run() -> anyhow::Result<()> {
             "--base-url" => base_url = Some(next_value(&mut arguments, "--base-url")?),
             "--model" => model = Some(next_value(&mut arguments, "--model")?),
             "--workspace" => workspace = Some(next_value(&mut arguments, "--workspace")?),
-            "--session" => session = next_value(&mut arguments, "--session")?,
+            "--session" | "-s" => session = Some(next_value(&mut arguments, "--session")?),
             "--max-rounds" => {
                 max_rounds = Some(
                     next_value(&mut arguments, "--max-rounds")?
@@ -44,7 +44,7 @@ async fn run() -> anyhow::Result<()> {
             "--repl" => repl_mode = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: e-agent [--base-url URL] [--model MODEL] [--workspace PATH] [--session NAME] [--max-rounds N] [--repl] [PROMPT]"
+                    "usage: e-agent [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--max-rounds N] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup)"
                 );
                 return Ok(());
             }
@@ -69,6 +69,23 @@ async fn run() -> anyhow::Result<()> {
     .map_err(anyhow::Error::msg)
     .context("cannot open workspace")?;
     let root = workspace.root().to_path_buf();
+    // Migrate pre-session-id files (the old implicit `default` session and
+    // task-id-named subagent files) to unique ids before anything loads.
+    for (old, new) in e_agent::session::migrate_legacy(&root) {
+        eprintln!("e-agent: migrated session {old} -> {new}");
+    }
+    let session = match session {
+        Some(name) => name,
+        None => {
+            let id = e_agent::session::new_id();
+            // TUI mode shows the id in the input border instead (printing
+            // here would pollute the screen before the alternate screen).
+            if !tui_mode {
+                eprintln!("e-agent: session {id}");
+            }
+            id
+        }
+    };
     let model = OpenAiModel::from_env(base_url, model)?;
     let (mut tools, background) = builtins(workspace.clone());
     let (mcp_tools, mcp_instructions) = mcp::connect_all(&root).await;
