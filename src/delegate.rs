@@ -778,8 +778,18 @@ mod tests {
     }
 
     #[tokio::test]
+    // Test-only env isolation: the std Mutex guard is held across .execute()
+    // awaits to serialize XDG_CONFIG_HOME mutation with roles.rs tests. The
+    // critical sections are short and never contend in practice.
+    #[allow(clippy::await_holding_lock)]
     async fn role_requires_a_roles_root_and_a_known_role() {
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
+        // Isolate from the developer's real global agents directory.
+        let xdg = temp.path().join("xdg-empty");
+        std::fs::create_dir_all(&xdg).unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
         // No roles root: any role is rejected.
         let plain = delegate(temp.path());
         assert!(
@@ -798,8 +808,8 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("unknown role `fixer`"), "{error}");
 
-        // A template on disk makes the role valid (its spec lists it).
-        let directory = temp.path().join(".e-agent/agents");
+        // A template on disk (workspace `agents/`) makes the role valid.
+        let directory = temp.path().join("agents");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("fixer.md"), "You fix things.").unwrap();
         let spec = rooted.spec();
@@ -807,6 +817,8 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(roles, &vec![json!("fixer")]);
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
     #[tokio::test]

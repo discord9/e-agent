@@ -190,6 +190,16 @@ impl Config {
     }
 }
 
+/// The user-level config directory (`$XDG_CONFIG_HOME/e-agent` or
+/// `~/.config/e-agent`), without requiring a `config.toml` to exist. Used by
+/// roles.rs to locate the global agents directory.
+pub fn config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(xdg).join("e-agent"));
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/e-agent"))
+}
+
 fn config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
