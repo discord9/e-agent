@@ -345,7 +345,6 @@ async fn run_inner(
                     inbox: &mut inbox,
                     sessions: &sessions,
                     sender: &sender,
-                    forward: &forward,
                 };
                 if run_request(
                     terminal,
@@ -368,7 +367,6 @@ async fn run_inner(
                         inbox: &mut inbox,
                         sessions: &sessions,
                         sender: &sender,
-                        forward: &forward,
                     };
                     if run_request(
                         terminal,
@@ -481,7 +479,6 @@ async fn run_inner(
                         inbox: &mut inbox,
                         sessions: &sessions,
                         sender: &sender,
-                        forward: &forward,
                     };
                     if run_request(
                         terminal,
@@ -504,7 +501,6 @@ async fn run_inner(
                             inbox: &mut inbox,
                             sessions: &sessions,
                             sender: &sender,
-                            forward: &forward,
                         };
                         if run_request(
                             terminal,
@@ -545,8 +541,6 @@ struct Ui<'a> {
     inbox: &'a mut mpsc::UnboundedReceiver<UiEvent>,
     sessions: &'a Sessions,
     sender: &'a mpsc::UnboundedSender<UiEvent>,
-    /// Per-turn event forwarder; re-armed on the agent for follow-up turns.
-    forward: &'a mpsc::UnboundedSender<AgentEvent>,
 }
 
 async fn run_request(
@@ -557,56 +551,43 @@ async fn run_request(
     prompt: String,
 ) -> anyhow::Result<bool> {
     let (root, session_name, persisted) = session;
-    let mut prompt = prompt;
-    loop {
-        ui.state.busy = Some(BusyState::thinking());
-        ui.state.streamed = false;
-        draw(terminal, ui.state)?;
-        let (result, interruption) = drive(
-            terminal,
-            ui.state,
-            ui.events,
-            ui.inbox,
-            ui.sessions,
-            ui.sender,
-            agent.run(std::mem::take(&mut prompt)),
-        )
-        .await?;
-        ui.state.busy = None;
-        while let Ok(event) = ui.inbox.try_recv() {
-            ui.state.push_event(event);
-        }
-        if let Some(result) = result {
-            match result {
-                Ok(answer) => ui.state.push_final_answer(answer),
-                Err(error) => ui
-                    .state
-                    .push_line(format!("error: {error:#}"), LineKind::ToolError),
-            }
-        }
-        if matches!(interruption, Some(Interruption::CancelTurn)) {
-            ui.state.push_line("cancelled".into(), LineKind::Dim);
-            ui.state.collapse_queue();
-        }
-        Session::append(root, session_name, &agent.history()[*persisted..])?;
-        *persisted = agent.history().len();
-        ui.state.follow();
-        draw(terminal, ui.state)?;
-        if matches!(interruption, Some(Interruption::ExitApp)) {
-            return Ok(true);
-        }
-        // A background task finished during the turn: the completion is now
-        // in the history but the model has not reacted. Run a follow-up
-        // empty turn so it responds immediately instead of after the next
-        // user prompt.
-        if agent.has_unanswered_background()
-            && !matches!(interruption, Some(Interruption::CancelTurn))
-        {
-            agent.subscribe(ui.forward.clone());
-            continue;
-        }
-        return Ok(false);
+    ui.state.busy = Some(BusyState::thinking());
+    ui.state.streamed = false;
+    draw(terminal, ui.state)?;
+    // Agent::run keeps turning until the model has reacted to every
+    // background completion that arrived along the way, so one drive()
+    // covers any completion-triggered follow-up turns too.
+    let (result, interruption) = drive(
+        terminal,
+        ui.state,
+        ui.events,
+        ui.inbox,
+        ui.sessions,
+        ui.sender,
+        agent.run(prompt),
+    )
+    .await?;
+    ui.state.busy = None;
+    while let Ok(event) = ui.inbox.try_recv() {
+        ui.state.push_event(event);
     }
+    if let Some(result) = result {
+        match result {
+            Ok(answer) => ui.state.push_final_answer(answer),
+            Err(error) => ui
+                .state
+                .push_line(format!("error: {error:#}"), LineKind::ToolError),
+        }
+    }
+    if matches!(interruption, Some(Interruption::CancelTurn)) {
+        ui.state.push_line("cancelled".into(), LineKind::Dim);
+        ui.state.collapse_queue();
+    }
+    Session::append(root, session_name, &agent.history()[*persisted..])?;
+    *persisted = agent.history().len();
+    ui.state.follow();
+    draw(terminal, ui.state)?;
+    Ok(matches!(interruption, Some(Interruption::ExitApp)))
 }
 
 enum Interruption {
