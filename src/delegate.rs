@@ -99,7 +99,9 @@ fn persist_turn(persist: &PersistConfig, agent: &Agent, persisted: &mut usize) {
 }
 
 pub struct Delegate {
-    model: OpenAiModel,
+    /// Subagents run on the role-routed model when configured, otherwise
+    /// on the main model.
+    subagent_model: OpenAiModel,
     workspace: Workspace,
     /// Shared background slots (with bash): a background delegate occupies
     /// one slot and its completion is delivered as a background completion.
@@ -125,12 +127,19 @@ pub struct PersistConfig {
 impl Delegate {
     pub fn new(model: OpenAiModel, workspace: Workspace, background: BackgroundTasks) -> Self {
         Self {
-            model,
+            subagent_model: model,
             workspace,
             background,
             sessions: Sessions::default(),
             persist_root: None,
         }
+    }
+
+    /// Route subagents onto a different model (e.g. a cheaper profile from
+    /// `[roles] subagent = "…"`). Without this they share the main model.
+    pub fn with_subagent_model(mut self, model: OpenAiModel) -> Self {
+        self.subagent_model = model;
+        self
     }
 
     /// Persist each subagent's history into its own session file, named by
@@ -159,6 +168,7 @@ impl Delegate {
         steering: Option<(SessionSink, SessionSource)>,
         persist: Option<PersistConfig>,
     ) -> String {
+        let role = model.name().to_owned();
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -175,12 +185,11 @@ impl Delegate {
                 // providers (kimi k3 answers HTTP 403 to `msgs=1`); give the
                 // subagent a minimal system prompt so its first call always
                 // carries a system + user pair.
-                agent.set_context_prefix(
-                    "You are a subagent inside the e-agent coding assistant. Work \
-                     autonomously on the delegated task with the file/bash tools, \
-                     then return a concise final answer."
-                        .into(),
-                );
+                agent.set_context_prefix(format!(
+                    "You are a subagent inside the e-agent coding assistant (running on the \
+                     `{role}` model). Work autonomously on the delegated task with the \
+                     file/bash tools, then return a concise final answer."
+                ));
                 let (sink, mut source) = match steering {
                     Some((sink, source)) => {
                         agent.observe(sink.clone());
@@ -290,15 +299,21 @@ impl Delegate {
 #[async_trait]
 impl Tool for Delegate {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "delegate".into(),
-            description: "Spawn a subagent with a fresh context to work on a task and return its \
+        let mut description =
+            "Spawn a subagent with a fresh context to work on a task and return its \
                 final answer. Use this for self-contained subtasks (searching, reading many files, \
                 focused edits) whose intermediate steps would clutter your own context. The \
-                subagent has the file and bash tools but cannot delegate further. With \
-                `background: true` it runs without blocking; the answer arrives as a \
-                background task completion."
-                .into(),
+                subagent has the file and bash tools but cannot delegate further."
+                .to_owned();
+        let model = self.subagent_model.name();
+        description.push_str(&format!(" The subagent runs on the `{model}` model."));
+        description.push_str(
+            " With `background: true` it runs without blocking; the answer arrives as a \
+                background task completion.",
+        );
+        ToolSpec {
+            name: "delegate".into(),
+            description,
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -327,7 +342,7 @@ impl Tool for Delegate {
             .unwrap_or(false);
 
         if background {
-            let model = self.model.clone();
+            let model = self.subagent_model.clone();
             let workspace = self.workspace.clone();
             let label = preview(&task, 100);
             let (handle, sink, source) = session_channel();
@@ -366,7 +381,7 @@ impl Tool for Delegate {
             );
         }
 
-        let model = self.model.clone();
+        let model = self.subagent_model.clone();
         let workspace = self.workspace.clone();
         let persist = self.persist_root.clone().map(|root| PersistConfig {
             root,

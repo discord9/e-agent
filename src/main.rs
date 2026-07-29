@@ -1,7 +1,7 @@
 use std::io::{IsTerminal, Read, Write};
 
 use anyhow::{Context, anyhow};
-use e_agent::agent::{Agent, AgentEvent, Model, preview};
+use e_agent::agent::{Agent, AgentEvent, preview};
 use e_agent::config::Config;
 use e_agent::delegate::Delegate;
 use e_agent::mcp;
@@ -110,12 +110,34 @@ async fn run() -> anyhow::Result<()> {
         }
     };
     let model_name = model.name().to_owned();
+    let subagent_model = match &config {
+        Some(config) => config
+            .resolve_role("subagent")
+            .context("cannot resolve [roles] subagent profile")?
+            .map(|resolved| {
+                OpenAiModel::new(
+                    resolved.base_url,
+                    resolved.api_key,
+                    resolved.model,
+                    resolved.reasoning_effort,
+                )
+            })
+            .transpose()?,
+        None => None,
+    };
     let (mut tools, background) = builtins(workspace.clone());
     let mcp_servers = config.map(|config| config.mcp).unwrap_or_default();
     let (mcp_tools, mcp_instructions) = mcp::connect_all(mcp_servers, &root).await;
     tools.extend(mcp_tools);
-    let delegate =
+    let mut delegate =
         Delegate::new(model.clone(), workspace, background.clone()).persist_sessions(root.clone());
+    if let Some(subagent_model) = subagent_model {
+        let name = subagent_model.name().to_owned();
+        delegate = delegate.with_subagent_model(subagent_model);
+        if !tui_mode {
+            eprintln!("e-agent: subagent model {name}");
+        }
+    }
     let subagent_sessions = delegate.sessions();
     tools.push(Box::new(delegate));
     let mut agent = Agent::new(Box::new(model), tools);

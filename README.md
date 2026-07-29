@@ -30,7 +30,21 @@ provider needs exactly one of `api_key_file` or `api_key_env`; key files are
 trimmed and must not be empty. `reasoning_effort` is an optional pass-through
 request field with no CLI or environment override. For Kimi Coding `k3`, its
 canonical values are `low`, `high`, and `max`; omitting it uses Kimi Coding's
-`high` default. Other providers may define different values. Then run:
+`high` default. Other providers may define different values.
+
+Built-in roles can be routed to a different profile with `[roles]`. The only
+role today is `subagent` (the model the `delegate` tool spawns); unrouted
+roles fall back to the main profile:
+
+```toml
+[models."kimi/k2"]
+model = "k2"
+
+[roles]
+subagent = "kimi/k2"
+```
+
+Then run:
 
 ```sh
 cargo run -- "inspect src/main.rs and explain it"

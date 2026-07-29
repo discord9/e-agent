@@ -14,6 +14,11 @@ pub struct Config {
     /// MCP server definitions (`[mcp.<name>]`), shared with mcp.rs.
     #[serde(default)]
     pub mcp: HashMap<String, crate::mcp::McpServerConfig>,
+    /// Built-in role -> model profile routing (`[roles]`). Roles fall back
+    /// to the main profile when not routed. Currently only `subagent`
+    /// exists; new roles are added where they are spawned.
+    #[serde(default)]
+    roles: HashMap<String, String>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -62,6 +67,19 @@ impl Config {
         let profile = requested_profile
             .or(self.default.as_deref())
             .ok_or_else(|| anyhow!("config requires `default` or --profile PROFILE"))?;
+        self.resolve_profile(profile)
+    }
+
+    /// Resolve the profile routed to a built-in role. Returns None when the
+    /// role is not routed (callers then fall back to the main profile).
+    pub fn resolve_role(&self, role: &str) -> anyhow::Result<Option<ResolvedModel>> {
+        match self.roles.get(role) {
+            Some(profile) => Ok(Some(self.resolve_profile(profile)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn resolve_profile(&self, profile: &str) -> anyhow::Result<ResolvedModel> {
         let provider_name = profile
             .split_once('/')
             .map(|(provider, _)| provider)
@@ -177,6 +195,58 @@ reasoning_effort = "max"
         assert_eq!(resolved.model, "k3");
         assert_eq!(resolved.api_key, "key");
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn resolves_role_routing_and_falls_back_when_unrouted() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("key"), "key").unwrap();
+        let path = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://api.kimi.com/coding/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[models."kimi/k2"]
+model = "k2"
+[roles]
+subagent = "kimi/k2"
+"#,
+        );
+        let config = Config::from_path(&path).unwrap();
+        let subagent = config.resolve_role("subagent").unwrap().unwrap();
+        assert_eq!(subagent.model, "k2");
+        assert!(config.resolve_role("reviewer").unwrap().is_none());
+    }
+
+    #[test]
+    fn reports_missing_role_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("key"), "key").unwrap();
+        let path = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://api.kimi.com/coding/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[roles]
+subagent = "kimi/nope"
+"#,
+        );
+        assert!(
+            Config::from_path(&path)
+                .unwrap()
+                .resolve_role("subagent")
+                .unwrap_err()
+                .to_string()
+                .contains("model profile `kimi/nope` is not defined")
+        );
     }
 
     #[test]

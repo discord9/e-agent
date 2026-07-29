@@ -63,12 +63,17 @@ impl OpenAiModel {
             reasoning_effort,
         })
     }
+
+    /// Model identifier, e.g. for role routing hints in tool descriptions.
+    pub fn name(&self) -> &str {
+        &self.model
+    }
 }
 
 #[async_trait::async_trait]
 impl Model for OpenAiModel {
     fn name(&self) -> &str {
-        &self.model
+        self.name()
     }
 
     async fn complete(
