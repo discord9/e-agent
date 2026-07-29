@@ -9,6 +9,8 @@ pub mod mcp;
 pub mod model;
 pub mod roles;
 pub mod session;
+#[cfg(feature = "greptime")]
+pub mod session_greptime;
 pub mod tools;
 pub mod tui;
 pub mod workspace;
