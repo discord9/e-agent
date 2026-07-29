@@ -18,7 +18,9 @@ use url::Url;
 
 pub const ISSUER: &str = "https://auth.openai.com";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const ACCOUNT_CLAIM: &str = "https://api.openai.com/auth.chatgpt_account_id";
+pub const ACCOUNT_CLAIM: &str = "https://api.openai.com/auth.chatgpt_account_id";
+const ACCOUNT_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
+const ACCOUNT_CLAIM_FIELD: &str = "chatgpt_account_id";
 const REFRESH_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
 const UNKNOWN_EXPIRY_REFRESH: ChronoDuration = ChronoDuration::days(8);
 
@@ -412,6 +414,12 @@ pub fn jwt_metadata(token: &str) -> Option<JwtMetadata> {
         account_id: value
             .get(ACCOUNT_CLAIM)
             .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                value
+                    .get(ACCOUNT_CLAIM_NAMESPACE)?
+                    .get(ACCOUNT_CLAIM_FIELD)?
+                    .as_str()
+            })
             .filter(|v| !v.is_empty())
             .map(str::to_owned),
         exp: value
@@ -610,6 +618,18 @@ mod tests {
             account_id: None,
         };
         assert_eq!(usable_account(&tokens).unwrap(), "access-account");
+    }
+
+    #[test]
+    fn jwt_metadata_reads_nested_namespace_claim() {
+        let token = jwt(serde_json::json!({
+            "exp": 2_000_000_000i64,
+            ACCOUNT_CLAIM_NAMESPACE: { ACCOUNT_CLAIM_FIELD: "nested-account" }
+        }));
+        assert_eq!(
+            jwt_metadata(&token).unwrap().account_id.as_deref(),
+            Some("nested-account")
+        );
     }
 
     #[test]
