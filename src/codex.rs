@@ -66,11 +66,9 @@ impl CodexModel {
             .post(&self.endpoint)
             .bearer_auth(&access_token)
             .header("ChatGPT-Account-ID", account_id)
+            .header("originator", "codex_cli_rs")
             .header(reqwest::header::ACCEPT, "text/event-stream")
-            .header(
-                reqwest::header::USER_AGENT,
-                format!("e-agent/{}", env!("CARGO_PKG_VERSION")),
-            )
+            .header(reqwest::header::USER_AGENT, "codex_cli_rs/0.0.0 (e-agent)")
             .json(request)
             .send()
             .await
@@ -342,7 +340,8 @@ mod tests {
             let count = stream.read(&mut request).await.unwrap();
             let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
             assert!(request.contains("chatgpt-account-id: account"));
-            assert!(request.contains("user-agent: e-agent/"));
+            assert!(request.contains("user-agent: codex_cli_rs/"));
+            assert!(request.contains("originator: codex_cli_rs"));
             let body = concat!(
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
                 "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"why\"}\n\n",
