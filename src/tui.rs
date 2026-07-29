@@ -1329,7 +1329,13 @@ impl TuiState {
     /// scrollback and follow its live stream from now on (see `bridge`).
     fn attach(&mut self, id: u64, label: String, handle: Arc<dyn SessionHandle>) {
         let mut state = TuiState::default();
+        let mut finished = false;
         for event in handle.snapshot() {
+            // The completion may have raced into the log before the attach;
+            // the view must still flip to finished.
+            if matches!(event, AgentEvent::BackgroundCompleted { .. }) {
+                finished = true;
+            }
             state.push_agent_event(event);
         }
         state.follow();
@@ -1340,7 +1346,7 @@ impl TuiState {
             handle,
             input: InputBuffer::default(),
             input_scroll: 0,
-            finished: false,
+            finished,
         }));
     }
 
@@ -1525,7 +1531,24 @@ impl TuiState {
             AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
         );
         match event {
-            AgentEvent::UserPrompt(text) => self.push_line(format!("you> {text}"), LineKind::User),
+            AgentEvent::UserPrompt(text) => {
+                // Background completions arrive as `[background task N
+                // completed]` user messages at the turn boundary; render
+                // them as the dim finished line. Regular prompts show as
+                // user input (in the main view the input loop already
+                // printed them, but this path is also the session snapshot
+                // replay for attached views).
+                if let Some(rest) = text.strip_prefix("[background task ")
+                    && let Some((id, output)) = rest.split_once(" completed]\n")
+                {
+                    self.push_line(
+                        format!("background task {id} finished: {}", preview(output, 500)),
+                        LineKind::Dim,
+                    );
+                } else {
+                    self.push_line(format!("you> {text}"), LineKind::User);
+                }
+            }
             AgentEvent::AssistantText(text) => self.push_line(text, LineKind::Normal),
             AgentEvent::AssistantDelta(text) => {
                 if self.active_lane == Some(ActiveStreamLane::Content) {
@@ -1548,10 +1571,11 @@ impl TuiState {
             AgentEvent::ToolResult { is_error, content } => {
                 self.push_tool_result(&content, is_error)
             }
-            AgentEvent::BackgroundCompleted { id, output } => self.push_line(
-                format!("background task {id} finished: {}", preview(&output, 500)),
-                LineKind::Dim,
-            ),
+            // Transient live signal (per-turn subscriber only): the
+            // persistent display line comes from the UserPrompt emitted at
+            // the turn boundary (handled above), so rendering this too
+            // would duplicate it.
+            AgentEvent::BackgroundCompleted { .. } => {}
             AgentEvent::Usage { context_input, .. } => {
                 self.tokens_context = context_input;
             }
@@ -1803,8 +1827,9 @@ mod tests {
             lines,
             ["partial", r#"tool: bash {"command":"ls"}"#, "  ok: files",]
         );
-        // The session's completion arrives as a main-channel event and
-        // flips the attached view to finished.
+        // The transient BackgroundCompleted flips the attached view to
+        // finished but renders nothing (the persistent "finished" line
+        // comes from the UserPrompt at the turn boundary).
         assert!(!state.attached.as_ref().unwrap().finished);
         state.push_event(UiEvent {
             session: 0,
@@ -1824,10 +1849,43 @@ mod tests {
                 .last()
                 .unwrap()
                 .text,
-            "background task 7 finished: done"
+            "  ok: files",
+            "transient completion renders no line"
         );
         state.detach();
         assert!(state.attached.is_none());
+    }
+
+    #[test]
+    fn attach_after_completion_marks_finished_from_the_snapshot() {
+        // Regression: a completion that raced into the session log before
+        // the attach left the view stuck in "running" forever.
+        let (handle, sink, _source) = crate::handle::session_channel();
+        sink.emit(AgentEvent::AssistantText("work".into()));
+        sink.emit(AgentEvent::BackgroundCompleted {
+            id: 3,
+            output: "done".into(),
+        });
+        let mut state = TuiState::default();
+        state.attach(3, "demo task".into(), Arc::new(handle));
+        assert!(state.attached.as_ref().unwrap().finished);
+    }
+
+    #[test]
+    fn background_completion_user_message_renders_as_finished_line() {
+        // The turn-boundary `[background task N completed]` user message is
+        // the single persistent notification; the main view renders it dim.
+        let mut state = TuiState::default();
+        state.push_agent_event(AgentEvent::UserPrompt(
+            "[background task 2 completed]\nall good".into(),
+        ));
+        assert_eq!(
+            state.lines.last().unwrap().text,
+            "background task 2 finished: all good"
+        );
+        // A regular user prompt still renders as user input.
+        state.push_agent_event(AgentEvent::UserPrompt("hello".into()));
+        assert_eq!(state.lines.last().unwrap().text, "you> hello");
     }
 
     #[test]

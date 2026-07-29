@@ -100,6 +100,9 @@ pub enum AgentEvent {
         is_error: bool,
         content: String,
     },
+    /// Emitted on the turn boundary when a background task's completion is
+    /// folded into the model context as a `[background task N completed]`
+    /// message. Not part of the session event log.
     BackgroundCompleted {
         id: u64,
         output: String,
@@ -316,14 +319,10 @@ impl Agent {
                 Some(AgentEvent::BackgroundCompleted { id, output }) => {
                     self.running_background.remove(&id);
                     self.pending_background.push_back((id, output.clone()));
-                    let event = AgentEvent::BackgroundCompleted {
-                        id,
-                        output: output.clone(),
-                    };
-                    if let Some(subscriber) = &self.subscriber {
-                        let _ = subscriber.send(event.clone());
-                    }
-                    self.fanout(&event);
+                    // No fanout here either: idle and mid-turn completions
+                    // both land in the session log as a user message at the
+                    // next turn boundary. The TUI prints this return value
+                    // itself; fanning out would duplicate the line.
                     return Some((id, output));
                 }
                 Some(_) => {}
@@ -523,9 +522,18 @@ impl Agent {
 
     fn inject_pending_background(&mut self) {
         while let Some((id, output)) = self.pending_background.pop_front() {
-            self.push_message(Message::User {
-                content: format!("[background task {id} completed]\n{output}"),
-            });
+            let text = format!("[background task {id} completed]\n{output}");
+            // The completion joins the history as a user message at this
+            // turn boundary; emit it to the session observers too so their
+            // event log (the TUI's scrollback and the attach snapshot)
+            // shows it exactly once — drain_background deliberately does
+            // not fan out.
+            let event = AgentEvent::UserPrompt(text.clone());
+            if let Some(subscriber) = &self.subscriber {
+                let _ = subscriber.send(event.clone());
+            }
+            self.fanout(&event);
+            self.push_message(Message::User { content: text });
         }
     }
 
@@ -534,15 +542,15 @@ impl Agent {
             self.background_receiver.try_recv()
         {
             self.running_background.remove(&id);
-            let event = AgentEvent::BackgroundCompleted {
-                id,
-                output: output.clone(),
-            };
-            self.pending_background.push_back((id, output));
+            self.pending_background.push_back((id, output.clone()));
+            // Notify only the per-turn subscriber (the TUI's live display).
+            // The long-lived observers' log gets this completion at the
+            // turn boundary, when `pending_background` is folded into a
+            // `[background task N completed]` user message — emitting here
+            // too would surface it twice.
             if let Some(subscriber) = &self.subscriber {
-                let _ = subscriber.send(event.clone());
+                let _ = subscriber.send(AgentEvent::BackgroundCompleted { id, output });
             }
-            self.fanout(&event);
         }
     }
 }
@@ -580,6 +588,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::handle::SessionHandle;
 
     struct ScriptedModel {
         replies: Vec<AssistantMessage>,
@@ -947,6 +956,89 @@ mod tests {
             message,
             Message::Assistant(AssistantMessage { content: Some(content), .. }) if content.contains("thinking")
         )));
+    }
+
+    #[tokio::test]
+    async fn background_completion_notifies_subscriber_once_and_observers_at_turn_boundary() {
+        // Regression: drain_background used to fanout to observers AND the
+        // completion reappeared in the model context as a user message, so
+        // the TUI (which listens to both paths) showed it twice. Now the
+        // transient BackgroundCompleted goes only to the per-turn
+        // subscriber and the observer log gets it as UserPrompt at the
+        // turn boundary.
+        let model = ScriptedModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![call(
+                        "background-1",
+                        "bash",
+                        r#"{"command":"echo done","background":true}"#,
+                    )],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("started".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("next".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ],
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut agent = Agent::new(
+            Box::new(model),
+            vec![Box::new(ScriptedBackgroundTool { sender: None })],
+        );
+        let (handle, sink, _source) = crate::handle::session_channel();
+        agent.observe(sink);
+        assert_eq!(agent.run("first".into()).await.unwrap(), "started");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        // Completion lands while idle: no observer event yet.
+        assert!(
+            handle
+                .snapshot()
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::BackgroundCompleted { .. }))
+        );
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        agent.subscribe(sender);
+        assert_eq!(agent.run("second".into()).await.unwrap(), "next");
+        // Subscriber saw the transient completion exactly once...
+        let mut transient = 0;
+        let mut prompt_notifications = 0;
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                AgentEvent::BackgroundCompleted { id: 1, .. } => transient += 1,
+                AgentEvent::UserPrompt(text)
+                    if text.starts_with("[background task 1 completed]") =>
+                {
+                    prompt_notifications += 1
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(transient, 1);
+        assert_eq!(prompt_notifications, 1);
+        // ...and the observer log holds it once, as the user message, never
+        // as the transient variant.
+        let snapshot = handle.snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::BackgroundCompleted { .. }))
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::UserPrompt(text) if text.starts_with("[background task 1 completed]")))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
