@@ -368,12 +368,20 @@ impl Agent {
         let response = {
             let model = &mut self.model;
             let event_handler = &mut self.event_handler;
+            let observers = &self.observers;
             let mut on_delta = |kind: ModelDeltaKind, delta: &str| {
+                let event = match kind {
+                    ModelDeltaKind::Content => AgentEvent::AssistantDelta(delta.into()),
+                    ModelDeltaKind::Reasoning => AgentEvent::ReasoningDelta(delta.into()),
+                };
                 if let Some(handler) = event_handler {
-                    handler(match kind {
-                        ModelDeltaKind::Content => AgentEvent::AssistantDelta(delta.into()),
-                        ModelDeltaKind::Reasoning => AgentEvent::ReasoningDelta(delta.into()),
-                    });
+                    handler(event.clone());
+                }
+                // Compaction streams to the session log too: frontends
+                // watching via a SessionHandle see the summary appear live
+                // instead of popping in whole at the end.
+                for sink in observers {
+                    sink.emit(event.clone());
                 }
             };
             model.complete(&request, &[], Some(&mut on_delta)).await?
@@ -1193,6 +1201,66 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("nothing to compact")
+        );
+    }
+
+    struct CompactDeltaModel;
+
+    #[async_trait]
+    impl Model for CompactDeltaModel {
+        async fn complete(
+            &mut self,
+            _: &[Message],
+            _: &[ToolSpec],
+            mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+        ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+            if let Some(callback) = &mut on_delta {
+                callback(ModelDeltaKind::Content, "sum");
+                callback(ModelDeltaKind::Content, "mary");
+            }
+            Ok((
+                AssistantMessage {
+                    content: Some("summary".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_streams_deltas_to_observers() {
+        // The TUI renders /compact through the session observer: without
+        // fanout here the summary pops in whole at the end instead of
+        // streaming live between the compaction banners.
+        let (handle, sink, _source) = crate::handle::session_channel();
+        use crate::handle::SessionHandle as _;
+        let mut agent = Agent::new(Box::new(CompactDeltaModel), vec![]);
+        agent.observe(sink);
+        agent.restore_history(vec![
+            Message::User {
+                content: "one".into(),
+            }
+            .into(),
+            Message::Assistant(AssistantMessage {
+                content: Some("two".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            })
+            .into(),
+            Message::User {
+                content: "current turn".into(),
+            }
+            .into(),
+        ]);
+        assert_eq!(agent.compact().await.unwrap(), "summary");
+        assert_eq!(
+            handle.snapshot(),
+            vec![
+                AgentEvent::AssistantDelta("sum".into()),
+                AgentEvent::AssistantDelta("mary".into()),
+            ]
         );
     }
 }

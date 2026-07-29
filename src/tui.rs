@@ -445,10 +445,13 @@ async fn run_inner(
                                         compaction_banner("compaction"),
                                         LineKind::Compaction,
                                     );
-                                    state.push_final_answer(format!(
-                                        "compacted: {}",
-                                        preview(&summary, 500)
-                                    ));
+                                    // If the summary streamed live (via the
+                                    // session observer) it is already in the
+                                    // scrollback; only print when the stream
+                                    // never arrived, and show it in full.
+                                    if !state.streamed {
+                                        state.push_final_answer(summary);
+                                    }
                                 }
                                 Err(error) => {
                                     state
