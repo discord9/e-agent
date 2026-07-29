@@ -105,6 +105,7 @@ mod tests {
         std::fs::create_dir_all(xdg.join("e-agent/agents")).unwrap();
         std::fs::write(xdg.join("e-agent/agents/explorer.md"), "global explorer").unwrap();
         std::fs::write(xdg.join("e-agent/agents/fixer.md"), "global fixer").unwrap();
+        std::fs::write(xdg.join("e-agent/agents/oracle.md"), "global oracle").unwrap();
         // SAFETY: single-threaded test process; no other thread reads env here.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
 
@@ -116,7 +117,7 @@ mod tests {
 
         assert_eq!(
             available_roles(workspace.path()),
-            vec!["explorer", "fixer", "reviewer"]
+            vec!["explorer", "fixer", "oracle", "reviewer"]
         );
         assert_eq!(
             role_prompt(workspace.path(), "fixer").unwrap().as_deref(),
@@ -130,7 +131,12 @@ mod tests {
             Some("global explorer"),
             "global role still available when not overridden"
         );
-        assert_eq!(role_prompt(workspace.path(), "oracle").unwrap(), None);
+        assert_eq!(
+            role_prompt(workspace.path(), "oracle").unwrap().as_deref(),
+            Some("global oracle"),
+            "oracle resolves from the global layer like any role"
+        );
+        assert_eq!(role_prompt(workspace.path(), "nonexistent").unwrap(), None);
 
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
