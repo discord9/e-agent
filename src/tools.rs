@@ -450,6 +450,7 @@ fn slot_append(slot: &OutputSlot, chunk: &[u8]) {
 struct RunningTask {
     id: u64,
     label: String,
+    role: Option<String>,
     process_group: Arc<AtomicI32>,
     handle: Arc<tokio::task::JoinHandle<()>>,
     output: Option<OutputSlot>,
@@ -460,6 +461,7 @@ struct RunningTask {
 pub struct BackgroundTaskInfo {
     pub id: u64,
     pub label: String,
+    pub role: Option<String>,
     /// Combined stdout/stderr tail so far; empty for non-bash tasks.
     pub output: Vec<u8>,
 }
@@ -489,6 +491,7 @@ impl BackgroundTasks {
             .map(|task| BackgroundTaskInfo {
                 id: task.id,
                 label: task.label.clone(),
+                role: task.role.clone(),
                 output: task
                     .output
                     .as_ref()
@@ -522,6 +525,7 @@ impl BackgroundTasks {
         let running = self.running.clone();
         self.spawn_with_id(
             preview(&command, 100),
+            None,
             Some(process_group),
             move |id| {
                 let mut running = running.lock().unwrap();
@@ -543,6 +547,7 @@ impl BackgroundTasks {
     pub fn spawn<F, Fut>(
         &self,
         label: String,
+        role: Option<String>,
         process_group: Option<Arc<AtomicI32>>,
         work: F,
     ) -> Result<String, String>
@@ -550,7 +555,7 @@ impl BackgroundTasks {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
-        self.spawn_with_id(label, process_group, |_| {}, work)
+        self.spawn_with_id(label, role, process_group, |_| {}, work)
     }
 
     /// Like [`Self::spawn`], but invokes `on_id` with the allocated task id
@@ -559,6 +564,7 @@ impl BackgroundTasks {
     pub fn spawn_with_id<F, Fut>(
         &self,
         label: String,
+        role: Option<String>,
         process_group: Option<Arc<AtomicI32>>,
         on_id: impl FnOnce(u64),
         work: F,
@@ -571,9 +577,16 @@ impl BackgroundTasks {
             .sender
             .clone()
             .ok_or("background task delivery is unavailable")?;
-        self.spawn_inner(label, process_group, on_id, work, move |id, output| {
-            let _ = sender.send(AgentEvent::BackgroundCompleted { id, output });
-        })
+        self.spawn_inner(
+            label,
+            role,
+            process_group,
+            on_id,
+            work,
+            move |id, output| {
+                let _ = sender.send(AgentEvent::BackgroundCompleted { id, output });
+            },
+        )
     }
 
     /// Spawn a registered task that runs to completion but does NOT send a
@@ -583,6 +596,7 @@ impl BackgroundTasks {
     pub fn spawn_silent<F, Fut>(
         &self,
         label: String,
+        role: Option<String>,
         process_group: Option<Arc<AtomicI32>>,
         on_id: impl FnOnce(u64),
         work: F,
@@ -591,12 +605,13 @@ impl BackgroundTasks {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
-        self.spawn_inner(label, process_group, on_id, work, |_, _| {})
+        self.spawn_inner(label, role, process_group, on_id, work, |_, _| {})
     }
 
     fn spawn_inner<F, Fut>(
         &self,
         label: String,
+        role: Option<String>,
         process_group: Option<Arc<AtomicI32>>,
         on_id: impl FnOnce(u64),
         work: F,
@@ -611,6 +626,7 @@ impl BackgroundTasks {
         self.running.lock().unwrap().push(RunningTask {
             id,
             label: label.clone(),
+            role,
             process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),
             handle: Arc::new(tokio::spawn(async {})),
             output: None,

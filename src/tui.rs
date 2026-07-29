@@ -208,7 +208,7 @@ fn attach_to_task(
     sessions: &Sessions,
     sender: &mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Some(handle) = sessions.get(task_id) else {
+    let Some(entry) = sessions.get(task_id) else {
         return;
     };
     let label = state
@@ -222,8 +222,16 @@ fn attach_to_task(
         })
         .map(|task| task.label)
         .unwrap_or_default();
-    state.attach(task_id, label, handle.clone());
-    let bridge = bridge(task_id, handle.as_ref(), sender.clone());
+    state.attach(
+        task_id,
+        label,
+        entry.handle.clone(),
+        entry.model.clone(),
+        entry.role.clone(),
+        entry.cwd.clone(),
+        entry.session_id.clone(),
+    );
+    let bridge = bridge(task_id, entry.handle.as_ref(), sender.clone());
     state.attached.as_mut().unwrap().bridge = Some(bridge);
 }
 
@@ -235,6 +243,7 @@ fn attached_input_width(
     Ok(usize::from(terminal.size()?.width.saturating_sub(2)).max(1))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut agent: Agent,
     root: PathBuf,
@@ -243,6 +252,7 @@ pub async fn run(
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
     model_name: String,
+    role_name: Option<String>,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -254,6 +264,7 @@ pub async fn run(
         session: session_name,
         model: model_name,
         cwd: root.display().to_string(),
+        role: role_name,
     };
     let result = run_inner(
         &mut terminal,
@@ -284,11 +295,12 @@ pub async fn run(
     }
 }
 
-/// Text painted around the input box border (session id, model, cwd).
+/// Text painted around the input box border (session id, model, role, cwd).
 struct InputLabels {
     session: String,
     model: String,
     cwd: String,
+    role: Option<String>,
 }
 
 struct TerminalGuard;
@@ -336,6 +348,7 @@ async fn run_inner(
     state.session_id = labels.session.clone();
     state.model_name = labels.model.clone();
     state.cwd = labels.cwd.clone();
+    state.role_name = labels.role.clone();
 
     state.background = Some(background);
     let probe = sessions.clone();
@@ -858,10 +871,12 @@ fn draw<B: ratatui::backend::Backend>(
                     } else {
                         "  (no view)"
                     };
-                    lines.push(Line::styled(
-                        format!("  #{}: {}{}", task.id, task.label, hint),
-                        style,
-                    ));
+                    let row = if let Some(role) = &task.role {
+                        format!("  #{}: [{}] {}{}", task.id, role, task.label, hint)
+                    } else {
+                        format!("  #{}: {}{}", task.id, task.label, hint)
+                    };
+                    lines.push(Line::styled(row, style));
                 }
                 if !selected_output.is_empty() {
                     let skip = selected_output.lines().count().saturating_sub(OUTPUT_LINES);
@@ -933,12 +948,25 @@ fn draw<B: ratatui::backend::Backend>(
                 } else {
                     "running"
                 };
-                let block = SOLARIZED_LIGHT.block(format!(
-                    "subagent #{}: {} ({}) — Esc detach · Enter steer · Ctrl-C interrupt",
-                    attached.id,
-                    preview(&attached.label, 40),
-                    status
-                ));
+                let block = SOLARIZED_LIGHT
+                    .block(format!(
+                        "subagent #{}: {} ({}) — Esc detach · Enter steer · Ctrl-C interrupt",
+                        attached.id,
+                        preview(&attached.label, 40),
+                        status
+                    ))
+                    .title_top(
+                        Line::from(attached.state.session_id.clone())
+                            .alignment(Alignment::Right)
+                            .style(Style::default().fg(SOLARIZED_LIGHT.muted)),
+                    )
+                    .title_bottom({
+                        let spans = model_role_spans(
+                            &attached.state.model_name,
+                            attached.state.role_name.as_deref(),
+                        );
+                        Line::from(spans).alignment(Alignment::Left)
+                    });
                 let (cursor_row, cursor_col) = attached.input.wrapped_cursor(inner_input_width);
                 let inner_input_height = usize::from(input.height.saturating_sub(2));
                 attached.input_scroll =
@@ -954,6 +982,26 @@ fn draw<B: ratatui::backend::Backend>(
                         .scroll((attached.input_scroll.min(u16::MAX as usize) as u16, 0)),
                     input,
                 );
+                {
+                    let usage = cwd_usage_text(&attached.state.cwd, attached.state.tokens_context);
+                    let width = UnicodeWidthStr::width(usage.as_str()) as u16 + 1;
+                    if input.width > width + 1 {
+                        let area = ratatui::layout::Rect {
+                            x: input.right().saturating_sub(width + 1),
+                            y: input.bottom() - 1,
+                            width,
+                            height: 1,
+                        };
+                        frame.render_widget(
+                            Paragraph::new(usage).style(
+                                Style::default()
+                                    .fg(SOLARIZED_LIGHT.orange)
+                                    .bg(SOLARIZED_LIGHT.panel),
+                            ),
+                            area,
+                        );
+                    }
+                }
                 frame.set_cursor_position((
                     input.x + 1 + (cursor_col as u16).min(input.width.saturating_sub(2)),
                     input.y
@@ -974,22 +1022,13 @@ fn draw<B: ratatui::backend::Backend>(
                         .alignment(Alignment::Right)
                         .style(Style::default().fg(SOLARIZED_LIGHT.muted)),
                 )
-                .title_bottom(
-                    Line::from(state.model_name.clone())
-                        .alignment(Alignment::Left)
-                        .style(Style::default().fg(SOLARIZED_LIGHT.violet)),
-                );
+                .title_bottom({
+                    let spans = model_role_spans(&state.model_name, state.role_name.as_deref());
+                    Line::from(spans).alignment(Alignment::Left)
+                });
             // cwd is always shown; the context-token count appears once the
             // first turn has reported usage.
-            let usage = if state.tokens_context > 0 {
-                format!(
-                    "{} · ctx {}",
-                    state.cwd,
-                    format_tokens(state.tokens_context)
-                )
-            } else {
-                state.cwd.clone()
-            };
+            let usage = cwd_usage_text(&state.cwd, state.tokens_context);
             let (cursor_row, cursor_col) = state.input.wrapped_cursor(inner_input_width);
             let inner_input_height = usize::from(input.height.saturating_sub(2));
             let input_scroll = cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
@@ -1077,6 +1116,59 @@ fn format_tokens(count: u64) -> String {
         format!("{:.1}k", count as f64 / 1000.0)
     } else {
         count.to_string()
+    }
+}
+
+/// Build the bottom-left title spans for the input block: model name (violet)
+/// with an optional ` · role` suffix (muted). Shared by the main and attached
+/// views. Returns an empty vec when `model_name` is empty.
+fn model_role_spans(model_name: &str, role_name: Option<&str>) -> Vec<Span<'static>> {
+    if model_name.is_empty() {
+        return Vec::new();
+    }
+    let mut spans = vec![Span::styled(
+        model_name.to_owned(),
+        Style::default().fg(SOLARIZED_LIGHT.violet),
+    )];
+    if let Some(role) = role_name {
+        spans.push(Span::styled(
+            format!(" · {role}"),
+            Style::default().fg(SOLARIZED_LIGHT.muted),
+        ));
+    }
+    spans
+}
+
+/// Format the bottom-right overlay text: cwd with optional context-token
+/// count. Shared by the main and attached views. A cwd under `$HOME` is
+/// shortened to `~/…` to keep the overlay narrow.
+fn cwd_usage_text(cwd: &str, tokens_context: u64) -> String {
+    let cwd = shorten_home(cwd);
+    if tokens_context > 0 {
+        format!("{} · ctx {}", cwd, format_tokens(tokens_context))
+    } else {
+        cwd.into_owned()
+    }
+}
+
+/// Replace a leading `$HOME` with `~` (e.g. `/home/alice/work` → `~/work`).
+fn shorten_home(cwd: &str) -> std::borrow::Cow<'_, str> {
+    match std::env::var_os("HOME") {
+        Some(home) => {
+            let home = home.to_string_lossy();
+            if cwd == home.as_ref() {
+                "~".into()
+            } else if let Some(rest) = cwd.strip_prefix(home.as_ref()) {
+                if let Some(rest) = rest.strip_prefix('/') {
+                    format!("~/{rest}").into()
+                } else {
+                    cwd.into()
+                }
+            } else {
+                cwd.into()
+            }
+        }
+        None => cwd.into(),
     }
 }
 
@@ -1179,6 +1271,9 @@ struct TuiState {
     /// later with --session).
     session_id: String,
     model_name: String,
+    /// Agent role name displayed next to the model name; `None` when no role
+    /// template exists.
+    role_name: Option<String>,
     cwd: String,
     input: InputBuffer,
     lines: Vec<DisplayLine>,
@@ -1417,8 +1512,24 @@ impl TuiState {
 
     /// Attach to a background session: snapshot its event log into a fresh
     /// scrollback and follow its live stream from now on (see `bridge`).
-    fn attach(&mut self, id: u64, label: String, handle: Arc<dyn SessionHandle>) {
-        let mut state = TuiState::default();
+    #[allow(clippy::too_many_arguments)]
+    fn attach(
+        &mut self,
+        id: u64,
+        label: String,
+        handle: Arc<dyn SessionHandle>,
+        model_name: String,
+        role_name: Option<String>,
+        cwd: String,
+        session_id: String,
+    ) {
+        let mut state = TuiState {
+            model_name,
+            role_name,
+            cwd,
+            session_id,
+            ..TuiState::default()
+        };
         let mut finished = false;
         for event in handle.snapshot() {
             // The completion may have raced into the log before the attach;
@@ -1861,6 +1972,20 @@ impl InputBuffer {
 mod tests {
     use super::*;
 
+    /// Test helper: attach with default metadata, mirroring the old 3-arg
+    /// signature for minimal test churn.
+    fn attach_test(state: &mut TuiState, id: u64, label: &str, handle: Arc<dyn SessionHandle>) {
+        state.attach(
+            id,
+            label.into(),
+            handle,
+            String::new(),
+            None,
+            String::new(),
+            String::new(),
+        );
+    }
+
     #[test]
     fn f2_toggles_tasks_panel() {
         let mut state = TuiState::default();
@@ -1876,7 +2001,7 @@ mod tests {
     fn f2_toggles_the_panel_while_attached() {
         let (handle, _sink, _source) = crate::handle::session_channel();
         let mut state = TuiState::default();
-        state.attach(7, "demo".into(), Arc::new(handle));
+        attach_test(&mut state, 7, "demo", Arc::new(handle));
         assert!(!state.show_tasks);
         state.handle_attached_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()), 80);
         assert!(state.show_tasks, "F2 opens the panel while attached");
@@ -1909,12 +2034,12 @@ mod tests {
         let (handle, sink, _source) = crate::handle::session_channel();
         let (sender, mut inbox) = mpsc::unbounded_channel();
         let mut state = TuiState::default();
-        state.attach(7, "demo".into(), Arc::new(handle.clone()));
+        attach_test(&mut state, 7, "demo", Arc::new(handle.clone()));
         state.attached.as_mut().unwrap().bridge = Some(bridge(7, &handle, sender.clone()));
         state.detach();
         tokio::task::yield_now().await;
 
-        state.attach(7, "demo".into(), Arc::new(handle.clone()));
+        attach_test(&mut state, 7, "demo", Arc::new(handle.clone()));
         state.attached.as_mut().unwrap().bridge = Some(bridge(7, &handle, sender));
         sink.emit(AgentEvent::AssistantDelta("你".into()));
         let first = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
@@ -1944,7 +2069,7 @@ mod tests {
             is_error: false,
             content: "files".into(),
         });
-        state.attach(7, "demo task".into(), Arc::new(handle));
+        attach_test(&mut state, 7, "demo task", Arc::new(handle));
         let lines: Vec<_> = state
             .attached
             .as_ref()
@@ -1998,7 +2123,7 @@ mod tests {
             output: "done".into(),
         });
         let mut state = TuiState::default();
-        state.attach(3, "demo task".into(), Arc::new(handle));
+        attach_test(&mut state, 3, "demo task", Arc::new(handle));
         assert!(state.attached.as_ref().unwrap().finished);
     }
 
@@ -2024,7 +2149,7 @@ mod tests {
     fn attached_enter_steers_and_ctrl_c_cancels_through_the_handle() {
         let (handle, _sink, mut source) = crate::handle::session_channel();
         let mut state = TuiState::default();
-        state.attach(7, "demo task".into(), Arc::new(handle));
+        attach_test(&mut state, 7, "demo task", Arc::new(handle));
         {
             let attached = state.attached.as_mut().unwrap();
             attached.input.insert("please also check tests");
@@ -2044,7 +2169,7 @@ mod tests {
         );
         // Re-attach replays the snapshot including the queued prompt.
         let handle = state.attached.as_ref().unwrap().handle.clone();
-        state.attach(7, "demo task".into(), handle);
+        attach_test(&mut state, 7, "demo task", handle);
         let lines = &state.attached.as_ref().unwrap().state.lines;
         assert!(
             lines
@@ -2072,7 +2197,7 @@ mod tests {
             scroll: 2,
             ..Default::default()
         };
-        state.attach(1, "task".into(), Arc::new(handle));
+        attach_test(&mut state, 1, "task", Arc::new(handle));
         {
             let attached = state.attached.as_mut().unwrap();
             attached.state.max_scroll = 9;
@@ -2160,7 +2285,7 @@ mod tests {
             scroll: 7,
             ..Default::default()
         };
-        parent.attach(1, "task".into(), Arc::new(handle));
+        attach_test(&mut parent, 1, "task", Arc::new(handle));
         let mut events = futures_util::stream::iter(vec![
             Ok::<_, io::Error>(Event::Key(down)),
             Ok(Event::Key(typing)),
@@ -2323,6 +2448,134 @@ mod tests {
                 .flatten()
                 .all(|cell| cell.bg != Color::Reset),
             "every output scrollback cell stays on an explicit Solarized surface after scrolling"
+        );
+    }
+
+    #[test]
+    fn attached_view_paints_input_corners_like_the_main_view() {
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (handle, sink, _source) = crate::handle::session_channel();
+        sink.emit(AgentEvent::Usage {
+            context_input: 1_500,
+            session: crate::agent::Usage {
+                input_tokens: 1_500,
+                output_tokens: 0,
+            },
+        });
+        let mut state = TuiState::default();
+        state.attach(
+            7,
+            "demo task".into(),
+            Arc::new(handle),
+            "deepseek-v4-flash".into(),
+            Some("fixer".into()),
+            "/repo".into(),
+            "sub-abc123".into(),
+        );
+
+        draw(&mut terminal, &mut state).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..60)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
+        let bottom = row_text(11);
+        assert!(
+            bottom.contains("deepseek-v4-flash · fixer"),
+            "bottom-left shows model · role, got: {bottom:?}"
+        );
+        assert!(
+            bottom.contains("/repo · ctx 1.5k"),
+            "bottom-right shows cwd · ctx, got: {bottom:?}"
+        );
+        let top = row_text(9);
+        assert!(
+            top.contains("sub-abc123"),
+            "top-right shows the session id, got: {top:?}"
+        );
+    }
+
+    #[test]
+    fn cwd_usage_text_shortens_home_to_tilde() {
+        let home = std::env::var_os("HOME").expect("tests run with HOME set");
+        let home = home.to_string_lossy().into_owned();
+        assert_eq!(
+            cwd_usage_text(&format!("{home}/work"), 0),
+            "~/work",
+            "paths under $HOME collapse to ~"
+        );
+        assert_eq!(cwd_usage_text(&home, 0), "~", "$HOME itself collapses to ~");
+        assert_eq!(
+            cwd_usage_text("/elsewhere", 0),
+            "/elsewhere",
+            "paths outside $HOME stay absolute"
+        );
+        assert_eq!(
+            cwd_usage_text(&format!("{home}x"), 0),
+            format!("{home}x"),
+            "a sibling sharing the prefix is not shortened"
+        );
+        assert_eq!(
+            cwd_usage_text(&format!("{home}/work"), 1_500),
+            "~/work · ctx 1.5k",
+            "token count still appended after shortening"
+        );
+    }
+
+    #[tokio::test]
+    async fn tasks_panel_tags_rows_with_the_agent_role() {
+        let backend = ratatui::backend::TestBackend::new(50, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_, mut background) =
+            crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        background.set_event_sender(sender);
+        background
+            .spawn_with_id(
+                "find the render site".into(),
+                Some("explorer".into()),
+                None,
+                |_| {},
+                || async { "done".into() },
+            )
+            .unwrap();
+        background
+            .spawn_with_id(
+                "sleep 5".into(),
+                None,
+                None,
+                |_| {},
+                || async { "done".into() },
+            )
+            .unwrap();
+        let mut state = TuiState {
+            background: Some(background),
+            show_tasks: true,
+            ..Default::default()
+        };
+
+        draw(&mut terminal, &mut state).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            text.contains("[explorer] find the render site"),
+            "role-tagged row, got: {text:?}"
+        );
+        assert!(
+            text.contains("sleep 5"),
+            "untagged bash row still shows its label"
+        );
+        assert!(
+            !text.contains("[] sleep 5"),
+            "bash row has no empty role tag"
         );
     }
 
@@ -2906,7 +3159,15 @@ mod ux_tests {
             busy: Some(BusyState::thinking()),
             ..Default::default()
         };
-        parent.attach(1, "task".into(), Arc::new(handle));
+        parent.attach(
+            1,
+            "task".into(),
+            Arc::new(handle),
+            String::new(),
+            None,
+            String::new(),
+            String::new(),
+        );
         let attached = parent.attached.as_mut().unwrap();
         attached.state.busy = Some(BusyState::thinking());
         attached

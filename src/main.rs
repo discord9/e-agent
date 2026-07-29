@@ -180,9 +180,13 @@ async fn run() -> anyhow::Result<()> {
     let mut context = Vec::new();
     // The main agent's orchestrator template (.e-agent/agents/main.md) leads;
     // it tells the model to decompose work and delegate to the named roles.
-    if let Some(orchestrator) = e_agent::roles::role_prompt(&root, e_agent::roles::MAIN_ROLE)? {
-        context.push(orchestrator);
-    }
+    let role_name = match e_agent::roles::role_prompt(&root, e_agent::roles::MAIN_ROLE)? {
+        Some(orchestrator) => {
+            context.push(orchestrator);
+            Some(e_agent::roles::MAIN_ROLE.to_owned())
+        }
+        None => None,
+    };
     if let Some(instructions) = agents_instructions {
         context.push(format!("## AGENTS.md\n\n{instructions}"));
     }
@@ -227,6 +231,7 @@ async fn run() -> anyhow::Result<()> {
             background,
             subagent_sessions,
             model_name,
+            role_name,
         )
         .await;
     }

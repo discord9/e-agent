@@ -37,22 +37,32 @@ use crate::workspace::Workspace;
 /// Ceiling for a synchronous delegate call.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// Metadata about a live subagent session, stored alongside its handle in
+/// the registry so frontends can display the model name, role, cwd, etc.
+pub struct SessionEntry {
+    pub handle: Arc<dyn SessionHandle>,
+    pub model: String,
+    pub role: Option<String>,
+    pub cwd: String,
+    pub session_id: String,
+}
+
 /// Registry of live session handles, keyed by background-task id (the same
 /// unified id sequence shared with background bash). Background subagents
 /// register their handle here so the TUI can attach; entries are removed
 /// when the subagent finishes.
 #[derive(Clone, Default)]
 pub struct Sessions {
-    sessions: Arc<Mutex<std::collections::HashMap<u64, Arc<dyn SessionHandle>>>>,
+    sessions: Arc<Mutex<std::collections::HashMap<u64, Arc<SessionEntry>>>>,
 }
 
 impl Sessions {
-    pub fn get(&self, id: u64) -> Option<Arc<dyn SessionHandle>> {
+    pub fn get(&self, id: u64) -> Option<Arc<SessionEntry>> {
         self.sessions.lock().unwrap().get(&id).cloned()
     }
 
-    pub fn insert(&self, id: u64, handle: Arc<dyn SessionHandle>) {
-        self.sessions.lock().unwrap().insert(id, handle);
+    pub fn insert(&self, id: u64, entry: Arc<SessionEntry>) {
+        self.sessions.lock().unwrap().insert(id, entry);
     }
 
     pub fn remove(&self, id: u64) {
@@ -124,6 +134,17 @@ pub struct PersistConfig {
     root: std::path::PathBuf,
     /// This subagent's session id, assigned at spawn time.
     session_id: String,
+}
+
+/// Task-panel title for a delegation: the caller's `label` wins (trimmed,
+/// non-empty, capped), then the role name, then a task preview.
+fn task_label(label: Option<&str>, role: Option<&str>, task: &str) -> String {
+    label
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(|label| preview(label, 60))
+        .or_else(|| role.map(str::to_owned))
+        .unwrap_or_else(|| preview(task, 60))
 }
 
 /// A delegated task plus the role template (if any) that shapes the
@@ -416,7 +437,7 @@ impl Tool for Delegate {
             .unwrap_or_default();
         if !roles.is_empty() {
             description.push_str(&format!(
-                " Pass `role` to give the subagent a specialized persona/model; available roles: {}.",
+                " Pass `role` to give the subagent a specialized persona/model; available roles: {}. Pass `label` to set a short (≤ 40 chars) title for the task panel; defaults to the role name or a preview of the task.",
                 roles.join(", ")
             ));
         }
@@ -433,6 +454,7 @@ impl Tool for Delegate {
                 "properties": {
                     "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"},
                     "role": role_property,
+                    "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
                     "background": {"type": "boolean", "description": "run without blocking; the answer arrives as a background completion (default false)"},
                     "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"}
                 },
@@ -516,11 +538,17 @@ impl Tool for Delegate {
             }
             None => None,
         };
+        // Parse optional label; fallback chain: label → role → task preview.
+        let raw_label = arguments
+            .as_object()
+            .and_then(|args| args.get("label"))
+            .and_then(Value::as_str);
+        let label = task_label(raw_label, role.as_deref(), &task);
 
         if background {
             let workspace = self.workspace.clone();
             let background = self.background.clone();
-            let label = preview(&task, 100);
+            /* label computed above */
             let (handle, sink, source) = session_channel();
             let session: Arc<dyn SessionHandle> = Arc::new(handle.clone());
             let sessions = self.sessions.clone();
@@ -542,11 +570,27 @@ impl Tool for Delegate {
             });
             // run_on_thread blocks on thread::join, so push it onto the
             // blocking thread pool to keep the executor responsive.
+            let model_name = model.name().to_string();
+            let role_name = role.clone();
+            let cwd = workspace.root().display().to_string();
+            let persist_session_id = persist
+                .as_ref()
+                .map(|p| p.session_id.clone())
+                .unwrap_or_default();
+            let entry = Arc::new(SessionEntry {
+                handle: session.clone(),
+                model: model_name,
+                role: role_name,
+                cwd,
+                session_id: persist_session_id,
+            });
+            let entry_for_hook = entry.clone();
             return self.background.spawn_with_id(
                 label,
+                role.clone(),
                 None,
                 move |id| {
-                    sessions.insert(id, session);
+                    sessions.insert(id, entry_for_hook);
                     *slot_in_hook.lock().unwrap() = Some(id);
                 },
                 move || async move {
@@ -584,7 +628,6 @@ impl Tool for Delegate {
         // Even a synchronous subagent is registered as a running task with a
         // live session, so it shows up in the task panel (F2) and can be
         // attached while the main agent is blocked waiting for it.
-        let label = preview(&task, 100);
         let (handle, sink, source) = session_channel();
         let session: Arc<dyn SessionHandle> = Arc::new(handle.clone());
         // A second handle for the cancel guard: dropping the blocked-on
@@ -599,12 +642,28 @@ impl Tool for Delegate {
         // Block until the subagent finishes (this is the synchronous mode).
         // spawn_silent keeps it visible in the task panel without emitting
         // a duplicate completion event (the answer is the tool result).
+        let model_name = model.name().to_string();
+        let role_name = role.clone();
+        let cwd = workspace.root().display().to_string();
+        let persist_session_id = persist
+            .as_ref()
+            .map(|p| p.session_id.clone())
+            .unwrap_or_default();
+        let entry = Arc::new(SessionEntry {
+            handle: session.clone(),
+            model: model_name,
+            role: role_name,
+            cwd,
+            session_id: persist_session_id,
+        });
+        let entry_for_hook = entry.clone();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<String>();
         let started = self.background.spawn_silent(
             label,
+            role.clone(),
             None,
             move |id| {
-                sessions.insert(id, session);
+                sessions.insert(id, entry_for_hook);
                 *slot_in_hook.lock().unwrap() = Some(id);
             },
             move || async move {
@@ -654,11 +713,48 @@ mod tests {
     use crate::tools::builtins;
 
     #[test]
+    fn task_label_falls_back_label_then_role_then_task() {
+        assert_eq!(
+            task_label(Some("  fix the typo  "), Some("fixer"), "a long task"),
+            "fix the typo",
+            "caller label wins, trimmed"
+        );
+        assert_eq!(
+            task_label(Some("   "), Some("fixer"), "a long task"),
+            "fixer",
+            "blank label falls through to the role"
+        );
+        assert_eq!(
+            task_label(None, Some("fixer"), "a long task"),
+            "fixer",
+            "no label falls back to the role"
+        );
+        assert_eq!(
+            task_label(None, None, "a long task"),
+            "a long task",
+            "no label and no role previews the task"
+        );
+        let long = "x".repeat(200);
+        let capped = task_label(Some(&long), None, "task");
+        assert!(
+            capped.chars().count() <= 61 && capped.ends_with('…'),
+            "caller label is capped with an ellipsis, got: {capped:?}"
+        );
+    }
+
+    #[test]
     fn registry_tracks_live_sessions() {
         let sessions = Sessions::default();
         assert!(sessions.get(1).is_none());
         let (handle, _sink, _source) = session_channel();
-        sessions.insert(1, Arc::new(handle));
+        let entry = Arc::new(SessionEntry {
+            handle: Arc::new(handle),
+            model: "test-model".into(),
+            role: None,
+            cwd: "/tmp".into(),
+            session_id: "sub-test".into(),
+        });
+        sessions.insert(1, entry);
         assert!(sessions.get(1).is_some());
         sessions.remove(1);
         assert!(sessions.get(1).is_none());
