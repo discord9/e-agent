@@ -27,6 +27,14 @@ use crate::agent::AgentEvent;
 const SESSION_EVENT_CAPACITY: usize = 256;
 
 /// A steering message from a frontend to a running agent session.
+///
+/// This is the cross-thread steering primitive: the frontend and the agent
+/// run in different tasks/threads, so "send a prompt" and "cancel the turn"
+/// travel over a channel. It is NOT subagent-specific — every session has
+/// the same two operations. The main agent is the one exception *in
+/// transport only*: its TUI shares the task and holds `&mut Agent`, so it
+/// drives `agent.run(prompt)` / drops the future directly instead of going
+/// through a `Steer` channel. The semantics are identical either way.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Steer {
     /// Queue a new user prompt; the agent starts it as a fresh turn once

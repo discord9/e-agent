@@ -88,3 +88,20 @@ contract through `Agent::emit` → fanout to `event_handler` + all `observers`:
   attached view has zero receivers but its log must keep filling.
 - A failed turn emits its error as an event too; a session must never fail
   silently into an empty log.
+
+## Steering transport: main agent vs subagent
+
+Every session supports the same two steering operations — queue a prompt,
+cancel the in-flight turn. Only the *transport* differs, and only because of
+where the frontend lives:
+
+- **Subagent (cross-thread):** the frontend steers through `SessionHandle`'s
+  `Steer::{Prompt, Cancel}` channel. `send_input` also records a
+  `UserPrompt` event in the session log first (see event semantics above).
+- **Main agent (same task):** the TUI holds `&mut Agent`, so it calls
+  `agent.run(prompt)` and cancels by dropping the in-flight future directly —
+  no `Steer` channel is used.
+
+These are two transports for one semantic contract, not two message types.
+Do not add a third path; if the main agent is ever moved behind a handle, it
+should adopt the same `Steer` channel rather than inventing a new one.
