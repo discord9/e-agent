@@ -73,8 +73,8 @@ async fn run() -> anyhow::Result<()> {
     let (mut tools, background) = builtins(workspace.clone());
     let (mcp_tools, mcp_instructions) = mcp::connect_all(&root).await;
     tools.extend(mcp_tools);
-    let delegate = Delegate::new(model.clone(), workspace, background.clone())
-        .persist_into(root.clone(), session.clone());
+    let delegate =
+        Delegate::new(model.clone(), workspace, background.clone()).persist_sessions(root.clone());
     let subagent_sessions = delegate.sessions();
     tools.push(Box::new(delegate));
     let mut agent = Agent::new(Box::new(model), tools);
