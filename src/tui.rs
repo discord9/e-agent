@@ -167,9 +167,14 @@ impl Palette {
 }
 
 /// Bridge a session handle's event stream into the shared UI channel,
-/// tagging each event with `session_id`. The spawned task exits when the
-/// channel closes (detach drops the UI's interest) or the session ends.
-fn bridge(session_id: u64, handle: &dyn SessionHandle, sender: mpsc::UnboundedSender<UiEvent>) {
+/// tagging each event with `session_id`. The caller aborts the returned
+/// handle when the view detaches; otherwise re-attaching would leave two
+/// bridges forwarding every future delta.
+fn bridge(
+    session_id: u64,
+    handle: &dyn SessionHandle,
+    sender: mpsc::UnboundedSender<UiEvent>,
+) -> tokio::task::AbortHandle {
     let mut stream = handle.subscribe();
     tokio::spawn(async move {
         loop {
@@ -191,7 +196,8 @@ fn bridge(session_id: u64, handle: &dyn SessionHandle, sender: mpsc::UnboundedSe
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+    })
+    .abort_handle()
 }
 
 /// Attach the TUI to a background task's session: replay its event log into
@@ -217,10 +223,8 @@ fn attach_to_task(
         .map(|task| task.label)
         .unwrap_or_default();
     state.attach(task_id, label, handle.clone());
-    // Bridge the session's live stream into the shared UI channel, tagged
-    // with the task id so push_event can route it. The bridge task exits
-    // when the UI channel closes (app exit) or the session ends.
-    bridge(task_id, handle.as_ref(), sender.clone());
+    let bridge = bridge(task_id, handle.as_ref(), sender.clone());
+    state.attached.as_mut().unwrap().bridge = Some(bridge);
 }
 
 /// Width of the attached steering input's content area (frame minus its
@@ -315,7 +319,7 @@ async fn run_inner(
     // attached-session events route to the attached view (see push_event).
     let (sender, mut inbox) = mpsc::unbounded_channel::<UiEvent>();
     let (main_handle, main_sink, _main_source) = crate::handle::session_channel();
-    bridge(0, &main_handle, sender.clone());
+    let _main_bridge = bridge(0, &main_handle, sender.clone());
     agent.observe(main_sink);
     // Per-turn event forwarder (deltas bypass the session log).
     let (forward, mut forward_inbox) = mpsc::unbounded_channel::<AgentEvent>();
@@ -1187,6 +1191,9 @@ struct AttachedView {
     id: u64,
     label: String,
     state: TuiState,
+    /// The live-event bridge for this attachment. Dropping the view aborts it
+    /// so re-attaching cannot forward each delta twice.
+    bridge: Option<tokio::task::AbortHandle>,
     /// The session seam: snapshot/subscribe/send_input/cancel.
     handle: Arc<dyn SessionHandle>,
     /// Input buffer for steering prompts.
@@ -1196,6 +1203,14 @@ struct AttachedView {
     /// Set once the session's completion event has arrived (view becomes a
     /// static record; further events are impossible).
     finished: bool,
+}
+
+impl Drop for AttachedView {
+    fn drop(&mut self) {
+        if let Some(bridge) = self.bridge.take() {
+            bridge.abort();
+        }
+    }
 }
 
 impl AttachedView {
@@ -1392,6 +1407,7 @@ impl TuiState {
             id,
             label,
             state,
+            bridge: None,
             handle,
             input: InputBuffer::default(),
             input_scroll: 0,
@@ -1838,6 +1854,33 @@ mod tests {
         assert_eq!(state.task_cursor, 0);
         let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
         assert_eq!(state.handle_tasks_panel_key(a), None);
+    }
+
+    #[tokio::test]
+    async fn reattaching_forwards_each_delta_once() {
+        let (handle, sink, _source) = crate::handle::session_channel();
+        let (sender, mut inbox) = mpsc::unbounded_channel();
+        let mut state = TuiState::default();
+        state.attach(7, "demo".into(), Arc::new(handle.clone()));
+        state.attached.as_mut().unwrap().bridge = Some(bridge(7, &handle, sender.clone()));
+        state.detach();
+        tokio::task::yield_now().await;
+
+        state.attach(7, "demo".into(), Arc::new(handle.clone()));
+        state.attached.as_mut().unwrap().bridge = Some(bridge(7, &handle, sender));
+        sink.emit(AgentEvent::AssistantDelta("你".into()));
+        let first = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.session, 7);
+        assert!(matches!(first.event, AgentEvent::AssistantDelta(text) if text == "你"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), inbox.recv())
+                .await
+                .is_err(),
+            "both the old and new bridges forwarded the same delta"
+        );
     }
 
     #[test]
