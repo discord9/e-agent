@@ -130,6 +130,10 @@ impl Palette {
             LineKind::Removed => Style::default()
                 .fg(self.red)
                 .bg(self.diff_removed_background),
+            LineKind::Compaction => Style::default()
+                .fg(self.violet)
+                .bg(self.element)
+                .add_modifier(Modifier::BOLD),
         }
     }
 
@@ -242,7 +246,7 @@ pub async fn run(
         model: model_name,
         cwd: root.display().to_string(),
     };
-    run_inner(
+    let result = run_inner(
         &mut terminal,
         &mut agent,
         &root,
@@ -251,7 +255,21 @@ pub async fn run(
         background,
         sessions,
     )
-    .await
+    .await;
+    // Do not return into main: the tokio runtime would then wait on
+    // still-running tasks (MCP stdio servers block forever reading their
+    // child's stdout), which is why exit used to need a second Ctrl-C.
+    // Dropping the terminal restores the shell screen first; the OS reaps
+    // any spawned MCP children.
+    drop(terminal);
+    drop(_guard);
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Text painted around the input box border (session id, model, cwd).
@@ -402,7 +420,8 @@ async fn run_inner(
                     drain_ready_scroll_keys(&mut events, &mut state).await;
                 } else if let Some(prompt) = state.handle_key(key) {
                     if prompt == "/compact" {
-                        state.busy = Some(BusyState::Compacting);
+                        state.push_line(compaction_banner("compacting…"), LineKind::Compaction);
+                        state.busy = Some(BusyState::compacting());
                         state.streamed = false;
                         draw(terminal, &mut state)?;
                         let (result, interruption) = drive(
@@ -421,10 +440,16 @@ async fn run_inner(
                         }
                         if let Some(result) = result {
                             match result {
-                                Ok(summary) => state.push_final_answer(format!(
-                                    "compacted: {}",
-                                    preview(&summary, 500)
-                                )),
+                                Ok(summary) => {
+                                    state.push_line(
+                                        compaction_banner("compaction"),
+                                        LineKind::Compaction,
+                                    );
+                                    state.push_final_answer(format!(
+                                        "compacted: {}",
+                                        preview(&summary, 500)
+                                    ));
+                                }
                                 Err(error) => {
                                     state
                                         .push_line(format!("error: {error:#}"), LineKind::ToolError)
@@ -438,6 +463,10 @@ async fn run_inner(
                         }
                         if matches!(interruption, Some(Interruption::CancelTurn)) {
                             state.push_line("cancelled".into(), LineKind::Dim);
+                            // Cancelling with queued prompts should not need
+                            // one Ctrl-C per queued turn: fold everything
+                            // queued into a single follow-up turn.
+                            state.collapse_queue();
                         }
                         state.follow();
                         continue;
@@ -489,6 +518,9 @@ async fn run_inner(
                 }
             }
             Some(Ok(Event::Paste(text))) => {
+                // Windows-style pastes arrive as \r\n; hard_wrap only splits
+                // on \n, so normalize or the newlines are swallowed.
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 if let Some(attached) = &mut state.attached {
                     attached.input.insert(&text);
                 } else {
@@ -520,7 +552,7 @@ async fn run_request(
     prompt: String,
 ) -> anyhow::Result<bool> {
     let (root, session_name, persisted) = session;
-    ui.state.busy = Some(BusyState::Thinking);
+    ui.state.busy = Some(BusyState::thinking());
     ui.state.streamed = false;
     draw(terminal, ui.state)?;
     let (result, interruption) = drive(
@@ -547,6 +579,7 @@ async fn run_request(
     }
     if matches!(interruption, Some(Interruption::CancelTurn)) {
         ui.state.push_line("cancelled".into(), LineKind::Dim);
+        ui.state.collapse_queue();
     }
     Session::append(root, session_name, &agent.history()[*persisted..])?;
     *persisted = agent.history().len();
@@ -642,7 +675,9 @@ async fn drive<T>(
                         state.show_tasks = true;
                         state.task_cursor = 0;
                     } else if key.code == KeyCode::Enter {
-                        if let Some(prompt) = state.take_input() {
+                        if key.modifiers == KeyModifiers::ALT {
+                            state.input.insert_char('\n');
+                        } else if let Some(prompt) = state.take_input() {
                             state.queued.push(prompt);
                         }
                     } else if is_scroll_key(key) {
@@ -654,6 +689,8 @@ async fn drive<T>(
                     draw(terminal, state)?;
                 }
                 Some(Ok(Event::Paste(text))) => {
+                    // Same \r\n normalization as the idle loop.
+                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
                     if let Some(attached) = &mut state.attached {
                         attached.input.insert(&text);
                     } else {
@@ -691,7 +728,13 @@ fn draw<B: ratatui::backend::Backend>(
             let input_height = (input_rows + 2)
                 .min((usize::from(frame.area().height) / 3).max(3))
                 .max(3) as u16;
-            let queue_height = u16::from(!attached && !state.queued.is_empty());
+            let queue_height = if attached || state.queued.is_empty() {
+                0
+            } else {
+                // One row per queued prompt, so every pending message is
+                // visible (not just the head).
+                state.queued.len() as u16
+            };
             let running: Vec<crate::tools::BackgroundTaskInfo> = state
                 .background
                 .as_ref()
@@ -712,17 +755,20 @@ fn draw<B: ratatui::backend::Backend>(
                 Constraint::Length(input_height),
             ])
             .areas(frame.area());
-            if queue_height == 1 {
+            if queue_height > 0 {
+                let queued_lines: Vec<Line> = state
+                    .queued
+                    .iter()
+                    .enumerate()
+                    .map(|(index, prompt)| {
+                        Line::styled(
+                            format!("queued {}: {}", index + 1, preview(prompt, 60)),
+                            SOLARIZED_LIGHT.queue_style(),
+                        )
+                    })
+                    .collect();
                 frame.render_widget(
-                    Paragraph::new(Line::styled(
-                        format!(
-                            "queued ({}): {}",
-                            state.queued.len(),
-                            preview(&state.queued[0], 60)
-                        ),
-                        SOLARIZED_LIGHT.queue_style(),
-                    ))
-                    .style(SOLARIZED_LIGHT.queue_style()),
+                    Paragraph::new(queued_lines).style(SOLARIZED_LIGHT.queue_style()),
                     queue_bar,
                 );
             }
@@ -857,11 +903,7 @@ fn draw<B: ratatui::backend::Backend>(
             // Input-box chrome: top-left = status, top-right = session id,
             // bottom-left = model (agent role goes here later), bottom-right =
             // cwd + context tokens.
-            let title = match state.busy {
-                Some(BusyState::Thinking) => "thinking…".to_owned(),
-                Some(BusyState::Compacting) => "compaction…".to_owned(),
-                None => String::new(),
-            };
+            let title = state.busy.map_or(String::new(), BusyState::title);
             let input_block = SOLARIZED_LIGHT
                 .block(title)
                 .title_top(
@@ -874,13 +916,17 @@ fn draw<B: ratatui::backend::Backend>(
                         .alignment(Alignment::Left)
                         .style(Style::default().fg(SOLARIZED_LIGHT.violet)),
                 );
-            let usage = (state.tokens_context > 0).then(|| {
+            // cwd is always shown; the context-token count appears once the
+            // first turn has reported usage.
+            let usage = if state.tokens_context > 0 {
                 format!(
                     "{} · ctx {}",
                     state.cwd,
                     format_tokens(state.tokens_context)
                 )
-            });
+            } else {
+                state.cwd.clone()
+            };
             let (cursor_row, cursor_col) = state.input.wrapped_cursor(inner_input_width);
             let inner_input_height = usize::from(input.height.saturating_sub(2));
             let input_scroll = cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
@@ -895,7 +941,7 @@ fn draw<B: ratatui::backend::Backend>(
                     .scroll((input_scroll.min(u16::MAX as usize) as u16, 0)),
                 input,
             );
-            if let Some(usage) = usage {
+            {
                 let width = UnicodeWidthStr::width(usage.as_str()) as u16 + 1;
                 if input.width > width + 1 {
                     let area = ratatui::layout::Rect {
@@ -955,6 +1001,13 @@ fn format_tokens(count: u64) -> String {
     } else {
         count.to_string()
     }
+}
+
+/// Horizontal rule marking compaction boundaries in the scrollback. Rendered
+/// with LineKind::Compaction (violet on the element surface) so it stands
+/// out from regular log lines.
+fn compaction_banner(label: &str) -> String {
+    format!("──── {label} ────")
 }
 
 fn is_scroll_key(key: KeyEvent) -> bool {
@@ -1135,12 +1188,58 @@ enum LineKind {
     ToolCall,
     ToolResult,
     ToolError,
+    /// Full-width banner marking where a compaction happened in the log.
+    Compaction,
 }
 
 #[derive(Clone, Copy)]
-enum BusyState {
+enum BusyKind {
     Thinking,
     Compacting,
+}
+
+/// In-flight work shown in the input border. The spinner frame advances on
+/// every routed session event (deltas, tool calls, …), so it spins while
+/// the model streams and freezes when the provider stalls — a stuck frame
+/// is itself the signal. Each view (main / attached) owns its TuiState, so
+/// sessions spin independently.
+#[derive(Clone, Copy)]
+struct BusyState {
+    kind: BusyKind,
+    frame: usize,
+}
+
+impl BusyState {
+    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+    fn thinking() -> Self {
+        Self {
+            kind: BusyKind::Thinking,
+            frame: 0,
+        }
+    }
+
+    fn compacting() -> Self {
+        Self {
+            kind: BusyKind::Compacting,
+            frame: 0,
+        }
+    }
+
+    fn advance(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    fn title(self) -> String {
+        let label = match self.kind {
+            BusyKind::Thinking => "thinking…",
+            BusyKind::Compacting => "compaction…",
+        };
+        format!(
+            "{} {label}",
+            Self::SPINNER[self.frame % Self::SPINNER.len()]
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1156,8 +1255,9 @@ impl TuiState {
             match entry {
                 SessionEntry::Message { message } => state.push_message(message),
                 SessionEntry::Compaction { summary, .. } => {
+                    state.push_line(compaction_banner("compaction"), LineKind::Compaction);
                     state.push_line(
-                        format!("── compacted: {}", preview(summary, 150)),
+                        format!("compacted: {}", preview(summary, 150)),
                         LineKind::Dim,
                     );
                 }
@@ -1217,6 +1317,15 @@ impl TuiState {
         }
     }
 
+    /// Fold every queued prompt into one so a cancelled turn is followed by
+    /// a single combined turn instead of N turns needing N cancels.
+    fn collapse_queue(&mut self) {
+        if self.queued.len() > 1 {
+            let joined = self.queued.join("\n\n");
+            self.queued = vec![joined];
+        }
+    }
+
     /// Attach to a background session: snapshot its event log into a fresh
     /// scrollback and follow its live stream from now on (see `bridge`).
     fn attach(&mut self, id: u64, label: String, handle: Arc<dyn SessionHandle>) {
@@ -1260,6 +1369,9 @@ impl TuiState {
             | KeyCode::PageDown
             | KeyCode::Home
             | KeyCode::End => attached.state.handle_scroll(key),
+            KeyCode::Enter if key.modifiers == KeyModifiers::ALT => {
+                attached.input.insert_char('\n');
+            }
             KeyCode::Enter => {
                 let prompt = std::mem::take(&mut attached.input.text);
                 attached.input.cursor = 0;
@@ -1306,6 +1418,16 @@ impl TuiState {
         }
     }
 
+    /// Every routed session event counts as a heartbeat: the receiving
+    /// view's spinner (and the main view's, since BackgroundCompleted of an
+    /// attached session lands in both) advances one frame.
+    fn push_agent_event(&mut self, event: AgentEvent) {
+        if let Some(busy) = &mut self.busy {
+            busy.advance();
+        }
+        self.push_agent_event_inner(event);
+    }
+
     fn edit_input(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(character)
@@ -1335,7 +1457,15 @@ impl TuiState {
             | KeyCode::PageDown
             | KeyCode::Home
             | KeyCode::End => self.handle_scroll(key),
-            KeyCode::Enter => return self.take_input(),
+            KeyCode::Enter => {
+                // Alt+Enter inserts a newline (Shift+Enter is not
+                // distinguishable in most terminals).
+                if key.modifiers == KeyModifiers::ALT {
+                    self.input.insert_char('\n');
+                } else {
+                    return self.take_input();
+                }
+            }
             _ => self.edit_input(key),
         }
         None
@@ -1389,7 +1519,7 @@ impl TuiState {
         self.scroll >= self.max_scroll
     }
 
-    fn push_agent_event(&mut self, event: AgentEvent) {
+    fn push_agent_event_inner(&mut self, event: AgentEvent) {
         let at_bottom = self.at_bottom();
         let ends_delta = matches!(
             &event,
@@ -2078,7 +2208,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = TuiState {
-            busy: Some(BusyState::Thinking),
+            busy: Some(BusyState::thinking()),
             ..Default::default()
         };
         draw(&mut terminal, &mut state).unwrap();
@@ -2087,9 +2217,10 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(thinking_title.contains("thinking…"));
+        assert!(thinking_title.contains(BusyState::SPINNER[0].to_string().as_str()));
         assert!(!thinking_title.contains("compaction…"));
 
-        state.busy = Some(BusyState::Compacting);
+        state.busy = Some(BusyState::compacting());
         draw(&mut terminal, &mut state).unwrap();
         let compaction_title: String = terminal.backend().buffer().content()[7 * 40..8 * 40]
             .iter()
@@ -2379,7 +2510,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_shows_compaction_entries_as_single_dim_lines() {
+    fn replay_shows_compaction_entries_as_a_banner_and_summary_line() {
         let entries = vec![
             SessionEntry::Message {
                 message: Message::User {
@@ -2408,10 +2539,134 @@ mod tests {
             lines,
             [
                 ("you> old work", LineKind::User),
-                ("── compacted: summary of old work", LineKind::Dim),
+                ("──── compaction ────", LineKind::Compaction),
+                ("compacted: summary of old work", LineKind::Dim),
                 ("you> new work", LineKind::User),
             ],
             "retained tail must not be duplicated in the scrollback"
         );
+    }
+}
+
+#[cfg(test)]
+mod ux_tests {
+    use super::*;
+
+    #[test]
+    fn session_events_advance_the_busy_spinner_frame() {
+        let mut state = TuiState {
+            busy: Some(BusyState::thinking()),
+            ..Default::default()
+        };
+        assert_eq!(state.busy.unwrap().frame, 0);
+        state.push_agent_event(AgentEvent::ReasoningDelta("hmm".into()));
+        assert_eq!(state.busy.unwrap().frame, 1);
+        state.push_agent_event(AgentEvent::AssistantDelta("hi".into()));
+        assert_eq!(state.busy.unwrap().frame, 2);
+        assert_ne!(
+            BusyState {
+                kind: BusyKind::Thinking,
+                frame: 0
+            }
+            .title(),
+            BusyState {
+                kind: BusyKind::Thinking,
+                frame: 1
+            }
+            .title(),
+            "the spinner glyph changes as events stream in"
+        );
+        state.busy = None;
+        state.push_agent_event(AgentEvent::AssistantDelta("done".into()));
+        assert!(state.busy.is_none(), "idle views have nothing to spin");
+    }
+
+    #[test]
+    fn spinner_frames_are_per_view_not_global() {
+        let (handle, _sink, _source) = crate::handle::session_channel();
+        let mut parent = TuiState {
+            busy: Some(BusyState::thinking()),
+            ..Default::default()
+        };
+        parent.attach(1, "task".into(), Arc::new(handle));
+        let attached = parent.attached.as_mut().unwrap();
+        attached.state.busy = Some(BusyState::thinking());
+        attached
+            .state
+            .push_agent_event(AgentEvent::AssistantDelta("sub".into()));
+        assert_eq!(
+            parent.attached.as_ref().unwrap().state.busy.unwrap().frame,
+            1
+        );
+        assert_eq!(
+            parent.busy.unwrap().frame,
+            0,
+            "attached-session events do not move the main spinner"
+        );
+    }
+
+    #[test]
+    fn cancelling_collapses_queued_prompts_into_one_turn() {
+        let mut state = TuiState {
+            queued: vec!["one".into(), "two".into(), "three".into()],
+            ..Default::default()
+        };
+        state.collapse_queue();
+        assert_eq!(state.queued, vec!["one\n\ntwo\n\nthree".to_owned()]);
+        // A single queued prompt (or none) is left alone.
+        let mut state = TuiState {
+            queued: vec!["only".into()],
+            ..Default::default()
+        };
+        state.collapse_queue();
+        assert_eq!(state.queued, vec!["only".to_owned()]);
+    }
+
+    #[test]
+    fn cwd_shows_in_the_input_border_before_any_token_usage() {
+        let backend = ratatui::backend::TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState {
+            cwd: "/home/me/project".into(),
+            tokens_context: 0,
+            ..Default::default()
+        };
+        draw(&mut terminal, &mut state).unwrap();
+        let bottom: String = terminal.backend().buffer().content()[9 * 60..10 * 60]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(bottom.contains("/home/me/project"), "bottom row: {bottom}");
+        assert!(!bottom.contains("ctx"), "bottom row: {bottom}");
+
+        state.tokens_context = 1234;
+        draw(&mut terminal, &mut state).unwrap();
+        let bottom: String = terminal.backend().buffer().content()[9 * 60..10 * 60]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(bottom.contains("ctx 1.2k"), "bottom row: {bottom}");
+    }
+
+    #[test]
+    fn pasted_crlf_is_normalized_to_plain_newlines() {
+        let mut input = InputBuffer::default();
+        let pasted = "one\r\ntwo\rthree"
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        input.insert(&pasted);
+        assert_eq!(input.text, "one\ntwo\nthree");
+        assert_eq!(input.visual_rows(40), 3);
+    }
+
+    #[test]
+    fn alt_enter_inserts_a_newline_instead_of_submitting() {
+        let mut state = TuiState::default();
+        state.input.insert("first");
+        let submitted = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(submitted.is_none());
+        assert_eq!(state.input.text, "first\n");
+        let submitted = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(submitted, Some("first\n".to_owned()));
     }
 }
