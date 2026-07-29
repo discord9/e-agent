@@ -88,6 +88,7 @@ pub struct ToolSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentEvent {
+    UserPrompt(String),
     AssistantText(String),
     AssistantDelta(String),
     ReasoningDelta(String),

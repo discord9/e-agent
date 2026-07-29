@@ -99,6 +99,13 @@ impl SessionHandle for LiveSession {
     }
 
     fn send_input(&self, prompt: String) {
+        // Record the prompt in the shared log/stream so frontends render it
+        // immediately (queued or not), then steer the agent.
+        let _ = self.events.send(AgentEvent::UserPrompt(prompt.clone()));
+        self.log
+            .lock()
+            .unwrap()
+            .push(AgentEvent::UserPrompt(prompt.clone()));
         let _ = self.steer.send(Steer::Prompt(prompt));
     }
 

@@ -1204,10 +1204,9 @@ impl TuiState {
                 let prompt = std::mem::take(&mut attached.input.text);
                 attached.input.cursor = 0;
                 if !prompt.trim().is_empty() && !attached.finished {
-                    attached
-                        .state
-                        .push_line(format!("you> {prompt}"), LineKind::User);
-                    attached.state.follow();
+                    // send_input records a UserPrompt event in the session
+                    // log/stream, which renders the `you>` line (queued or
+                    // not) via the normal event path.
                     attached.handle.send_input(prompt);
                 }
             }
@@ -1337,6 +1336,7 @@ impl TuiState {
             AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
         );
         match event {
+            AgentEvent::UserPrompt(text) => self.push_line(format!("you> {text}"), LineKind::User),
             AgentEvent::AssistantText(text) => self.push_line(text, LineKind::Normal),
             AgentEvent::AssistantDelta(text) => {
                 if self.active_lane == Some(ActiveStreamLane::Content) {
@@ -1657,18 +1657,20 @@ mod tests {
                 "please also check tests".into()
             ))
         );
-        // The steering prompt echoes into the attached scrollback.
+        // The steering prompt is recorded in the session log (snapshot
+        // replays it as a `you>` line on the next event).
         assert_eq!(
-            state
-                .attached
-                .as_ref()
-                .unwrap()
-                .state
-                .lines
-                .last()
-                .unwrap()
-                .text,
-            "you> please also check tests"
+            state.attached.as_ref().unwrap().handle.snapshot(),
+            vec![AgentEvent::UserPrompt("please also check tests".into())]
+        );
+        // Re-attach replays the snapshot including the queued prompt.
+        let handle = state.attached.as_ref().unwrap().handle.clone();
+        state.attach(7, "demo task".into(), handle);
+        let lines = &state.attached.as_ref().unwrap().state.lines;
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text == "you> please also check tests")
         );
         state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
         assert_eq!(source.try_recv(), Some(crate::handle::Steer::Cancel));

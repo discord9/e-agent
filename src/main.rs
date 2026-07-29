@@ -164,6 +164,9 @@ fn set_stderr_events(agent: &mut Agent) {
     let mut streaming = false;
     let mut reasoning = false;
     agent.set_event_handler(Box::new(move |event| match event {
+        // Steering prompts are recorded by the session handle; the stderr
+        // frontend never sends any, so nothing to print.
+        AgentEvent::UserPrompt(_) => {}
         AgentEvent::AssistantText(text) => eprintln!("assistant: {}", preview(&text, 500)),
         AgentEvent::AssistantDelta(text) => {
             if reasoning {
