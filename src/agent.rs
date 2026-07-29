@@ -524,15 +524,12 @@ impl Agent {
         while let Some((id, output)) = self.pending_background.pop_front() {
             let text = format!("[background task {id} completed]\n{output}");
             // The completion joins the history as a user message at this
-            // turn boundary; emit it to the session observers too so their
-            // event log (the TUI's scrollback and the attach snapshot)
-            // shows it exactly once — drain_background deliberately does
-            // not fan out.
-            let event = AgentEvent::UserPrompt(text.clone());
-            if let Some(subscriber) = &self.subscriber {
-                let _ = subscriber.send(event.clone());
-            }
-            self.fanout(&event);
+            // turn boundary; emit it to the session observers only (their
+            // event log is the TUI's scrollback and the attach snapshot).
+            // The per-turn subscriber is for transient signals (deltas, the
+            // BackgroundCompleted fired at drain time) — sending this too
+            // would render the line twice in the TUI, which listens to both.
+            self.fanout(&AgentEvent::UserPrompt(text.clone()));
             self.push_message(Message::User { content: text });
         }
     }
@@ -1008,7 +1005,9 @@ mod tests {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         agent.subscribe(sender);
         assert_eq!(agent.run("second".into()).await.unwrap(), "next");
-        // Subscriber saw the transient completion exactly once...
+        // Subscriber saw the transient completion exactly once, and the
+        // turn-boundary user message is NOT sent to it (that would render
+        // twice in the TUI, which listens to both paths).
         let mut transient = 0;
         let mut prompt_notifications = 0;
         while let Ok(event) = receiver.try_recv() {
@@ -1023,7 +1022,7 @@ mod tests {
             }
         }
         assert_eq!(transient, 1);
-        assert_eq!(prompt_notifications, 1);
+        assert_eq!(prompt_notifications, 0);
         // ...and the observer log holds it once, as the user message, never
         // as the transient variant.
         let snapshot = handle.snapshot();
