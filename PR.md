@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS session_entries (
 | Operation | Query | Optimization |
 |-----------|-------|-------------|
 | `connect` (find max seq) | `SELECT COALESCE(MAX(seq), -1)::BIGINT ... WHERE workspace_id=$1 AND session_id=$2` | Full partition scan (acceptable, sessions are bounded) |
-| `load` (read all entries) | `SELECT seq, event_time, payload ... ORDER BY seq ASC` | App-side dedup (`dedup_raw_entries`) — group by seq, keep only rows with the latest `event_time` per seq, sort output by seq ASC |
+| `load` (read all entries) | `SELECT seq, event_time, payload ... ORDER BY event_time ASC, seq ASC` | SQL returns every physical version; app-side `dedup_raw_entries` keeps the latest `event_time` per seq, then sorts logical output by winning `event_time ASC, seq ASC` |
 | `append` | Parameterized multi-row INSERT | Single statement (all-or-nothing per chunk of ≤9000 rows); `next_seq` advances only after all chunks succeed |
 
 ### Dedup semantics (load_with_seq → dedup_raw_entries)
@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS session_entries (
    identical (idempotent retry at the same microsecond), they are folded into
    one logical entry. If **any** differ, an error is returned with the seq,
    event_time, session id, and manual-inspection guidance.
-3. Output is ordered by seq ASC.
+3. Logical output is ordered by winning `event_time ASC`, with `seq ASC` only as the tie-breaker.
 
 ## Verification
 

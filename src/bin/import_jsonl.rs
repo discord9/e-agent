@@ -54,8 +54,8 @@ enum ImportPlan<'a> {
 /// Compare deduplicated DB entries with the full JSONL entry list, and
 /// decide what to do.
 ///
-/// **Pre-condition**: `db_entries` should already be sorted by seq AND have
-/// continuous seq values 0..N (checked by `verify_seq_continuity`).
+/// **Pre-condition**: `db_entries` should already be rebuilt in seq identity
+/// order 0..N by `entries_in_seq_order`.
 fn plan_import<'a>(
     db_entries: &[SessionEntry],
     jsonl_entries: &'a [SessionEntry],
@@ -82,18 +82,21 @@ fn plan_import<'a>(
     }
 }
 
-/// Verify that seq values are strictly 0..N continuous.
-fn verify_seq_continuity(entries: &[(i64, SessionEntry)]) -> anyhow::Result<()> {
+/// Validate that seq identities form the continuous set 0..N, then rebuild
+/// payloads in seq order for JSONL ordinal comparison.
+fn entries_in_seq_order(entries: &[(i64, SessionEntry)]) -> anyhow::Result<Vec<SessionEntry>> {
+    let mut entries = entries.to_vec();
+    entries.sort_unstable_by_key(|(seq, _)| *seq);
     for (i, (seq, _)) in entries.iter().enumerate() {
         let expected = i as i64;
         if *seq != expected {
             anyhow::bail!(
-                "seq discontinuity at index {i}: expected seq {expected}, got {seq}; \
+                "seq discontinuity: expected seq {expected}, got {seq}; \
                  DB has gaps or duplicates that dedup cannot resolve"
             );
         }
     }
-    Ok(())
+    Ok(entries.into_iter().map(|(_, entry)| entry).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -292,10 +295,9 @@ async fn run() -> anyhow::Result<()> {
         .await
         .context("cannot load session entries from GreptimeDB")?;
 
-    // --- Verify DB seq continuity ---
-    verify_seq_continuity(&db_with_seq).context("DB seq continuity check failed")?;
-
-    let db_entry_slice: Vec<SessionEntry> = db_with_seq.iter().map(|(_, e)| e.clone()).collect();
+    // --- Validate seq identities and rebuild JSONL ordinal order ---
+    let db_entry_slice =
+        entries_in_seq_order(&db_with_seq).context("DB seq continuity check failed")?;
 
     // --- Plan ---
     let plan = plan_import(&db_entry_slice, &jsonl_entries);
@@ -344,28 +346,28 @@ async fn run() -> anyhow::Result<()> {
                     missing.len()
                 );
             } else {
-                // TOCTOU guard: re-read DB before writing to check no concurrent changes.
-                // Uses load_with_seq + verify_seq_continuity + full snapshot equal.
-                // Skip this in dry-run mode (no insert planned).
+                // TOCTOU guard: re-read DB before writing, validate seq identities,
+                // and compare the snapshot in JSONL ordinal order. Skip this in
+                // dry-run mode (no insert planned).
                 let check = db
                     .load_with_seq()
                     .await
                     .context("cannot re-load DB entries before write (TOCTOU check)")?;
-                verify_seq_continuity(&check)
+                let check_entries = entries_in_seq_order(&check)
                     .context("DB seq continuity check failed before write (TOCTOU)")?;
-                if check != db_with_seq {
+                if check_entries != db_entry_slice {
                     bail!(
                         "DB changed between initial read and pre-write check \
                          ({} entries vs {}). Target session may not be idle. \
                          Re-run when session is idle.",
-                        db_with_seq.len(),
-                        check.len(),
+                        db_entry_slice.len(),
+                        check_entries.len(),
                     );
                 }
 
                 // Sync next_seq from the TOCTOU-re-read snapshot so that
                 // stale connect-time next_seq does not cause overwrites.
-                db.advance_next_seq_from_snapshot_len(check.len())
+                db.advance_next_seq_from_snapshot_len(check_entries.len())
                     .context("cannot advance next_seq from TOCTOU snapshot")?;
 
                 db.append(missing)
@@ -397,29 +399,31 @@ async fn verify_db_matches(db: &GreptimeSession, expected: &[SessionEntry]) -> a
         .await
         .context("cannot reload session entries after write for verification")?;
 
-    // 1. Verify seq continuity
-    if let Err(e) = verify_seq_continuity(&final_entries) {
-        bail!(
-            "verification FAILED — {e}; \
-             partial commit may have occurred. Fix the issue and re-run.",
-        );
-    }
+    // 1. Verify seq continuity and rebuild JSONL ordinal order.
+    let got_entries = match entries_in_seq_order(&final_entries) {
+        Ok(entries) => entries,
+        Err(e) => {
+            bail!(
+                "verification FAILED — {e}; \
+                 partial commit may have occurred. Fix the issue and re-run.",
+            );
+        }
+    };
 
     // 2. Verify length
-    if final_entries.len() != expected.len() {
+    if got_entries.len() != expected.len() {
         bail!(
             "verification FAILED: reloaded DB has {} entries, expected {}; \
              partial commit may have occurred. Fix the issue, ensure session \
              is idle, and re-run.",
-            final_entries.len(),
+            got_entries.len(),
             expected.len(),
         );
     }
 
-    // 3. Verify content per entry
-    let got_entries: Vec<&SessionEntry> = final_entries.iter().map(|(_, e)| e).collect();
+    // 3. Verify content per seq identity
     for (i, (got, want)) in got_entries.iter().zip(expected.iter()).enumerate() {
-        if *got != want {
+        if got != want {
             bail!(
                 "verification FAILED at position {i}: DB entry content differs from JSONL; \
                  partial commit may have occurred. Fix the issue and re-run.",
@@ -557,19 +561,28 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // verify_seq_continuity
+    // entries_in_seq_order
     // ------------------------------------------------------------------
 
     #[test]
     fn seq_continuity_ok() {
         let data: Vec<(i64, SessionEntry)> = (0..5).map(|i| (i, msg("x"))).collect();
-        assert!(verify_seq_continuity(&data).is_ok());
+        assert!(entries_in_seq_order(&data).is_ok());
+    }
+
+    #[test]
+    fn canonical_event_time_order_rebuilds_jsonl_seq_order() {
+        let data = vec![(2, msg("c")), (0, msg("a")), (1, msg("b"))];
+        let rebuilt = entries_in_seq_order(&data).unwrap();
+        let jsonl = entries(&["a", "b", "c"]);
+        assert_eq!(rebuilt, jsonl);
+        assert_eq!(plan_import(&rebuilt, &jsonl), ImportPlan::Unchanged);
     }
 
     #[test]
     fn seq_continuity_empty() {
         let data: Vec<(i64, SessionEntry)> = vec![];
-        assert!(verify_seq_continuity(&data).is_ok());
+        assert!(entries_in_seq_order(&data).is_ok());
     }
 
     #[test]
@@ -578,8 +591,8 @@ mod tests {
             (0, msg("a")),
             (2, msg("b")), // gap: seq 1 missing
         ];
-        let err = verify_seq_continuity(&data).unwrap_err();
-        assert!(format!("{err:#}").contains("seq discontinuity at index 1"));
+        let err = entries_in_seq_order(&data).unwrap_err();
+        assert!(format!("{err:#}").contains("seq discontinuity: expected seq 1"));
     }
 
     #[test]
@@ -587,8 +600,8 @@ mod tests {
         let data: Vec<(i64, SessionEntry)> = vec![
             (1, msg("a")), // should start at 0
         ];
-        let err = verify_seq_continuity(&data).unwrap_err();
-        assert!(format!("{err:#}").contains("seq discontinuity at index 0"));
+        let err = entries_in_seq_order(&data).unwrap_err();
+        assert!(format!("{err:#}").contains("seq discontinuity: expected seq 0"));
     }
 
     #[test]
@@ -599,8 +612,8 @@ mod tests {
         ];
         // Dedup handled in load_with_seq, but verify catches if duplicates
         // somehow survive.
-        let err = verify_seq_continuity(&data).unwrap_err();
-        assert!(format!("{err:#}").contains("seq discontinuity at index 1"));
+        let err = entries_in_seq_order(&data).unwrap_err();
+        assert!(format!("{err:#}").contains("seq discontinuity: expected seq 1"));
     }
 
     // ------------------------------------------------------------------

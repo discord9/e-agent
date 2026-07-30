@@ -385,7 +385,9 @@ with the same name in different workspaces remain isolated.
   ordering (same-µs or backward clock → prev+1).  Dedup: per seq, only rows
   with the latest `event_time` are retained; at the same max `event_time`,
   identical deserialised `SessionEntry` values are folded and divergent ones
-  cause a hard error.
+  cause a hard error. Canonical conversation order is the winning
+  `event_time ASC`, with `seq ASC` only as a tie-breaker; seq remains identity
+  and continuity metadata.
 - No transactions — atomicity is per multi-row INSERT statement
 - Subagents each open their own database connection (bounded, fine for
   single-user agents)
@@ -395,7 +397,7 @@ with the same name in different workspaces remain isolated.
 | Operation | Query | Optimization |
 |-----------|-------|-------------|
 | connect (find max seq) | `SELECT MAX(seq) ... WHERE workspace_id=$1 AND session_id=$2` | Full partition scan (acceptable, sessions are bounded) |
-| load (all entries) | `SELECT seq, event_time, payload ... ORDER BY seq ASC` | App-side dedup (group by seq, latest event_time wins) |
+| load (all entries) | `SELECT seq, event_time, payload ... ORDER BY event_time ASC, seq ASC` | App-side cross-version dedup (latest event_time per seq), then canonical winning `event_time ASC, seq ASC` order |
 | append | Parameterized multi-row INSERT | Single statement, all-or-nothing per chunk |
 
 ### Import tool: `e-agent-import-jsonl`

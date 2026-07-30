@@ -231,12 +231,13 @@ The `left(replace(...), 120)` strips newlines and truncates to 120 characters
 so the output fits in a terminal without scrolling. The payload is a
 `SessionEntry` JSON blob (see `SessionEntry` enum in the Rust source).
 
-### 7. Reconstruct logical transcript (deduplicated by seq, latest event_time wins)
+### 7. Reconstruct logical transcript (latest version per seq, event-time order)
 
-The production code loads entries ordered by `seq ASC` and deduplicates by
-seq: for each seq, only the row(s) with the latest `event_time` are kept
-(identical-payload rows at the same max event_time are folded; divergent
-payloads error). The result is a flat list in seq order.
+The production code deduplicates across all versions by seq: for each seq,
+only the row(s) with the latest `event_time` are kept (identical-payload rows
+at the same max event_time are folded; divergent payloads error). The result
+is ordered by the winning `event_time ASC`, then `seq ASC`; seq is only the
+tie-breaker plus identity and continuity metadata.
 
 For ad hoc inspection, first find the max `event_time` per seq, then keep
 **all** rows that match that max time — a tie at max event_time is not
@@ -254,7 +255,7 @@ SELECT s.seq, s.entry_kind, s.is_error,
 FROM session_entries s
 JOIN max_et m ON s.seq = m.seq AND s.event_time = m.max_event_time
 WHERE s.workspace_id=:'wid' AND s.session_id=:'sid'
-ORDER BY s.seq ASC;
+ORDER BY m.max_event_time ASC, s.seq ASC;
 ```
 
 > **Note**: This scans all rows for the session, which is fine for ad hoc
@@ -367,7 +368,8 @@ SQL
 
 ### 9. Inspect last compaction and understand effective history
 
-List all compaction entries (candidate rows from latest event_time per seq, ordered by seq):
+List all compaction entries (candidate rows from latest event_time per seq,
+ordered by winning event_time, then seq):
 
 ```bash
 psql "$CONN" -v sid="$SESSION" -v wid="$WORKSPACE" -P pager=off <<'SQL'
@@ -382,7 +384,7 @@ FROM session_entries s
 JOIN max_et m ON s.seq = m.seq AND s.event_time = m.max_event_time
 WHERE s.workspace_id=:'wid' AND s.session_id=:'sid'
   AND s.entry_kind = 'compaction'
-ORDER BY s.seq ASC;
+ORDER BY m.max_event_time ASC, s.seq ASC;
 SQL
 ```
 
@@ -395,9 +397,9 @@ SQL
 **How compaction works — effective history**:
 
 - Compaction is **append-only**: old rows remain in the table. Effective
-  history is reconstructed by taking the **last** `Compaction` entry (the
-  one with the highest `seq`, found via `rposition` in Rust) and appending
-  all entries with a higher seq.
+  history is reconstructed by taking the **last** `Compaction` entry in
+  canonical winning `(event_time, seq)` order (found via `rposition` in Rust)
+  and appending all entries that follow it in that canonical order.
 - Physical row count is **not** model context size. The model sees only
   logical entries after dedup and compaction resolution.
 - Each compaction entry stores a `summary` and a `retained` array of messages
@@ -514,7 +516,7 @@ ORDER BY seq DESC
 LIMIT 10;
 SQL
 
-# 3. Logical deduped transcript (seq order, latest event_time per seq — all tie rows)
+# 3. Logical deduped transcript (winning event_time, then seq — all tie rows)
 psql "$CONN" -v sid="$SESSION" -v wid="$WORKSPACE" -P pager=off <<'SQL'
 WITH max_et AS (
   SELECT seq, MAX(event_time) AS max_event_time
@@ -527,7 +529,7 @@ SELECT s.seq, s.entry_kind, s.is_error,
 FROM session_entries s
 JOIN max_et m ON s.seq = m.seq AND s.event_time = m.max_event_time
 WHERE s.workspace_id=:'wid' AND s.session_id=:'sid'
-ORDER BY s.seq ASC;
+ORDER BY m.max_event_time ASC, s.seq ASC;
 SQL
 
 # 4. Entry kind / error counts (candidate rows)
@@ -559,7 +561,7 @@ FROM session_entries s
 JOIN max_et m ON s.seq = m.seq AND s.event_time = m.max_event_time
 WHERE s.workspace_id=:'wid' AND s.session_id=:'sid'
   AND s.entry_kind = 'compaction'
-ORDER BY s.seq DESC
+ORDER BY m.max_event_time DESC, s.seq DESC
 LIMIT 1;
 SQL
 

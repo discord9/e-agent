@@ -172,7 +172,8 @@ impl GreptimeSession {
     }
 
     /// Load all entries for this session, deduplicated by seq (latest
-    /// event_time wins) and sorted by seq ASC.  Delegates to `load_with_seq`.
+    /// event_time wins) and sorted by winning event_time ASC, then seq ASC.
+    /// Delegates to `load_with_seq`.
     pub async fn load(&self) -> Result<Vec<SessionEntry>> {
         self.load_with_seq()
             .await
@@ -180,7 +181,9 @@ impl GreptimeSession {
     }
 
     /// Load entries paired with their sequence numbers, deduplicated by
-    /// seq (latest event_time wins per seq) and sorted by seq ASC.
+    /// seq (latest event_time wins per seq) and sorted by winning event_time
+    /// ASC, then seq ASC. The seq remains available as identity and integrity
+    /// metadata.
     ///
     /// **Duplicate handling per seq**:
     ///
@@ -195,14 +198,14 @@ impl GreptimeSession {
     ///    differ, this returns an error with the seq, event_time, session
     ///    id, and manual-inspection guidance.
     ///
-    /// 3. Output is ordered by seq ASC.
+    /// 3. Output is ordered by the winning event_time ASC, then seq ASC.
     pub async fn load_with_seq(&self) -> Result<Vec<(i64, SessionEntry)>> {
         let rows = self
             .client
             .query(
                 "SELECT seq, event_time, payload FROM session_entries \
                  WHERE workspace_id = $1 AND session_id = $2 \
-                 ORDER BY seq ASC",
+                 ORDER BY event_time ASC, seq ASC",
                 &[&self.workspace_id, &self.session_id],
             )
             .await
@@ -345,7 +348,7 @@ fn build_multi_row_insert(row_count: usize) -> String {
 /// - If the latest event_time has multiple physical rows (same microsecond),
 ///   their deserialised payloads are compared.  All identical → folded;
 ///   any divergent → `Err` with diagnostic guidance.
-/// - Output is sorted by seq ASC.
+/// - Output is sorted by the winning event_time ASC, then seq ASC.
 ///
 /// Exported as `pub(crate)` for testing without a live DB connection.
 pub(crate) fn dedup_raw_entries(
@@ -375,13 +378,8 @@ pub(crate) fn dedup_raw_entries(
         }
     }
 
-    let mut seqs: Vec<i64> = per_seq.keys().copied().collect();
-    seqs.sort_unstable();
-
-    let mut entries = Vec::with_capacity(seqs.len());
-    for seq in seqs {
-        let (max_et, payloads) = per_seq.remove(&seq).unwrap();
-
+    let mut entries = Vec::with_capacity(per_seq.len());
+    for (seq, (max_et, payloads)) in per_seq {
         let first_entry: SessionEntry = serde_json::from_str(&payloads[0]).with_context(|| {
             format!(
                 "cannot decode session {} (seq {} event_time {})",
@@ -414,10 +412,14 @@ pub(crate) fn dedup_raw_entries(
             }
         }
 
-        entries.push((seq, first_entry));
+        entries.push((max_et, seq, first_entry));
     }
 
-    Ok(entries)
+    entries.sort_unstable_by_key(|(event_time, seq, _)| (*event_time, *seq));
+    Ok(entries
+        .into_iter()
+        .map(|(_, seq, entry)| (seq, entry))
+        .collect())
 }
 
 #[cfg(test)]
@@ -855,11 +857,12 @@ mod tests {
         assert!(msg.contains("seq 5"), "got: {msg}");
     }
 
-    // --- output seq order ---
+    // --- canonical output order ---
 
     #[test]
-    fn dedup_output_seq_order() {
-        // Entries in random order; output must be sorted by seq ASC.
+    fn dedup_output_winning_event_time_precedes_seq() {
+        // Winning event_time defines conversation order even when it conflicts
+        // with seq order; seq remains attached as identity metadata.
         let raw = vec![
             (10i64, et(3000), msg_entry("ten")),
             (5i64, et(1000), msg_entry("five")),
@@ -867,14 +870,14 @@ mod tests {
         ];
         let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].0, 1, "first seq=1");
-        assert_eq!(result[1].0, 5, "second seq=5");
-        assert_eq!(result[2].0, 10, "third seq=10");
+        assert_eq!(result[0].0, 5, "earliest winning event_time first");
+        assert_eq!(result[1].0, 1, "middle winning event_time second");
+        assert_eq!(result[2].0, 10, "latest winning event_time last");
     }
 
     #[test]
-    fn dedup_output_seq_order_same_event_time() {
-        // Same event_time across different seqs → still ordered by seq ASC.
+    fn dedup_output_seq_tiebreaks_same_event_time() {
+        // seq is the deterministic tie-breaker for equal winning event_time.
         let raw = vec![
             (20i64, et(1000), msg_entry("seq20")),
             (5i64, et(1000), msg_entry("seq5")),
@@ -883,6 +886,25 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, 5, "lower seq first");
         assert_eq!(result[1].0, 20, "higher seq second");
+    }
+
+    #[test]
+    fn dedup_versions_use_winning_time_for_canonical_order() {
+        // The older physical version must neither survive nor determine order.
+        let raw = vec![
+            (0i64, et(100), msg_entry("seq0-old")),
+            (0i64, et(400), msg_entry("seq0-new")),
+            (0i64, et(400), msg_entry("seq0-new")), // winning tie folds
+            (1i64, et(300), msg_entry("seq1")),
+        ];
+        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 1);
+        assert_eq!(result[1].0, 0);
+        assert_eq!(
+            serde_json::to_string(&result[1].1).unwrap(),
+            msg_entry("seq0-new")
+        );
     }
 
     // --- edge cases ---
@@ -905,13 +927,13 @@ mod tests {
         ];
         let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].0, 1);
+        assert_eq!(result[0].0, 3);
+        assert_eq!(result[1].0, 2);
+        assert_eq!(result[2].0, 1);
         assert_eq!(
-            serde_json::to_string(&result[0].1).unwrap(),
+            serde_json::to_string(&result[2].1).unwrap(),
             msg_entry("seq1-latest")
         );
-        assert_eq!(result[1].0, 2);
-        assert_eq!(result[2].0, 3);
     }
 
     #[test]
