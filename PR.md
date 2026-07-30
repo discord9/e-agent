@@ -110,3 +110,27 @@ CREATE TABLE IF NOT EXISTS session_entries (
 - `tokio-postgres` needs `with-chrono-0_4` feature for TIMESTAMP params
 - memtable flush requires admin API (not SQL) — all current PoC data is in memtable
 - `event_time` is real wall-clock time but may have nanosecond collisions across processes (same-ns entries get prev+1)
+
+## Review Notes (pre-merge self-review)
+
+Findings from reviewing `44794ce..HEAD`, severity-ordered:
+
+1. **Low — dead code**: `GreptimeSession::append_batch` is never called by production
+   paths (SessionStore only uses `append`); used only by poc-harness importer and its
+   own test. `next_seq()` getter likewise test-only. Options: keep as documented PoC
+   surface, or strip before merge.
+2. **Low — doc inconsistency**: module header says "not a replacement yet" but
+   SessionStore makes it user-selectable. Consider updating the header.
+3. **Accepted — rewrite() no-op for Greptime**: legacy-v1 sessions loaded from DB get
+   `legacy=false`, so the no-op rewrite is unreachable in practice; behavior is correct.
+4. **Accepted — per-subagent DB connections**: one tokio-postgres connection per live
+   subagent; bounded by live subagent count. Fine for single-user agent.
+5. **Known limitation — concurrent same-session writers**: two processes on the same
+   session id can interleave seqs; read-side dedup (first-wins by event_time DESC)
+   makes this safe and is tested (`duplicate_retry_dedup`).
+6. **Note — `merge_mode = 'last_non_null'`** in DDL is ineffective under
+   `append_mode = 'true'`; harmless but could be dropped.
+
+Merge hygiene suggestion: consider excluding `poc-harness/`, `.greptimedb-poc/`,
+and `PR.md` from the merge to main (or moving to a docs/ location) — they are
+experiment artifacts. `GREPTIMEDB_STORAGE_MIGRATION_PITFALLS.md` is worth keeping.
