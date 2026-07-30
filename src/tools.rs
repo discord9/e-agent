@@ -77,6 +77,9 @@ fn tools_with_background_and_exa_key(
     sandbox: Option<crate::config::Sandbox>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools = file_tools(&workspace);
+    tools.push(Box::new(GetBackgroundTasks {
+        background: background.clone(),
+    }));
     tools.push(bash_tool(workspace, background, sandbox));
     if let Some(key) = exa_api_key
         .map(|key| key.trim().to_owned())
@@ -116,6 +119,40 @@ pub fn bash_tool(
         background,
         sandbox,
     })
+}
+
+struct GetBackgroundTasks {
+    background: BackgroundTasks,
+}
+
+#[async_trait]
+impl Tool for GetBackgroundTasks {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "get_background_tasks".into(),
+            description: "List currently running background tasks with their labels and roles."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    async fn execute(&self, _arguments: Value) -> Result<String, String> {
+        let tasks = self.background.running();
+        if tasks.is_empty() {
+            return Ok("No background tasks running.".into());
+        }
+        let mut out = format!("{} background task(s) running:\n", tasks.len());
+        for (i, task) in tasks.iter().enumerate() {
+            let role = task.role.as_deref().unwrap_or("bash");
+            out.push_str(&format!("#{}: {} ({})\n", i + 1, task.label, role));
+        }
+        out.truncate(out.trim_end().len());
+        Ok(out)
+    }
 }
 
 struct WebSearch {
@@ -1161,6 +1198,7 @@ mod tests {
             "read_file".to_string(),
             "write_file".to_string(),
             "edit_file".to_string(),
+            "get_background_tasks".to_string(),
             "bash".to_string(),
         ];
         for key in [None, Some("   ".into())] {
@@ -1172,7 +1210,7 @@ mod tests {
         let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
         assert_eq!(
             names,
-            ["read_file", "write_file", "edit_file", "bash", "web_search"].map(String::from)
+            ["read_file", "write_file", "edit_file", "get_background_tasks", "bash", "web_search"].map(String::from)
         );
     }
 
@@ -1835,6 +1873,45 @@ mod tests {
                 .unwrap()
                 .success(),
             "background child survived cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_background_tasks_lists_running_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+        let background = bash.background.clone();
+
+        // No tasks running initially.
+        let tool = GetBackgroundTasks {
+            background: background.clone(),
+        };
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap(),
+            "No background tasks running."
+        );
+
+        // Start a background task.
+        bash.execute(json!({"command": "echo hello; sleep 30", "background": true}))
+            .await
+            .unwrap();
+        let tasks = background.running();
+        assert_eq!(tasks.len(), 1);
+
+        // The tool reports the running task.
+        let output = tool.execute(json!({})).await.unwrap();
+        assert!(output.contains("1 background task(s) running"));
+        assert!(output.contains("echo hello"));
+
+        // Cancel the task.
+        background.cancel(tasks[0].id);
+        // Drain the completion notification so the test doesn't leak.
+        let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+
+        // No tasks running after cancel.
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap(),
+            "No background tasks running."
         );
     }
 }
