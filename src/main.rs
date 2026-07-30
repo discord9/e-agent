@@ -1,5 +1,7 @@
+use std::backtrace::Backtrace;
+use std::ffi::OsStr;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 use e_agent::agent::{Agent, AgentEvent, preview};
@@ -18,6 +20,8 @@ use e_agent::workspace::Workspace;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install_panic_hook();
+    notify_crash_if_exists();
     if let Err(error) = run().await {
         eprintln!("e-agent: {error:#}");
         std::process::exit(1);
@@ -649,6 +653,109 @@ fn next_value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> anyho
         .ok_or_else(|| anyhow!("{flag} requires a value"))
 }
 
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Panic crash diagnostics
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// Resolve crash directory from env, pure for testability.
+fn crash_dir_inner(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(x) = xdg
+        && !x.is_empty()
+    {
+        Some(PathBuf::from(x).join("e-agent/crash"))
+    } else {
+        home.map(|h| PathBuf::from(h).join(".config/e-agent/crash"))
+    }
+}
+fn crash_dir() -> Option<PathBuf> {
+    crash_dir_inner(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Build crash report string (pure, for testability).
+fn format_crash_report(ts: u64, thread: &str, location: Option<&str>, bt: &str) -> String {
+    let mut r = format!("timestamp: {ts}\nthread: {thread}\n");
+    if let Some(loc) = location {
+        r.push_str(&format!("location: {loc}\n"));
+    }
+    r.push_str("panic payload omitted\nbacktrace:\n");
+    r.push_str(bt);
+    if !bt.ends_with('\n') {
+        r.push('\n');
+    }
+    r
+}
+
+/// Install global panic hook: restore terminal only when panicking on the
+/// main thread, call the previous hook, write crash file (best-effort, no
+/// payload content). No re-entrancy guard — every operation is fallible.
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() == Some("main") {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stderr(),
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::cursor::Show,
+            );
+        }
+        prev(info);
+
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let bt = Backtrace::force_capture();
+        let report = format_crash_report(ts, &thread, location.as_deref(), &format!("{bt:#}"));
+        if let Some(dir) = crash_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let latest = dir.join("latest.log");
+            let tmp = latest.with_extension("tmp");
+            if std::fs::write(&tmp, &report).is_ok() {
+                let _ = std::fs::rename(&tmp, &latest);
+            }
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }));
+}
+
+/// Acknowledge a previous crash: print brief notice and rename to
+/// `previous.log` so the notice is one-shot. Returns `true` if a crash
+/// file was found and acknowledged.
+fn acknowledge_crash(latest: &Path, previous: &Path) -> bool {
+    let content = match std::fs::read_to_string(latest) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let location = content
+        .lines()
+        .find_map(|l| l.strip_prefix("location: "))
+        .unwrap_or("<unknown>");
+    eprintln!("e-agent: previous crash at {location}");
+    let report_path = if std::fs::rename(latest, previous).is_ok() {
+        previous
+    } else {
+        latest
+    };
+    eprintln!("  crash report: {}", report_path.display());
+    true
+}
+
+fn notify_crash_if_exists() {
+    let Some(dir) = crash_dir() else { return };
+    acknowledge_crash(&dir.join("latest.log"), &dir.join("previous.log"));
+}
+
 fn configured_model(
     resolved: ResolvedModel,
     auth: Option<&CodexAuth>,
@@ -778,5 +885,60 @@ mod tests {
                 "e-agent: resume with: e-agent --session xyz-789",
             ]
         );
+    }
+
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    // Crash diagnostic tests
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    #[test]
+    fn test_format_crash_report() {
+        let r = format_crash_report(1700000000, "main", Some("src/main.rs:42:5"), "  bt line\n");
+        assert!(r.contains("timestamp: 1700000000\n"), "{r}");
+        assert!(r.contains("thread: main\n"));
+        assert!(r.contains("location: src/main.rs:42:5\n"));
+        assert!(r.contains("panic payload omitted\n"));
+        assert!(r.contains("  bt line\n"));
+        assert!(r.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_format_crash_report_no_location() {
+        let r = format_crash_report(0, "t", None, "bt\n");
+        assert!(!r.contains("location:"));
+        assert!(r.contains("panic payload omitted"));
+    }
+
+    #[test]
+    fn test_crash_dir_inner() {
+        // XDG takes precedence
+        let d = crash_dir_inner(Some(OsStr::new("/xdg/state")), Some(OsStr::new("/home/u")));
+        assert_eq!(d, Some(PathBuf::from("/xdg/state/e-agent/crash")));
+        // Empty XDG -> fallback to HOME
+        let d = crash_dir_inner(Some(OsStr::new("")), Some(OsStr::new("/home/u")));
+        assert_eq!(d, Some(PathBuf::from("/home/u/.config/e-agent/crash")));
+        // No XDG, no HOME -> None
+        let d = crash_dir_inner(None, None);
+        assert_eq!(d, None);
+    }
+
+    #[test]
+    fn test_acknowledge_crash_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let latest = tmp.path().join("latest.log");
+        let previous = tmp.path().join("previous.log");
+
+        // Write a fake report
+        let report = "timestamp: 1\nthread: main\n\
+                       location: foo.rs:1:1\n\
+                       panic payload omitted\nbacktrace:\n  bt\n";
+        std::fs::write(&latest, report).unwrap();
+
+        assert!(acknowledge_crash(&latest, &previous));
+        assert!(!latest.exists());
+        assert!(previous.exists());
+
+        // No latest file -> false
+        assert!(!acknowledge_crash(&latest, &previous));
     }
 }
