@@ -51,11 +51,13 @@ pub fn builtins_with_background(
     background: BackgroundTasks,
     sandbox: Option<crate::config::Sandbox>,
 ) -> Vec<Box<dyn Tool>> {
+    // Subagent / fixer: protect_git = true so .git is read-only.
     tools_with_background_and_exa_key(
         workspace,
         background,
         std::env::var("EXA_API_KEY").ok(),
         sandbox,
+        true,
     )
 }
 
@@ -65,8 +67,14 @@ fn builtins_with_exa_key(
     sandbox: Option<crate::config::Sandbox>,
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
     let background = BackgroundTasks::new(Duration::from_secs(30 * 60), sandbox.clone());
-    let tools =
-        tools_with_background_and_exa_key(workspace, background.clone(), exa_api_key, sandbox);
+    // Main agent: protect_git = false so git worktree/add/commit work.
+    let tools = tools_with_background_and_exa_key(
+        workspace,
+        background.clone(),
+        exa_api_key,
+        sandbox,
+        false,
+    );
     (tools, background)
 }
 
@@ -75,12 +83,13 @@ fn tools_with_background_and_exa_key(
     background: BackgroundTasks,
     exa_api_key: Option<String>,
     sandbox: Option<crate::config::Sandbox>,
+    protect_git: bool,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools = file_tools(&workspace);
     tools.push(Box::new(GetBackgroundTasks {
         background: background.clone(),
     }));
-    tools.push(bash_tool(workspace, background, sandbox));
+    tools.push(bash_tool(workspace, background, sandbox, protect_git));
     if let Some(key) = exa_api_key
         .map(|key| key.trim().to_owned())
         .filter(|key| !key.is_empty())
@@ -108,16 +117,20 @@ pub fn file_tools(workspace: &Workspace) -> Vec<Box<dyn Tool>> {
 }
 
 /// A bash tool bound to a shared background-task registry.
+/// `protect_git`: when true, `<workspace>/.git` is bound read-only
+/// (subagent / fixer); main agent passes false so orchestration works.
 pub fn bash_tool(
     workspace: Workspace,
     background: BackgroundTasks,
     sandbox: Option<crate::config::Sandbox>,
+    protect_git: bool,
 ) -> Box<dyn Tool> {
     Box::new(Bash {
         workspace,
         timeout: Duration::from_secs(30),
         background,
         sandbox,
+        protect_git,
     })
 }
 
@@ -470,6 +483,9 @@ struct Bash {
     timeout: Duration,
     background: BackgroundTasks,
     sandbox: Option<crate::config::Sandbox>,
+    /// When true and sandbox is enabled, bind `<workspace>/.git` read-only
+    /// so subagents / fixers cannot corrupt the repository metadata.
+    protect_git: bool,
 }
 
 #[async_trait]
@@ -510,10 +526,14 @@ impl Tool for Bash {
             description.push_str(
                 " The read_file/write_file/edit_file tools are restricted to the workspace \
                  (capability-relative, not the sandbox); to read a file outside the workspace \
-                 that is mounted in the sandbox, use bash (e.g. cat). \
-                 The workspace `.git` metadata (directory or linked-worktree pointer) is bound \
-                 read-only to prevent accidental corruption by fixer subagents.",
+                 that is mounted in the sandbox, use bash (e.g. cat).",
             );
+            if self.protect_git {
+                description.push_str(
+                    " The workspace `.git` metadata (directory or linked-worktree pointer) \
+                     is bound read-only to prevent accidental corruption by fixer subagents.",
+                );
+            }
         }
         ToolSpec {
             name: "bash".into(),
@@ -532,14 +552,17 @@ impl Tool for Bash {
     async fn execute(&self, arguments: Value) -> Result<String, String> {
         let command = required_string(&arguments, "command")?;
         if optional_bool(&arguments, "background")? {
-            return self
-                .background
-                .start(self.workspace.clone(), command.to_owned());
+            return self.background.start(
+                self.workspace.clone(),
+                command.to_owned(),
+                self.protect_git,
+            );
         }
         run_bash(
             &self.workspace,
             command,
             self.timeout,
+            self.protect_git,
             None,
             None,
             self.sandbox.as_ref(),
@@ -674,7 +697,14 @@ impl BackgroundTasks {
 
     /// Start a background bash command. Returns a human-readable "started"
     /// message containing the task id.
-    pub fn start(&self, workspace: Workspace, command: String) -> Result<String, String> {
+    /// `protect_git` controls whether `<workspace>/.git` is bound read-only
+    /// inside the sandbox (subagent = true, main agent = false).
+    pub fn start(
+        &self,
+        workspace: Workspace,
+        command: String,
+        protect_git: bool,
+    ) -> Result<String, String> {
         let process_group = Arc::new(AtomicI32::new(0));
         let output: OutputSlot = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pg = process_group.clone();
@@ -698,6 +728,7 @@ impl BackgroundTasks {
                     &workspace,
                     &command,
                     timeout,
+                    protect_git,
                     Some(pg),
                     Some(slot),
                     sandbox.as_ref(),
@@ -880,6 +911,7 @@ async fn run_bash(
     workspace: &Workspace,
     command: &str,
     timeout: Duration,
+    protect_git: bool,
     process_group_slot: Option<Arc<AtomicI32>>,
     output_slot: Option<OutputSlot>,
     sandbox: Option<&crate::config::Sandbox>,
@@ -972,11 +1004,15 @@ async fn run_bash(
             // corrupting the pointer, running `git init`, or writing any
             // commit metadata. It comes after all writable binds and the
             // .e-agent/config.toml protection so it cannot be shadowed.
-            let git_path = format!("{root_str}/.git");
-            if std::path::Path::new(&git_path).exists() {
-                args.push("--ro-bind".into());
-                args.push(git_path.clone());
-                args.push(git_path);
+            // Only enabled for subagents (protect_git=true); the main agent
+            // needs writable .git for orchestration (git add/commit/etc).
+            if protect_git {
+                let git_path = format!("{root_str}/.git");
+                if std::path::Path::new(&git_path).exists() {
+                    args.push("--ro-bind".into());
+                    args.push(git_path.clone());
+                    args.push(git_path);
+                }
             }
             args.extend([
                 "--unshare-pid".into(),
@@ -1674,6 +1710,7 @@ mod tests {
             timeout: Duration::from_millis(100),
             background: BackgroundTasks::new(Duration::from_secs(30 * 60), None),
             sandbox: None,
+            protect_git: false,
         };
         assert!(
             tool.execute(json!({"command": "sleep 30 & echo $! > child.pid; wait"}))
@@ -1703,11 +1740,12 @@ mod tests {
             timeout: Duration::from_secs(1),
             background: background.clone(),
             sandbox: None,
+            protect_git: false,
         };
         let plain_desc = plain.spec().description;
         assert!(!plain_desc.contains("sandbox"), "{plain_desc}");
 
-        // Sandboxed with writable workspace.
+        // Sandboxed with writable workspace AND protect_git = true (subagent).
         let sandboxed = Bash {
             workspace: workspace.clone(),
             timeout: Duration::from_secs(1),
@@ -1719,6 +1757,7 @@ mod tests {
                 writable_paths: vec!["/mnt/big/cargo-home".into()],
                 readable_paths: vec!["~/.rustup".into()],
             }),
+            protect_git: true,
         };
         let desc = sandboxed.spec().description;
         assert!(desc.contains("bubblewrap sandbox"), "{desc}");
@@ -1728,15 +1767,15 @@ mod tests {
         assert!(desc.contains("/mnt/big/cargo-home"), "{desc}");
         assert!(desc.contains("~/.rustup"), "{desc}");
         assert!(desc.contains("read_file/write_file/edit_file"), "{desc}");
-        assert!(desc.contains(".git"), "{desc}");
+        assert!(desc.contains("`.git`"), "{desc}");
         assert!(desc.contains("linked-worktree pointer"), "{desc}");
         assert!(desc.contains("read-only to prevent"), "{desc}");
 
-        // Sandboxed with read-only workspace.
+        // Sandboxed with read-only workspace, protect_git = false (main).
         let sandboxed_ro = Bash {
-            workspace,
+            workspace: workspace.clone(),
             timeout: Duration::from_secs(1),
-            background,
+            background: background.clone(),
             sandbox: Some(crate::config::Sandbox {
                 enabled: true,
                 network: true,
@@ -1744,9 +1783,36 @@ mod tests {
                 writable_paths: vec![],
                 readable_paths: vec![],
             }),
+            protect_git: false,
         };
         let desc_ro = sandboxed_ro.spec().description;
         assert!(desc_ro.contains("workspace is read-only"), "{desc_ro}");
+        // Use a precise marker: the protect-git text includes backtick-wrapped `.git`.
+        assert!(
+            !desc_ro.contains("`.git`"),
+            "main agent description must not claim .git is read-only: {desc_ro}"
+        );
+
+        // Sandboxed with writable workspace, protect_git = false (main):
+        // must NOT mention .git.
+        let sandboxed_main = Bash {
+            workspace,
+            timeout: Duration::from_secs(1),
+            background,
+            sandbox: Some(crate::config::Sandbox {
+                enabled: true,
+                network: true,
+                workspace_writable: true,
+                writable_paths: vec![],
+                readable_paths: vec![],
+            }),
+            protect_git: false,
+        };
+        let desc_main = sandboxed_main.spec().description;
+        assert!(
+            !desc_main.contains("`.git`"),
+            "main agent description must not claim .git is read-only: {desc_main}"
+        );
     }
 
     fn background_bash(
@@ -1759,6 +1825,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             background: BackgroundTasks::new(timeout, None),
             sandbox: None,
+            protect_git: false,
         };
         bash.set_event_sender(sender);
         (bash, receiver)
@@ -1787,6 +1854,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             background: BackgroundTasks::new(Duration::from_secs(30), None),
             sandbox: Some(sandbox),
+            protect_git: false,
         };
         // Writing inside the workspace succeeds.
         tool.execute(json!({"command": "echo hi > inside.txt"}))
@@ -1818,6 +1886,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             background: BackgroundTasks::new(Duration::from_secs(30), None),
             sandbox: Some(sandbox),
+            protect_git: false,
         };
         // No loopback either in a fresh net namespace: connecting anywhere fails.
         let result = tool
@@ -1847,6 +1916,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             background: BackgroundTasks::new(Duration::from_secs(30), None),
             sandbox: Some(sandbox),
+            protect_git: false,
         };
         let cache_path = cache.path().to_string_lossy().into_owned();
         let data_path = data.path().to_string_lossy().into_owned();
@@ -1886,6 +1956,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             background: BackgroundTasks::new(Duration::from_secs(30), None),
             sandbox: Some(sandbox),
+            protect_git: true,
         };
         // Reading .git/HEAD must succeed (git commands read metadata).
         let out = tool
@@ -1924,6 +1995,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             background: BackgroundTasks::new(Duration::from_secs(30), None),
             sandbox: Some(sandbox),
+            protect_git: true,
         };
         // Reading the .git pointer must succeed.
         let out = tool.execute(json!({"command": "cat .git"})).await.unwrap();
@@ -1957,6 +2029,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             background: BackgroundTasks::new(Duration::from_secs(30), None),
             sandbox: Some(sandbox),
+            protect_git: false,
         };
         // Check whether /run/systemd/resolve exists on this host.
         let host_has_resolve = std::path::Path::new("/run/systemd/resolve").exists();
@@ -2005,6 +2078,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             background: BackgroundTasks::new(Duration::from_secs(30), None),
             sandbox: Some(sandbox),
+            protect_git: false,
         };
         // /etc/resolv.conf is always mounted (--ro-bind-try). Its contents
         // depend on the host config; we just check it is readable.
@@ -2038,6 +2112,7 @@ mod tests {
             timeout: Duration::from_secs(15),
             background: BackgroundTasks::new(Duration::from_secs(30), None),
             sandbox: Some(sandbox),
+            protect_git: false,
         };
         // Live DNS resolution: this is a network-dependent smoke test.
         // Skip if /run/systemd/resolve does not exist on the host (no
@@ -2319,6 +2394,141 @@ mod tests {
         assert_eq!(
             output,
             "1 background task(s) running:\n#1: search the logs (explorer)"
+        );
+    }
+
+    /// Verify that BackgroundTasks::start propagates protect_git by checking
+    /// the parameter is accepted (structural/API coverage). The actual
+    /// protect_git effect is verified by the bwrap-based tests below.
+    #[tokio::test]
+    async fn background_start_accepts_protect_git_parameter() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+
+        // Start a background task with protect_git=false (main-agent style).
+        bash.execute(json!({"command": "echo main_bg", "background": true}))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            AgentEvent::BackgroundCompleted { output, .. } if output.contains("main_bg")
+        ));
+    }
+
+    #[tokio::test]
+    async fn sandbox_does_not_protect_git_when_protect_git_is_false() {
+        let Some(sandbox) = sandbox() else {
+            eprintln!("bwrap unavailable; skipping sandbox test");
+            return;
+        };
+        // Create a workspace with a fake .git directory.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::fs::write(temp.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        // Main agent: protect_git = false → .git is NOT ro-bind.
+        let tool = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(10),
+            background: BackgroundTasks::new(Duration::from_secs(30), None),
+            sandbox: Some(sandbox),
+            protect_git: false,
+        };
+        // Writing to .git/HEAD must succeed (main agent orchestrates git).
+        let write = tool
+            .execute(json!({"command": "echo 'ref: refs/heads/feature' > .git/HEAD 2>&1; cat .git/HEAD"}))
+            .await
+            .unwrap();
+        assert!(
+            write.contains("ref: refs/heads/feature"),
+            "main agent must be able to write into .git: {write}"
+        );
+        // The host .git was actually updated.
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".git/HEAD")).unwrap(),
+            "ref: refs/heads/feature\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_does_not_protect_git_file_when_protect_git_is_false() {
+        let Some(sandbox) = sandbox() else {
+            eprintln!("bwrap unavailable; skipping sandbox test");
+            return;
+        };
+        // Simulate a linked-worktree .git pointer file.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join(".git"),
+            "gitdir: /some/other/.git/worktrees/x\n",
+        )
+        .unwrap();
+
+        // Main agent: protect_git = false → .git pointer is writable.
+        let tool = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(10),
+            background: BackgroundTasks::new(Duration::from_secs(30), None),
+            sandbox: Some(sandbox),
+            protect_git: false,
+        };
+        // Overwriting the .git pointer must succeed.
+        let write = tool
+            .execute(json!({"command": "echo 'gitdir: /new/path' > .git 2>&1; cat .git"}))
+            .await
+            .unwrap();
+        assert!(
+            write.contains("/new/path"),
+            "main agent must be able to update .git pointer: {write}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".git")).unwrap(),
+            "gitdir: /new/path\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_bash_inherits_protect_git_from_parent_bash() {
+        let Some(sandbox) = sandbox() else {
+            eprintln!("bwrap unavailable; skipping sandbox test");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::fs::write(temp.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        // Bash with protect_git = true (subagent style).
+        // BackgroundTasks must share the same sandbox so bwrap is used.
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut bash = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(10),
+            background: BackgroundTasks::new(Duration::from_secs(30 * 60), Some(sandbox.clone())),
+            sandbox: Some(sandbox),
+            protect_git: true,
+        };
+        bash.set_event_sender(sender);
+
+        // Start background task: it inherits protect_git=true from bash.
+        // Writing to .git/HEAD should fail because the background bash
+        // also has .git bound read-only.
+        let start = bash
+            .execute(json!({"command": "echo corrupted > .git/HEAD 2>&1", "background": true}))
+            .await
+            .unwrap();
+        assert!(start.starts_with("started background task"), "{start}");
+        // Give it time to run and fail.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The host .git must be untouched.
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".git/HEAD")).unwrap(),
+            "ref: refs/heads/main\n",
+            "background bash with protect_git=true must not corrupt .git"
         );
     }
 }

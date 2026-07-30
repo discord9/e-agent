@@ -186,18 +186,30 @@ variables of the parent process other than the stripped credential names
 (`EXA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`,
 `MOONSHOT_API_KEY`, `KIMI_API_KEY`) remain visible inside the sandbox.
 
-Additionally, when the sandbox is enabled and the workspace root contains a
-`.git` entry (a regular repository directory or a linked-worktree pointer
-file), the sandbox binds `<workspace>/.git` read-only **over itself** after
-all writable mounts. This prevents the agent from deleting or corrupting the
-pointer, running `git init`, or writing directly into `<workspace>/.git` — protecting
-workspace Git metadata against accidental corruption by a fixer subagent.
+Additionally, when the sandbox is enabled, the protection applied to the
+workspace `.git` entry depends on the agent role:
+
+- **Main agent (orchestrator):** the `.git` directory (or linked-worktree
+  pointer file) is left writable so that `git add`, `git commit`,
+  `git worktree`, `git cherry-pick`, and other repository operations work
+  normally. The main agent needs to mutate Git metadata to drive the
+  development workflow.
+- **Delegated subagent / fixer:** the sandbox binds `<workspace>/.git`
+  read-only **over itself** after all writable mounts. This prevents the
+  subagent from deleting or corrupting the pointer, running `git init`, or
+  writing any commit metadata — protecting the workspace Git metadata against
+  accidental corruption by a delegated subtask.
+
 This protection covers only the `.git` entry inside the workspace; it does
 not cover a repository's object store, packed references, or other data that
 resides outside the workspace (e.g. in a common Git directory referenced by a
 linked-worktree pointer). This protection does not prevent `git` commands from reading
 the repository, and it does not extend to any repository outside the workspace
 that happens to be mounted via `writable_paths`.
+
+Background bash commands inherit their parent's role: a background task
+started by the main agent has writable `.git`; one started by a subagent has
+`.git` bound read-only.
 
 Every `web_search` query is disclosed to Exa, a third party. Never include
 credentials, tokens, private repository contents, customer data, personal data,
