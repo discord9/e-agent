@@ -472,7 +472,8 @@ impl Tool for Delegate {
                     "role": role_property,
                     "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
                     "background": {"type": "boolean", "description": "run without blocking; the answer arrives as a background completion (default false)"},
-                    "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"}
+                    "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
+                    "workspace": {"type": "string", "description": "working directory for the subagent (absolute path); defaults to the parent's workspace"}
                 },
                 "required": ["task"]
             }),
@@ -561,8 +562,19 @@ impl Tool for Delegate {
             .and_then(Value::as_str);
         let label = task_label(raw_label, role.as_deref(), &task);
 
+        // Resolve custom workspace, if given; otherwise inherit the parent's.
+        let workspace = match arguments
+            .as_object()
+            .and_then(|args| args.get("workspace"))
+            .and_then(Value::as_str)
+        {
+            Some(path) => Workspace::new(path)
+                .map_err(|error| format!("invalid `workspace` path `{path}`: {error}"))?,
+            None => self.workspace.clone(),
+        };
+
         if background {
-            let workspace = self.workspace.clone();
+            let workspace = workspace.clone();
             let background = self.background.clone();
             let sandbox = self.sandbox.clone();
             /* label computed above */
@@ -636,7 +648,7 @@ impl Tool for Delegate {
             );
         }
 
-        let workspace = self.workspace.clone();
+        let workspace = workspace.clone();
         let background = self.background.clone();
         let sandbox = self.sandbox.clone();
         let (resume_id, resume_entries) = match resume {
@@ -980,5 +992,50 @@ mod tests {
             event,
             AgentEvent::BackgroundCompleted { output, .. } if output.contains("shared")
         ));
+    }
+
+    #[tokio::test]
+    async fn delegate_uses_custom_workspace() {
+        let parent = tempfile::tempdir().unwrap();
+        // Create a separate tempdir as the custom workspace.
+        let custom = tempfile::tempdir().unwrap();
+        // Put a marker file in each workspace.
+        std::fs::write(custom.path().join("sentinel.txt"), "custom").unwrap();
+        std::fs::write(parent.path().join("sentinel.txt"), "parent").unwrap();
+
+        // 1) An invalid (non-existent) workspace path is rejected at
+        //    parameter-validation time, before any subagent is spawned.
+        let tool = delegate(parent.path());
+        let err = tool
+            .execute(json!({
+                "task": "irrelevant",
+                "workspace": "/nonexistent-path-that-surely-does-not-exist-12345"
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("invalid `workspace`"),
+            "expected invalid-workspace error, got: {err}"
+        );
+
+        // 2) A valid custom workspace is accepted; the subagent tries to
+        //    contact the dummy model (localhost) and fails with a connection
+        //    error — but crucially the workspace error is NOT raised.
+        let tool = delegate(parent.path());
+        let answer = tool
+            .execute(json!({
+                "task": "read sentinel.txt and report its content",
+                "workspace": custom.path().to_str().unwrap()
+            }))
+            .await
+            .unwrap();
+        assert!(
+            answer.starts_with("subagent failed:"),
+            "expected model-connection failure, got: {answer}"
+        );
+        assert!(
+            !answer.contains("invalid `workspace`"),
+            "valid workspace path should not produce a workspace error, got: {answer}"
+        );
     }
 }
