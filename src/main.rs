@@ -172,7 +172,7 @@ async fn run() -> anyhow::Result<()> {
     }
     // The bash sandbox ([sandbox] in config) wraps every bash call — main
     // agent and subagents alike — in bwrap when enabled.
-    let sandbox = config.as_ref().and_then(|config| config.sandbox());
+    let sandbox = config.as_ref().and_then(|config| config.sandbox(&root));
     if sandbox.is_some() && !tui_mode {
         eprintln!("e-agent: bash sandboxed with bwrap");
     }

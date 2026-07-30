@@ -753,9 +753,8 @@ async fn run_bash(
                 "--ro-bind"
             };
             let root_str = root.to_string_lossy().into_owned();
-            // Order matters: the /home tmpfs must be mounted BEFORE the
-            // workspace bind, or the tmpfs would shadow a workspace that
-            // lives under /home.
+            // Order matters: extra paths under /home (e.g. ~/.cargo) must be
+            // mounted AFTER the /home tmpfs, or the tmpfs would shadow them.
             let mut args: Vec<String> = vec![
                 "--dev-bind".into(),
                 "/dev".into(),
@@ -781,11 +780,23 @@ async fn run_bash(
                 "/tmp".into(),
                 "--tmpfs".into(),
                 "/home".into(),
+            ];
+            // Extra user-configured mounts (cargo caches, shared target
+            // disks, ...). --bind-try / --ro-bind-try skip paths that do not
+            // exist on the host so a missing cache dir cannot break the run.
+            for path in &sandbox.writable_paths {
+                args.push("--bind-try".into());
+                args.push(path.clone());
+                args.push(path.clone());
+            }
+            for path in &sandbox.readable_paths {
+                args.push("--ro-bind-try".into());
+                args.push(path.clone());
+                args.push(path.clone());
+            }
+            args.extend([
                 workspace_bind.into(),
                 root_str.clone(),
-                root_str.clone(),
-                "--setenv".into(),
-                "HOME".into(),
                 root_str.clone(),
                 "--unshare-pid".into(),
                 "--unshare-ipc".into(),
@@ -794,7 +805,7 @@ async fn run_bash(
                 "--die-with-parent".into(),
                 "--chdir".into(),
                 root_str,
-            ];
+            ]);
             if !sandbox.network {
                 args.push("--unshare-net".into());
             }
@@ -1511,6 +1522,8 @@ mod tests {
                 enabled: true,
                 network: true,
                 workspace_writable: true,
+                writable_paths: Vec::new(),
+                readable_paths: Vec::new(),
             })
     }
 
@@ -1564,6 +1577,50 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("NET_BLOCKED"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn sandbox_extra_writable_and_readable_paths() {
+        let Some(mut sandbox) = sandbox() else {
+            eprintln!("bwrap unavailable; skipping sandbox test");
+            return;
+        };
+        // A "cache" dir outside the workspace (like ~/.cargo or a shared
+        // target disk) and a read-only data dir.
+        let cache = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("info.txt"), "data").unwrap();
+        sandbox.writable_paths = vec![cache.path().to_string_lossy().into_owned()];
+        sandbox.readable_paths = vec![data.path().to_string_lossy().into_owned()];
+
+        let temp = tempfile::tempdir().unwrap();
+        let tool = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(10),
+            background: BackgroundTasks::new(Duration::from_secs(30), None),
+            sandbox: Some(sandbox),
+        };
+        let cache_path = cache.path().to_string_lossy().into_owned();
+        let data_path = data.path().to_string_lossy().into_owned();
+        // Writable path: read + write.
+        tool.execute(json!({"command": format!("echo cached > '{cache_path}/entry'")}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cache.path().join("entry")).unwrap(),
+            "cached\n"
+        );
+        // Readable path: readable but NOT writable.
+        let out = tool
+            .execute(json!({"command": format!("cat '{data_path}/info.txt'")}))
+            .await
+            .unwrap();
+        assert!(out.contains("data"), "{out}");
+        let write = tool
+            .execute(json!({"command": format!("touch '{data_path}/nope' 2>&1")}))
+            .await;
+        assert!(write.is_err(), "readable path must reject writes");
+        assert!(!data.path().join("nope").exists());
     }
 
     #[tokio::test]

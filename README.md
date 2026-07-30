@@ -70,7 +70,23 @@ sandbox is off unless explicitly enabled:
 enabled = true
 # network = false            # unshare the network namespace (default: shared)
 # workspace_writable = false # mount the workspace read-only (default: writable)
+# Extra mounts, e.g. toolchain caches the agent needs inside the sandbox:
+# writable_paths = ["/mnt/big/cargo-home"]
+# readable_paths = ["~/.rustup", "~/.local"]
 ```
+
+`writable_paths` / `readable_paths` are unioned with the project-local
+`<workspace>/.e-agent/config.toml` `[sandbox]` section (which can add paths but
+never change `enabled` / `network` / `workspace_writable`). A leading `~`
+expands to the home directory; relative paths resolve against the workspace
+root. Paths that do not exist on the host are skipped, so a missing cache
+directory never breaks a run.
+
+Note that the sandbox hides all of `$HOME` behind a fresh tmpfs and then
+binds in only the workspace and these extra paths — so personal files such as
+`~/.ssh`, `~/.gitconfig`, or `~/.config` are NOT visible inside the sandbox
+unless explicitly listed in `readable_paths`. Toolchains installed under
+`$HOME` (rustup, pyenv, nvm, ...) must be listed for the agent to use them.
 
 See "Safety boundaries" for what the sandbox does and does not constrain.
 

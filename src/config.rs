@@ -30,7 +30,7 @@ pub struct Config {
 }
 
 /// Runtime sandbox configuration for the bash tool, from `[sandbox]`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct Sandbox {
     /// Master switch. Absent section or `enabled = false` means no sandbox.
     #[serde(default)]
@@ -41,6 +41,15 @@ pub struct Sandbox {
     /// Mount the workspace read-write inside the sandbox (default true).
     #[serde(default = "default_true")]
     pub workspace_writable: bool,
+    /// Extra paths mounted read-write inside the sandbox, beyond the
+    /// workspace. Global and project configs merge (union). `~` expands to
+    /// the home directory; relative paths resolve against the workspace root.
+    #[serde(default)]
+    pub writable_paths: Vec<String>,
+    /// Extra paths mounted read-only inside the sandbox. Same merge and
+    /// resolution rules as `writable_paths`.
+    #[serde(default)]
+    pub readable_paths: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -156,8 +165,26 @@ impl Config {
     }
 
     /// The bash sandbox, only when `[sandbox] enabled = true`. Otherwise None.
-    pub fn sandbox(&self) -> Option<Sandbox> {
-        self.sandbox.clone().filter(|sandbox| sandbox.enabled)
+    ///
+    /// Merges the project-local `<workspace>/.e-agent/config.toml` on top of
+    /// this (global) config: `writable_paths` / `readable_paths` are unioned,
+    /// while `enabled` / `network` / `workspace_writable` come from the global
+    /// config only (a project file can add paths but never weaken the policy).
+    /// Paths are expanded: `~` -> home, relative -> the workspace root.
+    pub fn sandbox(&self, workspace: &Path) -> Option<Sandbox> {
+        let mut sandbox = self.sandbox.clone().filter(|sandbox| sandbox.enabled)?;
+        if let Some(project) = project_sandbox(workspace) {
+            sandbox.writable_paths.extend(project.writable_paths);
+            sandbox.readable_paths.extend(project.readable_paths);
+        }
+        for paths in [&mut sandbox.writable_paths, &mut sandbox.readable_paths] {
+            for path in paths.iter_mut() {
+                *path = expand_sandbox_path(path, workspace);
+            }
+            paths.sort();
+            paths.dedup();
+        }
+        Some(sandbox)
     }
 
     fn resolve_profile(&self, profile: &str) -> anyhow::Result<ResolvedModel> {
@@ -260,6 +287,39 @@ pub fn config_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(xdg).join("e-agent"));
     }
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/e-agent"))
+}
+
+/// The `[sandbox]` section of the project-local config at
+/// `<workspace>/.e-agent/config.toml`, if present and parseable. Only the
+/// sandbox is read; a malformed file is ignored (the sandbox must not fail
+/// closed/open because of a typo in an optional local file).
+fn project_sandbox(workspace: &Path) -> Option<Sandbox> {
+    #[derive(Deserialize)]
+    struct ProjectConfig {
+        sandbox: Option<Sandbox>,
+    }
+    let path = workspace.join(".e-agent/config.toml");
+    let source = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<ProjectConfig>(&source).ok()?.sandbox
+}
+
+/// Expand a sandbox path: a leading `~` becomes the home directory, and a
+/// relative path is resolved against the workspace root (then normalized
+/// lexically, not symlink-resolved — the sandbox binds the literal path).
+fn expand_sandbox_path(path: &str, workspace: &Path) -> String {
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(rest))
+            .unwrap_or_else(|| PathBuf::from(path))
+    } else {
+        let candidate = PathBuf::from(path);
+        if candidate.is_absolute() {
+            candidate
+        } else {
+            workspace.join(candidate)
+        }
+    };
+    expanded.to_string_lossy().into_owned()
 }
 
 fn config_paths() -> Vec<PathBuf> {
@@ -427,6 +487,103 @@ subagent = "kimi/nope"
                 .unwrap_err()
                 .to_string()
                 .contains("model profile `kimi/nope` is not defined")
+        );
+    }
+
+    #[test]
+    fn sandbox_merges_project_paths_and_expands_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        // Global config: enabled, one writable path with ~, one absolute.
+        let path = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[sandbox]
+enabled = true
+network = false
+writable_paths = ["~/.cargo/registry", "/mnt/nvme_rust/sccache"]
+readable_paths = ["~/.gitconfig"]
+"#,
+        );
+        std::fs::write(temp.path().join("key"), "key").unwrap();
+        // Project-local: adds paths (cannot flip `network` back on).
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            r#"
+[sandbox]
+enabled = false
+network = true
+writable_paths = ["target", "~/.cargo/registry"]
+readable_paths = ["/opt/shared"]
+"#,
+        )
+        .unwrap();
+
+        let home = std::env::var("HOME").unwrap();
+        let sandbox = Config::from_path(&path)
+            .unwrap()
+            .sandbox(&workspace)
+            .expect("sandbox enabled globally");
+
+        // Policy switches come from the global config only.
+        assert!(!sandbox.network, "project file must not weaken policy");
+        // Paths merged (union) and expanded; project duplicate deduped.
+        let cargo = format!("{home}/.cargo/registry");
+        assert!(sandbox.writable_paths.contains(&cargo));
+        assert!(
+            sandbox
+                .writable_paths
+                .contains(&"/mnt/nvme_rust/sccache".to_owned())
+        );
+        assert!(
+            sandbox
+                .writable_paths
+                .contains(&workspace.join("target").to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            sandbox
+                .writable_paths
+                .iter()
+                .filter(|p| **p == cargo)
+                .count(),
+            1,
+            "global + project duplicate must be deduped"
+        );
+        assert!(
+            sandbox
+                .readable_paths
+                .contains(&format!("{home}/.gitconfig"))
+        );
+        assert!(sandbox.readable_paths.contains(&"/opt/shared".to_owned()));
+    }
+
+    #[test]
+    fn sandbox_absent_or_disabled_is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let bare = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+"#,
+        );
+        std::fs::write(temp.path().join("key"), "key").unwrap();
+        assert!(
+            Config::from_path(&bare)
+                .unwrap()
+                .sandbox(temp.path())
+                .is_none()
         );
     }
 
