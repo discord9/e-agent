@@ -95,6 +95,7 @@ async fn run() -> anyhow::Result<()> {
     .context("cannot open workspace")?;
     let root = workspace.root().to_path_buf();
     let agents_instructions = read_agents(&root)?;
+    let skills_instructions = read_skills(&root)?;
     let config = Config::load()?;
     let backend = config
         .as_ref()
@@ -244,6 +245,9 @@ async fn run() -> anyhow::Result<()> {
     };
     if let Some(instructions) = agents_instructions {
         context.push(format!("## AGENTS.md\n\n{instructions}"));
+    }
+    if let Some(skills) = skills_instructions {
+        context.push(skills);
     }
     context.extend(mcp_instructions);
     if !context.is_empty() {
@@ -475,6 +479,73 @@ fn read_agents(root: &Path) -> anyhow::Result<Option<String>> {
     }
 }
 
+/// Read all workspace skills from `.e-agent/skills/<name>/SKILL.md`.
+///
+/// Returns `None` (silently) when the directory is missing, empty, or contains
+/// only non-directories / missing / empty SKILL.md files. Actual I/O or UTF-8
+/// errors on a SKILL.md that should be readable are returned with a path
+/// context.
+///
+/// Skills are sorted by `<name>` (dictionary order, stable) and joined as a
+/// single block prefixed with `## Skill: <name>` per skill.
+fn read_skills(root: &Path) -> anyhow::Result<Option<String>> {
+    let skills_dir = root.join(".e-agent").join("skills");
+
+    let dir = match std::fs::read_dir(&skills_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("cannot read .e-agent/skills"),
+    };
+
+    let mut skills: Vec<(String, String)> = Vec::new();
+
+    for entry in dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => return Err(e).context("cannot read .e-agent/skills entry"),
+        };
+
+        // Only directories are candidate skill folders
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+
+        let skill_name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+
+        let skill_path = entry.path().join("SKILL.md");
+
+        match std::fs::read_to_string(&skill_path) {
+            Ok(content) => {
+                if !content.trim().is_empty() {
+                    skills.push((skill_name, content));
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e)
+                    .context(format!("cannot read .e-agent/skills/{skill_name}/SKILL.md"));
+            }
+        }
+    }
+
+    if skills.is_empty() {
+        return Ok(None);
+    }
+
+    skills.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let combined = skills
+        .into_iter()
+        .map(|(name, content)| format!("## Skill: {name}\n\n{content}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    Ok(Some(combined))
+}
+
 fn next_value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<String> {
     arguments
         .next()
@@ -509,5 +580,118 @@ fn configured_model(
             cm.display = display;
             Ok(cm)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+
+    #[test]
+    fn test_read_skills_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_skills(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_read_skills_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".e-agent/skills")).unwrap();
+        assert_eq!(read_skills(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_read_skills_ignores_non_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join(".e-agent/skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        // A regular file (not a dir) inside skills — must be skipped
+        fs::write(skills_dir.join("not_a_dir"), "content").unwrap();
+        assert_eq!(read_skills(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_read_skills_missing_skill_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".e-agent/skills/my-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        // No SKILL.md inside — silently skipped
+        assert_eq!(read_skills(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_read_skills_empty_skill_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".e-agent/skills/my-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "").unwrap();
+        assert_eq!(read_skills(dir.path()).unwrap(), None);
+
+        // Whitespace-only is also empty
+        let skill_dir2 = dir.path().join(".e-agent/skills/other-skill");
+        fs::create_dir_all(&skill_dir2).unwrap();
+        fs::write(skill_dir2.join("SKILL.md"), "   \n  \t  ").unwrap();
+        assert_eq!(read_skills(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_read_skills_multiple_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join(".e-agent/skills");
+
+        for (name, content) in [
+            ("z-skill", "last skill content"),
+            ("a-skill", "first skill content"),
+            ("m-skill", "middle skill content"),
+        ] {
+            let d = skills_dir.join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("SKILL.md"), content).unwrap();
+        }
+
+        let result = read_skills(dir.path()).unwrap().unwrap();
+        // a-skill first, then m-skill, then z-skill
+        assert_eq!(
+            result,
+            "## Skill: a-skill\n\nfirst skill content\n\n\
+             ## Skill: m-skill\n\nmiddle skill content\n\n\
+             ## Skill: z-skill\n\nlast skill content"
+        );
+    }
+
+    #[test]
+    fn test_read_skills_keeps_content_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join(".e-agent/skills/with-newlines");
+        fs::create_dir_all(&d).unwrap();
+        let content = "line 1\nline 2\n\nline 4";
+        fs::write(d.join("SKILL.md"), content).unwrap();
+
+        let result = read_skills(dir.path()).unwrap().unwrap();
+        assert_eq!(result, format!("## Skill: with-newlines\n\n{content}"));
+    }
+
+    #[test]
+    fn test_read_skills_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join(".e-agent/skills/bad-utf8");
+        fs::create_dir_all(&d).unwrap();
+        let bad = d.join("SKILL.md");
+        let mut f = fs::File::create(&bad).unwrap();
+        f.write_all(&[0xff, 0xfe, 0x00]).unwrap();
+        drop(f);
+
+        let err = read_skills(dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bad-utf8/SKILL.md"),
+            "expected path context in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("UTF-8"),
+            "expected 'UTF-8' in error, got: {msg}"
+        );
     }
 }

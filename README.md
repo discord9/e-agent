@@ -138,6 +138,18 @@ canonical workspace (the current directory by default). At startup, e-agent
 loads a non-empty `AGENTS.md` from that workspace root into the system context
 for both the main agent and delegated subagents. It does not search parent or
 nested directories, and the instructions are not persisted in sessions.
+
+Workspace skills live in `.e-agent/skills/<name>/SKILL.md` relative to the
+canonical workspace root. At startup, the main agent loads all skills, sorted
+by `<name>` in dictionary order, and injects each as a
+`## Skill: <name>\n\n<content>` block — all skills are merged into a single
+context segment. The injection order is: main role template
+(`.e-agent/agents/main.md`) → workspace `AGENTS.md` → skills → MCP server
+instructions. Skills are loaded for the main agent only; subagents do not
+inherit them. Missing `.e-agent/skills`, empty directories,
+non-directory entries, subdirectories without `SKILL.md`, and empty
+`SKILL.md` files are all silently skipped. Real I/O or UTF-8 errors on a
+`SKILL.md` that should be readable produce an error with path context.
 `read_file` pages long files by 1-indexed lines (optional `offset`/`limit`,
 default 2000 lines per read, capped at 64 KiB) and prints a continuation hint
 when more lines remain.
@@ -373,6 +385,10 @@ display/audit; it is never sent back to the API.
 Web search deliberately has no browser, crawler, URL fetch, citations, domain
 filters, multiple providers or provider trait, retries, cache, background
 search, or remote MCP support.
+Workspace skills are deliberately flat `.e-agent/skills/<name>/SKILL.md` only:
+no YAML/front matter parsing, remote installation, registry, dependencies, hot
+reload, slash commands, on-demand loading, config toggle, or recursive skill
+discovery. Skills are main-agent-only and are not inherited by subagents.
 
 GreptimeDB-specific non-goals (when built with `--features greptime`):
 
