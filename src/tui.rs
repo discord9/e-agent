@@ -708,7 +708,7 @@ async fn drive<T>(
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
                     if key.code == KeyCode::F(2) {
                         state.show_tasks = true;
-                        state.task_cursor = 0;
+                        state.task_cursor = state.cursor_at_attached();
                     } else if key.code == KeyCode::Enter {
                         if key.modifiers == KeyModifiers::ALT {
                             state.input.insert_char('\n');
@@ -1623,7 +1623,7 @@ impl TuiState {
     fn handle_attached_key(&mut self, key: KeyEvent, input_width: usize) {
         if key.code == KeyCode::F(2) {
             self.show_tasks = !self.show_tasks;
-            self.task_cursor = 0;
+            self.task_cursor = self.cursor_at_attached();
             return;
         }
         let Some(attached) = &mut self.attached else {
@@ -1716,7 +1716,7 @@ impl TuiState {
         match key.code {
             KeyCode::F(2) => {
                 self.show_tasks = !self.show_tasks;
-                self.task_cursor = 0;
+                self.task_cursor = self.cursor_at_attached();
             }
             KeyCode::Up
             | KeyCode::Down
@@ -1739,6 +1739,21 @@ impl TuiState {
     }
 
     /// Keys pressed while the tasks panel is open return here first:
+    /// The task-list index of the currently attached session, or 0 when
+    /// nothing is attached (or the attached task is not in the list).
+    fn cursor_at_attached(&self) -> usize {
+        let Some(attached) = &self.attached else {
+            return 0;
+        };
+        self.background
+            .as_ref()
+            .map(|background| background.running())
+            .unwrap_or_default()
+            .iter()
+            .position(|task| task.id == attached.id)
+            .unwrap_or(0)
+    }
+
     /// Up/Down move the cursor and immediately attach to the selected task.
     /// Returns the attach request `(task_id)` if one was made.
     fn handle_tasks_panel_key(&mut self, key: KeyEvent) -> Option<u64> {
