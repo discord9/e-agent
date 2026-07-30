@@ -275,7 +275,7 @@ impl GreptimeSession {
             let sql = build_multi_row_insert(chunk.len());
 
             // Flatten params: workspace_id, session_id, seq, ts, kind, payload, is_error per row.
-            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> =
+            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
                 Vec::with_capacity(chunk.len() * 7);
             for (seq, ts, kind, payload, err) in chunk {
                 params.push(Box::new(wid.as_str()));
@@ -287,8 +287,10 @@ impl GreptimeSession {
                 params.push(Box::new(*err));
             }
 
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                params.iter().map(|p| p.as_ref()).collect();
+            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                .iter()
+                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
             self.client
                 .execute(&sql, &param_refs)
                 .await

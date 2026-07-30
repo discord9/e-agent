@@ -39,4 +39,5 @@ path = "src/bin/import_jsonl.rs"
 required-features = ["greptime"]
 
 [features]
+default = ["greptime"]
 greptime = ["dep:tokio-postgres"]
