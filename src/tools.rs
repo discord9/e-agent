@@ -89,6 +89,9 @@ fn tools_with_background_and_exa_key(
     tools.push(Box::new(GetBackgroundTasks {
         background: background.clone(),
     }));
+    tools.push(Box::new(CancelBackgroundTask {
+        background: background.clone(),
+    }));
     tools.push(bash_tool(workspace, background, sandbox, protect_git));
     if let Some(key) = exa_api_key
         .map(|key| key.trim().to_owned())
@@ -186,6 +189,41 @@ impl Tool for GetBackgroundTasks {
         }
         out.truncate(out.trim_end().len());
         Ok(out)
+    }
+}
+
+struct CancelBackgroundTask {
+    background: BackgroundTasks,
+}
+
+#[async_trait]
+impl Tool for CancelBackgroundTask {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "cancel_background_task".into(),
+            description: "Cancel a currently running background bash or delegate task.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "background task id"}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String, String> {
+        let id = arguments
+            .as_object()
+            .ok_or("tool arguments must be a JSON object")?
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or("`id` must be a non-negative integer")?;
+        self.background
+            .cancel(id)
+            .ok_or_else(|| format!("background task {id} is not running"))?;
+        Ok(format!("cancelled background task {id}"))
     }
 }
 
@@ -1333,6 +1371,7 @@ mod tests {
             "write_file".to_string(),
             "edit_file".to_string(),
             "get_background_tasks".to_string(),
+            "cancel_background_task".to_string(),
             "bash".to_string(),
         ];
         for key in [None, Some("   ".into())] {
@@ -1349,6 +1388,7 @@ mod tests {
                 "write_file",
                 "edit_file",
                 "get_background_tasks",
+                "cancel_background_task",
                 "bash",
                 "web_search"
             ]
