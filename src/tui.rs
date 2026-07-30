@@ -253,6 +253,7 @@ pub async fn run(
     sessions: Sessions,
     model_name: String,
     role_name: Option<String>,
+    context_window: Option<u64>,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -274,6 +275,7 @@ pub async fn run(
         &mut persisted,
         background,
         sessions,
+        context_window,
     )
     .await;
     // Do not return into main: the tokio runtime would then wait on
@@ -317,6 +319,7 @@ impl Drop for TerminalGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent: &mut Agent,
@@ -325,6 +328,7 @@ async fn run_inner(
     persisted: &mut usize,
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
+    context_window: Option<u64>,
 ) -> anyhow::Result<()> {
     // One UI channel carrying every session's events, tagged by session id
     // (0 = main agent). Main-agent events route to the main scrollback,
@@ -349,6 +353,7 @@ async fn run_inner(
     state.model_name = labels.model.clone();
     state.cwd = labels.cwd.clone();
     state.role_name = labels.role.clone();
+    state.context_window = context_window;
 
     state.background = Some(background);
     let probe = sessions.clone();
@@ -1209,7 +1214,7 @@ fn cwd_usage_text(cwd: &str, tokens_context: u64, context_window: Option<u64>) -
     let (text, pct_high) = match context_window {
         Some(window) if window > 0 => {
             let pct = (tokens_context as f64 / window as f64 * 100.0).round() as u64;
-            let high = tokens_context >= window.saturating_mul(80) / 100;
+            let high = (tokens_context as u128) * 100 >= (window as u128) * 80;
             (
                 format!(
                     "{} ctx {} {}%",
@@ -1856,6 +1861,7 @@ impl TuiState {
         );
         match event {
             AgentEvent::Notice(text) => {
+                self.active_lane = None;
                 self.push_line(text, LineKind::Dim);
             }
             AgentEvent::UserPrompt(text) => {

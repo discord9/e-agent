@@ -215,6 +215,9 @@ pub struct Agent {
     /// Maximum context window in tokens. When set, triggers auto-compaction
     /// whenever `last_context_input` exceeds 80% of this value.
     context_window: Option<u64>,
+    /// Set to true when auto-compact fires. Reset to false when
+    /// record_usage reports context below 80% of the window.
+    auto_compacted: bool,
     /// Workspace and server instructions prepended to every model call.
     /// Not persisted in sessions.
     context_prefix: Option<String>,
@@ -247,6 +250,7 @@ impl Agent {
             session_output_tokens: 0,
             last_context_input: 0,
             context_window: None,
+            auto_compacted: false,
             context_prefix: None,
         }
     }
@@ -490,6 +494,15 @@ impl Agent {
             if refresh_context {
                 self.last_context_input = usage.input_tokens;
             }
+            // Reset auto-compacted flag when context drops below 80% of the
+            // window (compaction succeeded and usage decreased).
+            if self.auto_compacted
+                && let Some(window) = self.context_window
+                && window > 0
+                && (self.last_context_input as u128) * 100 < (window as u128) * 80
+            {
+                self.auto_compacted = false;
+            }
             self.emit(AgentEvent::Usage {
                 context_input: self.last_context_input,
                 session: Usage {
@@ -542,8 +555,10 @@ impl Agent {
             // Auto-compact when usage exceeds 80% of the configured context window.
             if let Some(window) = self.context_window
                 && window > 0
-                && self.last_context_input >= window.saturating_mul(80) / 100
+                && !self.auto_compacted
+                && (self.last_context_input as u128) * 100 >= (window as u128) * 80
             {
+                self.auto_compacted = true;
                 self.emit(AgentEvent::Notice("──── auto-compacting… ────".into()));
                 if let Err(error) = self.compact().await {
                     self.emit(AgentEvent::Notice(format!(
