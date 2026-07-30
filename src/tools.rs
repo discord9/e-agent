@@ -130,7 +130,10 @@ impl Tool for GetBackgroundTasks {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "get_background_tasks".into(),
-            description: "List currently running background tasks with their labels and roles."
+            description: "Return a one-time snapshot of currently running background tasks. \
+                Do not poll or repeatedly call this tool to wait for completion. \
+                Results are delivered automatically as [background task N completed]; \
+                continue independent work or end the turn while waiting."
                 .into(),
             parameters: json!({
                 "type": "object",
