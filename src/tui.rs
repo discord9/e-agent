@@ -515,7 +515,6 @@ async fn run_inner(
                         if matches!(interruption, Some(Interruption::CancelTurn)) {
                             state.push_line("cancelled".into(), LineKind::Dim);
                         }
-                        state.follow();
                         // Cancelling with queued prompts: drain all into
                         // a single follow-up turn.
                         loop {
@@ -682,7 +681,6 @@ async fn run_request(
         .append(root, session_name, &agent.history()[*persisted..])
         .await?;
     *persisted = agent.history().len();
-    ui.state.follow();
     draw(terminal, ui.state)?;
     Ok(matches!(interruption, Some(Interruption::ExitApp)))
 }
@@ -1026,13 +1024,25 @@ fn draw<'a, B: ratatui::backend::Backend>(
                 usize::from(output.height),
             );
         }
-        // Render the window range into visual rows.
-        let visual = render_window(
-            &scroll_state.lines,
-            scroll_state.window.source_start,
-            scroll_state.window.source_end,
-            inner_width,
-        );
+        // Render the window range into visual rows. If the viewport is
+        // frozen with a tail-text snapshot, build a temporary line copy so
+        // streaming deltas cannot mutate the rendered output.
+        let visual = if let Some(frozen_text) = &scroll_state.window.frozen_tail_text {
+            let mut frozen_lines: Vec<DisplayLine> = scroll_state.lines
+                [scroll_state.window.source_start..scroll_state.window.source_end]
+                .to_vec();
+            if let Some(last) = frozen_lines.last_mut() {
+                last.text = frozen_text.clone();
+            }
+            render_window(&frozen_lines, 0, frozen_lines.len(), inner_width)
+        } else {
+            render_window(
+                &scroll_state.lines,
+                scroll_state.window.source_start,
+                scroll_state.window.source_end,
+                inner_width,
+            )
+        };
         let total_rows = visual.len();
         let height = usize::from(output.height);
         // Clamp local_offset in follow mode.
@@ -1581,10 +1591,7 @@ fn hard_wrap(text: &str, width: usize) -> Vec<&str> {
 #[cfg(test)]
 fn wrapped_rows(lines: &[DisplayLine], width: u16) -> usize {
     let width = usize::from(width.max(1));
-    lines
-        .iter()
-        .map(|line| hard_wrap(&line.text, width).len())
-        .sum()
+    lines.iter().map(|line| line_visual_rows(line, width)).sum()
 }
 
 #[derive(Default)]
@@ -1686,6 +1693,7 @@ impl AttachedView {
     }
 }
 
+#[derive(Clone)]
 struct DisplayLine {
     text: String,
     kind: LineKind,
@@ -1713,6 +1721,14 @@ struct ScrollWindow {
     local_offset: usize,
     /// Whether the viewport auto-follows the tail.
     follow_bottom: bool,
+    /// Snapshot of the last line's text taken when freezing the viewport
+    /// during active streaming. While set, the drawn visual replaces the
+    /// last DisplayLine's text with this snapshot so subsequent streaming
+    /// deltas cannot mutate the frozen viewport.
+    frozen_tail_text: Option<String>,
+    /// The source_end value at the moment the snapshot was taken; used to
+    /// detect when the user has scrolled past the frozen range.
+    frozen_source_end: usize,
 }
 
 impl Default for ScrollWindow {
@@ -1728,6 +1744,8 @@ impl ScrollWindow {
             source_end: 0,
             local_offset: 0,
             follow_bottom: true,
+            frozen_tail_text: None,
+            frozen_source_end: 0,
         }
     }
 
@@ -1744,7 +1762,7 @@ impl ScrollWindow {
         let mut accumulated = 0usize;
         while self.source_start > 0 {
             let prev = self.source_start - 1;
-            let rows = line_visual_rows(&lines[prev].text, width);
+            let rows = line_visual_rows(&lines[prev], width);
             if accumulated + rows > height && accumulated > 0 {
                 break;
             }
@@ -1756,9 +1774,24 @@ impl ScrollWindow {
 }
 
 /// Count the visual rows a single DisplayLine would produce at `width`.
-/// Uses hard_wrap for all kinds (consistent with draw's rendering).
-fn line_visual_rows(text: &str, width: usize) -> usize {
-    hard_wrap(text, width.max(1)).len()
+/// For Normal lines, uses the same markdown rendering pipeline as
+/// `render_window` so that inline-code/bold delimiters are stripped before
+/// wrapping — this keeps estimates consistent with actual rendering.
+/// For non-Normal lines, falls back to `hard_wrap` (matches `styled_scroll_line`).
+fn line_visual_rows(line: &DisplayLine, width: usize) -> usize {
+    let width = width.max(1);
+    if line.kind == LineKind::Normal {
+        let mut md = crate::markdown::MarkdownLines::new();
+        line.text
+            .split('\n')
+            .flat_map(|segment| {
+                let spans = md.render_line(segment);
+                crate::markdown::wrap_spans(&spans, width)
+            })
+            .count()
+    } else {
+        hard_wrap(&line.text, width).len()
+    }
 }
 
 /// How many of the lines immediately before `source_start` to replay through
@@ -2296,14 +2329,13 @@ impl TuiState {
                 let was_following = self.window.follow_bottom;
                 self.window.follow_bottom = false;
                 if was_following {
-                    // Snapshot: freeze source_end at current position
-                    // but exclude the last line if it is being streamed
-                    // into, so streaming tail mutations stay invisible.
+                    // Snapshot: freeze source_end at current position.
+                    // Do NOT subtract the active streaming line — instead
+                    // snapshot its text so deltas cannot mutate the viewport.
                     self.window.source_end = self.lines.len();
-                    if self.active_lane == Some(ActiveStreamLane::Content)
-                        || self.active_lane == Some(ActiveStreamLane::Reasoning)
-                    {
-                        self.window.source_end = self.window.source_end.saturating_sub(1);
+                    self.window.frozen_source_end = self.window.source_end;
+                    if self.active_lane.is_some() {
+                        self.window.frozen_tail_text = self.lines.last().map(|l| l.text.clone());
                     }
                 }
                 let w = self.inner_width.max(1);
@@ -2311,23 +2343,33 @@ impl TuiState {
                     self.window.local_offset -= 1;
                 } else if self.window.source_start > 0 {
                     self.window.source_start -= 1;
-                    let n = line_visual_rows(&self.lines[self.window.source_start].text, w);
+                    let n = line_visual_rows(&self.lines[self.window.source_start], w);
                     self.window.local_offset = n.saturating_sub(1);
                 }
             }
             KeyCode::Down => {
-                self.window.follow_bottom = false;
+                if self.window.follow_bottom {
+                    // In follow mode: no-op, stay at bottom.
+                    return;
+                }
                 self.window.local_offset += 1;
+                // When frozen and at the local bottom, extend forward.
+                extend_window_down(self, 1, |state| {
+                    if state.window.frozen_tail_text.is_some()
+                        && state.window.source_end > state.window.frozen_source_end
+                    {
+                        state.window.frozen_tail_text = None;
+                    }
+                });
             }
             KeyCode::PageUp => {
                 let was_following = self.window.follow_bottom;
                 self.window.follow_bottom = false;
                 if was_following {
                     self.window.source_end = self.lines.len();
-                    if self.active_lane == Some(ActiveStreamLane::Content)
-                        || self.active_lane == Some(ActiveStreamLane::Reasoning)
-                    {
-                        self.window.source_end = self.window.source_end.saturating_sub(1);
+                    self.window.frozen_source_end = self.window.source_end;
+                    if self.active_lane.is_some() {
+                        self.window.frozen_tail_text = self.lines.last().map(|l| l.text.clone());
                     }
                 }
                 let step = 10usize;
@@ -2336,7 +2378,7 @@ impl TuiState {
                 let mut prepended_rows = 0usize;
                 while deficit > 0 && self.window.source_start > 0 {
                     self.window.source_start -= 1;
-                    let rows = line_visual_rows(&self.lines[self.window.source_start].text, w);
+                    let rows = line_visual_rows(&self.lines[self.window.source_start], w);
                     prepended_rows += rows;
                     deficit = deficit.saturating_sub(rows);
                     if deficit == 0 {
@@ -2351,16 +2393,32 @@ impl TuiState {
                 }
             }
             KeyCode::PageDown => {
-                self.window.follow_bottom = false;
+                if self.window.follow_bottom {
+                    // In follow mode: no-op, stay at bottom.
+                    return;
+                }
                 self.window.local_offset += 10;
+                // When frozen and at the local bottom, extend forward by
+                // enough to show 10 more visual rows.
+                extend_window_down(self, 10, |state| {
+                    if state.window.frozen_tail_text.is_some()
+                        && state.window.source_end > state.window.frozen_source_end
+                    {
+                        state.window.frozen_tail_text = None;
+                    }
+                });
             }
             KeyCode::Home => {
                 self.window.follow_bottom = false;
                 self.window.source_start = 0;
                 self.window.local_offset = 0;
                 self.window.source_end = self.lines.len();
+                self.window.frozen_tail_text = None;
             }
-            KeyCode::End => self.window.follow_bottom = true,
+            KeyCode::End => {
+                self.window.follow_bottom = true;
+                self.window.frozen_tail_text = None;
+            }
             _ => {}
         }
     }
@@ -2370,7 +2428,6 @@ impl TuiState {
     }
 
     fn push_agent_event_inner(&mut self, event: AgentEvent) {
-        let at_bottom = self.at_bottom();
         let ends_delta = matches!(
             &event,
             AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
@@ -2430,7 +2487,7 @@ impl TuiState {
             self.streamed = false;
             self.active_lane = None;
         }
-        if at_bottom {
+        if self.at_bottom() {
             self.follow();
         }
     }
@@ -2508,6 +2565,40 @@ impl TuiState {
         if remaining > 0 {
             self.push_line(format!("{prefix}… ({remaining} more lines)"), kind);
         }
+    }
+}
+
+/// After `handle_scroll` increments `local_offset`, check whether the
+/// window needs to be extended forward (when the local end is reached and
+/// more source lines exist). Adds enough `DisplayLine` entries to cover
+/// `step` visual rows. When the true end is reached, resumes follow mode.
+/// `on_extension` is called after any source_end growth (used to clear the
+/// frozen-tail snapshot once the user scrolls past the freeze point).
+fn extend_window_down(state: &mut TuiState, step: usize, on_extension: impl FnOnce(&mut TuiState)) {
+    let w = state.inner_width.max(1);
+    // Compute total visual rows in the current window.
+    let mut total_visual = 0usize;
+    for line in &state.lines[state.window.source_start..state.window.source_end] {
+        total_visual += line_visual_rows(line, w);
+    }
+    // If local_offset points past the last visual row and more source
+    // lines exist, extend the window forward.
+    if state.window.local_offset >= total_visual && state.window.source_end < state.lines.len() {
+        let mut added = 0usize;
+        while state.window.source_end < state.lines.len() && added < step {
+            let rows = line_visual_rows(&state.lines[state.window.source_end], w);
+            state.window.source_end += 1;
+            added += rows;
+            total_visual += rows;
+        }
+        if state.window.source_end >= state.lines.len() {
+            state.window.follow_bottom = true;
+        }
+        state.window.local_offset = state
+            .window
+            .local_offset
+            .min(total_visual.saturating_sub(1).max(0));
+        on_extension(state);
     }
 }
 
@@ -3338,7 +3429,22 @@ mod tests {
             Ok(Event::Key(typing)),
         ])
         .peekable();
-        let mut state = TuiState::default();
+        // Start with follow_bottom = false so Down/PageDown are not no-ops.
+        let mut state = TuiState {
+            window: ScrollWindow {
+                follow_bottom: false,
+                local_offset: 0,
+                source_start: 0,
+                source_end: 1,
+                ..Default::default()
+            },
+            lines: vec![DisplayLine {
+                text: "hello".into(),
+                kind: LineKind::Normal,
+            }],
+            inner_width: 80,
+            ..Default::default()
+        };
 
         state.handle_scroll(down);
         drain_ready_scroll_keys(&mut events, &mut state).await;
@@ -3367,7 +3473,21 @@ mod tests {
         let mut events = delayed_scroll
             .chain(futures_util::stream::iter(vec![Ok(Event::Key(typing))]))
             .peekable();
-        let mut state = TuiState::default();
+        let mut state = TuiState {
+            window: ScrollWindow {
+                follow_bottom: false,
+                local_offset: 0,
+                source_start: 0,
+                source_end: 1,
+                ..Default::default()
+            },
+            lines: vec![DisplayLine {
+                text: "hello".into(),
+                kind: LineKind::Normal,
+            }],
+            inner_width: 80,
+            ..Default::default()
+        };
         state.handle_scroll(down);
         drain_ready_scroll_keys(&mut events, &mut state).await;
         assert_eq!(
@@ -3395,6 +3515,14 @@ mod tests {
         .peekable();
         {
             let attached = parent.attached.as_mut().unwrap();
+            attached.state.lines.push(DisplayLine {
+                text: "hello".into(),
+                kind: LineKind::Normal,
+            });
+            attached.state.window.source_start = 0;
+            attached.state.window.source_end = 1;
+            attached.state.window.follow_bottom = false;
+            attached.state.inner_width = 80;
             attached.state.handle_scroll(down);
             drain_ready_scroll_keys(&mut events, &mut attached.state).await;
             assert_eq!(attached.state.window.local_offset, 2);
@@ -4511,7 +4639,9 @@ mod tests {
         state.window.source_end = 2;
         state.window.local_offset = 0;
         state.inner_width = 80;
-        // PageDown scrolls away from bottom; follow_bottom becomes false.
+        // Up disengages follow mode; then PageDown advances.
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(!state.window.follow_bottom);
         state.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         assert!(!state.window.follow_bottom);
         assert_eq!(state.window.local_offset, 10);
