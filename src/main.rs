@@ -375,6 +375,7 @@ fn set_stderr_events(agent: &mut Agent) {
         AgentEvent::Notice(text) => {
             eprintln!("{}", text);
         }
+        AgentEvent::Error(text) => eprintln!("error: {text}"),
         AgentEvent::AssistantText(text) => eprintln!("assistant: {}", preview(&text, 500)),
         AgentEvent::AssistantDelta(text) => {
             if reasoning {

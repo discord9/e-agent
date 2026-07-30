@@ -103,6 +103,8 @@ pub enum AgentEvent {
     /// A system-injected notice (background completion, task-kill report)
     /// rendered in the TUI as a dim line.
     Notice(String),
+    /// A turn failed. Recorded even when no frontend is attached.
+    Error(String),
     /// Emitted on the turn boundary when a background task's completion is
     /// folded into the model context as a `[background task N completed]`
     /// message. Not part of the session event log.
@@ -210,6 +212,18 @@ pub trait Tool: Send + Sync {
     fn has_event_sender(&self) -> bool {
         false
     }
+}
+
+pub(crate) struct RoundOutput {
+    pub(crate) assistant: AssistantMessage,
+    pub(crate) usage: Option<Usage>,
+    pub(crate) produced_content_delta: bool,
+}
+
+pub(crate) struct CompactionOutput {
+    pub(crate) entry: SessionEntry,
+    pub(crate) summary: String,
+    pub(crate) usage: Option<Usage>,
 }
 
 pub struct Agent {
@@ -411,10 +425,6 @@ impl Agent {
         loop {
             match self.background_receiver.recv().await {
                 Some(AgentEvent::BackgroundCompleted { id, output, label }) => {
-                    self.running_background.remove(&id);
-                    if let Some((root, session)) = &self.background_record {
-                        crate::session::Session::clear_background_task(root, session, id);
-                    }
                     self.pending_background
                         .push_back((id, output.clone(), label.clone()));
                     // No fanout here either: idle and mid-turn completions
@@ -476,6 +486,14 @@ impl Agent {
     /// so the derived context still sees it, while the full history stays
     /// append-only.
     pub async fn compact(&mut self) -> anyhow::Result<String> {
+        let prepared = self.prepare_compaction().await?;
+        let summary = prepared.summary;
+        self.apply_entry(prepared.entry);
+        self.apply_usage(prepared.usage, false);
+        Ok(summary)
+    }
+
+    pub(crate) async fn prepare_compaction(&mut self) -> anyhow::Result<CompactionOutput> {
         let context = self.context();
         let Some(split) = context
             .iter()
@@ -514,7 +532,6 @@ impl Agent {
             model.complete(&request, &[], Some(&mut on_delta)).await?
         };
         let (response, usage) = response;
-        self.record_usage(usage, false);
         if !response.tool_calls.is_empty() {
             anyhow::bail!("compaction response contains tool calls");
         }
@@ -522,11 +539,54 @@ impl Agent {
             .content
             .filter(|c| !c.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("compaction produced empty summary"))?;
-        self.history.push(SessionEntry::Compaction {
-            summary: summary.clone(),
-            retained: context[split..].to_vec(),
-        });
-        Ok(summary)
+        Ok(CompactionOutput {
+            entry: SessionEntry::Compaction {
+                summary: summary.clone(),
+                retained: context[split..].to_vec(),
+            },
+            summary,
+            usage,
+        })
+    }
+
+    pub(crate) fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.tools.iter().map(|tool| tool.spec()).collect()
+    }
+
+    pub(crate) async fn execute_tool(&mut self, call: &ToolCall) -> Result<String, String> {
+        Self::execute_on(&self.tools, call).await
+    }
+
+    pub(crate) fn apply_entry(&mut self, entry: SessionEntry) {
+        self.history.push(entry);
+    }
+
+    pub(crate) fn apply_usage(&mut self, usage: Option<Usage>, refresh_context: bool) {
+        self.record_usage(usage, refresh_context);
+    }
+
+    pub(crate) fn emit_event(&mut self, event: AgentEvent) {
+        self.emit(event);
+    }
+
+    pub(crate) fn after_tool_entry(&mut self, call: &ToolCall, result: &Result<String, String>) {
+        if result.is_ok()
+            && call.name == "bash"
+            && is_background_call(call)
+            && let Some(id) = started_task_id(result.as_deref().unwrap_or_default())
+        {
+            self.running_background.insert(id);
+            if let Some((root, session)) = &self.background_record {
+                let command = serde_json::from_str::<Value>(&call.arguments)
+                    .ok()
+                    .and_then(|args| args["command"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| call.arguments.clone());
+                let label = preview(&command, 100);
+                let _ = crate::session::Session::record_background_start(
+                    root, session, id, &label, None,
+                );
+            }
+        }
     }
 
     fn push_message(&mut self, message: Message) {
@@ -559,6 +619,38 @@ impl Agent {
         }
     }
 
+    pub(crate) async fn complete_round(
+        &mut self,
+        specs: &[ToolSpec],
+    ) -> anyhow::Result<RoundOutput> {
+        let mut produced_content_delta = false;
+        let context = self.context();
+        let model = &mut self.model;
+        let event_handler = &mut self.event_handler;
+        let observers = &self.observers;
+        let mut on_delta = |kind: ModelDeltaKind, delta: &str| {
+            if kind == ModelDeltaKind::Content {
+                produced_content_delta = true;
+            }
+            let event = match kind {
+                ModelDeltaKind::Content => AgentEvent::AssistantDelta(delta.into()),
+                ModelDeltaKind::Reasoning => AgentEvent::ReasoningDelta(delta.into()),
+            };
+            if let Some(handler) = event_handler {
+                handler(event.clone());
+            }
+            for sink in observers {
+                sink.emit(event.clone());
+            }
+        };
+        let (assistant, usage) = model.complete(&context, specs, Some(&mut on_delta)).await?;
+        Ok(RoundOutput {
+            assistant,
+            usage,
+            produced_content_delta,
+        })
+    }
+
     async fn run_loop(&mut self, specs: &[ToolSpec]) -> anyhow::Result<String> {
         let mut rounds = 0usize;
         loop {
@@ -570,33 +662,12 @@ impl Agent {
             rounds += 1;
             self.drain_background();
             self.inject_pending_background();
-            let mut produced_delta = false;
-            let context = self.context();
-            let assistant = {
-                let model = &mut self.model;
-                let event_handler = &mut self.event_handler;
-                let observers = &self.observers;
-                let mut on_delta = |kind: ModelDeltaKind, delta: &str| {
-                    if kind == ModelDeltaKind::Content {
-                        produced_delta = true;
-                    }
-                    let event = match kind {
-                        ModelDeltaKind::Content => AgentEvent::AssistantDelta(delta.into()),
-                        ModelDeltaKind::Reasoning => AgentEvent::ReasoningDelta(delta.into()),
-                    };
-                    if let Some(handler) = event_handler {
-                        handler(event.clone());
-                    }
-                    // Subagents stream to their session log too, so an
-                    // attached view shows live thinking/output instead of a
-                    // frozen screen during a long reasoning call.
-                    for sink in observers {
-                        sink.emit(event.clone());
-                    }
-                };
-                model.complete(&context, specs, Some(&mut on_delta)).await?
-            };
-            let (assistant, usage) = assistant;
+            let round = self.complete_round(specs).await?;
+            let RoundOutput {
+                assistant,
+                usage,
+                produced_content_delta: produced_delta,
+            } = round;
             self.record_usage(usage, true);
             // Auto-compact when usage exceeds 80% of the configured context window.
             if let Some(window) = self.context_window
@@ -635,23 +706,7 @@ impl Agent {
                     arguments: call.arguments.clone(),
                 });
                 let result = Self::execute_on(&self.tools, call).await;
-                if result.is_ok()
-                    && call.name == "bash"
-                    && is_background_call(call)
-                    && let Some(id) = started_task_id(result.as_deref().unwrap_or_default())
-                {
-                    self.running_background.insert(id);
-                    if let Some((root, session)) = &self.background_record {
-                        let command = serde_json::from_str::<Value>(&call.arguments)
-                            .ok()
-                            .and_then(|args| args["command"].as_str().map(str::to_owned))
-                            .unwrap_or_else(|| call.arguments.clone());
-                        let label = crate::agent::preview(&command, 100);
-                        let _ = crate::session::Session::record_background_start(
-                            root, session, id, &label, None,
-                        );
-                    }
-                }
+                self.after_tool_entry(call, &result);
                 self.emit(AgentEvent::ToolResult {
                     is_error: result.is_err(),
                     content: match &result {
@@ -690,43 +745,67 @@ impl Agent {
     }
 
     fn inject_pending_background(&mut self) {
-        while let Some((id, output, label)) = self.pending_background.pop_front() {
-            // Fanout structured display event to session observers (TUI
-            // scrollback, snapshot). The per-turn subscriber does NOT get
-            // this — it already received the transient BackgroundCompleted
-            // at drain time; sending this too would duplicate the line.
-            self.fanout(&AgentEvent::BackgroundCompletionNotice {
-                id,
-                output: output.clone(),
-                label: label.clone(),
-            });
-            // Persist as a structured entry so the model context sees the
-            // full text and backwards-compatible deserialisation works.
-            self.history
-                .push(SessionEntry::BackgroundCompletion { id, output, label });
+        while !self.pending_background.is_empty() {
+            let entry = self.peek_background_entry().expect("pending entry");
+            self.apply_entry(entry);
+            self.ack_background_entry();
         }
     }
 
-    fn drain_background(&mut self) {
+    pub(crate) fn drain_background_ready(&mut self) {
         while let Ok(AgentEvent::BackgroundCompleted { id, output, label }) =
             self.background_receiver.try_recv()
         {
-            self.running_background.remove(&id);
-            // The task finished while we were alive; forget its record.
-            if let Some((root, session)) = &self.background_record {
-                crate::session::Session::clear_background_task(root, session, id);
-            }
             self.pending_background
                 .push_back((id, output.clone(), label.clone()));
-            // Notify only the per-turn subscriber (the TUI's live display).
-            // The long-lived observers' log gets this completion at the
-            // turn boundary, when `pending_background` is folded into a
-            // `[background task N completed]` user message — emitting here
-            // too would surface it twice.
             if let Some(subscriber) = &self.subscriber {
                 let _ = subscriber.send(AgentEvent::BackgroundCompleted { id, output, label });
             }
         }
+    }
+
+    pub(crate) async fn wait_background_ready(&mut self) -> bool {
+        self.next_background_completion().await.is_some()
+    }
+
+    pub(crate) fn peek_background_entry(&self) -> Option<SessionEntry> {
+        self.pending_background.front().map(|(id, output, label)| {
+            SessionEntry::BackgroundCompletion {
+                id: *id,
+                output: output.clone(),
+                label: label.clone(),
+            }
+        })
+    }
+
+    pub(crate) fn ack_background_entry(&mut self) {
+        if let Some((id, output, label)) = self.pending_background.pop_front() {
+            self.running_background.remove(&id);
+            if let Some((root, session)) = &self.background_record {
+                crate::session::Session::clear_background_task(root, session, id);
+            }
+            self.fanout(&AgentEvent::BackgroundCompletionNotice { id, output, label });
+        }
+    }
+
+    pub(crate) fn take_auto_compact_request(&mut self) -> bool {
+        let requested = self.context_window.is_some_and(|window| {
+            window > 0
+                && !self.auto_compacted
+                && (self.last_context_input as u128) * 100 >= (window as u128) * 80
+        });
+        if requested {
+            self.auto_compacted = true;
+        }
+        requested
+    }
+
+    pub(crate) fn reset_auto_compact_request(&mut self) {
+        self.auto_compacted = false;
+    }
+
+    fn drain_background(&mut self) {
+        self.drain_background_ready();
     }
 }
 

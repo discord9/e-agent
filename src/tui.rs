@@ -2493,6 +2493,10 @@ impl TuiState {
                     self.push_line(text, LineKind::Dim);
                 }
             }
+            AgentEvent::Error(text) => {
+                self.active_lane = None;
+                self.push_line(format!("error: {text}"), LineKind::Dim);
+            }
             AgentEvent::UserPrompt(text) => {
                 self.push_line(format!("you> {text}"), LineKind::User);
             }
