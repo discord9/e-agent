@@ -74,6 +74,10 @@ struct Provider {
 struct ModelProfile {
     model: Option<String>,
     reasoning_effort: Option<String>,
+    /// Maximum context window in tokens (e.g. 131072). When set, the agent
+    /// auto-compacts when usage exceeds 80% of this value, and the TUI
+    /// shows a percentage alongside the token count.
+    context_window: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -84,6 +88,7 @@ pub struct ResolvedModel {
     pub reasoning_effort: Option<String>,
     pub auth: AuthMode,
     pub display: String,
+    pub context_window: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +235,7 @@ impl Config {
                 reasoning_effort,
                 auth: AuthMode::ChatGpt,
                 display: profile.to_owned(),
+                context_window: model_profile.context_window,
             });
         }
         let base_url = provider
@@ -263,6 +269,7 @@ impl Config {
             reasoning_effort,
             auth: AuthMode::ApiKey,
             display: profile.to_owned(),
+            context_window: model_profile.context_window,
         })
     }
 
@@ -374,6 +381,27 @@ reasoning_effort = "max"
         assert_eq!(resolved.display, "kimi/k3");
         assert_eq!(resolved.api_key, "key");
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("max"));
+        assert!(resolved.context_window.is_none());
+    }
+
+    #[test]
+    fn resolves_context_window_from_model_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("key"), "key").unwrap();
+        let path = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://api.kimi.com/coding/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+context_window = 131072
+"#,
+        );
+        let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
+        assert_eq!(resolved.context_window, Some(131072));
     }
 
     #[test]

@@ -135,6 +135,7 @@ async fn run() -> anyhow::Result<()> {
         ),
         None => (None, None, std::collections::HashMap::new()),
     };
+    let main_context_window = main_resolved.as_ref().and_then(|r| r.context_window);
     if matches!(
         main_resolved.as_ref().map(|value| value.auth),
         Some(AuthMode::ChatGpt)
@@ -249,6 +250,10 @@ async fn run() -> anyhow::Result<()> {
         Session::rewrite(&root, &session, agent.history())?;
     }
 
+    if let Some(window) = main_context_window {
+        agent.set_context_window(window);
+    }
+
     if tui_mode {
         return tui::run(
             agent,
@@ -259,6 +264,7 @@ async fn run() -> anyhow::Result<()> {
             subagent_sessions,
             model_name,
             role_name,
+            main_context_window,
         )
         .await;
     }

@@ -212,6 +212,12 @@ pub struct Agent {
     session_input_tokens: u64,
     session_output_tokens: u64,
     last_context_input: u64,
+    /// Maximum context window in tokens. When set, triggers auto-compaction
+    /// whenever `last_context_input` exceeds 80% of this value.
+    context_window: Option<u64>,
+    /// Set to true when auto-compact fires. Reset to false when
+    /// record_usage reports context below 80% of the window.
+    auto_compacted: bool,
     /// Workspace and server instructions prepended to every model call.
     /// Not persisted in sessions.
     context_prefix: Option<String>,
@@ -243,6 +249,8 @@ impl Agent {
             session_input_tokens: 0,
             session_output_tokens: 0,
             last_context_input: 0,
+            context_window: None,
+            auto_compacted: false,
             context_prefix: None,
         }
     }
@@ -264,6 +272,12 @@ impl Agent {
     pub fn max_tool_rounds(mut self, rounds: usize) -> Self {
         self.max_tool_rounds = Some(rounds);
         self
+    }
+
+    /// Set the context window (token count). When set, the agent
+    /// auto-compacts when usage exceeds 80% of this value.
+    pub fn set_context_window(&mut self, window: u64) {
+        self.context_window = Some(window);
     }
 
     pub fn set_event_handler(&mut self, handler: Box<dyn FnMut(AgentEvent) + Send>) {
@@ -480,6 +494,15 @@ impl Agent {
             if refresh_context {
                 self.last_context_input = usage.input_tokens;
             }
+            // Reset auto-compacted flag when context drops below 80% of the
+            // window (compaction succeeded and usage decreased).
+            if self.auto_compacted
+                && let Some(window) = self.context_window
+                && window > 0
+                && (self.last_context_input as u128) * 100 < (window as u128) * 80
+            {
+                self.auto_compacted = false;
+            }
             self.emit(AgentEvent::Usage {
                 context_input: self.last_context_input,
                 session: Usage {
@@ -529,6 +552,21 @@ impl Agent {
             };
             let (assistant, usage) = assistant;
             self.record_usage(usage, true);
+            // Auto-compact when usage exceeds 80% of the configured context window.
+            if let Some(window) = self.context_window
+                && window > 0
+                && !self.auto_compacted
+                && (self.last_context_input as u128) * 100 >= (window as u128) * 80
+            {
+                self.auto_compacted = true;
+                self.emit(AgentEvent::Notice("──── auto-compacting… ────".into()));
+                if let Err(error) = self.compact().await {
+                    self.emit(AgentEvent::Notice(format!(
+                        "auto-compaction error: {error:#}"
+                    )));
+                }
+                self.emit(AgentEvent::Notice("──── auto-compaction ────".into()));
+            }
             if assistant.tool_calls.is_empty() {
                 let answer = assistant.content.clone().unwrap_or_default();
                 self.push_message(Message::Assistant(assistant));
