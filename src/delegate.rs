@@ -726,14 +726,25 @@ impl Tool for Delegate {
         let label = task_label(raw_label, role.as_deref(), &task);
 
         // Resolve custom workspace, if given; otherwise inherit the parent's.
-        let workspace = match arguments
+        // Track whether a custom workspace was explicitly provided (for
+        // display metadata; inherited workspace is not shown).
+        let explicit_workspace_arg: Option<String> = arguments
             .as_object()
             .and_then(|args| args.get("workspace"))
             .and_then(Value::as_str)
-        {
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let workspace = match &explicit_workspace_arg {
             Some(path) => Workspace::new(path)
                 .map_err(|error| format!("invalid `workspace` path `{path}`: {error}"))?,
             None => self.workspace.clone(),
+        };
+
+        // Build structured display metadata for the F2 task panel.
+        // Only tracks explicitly-provided values; inherited defaults are not shown.
+        let task_display = crate::tools::TaskDisplayMeta {
+            background,
+            workspace: explicit_workspace_arg.clone(),
         };
 
         if background {
@@ -785,10 +796,12 @@ impl Tool for Delegate {
             let record = self.record_in.clone();
             let record_in_work = record.clone();
             let record_label = label.clone();
+            let task_display_bg = task_display.clone();
             return self.background.spawn_with_id(
                 label,
                 role.clone(),
                 None,
+                Some(task_display_bg),
                 move |id| {
                     sessions.insert(id, entry_for_hook);
                     *slot_in_hook.lock().unwrap() = Some(id);
@@ -887,6 +900,7 @@ impl Tool for Delegate {
             label,
             role.clone(),
             None,
+            Some(task_display),
             move |id| {
                 sessions.insert(id, entry_for_hook);
                 *slot_in_hook.lock().unwrap() = Some(id);

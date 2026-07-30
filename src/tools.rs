@@ -151,7 +151,25 @@ impl Tool for GetBackgroundTasks {
         let mut out = format!("{} background task(s) running:\n", tasks.len());
         for task in tasks.iter() {
             let role = task.role.as_deref().unwrap_or(&task.kind);
-            out.push_str(&format!("#{}: {} ({})\n", task.id, task.label, role));
+            let tags = task
+                .display_meta
+                .as_ref()
+                .map(|meta| {
+                    let mut t = String::new();
+                    if meta.background {
+                        t.push_str(" [background]");
+                    }
+                    if let Some(ws) = &meta.workspace {
+                        use crate::agent::preview;
+                        t.push_str(&format!(" [workspace: {}]", preview(ws, 40)));
+                    }
+                    t
+                })
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "#{}: {} ({}){}\n",
+                task.id, task.label, role, tags
+            ));
         }
         out.truncate(out.trim_end().len());
         Ok(out)
@@ -569,6 +587,18 @@ struct RunningTask {
     process_group: Arc<AtomicI32>,
     handle: Arc<tokio::task::JoinHandle<()>>,
     output: Option<OutputSlot>,
+    display_meta: Option<TaskDisplayMeta>,
+}
+
+/// Structured metadata for delegate-task display in the F2 task panel.
+/// Avoids label/string re-parsing. Only populated for delegate tasks.
+#[derive(Clone, Debug, Default)]
+pub struct TaskDisplayMeta {
+    /// Whether `background: true` was explicitly set.
+    pub background: bool,
+    /// Explicit user-provided workspace path (trimmed, non-empty); `None`
+    /// means the parent's default workspace was inherited.
+    pub workspace: Option<String>,
 }
 
 /// A snapshot of one running background task, for display.
@@ -581,6 +611,8 @@ pub struct BackgroundTaskInfo {
     pub kind: String,
     /// Combined stdout/stderr tail so far; empty for non-bash tasks.
     pub output: Vec<u8>,
+    /// Delegate-specific display metadata; `None` for non-delegate tasks.
+    pub display_meta: Option<TaskDisplayMeta>,
 }
 
 impl BackgroundTasks {
@@ -620,6 +652,7 @@ impl BackgroundTasks {
                     .as_ref()
                     .map(|slot| slot.lock().unwrap().clone())
                     .unwrap_or_default(),
+                display_meta: task.display_meta.clone(),
             })
             .collect()
     }
@@ -651,6 +684,7 @@ impl BackgroundTasks {
             preview(&command, 100),
             None,
             Some(process_group),
+            None, // display_meta
             move |id| {
                 let mut running = running.lock().unwrap();
                 if let Some(task) = running.iter_mut().find(|task| task.id == id) {
@@ -688,7 +722,7 @@ impl BackgroundTasks {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
-        self.spawn_with_id(label, role, process_group, |_| {}, work)
+        self.spawn_with_id(label, role, process_group, None, |_| {}, work)
     }
 
     /// Like [`Self::spawn`], but invokes `on_id` with the allocated task id
@@ -699,6 +733,7 @@ impl BackgroundTasks {
         label: String,
         role: Option<String>,
         process_group: Option<Arc<AtomicI32>>,
+        display_meta: Option<TaskDisplayMeta>,
         on_id: impl FnOnce(u64),
         work: F,
     ) -> Result<String, String>
@@ -714,6 +749,7 @@ impl BackgroundTasks {
             label,
             role,
             process_group,
+            display_meta,
             on_id,
             work,
             move |id, output| {
@@ -731,6 +767,7 @@ impl BackgroundTasks {
         label: String,
         role: Option<String>,
         process_group: Option<Arc<AtomicI32>>,
+        display_meta: Option<TaskDisplayMeta>,
         on_id: impl FnOnce(u64),
         work: F,
     ) -> Result<String, String>
@@ -738,14 +775,24 @@ impl BackgroundTasks {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
-        self.spawn_inner(label, role, process_group, on_id, work, |_, _| {})
+        self.spawn_inner(
+            label,
+            role,
+            process_group,
+            display_meta,
+            on_id,
+            work,
+            |_, _| {},
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_inner<F, Fut>(
         &self,
         label: String,
         role: Option<String>,
         process_group: Option<Arc<AtomicI32>>,
+        display_meta: Option<TaskDisplayMeta>,
         on_id: impl FnOnce(u64),
         work: F,
         on_complete: impl FnOnce(u64, String) + Send + 'static,
@@ -763,6 +810,7 @@ impl BackgroundTasks {
             process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),
             handle: Arc::new(tokio::spawn(async {})),
             output: None,
+            display_meta,
         });
         on_id(id);
         let running = self.running.clone();

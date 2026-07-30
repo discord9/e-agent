@@ -927,11 +927,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
                 } else {
                     "  (no view)"
                 };
-                let row = if let Some(role) = &task.role {
-                    format!("  #{}: [{}] {}{}", task.id, role, task.label, hint)
-                } else {
-                    format!("  #{}: {}{}", task.id, task.label, hint)
-                };
+                let row = format_task_label(task, hint, 40);
                 lines.push(Line::styled(row, style));
             }
             if !selected_output.is_empty() {
@@ -2125,6 +2121,36 @@ fn parse_edit_arguments(arguments: &str) -> Option<(String, String, String)> {
     ))
 }
 
+/// Format a single task row for the F2 task panel, incorporating structured
+/// display metadata from delegate calls.
+///
+/// Output format: `  #<id>: [<role>] <label>[background][ workspace: <ws>]`
+/// where `[background]` and `[workspace: …]` are only shown when the
+/// delegate explicitly set them. "bash" tasks never have these tags.
+pub fn format_task_label(
+    task: &crate::tools::BackgroundTaskInfo,
+    hint: &str,
+    ws_max: usize,
+) -> String {
+    let base = if let Some(role) = &task.role {
+        format!("  #{}: [{}] {}", task.id, role, task.label)
+    } else {
+        format!("  #{}: {}", task.id, task.label)
+    };
+    let mut s = base;
+    if let Some(meta) = &task.display_meta {
+        if meta.background {
+            s.push_str(" [background]");
+        }
+        if let Some(ws) = &meta.workspace {
+            use std::fmt::Write;
+            let _ = write!(s, " [workspace: {}]", crate::agent::preview(ws, ws_max));
+        }
+    }
+    s.push_str(hint);
+    s
+}
+
 fn format_tool_call(name: &str, arguments: &str) -> String {
     use serde_json::Value;
     use std::fmt::Write;
@@ -2174,6 +2200,11 @@ fn format_tool_call(name: &str, arguments: &str) -> String {
                 .unwrap_or("delegate");
             let task = value.get("task").and_then(|v| v.as_str()).unwrap_or("");
             let task = preview(task, 120);
+            let label = value
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
             let bg = value
                 .get("background")
                 .and_then(|v| v.as_bool())
@@ -2181,13 +2212,18 @@ fn format_tool_call(name: &str, arguments: &str) -> String {
             let ws = value
                 .get("workspace")
                 .and_then(|v| v.as_str())
+                .map(|s| s.trim())
                 .filter(|s| !s.is_empty());
-            let mut s = format!("{role}: {task}");
+            let mut s = if let Some(l) = label {
+                format!("{role}: {} — {task}", preview(l, 40))
+            } else {
+                format!("{role}: {task}")
+            };
             if bg {
                 s.push_str(" [background]");
             }
             if let Some(w) = ws {
-                let _ = write!(s, " [workspace: {w}]");
+                let _ = write!(s, " [workspace: {}]", preview(w, 40));
             }
             s
         }
@@ -2200,6 +2236,266 @@ fn format_tool_call(name: &str, arguments: &str) -> String {
         }
         "get_background_tasks" => "tasks".to_string(),
         _ => format!("tool: {name} {}", preview(arguments, 200)),
+    }
+}
+
+#[cfg(test)]
+mod format_tool_call_tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── delegate ────────────────────────────────────────────────────────
+    // Compressed from 22 individual tests into table-driven cases below.
+
+    #[test]
+    fn delegate_label_cases() {
+        let cases = [
+            // (role, label, task, expected_substr)
+            (
+                Some("coder"),
+                Some("My Label"),
+                "Do the thing",
+                "coder: My Label — Do the thing",
+            ),
+            (Some("coder"), None, "Do the thing", "coder: Do the thing"),
+            (
+                Some("coder"),
+                Some("  "),
+                "Do the thing",
+                "coder: Do the thing",
+            ),
+            (
+                Some("coder"),
+                Some("  My Label  "),
+                "Do the thing",
+                "coder: My Label — Do the thing",
+            ),
+            (None, None, "just a task", "delegate: just a task"),
+        ];
+        for (role, label, task, expected) in &cases {
+            let mut map = serde_json::Map::new();
+            map.insert("task".into(), json!(task));
+            if let Some(r) = role {
+                map.insert("role".into(), json!(r));
+            }
+            if let Some(l) = label {
+                map.insert("label".into(), json!(l));
+            }
+            let json = serde_json::to_string(&map).unwrap();
+            let out = format_tool_call("delegate", &json);
+            assert_eq!(
+                out, *expected,
+                "case role={role:?} label={label:?} task={task:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delegate_background_variants() {
+        let cases = [
+            (true, "delegate: bg task [background]"),
+            (false, "delegate: sync task"),
+            // absent maps to None
+        ];
+        // background:true
+        let out = format_tool_call("delegate", r#"{"task":"bg task","background":true}"#);
+        assert_eq!(out, cases[0].1);
+        // background:false
+        let out = format_tool_call("delegate", r#"{"task":"sync task","background":false}"#);
+        assert_eq!(out, cases[1].1);
+        // absent
+        let out = format_tool_call("delegate", r#"{"task":"plain task"}"#);
+        assert_eq!(out, "delegate: plain task");
+    }
+
+    #[test]
+    fn delegate_workspace_variants() {
+        let cases = [
+            (
+                Some("/some/path"),
+                "delegate: with ws [workspace: /some/path]",
+            ),
+            (Some("  /a/b  "), "delegate: trim ws [workspace: /a/b]"),
+            (Some(""), "delegate: no ws"),
+            (None, "delegate: no ws key"),
+            (Some("   "), "delegate: ws blank"),
+        ];
+        for (workspace, expected) in &cases {
+            let mut map = serde_json::Map::new();
+            map.insert(
+                "task".into(),
+                json!(match workspace {
+                    Some(_)
+                        if workspace.unwrap().trim().is_empty()
+                            && !workspace.unwrap().is_empty() =>
+                        "ws blank",
+                    Some(_) if workspace.unwrap().is_empty() => "no ws",
+                    Some(_)
+                        if workspace.unwrap().contains('/')
+                            && workspace.unwrap().contains("trim") =>
+                        "trim ws",
+                    Some(_) => "with ws",
+                    None => "no ws key",
+                }),
+            );
+            // Simpler: just use a map of workspace value -> task label
+            let (task, ws_val) = match workspace {
+                Some("/some/path") => ("with ws", Some("/some/path")),
+                Some("  /a/b  ") => ("trim ws", Some("  /a/b  ")),
+                Some("") => ("no ws", Some("")),
+                None => ("no ws key", None),
+                Some("   ") => ("ws blank", Some("   ")),
+                _ => unreachable!(),
+            };
+            let mut map = serde_json::Map::new();
+            map.insert("task".into(), json!(task));
+            if let Some(w) = ws_val {
+                map.insert("workspace".into(), json!(w));
+            }
+            let json = serde_json::to_string(&map).unwrap();
+            let out = format_tool_call("delegate", &json);
+            assert_eq!(out, *expected, "case workspace={workspace:?}");
+        }
+    }
+
+    #[test]
+    fn delegate_long_content_preview() {
+        // Long label (50 chars → preview at 40)
+        let long_label = "a".repeat(50);
+        let json = format!(r#"{{"label":"{long_label}","task":"short"}}"#);
+        let out = format_tool_call("delegate", &json);
+        let previewed = preview(&long_label, 40);
+        assert_eq!(out, format!("delegate: {previewed} — short"));
+        assert!(out.contains('…'), "long label must contain ellipsis");
+
+        // Long task (200 chars → preview at 120)
+        let long_task = "b".repeat(200);
+        let json = format!(r#"{{"task":"{long_task}"}}"#);
+        let out = format_tool_call("delegate", &json);
+        let previewed = preview(&long_task, 120);
+        assert_eq!(out, format!("delegate: {previewed}"));
+        assert!(out.contains('…'), "long task must contain ellipsis");
+
+        // Long workspace (preview at 40)
+        let long_ws = "/some/very/long/path/that/should/be/truncated/with/ellipsis/for/safety";
+        let json = format!(r#"{{"task":"x","workspace":"{long_ws}"}}"#);
+        let out = format_tool_call("delegate", &json);
+        let previewed = preview(long_ws, 40);
+        assert_eq!(out, format!("delegate: x [workspace: {previewed}]"));
+        assert!(out.contains('…'), "long workspace must contain ellipsis");
+    }
+
+    #[test]
+    fn delegate_combined_and_edge_cases() {
+        // All fields
+        let out = format_tool_call(
+            "delegate",
+            r#"{"role":"reviewer","label":"CR","task":"review the code changes in PR","background":true,"workspace":"/tmp/review"}"#,
+        );
+        assert_eq!(
+            out,
+            "reviewer: CR — review the code changes in PR [background] [workspace: /tmp/review]"
+        );
+
+        // Invalid JSON
+        let out = format_tool_call("delegate", "not json at all");
+        assert!(
+            out.starts_with("tool: delegate "),
+            "invalid json fallback: {out}"
+        );
+
+        // Empty JSON
+        let out = format_tool_call("delegate", "{}");
+        assert_eq!(out, "delegate: ");
+    }
+}
+
+#[cfg(test)]
+mod format_task_label_tests {
+    use super::*;
+    use crate::tools::{BackgroundTaskInfo, TaskDisplayMeta};
+
+    fn make_task(
+        id: u64,
+        role: Option<&str>,
+        label: &str,
+        display_meta: Option<TaskDisplayMeta>,
+    ) -> BackgroundTaskInfo {
+        BackgroundTaskInfo {
+            id,
+            label: label.into(),
+            role: role.map(String::from),
+            kind: "delegate".into(),
+            output: vec![],
+            display_meta,
+        }
+    }
+
+    #[test]
+    fn task_label_no_meta() {
+        let task = make_task(1, None, "hello", None);
+        assert_eq!(format_task_label(&task, "", 40), "  #1: hello");
+    }
+
+    #[test]
+    fn task_label_with_role() {
+        let task = make_task(2, Some("coder"), "write tests", None);
+        assert_eq!(
+            format_task_label(&task, "", 40),
+            "  #2: [coder] write tests"
+        );
+    }
+
+    #[test]
+    fn task_label_background() {
+        let meta = TaskDisplayMeta {
+            background: true,
+            workspace: None,
+        };
+        let task = make_task(3, None, "bg task", Some(meta));
+        assert_eq!(
+            format_task_label(&task, "", 40),
+            "  #3: bg task [background]"
+        );
+    }
+
+    #[test]
+    fn task_label_workspace() {
+        let meta = TaskDisplayMeta {
+            background: false,
+            workspace: Some("/tmp/work".into()),
+        };
+        let task = make_task(4, Some("dev"), "deploy", Some(meta));
+        assert_eq!(
+            format_task_label(&task, "", 40),
+            "  #4: [dev] deploy [workspace: /tmp/work]"
+        );
+    }
+
+    #[test]
+    fn task_label_background_and_workspace() {
+        let meta = TaskDisplayMeta {
+            background: true,
+            workspace: Some("/custom/path".into()),
+        };
+        let task = make_task(5, None, "full", Some(meta));
+        assert_eq!(
+            format_task_label(&task, "", 40),
+            "  #5: full [background] [workspace: /custom/path]"
+        );
+    }
+
+    #[test]
+    fn task_label_bash_no_tags() {
+        let task = BackgroundTaskInfo {
+            id: 10,
+            label: "echo hi".into(),
+            role: None,
+            kind: "bash".into(),
+            output: vec![],
+            display_meta: None,
+        };
+        assert_eq!(format_task_label(&task, "", 40), "  #10: echo hi");
     }
 }
 
@@ -3136,6 +3432,7 @@ mod tests {
                 "find the render site".into(),
                 Some("explorer".into()),
                 None,
+                None, // display_meta
                 |_| {},
                 || async { "done".into() },
             )
@@ -3145,6 +3442,7 @@ mod tests {
                 "sleep 5".into(),
                 None,
                 None,
+                None, // display_meta
                 |_| {},
                 || async { "done".into() },
             )
