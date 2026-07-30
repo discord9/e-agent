@@ -624,6 +624,7 @@ impl Tool for Delegate {
                 .as_ref()
                 .map(|p| p.session_id.clone())
                 .unwrap_or_default();
+            let record_session_id = persist_session_id.clone();
             let entry = Arc::new(SessionEntry {
                 handle: session.clone(),
                 model: model_name,
@@ -648,6 +649,7 @@ impl Tool for Delegate {
                             session,
                             id,
                             &record_label,
+                            Some(&record_session_id),
                         );
                     }
                 },

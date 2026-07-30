@@ -563,7 +563,7 @@ impl Agent {
                             .unwrap_or_else(|| call.arguments.clone());
                         let label = crate::agent::preview(&command, 100);
                         let _ = crate::session::Session::record_background_start(
-                            root, session, id, &label,
+                            root, session, id, &label, None,
                         );
                     }
                 }

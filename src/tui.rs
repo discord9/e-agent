@@ -1771,6 +1771,7 @@ impl TuiState {
                     self.task_cursor = (self.task_cursor + 1).min(running.len() - 1);
                 }
             }
+            KeyCode::Enter => {}
             _ => return None,
         }
         // After any cursor move, attach to the newly selected task (if

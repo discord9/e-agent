@@ -238,6 +238,7 @@ impl Session {
         session: &str,
         id: u64,
         label: &str,
+        session_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let path = background_record_path(root, session)?;
         let directory = path.parent().unwrap();
@@ -247,10 +248,14 @@ impl Session {
             .create(true)
             .append(true)
             .open(&path)?;
-        file.write_all(&serde_json::to_vec(&serde_json::json!({
+        let mut record = serde_json::json!({
             "id": id,
             "label": label,
-        }))?)?;
+        });
+        if let Some(sid) = session_id {
+            record["session_id"] = serde_json::json!(sid);
+        }
+        file.write_all(&serde_json::to_vec(&record)?)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
         #[cfg(unix)]
@@ -311,7 +316,12 @@ impl Session {
             if let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) {
                 let id = record["id"].as_u64().unwrap_or(0);
                 let label = record["label"].as_str().unwrap_or("?");
-                labels.push(format!("task {id}: {label}"));
+                match record["session_id"].as_str() {
+                    Some(sid) if !sid.is_empty() => {
+                        labels.push(format!("task {id}: {label} (session: {sid})"));
+                    }
+                    _ => labels.push(format!("task {id}: {label}")),
+                }
             }
         }
         let _ = std::fs::remove_file(&path);
@@ -492,8 +502,8 @@ mod tests {
         // Nothing recorded: nothing to report.
         assert!(Session::take_unfinished_background(temp.path(), "a").is_empty());
 
-        Session::record_background_start(temp.path(), "a", 1, "sleep 100").unwrap();
-        Session::record_background_start(temp.path(), "a", 2, "cargo build").unwrap();
+        Session::record_background_start(temp.path(), "a", 1, "sleep 100", None).unwrap();
+        Session::record_background_start(temp.path(), "a", 2, "cargo build", None).unwrap();
         // Records are scoped per session: session b sees none of a's tasks.
         assert!(Session::take_unfinished_background(temp.path(), "b").is_empty());
         // Task 1 completes while we are alive: only task 2 stays on record.
@@ -505,7 +515,7 @@ mod tests {
         // take consumes the file: a second launch has nothing to report.
         assert!(Session::take_unfinished_background(temp.path(), "a").is_empty());
         // Clearing the last recorded task removes the file entirely.
-        Session::record_background_start(temp.path(), "a", 3, "x").unwrap();
+        Session::record_background_start(temp.path(), "a", 3, "x", None).unwrap();
         Session::clear_background_task(temp.path(), "a", 3);
         assert!(
             !temp
