@@ -382,6 +382,9 @@ impl Tool for Delegate {
             .and_then(|args| args.get("background"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if background && !self.background.completion_delivery_available() {
+            return Err("background task delivery is unavailable".into());
+        }
         let role = arguments
             .as_object()
             .and_then(|args| args.get("role"))
@@ -767,16 +770,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_fails_without_event_sender() {
-        // BackgroundTasks without set_event_sender cannot deliver results.
+    async fn background_delivery_preflight_fails_before_later_work() {
+        // The missing sender must win over resume loading and workspace
+        // construction, and must not allocate or persist anything.
         let temp = tempfile::tempdir().unwrap();
-        let delegate = delegate(temp.path());
+        let persist_root = temp.path().join("subagent-sessions");
+        let record_root = temp.path().join("parent-session");
+        let delegate = delegate(temp.path())
+            .persist_sessions(persist_root.clone())
+            .record_background_tasks_in(record_root.clone(), "parent");
+
+        let error = delegate
+            .execute(json!({
+                "task": "hi",
+                "background": true,
+                "resume": "sub-does-not-exist",
+                "workspace": "/nonexistent-path-that-surely-does-not-exist-12345"
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "background task delivery is unavailable");
+        assert!(delegate.background.running().is_empty());
+        assert!(delegate.sessions.sessions.lock().unwrap().is_empty());
+        assert!(!persist_root.exists(), "resume store must not connect");
         assert!(
-            delegate
-                .execute(json!({"task": "hi", "background": true}))
-                .await
-                .unwrap_err()
-                .contains("delivery is unavailable")
+            !record_root.exists(),
+            "background record must not be written"
         );
     }
 

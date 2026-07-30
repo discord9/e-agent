@@ -695,6 +695,16 @@ impl BackgroundTasks {
         self.sender = Some(sender);
     }
 
+    /// Whether background completion delivery is currently usable.
+    ///
+    /// This is a read-only preflight; spawning still performs its own final
+    /// sender check to guard against the receiver closing in the meantime.
+    pub fn completion_delivery_available(&self) -> bool {
+        self.sender
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed())
+    }
+
     /// Snapshot of currently running background tasks, for the TUI panel.
     pub fn running(&self) -> Vec<BackgroundTaskInfo> {
         self.running
@@ -815,6 +825,7 @@ impl BackgroundTasks {
         let sender = self
             .sender
             .clone()
+            .filter(|sender| !sender.is_closed())
             .ok_or("background task delivery is unavailable")?;
         let completion_label = label.clone();
         self.spawn_inner(
@@ -2440,6 +2451,55 @@ mod tests {
             output,
             "1 background task(s) running:\n#1: search the logs (explorer)"
         );
+    }
+
+    #[tokio::test]
+    async fn completion_delivery_available_requires_an_open_receiver() {
+        let mut background = BackgroundTasks::new(Duration::from_secs(30), None);
+        assert!(!background.completion_delivery_available());
+
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        assert!(background.completion_delivery_available());
+
+        drop(receiver);
+        assert!(!background.completion_delivery_available());
+        let work_runs = Arc::new(AtomicU64::new(0));
+        let work_runs_on_failure = work_runs.clone();
+        let error = background
+            .spawn_with_id(
+                "must not start".into(),
+                None,
+                None,
+                None,
+                |_| panic!("closed delivery must not call on_id"),
+                move || async move {
+                    work_runs_on_failure.fetch_add(1, Ordering::Relaxed);
+                    "done".into()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error, "background task delivery is unavailable");
+        assert!(background.running().is_empty());
+        assert_eq!(work_runs.load(Ordering::Relaxed), 0);
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        let started = background
+            .spawn_with_id(
+                "starts now".into(),
+                None,
+                None,
+                None,
+                |_| {},
+                || async { "done".into() },
+            )
+            .unwrap();
+        assert_eq!(started, "started background task 1: starts now");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(AgentEvent::BackgroundCompleted { id: 1, .. })
+        ));
     }
 
     #[tokio::test]
