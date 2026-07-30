@@ -192,7 +192,8 @@ async fn run() -> anyhow::Result<()> {
         .persist_sessions(root.clone())
         .with_role_models(role_models)
         .with_roles_root(root.clone())
-        .with_sandbox(sandbox);
+        .with_sandbox(sandbox)
+        .record_background_tasks_in(root.clone(), &session);
     if let Some(subagent_model) = subagent_model {
         let name = subagent_model.display_name().to_owned();
         delegate = delegate.with_subagent_model(subagent_model);

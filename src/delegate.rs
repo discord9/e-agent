@@ -123,6 +123,10 @@ pub struct Delegate {
     roles_root: Option<std::path::PathBuf>,
     /// Optional bwrap sandbox inherited by every subagent's bash tool.
     sandbox: Option<crate::config::Sandbox>,
+    /// Parent session's background-task record (root + session name), so
+    /// subagent delegates are recorded alongside bash background tasks and
+    /// trigger the "killed on exit" notice on restart.
+    record_in: Option<(std::path::PathBuf, String)>,
 }
 
 /// Where a subagent writes its own session file.
@@ -163,6 +167,7 @@ impl Delegate {
             role_models: std::collections::HashMap::new(),
             roles_root: None,
             sandbox: None,
+            record_in: None,
         }
     }
 
@@ -194,6 +199,13 @@ impl Delegate {
     /// main agent.
     pub fn with_sandbox(mut self, sandbox: Option<crate::config::Sandbox>) -> Self {
         self.sandbox = sandbox;
+        self
+    }
+
+    /// Record subagent background tasks in the parent session's record so a
+    /// restart can warn about killed subagents alongside killed bash tasks.
+    pub fn record_background_tasks_in(mut self, root: std::path::PathBuf, session: &str) -> Self {
+        self.record_in = Some((root, session.to_owned()));
         self
     }
 
@@ -620,6 +632,9 @@ impl Tool for Delegate {
                 session_id: persist_session_id,
             });
             let entry_for_hook = entry.clone();
+            let record = self.record_in.clone();
+            let record_in_work = record.clone();
+            let record_label = label.clone();
             return self.background.spawn_with_id(
                 label,
                 role.clone(),
@@ -627,6 +642,14 @@ impl Tool for Delegate {
                 move |id| {
                     sessions.insert(id, entry_for_hook);
                     *slot_in_hook.lock().unwrap() = Some(id);
+                    if let Some((root, session)) = &record {
+                        let _ = crate::session::Session::record_background_start(
+                            root,
+                            session,
+                            id,
+                            &record_label,
+                        );
+                    }
                 },
                 move || async move {
                     let output = tokio::task::spawn_blocking(move || {
@@ -648,6 +671,9 @@ impl Tool for Delegate {
                     .unwrap_or_else(|error| format!("subagent blocking task failed: {error}"));
                     if let Some(id) = *slot_in_work.lock().unwrap() {
                         sessions_in_work.remove(id);
+                        if let Some((root, session)) = &record_in_work {
+                            crate::session::Session::clear_background_task(root, session, id);
+                        }
                     }
                     output
                 },
