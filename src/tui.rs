@@ -990,42 +990,37 @@ fn draw<'a, B: ratatui::backend::Backend>(
             Some(attached) => &mut attached.state,
             None => state,
         };
-        // Body text (Normal) is parsed as markdown line-by-line so code
-        // fences track state across lines; other kinds keep flat styling.
-        let mut markdown = crate::markdown::MarkdownLines::new();
-        let visual: Vec<Line> = scroll_state
-            .lines
-            .iter()
-            .flat_map(|line| {
-                if line.kind == LineKind::Normal {
-                    // A Normal line may embed newlines (replayed content,
-                    // a non-streamed final answer); split them so each
-                    // becomes its own visual row. The code-fence state
-                    // still carries across these segments.
-                    line.text
-                        .split('\n')
-                        .flat_map(|segment| {
-                            let spans = markdown.render_line(segment);
-                            crate::markdown::wrap_spans(&spans, inner_width)
-                        })
-                        .collect::<Vec<Line>>()
-                } else {
-                    hard_wrap(&line.text, inner_width)
-                        .into_iter()
-                        .map(move |row| styled_scroll_line(row, line.kind))
-                        .collect()
-                }
-            })
-            .collect();
+        // Store the output width for scroll-accounting in handle_scroll.
+        scroll_state.inner_width = inner_width;
+        // When following, anchor the window at the tail.
+        if scroll_state.window.follow_bottom {
+            scroll_state.window.anchor_tail(
+                &scroll_state.lines,
+                inner_width,
+                usize::from(output.height),
+            );
+        }
+        // Render the window range into visual rows.
+        let visual = render_window(
+            &scroll_state.lines,
+            scroll_state.window.source_start,
+            scroll_state.window.source_end,
+            inner_width,
+        );
         let total_rows = visual.len();
         let height = usize::from(output.height);
-        let max_scroll = total_rows.saturating_sub(height);
-        scroll_state.max_scroll = max_scroll;
-        scroll_state.scroll = scroll_state.scroll.min(max_scroll);
+        // Clamp local_offset in follow mode.
+        if scroll_state.window.follow_bottom {
+            scroll_state.window.local_offset = total_rows.saturating_sub(height);
+        }
+        scroll_state.window.local_offset = scroll_state
+            .window
+            .local_offset
+            .min(total_rows.saturating_sub(height).max(0));
         {
             let buf = frame.buffer_mut();
             buf.set_style(output, SOLARIZED_LIGHT.screen_style());
-            let scroll_offset = scroll_state.scroll;
+            let scroll_offset = scroll_state.window.local_offset;
             for (row_idx, line) in visual.iter().enumerate().skip(scroll_offset) {
                 let y = output.y + (row_idx - scroll_offset) as u16;
                 if y >= output.bottom() {
@@ -1578,8 +1573,10 @@ struct TuiState {
     cwd: String,
     input: InputBuffer,
     lines: Vec<DisplayLine>,
-    scroll: usize,
-    max_scroll: usize,
+    /// Bounded local rendering window.
+    window: ScrollWindow,
+    /// Terminal width (in cells) for the output area, updated on every draw.
+    inner_width: usize,
     busy: Option<BusyState>,
     streamed: bool,
     active_lane: Option<ActiveStreamLane>,
@@ -1666,6 +1663,158 @@ impl AttachedView {
 struct DisplayLine {
     text: String,
     kind: LineKind,
+}
+
+/// Bounded local rendering window over a sub-range of the scrollback's
+/// `DisplayLine` entries.
+///
+/// Instead of rendering the full history to compute a global scroll offset,
+/// we maintain a window over `lines[source_start .. source_end]`, produce
+/// visual rows from that range, and track a `local_offset` (visual-row
+/// index) within that window.
+///
+/// While `follow_bottom` is true the window anchors at the tail and grows
+/// with appended content. When the user scrolls away from the bottom, the
+/// window becomes a stable snapshot — appended events and streaming changes
+/// outside the window do not mutate the visible viewport.
+struct ScrollWindow {
+    /// Index into `TuiState::lines` for the first DisplayLine in the window.
+    source_start: usize,
+    /// Index (exclusive) into `TuiState::lines` for the end of the window.
+    source_end: usize,
+    /// Visual-row offset within the rendered window. The first visual row
+    /// shown at the viewport top is `rendered[local_offset]`.
+    local_offset: usize,
+    /// Whether the viewport auto-follows the tail.
+    follow_bottom: bool,
+}
+
+impl Default for ScrollWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScrollWindow {
+    fn new() -> Self {
+        Self {
+            source_start: 0,
+            source_end: 0,
+            local_offset: 0,
+            follow_bottom: true,
+        }
+    }
+
+    /// Populate the window from a tail-anchored range of `lines`, choosing
+    /// `source_start` by walking backward far enough to fill `height` visual
+    /// rows at `width`. After this call the window is ready for rendering
+    /// and `local_offset` points to the bottom (follow mode).
+    fn anchor_tail(&mut self, lines: &[DisplayLine], width: usize, height: usize) {
+        let total = lines.len();
+        self.follow_bottom = true;
+        self.source_end = total;
+        // Walk backward counting visual rows until we have enough.
+        self.source_start = total;
+        let mut accumulated = 0usize;
+        while self.source_start > 0 {
+            let prev = self.source_start - 1;
+            let rows = line_visual_rows(&lines[prev].text, width);
+            if accumulated + rows > height && accumulated > 0 {
+                break;
+            }
+            accumulated += rows;
+            self.source_start = prev;
+        }
+        self.local_offset = 0; // will be set after rendering
+    }
+}
+
+/// Count the visual rows a single DisplayLine would produce at `width`.
+/// Uses hard_wrap for all kinds (consistent with draw's rendering).
+fn line_visual_rows(text: &str, width: usize) -> usize {
+    hard_wrap(text, width.max(1)).len()
+}
+
+/// How many of the lines immediately before `source_start` to replay through
+/// the Markdown renderer so code-fence state is seeded correctly. A fence
+/// opened before this range may produce mis-styled body text inside the
+/// window; in practice terminal-width code blocks rarely span >32 lines.
+const FENCE_LOOKBEHIND: usize = 32;
+
+/// Return the look-behind start index used by `render_window`. Exposed for
+/// deterministic testing: the result is `source_start.saturating_sub(n)`
+/// where `n ≤ FENCE_LOOKBEHIND` but is also clamped so that every newline
+/// segment inside the look-behind range is replayed, not just DisplayLine
+/// boundaries.
+fn lookbehind_start(lines: &[DisplayLine], source_start: usize) -> usize {
+    let mut count = 0usize;
+    let mut idx = source_start;
+    while idx > 0 {
+        idx -= 1;
+        let line = &lines[idx];
+        count += if line.kind == LineKind::Normal {
+            // Each embedded newline resets the search for ` ``` ` line,
+            // so the segment count is what matters for fence scanning.
+            line.text.split('\n').count()
+        } else {
+            // Non-Normal lines reset MarkdownLines fully, so the fence
+            // state is reset after one such line; scanning further back
+            // is pointless.
+            1
+        };
+        if count > FENCE_LOOKBEHIND {
+            // We have scanned enough segments; push `idx` forward one
+            // (past the segment that tipped the count) so the returned
+            // range stays inside the budget.
+            return idx + 1;
+        }
+    }
+    0
+}
+
+/// Render `lines[source_start..source_end]` into styled visual `Line`s at
+/// `width`. The markdown code-fence state is primed by replaying at most
+/// `FENCE_LOOKBEHIND` preceding lines through the MarkdownLines renderer
+/// (see `lookbehind_start`). A code fence opened earlier may be invisible
+/// to the priming pass and produce incorrect styling.
+fn render_window(
+    lines: &[DisplayLine],
+    source_start: usize,
+    source_end: usize,
+    width: usize,
+) -> Vec<ratatui::text::Line<'static>> {
+    let width = width.max(1);
+    let mut markdown = crate::markdown::MarkdownLines::new();
+    // Prime the fence state with a bounded prefix window.
+    let lb_start = lookbehind_start(lines, source_start);
+    for line in &lines[lb_start..source_start] {
+        if line.kind == LineKind::Normal {
+            for segment in line.text.split('\n') {
+                markdown.render_line(segment);
+            }
+        } else {
+            markdown = crate::markdown::MarkdownLines::new();
+        }
+    }
+    lines[source_start..source_end]
+        .iter()
+        .flat_map(|line| {
+            if line.kind == LineKind::Normal {
+                line.text
+                    .split('\n')
+                    .flat_map(|segment| {
+                        let spans = markdown.render_line(segment);
+                        crate::markdown::wrap_spans(&spans, width)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                hard_wrap(&line.text, width)
+                    .into_iter()
+                    .map(|row| styled_scroll_line(row, line.kind))
+                    .collect::<Vec<_>>()
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2120,18 +2269,82 @@ impl TuiState {
 
     fn handle_scroll(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Down => self.scroll = self.scroll.saturating_add(1).min(self.max_scroll),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10).min(self.max_scroll),
-            KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.follow(),
+            KeyCode::Up => {
+                // Freeze window on first scroll away from bottom.
+                let was_following = self.window.follow_bottom;
+                self.window.follow_bottom = false;
+                if was_following {
+                    // Snapshot: freeze source_end at current position
+                    // but exclude the last line if it is being streamed
+                    // into, so streaming tail mutations stay invisible.
+                    self.window.source_end = self.lines.len();
+                    if self.active_lane == Some(ActiveStreamLane::Content)
+                        || self.active_lane == Some(ActiveStreamLane::Reasoning)
+                    {
+                        self.window.source_end = self.window.source_end.saturating_sub(1);
+                    }
+                }
+                let w = self.inner_width.max(1);
+                if self.window.local_offset > 0 {
+                    self.window.local_offset -= 1;
+                } else if self.window.source_start > 0 {
+                    self.window.source_start -= 1;
+                    let n = line_visual_rows(&self.lines[self.window.source_start].text, w);
+                    self.window.local_offset = n.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                self.window.follow_bottom = false;
+                self.window.local_offset += 1;
+            }
+            KeyCode::PageUp => {
+                let was_following = self.window.follow_bottom;
+                self.window.follow_bottom = false;
+                if was_following {
+                    self.window.source_end = self.lines.len();
+                    if self.active_lane == Some(ActiveStreamLane::Content)
+                        || self.active_lane == Some(ActiveStreamLane::Reasoning)
+                    {
+                        self.window.source_end = self.window.source_end.saturating_sub(1);
+                    }
+                }
+                let step = 10usize;
+                let w = self.inner_width.max(1);
+                let mut deficit = step.saturating_sub(self.window.local_offset);
+                let mut prepended_rows = 0usize;
+                while deficit > 0 && self.window.source_start > 0 {
+                    self.window.source_start -= 1;
+                    let rows = line_visual_rows(&self.lines[self.window.source_start].text, w);
+                    prepended_rows += rows;
+                    deficit = deficit.saturating_sub(rows);
+                    if deficit == 0 {
+                        self.window.local_offset = prepended_rows - step;
+                        break;
+                    }
+                }
+                if deficit > 0 {
+                    self.window.local_offset = 0;
+                } else if prepended_rows == 0 {
+                    self.window.local_offset = self.window.local_offset.saturating_sub(step);
+                }
+            }
+            KeyCode::PageDown => {
+                self.window.follow_bottom = false;
+                self.window.local_offset += 10;
+            }
+            KeyCode::Home => {
+                self.window.follow_bottom = false;
+                self.window.source_start = 0;
+                self.window.local_offset = 0;
+                self.window.source_end = self.lines.len();
+            }
+            KeyCode::End => self.window.follow_bottom = true,
             _ => {}
         }
     }
 
     fn at_bottom(&self) -> bool {
-        self.scroll >= self.max_scroll
+        self.window.follow_bottom
     }
 
     fn push_agent_event_inner(&mut self, event: AgentEvent) {
@@ -2201,8 +2414,8 @@ impl TuiState {
     }
 
     fn follow(&mut self) {
-        // Clamped to the real bottom (wrapped rows minus viewport) in draw().
-        self.scroll = usize::MAX;
+        self.window.follow_bottom = true;
+        // source_start/source_end will be anchored at the tail on next draw.
     }
 
     fn push_final_answer(&mut self, answer: String) {
@@ -2212,7 +2425,18 @@ impl TuiState {
     }
 
     fn push_line(&mut self, text: String, kind: LineKind) {
+        let was_empty = self.lines.is_empty();
         self.lines.push(DisplayLine { text, kind });
+        if !was_empty && self.window.follow_bottom {
+            self.window.source_end = self.lines.len();
+        }
+        if was_empty {
+            // First line: initialize window.
+            self.window.source_start = 0;
+            self.window.source_end = 1;
+            self.window.follow_bottom = true;
+            self.window.local_offset = 0;
+        }
     }
 
     fn push_tool_call(&mut self, name: &str, arguments: &str) {
@@ -2759,6 +2983,40 @@ mod tests {
         );
     }
 
+    /// Verify that the lookbehind used by render_window is bounded even
+    /// when the full scrollback contains 10k preceding lines.
+    #[test]
+    fn lookbehind_is_bounded_with_10k_prefix() {
+        // 10,000 preceding lines followed by one Normal line.
+        let mut lines: Vec<DisplayLine> = (0..10_000)
+            .map(|i| DisplayLine {
+                text: format!("line {i}"),
+                kind: LineKind::Dim,
+            })
+            .collect();
+        lines.push(DisplayLine {
+            text: "the actual rendered line".into(),
+            kind: LineKind::Normal,
+        });
+        let source_start = 10_000;
+        let lb = lookbehind_start(&lines, source_start);
+        // The look-behind must be bounded to at most FENCE_LOOKBEHIND
+        // preceding segments; with 10k identical-line entries each is 1
+        // segment, so the start is at most FENCE_LOOKBEHIND away.
+        assert!(
+            source_start - lb <= FENCE_LOOKBEHIND + 1,
+            "lookbehind_start gap was {} (max {})",
+            source_start - lb,
+            FENCE_LOOKBEHIND + 1
+        );
+        // Render the single line with the bounded prefix to prove it
+        // completes without iterating the full 10k prefix.
+        let rendered = render_window(&lines, source_start, source_start + 1, 80);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].spans.len(), 1);
+        assert_eq!(rendered[0].spans[0].content, "the actual rendered line");
+    }
+
     #[test]
     fn f2_toggles_tasks_panel() {
         let mut state = TuiState::default();
@@ -2994,21 +3252,40 @@ mod tests {
     fn attached_view_scrolls_independently() {
         let (handle, _sink, _source) = crate::handle::session_channel();
         let mut state = TuiState {
-            scroll: 2,
+            window: ScrollWindow {
+                local_offset: 2,
+                ..Default::default()
+            },
             ..Default::default()
         };
         attach_test(&mut state, 1, "task", Arc::new(handle));
         {
             let attached = state.attached.as_mut().unwrap();
-            attached.state.max_scroll = 9;
-            attached.state.scroll = 5;
+            attached.state.lines.push(DisplayLine {
+                text: "a".into(),
+                kind: LineKind::Normal,
+            });
+            attached.state.lines.push(DisplayLine {
+                text: "b".into(),
+                kind: LineKind::Normal,
+            });
+            attached.state.window.source_start = 0;
+            attached.state.window.source_end = 2;
+            attached.state.window.local_offset = 1;
+            attached.state.inner_width = 80;
         }
         // Scrolling while attached moves the subagent view only.
         state.handle_attached_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()), 80);
-        assert_eq!(state.scroll, 2, "main scroll untouched");
-        assert_eq!(state.attached.as_ref().unwrap().state.scroll, 4);
+        assert_eq!(state.window.local_offset, 2, "main scroll untouched");
+        assert_eq!(
+            state.attached.as_ref().unwrap().state.window.local_offset,
+            0
+        );
         state.handle_attached_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), 80);
-        assert_eq!(state.attached.as_ref().unwrap().state.scroll, 5);
+        assert_eq!(
+            state.attached.as_ref().unwrap().state.window.local_offset,
+            1
+        );
     }
 
     #[test]
@@ -3039,14 +3316,14 @@ mod tests {
             Ok(Event::Key(typing)),
         ])
         .peekable();
-        let mut state = TuiState {
-            max_scroll: 20,
-            ..Default::default()
-        };
+        let mut state = TuiState::default();
 
         state.handle_scroll(down);
         drain_ready_scroll_keys(&mut events, &mut state).await;
-        assert_eq!(state.scroll, 12, "the ready scroll run is applied in order");
+        assert_eq!(
+            state.window.local_offset, 12,
+            "the ready scroll run is applied in order"
+        );
         assert!(matches!(
             events.next().await,
             Some(Ok(Event::Key(key))) if key == typing
@@ -3068,13 +3345,13 @@ mod tests {
         let mut events = delayed_scroll
             .chain(futures_util::stream::iter(vec![Ok(Event::Key(typing))]))
             .peekable();
-        let mut state = TuiState {
-            max_scroll: 20,
-            ..Default::default()
-        };
+        let mut state = TuiState::default();
         state.handle_scroll(down);
         drain_ready_scroll_keys(&mut events, &mut state).await;
-        assert_eq!(state.scroll, 2, "a woken scroll key joins the quiet window");
+        assert_eq!(
+            state.window.local_offset, 2,
+            "a woken scroll key joins the quiet window"
+        );
         assert!(matches!(
             events.next().await,
             Some(Ok(Event::Key(key))) if key == typing
@@ -3082,7 +3359,10 @@ mod tests {
 
         let (handle, _sink, _source) = crate::handle::session_channel();
         let mut parent = TuiState {
-            scroll: 7,
+            window: ScrollWindow {
+                local_offset: 7,
+                ..Default::default()
+            },
             ..Default::default()
         };
         attach_test(&mut parent, 1, "task", Arc::new(handle));
@@ -3093,14 +3373,12 @@ mod tests {
         .peekable();
         {
             let attached = parent.attached.as_mut().unwrap();
-            attached.state.max_scroll = 20;
-            attached.state.scroll = 0;
             attached.state.handle_scroll(down);
             drain_ready_scroll_keys(&mut events, &mut attached.state).await;
-            assert_eq!(attached.state.scroll, 2);
+            assert_eq!(attached.state.window.local_offset, 2);
         }
         assert_eq!(
-            parent.scroll, 7,
+            parent.window.local_offset, 7,
             "attached coalescing leaves main scroll alone"
         );
         assert!(matches!(
@@ -3232,11 +3510,15 @@ mod tests {
             ..Default::default()
         };
 
-        // Frame 1: display " 好" at scroll=0.
+        // Frame 1: display " 好" (scroll to first line).
         // The wide glyph 好 sits at column 1, width=2, so its trailing
         // cell occupies column 2.  After the draw, the post-render pass
         // marks column 1+2=3 (x + width) with AlwaysUpdate.
-        state.scroll = 0;
+        state.window.source_start = 0;
+        state.window.source_end = 1;
+        state.window.local_offset = 0;
+        state.window.follow_bottom = false;
+        state.inner_width = 6;
         let completed = draw(&mut terminal, &mut state).unwrap();
         let frame_buf = completed.buffer;
 
@@ -3248,13 +3530,15 @@ mod tests {
             "cell after a wide glyph must be marked AlwaysUpdate"
         );
 
-        // Frame 2: scroll to show "好 ".
+        // Frame 2: scroll to show "好 " (second line).
         // Now 好 sits at column 0, width=2, covering columns 0-1.
         // Column 2 becomes a plain space.  The post-render pass marks
         // column 0+2=2 with AlwaysUpdate so the diff emits it even though
         // it logically compares equal to column 2 of of the previous frame
         // (both had Solarized background, both have empty/space symbol).
-        state.scroll = 1;
+        state.window.source_start = 1;
+        state.window.source_end = 2;
+        state.window.local_offset = 0;
         let completed = draw(&mut terminal, &mut state).unwrap();
         let frame_buf = completed.buffer;
 
@@ -3333,7 +3617,9 @@ mod tests {
         draw(&mut terminal, &mut state).unwrap();
         state.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         draw(&mut terminal, &mut state).unwrap();
-        assert_eq!(state.scroll, 0);
+        assert_eq!(state.window.local_offset, 0);
+        assert_eq!(state.window.source_start, 0);
+        assert!(!state.window.follow_bottom);
         assert_eq!(
             terminal.backend().buffer()[(0, 0)].bg,
             SOLARIZED_LIGHT.background,
@@ -4122,7 +4408,7 @@ mod tests {
                 "done",
             ]
         );
-        assert_eq!(state.scroll, usize::MAX);
+        assert!(state.window.follow_bottom);
     }
 
     #[test]
@@ -4138,15 +4424,19 @@ mod tests {
                     kind: LineKind::Normal,
                 },
             ],
-            max_scroll: 2,
             ..Default::default()
         };
-        state.scroll = 0;
+        state.window.source_start = 0;
+        state.window.source_end = 2;
+        state.window.follow_bottom = false;
+        state.window.local_offset = 0;
+        state.inner_width = 80;
         state.push_agent_event(AgentEvent::AssistantText("three".into()));
-        assert_eq!(state.scroll, 0);
-        state.scroll = state.max_scroll;
+        assert!(!state.window.follow_bottom);
+        assert_eq!(state.window.local_offset, 0);
+        state.window.follow_bottom = true;
         state.push_agent_event(AgentEvent::AssistantText("four".into()));
-        assert_eq!(state.scroll, usize::MAX);
+        assert!(state.window.follow_bottom);
     }
 
     #[test]
@@ -4162,14 +4452,17 @@ mod tests {
                     kind: LineKind::Normal,
                 },
             ],
-            max_scroll: 42,
             ..Default::default()
         };
-        state.scroll = 10;
+        state.window.local_offset = 10;
+        state.window.source_start = 0;
+        state.window.source_end = 2;
+        state.inner_width = 80;
         state.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-        assert_eq!(state.scroll, 0);
+        assert_eq!(state.window.local_offset, 0);
+        assert_eq!(state.window.source_start, 0);
         state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        assert_eq!(state.scroll, usize::MAX);
+        assert!(state.window.follow_bottom);
         state.input.insert("xy");
         state.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert_eq!(state.input.cursor, 0);
@@ -4190,19 +4483,27 @@ mod tests {
                     kind: LineKind::Normal,
                 },
             ],
-            max_scroll: 2,
             ..Default::default()
         };
+        state.window.source_start = 0;
+        state.window.source_end = 2;
+        state.window.local_offset = 0;
+        state.inner_width = 80;
+        // PageDown scrolls away from bottom; follow_bottom becomes false.
         state.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(state.scroll, 2);
+        assert!(!state.window.follow_bottom);
+        assert_eq!(state.window.local_offset, 10);
+        // ToolResult ends a delta; at_bottom is false so follow is NOT called.
         state.push_agent_event(AgentEvent::ToolResult {
             is_error: false,
             content: "done".into(),
         });
         assert_eq!(state.lines.last().unwrap().text, "  ok: done");
         assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolResult);
-        assert_eq!(state.scroll, usize::MAX);
+        assert!(!state.window.follow_bottom);
 
+        // When following, a ToolResult keeps follow_bottom = true.
+        state.window.follow_bottom = true;
         state.push_agent_event(AgentEvent::ToolResult {
             is_error: true,
             content: "failed".into(),
