@@ -1350,55 +1350,90 @@ fn compaction_banner(label: &str) -> String {
 }
 
 /// Truncate background completion output for TUI display. Shows head and
-/// tail with a middle marker indicating how many chars and lines were
+/// tail with a middle marker indicating how many lines and chars were
 /// omitted. The full output is always preserved in the session entry /
 /// model context / persisted JSONL / Greptime payload.
 ///
-/// Budget: 2000 chars (generous for a terminal preview, well below the
-/// 64 KiB tool-result limit). Single-line and multi-line outputs are
-/// both handled: for multi-line, individual lines beyond the limit are
-/// trimmed, and the marker reports both chars and lines.
+/// Visual budget:
+///   - At most 5 head lines + 1 marker line + 3 tail lines = 9 lines total.
+///   - Each retained line is middle-elided with `preview(120)` (Unicode-safe,
+///     CJK-safe) so a single long line never wraps across the terminal.
+///   - Short output (≤ 8 logical lines) whose every line also fits 120 chars
+///     is returned unchanged.
+///
+/// The marker reports both dropped lines and total omitted chars (sum of chars
+/// from dropped lines plus chars trimmed from retained lines via middle-elision).
+/// "Chars omitted" = len(original) - len(visible result including the marker).
 fn truncate_background_output(output: &str) -> String {
-    const MAX_CHARS: usize = 2000;
-    if output.chars().count() <= MAX_CHARS {
+    const HEAD_LINES: usize = 5;
+    const TAIL_LINES: usize = 3;
+    const MAX_VISUAL_LINES: usize = HEAD_LINES + TAIL_LINES; // 8 (before truncation)
+    const MAX_LINE_CHARS: usize = 120;
+
+    let lines: Vec<&str> = output.lines().collect();
+    let total_lines = lines.len();
+
+    // Elide a single line to MAX_LINE_CHARS via middle ellipsis.
+    let elide = |line: &str| -> String {
+        if line.chars().count() > MAX_LINE_CHARS {
+            preview(line, MAX_LINE_CHARS)
+        } else {
+            line.to_owned()
+        }
+    };
+
+    // Case 1: short output, no line too long → return unchanged.
+    let any_long = lines.iter().any(|l| l.chars().count() > MAX_LINE_CHARS);
+    if total_lines <= MAX_VISUAL_LINES && !any_long {
         return output.to_owned();
     }
-    // 2:1 head-to-tail ratio within the budget, minus the marker length.
-    let marker = |head_len: usize, tail_len: usize| -> String {
-        let omitted = output.chars().count() - head_len - tail_len;
-        format!(" […] ({omitted} chars omitted)")
-    };
-    let head_ratio = 2;
-    let tail_ratio = 1;
-    let total_ratio = head_ratio + tail_ratio;
-    // Estimate: reserve space for the marker, then split.
-    // Start with a marker estimate of ~40 chars (generous).
-    let marker_est = 40usize;
-    let available = MAX_CHARS.saturating_sub(marker_est);
-    let head_chars = available * head_ratio / total_ratio;
-    let tail_chars = available - head_chars;
-    let chars: Vec<char> = output.chars().collect();
-    let head: String = chars[..head_chars.min(chars.len())].iter().collect();
-    let tail_start = chars.len().saturating_sub(tail_chars);
-    let tail: String = chars[tail_start..].iter().collect();
-    let actual_marker = marker(head.chars().count(), tail.chars().count());
-    if head.chars().count() + tail.chars().count() + actual_marker.chars().count() <= MAX_CHARS {
-        return format!("{head}{actual_marker}{tail}");
+
+    let total_orig_chars: usize = output.chars().count();
+
+    // Case 2: short output (≤ 8 lines) but some lines exceed 120 chars.
+    // Keep every line with middle elision on the long ones, then append
+    // a chars-omitted note.
+    if total_lines <= MAX_VISUAL_LINES {
+        let elided: Vec<String> = lines.iter().map(|l| elide(l)).collect();
+        let body = elided.join("\n");
+        let visible = body.chars().count();
+        let omitted = total_orig_chars.saturating_sub(visible);
+        if omitted > 0 {
+            return format!("{body}\n\u{2026} ({omitted} chars omitted)");
+        }
+        return body;
     }
-    // Marker was too long; tighten the head+tail.
-    let slack =
-        head.chars().count() + tail.chars().count() + actual_marker.chars().count() - MAX_CHARS;
-    let trim_head = (slack * head_ratio / total_ratio).min(head.chars().count().saturating_sub(1));
-    let trim_tail = (slack - trim_head).min(tail.chars().count().saturating_sub(1));
-    let head: String = chars[..head.chars().count().saturating_sub(trim_head)]
-        .iter()
-        .collect();
-    let tail_start = chars
-        .len()
-        .saturating_sub(tail.chars().count().saturating_sub(trim_tail));
-    let tail: String = chars[tail_start..].iter().collect();
-    let final_marker = marker(head.chars().count(), tail.chars().count());
-    format!("{head}{final_marker}{tail}")
+
+    // Case 3: many lines (> 8).
+    let head = &lines[..HEAD_LINES];
+    let tail = &lines[total_lines - TAIL_LINES..];
+    let omitted_lines = total_lines - HEAD_LINES - TAIL_LINES;
+
+    let elided_head: Vec<String> = head.iter().map(|l| elide(l)).collect();
+    let elided_tail: Vec<String> = tail.iter().map(|l| elide(l)).collect();
+    let head_chars: usize = elided_head.iter().map(|s| s.chars().count()).sum();
+    let tail_chars: usize = elided_tail.iter().map(|s| s.chars().count()).sum();
+
+    // Build marker.  The marker text itself is part of the visible result,
+    // so we need an estimated length to compute the chars-omitted value,
+    // then refine once.
+    let est_marker_len = 64usize;
+    let rough_omitted = total_orig_chars.saturating_sub(head_chars + tail_chars + est_marker_len);
+    let marker =
+        format!("\n\u{2026} ({omitted_lines} lines omitted, {rough_omitted} chars omitted)");
+    // Refine with actual marker length.
+    let actual_omitted =
+        total_orig_chars.saturating_sub(head_chars + tail_chars + marker.chars().count());
+    let marker =
+        format!("\n\u{2026} ({omitted_lines} lines omitted, {actual_omitted} chars omitted)");
+
+    let mut result = elided_head.join("\n");
+    result.push_str(&marker);
+    for line in &elided_tail {
+        result.push('\n');
+        result.push_str(line);
+    }
+    result
 }
 
 fn is_scroll_key(key: KeyEvent) -> bool {
@@ -4506,6 +4541,7 @@ mod ux_tests {
     fn truncate_background_long_single_line() {
         let long = "x".repeat(3000);
         let result = truncate_background_output(&long);
+        // The result has the elided line + a chars-omitted note.
         assert!(
             result.chars().count() <= 2000,
             "truncated length {} > 2000",
@@ -4515,13 +4551,13 @@ mod ux_tests {
             result.contains('\u{2026}'),
             "long output must contain ellipsis marker, got: {result:?}"
         );
-        // Head preserved
+        // Head preserved in preview
         assert!(result.starts_with("xxx"), "head must be preserved");
-        // Tail preserved
+        // Tail preserved in the preview (first/only content line)
+        let first_line = result.lines().next().expect("at least one line");
         assert!(
-            result.ends_with("xxx"),
-            "tail must be preserved, got end: {:?}",
-            &result[result.len().saturating_sub(10)..]
+            first_line.ends_with("xxx"),
+            "preview tail must be preserved, got: {first_line:?}"
         );
     }
 
@@ -4534,10 +4570,12 @@ mod ux_tests {
         let long = lines.join("\n");
         assert!(long.chars().count() > 2000);
         let result = truncate_background_output(&long);
+        // Each line is ~42 chars (< 120) so no per-line elision; 200 lines > 8
+        // so we get head 5 + marker + tail 3 = 9 visual lines.
         assert!(
-            result.chars().count() <= 2000,
-            "truncated length {} > 2000",
-            result.chars().count()
+            result.lines().count() <= 9,
+            "expected ≤ 9 visual lines, got {}",
+            result.lines().count()
         );
         assert!(result.contains('\u{2026}'), "must contain ellipsis marker");
         assert!(result.starts_with("line 0:"), "head preserved");
@@ -4554,8 +4592,57 @@ mod ux_tests {
         let result = truncate_background_output(&long);
         assert!(
             result.contains("chars omitted"),
-            "marker must report char count"
+            "marker must report char count, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn truncate_background_10_lines_head_tail_and_marker() {
+        // Exactly 9 lines (5+1+3) after truncation from 15 lines.
+        let lines: Vec<String> = (0..15).map(|i| format!("line {i}")).collect();
+        let output = lines.join("\n");
+        let result = truncate_background_output(&output);
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert_eq!(result_lines.len(), 9, "expected 9 visual lines");
+        // Head: first 5 lines
+        for (i, line) in result_lines[..5].iter().enumerate() {
+            assert_eq!(*line, format!("line {i}"));
+        }
+        // Marker line
+        assert!(result_lines[5].contains("lines omitted"));
+        assert!(result_lines[5].contains("chars omitted"));
+        // Tail: last 3 lines (indices 12, 13, 14)
+        for (j, i) in (12..=14).enumerate() {
+            assert_eq!(result_lines[6 + j], format!("line {i}"));
+        }
+    }
+
+    #[test]
+    fn truncate_background_long_lines_many_lines_under_9_visual() {
+        // 20 lines, each ~200 chars (wider than 120, so truncated)
+        let lines: Vec<String> = (0..20)
+            .map(|i| format!("line {i}: {}", "data".repeat(40)))
+            .collect();
+        let output = lines.join("\n");
+        let result = truncate_background_output(&output);
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert!(
+            result_lines.len() <= 9,
+            "expected ≤ 9 visual lines, got {}",
+            result_lines.len()
+        );
+        // Every line is ≤ 120 chars
+        for line in &result_lines {
+            assert!(
+                line.chars().count() <= 120,
+                "line too long: {} chars in {line:?}",
+                line.chars().count()
+            );
+        }
+        // Head preserved
+        assert!(result_lines[0].starts_with("line 0:"));
+        // Tail preserved
+        assert!(result_lines.last().unwrap().contains("line 19:"));
     }
 
     #[test]
