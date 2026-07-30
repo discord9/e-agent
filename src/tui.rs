@@ -288,16 +288,7 @@ pub async fn run(
     // any spawned MCP children.
     drop(terminal);
     drop(_guard);
-    match result {
-        Ok(()) => {
-            eprintln!("e-agent: resume with: e-agent --session {}", labels.session);
-            std::process::exit(0);
-        }
-        Err(error) => {
-            eprintln!("error: {error:#}");
-            std::process::exit(1);
-        }
-    }
+    result
 }
 
 /// Text painted around the input box border (session id, model, role, cwd).

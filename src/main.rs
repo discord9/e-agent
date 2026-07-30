@@ -124,6 +124,17 @@ async fn run() -> anyhow::Result<()> {
             id
         }
     };
+    // TUI-mode session-report guard: prints session info to stderr when
+    // the function returns (regardless of Ok/Err).  Non-TUI sessions set
+    // session=None so the guard is a no-op.
+    let mut _tui_report = TuiSessionReport {
+        session: if tui_mode {
+            Some(session.clone())
+        } else {
+            None
+        },
+        success: false,
+    };
     // Web search reads EXA_API_KEY from the process env (tools.rs and
     // subagents pick it up there). When unset, fall back to the `[web_search]`
     // config section by injecting it into the env once at startup — this keeps
@@ -288,7 +299,7 @@ async fn run() -> anyhow::Result<()> {
     }
 
     if tui_mode {
-        return tui::run(
+        let result = tui::run(
             agent,
             root,
             session,
@@ -301,6 +312,8 @@ async fn run() -> anyhow::Result<()> {
             main_context_window,
         )
         .await;
+        _tui_report.success = result.is_ok();
+        return result;
     }
     set_stderr_events(&mut agent);
     if repl_mode {
@@ -315,6 +328,37 @@ async fn run() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Lines printed by TuiSessionReport Drop (pure for testability).
+fn tui_report_lines(session: &str, success: bool) -> Vec<String> {
+    let resume = format!("e-agent: resume with: e-agent --session {session}");
+    if success {
+        vec![resume]
+    } else {
+        vec![
+            format!("e-agent: session {session} (the failed turn may not have been persisted)"),
+            resume,
+        ]
+    }
+}
+
+/// TUI-mode guard: prints session info to stderr on drop (terminal restored).
+/// Non-TUI sessions set session=None and the guard is a no-op.
+struct TuiSessionReport {
+    session: Option<String>,
+    success: bool,
+}
+
+impl Drop for TuiSessionReport {
+    fn drop(&mut self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        for line in tui_report_lines(session, self.success) {
+            eprintln!("{line}");
+        }
+    }
 }
 
 fn set_stderr_events(agent: &mut Agent) {
@@ -692,6 +736,24 @@ mod tests {
         assert!(
             msg.contains("UTF-8"),
             "expected 'UTF-8' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_tui_session_report_ok() {
+        let lines = tui_report_lines("abc-123", true);
+        assert_eq!(lines, ["e-agent: resume with: e-agent --session abc-123"]);
+    }
+
+    #[test]
+    fn test_tui_session_report_err() {
+        let lines = tui_report_lines("xyz-789", false);
+        assert_eq!(
+            lines,
+            [
+                "e-agent: session xyz-789 (the failed turn may not have been persisted)",
+                "e-agent: resume with: e-agent --session xyz-789",
+            ]
         );
     }
 }
