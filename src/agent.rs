@@ -230,14 +230,6 @@ pub struct Agent {
     /// Workspace root + session name used to record in-flight background
     /// tasks, so resuming the same session can report what died. None in tests.
     background_record: Option<(std::path::PathBuf, String)>,
-    /// Optional session store for proactive per-entry persistence. When set,
-    /// every User/Assistant/Tool/Compaction/BackgroundCompletion entry is
-    /// persisted immediately after being appended to history.
-    persist: Option<(
-        crate::session_store::SessionStore,
-        std::path::PathBuf,
-        String,
-    )>,
     session_input_tokens: u64,
     session_output_tokens: u64,
     last_context_input: u64,
@@ -281,7 +273,6 @@ impl Agent {
             context_window: None,
             auto_compacted: false,
             context_prefix: None,
-            persist: None,
         }
     }
 
@@ -308,31 +299,6 @@ impl Agent {
     /// auto-compacts when usage exceeds 80% of this value.
     pub fn set_context_window(&mut self, window: u64) {
         self.context_window = Some(window);
-    }
-
-    /// Enable proactive per-entry persistence. Every User / Assistant / Tool /
-    /// Compaction / BackgroundCompletion entry is persisted to the store
-    /// before being appended to history.
-    pub fn set_persist(
-        &mut self,
-        store: crate::session_store::SessionStore,
-        root: std::path::PathBuf,
-        session: String,
-    ) {
-        self.persist = Some((store, root, session));
-    }
-
-    /// Persist an entry and only then append it to history. This is the
-    /// single write path for all persistent entries. Deltas are never passed
-    /// through this method — they are not part of the history.
-    async fn persist_and_push(&mut self, entry: SessionEntry) -> anyhow::Result<()> {
-        if let Some((store, root, session)) = &self.persist {
-            store
-                .append(root, session, std::slice::from_ref(&entry))
-                .await?;
-        }
-        self.history.push(entry);
-        Ok(())
     }
 
     pub fn set_event_handler(&mut self, handler: Box<dyn FnMut(AgentEvent) + Send>) {
@@ -484,13 +450,12 @@ impl Agent {
     /// model reacting to them yet — run() uses it to start a follow-up turn.
     async fn run_turn(&mut self, prompt: String) -> anyhow::Result<(String, bool)> {
         self.drain_background();
-        self.inject_pending_background().await?;
+        self.inject_pending_background();
         // Reset the auto-compact latch at the start of each new user turn so
         // a failed compaction doesn't permanently prevent future attempts.
         self.auto_compacted = false;
         if !prompt.is_empty() {
-            self.persist_and_push(Message::User { content: prompt }.into())
-                .await?;
+            self.history.push(Message::User { content: prompt }.into());
         }
         let specs: Vec<_> = self.tools.iter().map(|tool| tool.spec()).collect();
 
@@ -502,7 +467,7 @@ impl Agent {
         // of waiting for the next prompt. run() then loops so the model
         // reacts to them right away.
         let injected_at_end = !self.pending_background.is_empty();
-        self.inject_pending_background().await?;
+        self.inject_pending_background();
         result.map(|answer| (answer, injected_at_end))
     }
 
@@ -549,6 +514,7 @@ impl Agent {
             model.complete(&request, &[], Some(&mut on_delta)).await?
         };
         let (response, usage) = response;
+        self.record_usage(usage, false);
         if !response.tool_calls.is_empty() {
             anyhow::bail!("compaction response contains tool calls");
         }
@@ -556,17 +522,15 @@ impl Agent {
             .content
             .filter(|c| !c.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("compaction produced empty summary"))?;
-        self.persist_and_push(SessionEntry::Compaction {
+        self.history.push(SessionEntry::Compaction {
             summary: summary.clone(),
             retained: context[split..].to_vec(),
-        })
-        .await?;
-        self.record_usage(usage, false);
+        });
         Ok(summary)
     }
 
-    async fn push_message(&mut self, message: Message) -> anyhow::Result<()> {
-        self.persist_and_push(message.into()).await
+    fn push_message(&mut self, message: Message) {
+        self.history.push(message.into());
     }
 
     fn record_usage(&mut self, usage: Option<Usage>, refresh_context: bool) {
@@ -605,7 +569,7 @@ impl Agent {
             }
             rounds += 1;
             self.drain_background();
-            self.inject_pending_background().await?;
+            self.inject_pending_background();
             let mut produced_delta = false;
             let context = self.context();
             let assistant = {
@@ -633,10 +597,6 @@ impl Agent {
                 model.complete(&context, specs, Some(&mut on_delta)).await?
             };
             let (assistant, usage) = assistant;
-            // Complete assistant entries become durable before usage/events and
-            // auto-compaction advance the turn.
-            self.push_message(Message::Assistant(assistant.clone()))
-                .await?;
             self.record_usage(usage, true);
             // Auto-compact when usage exceeds 80% of the configured context window.
             if let Some(window) = self.context_window
@@ -656,6 +616,7 @@ impl Agent {
             }
             if assistant.tool_calls.is_empty() {
                 let answer = assistant.content.clone().unwrap_or_default();
+                self.push_message(Message::Assistant(assistant));
                 return Ok(answer);
             }
 
@@ -667,23 +628,13 @@ impl Agent {
             {
                 self.emit(AgentEvent::AssistantText(content.into()));
             }
+            self.push_message(Message::Assistant(assistant.clone()));
             for call in &assistant.tool_calls {
                 self.emit(AgentEvent::ToolCall {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 });
                 let result = Self::execute_on(&self.tools, call).await;
-                // Persist the tool result entry BEFORE background bookkeeping
-                // and ToolResult emission, per proactive-persistence contract.
-                self.push_message(Message::Tool {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    content: match &result {
-                        Ok(content) | Err(content) => content.clone(),
-                    },
-                    is_error: result.is_err(),
-                })
-                .await?;
                 if result.is_ok()
                     && call.name == "bash"
                     && is_background_call(call)
@@ -706,6 +657,14 @@ impl Agent {
                     content: match &result {
                         Ok(content) | Err(content) => content.clone(),
                     },
+                });
+                self.push_message(Message::Tool {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    content: match &result {
+                        Ok(content) | Err(content) => content.clone(),
+                    },
+                    is_error: result.is_err(),
                 });
             }
         }
@@ -730,17 +689,8 @@ impl Agent {
         self.fanout(&event);
     }
 
-    async fn inject_pending_background(&mut self) -> anyhow::Result<()> {
-        while let Some((id, output, label)) = self.pending_background.front().cloned() {
-            // Persist as a structured entry BEFORE fanout, so the log is
-            // durable before any observer reacts to the completion.
-            self.persist_and_push(SessionEntry::BackgroundCompletion {
-                id,
-                output: output.clone(),
-                label: label.clone(),
-            })
-            .await?;
-            self.pending_background.pop_front();
+    fn inject_pending_background(&mut self) {
+        while let Some((id, output, label)) = self.pending_background.pop_front() {
             // Fanout structured display event to session observers (TUI
             // scrollback, snapshot). The per-turn subscriber does NOT get
             // this — it already received the transient BackgroundCompleted
@@ -750,8 +700,11 @@ impl Agent {
                 output: output.clone(),
                 label: label.clone(),
             });
+            // Persist as a structured entry so the model context sees the
+            // full text and backwards-compatible deserialisation works.
+            self.history
+                .push(SessionEntry::BackgroundCompletion { id, output, label });
         }
-        Ok(())
     }
 
     fn drain_background(&mut self) {

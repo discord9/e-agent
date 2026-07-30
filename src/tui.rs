@@ -249,7 +249,8 @@ pub async fn run(
     mut agent: Agent,
     root: PathBuf,
     session_name: String,
-    _store: SessionStore,
+    store: SessionStore,
+    mut persisted: usize,
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
     model_name: String,
@@ -273,6 +274,8 @@ pub async fn run(
         &mut agent,
         &root,
         &labels,
+        &mut persisted,
+        store,
         background,
         sessions,
         context_window,
@@ -322,8 +325,10 @@ impl Drop for TerminalGuard {
 async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent: &mut Agent,
-    _root: &std::path::Path,
+    root: &std::path::Path,
     labels: &InputLabels,
+    persisted: &mut usize,
+    store: SessionStore,
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
     context_window: Option<u64>,
@@ -386,6 +391,8 @@ async fn run_inner(
                     terminal,
                     agent,
                     &mut ui,
+                    &store,
+                    (root, &labels.session, persisted),
                     String::new(),
                 )
                 .await?
@@ -410,6 +417,8 @@ async fn run_inner(
                         terminal,
                         agent,
                         &mut ui,
+                        &store,
+                        (root, &labels.session, persisted),
                         next,
                     )
                     .await?
@@ -501,6 +510,8 @@ async fn run_inner(
                                 }
                             }
                         }
+                        store.append(root, &labels.session, &agent.history()[*persisted..]).await?;
+                        *persisted = agent.history().len();
                         if matches!(interruption, Some(Interruption::ExitApp)) {
                             return Ok(());
                         }
@@ -524,6 +535,8 @@ async fn run_inner(
                                 terminal,
                                 agent,
                                 &mut ui,
+                                &store,
+                                (root, &labels.session, persisted),
                                 next,
                             )
                             .await?
@@ -559,6 +572,8 @@ async fn run_inner(
                         terminal,
                         agent,
                         &mut ui,
+                        &store,
+                        (root, &labels.session, persisted),
                         prompt,
                     )
                     .await?
@@ -581,6 +596,8 @@ async fn run_inner(
                             terminal,
                             agent,
                             &mut ui,
+                            &store,
+                            (root, &labels.session, persisted),
                             next,
                         )
                         .await?
@@ -621,8 +638,11 @@ async fn run_request(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent: &mut Agent,
     ui: &mut Ui<'_>,
+    store: &SessionStore,
+    session: (&std::path::Path, &str, &mut usize),
     prompt: String,
 ) -> anyhow::Result<bool> {
+    let (root, session_name, persisted) = session;
     ui.state.busy = Some(BusyState::thinking());
     // Reset the per-turn stream state. A turn that ended on a plain text
     // answer leaves active_lane = Content (no tool result reset it); without
@@ -659,6 +679,10 @@ async fn run_request(
     if matches!(interruption, Some(Interruption::CancelTurn)) {
         ui.state.push_line("cancelled".into(), LineKind::Dim);
     }
+    store
+        .append(root, session_name, &agent.history()[*persisted..])
+        .await?;
+    *persisted = agent.history().len();
     draw(terminal, ui.state)?;
     Ok(matches!(interruption, Some(Interruption::ExitApp)))
 }

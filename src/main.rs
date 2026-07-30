@@ -275,10 +275,6 @@ async fn run() -> anyhow::Result<()> {
     let legacy = loaded.legacy;
     agent.restore_history(loaded.entries);
     agent.record_background_tasks_in(root.clone(), &session);
-    // Legacy rewrite must happen BEFORE any new entries are added.
-    if legacy {
-        store.rewrite(&root, &session, agent.history()).await?;
-    }
     let unfinished = Session::take_unfinished_background(&root, &session);
     if !unfinished.is_empty() {
         let notice = format!(
@@ -289,16 +285,18 @@ async fn run() -> anyhow::Result<()> {
         let entry = e_agent::agent::SessionEntry::Notice {
             text: notice.clone(),
         };
-        // Persist explicitly before push_entry so the startup notice is
-        // durable even if the agent crashes before any turn completes.
+        // Persist immediately so a crash-before-first-turn cannot inject
+        // the same notice again on the next launch.
         store
             .append(&root, &session, std::slice::from_ref(&entry))
             .await?;
         // Append (NOT restore_history, which would wipe the resumed history).
         agent.push_entry(entry);
     }
-    // All future entries are persisted proactively by the agent itself.
-    agent.set_persist(store.clone(), root.clone(), session.clone());
+    let mut persisted = agent.history().len();
+    if legacy {
+        store.rewrite(&root, &session, agent.history()).await?;
+    }
 
     if let Some(window) = main_context_window {
         agent.set_context_window(window);
@@ -310,6 +308,7 @@ async fn run() -> anyhow::Result<()> {
             root,
             session,
             store,
+            persisted,
             background,
             subagent_sessions,
             model_name,
@@ -322,9 +321,9 @@ async fn run() -> anyhow::Result<()> {
     }
     set_stderr_events(&mut agent);
     if repl_mode {
-        return repl(agent, root, session, store).await;
+        return repl(agent, root, session, store, persisted).await;
     }
-    let answer = agent.run(prompt).await?;
+    let answer = run_and_save(&mut agent, &store, &root, &session, &mut persisted, prompt).await?;
     println!("{answer}");
     if !agent.background_task_ids().is_empty() {
         eprintln!(
@@ -456,11 +455,28 @@ fn set_stderr_events(agent: &mut Agent) {
     }));
 }
 
+async fn run_and_save(
+    agent: &mut Agent,
+    store: &SessionStore,
+    root: &std::path::Path,
+    session: &str,
+    persisted: &mut usize,
+    prompt: String,
+) -> anyhow::Result<String> {
+    let result = agent.run(prompt).await;
+    store
+        .append(root, session, &agent.history()[*persisted..])
+        .await?;
+    *persisted = agent.history().len();
+    result
+}
+
 async fn repl(
     mut agent: Agent,
-    _root: std::path::PathBuf,
-    _session: String,
-    _store: SessionStore,
+    root: std::path::PathBuf,
+    session: String,
+    store: SessionStore,
+    mut persisted: usize,
 ) -> anyhow::Result<()> {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let stdin = std::io::stdin();
@@ -486,7 +502,10 @@ async fn repl(
         }
         if line == "/compact" {
             let result = agent.compact().await;
-            // Compaction is proactively persisted by the agent.
+            store
+                .append(&root, &session, &agent.history()[persisted..])
+                .await?;
+            persisted = agent.history().len();
             match result {
                 Ok(summary) => println!("compacted: {summary}"),
                 Err(error) => eprintln!("e-agent: {error:#}"),
@@ -494,7 +513,16 @@ async fn repl(
             continue;
         }
         agent.subscribe(sender.clone());
-        match agent.run(line.to_owned()).await {
+        match run_and_save(
+            &mut agent,
+            &store,
+            &root,
+            &session,
+            &mut persisted,
+            line.to_owned(),
+        )
+        .await
+        {
             Ok(answer) => println!("{answer}"),
             Err(error) => eprintln!("e-agent: {error:#}"),
         }
