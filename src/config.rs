@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 
-#[derive(Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 #[serde(tag = "backend", rename_all = "lowercase")]
 pub enum SessionBackend {
     #[default]

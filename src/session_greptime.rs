@@ -29,19 +29,20 @@ CREATE TABLE IF NOT EXISTS session_entries (
 )
 "#;
 
-/// Monotonic real-time nanosecond timestamp. Uses wall clock but guarantees
+/// Monotonic real-time microsecond timestamp. Uses wall clock but guarantees
 /// strict ordering within a process: if two entries land in the same
-/// nanosecond (or the clock goes backwards), the later one gets prev+1.
-fn next_event_time() -> i64 {
+/// microsecond (or the clock goes backwards), the later one gets prev+1.
+/// Returns microseconds since Unix epoch.
+fn next_event_time_us() -> i64 {
     use std::sync::atomic::{AtomicI64, Ordering};
     static LAST: AtomicI64 = AtomicI64::new(0);
-    let now = std::time::SystemTime::now()
+    let now_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as i64;
+        .as_micros() as i64;
     loop {
         let prev = LAST.load(Ordering::Relaxed);
-        let ts = if now > prev { now } else { prev + 1 };
+        let ts = if now_us > prev { now_us } else { prev + 1 };
         if LAST
             .compare_exchange(prev, ts, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
@@ -51,9 +52,9 @@ fn next_event_time() -> i64 {
     }
 }
 
-/// Convert nanosecond epoch to chrono NaiveDateTime for tokio-postgres.
-fn ns_to_datetime(ns: i64) -> chrono::NaiveDateTime {
-    chrono::DateTime::from_timestamp(ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
+/// Convert microseconds-since-epoch to chrono NaiveDateTime for tokio-postgres.
+fn us_to_datetime(us: i64) -> chrono::NaiveDateTime {
+    chrono::DateTime::from_timestamp(us / 1_000_000, ((us % 1_000_000) * 1000) as u32)
         .unwrap()
         .naive_utc()
 }
@@ -155,19 +156,33 @@ impl GreptimeSession {
         Ok(entries)
     }
 
-    /// Append new entries. Each gets the next seq and a monotonic timestamp.
-    /// Retries are safe: duplicates land as extra rows, deduplicated on read.
+    /// Append new entries atomically within a transaction.
+    ///
+    /// All entries in one call share a single database transaction — no
+    /// partial commit within the slice. `next_seq` advances by
+    /// `entries.len()` only after commit succeeds, so retries are safe
+    /// (duplicates land as extra rows, deduplicated on read by seq).
     pub async fn append(&mut self, entries: &[SessionEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        for entry in entries {
-            let payload = serde_json::to_string(entry).context("cannot serialize entry")?;
+        let n = entries.len() as i64;
+        let tx = self
+            .client
+            .build_transaction()
+            .start()
+            .await
+            .context("cannot start transaction")?;
+
+        for (i, entry) in entries.iter().enumerate() {
+            let seq = self.next_seq + i as i64;
+            let payload = serde_json::to_string(entry)
+                .with_context(|| format!("cannot serialize entry seq {seq}"))?;
             let kind = entry_kind(entry);
             let err = is_error(entry);
-            let seq = self.next_seq;
-            let ts = ns_to_datetime(next_event_time());
-            self.client
+            let ts = us_to_datetime(next_event_time_us());
+
+            tx.client()
                 .execute(
                     r#"INSERT INTO session_entries
                         (session_id, seq, event_time, entry_kind, payload,
@@ -177,8 +192,11 @@ impl GreptimeSession {
                 )
                 .await
                 .with_context(|| format!("cannot append session {} seq {seq}", self.session_id))?;
-            self.next_seq += 1;
         }
+
+        tx.commit().await.context("cannot commit transaction")?;
+
+        self.next_seq += n;
         Ok(())
     }
 }
@@ -298,6 +316,29 @@ mod tests {
         let loaded = session.load().await.unwrap();
         assert_eq!(loaded.len(), 3);
         for (got, want) in loaded.iter().zip(entries[..3].iter()) {
+            assert_eq!(got, want);
+        }
+    }
+
+    #[tokio::test]
+    async fn append_is_atomic_per_call() {
+        let sid = format!("test-gt-atomic-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn_str(), &sid).await.unwrap();
+        let entries = test_entries();
+
+        // Append a slice, verify it's recovered in order.
+        session.append(&entries[..4]).await.unwrap();
+        let loaded = session.load().await.unwrap();
+        assert_eq!(loaded.len(), 4);
+        for (got, want) in loaded.iter().zip(entries[..4].iter()) {
+            assert_eq!(got, want);
+        }
+
+        // Append a fresh slice, verify seqs continue without gaps.
+        session.append(&entries[4..]).await.unwrap();
+        let loaded = session.load().await.unwrap();
+        assert_eq!(loaded.len(), entries.len());
+        for (got, want) in loaded.iter().zip(entries.iter()) {
             assert_eq!(got, want);
         }
     }

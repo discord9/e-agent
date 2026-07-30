@@ -124,14 +124,12 @@ async fn run() -> anyhow::Result<()> {
     {
         unsafe { std::env::set_var("EXA_API_KEY", key) };
     }
-    let store = SessionStore::connect(
-        config
-            .as_ref()
-            .map(|c| &c.session)
-            .unwrap_or(&Default::default()),
-        &session,
-    )
-    .await?;
+    let backend = config
+        .as_ref()
+        .map(|c| &c.session)
+        .cloned()
+        .unwrap_or_default();
+    let store = SessionStore::connect(&backend, &session).await?;
     let (main_resolved, role_resolved, all_roles) = match &config {
         Some(config) => (
             Some(config.resolve(profile.as_deref())?),
@@ -218,7 +216,7 @@ async fn run() -> anyhow::Result<()> {
         .with_roles_root(root.clone())
         .with_sandbox(sandbox)
         .record_background_tasks_in(root.clone(), &session)
-        .with_persist_store(store.clone());
+        .with_persist_store(backend);
     if let Some(subagent_model) = subagent_model {
         let name = subagent_model.display_name().to_owned();
         delegate = delegate.with_subagent_model(subagent_model);

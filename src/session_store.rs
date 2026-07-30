@@ -29,7 +29,13 @@ pub enum SessionStore {
     /// GreptimeDB-backed session storage behind a mutex so `&self` methods
     /// work from any context.
     #[cfg(feature = "greptime")]
-    Greptime(Arc<Mutex<crate::session_greptime::GreptimeSession>>),
+    Greptime {
+        /// The connected Greptime session client, session-bound.
+        session: Arc<Mutex<crate::session_greptime::GreptimeSession>>,
+        /// Connection string, preserved so the backend config can be
+        /// recovered for subagent session binding.
+        conn: String,
+    },
 }
 
 impl SessionStore {
@@ -49,12 +55,27 @@ impl SessionStore {
             SessionBackend::Greptime { conn } => {
                 let session =
                     crate::session_greptime::GreptimeSession::connect(conn, session_id).await?;
-                Ok(SessionStore::Greptime(Arc::new(Mutex::new(session))))
+                Ok(SessionStore::Greptime {
+                    session: Arc::new(Mutex::new(session)),
+                    conn: conn.clone(),
+                })
             }
             #[cfg(not(feature = "greptime"))]
             SessionBackend::Greptime { .. } => {
                 anyhow::bail!("greptime session backend requires the `greptime` cargo feature");
             }
+        }
+    }
+
+    /// Return the backend configuration that was used to create this store.
+    ///
+    /// For JSONL returns `SessionBackend::Jsonl`; for Greptime returns
+    /// `SessionBackend::Greptime { conn }` with the stored connection string.
+    pub fn backend(&self) -> SessionBackend {
+        match self {
+            SessionStore::Jsonl => SessionBackend::Jsonl,
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { conn, .. } => SessionBackend::Greptime { conn: conn.clone() },
         }
     }
 
@@ -66,7 +87,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => Session::load(root, name),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime(session) => {
+            SessionStore::Greptime { session, .. } => {
                 let entries = { session.lock().await.load().await? };
                 Ok(LoadedSession {
                     entries,
@@ -87,7 +108,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => Session::append(root, name, entries),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime(session) => session.lock().await.append(entries).await,
+            SessionStore::Greptime { session, .. } => session.lock().await.append(entries).await,
         }
     }
 
@@ -99,7 +120,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => Session::rewrite(root, name, entries),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime(_) => Ok(()), // Append-only; rewriting is a no-op.
+            SessionStore::Greptime { .. } => Ok(()), // Append-only; rewriting is a no-op.
         }
     }
 }
