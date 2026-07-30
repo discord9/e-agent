@@ -414,7 +414,7 @@ async fn repl(
                 .await?;
             persisted = agent.history().len();
             match result {
-                Ok(summary) => println!("compacted: {}", preview(&summary, 500)),
+                Ok(summary) => println!("compacted: {summary}"),
                 Err(error) => eprintln!("e-agent: {error:#}"),
             }
             continue;

@@ -477,13 +477,14 @@ async fn run_inner(
                         }
                         if let Some(result) = result {
                             match result {
-                                Ok(_summary) => {
-                                    // The summary already streamed live via
-                                    // the session observer; the closing
-                                    // banner is all the closure it needs.
+                                Ok(summary) => {
                                     state.push_line(
                                         compaction_banner("compaction"),
                                         LineKind::Compaction,
+                                    );
+                                    state.push_line(
+                                        format!("compacted: {summary}"),
+                                        LineKind::Dim,
                                     );
                                 }
                                 Err(error) => {
@@ -1036,10 +1037,10 @@ fn draw<'a, B: ratatui::backend::Backend>(
             );
             let block = SOLARIZED_LIGHT
                 .block(format!(
-                    "subagent #{}: {} ({}) — Esc detach  Enter steer  Ctrl-C interrupt",
+                    "{} — subagent #{}: {} — Esc detach  Enter steer  Ctrl-C interrupt",
+                    status,
                     attached.id,
                     preview(&attached.label, 40),
-                    status
                 ))
                 .title_top(
                     Line::from(attached.state.session_id.clone())
@@ -1591,10 +1592,7 @@ impl TuiState {
                 }
                 SessionEntry::Compaction { summary, .. } => {
                     state.push_line(compaction_banner("compaction"), LineKind::Compaction);
-                    state.push_line(
-                        format!("compacted: {}", preview(summary, 150)),
-                        LineKind::Dim,
-                    );
+                    state.push_line(format!("compacted: {summary}"), LineKind::Dim);
                 }
             }
         }
@@ -2901,6 +2899,109 @@ mod tests {
             top.contains("sub-abc123"),
             "top-right shows the session id, got: {top:?}"
         );
+        // The title (top-row of the input block) starts with the status
+        // followed by the subagent label. After attach with no
+        // BackgroundCompleted, the subagent is in thinking state.
+        assert!(
+            top.contains("thinking… — subagent #7"),
+            "title must show status before subagent label, got: {top:?}"
+        );
+        // The first display character after the block drawing is the spinner.
+        let first_chars: String = top.chars().take(2).collect();
+        assert!(
+            first_chars.starts_with('┌'),
+            "title row must start with the top-left corner, got: {first_chars:?}"
+        );
+        assert!(
+            first_chars.chars().nth(1) == Some('⠋'),
+            "spinner must be the second character (after the corner), got: {first_chars:?}"
+        );
+    }
+
+    #[test]
+    fn attached_title_shows_finished_before_subagent_label() {
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_handle, sink, _source) = crate::handle::session_channel();
+        // Emit a completion so the attach marks the view as finished.
+        sink.emit(AgentEvent::BackgroundCompleted {
+            id: 3,
+            output: "done".into(),
+        });
+        let mut state = TuiState::default();
+        state.attach(
+            3,
+            "quick job".into(),
+            Arc::new(_handle),
+            String::new(),
+            None,
+            String::new(),
+            String::new(),
+            None,
+        );
+        draw(&mut terminal, &mut state).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let top: String = (0..60)
+            .map(|x| buffer[(x, 9)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            top.contains("finished — subagent #3"),
+            "finished view must have status before subagent label, got: {top:?}"
+        );
+        assert!(
+            !top.contains("(finished)"),
+            "must not use old parenthesized format, got: {top:?}"
+        );
+    }
+
+    #[test]
+    fn attached_title_shows_running_status_before_subagent_label() {
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_handle, sink, _source) = crate::handle::session_channel();
+        // Emit a user prompt so the session has content but is still
+        // running (no BackgroundCompleted). After attach with no
+        // completion, the busy state is set to thinking; the "running"
+        // state only appears when busy is None AND finished is false.
+        // Create that by sending a BackgroundCompleted then attaching
+        // without one — not possible through the normal path.
+        // Instead, manually set the attached view state.
+        //
+        // We use a snapshot that has content but no completion.
+        sink.emit(AgentEvent::UserPrompt("do work".into()));
+        sink.emit(AgentEvent::AssistantText("working...".into()));
+        let (handle2, _sink2, _source2) = crate::handle::session_channel();
+        let mut state = TuiState::default();
+        state.attach(
+            5,
+            "long job".into(),
+            Arc::new(handle2),
+            String::new(),
+            None,
+            String::new(),
+            String::new(),
+            None,
+        );
+        // The attach with no messages sets busy=thinking; override to
+        // simulate a running (not thinking) state.
+        let attached = state.attached.as_mut().unwrap();
+        attached.state.busy = None;
+        attached.finished = false;
+        draw(&mut terminal, &mut state).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let top: String = (0..60)
+            .map(|x| buffer[(x, 9)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            top.contains("running — subagent #5"),
+            "running view must have status before subagent label, got: {top:?}"
+        );
+        assert!(
+            !top.contains("(running)"),
+            "must not use old parenthesized format, got: {top:?}"
+        );
     }
 
     #[test]
@@ -3547,6 +3648,38 @@ mod tests {
             ],
             "retained tail must not be duplicated in the scrollback"
         );
+    }
+
+    #[test]
+    fn replay_compaction_long_summary_not_truncated() {
+        // A summary longer than any preview limit must appear in full.
+        let long = "long summary: ".to_owned() + &"data ".repeat(200);
+        assert!(long.len() > 500, "test needs a long summary");
+        let entries = vec![SessionEntry::Compaction {
+            summary: long.clone(),
+            retained: vec![],
+        }];
+        let state = TuiState::from_history(&entries);
+        assert_eq!(state.lines.len(), 2);
+        assert_eq!(state.lines[0].kind, LineKind::Compaction);
+        assert_eq!(state.lines[1].text, format!("compacted: {long}"));
+        assert_eq!(state.lines[1].kind, LineKind::Dim);
+    }
+
+    #[test]
+    fn replay_compaction_multiline_summary_preserves_newlines() {
+        let multi = "line one\nline two\nline three\n";
+        let entries = vec![SessionEntry::Compaction {
+            summary: multi.into(),
+            retained: vec![],
+        }];
+        let state = TuiState::from_history(&entries);
+        assert_eq!(state.lines.len(), 2);
+        assert_eq!(state.lines[1].text, format!("compacted: {multi}"));
+        // hard_wrap splits on \n: the stored text is one DisplayLine with
+        // embedded newlines; rendering splits them into multiple visual rows.
+        let rows = hard_wrap(&state.lines[1].text, 100);
+        assert_eq!(rows.len(), 4, "multi-line summary: one row per line");
     }
 }
 

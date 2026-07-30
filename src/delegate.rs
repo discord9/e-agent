@@ -288,8 +288,8 @@ impl Delegate {
                     },
                     crate::agent::Message::System { .. } => continue,
                 },
-                crate::agent::SessionEntry::Compaction { .. } => {
-                    AgentEvent::Notice("──── persisted session checkpoint ────".into())
+                crate::agent::SessionEntry::Compaction { summary, .. } => {
+                    AgentEvent::Notice(format!("──── compaction ────\ncompacted: {summary}"))
                 }
                 crate::agent::SessionEntry::Notice { text } => AgentEvent::Notice(text.clone()),
             };
@@ -1321,6 +1321,70 @@ mod tests {
         assert!(
             assistant_texts.contains(&"earlier answer"),
             "expected 'earlier answer' in AssistantText events, got {assistant_texts:?}"
+        );
+    }
+
+    #[test]
+    fn replay_scrollback_shows_full_compaction_summary() {
+        let (handle, sink, _source) = session_channel();
+        let entries = vec![
+            crate::agent::SessionEntry::from(crate::agent::Message::User {
+                content: "prior work".into(),
+            }),
+            crate::agent::SessionEntry::Compaction {
+                summary: "compacted content\nmulti-line detail".into(),
+                retained: vec![],
+            },
+        ];
+        Delegate::replay_scrollback(&sink, &entries);
+        let snapshot = handle.snapshot();
+        let notices: Vec<&str> = snapshot
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Notice(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].contains("──── compaction ────"),
+            "notice contains the banner, got: {:?}",
+            notices[0]
+        );
+        assert!(
+            notices[0].contains("compacted content"),
+            "notice contains summary text, got: {:?}",
+            notices[0]
+        );
+        assert!(
+            notices[0].contains("multi-line detail"),
+            "notice preserves multi-line content, got: {:?}",
+            notices[0]
+        );
+    }
+
+    #[test]
+    fn replay_scrollback_compaction_long_summary_not_truncated() {
+        let long = "long summary: ".to_owned() + &"data ".repeat(200);
+        assert!(long.len() > 500, "test needs long summary");
+        let (handle, sink, _source) = session_channel();
+        let entries = vec![crate::agent::SessionEntry::Compaction {
+            summary: long.clone(),
+            retained: vec![],
+        }];
+        Delegate::replay_scrollback(&sink, &entries);
+        let snapshot = handle.snapshot();
+        let notices: Vec<&str> = snapshot
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Notice(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].contains(&long),
+            "long summary not truncated in replay_scrollback"
         );
     }
 }
