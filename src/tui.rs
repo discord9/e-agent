@@ -515,6 +515,9 @@ async fn run_inner(
                         if matches!(interruption, Some(Interruption::ExitApp)) {
                             return Ok(());
                         }
+                        if matches!(interruption, Some(Interruption::CancelTurn)) {
+                            state.push_line("cancelled".into(), LineKind::Dim);
+                        }
                         // Queued prompts drain into a single follow-up turn.
                         loop {
                             let Some(next) = state.take_queued_batch() else { break };
@@ -673,6 +676,9 @@ async fn run_request(
                 .push_line(format!("error: {error:#}"), LineKind::ToolError),
         }
     }
+    if matches!(interruption, Some(Interruption::CancelTurn)) {
+        ui.state.push_line("cancelled".into(), LineKind::Dim);
+    }
     store
         .append(root, session_name, &agent.history()[*persisted..])
         .await?;
@@ -683,6 +689,7 @@ async fn run_request(
 
 enum Interruption {
     ExitApp,
+    CancelTurn,
 }
 
 fn route_idle_events(
@@ -697,9 +704,23 @@ fn route_idle_events(
     }
 }
 
+/// Decide whether a key press should interrupt the active main-agent turn.
+/// Returns `Some(CancelTurn)` only when not attached to a subagent view
+/// (Ctrl-C while attached goes through `handle_attached_key` for local
+/// cancellation) and the key is a Press-kind Ctrl-C. Esc is intentionally
+/// excluded — it is reserved for "leave the current view".
+fn active_main_interruption(key: KeyEvent, attached: bool) -> Option<Interruption> {
+    if key.kind == crossterm::event::KeyEventKind::Press && !attached && is_cancel(key) {
+        Some(Interruption::CancelTurn)
+    } else {
+        None
+    }
+}
+
 /// Pump an agent future while keeping the UI responsive. Scroll and input
-/// editing stay available; Ctrl-C cancels the main turn and exits. When the
-/// task panel is open it still cancels only the selected task.
+/// editing stay available; Ctrl-C (unattached) cancels the main turn.
+/// When attached, Ctrl-C goes through `handle_attached_key` for local
+/// cancellation. The task panel always takes priority over all other keys.
 async fn drive<T>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut TuiState,
@@ -770,8 +791,12 @@ async fn drive<T>(
                     }
                     draw(terminal, state)?;
                 }
-                Some(Ok(Event::Key(key))) if exits_active_main_turn(key) => {
-                    return Ok((None, Some(Interruption::ExitApp)));
+                Some(Ok(Event::Key(key)))
+                    if active_main_interruption(key, state.attached.is_some()).is_some() =>
+                {
+                    let interruption = active_main_interruption(key, state.attached.is_some())
+                        .expect("guard requires an active-main interruption");
+                    return Ok((None, Some(interruption)));
                 }
                 // Not attached: Esc during a turn closes the tasks panel
                 // (leave-the-current-view), it never cancels the turn.
@@ -1533,10 +1558,6 @@ fn is_exit(key: KeyEvent) -> bool {
 /// tasks panel) so its meaning is consistent everywhere.
 fn is_cancel(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-fn exits_active_main_turn(key: KeyEvent) -> bool {
-    key.kind == crossterm::event::KeyEventKind::Press && is_cancel(key)
 }
 
 /// Safe terminal-title string: strip ASCII/C1 controls, collapse whitespace,
@@ -3177,15 +3198,46 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_exits_an_active_main_turn() {
-        assert!(exits_active_main_turn(KeyEvent::new(
+    fn is_exit_matches_esc_or_ctrl_c_idle() {
+        // Idle: Esc exits.
+        assert!(is_exit(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        // Idle: Ctrl+C exits (idle has no active turn to cancel).
+        assert!(is_exit(KeyEvent::new(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
         )));
-        assert!(!exits_active_main_turn(KeyEvent::new(
-            KeyCode::Esc,
-            KeyModifiers::NONE,
+        // A plain character is not an exit.
+        assert!(!is_exit(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE
         )));
+        assert!(!is_exit(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::empty(),
+        )));
+    }
+
+    #[test]
+    fn active_main_interruption_unattached_ctrl_c_yields_cancel_turn() {
+        // Unattached Ctrl+C => CancelTurn.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            active_main_interruption(ctrl_c, false),
+            Some(Interruption::CancelTurn)
+        ));
+        // Attached Ctrl+C => None (goes through handle_attached_key).
+        assert!(active_main_interruption(ctrl_c, true).is_none());
+        // Esc => None (esc is for "leave the current view").
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(active_main_interruption(esc, false).is_none());
+        assert!(active_main_interruption(esc, true).is_none());
+        // Release-kind Ctrl+C => None.
+        let ctrl_c_release = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            crossterm::event::KeyEventKind::Release,
+        );
+        assert!(active_main_interruption(ctrl_c_release, false).is_none());
     }
 
     #[test]
