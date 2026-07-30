@@ -1688,6 +1688,10 @@ impl TuiState {
                 if let Some(attached) = &mut self.attached
                     && attached.id == session
                 {
+                    if matches!(ui.event, AgentEvent::BackgroundCompleted { .. }) {
+                        attached.finished = true;
+                        attached.state.busy = None;
+                    }
                     attached.state.push_agent_event(ui.event);
                 }
             }
@@ -2194,6 +2198,32 @@ mod tests {
         );
         state.detach();
         assert!(state.attached.is_none());
+    }
+
+    #[test]
+    fn attached_view_clears_spinner_on_background_completed_from_bridge() {
+        // BackgroundCompleted arriving via the bridge (session id != 0)
+        // must clear the spinner and mark the view finished, same as the
+        // main-session path.
+        let (handle, sink, _source) = crate::handle::session_channel();
+        let mut state = TuiState::default();
+        // Attach with an unfinished session (no BackgroundCompleted in log).
+        sink.emit(AgentEvent::AssistantDelta("working...".into()));
+        attach_test(&mut state, 7, "demo task", Arc::new(handle));
+        let attached = state.attached.as_ref().unwrap();
+        assert!(!attached.finished);
+        assert!(attached.state.busy.is_some(), "spinner should be active");
+        // Simulate a BackgroundCompleted arriving from the bridge.
+        state.push_event(UiEvent {
+            session: 7,
+            event: AgentEvent::BackgroundCompleted {
+                id: 7,
+                output: "done".into(),
+            },
+        });
+        let attached = state.attached.as_ref().unwrap();
+        assert!(attached.finished);
+        assert!(attached.state.busy.is_none(), "spinner should be cleared");
     }
 
     #[test]
