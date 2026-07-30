@@ -127,6 +127,14 @@ the app; it never cancels a turn. Ctrl-C cancels the in-flight turn and quits
 at the idle prompt. On exit, e-agent prints `e-agent --session <id>` so the
 session can be resumed from the same workspace.
 
+The TUI sets the terminal title (which Zellij adopts as its pane title) to
+`e-agent — <title>`, where `<title>` is derived from the first real user
+message in session history (trimmed, control-safe, ≤40 Unicode chars). An
+empty/new session shows the session id until the first prompt is submitted.
+The title is never persisted or used as a session key. Users who prefer an
+explicit label can override it with `zellij action rename-pane
+"<custom>"` at any time — Zellij's own title takes precedence.
+
 The four always-present tools are `read_file`, `write_file`, `edit_file`, and
 `bash`. `web_search` is a fifth tool that searches public documentation and
 code examples through the Exa Context API; it is enabled when `EXA_API_KEY` is

@@ -11,7 +11,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use futures_util::StreamExt;
 use ratatui::Terminal;
@@ -258,7 +258,7 @@ pub async fn run(
     context_window: Option<u64>,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
-    let _guard = TerminalGuard;
+    let _guard = TerminalGuard::new();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
@@ -301,11 +301,19 @@ struct InputLabels {
 
 struct TerminalGuard;
 
+impl TerminalGuard {
+    fn new() -> Self {
+        let _ = execute!(io::stdout(), SetTitle("e-agent"));
+        Self
+    }
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
+            SetTitle(""),
             DisableBracketedPaste,
             LeaveAlternateScreen,
             Show
@@ -351,6 +359,15 @@ async fn run_inner(
     state.context_window = context_window;
 
     state.background = Some(background);
+    // Resume: if history has a first User message, set the terminal title
+    // immediately and mark it as set so subsequent prompts never overwrite.
+    if let Some(title) = derive_session_title(agent.history()) {
+        set_terminal_title(&title);
+        state.session_title_set = true;
+    } else {
+        // New empty session: show the session id until the first prompt.
+        set_terminal_title(&labels.session);
+    }
     let probe = sessions.clone();
     state.attachable = Some(Box::new(move |id| probe.get(id).is_some()));
     loop {
@@ -498,6 +515,18 @@ async fn run_inner(
                         }
                         state.follow();
                         continue;
+                    }
+                    // First real user prompt: derive terminal title from it
+                    // and never overwrite on subsequent prompts.
+                    if !state.session_title_set {
+                        let title = sanitize_title(&prompt);
+                        let title = if title.is_empty() {
+                            labels.session.clone()
+                        } else {
+                            title
+                        };
+                        set_terminal_title(&title);
+                        state.session_title_set = true;
                     }
                     state.push_line(format!("you> {prompt}"), LineKind::User);
                     state.follow();
@@ -1412,6 +1441,50 @@ fn is_cancel(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// Safe terminal-title string: strip ASCII/C1 controls, collapse whitespace,
+/// middle-ellipsis preview at 40 Unicode chars.
+fn sanitize_title(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut ws = false;
+    for c in raw.chars() {
+        let code = c as u32;
+        if code <= 0x08
+            || (0x0E..=0x1F).contains(&code)
+            || code == 0x7F
+            || (0x80..=0x9F).contains(&code)
+        {
+            continue;
+        }
+        if c.is_whitespace() {
+            if !ws {
+                out.push(' ');
+                ws = true;
+            }
+        } else {
+            out.push(c);
+            ws = false;
+        }
+    }
+    crate::agent::preview(out.trim(), 40)
+}
+
+/// First `Message::User` from history, skipping Notice/Compaction/BackgroundCompletion.
+fn derive_session_title(entries: &[SessionEntry]) -> Option<String> {
+    for entry in entries {
+        if let SessionEntry::Message { message } = entry
+            && let Message::User { content } = message
+        {
+            let t = sanitize_title(content);
+            return if t.is_empty() { None } else { Some(t) };
+        }
+    }
+    None
+}
+
+fn set_terminal_title(title: &str) {
+    let _ = execute!(io::stdout(), SetTitle(format!("e-agent — {title}")));
+}
+
 /// Hard-wrap text at `width` terminal cells (char-boundary safe, CJK-aware).
 /// Rendering and scroll accounting share this function so bottom-following
 /// is exact instead of estimated.
@@ -1483,6 +1556,9 @@ struct TuiState {
     /// Attached session view; when set, draw renders this instead of the
     /// main scrollback and Esc detaches instead of cancelling the turn.
     attached: Option<Box<AttachedView>>,
+    /// Whether the terminal title has been set to a user-derived value.
+    /// Once true, subsequent prompts never overwrite the title.
+    session_title_set: bool,
 }
 
 /// A live view into a running background session: its own scrollback
@@ -4345,5 +4421,75 @@ mod ux_tests {
         // (resume_replays_scrollback_into_session_sink).
         let snapshot = handle.snapshot();
         assert!(snapshot.is_empty(), "no events emitted directly");
+    }
+
+    // ── Session title derivation ────────────────────────────────────────
+
+    #[test]
+    fn sanitize_title_cases() {
+        for (input, expected) in [
+            ("", ""),
+            ("  hello   world  ", "hello world"),
+            ("hello\n\r\tworld", "hello world"),
+            ("\x00\x01\x07\x1B\x7F\u{80}\u{9F}", ""),
+            ("hello\x1Bworld", "helloworld"),
+            (" 你好 🚀 世界 ", "你好 🚀 世界"),
+        ] {
+            assert_eq!(sanitize_title(input), expected, "input {input:?}");
+        }
+        // Long text truncated to ≤40 Unicode chars
+        let long = "a".repeat(100);
+        assert!(sanitize_title(&long).chars().count() <= 40);
+    }
+
+    #[test]
+    fn derive_title_skips_non_user_and_picks_first() {
+        use crate::agent::{AssistantMessage, Message, SessionEntry};
+        let entries = [
+            SessionEntry::Notice { text: "n".into() },
+            SessionEntry::BackgroundCompletion {
+                id: 1,
+                output: "o".into(),
+            },
+            SessionEntry::Compaction {
+                summary: "c".into(),
+                retained: vec![],
+            },
+            SessionEntry::Message {
+                message: Message::System {
+                    content: "s".into(),
+                },
+            },
+            SessionEntry::Message {
+                message: Message::Assistant(AssistantMessage {
+                    content: None,
+                    tool_calls: vec![],
+                    reasoning: None,
+                }),
+            },
+            SessionEntry::Message {
+                message: Message::User {
+                    content: "  first   msg  ".into(),
+                },
+            },
+            SessionEntry::Message {
+                message: Message::User {
+                    content: "second".into(),
+                },
+            },
+        ];
+        assert_eq!(derive_session_title(&entries).unwrap(), "first msg");
+    }
+
+    #[test]
+    fn derive_title_none_when_no_user_msg_or_all_control() {
+        use crate::agent::Message;
+        assert!(derive_session_title(&[]).is_none());
+        let entries = [SessionEntry::Message {
+            message: Message::User {
+                content: "\x00\x01\x02".into(),
+            },
+        }];
+        assert!(derive_session_title(&entries).is_none());
     }
 }
