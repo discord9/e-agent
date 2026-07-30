@@ -16,7 +16,7 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::buffer::{CellDiffOption, CellWidth};
+use ratatui::buffer::CellWidth;
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -951,9 +951,10 @@ fn draw<'a, B: ratatui::backend::Backend>(
                 }
                 buf.set_line(output.x, y, line, output.width);
             }
-            // Fix trailing cells of wide glyphs: they were reset to
-            // Cell::EMPTY by set_stringn but must keep the correct style
-            // (matching the wide glyph's style) so the diff can emit them.
+            // Restore glyph style on trailing cells set_stringn reset so the
+            // completed buffer carries the correct background (this, plus
+            // ratatui's built-in wide→narrow trailing emission, is what
+            // prevents stale terminal cells).
             for y in output.y..output.bottom() {
                 let mut x = output.x;
                 while x < output.right() {
@@ -962,9 +963,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
                         let glyph_style = buf[(x, y)].style();
                         let last = (x + width).min(output.right());
                         for cx in x + 1..last {
-                            let cell = &mut buf[(cx, y)];
-                            cell.set_symbol(" ").set_style(glyph_style);
-                            cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                            buf[(cx, y)].set_style(glyph_style);
                         }
                         x += width;
                     } else {
@@ -1023,7 +1022,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
                     }
                     buf.set_line(inner.x, y, line_text, inner.width);
                 }
-                // Fix trailing cells of wide glyphs.
+                // Restore glyph style on trailing cells set_stringn reset.
                 for y in inner.y..inner.bottom() {
                     let mut x = inner.x;
                     while x < inner.right() {
@@ -1032,9 +1031,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
                             let glyph_style = buf[(x, y)].style();
                             let last = (x + width).min(inner.right());
                             for cx in x + 1..last {
-                                let cell = &mut buf[(cx, y)];
-                                cell.set_symbol(" ").set_style(glyph_style);
-                                cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                                buf[(cx, y)].set_style(glyph_style);
                             }
                             x += width;
                         } else {
@@ -1111,7 +1108,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
                 }
                 buf.set_line(inner.x, y, line_text, inner.width);
             }
-            // Fix trailing cells of wide glyphs.
+            // Restore glyph style on trailing cells set_stringn reset.
             for y in inner.y..inner.bottom() {
                 let mut x = inner.x;
                 while x < inner.right() {
@@ -1120,9 +1117,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
                         let glyph_style = buf[(x, y)].style();
                         let last = (x + width).min(inner.right());
                         for cx in x + 1..last {
-                            let cell = &mut buf[(cx, y)];
-                            cell.set_symbol(" ").set_style(glyph_style);
-                            cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                            buf[(cx, y)].set_style(glyph_style);
                         }
                         x += width;
                     } else {
@@ -2506,20 +2501,17 @@ mod tests {
     fn wide_scroll_lines_leave_no_stale_trailing_cells() {
         // Regression: in the scrollback area (no Block repaint), trailing
         // cells of wide glyphs must carry the line's background style so
-        // the buffer diff can emit them when the glyph is later replaced.
+        // the completed buffer has the correct background.
         //
-        // The diff iterator never visits trailing cells of wide glyphs
-        // (they are skipped by cell_width logic).  When a wide glyph IS
-        // later replaced by narrower text, the trailing state mechanism
-        // emits those cells from the *current* frame buffer.  In the old
-        // code those cells were Cell::EMPTY (bg = Color::Reset), so the
-        // terminal showed a black box.  The fixup re-styles them with the
-        // glyph's own background before the diff runs.
+        // set_stringn resets covered cells; the fixup loop re-styles them
+        // with the glyph's own style.  ratatui's BufferDiff force-emits
+        // trailing cells when a previous wide glyph is replaced by narrower
+        // content (the previous_width > cell_width path in
+        // diff_cell_state), provided the previous background is non-Reset.
         //
         // We test this by verifying that trailing cells in the completed
         // (backend) buffer have the line's Solarized bg after a single
-        // draw, which the old code never achieved because EMPTY cells
-        // were skipped by the diff and never reached the backend.
+        // draw.
         let backend = ratatui::backend::TestBackend::new(12, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = TuiState::default();
@@ -2533,25 +2525,15 @@ mod tests {
         let frame_buf = completed.buffer;
 
         // The trailing cells (odd x positions) must carry the Normal
-        // line's background style AND be marked AlwaysUpdate so the
-        // diff can emit them when a wide glyph is later replaced.
-        // In the old code the Paragraph.render_line never reset
-        // trailing cells (they kept the area bg), so the bg assertion
-        // alone would pass.  But the old force_wide_trailing_cell_updates
-        // helper marked x+width (the cell AFTER the glyph) instead of
-        // the *covered* trailing cells, so the diff_option on the
-        // actual trailing cells was None rather than AlwaysUpdate.
+        // line's background style.  This is the condition that allows
+        // BufferDiff to force-emit them when a wide glyph is later
+        // replaced by narrower content (previous bg non-Reset).
         let line_bg = SOLARIZED_LIGHT.background;
         for trailing_x in [1, 3, 5, 7] {
             assert_eq!(
                 frame_buf[(trailing_x, 0)].bg,
                 line_bg,
                 "trailing cell ({trailing_x}, 0) in frame buffer must have line bg, not Reset"
-            );
-            assert_eq!(
-                frame_buf[(trailing_x, 0)].diff_option,
-                CellDiffOption::AlwaysUpdate,
-                "trailing cell ({trailing_x}, 0) must have AlwaysUpdate, old code set it on x+width instead"
             );
         }
 
