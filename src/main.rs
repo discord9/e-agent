@@ -98,8 +98,7 @@ async fn run() -> anyhow::Result<()> {
     let config = Config::load()?;
     let backend = config
         .as_ref()
-        .map(|c| &c.session)
-        .cloned()
+        .map(|c| c.session_backend())
         .unwrap_or_default();
     // Migrate pre-session-id files only when using the JSONL backend;
     // GreptimeDB has its own session namespace and does not need file

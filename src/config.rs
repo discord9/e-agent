@@ -4,17 +4,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 
-#[derive(Clone, Deserialize, Default)]
-#[serde(tag = "backend", rename_all = "lowercase")]
-pub enum SessionBackend {
-    #[default]
-    Jsonl,
-    Greptime {
-        /// tokio-postgres connection string, e.g. "host=127.0.0.1 port=4002 dbname=public"
-        conn: String,
-    },
-}
-
 #[derive(Deserialize)]
 pub struct Config {
     default: Option<String>,
@@ -28,10 +17,6 @@ pub struct Config {
     /// Built-in role -> model profile routing (`[roles]`). Roles fall back
     /// to the main profile when not routed. Currently only `subagent`
     /// exists; new roles are added where they are spawned.
-
-    /// Session storage backend. Defaults to JSONL files.
-    #[serde(default)]
-    pub session: SessionBackend,
     #[serde(default)]
     roles: HashMap<String, String>,
     /// Optional `[web_search]` credentials for the Exa `web_search` tool.
@@ -72,7 +57,7 @@ pub struct Sandbox {
 
 /// Backend selection for session persistence.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(tag = "backend", rename_all = "lowercase")]
 pub enum SessionBackend {
     /// JSONL file backend (default).
     #[default]
@@ -86,7 +71,7 @@ pub enum SessionBackend {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct SessionConfig {
     /// Backend type: `"jsonl"` (default) or `"greptime"`.
-    #[serde(default)]
+    #[serde(flatten)]
     pub backend: SessionBackend,
 }
 
@@ -399,6 +384,12 @@ fn config_paths() -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    fn write_config(dir: &Path, contents: &str) -> PathBuf {
+        let path = dir.join("config.toml");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
     #[test]
     fn parses_session_backend_config() {
         let temp = tempfile::tempdir().unwrap();
@@ -417,7 +408,7 @@ model = "k3"
 "#,
         );
         let config = Config::from_path(&path).unwrap();
-        assert!(matches!(config.session, SessionBackend::Jsonl));
+        assert!(matches!(config.session_backend(), SessionBackend::Jsonl));
 
         // Explicit jsonl
         let path = write_config(
@@ -434,7 +425,7 @@ backend = "jsonl"
 "#,
         );
         let config = Config::from_path(&path).unwrap();
-        assert!(matches!(config.session, SessionBackend::Jsonl));
+        assert!(matches!(config.session_backend(), SessionBackend::Jsonl));
 
         // Greptime with connection string
         let path = write_config(
@@ -452,18 +443,12 @@ conn = "host=127.0.0.1 port=4002 dbname=public"
 "#,
         );
         let config = Config::from_path(&path).unwrap();
-        match &config.session {
+        match config.session_backend() {
             SessionBackend::Greptime { conn } => {
                 assert_eq!(conn, "host=127.0.0.1 port=4002 dbname=public");
             }
             _ => panic!("expected Greptime backend"),
         }
-    }
-
-    fn write_config(dir: &Path, contents: &str) -> PathBuf {
-        let path = dir.join("config.toml");
-        std::fs::write(&path, contents).unwrap();
-        path
     }
 
     #[test]
