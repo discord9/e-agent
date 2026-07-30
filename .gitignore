@@ -2,3 +2,5 @@
 /.e-agent/
 .slim/
 /.greptimedb-poc/
+/kimi-key
+/auth.json
