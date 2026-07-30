@@ -12,7 +12,7 @@ use e_agent::config::{AuthMode, ResolvedModel};
 use e_agent::delegate::Delegate;
 use e_agent::mcp;
 use e_agent::model::{ConfiguredModel, OpenAiModel};
-use e_agent::runner::{IdlePolicy, SessionRunner};
+use e_agent::runner::{IdlePolicy, SessionHandle, SessionResult, SessionRunner, SessionStatus};
 use e_agent::session::Session;
 use e_agent::session_store::SessionStore;
 use e_agent::tools::builtins;
@@ -294,7 +294,6 @@ async fn run() -> anyhow::Result<()> {
         // Append (NOT restore_history, which would wipe the resumed history).
         agent.push_entry(entry);
     }
-    let mut persisted = agent.history().len();
     if legacy {
         store.rewrite(&root, &session, agent.history()).await?;
     }
@@ -327,19 +326,27 @@ async fn run() -> anyhow::Result<()> {
         _tui_report.success = result.is_ok();
         return result;
     }
-    set_stderr_events(&mut agent);
+    let policy = if repl_mode {
+        IdlePolicy::WaitForInput
+    } else {
+        IdlePolicy::FinishWhenIdle
+    };
+    let (runner, handle) = SessionRunner::new(agent, store, root, session, policy);
+    let task = runner.start((!repl_mode).then_some(prompt));
     if repl_mode {
-        return repl(agent, root, session, store, persisted).await;
+        repl(handle, task).await
+    } else {
+        let (_, events, status) = handle.attach();
+        let render = tokio::spawn(consume_stderr_events(events));
+        task.join().await?;
+        let result = status.borrow().clone();
+        drop(handle);
+        let _ = render.await;
+        if let SessionStatus::Finished(SessionResult::Completed(Some(answer))) = result {
+            println!("{answer}");
+        }
+        Ok(())
     }
-    let answer = run_and_save(&mut agent, &store, &root, &session, &mut persisted, prompt).await?;
-    println!("{answer}");
-    if !agent.background_task_ids().is_empty() {
-        eprintln!(
-            "background tasks {:?} still running; results will be delivered in the next session's first turn",
-            agent.background_task_ids()
-        );
-    }
-    Ok(())
 }
 
 /// Lines printed by TuiSessionReport Drop (pure for testability).
@@ -373,123 +380,107 @@ impl Drop for TuiSessionReport {
     }
 }
 
-fn set_stderr_events(agent: &mut Agent) {
+async fn consume_stderr_events(mut events: tokio::sync::broadcast::Receiver<AgentEvent>) {
     let mut streaming = false;
     let mut reasoning = false;
-    agent.set_event_handler(Box::new(move |event| match event {
-        // Steering prompts are recorded by the session handle; the stderr
-        // frontend never sends any, so nothing to print.
-        AgentEvent::UserPrompt(_) => {}
-        AgentEvent::Notice(text) => {
-            eprintln!("{}", text);
-        }
-        AgentEvent::Error(text) => eprintln!("error: {text}"),
-        AgentEvent::AssistantText(text) => eprintln!("assistant: {}", preview(&text, 500)),
-        AgentEvent::AssistantDelta(text) => {
-            if reasoning {
-                eprintln!();
-                reasoning = false;
+    while let Ok(event) = events.recv().await {
+        match event {
+            // Steering prompts are recorded by the session handle; the stderr
+            // frontend never sends any, so nothing to print.
+            AgentEvent::UserPrompt(_) => {}
+            AgentEvent::Notice(text) => {
+                eprintln!("{}", text);
             }
-            eprint!("{text}");
-            streaming = true;
-        }
-        AgentEvent::ReasoningDelta(text) => {
-            eprint!("\x1b[2m{text}\x1b[0m");
-            reasoning = true;
-        }
-        AgentEvent::ToolCall { name, arguments } => {
-            if streaming || reasoning {
-                eprintln!();
-                streaming = false;
-                reasoning = false;
+            AgentEvent::Error(text) => eprintln!("error: {text}"),
+            AgentEvent::AssistantText(text) => eprintln!("assistant: {}", preview(&text, 500)),
+            AgentEvent::AssistantDelta(text) => {
+                if reasoning {
+                    eprintln!();
+                    reasoning = false;
+                }
+                eprint!("{text}");
+                streaming = true;
             }
-            eprintln!("tool: {name} {}", preview(&arguments, 200))
-        }
-        AgentEvent::ToolResult { is_error, content } => eprintln!(
-            "  {}: {}",
-            if is_error { "error" } else { "ok" },
-            preview(&content, 500)
-        ),
-        AgentEvent::BackgroundCompleted {
-            id, output, label, ..
-        } => {
-            let title = label
-                .as_deref()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| format!(": {l}"))
-                .unwrap_or_default();
-            eprintln!(
-                "background task {id} finished{title}: {}",
-                preview(&output, 500)
-            )
-        }
-        AgentEvent::BackgroundCompletionNotice {
-            id: _,
-            output,
-            label: _,
-            ..
-        } => {
-            // REPL/stderr: show a finite preview with middle ellipsis
-            let lines: Vec<&str> = output.lines().collect();
-            if lines.len() <= 8 && output.len() <= 500 {
-                for line in &lines {
-                    eprintln!("  {line}");
+            AgentEvent::ReasoningDelta(text) => {
+                eprint!("\x1b[2m{text}\x1b[0m");
+                reasoning = true;
+            }
+            AgentEvent::ToolCall { name, arguments } => {
+                if streaming || reasoning {
+                    eprintln!();
+                    streaming = false;
+                    reasoning = false;
                 }
-            } else {
-                let head: Vec<&str> = lines.iter().take(5).copied().collect();
-                let tail: Vec<&str> = lines.iter().rev().take(3).rev().copied().collect();
-                let omitted = lines.len() - head.len() - tail.len();
-                for line in &head {
-                    eprintln!("  {line}");
-                }
+                eprintln!("tool: {name} {}", preview(&arguments, 200))
+            }
+            AgentEvent::ToolResult { is_error, content } => eprintln!(
+                "  {}: {}",
+                if is_error { "error" } else { "ok" },
+                preview(&content, 500)
+            ),
+            AgentEvent::BackgroundCompleted {
+                id, output, label, ..
+            } => {
+                let title = label
+                    .as_deref()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| format!(": {l}"))
+                    .unwrap_or_default();
                 eprintln!(
-                    "  … ({omitted} lines, {} chars omitted)",
-                    output.len().saturating_sub(
-                        head.iter().map(|l| l.len()).sum::<usize>()
-                            + tail.iter().map(|l| l.len()).sum::<usize>()
-                    )
-                );
-                for line in &tail {
-                    eprintln!("  {line}");
+                    "background task {id} finished{title}: {}",
+                    preview(&output, 500)
+                )
+            }
+            AgentEvent::BackgroundCompletionNotice {
+                id: _,
+                output,
+                label: _,
+                ..
+            } => {
+                // REPL/stderr: show a finite preview with middle ellipsis
+                let lines: Vec<&str> = output.lines().collect();
+                if lines.len() <= 8 && output.len() <= 500 {
+                    for line in &lines {
+                        eprintln!("  {line}");
+                    }
+                } else {
+                    let head: Vec<&str> = lines.iter().take(5).copied().collect();
+                    let tail: Vec<&str> = lines.iter().rev().take(3).rev().copied().collect();
+                    let omitted = lines.len() - head.len() - tail.len();
+                    for line in &head {
+                        eprintln!("  {line}");
+                    }
+                    eprintln!(
+                        "  … ({omitted} lines, {} chars omitted)",
+                        output.len().saturating_sub(
+                            head.iter().map(|l| l.len()).sum::<usize>()
+                                + tail.iter().map(|l| l.len()).sum::<usize>()
+                        )
+                    );
+                    for line in &tail {
+                        eprintln!("  {line}");
+                    }
                 }
             }
+            AgentEvent::Usage {
+                context_input,
+                session,
+            } => eprintln!(
+                "\x1b[2mctx {}, session {} in / {} out\x1b[0m",
+                context_input, session.input_tokens, session.output_tokens
+            ),
         }
-        AgentEvent::Usage {
-            context_input,
-            session,
-        } => eprintln!(
-            "\x1b[2mctx {}, session {} in / {} out\x1b[0m",
-            context_input, session.input_tokens, session.output_tokens
-        ),
-    }));
+    }
 }
 
-async fn run_and_save(
-    agent: &mut Agent,
-    store: &SessionStore,
-    root: &std::path::Path,
-    session: &str,
-    persisted: &mut usize,
-    prompt: String,
-) -> anyhow::Result<String> {
-    let result = agent.run(prompt).await;
-    store
-        .append(root, session, &agent.history()[*persisted..])
-        .await?;
-    *persisted = agent.history().len();
-    result
-}
-
-async fn repl(
-    mut agent: Agent,
-    root: std::path::PathBuf,
-    session: String,
-    store: SessionStore,
-    mut persisted: usize,
-) -> anyhow::Result<()> {
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+async fn repl(handle: SessionHandle, task: e_agent::runner::SessionTask) -> anyhow::Result<()> {
+    let (_, events, mut status) = handle.attach();
+    let render = tokio::spawn(consume_stderr_events(events));
     let stdin = std::io::stdin();
     loop {
+        while !matches!(*status.borrow(), SessionStatus::Idle) {
+            status.changed().await?;
+        }
         print!("e-agent> ");
         std::io::stdout().flush()?;
         let mut line = String::new();
@@ -502,54 +493,22 @@ async fn repl(
             }
             Err(error) => return Err(error.into()),
         }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "/exit" || line == "/quit" {
-            break;
-        }
-        if line == "/compact" {
-            let result = agent.compact().await;
-            store
-                .append(&root, &session, &agent.history()[persisted..])
-                .await?;
-            persisted = agent.history().len();
-            match result {
-                Ok(summary) => println!("compacted: {summary}"),
-                Err(error) => eprintln!("e-agent: {error:#}"),
+        match line.trim() {
+            "" => {}
+            "/exit" | "/quit" => break,
+            "/compact" => {
+                handle.compact();
+                status.changed().await?;
             }
-            continue;
-        }
-        agent.subscribe(sender.clone());
-        match run_and_save(
-            &mut agent,
-            &store,
-            &root,
-            &session,
-            &mut persisted,
-            line.to_owned(),
-        )
-        .await
-        {
-            Ok(answer) => println!("{answer}"),
-            Err(error) => eprintln!("e-agent: {error:#}"),
-        }
-        while let Ok(AgentEvent::BackgroundCompleted {
-            id, output, label, ..
-        }) = receiver.try_recv()
-        {
-            let title = label
-                .as_deref()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| format!(": {l}"))
-                .unwrap_or_default();
-            eprintln!(
-                "background task {id} finished{title}: {}",
-                preview(&output, 500)
-            );
+            prompt => {
+                handle.prompt(prompt);
+                status.changed().await?;
+            }
         }
     }
+    drop(handle);
+    drop(task);
+    render.abort();
     Ok(())
 }
 

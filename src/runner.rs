@@ -99,7 +99,7 @@ pub enum SessionStatus {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionResult {
-    Completed,
+    Completed(Option<String>),
     Failed(String),
     Cancelled,
     Closed,
@@ -182,6 +182,7 @@ pub struct SessionRunner {
     pending: VecDeque<String>,
     compact_pending: bool,
     policy: IdlePolicy,
+    last_answer: Option<String>,
 }
 
 impl SessionRunner {
@@ -220,6 +221,7 @@ impl SessionRunner {
                 pending: VecDeque::new(),
                 compact_pending: false,
                 policy,
+                last_answer: None,
             },
             handle,
         )
@@ -330,7 +332,9 @@ impl SessionRunner {
             if self.pending.is_empty() {
                 self.status(SessionStatus::Idle);
                 if self.policy == IdlePolicy::FinishWhenIdle {
-                    self.status(SessionStatus::Finished(SessionResult::Completed));
+                    self.status(SessionStatus::Finished(SessionResult::Completed(
+                        self.last_answer.clone(),
+                    )));
                     return;
                 }
                 tokio::select! {
@@ -386,6 +390,9 @@ impl SessionRunner {
                 let streamed = round.produced_content_delta;
                 let calls = assistant.tool_calls.clone();
                 let content = assistant.content.clone();
+                if calls.is_empty() {
+                    self.last_answer = content.clone();
+                }
                 if let Err(error) = self.commit(Message::Assistant(assistant).into()).await {
                     self.failed(error);
                     return;
