@@ -457,10 +457,10 @@ mod tests {
         }
         let wid_a = derive_workspace_id(Path::new("/tmp/e-agent-workspace-a"));
         let wid_b = derive_workspace_id(Path::new("/tmp/e-agent-workspace-b"));
-        let sid = "shared-session-name";
+        let sid = format!("shared-session-name-{}", crate::session::new_id());
 
-        let mut sa = GreptimeSession::connect(&conn, &wid_a, sid).await.unwrap();
-        let sb = GreptimeSession::connect(&conn, &wid_b, sid).await.unwrap();
+        let mut sa = GreptimeSession::connect(&conn, &wid_a, &sid).await.unwrap();
+        let sb = GreptimeSession::connect(&conn, &wid_b, &sid).await.unwrap();
 
         let user_msg = Message::User {
             content: "only in workspace A".into(),
