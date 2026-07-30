@@ -416,6 +416,9 @@ impl Agent {
     async fn run_turn(&mut self, prompt: String) -> anyhow::Result<(String, bool)> {
         self.drain_background();
         self.inject_pending_background();
+        // Reset the auto-compact latch at the start of each new user turn so
+        // a failed compaction doesn't permanently prevent future attempts.
+        self.auto_compacted = false;
         if !prompt.is_empty() {
             self.history.push(Message::User { content: prompt }.into());
         }
@@ -448,6 +451,15 @@ impl Agent {
         if split == 0 {
             anyhow::bail!("nothing to compact");
         }
+        // Skip the context prefix (System messages) — only compact if
+        // there is actual conversation history (at least one assistant or
+        // tool message) before the retained user turn.
+        if !context[..split]
+            .iter()
+            .any(|msg| matches!(msg, Message::Assistant(_) | Message::Tool { .. }))
+        {
+            anyhow::bail!("nothing to compact");
+        }
         let mut request = context[..split].to_vec();
         request.push(Message::User {
             content: "Summarize the earlier conversation. Preserve the user's goals, decisions made, files changed, and unfinished work. Be concise and use Chinese or English to match the conversation language.".into(),
@@ -455,7 +467,6 @@ impl Agent {
         let response = {
             let model = &mut self.model;
             let event_handler = &mut self.event_handler;
-            let observers = &self.observers;
             let mut on_delta = |kind: ModelDeltaKind, delta: &str| {
                 let event = match kind {
                     ModelDeltaKind::Content => AgentEvent::AssistantDelta(delta.into()),
@@ -464,18 +475,18 @@ impl Agent {
                 if let Some(handler) = event_handler {
                     handler(event.clone());
                 }
-                // Compaction streams to the session log too: frontends
-                // watching via a SessionHandle see the summary appear live
-                // instead of popping in whole at the end.
-                for sink in observers {
-                    sink.emit(event.clone());
-                }
             };
             model.complete(&request, &[], Some(&mut on_delta)).await?
         };
         let (response, usage) = response;
         self.record_usage(usage, false);
-        let summary = response.content.unwrap_or_default();
+        if !response.tool_calls.is_empty() {
+            anyhow::bail!("compaction response contains tool calls");
+        }
+        let summary = response
+            .content
+            .filter(|c| !c.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("compaction produced empty summary"))?;
         self.history.push(SessionEntry::Compaction {
             summary: summary.clone(),
             retained: context[split..].to_vec(),
@@ -561,6 +572,7 @@ impl Agent {
                 self.auto_compacted = true;
                 self.emit(AgentEvent::Notice("──── auto-compacting… ────".into()));
                 if let Err(error) = self.compact().await {
+                    self.auto_compacted = false;
                     self.emit(AgentEvent::Notice(format!(
                         "auto-compaction error: {error:#}"
                     )));
@@ -1544,10 +1556,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_streams_deltas_to_observers() {
-        // The TUI renders /compact through the session observer: without
-        // fanout here the summary pops in whole at the end instead of
-        // streaming live between the compaction banners.
+    async fn compact_does_not_stream_deltas_to_observers() {
+        // Per AGENTS.md, compaction deltas go to the handler only, not
+        // observers. The TUI renders /compact from the returned summary,
+        // not from observer deltas.
         let (handle, sink, _source) = crate::handle::session_channel();
         use crate::handle::SessionHandle as _;
         let mut agent = Agent::new(Box::new(CompactDeltaModel), vec![]);
@@ -1569,13 +1581,8 @@ mod tests {
             .into(),
         ]);
         assert_eq!(agent.compact().await.unwrap(), "summary");
-        assert_eq!(
-            handle.snapshot(),
-            vec![
-                AgentEvent::AssistantDelta("sum".into()),
-                AgentEvent::AssistantDelta("mary".into()),
-            ]
-        );
+        // Observers see nothing from compaction (no delta events).
+        assert!(handle.snapshot().is_empty());
     }
 
     #[tokio::test]

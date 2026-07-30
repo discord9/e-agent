@@ -135,7 +135,10 @@ async fn run() -> anyhow::Result<()> {
         ),
         None => (None, None, std::collections::HashMap::new()),
     };
-    let main_context_window = main_resolved.as_ref().and_then(|r| r.context_window);
+    let mut main_context_window = main_resolved.as_ref().and_then(|r| r.context_window);
+    // When --model overrides the profile's wire model, the profile's
+    // context window is no longer valid for the unknown model.
+    let model_override = model.is_some();
     if matches!(
         main_resolved.as_ref().map(|value| value.auth),
         Some(AuthMode::ChatGpt)
@@ -163,12 +166,18 @@ async fn run() -> anyhow::Result<()> {
             ConfiguredModel::chat(OpenAiModel::from_env(base_url, model)?)
         }
     };
+    if model_override {
+        main_context_window = None;
+    }
     let model_name = model.display_name().to_owned();
+    let subagent_context_window = role_resolved.as_ref().and_then(|r| r.context_window);
     let subagent_model = role_resolved
         .map(|resolved| configured_model(resolved, auth.as_ref(), None, None))
         .transpose()?;
     let mut role_models = std::collections::HashMap::new();
+    let mut role_context_windows = std::collections::HashMap::new();
     for (role, resolved) in all_roles {
+        role_context_windows.insert(role.clone(), resolved.context_window);
         role_models.insert(role, configured_model(resolved, auth.as_ref(), None, None)?);
     }
     // The bash sandbox ([sandbox] in config) wraps every bash call — main
@@ -186,12 +195,17 @@ async fn run() -> anyhow::Result<()> {
         }
     }
     let (mut tools, background) = builtins(workspace.clone(), sandbox.clone());
-    let mcp_servers = config.map(|config| config.mcp).unwrap_or_default();
+    let mcp_servers = config
+        .as_ref()
+        .map(|config| config.mcp.clone())
+        .unwrap_or_default();
     let (mcp_tools, mcp_instructions) = mcp::connect_all(mcp_servers, &root).await;
     tools.extend(mcp_tools);
     let mut delegate = Delegate::new(model.clone(), workspace, background.clone())
         .persist_sessions(root.clone())
         .with_role_models(role_models)
+        .with_role_context_windows(role_context_windows)
+        .with_subagent_context_window(subagent_context_window)
         .with_roles_root(root.clone())
         .with_sandbox(sandbox)
         .record_background_tasks_in(root.clone(), &session);

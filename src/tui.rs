@@ -230,6 +230,7 @@ fn attach_to_task(
         entry.role.clone(),
         entry.cwd.clone(),
         entry.session_id.clone(),
+        entry.context_window,
     );
     let bridge = bridge(task_id, entry.handle.as_ref(), sender.clone());
     state.attached.as_mut().unwrap().bridge = Some(bridge);
@@ -1656,12 +1657,14 @@ impl TuiState {
         role_name: Option<String>,
         cwd: String,
         session_id: String,
+        context_window: Option<u64>,
     ) {
         let mut state = TuiState {
             model_name,
             role_name,
             cwd,
             session_id,
+            context_window,
             ..TuiState::default()
         };
         let mut finished = false;
@@ -1914,7 +1917,11 @@ impl TuiState {
         match event {
             AgentEvent::Notice(text) => {
                 self.active_lane = None;
-                self.push_line(text, LineKind::Dim);
+                if text.starts_with("──── auto-compact") {
+                    self.push_line(text, LineKind::Compaction);
+                } else {
+                    self.push_line(text, LineKind::Dim);
+                }
             }
             AgentEvent::UserPrompt(text) => {
                 self.push_line(format!("you> {text}"), LineKind::User);
@@ -1985,10 +1992,7 @@ impl TuiState {
             self.push_line(format!("tool: edit_file {path}"), LineKind::ToolCall);
             return;
         }
-        self.push_line(
-            format!("tool: {name} {}", preview(arguments, 200)),
-            LineKind::ToolCall,
-        );
+        self.push_line(format_tool_call(name, arguments), LineKind::ToolCall);
     }
 
     fn push_tool_result(&mut self, content: &str, is_error: bool) {
@@ -2045,6 +2049,84 @@ fn parse_edit_arguments(arguments: &str) -> Option<(String, String, String)> {
         value.get("old")?.as_str()?.to_owned(),
         value.get("new")?.as_str()?.to_owned(),
     ))
+}
+
+fn format_tool_call(name: &str, arguments: &str) -> String {
+    use serde_json::Value;
+    use std::fmt::Write;
+
+    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
+        return format!("tool: {name} {}", preview(arguments, 200));
+    };
+
+    match name {
+        "bash" => {
+            let cmd = value
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or(arguments);
+            let desc = value
+                .get("description")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            if let Some(desc) = desc {
+                format!("bash: {cmd}  # {desc}")
+            } else {
+                format!("bash: {cmd}")
+            }
+        }
+        "read_file" => {
+            let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let offset = value.get("offset").and_then(|v| v.as_u64());
+            let limit = value.get("limit").and_then(|v| v.as_u64());
+            let mut s = format!("read: {path}");
+            if let Some(o) = offset {
+                let _ = write!(s, " [{o}]");
+            }
+            if let Some(l) = limit {
+                let _ = write!(s, " [{l}]");
+            }
+            s
+        }
+        "write_file" => {
+            let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            format!("write: {path} ({} bytes)", content.len())
+        }
+        "delegate" => {
+            let role = value
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("delegate");
+            let task = value.get("task").and_then(|v| v.as_str()).unwrap_or("");
+            let task = preview(task, 120);
+            let bg = value
+                .get("background")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let ws = value
+                .get("workspace")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let mut s = format!("{role}: {task}");
+            if bg {
+                s.push_str(" [background]");
+            }
+            if let Some(w) = ws {
+                let _ = write!(s, " [workspace: {w}]");
+            }
+            s
+        }
+        "web_search" => {
+            let query = value
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or(arguments);
+            format!("search: {query}")
+        }
+        "get_background_tasks" => "tasks".to_string(),
+        _ => format!("tool: {name} {}", preview(arguments, 200)),
+    }
 }
 
 #[derive(Default)]
@@ -2142,6 +2224,7 @@ mod tests {
             None,
             String::new(),
             String::new(),
+            None,
         );
     }
 
@@ -2238,10 +2321,7 @@ mod tests {
             .iter()
             .map(|line| line.text.as_str())
             .collect();
-        assert_eq!(
-            lines,
-            ["partial", r#"tool: bash {"command":"ls"}"#, "  ok: files",]
-        );
+        assert_eq!(lines, ["partial", "bash: ls", "  ok: files",]);
         // The transient BackgroundCompleted flips the attached view to
         // finished but renders nothing (the persistent "finished" line
         // comes from the UserPrompt at the turn boundary).
@@ -2786,6 +2866,7 @@ mod tests {
             Some("fixer".into()),
             "/repo".into(),
             "sub-abc123".into(),
+            None,
         );
 
         draw(&mut terminal, &mut state).unwrap();
@@ -3210,7 +3291,7 @@ mod tests {
             [
                 "you> hello",
                 "checking",
-                r#"tool: read_file {"path":"README.md"}"#,
+                "read: README.md",
                 "  ok: contents",
                 "done",
             ]
@@ -3507,6 +3588,7 @@ mod ux_tests {
             None,
             String::new(),
             String::new(),
+            None,
         );
         let attached = parent.attached.as_mut().unwrap();
         attached.state.busy = Some(BusyState::thinking());

@@ -25,6 +25,9 @@ pub struct Config {
     /// Optional `[sandbox]` bwrap wrapper for the bash tool.
     #[serde(default)]
     sandbox: Option<Sandbox>,
+    /// Optional `[session]` backend configuration.
+    #[serde(default)]
+    session: Option<SessionConfig>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -50,6 +53,26 @@ pub struct Sandbox {
     /// resolution rules as `writable_paths`.
     #[serde(default)]
     pub readable_paths: Vec<String>,
+}
+
+/// Backend selection for session persistence.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionBackend {
+    /// JSONL file backend (default).
+    #[default]
+    Jsonl,
+    /// GreptimeDB backend. `conn` is a tokio-postgres connection string
+    /// (e.g. "host=127.0.0.1 port=4002 dbname=public"). Requires the `greptime` feature.
+    Greptime { conn: String },
+}
+
+/// The `[session]` config section.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct SessionConfig {
+    /// Backend type: `"jsonl"` (default) or `"greptime"`.
+    #[serde(default)]
+    pub backend: SessionBackend,
 }
 
 fn default_true() -> bool {
@@ -180,6 +203,14 @@ impl Config {
     /// while `enabled` / `network` / `workspace_writable` come from the global
     /// config only (a project file can add paths but never weaken the policy).
     /// Paths are expanded: `~` -> home, relative -> the workspace root.
+    /// The session backend from `[session] backend`, defaulting to Jsonl.
+    pub fn session_backend(&self) -> SessionBackend {
+        match &self.session {
+            Some(session) => session.backend.clone(),
+            None => SessionBackend::default(),
+        }
+    }
+
     pub fn sandbox(&self, workspace: &Path) -> Option<Sandbox> {
         let mut sandbox = self.sandbox.clone().filter(|sandbox| sandbox.enabled)?;
         if let Some(project) = project_sandbox(workspace) {

@@ -40,6 +40,7 @@ pub struct SessionEntry {
     pub role: Option<String>,
     pub cwd: String,
     pub session_id: String,
+    pub context_window: Option<u64>,
 }
 
 /// Registry of live session handles, keyed by background-task id (the same
@@ -104,6 +105,8 @@ pub struct Delegate {
     /// Subagents run on the role-routed model when configured, otherwise
     /// on the main model.
     subagent_model: ConfiguredModel,
+    /// Context window for the default subagent model (from profile).
+    subagent_context_window: Option<u64>,
     workspace: Workspace,
     /// Shared running-task registry: background delegates and bash commands
     /// stay visible together and deliver completions through the parent.
@@ -119,6 +122,8 @@ pub struct Delegate {
     /// Per-role models from `[roles]` (role name -> model). A role not
     /// present here falls back to `subagent_model`.
     role_models: std::collections::HashMap<String, ConfiguredModel>,
+    /// Context window per role model (from profile).
+    role_context_windows: std::collections::HashMap<String, Option<u64>>,
     /// Workspace root used to read role templates (`.e-agent/agents/<role>.md`).
     roles_root: Option<std::path::PathBuf>,
     /// Optional bwrap sandbox inherited by every subagent's bash tool.
@@ -160,15 +165,32 @@ impl Delegate {
     pub fn new(model: ConfiguredModel, workspace: Workspace, background: BackgroundTasks) -> Self {
         Self {
             subagent_model: model,
+            subagent_context_window: None,
             workspace,
             background,
             sessions: Sessions::default(),
             persist_root: None,
             role_models: std::collections::HashMap::new(),
+            role_context_windows: std::collections::HashMap::new(),
             roles_root: None,
             sandbox: None,
             record_in: None,
         }
+    }
+
+    /// Set the context window for the default subagent model.
+    pub fn with_subagent_context_window(mut self, window: Option<u64>) -> Self {
+        self.subagent_context_window = window;
+        self
+    }
+
+    /// Set context windows for role models.
+    pub fn with_role_context_windows(
+        mut self,
+        windows: std::collections::HashMap<String, Option<u64>>,
+    ) -> Self {
+        self.role_context_windows = windows;
+        self
     }
 
     /// Route subagents onto a different model (e.g. a cheaper profile from
@@ -221,6 +243,36 @@ impl Delegate {
         self.sessions.clone()
     }
 
+    /// Replay persisted [`SessionEntry`] values into a [`SessionSink`] so the
+    /// display log shows the prior conversation before the new prompt. Called
+    /// only when resuming a subagent session.
+    fn replay_scrollback(sink: &SessionSink, entries: &[crate::agent::SessionEntry]) {
+        for entry in entries {
+            let event = match entry {
+                crate::agent::SessionEntry::Message { message } => match message {
+                    crate::agent::Message::User { content } => {
+                        AgentEvent::UserPrompt(content.clone())
+                    }
+                    crate::agent::Message::Assistant(msg) => {
+                        AgentEvent::AssistantText(msg.content.clone().unwrap_or_default())
+                    }
+                    crate::agent::Message::Tool {
+                        content, is_error, ..
+                    } => AgentEvent::ToolResult {
+                        is_error: *is_error,
+                        content: content.clone(),
+                    },
+                    crate::agent::Message::System { .. } => continue,
+                },
+                crate::agent::SessionEntry::Compaction { .. } => {
+                    AgentEvent::Notice("──── persisted session checkpoint ────".into())
+                }
+                crate::agent::SessionEntry::Notice { text } => AgentEvent::Notice(text.clone()),
+            };
+            sink.emit(event);
+        }
+    }
+
     /// Run `task` on a dedicated thread with a fresh agent and return the
     /// final answer. Used by both sync and background execution so the two
     /// modes share one code path. With a `steering` pair the subagent's
@@ -234,8 +286,10 @@ impl Delegate {
     /// parent's task panel and delivers its
     /// completion to the PARENT agent — it survives the subagent's end
     /// instead of being silently killed and forgotten.
+    #[allow(clippy::too_many_arguments)]
     fn run_on_thread(
         model: ConfiguredModel,
+        context_window: Option<u64>,
         workspace: Workspace,
         background: BackgroundTasks,
         task: DelegatedTask,
@@ -265,6 +319,9 @@ impl Delegate {
                 let tools =
                     crate::tools::builtins_with_background(workspace, background, sandbox);
                 let mut agent = Agent::new(Box::new(model), tools);
+                if let Some(window) = context_window {
+                    agent.set_context_window(window);
+                }
                 // A bare single-user-message request is rejected by some
                 // providers (kimi k3 answers HTTP 403 to `msgs=1`); give the
                 // subagent a system prompt so its first call always carries a
@@ -300,9 +357,14 @@ impl Delegate {
                 // only appends the NEW turns (no duplicate replay of the
                 // loaded history).
                 let mut persisted_len = 0usize;
-                if let Some(entries) = resume_entries {
+                if let Some(entries) = &resume_entries {
                     persisted_len = entries.len();
-                    agent.restore_history(entries);
+                    agent.restore_history(entries.clone());
+                    // Seed the display log so an attached view shows the
+                    // prior conversation, not just the new prompt.
+                    if let Some(sink) = &sink {
+                        Self::replay_scrollback(sink, entries);
+                    }
                 }
                 // Prompts stashed while a turn was running, in arrival order.
                 let mut pending: Vec<String> = Vec::new();
@@ -361,13 +423,35 @@ impl Delegate {
                     last_answer = match result {
                         Ok(answer) => answer,
                         Err(error) => {
-                            // Surface the failure in the session log so an
-                            // attached view shows it instead of going blank.
-                            let message = format!("subagent failed: {error:#}");
-                            if let Some(sink) = &sink {
-                                sink.emit(AgentEvent::AssistantText(message.clone()));
+                            let error_str = format!("{error:#}");
+                            // Retry once when the provider stream dropped
+                            // mid-turn (prompt is already in history, so an
+                            // empty-string retry continues the round).
+                            if error_str.contains("Transport error:") {
+                                if let Some(sink) = &sink {
+                                    sink.emit(AgentEvent::Notice(
+                                        "transport disconnected; retrying once…".into(),
+                                    ));
+                                }
+                                match agent.run(String::new()).await {
+                                    Ok(answer) => answer,
+                                    Err(retry_error) => {
+                                        let msg = format!("subagent failed: {retry_error:#}");
+                                        if let Some(sink) = &sink {
+                                            sink.emit(AgentEvent::AssistantText(
+                                                msg.clone(),
+                                            ));
+                                        }
+                                        msg
+                                    }
+                                }
+                            } else {
+                                let message = format!("subagent failed: {error_str}");
+                                if let Some(sink) = &sink {
+                                    sink.emit(AgentEvent::AssistantText(message.clone()));
+                                }
+                                message
                             }
-                            message
                         }
                     };
                     // Persist this turn's entries (append-only) so the full
@@ -521,7 +605,7 @@ impl Tool for Delegate {
         // Resolve the role: its model ([roles] <role> > subagent > main) and
         // its prompt template (.e-agent/agents/<role>.md). An unknown role is
         // rejected unless no roles are configured at all.
-        let (model, role_prompt) = match role.as_deref() {
+        let (model, context_window, role_prompt) = match role.as_deref() {
             Some(role) => {
                 let root = self
                     .roles_root
@@ -545,9 +629,19 @@ impl Tool for Delegate {
                     .get(role)
                     .cloned()
                     .unwrap_or_else(|| self.subagent_model.clone());
-                (model, Some(prompt))
+                let cw = self
+                    .role_context_windows
+                    .get(role)
+                    .copied()
+                    .flatten()
+                    .or(self.subagent_context_window);
+                (model, cw, Some(prompt))
             }
-            None => (self.subagent_model.clone(), None),
+            None => (
+                self.subagent_model.clone(),
+                self.subagent_context_window,
+                None,
+            ),
         };
         let resume = arguments
             .as_object()
@@ -625,12 +719,14 @@ impl Tool for Delegate {
                 .map(|p| p.session_id.clone())
                 .unwrap_or_default();
             let record_session_id = persist_session_id.clone();
+            let output_session_id = persist_session_id.clone();
             let entry = Arc::new(SessionEntry {
                 handle: session.clone(),
                 model: model_name,
                 role: role_name,
                 cwd,
                 session_id: persist_session_id,
+                context_window,
             });
             let entry_for_hook = entry.clone();
             let record = self.record_in.clone();
@@ -657,6 +753,7 @@ impl Tool for Delegate {
                     let output = tokio::task::spawn_blocking(move || {
                         Self::run_on_thread(
                             model,
+                            context_window,
                             workspace,
                             background,
                             DelegatedTask {
@@ -671,6 +768,11 @@ impl Tool for Delegate {
                     })
                     .await
                     .unwrap_or_else(|error| format!("subagent blocking task failed: {error}"));
+                    let output = if output_session_id.is_empty() {
+                        output
+                    } else {
+                        format!("subagent session: {output_session_id}\n{output}")
+                    };
                     if let Some(id) = *slot_in_work.lock().unwrap() {
                         sessions_in_work.remove(id);
                         if let Some((root, session)) = &record_in_work {
@@ -723,6 +825,7 @@ impl Tool for Delegate {
             role: role_name,
             cwd,
             session_id: persist_session_id,
+            context_window,
         });
         let entry_for_hook = entry.clone();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<String>();
@@ -738,6 +841,7 @@ impl Tool for Delegate {
                 let output = tokio::task::spawn_blocking(move || {
                     Self::run_on_thread(
                         model,
+                        context_window,
                         workspace,
                         background,
                         DelegatedTask {
@@ -824,6 +928,7 @@ mod tests {
             role: None,
             cwd: "/tmp".into(),
             session_id: "sub-test".into(),
+            context_window: None,
         });
         sessions.insert(1, entry);
         assert!(sessions.get(1).is_some());
@@ -1062,6 +1167,112 @@ mod tests {
         assert!(
             !answer.contains("invalid `workspace`"),
             "valid workspace path should not produce a workspace error, got: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_delegate_completion_contains_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let mut tool = delegate(temp.path()).persist_sessions(root);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tool.set_event_sender(sender);
+
+        let answer = tool
+            .execute(json!({"task": "hello", "background": true}))
+            .await
+            .unwrap();
+        assert!(answer.starts_with("started background task"));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("timed out waiting for background completion")
+            .unwrap();
+        match event {
+            AgentEvent::BackgroundCompleted { output, .. } => {
+                assert!(
+                    output.starts_with("subagent session: sub-"),
+                    "expected subagent session prefix, got: {output}"
+                );
+            }
+            other => panic!("expected BackgroundCompleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_replays_scrollback_into_session_sink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+
+        // Create a persisted prior session with two entries.
+        let prior = vec![
+            crate::agent::SessionEntry::from(crate::agent::Message::User {
+                content: "earlier task".into(),
+            }),
+            crate::agent::SessionEntry::from(crate::agent::Message::Assistant(
+                crate::agent::AssistantMessage {
+                    content: Some("earlier answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            )),
+        ];
+        crate::session::Session::append(&root, "sub-resume-scrollback", &prior).unwrap();
+
+        let mut tool = delegate(temp.path()).persist_sessions(root);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tool.set_event_sender(sender);
+
+        // Spawn a background delegate that resumes the prior session.
+        let answer = tool
+            .execute(json!({"task": "new prompt", "background": true, "resume": "sub-resume-scrollback"}))
+            .await
+            .unwrap();
+        assert!(answer.starts_with("started background task"));
+
+        let id: u64 = answer
+            .strip_prefix("started background task ")
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| s.trim().parse().ok())
+            .expect("could not extract task id");
+
+        // Give the subagent thread a moment to emit the scrollback events.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let entry = tool.sessions().get(id).expect("session entry missing");
+        let snapshot = entry.handle.snapshot();
+
+        // The snapshot should contain the prior UserPrompt before the new one.
+        let user_texts: Vec<&str> = snapshot
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::UserPrompt(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_texts.len() >= 2,
+            "expected at least two UserPrompt events (prior + new), got {user_texts:?}"
+        );
+        assert_eq!(user_texts[0], "earlier task");
+        // The new prompt may or may not be last (replayed prior events
+        // come first); just check it appears.
+        assert!(
+            user_texts.contains(&"new prompt"),
+            "expected 'new prompt' in UserPrompt events, got {user_texts:?}"
+        );
+
+        // The prior AssistantText must be in the log too.
+        let assistant_texts: Vec<&str> = snapshot
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::AssistantText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            assistant_texts.contains(&"earlier answer"),
+            "expected 'earlier answer' in AssistantText events, got {assistant_texts:?}"
         );
     }
 }
