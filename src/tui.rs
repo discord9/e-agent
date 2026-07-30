@@ -427,6 +427,9 @@ async fn run_inner(
                     }
                 }
             }
+            Some(first) = inbox.recv() => {
+                route_idle_events(&mut state, first, &mut inbox);
+            }
             event = events.next() => match event {
             Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
                 // Tasks panel open: navigation keys belong to the panel
@@ -688,6 +691,18 @@ async fn run_request(
 enum Interruption {
     ExitApp,
     CancelTurn,
+}
+
+fn route_idle_events(
+    state: &mut TuiState,
+    first: UiEvent,
+    inbox: &mut mpsc::UnboundedReceiver<UiEvent>,
+) {
+    state.push_event(first);
+    for _ in 1..256 {
+        let Ok(event) = inbox.try_recv() else { break };
+        state.push_event(event);
+    }
 }
 
 /// Pump an agent future to completion while streaming session events into
@@ -3202,6 +3217,29 @@ mod tests {
         assert_eq!(state.task_cursor, 0);
         let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
         assert_eq!(state.handle_tasks_panel_key(a), None);
+    }
+
+    #[tokio::test]
+    async fn idle_attached_view_routes_ready_deltas_without_reattach() {
+        let (handle, _sink, _source) = crate::handle::session_channel();
+        let mut state = TuiState::default();
+        attach_test(&mut state, 7, "demo", Arc::new(handle));
+        let (sender, mut inbox) = mpsc::unbounded_channel();
+        for text in ["live ", "while ", "idle"] {
+            sender
+                .send(UiEvent {
+                    session: 7,
+                    event: AgentEvent::AssistantDelta(text.into()),
+                })
+                .unwrap();
+        }
+        let first = inbox.recv().await.unwrap();
+        route_idle_events(&mut state, first, &mut inbox);
+        assert!(inbox.try_recv().is_err());
+        assert_eq!(
+            state.attached.as_ref().unwrap().state.lines[0].text,
+            "live while idle"
+        );
     }
 
     #[tokio::test]
