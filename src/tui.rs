@@ -515,11 +515,7 @@ async fn run_inner(
                         if matches!(interruption, Some(Interruption::ExitApp)) {
                             return Ok(());
                         }
-                        if matches!(interruption, Some(Interruption::CancelTurn)) {
-                            state.push_line("cancelled".into(), LineKind::Dim);
-                        }
-                        // Cancelling with queued prompts: drain all into
-                        // a single follow-up turn.
+                        // Queued prompts drain into a single follow-up turn.
                         loop {
                             let Some(next) = state.take_queued_batch() else { break };
                             state.push_line(format!("you> {next}"), LineKind::User);
@@ -677,9 +673,6 @@ async fn run_request(
                 .push_line(format!("error: {error:#}"), LineKind::ToolError),
         }
     }
-    if matches!(interruption, Some(Interruption::CancelTurn)) {
-        ui.state.push_line("cancelled".into(), LineKind::Dim);
-    }
     store
         .append(root, session_name, &agent.history()[*persisted..])
         .await?;
@@ -690,7 +683,6 @@ async fn run_request(
 
 enum Interruption {
     ExitApp,
-    CancelTurn,
 }
 
 fn route_idle_events(
@@ -705,10 +697,9 @@ fn route_idle_events(
     }
 }
 
-/// Pump an agent future to completion while streaming session events into
-/// the scrollback and keeping the UI responsive. Scroll and input editing
-/// stay available while work is in flight; Ctrl-C cancels the turn (Esc
-/// only leaves the current view: detach from a session or close the panel).
+/// Pump an agent future while keeping the UI responsive. Scroll and input
+/// editing stay available; Ctrl-C cancels the main turn and exits. When the
+/// task panel is open it still cancels only the selected task.
 async fn drive<T>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut TuiState,
@@ -779,8 +770,8 @@ async fn drive<T>(
                     }
                     draw(terminal, state)?;
                 }
-                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press && is_cancel(key) => {
-                    return Ok((None, Some(Interruption::CancelTurn)));
+                Some(Ok(Event::Key(key))) if exits_active_main_turn(key) => {
+                    return Ok((None, Some(Interruption::ExitApp)));
                 }
                 // Not attached: Esc during a turn closes the tasks panel
                 // (leave-the-current-view), it never cancels the turn.
@@ -1542,6 +1533,10 @@ fn is_exit(key: KeyEvent) -> bool {
 /// tasks panel) so its meaning is consistent everywhere.
 fn is_cancel(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn exits_active_main_turn(key: KeyEvent) -> bool {
+    key.kind == crossterm::event::KeyEventKind::Press && is_cancel(key)
 }
 
 /// Safe terminal-title string: strip ASCII/C1 controls, collapse whitespace,
@@ -3174,6 +3169,18 @@ mod tests {
         assert_eq!(rendered.len(), 1);
         assert_eq!(rendered[0].spans.len(), 1);
         assert_eq!(rendered[0].spans[0].content, "the actual rendered line");
+    }
+
+    #[test]
+    fn ctrl_c_exits_an_active_main_turn() {
+        assert!(exits_active_main_turn(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!exits_active_main_turn(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
     }
 
     #[test]
