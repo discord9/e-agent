@@ -1034,7 +1034,11 @@ fn draw<'a, B: ratatui::backend::Backend>(
                 }
             }
             {
-                let usage = cwd_usage_text(&attached.state.cwd, attached.state.tokens_context);
+                let (usage, fg) = cwd_usage_text(
+                    &attached.state.cwd,
+                    attached.state.tokens_context,
+                    attached.state.context_window,
+                );
                 let width = UnicodeWidthStr::width(usage.as_str()) as u16 + 1;
                 if input.width > width + 1 {
                     let area = ratatui::layout::Rect {
@@ -1044,11 +1048,8 @@ fn draw<'a, B: ratatui::backend::Backend>(
                         height: 1,
                     };
                     frame.render_widget(
-                        Paragraph::new(usage).style(
-                            Style::default()
-                                .fg(SOLARIZED_LIGHT.orange)
-                                .bg(SOLARIZED_LIGHT.panel),
-                        ),
+                        Paragraph::new(usage)
+                            .style(Style::default().fg(fg).bg(SOLARIZED_LIGHT.panel)),
                         area,
                     );
                 }
@@ -1079,7 +1080,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
             });
         // cwd is always shown; the context-token count appears once the
         // first turn has reported usage.
-        let usage = cwd_usage_text(&state.cwd, state.tokens_context);
+        let (usage, fg) = cwd_usage_text(&state.cwd, state.tokens_context, state.context_window);
         let (cursor_row, cursor_col) = state.input.wrapped_cursor(inner_input_width);
         let inner_input_height = usize::from(input.height.saturating_sub(2));
         let input_scroll = cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
@@ -1130,11 +1131,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
                     height: 1,
                 };
                 frame.render_widget(
-                    Paragraph::new(usage).style(
-                        Style::default()
-                            .fg(SOLARIZED_LIGHT.orange)
-                            .bg(SOLARIZED_LIGHT.panel),
-                    ),
+                    Paragraph::new(usage).style(Style::default().fg(fg).bg(SOLARIZED_LIGHT.panel)),
                     area,
                 );
             }
@@ -1200,15 +1197,40 @@ fn model_role_spans(model_name: &str, role_name: Option<&str>) -> Vec<Span<'stat
 }
 
 /// Format the bottom-right overlay text: cwd with optional context-token
-/// count. Shared by the main and attached views. A cwd under `$HOME` is
-/// shortened to `~/…` to keep the overlay narrow.
-fn cwd_usage_text(cwd: &str, tokens_context: u64) -> String {
+/// count and optional window/percentage display. Returns the text and the
+/// foreground color (orange normally, red when >= 80% of context window).
+/// Shared by the main and attached views. A cwd under `$HOME` is shortened
+/// to `~/…` to keep the overlay narrow.
+fn cwd_usage_text(cwd: &str, tokens_context: u64, context_window: Option<u64>) -> (String, Color) {
     let cwd = shorten_home(cwd);
-    if tokens_context > 0 {
-        format!("{} ctx {}", cwd, format_tokens(tokens_context))
-    } else {
-        cwd.into_owned()
+    if tokens_context == 0 {
+        return (cwd.into_owned(), SOLARIZED_LIGHT.orange);
     }
+    let (text, pct_high) = match context_window {
+        Some(window) if window > 0 => {
+            let pct = (tokens_context as f64 / window as f64 * 100.0).round() as u64;
+            let high = tokens_context >= window.saturating_mul(80) / 100;
+            (
+                format!(
+                    "{} ctx {} {}%",
+                    cwd,
+                    format_tokens(tokens_context),
+                    pct.min(100)
+                ),
+                high,
+            )
+        }
+        _ => (
+            format!("{} ctx {}", cwd, format_tokens(tokens_context)),
+            false,
+        ),
+    };
+    let fg = if pct_high {
+        SOLARIZED_LIGHT.red
+    } else {
+        SOLARIZED_LIGHT.orange
+    };
+    (text, fg)
 }
 
 /// Replace a leading `$HOME` with `~` (e.g. `/home/alice/work` → `~/work`).
@@ -1343,6 +1365,9 @@ struct TuiState {
     streamed: bool,
     active_lane: Option<ActiveStreamLane>,
     tokens_context: u64,
+    /// Configured context window (token count) from the model profile, used
+    /// to display a usage percentage and trigger the red style at >= 80%.
+    context_window: Option<u64>,
     /// Prompts submitted while a turn is in flight; drained (never persisted)
     /// once the current turn ends.
     queued: Vec<String>,
@@ -2656,27 +2681,53 @@ mod tests {
     fn cwd_usage_text_shortens_home_to_tilde() {
         let home = std::env::var_os("HOME").expect("tests run with HOME set");
         let home = home.to_string_lossy().into_owned();
+        let (text, fg) = cwd_usage_text(&format!("{home}/work"), 0, None);
+        assert_eq!(text, "~/work", "paths under $HOME collapse to ~");
+        assert_eq!(fg, SOLARIZED_LIGHT.orange, "zero tokens uses orange");
+        let (text, _fg) = cwd_usage_text(&home, 0, None);
+        assert_eq!(text, "~", "$HOME itself collapses to ~");
+        let (text, _fg) = cwd_usage_text("/elsewhere", 0, None);
+        assert_eq!(text, "/elsewhere", "paths outside $HOME stay absolute");
+        let (text, _fg) = cwd_usage_text(&format!("{home}x"), 0, None);
         assert_eq!(
-            cwd_usage_text(&format!("{home}/work"), 0),
-            "~/work",
-            "paths under $HOME collapse to ~"
-        );
-        assert_eq!(cwd_usage_text(&home, 0), "~", "$HOME itself collapses to ~");
-        assert_eq!(
-            cwd_usage_text("/elsewhere", 0),
-            "/elsewhere",
-            "paths outside $HOME stay absolute"
-        );
-        assert_eq!(
-            cwd_usage_text(&format!("{home}x"), 0),
+            text,
             format!("{home}x"),
             "a sibling sharing the prefix is not shortened"
         );
+        let (text, _fg) = cwd_usage_text(&format!("{home}/work"), 1_500, None);
         assert_eq!(
-            cwd_usage_text(&format!("{home}/work"), 1_500),
-            "~/work ctx 1.5k",
+            text, "~/work ctx 1.5k",
             "token count still appended after shortening"
         );
+    }
+
+    #[test]
+    fn cwd_usage_text_shows_percentage_with_context_window() {
+        let (text, fg) = cwd_usage_text("/repo", 45_000, Some(131_072));
+        assert_eq!(text, "/repo ctx 45.0k 34%");
+        assert_eq!(fg, SOLARIZED_LIGHT.orange, "34% < 80% uses orange");
+    }
+
+    #[test]
+    fn cwd_usage_text_uses_red_at_80_percent_or_higher() {
+        let (text, fg) = cwd_usage_text("/repo", 104_858, Some(131_072));
+        // 104858 / 131072 ≈ 80.0% — at the boundary
+        assert!(text.contains("80%"), "text = {text:?}");
+        assert_eq!(fg, SOLARIZED_LIGHT.red, ">= 80% uses red");
+
+        let (text, fg) = cwd_usage_text("/repo", 131_072, Some(131_072));
+        assert!(text.contains("100%"), "text = {text:?}");
+        assert_eq!(fg, SOLARIZED_LIGHT.red);
+
+        let (_text, fg) = cwd_usage_text("/repo", 1_500, Some(131_072));
+        assert_eq!(fg, SOLARIZED_LIGHT.orange, "1% uses orange");
+    }
+
+    #[test]
+    fn cwd_usage_text_behaves_normally_without_window() {
+        let (text, fg) = cwd_usage_text("/repo", 1_500, None);
+        assert_eq!(text, "/repo ctx 1.5k");
+        assert_eq!(fg, SOLARIZED_LIGHT.orange);
     }
 
     #[tokio::test]
