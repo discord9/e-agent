@@ -366,7 +366,6 @@ CREATE TABLE IF NOT EXISTS session_entries (
     entry_kind      STRING       NOT NULL,
     payload         STRING       NOT NULL,
     schema_version  INT          NOT NULL DEFAULT 1,
-    agent_role      STRING       NOT NULL DEFAULT 'main',
     is_error        BOOLEAN      NOT NULL DEFAULT FALSE,
     appended_at     TIMESTAMP(9) NOT NULL DEFAULT now(),
     PRIMARY KEY (workspace_id, session_id)
@@ -391,9 +390,78 @@ with the same name in different workspaces remain isolated.
 
 | Operation | Query | Optimization |
 |-----------|-------|-------------|
-| connect (find max seq) | `last_value(seq ORDER BY event_time ASC) GROUP BY workspace_id, session_id` | LastRow scan hint → reads ~2 rows |
+| connect (find max seq) | `SELECT MAX(seq) ... WHERE workspace_id=$1 AND session_id=$2` | Full partition scan (acceptable, sessions are bounded) |
 | load (all entries) | `SELECT seq, payload ... ORDER BY event_time DESC` | WindowedSortExec + app-side HashMap dedup |
 | append | Parameterized multi-row INSERT | Single statement, all-or-nothing per chunk |
+
+### Import tool: `e-agent-import-jsonl`
+
+A standalone binary for manual, incremental JSONL-to-GreptimeDB import. Only
+appends entries that do not yet exist, and refuses to write when the existing
+DB prefix diverges from the JSONL file. Re-runnable under idle target+strict prefix conditions; not physically idempotent (identical-payload duplicates are folded, divergent duplicates rejected).
+
+#### Build
+
+```sh
+cargo build --features greptime --bin e-agent-import-jsonl
+```
+
+#### Usage
+
+```sh
+e-agent-import-jsonl --session <SESSION_ID> [--workspace <PATH>] [--conn <CONN>] \
+    [--dry-run]
+```
+
+- `--session` (required) — session name matching `[a-zA-Z0-9_-]+`.
+- `--workspace` (default: current directory) — workspace root; canonicalised
+  and used to derive the `workspace_id` that scopes the session.
+- `--conn` (default: from config `[session] backend = "greptime"`) — pg-wire
+  connection string (e.g. `"host=127.0.0.1 port=4002 dbname=public"`).
+- `--dry-run` — print the range that *would* be appended without inserting rows.
+  NOTE: still connects to DB, which may execute CREATE TABLE.
+
+#### Safety
+
+1. The tool requires the JSONL file at exactly `.e-agent/sessions/<id>.jsonl`
+   to exist (empty files are valid). Legacy `.json` format is rejected.
+2. The DB's seq values are verified to be strictly 0..N continuous before
+   planning (gaps or divergent duplicates cause a hard error; identical-payload
+   duplicates are silently folded).
+3. If the DB has **more** entries than the JSONL file, the tool errors out
+   without writing — it will never truncate.
+4. If the existing DB prefix **differs** from the same-length prefix of the
+   JSONL file, the tool reports the first divergent sequence number and
+   refuses to write.
+5. When the prefix matches, the tool re-reads the DB immediately before
+   writing (TOCTOU mitigation) to detect concurrent changes. If the DB
+   changed, the tool errors out.
+6. After writing, the tool reloads the DB and verifies it matches the JSONL
+   file exactly by length and per-entry content. Verification failure is
+   reported as an error.
+7. **Not safe for concurrent writers**: GreptimeDB has no transactions, so a
+   concurrent writer between the pre-write check and the INSERT can still
+   race. Ensure the target session is **idle** during import.
+8. **Partial commits**: chunks of >9000 entries use separate INSERT
+   statements. If the first chunk commits and the second fails, some entries
+   are written. Fix the issue (e.g. network, JSONL source) and re-run.
+9. **Duplicate handling**: identical physical duplicates (same seq, same
+   payload) are folded silently. Divergent duplicates (same seq, different
+   payload) cause a hard error — stop writers, inspect with SQL, and resolve
+   manually.
+
+
+
+#### Example
+
+```sh
+# Dry-run to see what would be imported
+e-agent-import-jsonl --session 20250331-120000-abc3 --dry-run
+
+# Real import (normal append, prefix must match)
+e-agent-import-jsonl --session 20250331-120000-abc3
+
+```
 
 ### Tests
 
@@ -440,8 +508,8 @@ merge or concatenation.
 GreptimeDB-specific non-goals (when built with `--features greptime`):
 
 - No automatic migration of existing JSONL sessions — existing JSONL sessions
-  are not migrated to GreptimeDB at startup (a one-shot importer was built and
-  used during the PoC; removed before merge as an experiment artifact)
+  are not migrated to GreptimeDB at startup; use `e-agent-import-jsonl` for
+  manual incremental import
 - No automatic migration between backends — switching backends in config does
   not transfer session data
 - No cross-workspace session sharing — sessions with the same name in

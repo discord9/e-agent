@@ -43,6 +43,11 @@ pub fn derive_workspace_id(root: &Path) -> String {
 /// strict ordering within a process: if two entries land in the same
 /// microsecond (or the clock goes backwards), the later one gets prev+1.
 /// Returns microseconds since Unix epoch.
+///
+/// Precision note: `TIMESTAMP(9)` stores up to nanosecond precision, but
+/// this function only guarantees microsecond granularity. Timestamps from
+/// this function are stored as microseconds-since-epoch and converted to
+/// nanoseconds for the `chrono::NaiveDateTime` used by tokio-postgres.
 fn next_event_time_us() -> i64 {
     use std::sync::atomic::{AtomicI64, Ordering};
     static LAST: AtomicI64 = AtomicI64::new(0);
@@ -116,19 +121,20 @@ impl GreptimeSession {
             .await
             .context("cannot create session_entries table")?;
 
-        // Find the current max seq via LastRow scan (reads ~2 rows instead of
-        // scanning the entire session). Falls back to -1 for new sessions.
+        // Find the current max seq via COALESCE(MAX(seq), -1).
+        // Returns -1 for an empty session (no rows for the workspace/session).
+        // Scans the full session partition, which is acceptable because
+        // sessions are append-only and bounded by typical turn counts.
         let row = client
-            .query_opt(
-                "SELECT last_value(seq ORDER BY event_time ASC) AS last_seq \
+            .query_one(
+                "SELECT COALESCE(MAX(seq), -1)::BIGINT AS max_seq \
                  FROM session_entries \
-                 WHERE workspace_id = $1 AND session_id = $2 \
-                 GROUP BY workspace_id, session_id",
+                 WHERE workspace_id = $1 AND session_id = $2",
                 &[&workspace_id, &session_id],
             )
             .await
-            .context("cannot query last seq")?;
-        let max_seq: i64 = row.map_or(-1, |r| r.get("last_seq"));
+            .context("cannot query max seq")?;
+        let max_seq: i64 = row.get("max_seq");
 
         Ok(Self {
             client,
@@ -138,39 +144,80 @@ impl GreptimeSession {
         })
     }
 
-    /// Load all entries for this session. Queries by TIME INDEX (DESC) and
-    /// deduplicates by seq in application code — first occurrence wins (which
-    /// is the latest write for that seq, since we're scanning newest-first).
+    /// Load all entries for this session. Delegates to `load_with_seq`.
     pub async fn load(&self) -> Result<Vec<SessionEntry>> {
+        self.load_with_seq()
+            .await
+            .map(|v| v.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Load entries paired with their sequence numbers. Used by the JSONL
+    /// import tool to validate that seq values are strictly 0..N continuous.
+    ///
+    /// **Duplicate handling**: if the same seq has multiple physical rows
+    /// with identical payload (identical deserialized `SessionEntry`), they
+    /// are folded into one logical entry. If any duplicate seq has
+    /// **divergent** payloads (different `SessionEntry`), this returns an
+    /// error with the seq, session id, and manual-inspection guidance.
+    pub async fn load_with_seq(&self) -> Result<Vec<(i64, SessionEntry)>> {
         let rows = self
             .client
             .query(
                 "SELECT seq, payload FROM session_entries \
                  WHERE workspace_id = $1 AND session_id = $2 \
-                 ORDER BY event_time DESC",
+                 ORDER BY seq, event_time DESC",
                 &[&self.workspace_id, &self.session_id],
             )
             .await
             .context("cannot load session entries")?;
 
-        // Dedup: keep first occurrence per seq (latest write, since DESC).
-        let mut seen = std::collections::HashMap::with_capacity(rows.len());
+        // Group all payloads per seq, then validate rather than picking a
+        // winner.
+        let mut per_seq: std::collections::HashMap<i64, Vec<&str>> =
+            std::collections::HashMap::with_capacity(rows.len().min(64));
         for row in &rows {
             let seq: i64 = row.get("seq");
             let payload: &str = row.get("payload");
-            seen.entry(seq).or_insert(payload);
+            per_seq.entry(seq).or_default().push(payload);
         }
 
-        // Sort by seq ascending and deserialize.
-        let mut pairs: Vec<_> = seen.into_iter().collect();
-        pairs.sort_by_key(|(seq, _)| *seq);
+        let mut seqs: Vec<i64> = per_seq.keys().copied().collect();
+        seqs.sort_unstable();
 
-        let mut entries = Vec::with_capacity(pairs.len());
-        for (seq, payload) in pairs {
-            let entry: SessionEntry = serde_json::from_str(payload)
+        let mut entries = Vec::with_capacity(seqs.len());
+        for seq in seqs {
+            let payloads = &per_seq[&seq];
+
+            // Deserialize first occurrence to check for divergence.
+            let first_entry: SessionEntry = serde_json::from_str(payloads[0])
                 .with_context(|| format!("cannot decode session {} seq {seq}", self.session_id))?;
-            entries.push(entry);
+
+            // Check duplicates for divergent payloads.
+            for (i, &payload) in payloads.iter().enumerate().skip(1) {
+                let other: SessionEntry = serde_json::from_str(payload).with_context(|| {
+                    format!(
+                        "cannot decode session {} seq {seq} (dup {i})",
+                        self.session_id
+                    )
+                })?;
+                if other != first_entry {
+                    anyhow::bail!(
+                        "session '{}' seq {seq} has divergent physical duplicates; \
+                         cannot safely load. Stop writers, inspect with SQL:\n\
+                         SELECT * FROM session_entries \
+                         WHERE workspace_id = '{}' AND session_id = '{}' AND seq = {seq}\n\
+                         ORDER BY event_time;\n\
+                         Resolve manually (new session or repair) then re-run import.",
+                        self.session_id,
+                        self.workspace_id,
+                        self.session_id,
+                    );
+                }
+            }
+
+            entries.push((seq, first_entry));
         }
+
         Ok(entries)
     }
 
@@ -181,20 +228,20 @@ impl GreptimeSession {
     /// or commits zero. Serialization happens before any DB write.
     ///
     /// Chunking: tokio-postgres / pg-wire allows at most 65535 bound
-    /// parameters, so entries are chunked at 10000 per statement
-    /// (70000 params). >10000-entry appends can partially commit across
-    /// chunks; acceptable, turns are far smaller.
+    /// parameters. With 7 params per row, max row count is 65535/7 = 9362.
+    /// We use 9000 to leave headroom. >9000-entry appends can partially
+    /// commit across chunks; acceptable, turns are far smaller.
     ///
     /// `next_seq` is computed once before any chunk loop. On failure
     /// `next_seq` is unchanged, so retries of the same slice reuse the same
-    /// seq range. Duplicates of a fully-committed-then-retried batch are
-    /// handled by read-side dedup (equal seq, first-wins by event_time DESC).
+    /// seq range. Identical-payload duplicates from a fully-committed-then-retried
+    /// batch are folded by the read path.
     pub async fn append(&mut self, entries: &[SessionEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
         let n = entries.len();
-        const CHUNK_SIZE: usize = 10000;
+        const CHUNK_SIZE: usize = 9000;
 
         // Serialize all entries upfront so serialization errors happen
         // before any database write.
@@ -247,9 +294,12 @@ impl GreptimeSession {
     }
 }
 
-/// Build a multi-row INSERT with 7 bound parameters per row (workspace_id, session_id, seq, event_time, entry_kind, payload, schema_version, is_error).
+/// Build a multi-row INSERT with 7 bound parameters per row (workspace_id,
+/// session_id, seq, event_time, entry_kind, payload, is_error);
+/// schema_version is hardcoded as 1.
 /// Example (1 row):
-/// `INSERT INTO session_entries (workspace_id, session_id, seq, event_time, entry_kind, payload, schema_version, is_error) VALUES ($1,$2,$3,$4,$5,$6,1,$7)`
+/// `INSERT INTO session_entries (workspace_id, session_id, seq, event_time,
+///  entry_kind, payload, schema_version, is_error) VALUES ($1,$2,$3,$4,$5,$6,1,$7)`
 fn build_multi_row_insert(row_count: usize) -> String {
     let mut sql = String::with_capacity(200 + row_count * 50);
     sql.push_str(
@@ -407,7 +457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_retry_dedup() {
+    async fn duplicate_retry_fold_identical() {
         let conn = conn_str();
         if conn == "skipped" {
             eprintln!("skipping: GREPTIME_PG not set");
@@ -432,14 +482,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_is_atomic_per_call() {
+    async fn append_appends_with_contiguous_seq() {
         let conn = conn_str();
         if conn == "skipped" {
             eprintln!("skipping: GREPTIME_PG not set");
             return;
         }
         let wid = workspace_id();
-        let sid = format!("test-gt-atomic-{}", crate::session::new_id());
+        let sid = format!("test-gt-seq-{}", crate::session::new_id());
         let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         let entries = test_entries();
 

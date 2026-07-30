@@ -33,5 +33,10 @@ webbrowser = "1"
 [dev-dependencies]
 tempfile = "3"
 
+[[bin]]
+name = "e-agent-import-jsonl"
+path = "src/bin/import_jsonl.rs"
+required-features = ["greptime"]
+
 [features]
 greptime = ["dep:tokio-postgres"]
