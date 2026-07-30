@@ -89,8 +89,7 @@ contract through `Agent::emit` → fanout to `event_handler` + all `observers`:
 - The ONLY intentional asymmetry: `compact()` deltas go to the handler only,
   because compaction is background maintenance and must not paint over a
   session's visible scrollback.
-- Never drop a SessionSink based on live-receiver count — a session with no
-  attached view has zero receivers but its log must keep filling.
+- A runner session with no attached view must still keep filling its shared event log.
 - A failed turn emits its error as an event too; a session must never fail
   silently into an empty log.
 

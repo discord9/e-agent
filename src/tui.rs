@@ -1,6 +1,5 @@
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::cursor::Show;
@@ -25,7 +24,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::{AgentEvent, preview};
 use crate::delegate::Sessions;
-use crate::handle::SessionHandle;
 use crate::runner::{SessionHandle as RunnerHandle, SessionStatus, SessionTask};
 
 /// Events on the shared UI channel are tagged by session id: `0` is the
@@ -169,10 +167,10 @@ impl Palette {
 /// bridges forwarding every future delta.
 fn bridge(
     session_id: u64,
-    handle: &dyn SessionHandle,
+    handle: &RunnerHandle,
     sender: mpsc::UnboundedSender<UiEvent>,
 ) -> tokio::task::AbortHandle {
-    let mut stream = handle.subscribe();
+    let mut stream = handle.attach().1;
     tokio::spawn(async move {
         loop {
             match stream.recv().await {
@@ -222,7 +220,7 @@ fn attach_to_task(
     state.attach(
         task_id,
         label,
-        Arc::new(entry.handle.clone()),
+        entry.handle.clone(),
         entry.model.clone(),
         entry.role.clone(),
         entry.cwd.clone(),
@@ -365,7 +363,7 @@ async fn run_inner(
                     if active && is_cancel(key) { handle.cancel(); continue; }
                     if !active && is_exit(key) { return Ok(()); }
                     if is_scroll_key(key) { state.handle_scroll(key); drain_ready_scroll_keys(&mut events,&mut state).await; }
-                    else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.send_input(prompt); } }
+                    else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
                 Some(Ok(Event::Paste(text))) => state.input.insert(&text.replace("\r\n","\n").replace('\r',"\n")),
                 Some(Ok(_)) => {}, Some(Err(error)) => return Err(error.into()), None => return Ok(()),
@@ -1203,7 +1201,7 @@ struct AttachedView {
     /// so re-attaching cannot forward each delta twice.
     bridge: Option<tokio::task::AbortHandle>,
     /// The session seam: snapshot/subscribe/send_input/cancel.
-    handle: Arc<dyn SessionHandle>,
+    handle: RunnerHandle,
     /// Input buffer for steering prompts.
     input: InputBuffer,
     /// Vertical scroll of the steering input (multi-line).
@@ -1549,7 +1547,7 @@ impl TuiState {
         &mut self,
         id: u64,
         label: String,
-        handle: Arc<dyn SessionHandle>,
+        handle: RunnerHandle,
         model_name: String,
         role_name: Option<String>,
         cwd: String,
@@ -1623,7 +1621,7 @@ impl TuiState {
                     // send_input records a UserPrompt event in the session
                     // log/stream, which renders the `you>` line (queued or
                     // not) via the normal event path.
-                    attached.handle.send_input(prompt);
+                    attached.handle.prompt(prompt);
                 }
             }
             _ if is_cancel(key) && !attached.finished => attached.handle.cancel(),
@@ -2596,7 +2594,7 @@ mod tests {
 
     /// Test helper: attach with default metadata, mirroring the old 3-arg
     /// signature for minimal test churn.
-    fn attach_test(state: &mut TuiState, id: u64, label: &str, handle: Arc<dyn SessionHandle>) {
+    fn attach_test(state: &mut TuiState, id: u64, label: &str, handle: RunnerHandle) {
         state.attach(
             id,
             label.into(),
@@ -2676,9 +2674,9 @@ mod tests {
 
     #[test]
     fn f2_toggles_the_panel_while_attached() {
-        let (handle, _sink, _source) = crate::handle::session_channel();
+        let (handle, _sink, _source) = crate::runner::session_test_channel();
         let mut state = TuiState::default();
-        attach_test(&mut state, 7, "demo", Arc::new(handle));
+        attach_test(&mut state, 7, "demo", handle);
         assert!(!state.show_tasks);
         state.handle_attached_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()), 80);
         assert!(state.show_tasks, "F2 opens the panel while attached");
@@ -2708,9 +2706,9 @@ mod tests {
 
     #[tokio::test]
     async fn idle_attached_view_routes_ready_deltas_without_reattach() {
-        let (handle, _sink, _source) = crate::handle::session_channel();
+        let (handle, _sink, _source) = crate::runner::session_test_channel();
         let mut state = TuiState::default();
-        attach_test(&mut state, 7, "demo", Arc::new(handle));
+        attach_test(&mut state, 7, "demo", handle);
         let (sender, mut inbox) = mpsc::unbounded_channel();
         for text in ["live ", "while ", "idle"] {
             sender
@@ -2731,15 +2729,15 @@ mod tests {
 
     #[tokio::test]
     async fn reattaching_forwards_each_delta_once() {
-        let (handle, sink, _source) = crate::handle::session_channel();
+        let (handle, sink, _source) = crate::runner::session_test_channel();
         let (sender, mut inbox) = mpsc::unbounded_channel();
         let mut state = TuiState::default();
-        attach_test(&mut state, 7, "demo", Arc::new(handle.clone()));
+        attach_test(&mut state, 7, "demo", handle.clone());
         state.attached.as_mut().unwrap().bridge = Some(bridge(7, &handle, sender.clone()));
         state.detach();
         tokio::task::yield_now().await;
 
-        attach_test(&mut state, 7, "demo", Arc::new(handle.clone()));
+        attach_test(&mut state, 7, "demo", handle.clone());
         state.attached.as_mut().unwrap().bridge = Some(bridge(7, &handle, sender));
         sink.emit(AgentEvent::AssistantDelta("你".into()));
         let first = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
@@ -2758,7 +2756,7 @@ mod tests {
 
     #[test]
     fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
-        let (handle, sink, _source) = crate::handle::session_channel();
+        let (handle, sink, _source) = crate::runner::session_test_channel();
         let mut state = TuiState::default();
         sink.emit(AgentEvent::AssistantDelta("partial".into()));
         sink.emit(AgentEvent::ToolCall {
@@ -2769,7 +2767,7 @@ mod tests {
             is_error: false,
             content: "files".into(),
         });
-        attach_test(&mut state, 7, "demo task", Arc::new(handle));
+        attach_test(&mut state, 7, "demo task", handle);
         let lines: Vec<_> = state
             .attached
             .as_ref()
@@ -2815,11 +2813,11 @@ mod tests {
         // BackgroundCompleted arriving via the bridge (session id != 0)
         // must clear the spinner and mark the view finished, same as the
         // main-session path.
-        let (handle, sink, _source) = crate::handle::session_channel();
+        let (handle, sink, _source) = crate::runner::session_test_channel();
         let mut state = TuiState::default();
         // Attach with an unfinished session (no BackgroundCompleted in log).
         sink.emit(AgentEvent::AssistantDelta("working...".into()));
-        attach_test(&mut state, 7, "demo task", Arc::new(handle));
+        attach_test(&mut state, 7, "demo task", handle);
         let attached = state.attached.as_ref().unwrap();
         assert!(!attached.finished);
         assert!(attached.state.busy.is_some(), "spinner should be active");
@@ -2841,7 +2839,7 @@ mod tests {
     fn attach_after_completion_marks_finished_from_the_snapshot() {
         // Regression: a completion that raced into the session log before
         // the attach left the view stuck in "running" forever.
-        let (handle, sink, _source) = crate::handle::session_channel();
+        let (handle, sink, _source) = crate::runner::session_test_channel();
         sink.emit(AgentEvent::AssistantText("work".into()));
         sink.emit(AgentEvent::BackgroundCompleted {
             id: 3,
@@ -2849,7 +2847,7 @@ mod tests {
             label: None,
         });
         let mut state = TuiState::default();
-        attach_test(&mut state, 3, "demo task", Arc::new(handle));
+        attach_test(&mut state, 3, "demo task", handle);
         assert!(state.attached.as_ref().unwrap().finished);
     }
 
@@ -2873,37 +2871,27 @@ mod tests {
 
     #[test]
     fn attached_enter_steers_and_ctrl_c_cancels_through_the_handle() {
-        let (handle, _sink, mut source) = crate::handle::session_channel();
+        let (handle, _sink, mut source) = crate::runner::session_test_channel();
         let mut state = TuiState::default();
-        attach_test(&mut state, 7, "demo task", Arc::new(handle));
+        attach_test(&mut state, 7, "demo task", handle);
         {
             let attached = state.attached.as_mut().unwrap();
             attached.input.insert("please also check tests");
         }
         state.handle_attached_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), 80);
         assert_eq!(
-            source.try_recv(),
-            Some(crate::handle::Steer::Prompt(
+            source.try_recv().ok(),
+            Some(crate::runner::SessionCommand::Prompt(
                 "please also check tests".into()
             ))
         );
-        // The steering prompt is recorded in the session log (snapshot
-        // replays it as a `you>` line on the next event).
-        assert_eq!(
-            state.attached.as_ref().unwrap().handle.snapshot(),
-            vec![AgentEvent::UserPrompt("please also check tests".into())]
-        );
-        // Re-attach replays the snapshot including the queued prompt.
-        let handle = state.attached.as_ref().unwrap().handle.clone();
-        attach_test(&mut state, 7, "demo task", handle);
-        let lines = &state.attached.as_ref().unwrap().state.lines;
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.text == "you> please also check tests")
-        );
+        // The runner records UserPrompt only after persistence succeeds;
+        // this channel-only fixture has no running persistence loop.
         state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
-        assert_eq!(source.try_recv(), Some(crate::handle::Steer::Cancel));
+        assert_eq!(
+            source.try_recv().ok(),
+            Some(crate::runner::SessionCommand::Cancel)
+        );
         // Finished sessions no longer accept steering.
         state.push_event(UiEvent {
             session: 0,
@@ -2914,12 +2902,12 @@ mod tests {
             },
         });
         state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
-        assert_eq!(source.try_recv(), None);
+        assert_eq!(source.try_recv().ok(), None);
     }
 
     #[test]
     fn attached_view_scrolls_independently() {
-        let (handle, _sink, _source) = crate::handle::session_channel();
+        let (handle, _sink, _source) = crate::runner::session_test_channel();
         let mut state = TuiState {
             window: ScrollWindow {
                 local_offset: 2,
@@ -2927,7 +2915,7 @@ mod tests {
             },
             ..Default::default()
         };
-        attach_test(&mut state, 1, "task", Arc::new(handle));
+        attach_test(&mut state, 1, "task", handle);
         {
             let attached = state.attached.as_mut().unwrap();
             attached.state.lines.push(DisplayLine {
@@ -3055,7 +3043,7 @@ mod tests {
             Some(Ok(Event::Key(key))) if key == typing
         ));
 
-        let (handle, _sink, _source) = crate::handle::session_channel();
+        let (handle, _sink, _source) = crate::runner::session_test_channel();
         let mut parent = TuiState {
             window: ScrollWindow {
                 local_offset: 7,
@@ -3063,7 +3051,7 @@ mod tests {
             },
             ..Default::default()
         };
-        attach_test(&mut parent, 1, "task", Arc::new(handle));
+        attach_test(&mut parent, 1, "task", handle);
         let mut events = futures_util::stream::iter(vec![
             Ok::<_, io::Error>(Event::Key(down)),
             Ok(Event::Key(typing)),
@@ -3376,7 +3364,7 @@ mod tests {
     fn attached_view_paints_input_corners_like_the_main_view() {
         let backend = ratatui::backend::TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).unwrap();
-        let (handle, sink, _source) = crate::handle::session_channel();
+        let (handle, sink, _source) = crate::runner::session_test_channel();
         sink.emit(AgentEvent::Usage {
             context_input: 1_500,
             session: crate::agent::Usage {
@@ -3388,7 +3376,7 @@ mod tests {
         state.attach(
             7,
             "demo task".into(),
-            Arc::new(handle),
+            handle,
             "deepseek-v4-flash".into(),
             Some("fixer".into()),
             "/repo".into(),
@@ -3441,7 +3429,7 @@ mod tests {
     fn attached_title_shows_finished_before_subagent_label() {
         let backend = ratatui::backend::TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).unwrap();
-        let (_handle, sink, _source) = crate::handle::session_channel();
+        let (_handle, sink, _source) = crate::runner::session_test_channel();
         // Emit a completion so the attach marks the view as finished.
         sink.emit(AgentEvent::BackgroundCompleted {
             id: 3,
@@ -3452,7 +3440,7 @@ mod tests {
         state.attach(
             3,
             "quick job".into(),
-            Arc::new(_handle),
+            _handle,
             String::new(),
             None,
             String::new(),
@@ -3479,7 +3467,7 @@ mod tests {
     fn attached_title_shows_running_status_before_subagent_label() {
         let backend = ratatui::backend::TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).unwrap();
-        let (_handle, sink, _source) = crate::handle::session_channel();
+        let (_handle, sink, _source) = crate::runner::session_test_channel();
         // Emit a user prompt so the session has content but is still
         // running (no BackgroundCompleted). After attach with no
         // completion, the busy state is set to thinking; the "running"
@@ -3491,12 +3479,12 @@ mod tests {
         // We use a snapshot that has content but no completion.
         sink.emit(AgentEvent::UserPrompt("do work".into()));
         sink.emit(AgentEvent::AssistantText("working...".into()));
-        let (handle2, _sink2, _source2) = crate::handle::session_channel();
+        let (handle2, _sink2, _source2) = crate::runner::session_test_channel();
         let mut state = TuiState::default();
         state.attach(
             5,
             "long job".into(),
-            Arc::new(handle2),
+            handle2,
             String::new(),
             None,
             String::new(),
@@ -4312,7 +4300,7 @@ mod ux_tests {
 
     #[test]
     fn spinner_frames_are_per_view_not_global() {
-        let (handle, _sink, _source) = crate::handle::session_channel();
+        let (handle, _sink, _source) = crate::runner::session_test_channel();
         let mut parent = TuiState {
             busy: Some(BusyState::thinking()),
             ..Default::default()
@@ -4320,7 +4308,7 @@ mod ux_tests {
         parent.attach(
             1,
             "task".into(),
-            Arc::new(handle),
+            handle,
             String::new(),
             None,
             String::new(),
@@ -4534,7 +4522,7 @@ mod ux_tests {
             label: None,
         }];
         // Create a session channel to capture emitted events.
-        let (handle, sink, _source) = crate::handle::session_channel();
+        let (handle, sink, _source) = crate::runner::session_test_channel();
         // replay_scrollback is crate-visible; the TUI test is in the same
         // crate, so we call its wrapper through the delegate module.
         // Instead, test by constructing the expected event directly.

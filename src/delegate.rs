@@ -10,8 +10,7 @@
 //! [`AgentEvent::BackgroundCompleted`] through the parent's event channel,
 //! waking an idle agent (see Slice 1).
 //!
-//! Every background subagent is exposed through a [`LiveSession`] handle
-//! (see `handle.rs`): frontends attach to it for a full live view and can
+//! Every background subagent is exposed through a runner [`SessionHandle`]
 //! steer it (queue prompts / cancel the in-flight turn). Sync delegates
 //! stay single-turn and handle-less.
 //!
@@ -110,7 +109,7 @@ pub struct PersistConfig {
     /// This subagent's session id, assigned at spawn time.
     session_id: String,
     /// Session backend configuration. The subagent connects its own store
-    /// from this at the start of `run_on_thread`.
+    /// from this when starting the runner.
     backend: SessionBackend,
 }
 
@@ -829,7 +828,7 @@ mod tests {
         // it): a background command's completion arrives on the parent's
         // channel even after the subagent is dropped. End-to-end subagent
         // behaviour is covered by agent.rs's shared-sender test; here we
-        // pin the wiring used by run_on_thread.
+        // pin the runner wiring.
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::new(temp.path()).unwrap();
         let (_, mut parent_background) = builtins(workspace.clone(), None);

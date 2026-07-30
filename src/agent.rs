@@ -239,7 +239,6 @@ pub struct Agent {
     /// `event_handler` and `subscriber` (per-turn), these survive across
     /// turns and receive every emitted event. Sinks are dropped once their
     /// session handle is gone.
-    observers: Vec<crate::handle::SessionSink>,
     running_background: HashSet<u64>,
     /// Workspace root + session name used to record in-flight background
     /// tasks, so resuming the same session can report what died. None in tests.
@@ -278,7 +277,6 @@ impl Agent {
             background_receiver,
             pending_background: VecDeque::new(),
             subscriber: None,
-            observers: Vec::new(),
             running_background: HashSet::new(),
             background_record: None,
             session_input_tokens: 0,
@@ -393,20 +391,6 @@ impl Agent {
 
     pub fn subscribe(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         self.subscriber = Some(sender);
-    }
-
-    /// Register a long-lived session sink receiving every event (text,
-    /// tool calls, background completions) across all turns. The matching
-    /// `LiveSession` handle lets a frontend snapshot and follow this agent
-    /// without owning it.
-    pub fn observe(&mut self, sink: crate::handle::SessionSink) {
-        self.observers.push(sink);
-    }
-
-    fn fanout(&self, event: &AgentEvent) {
-        for sink in &self.observers {
-            sink.emit(event.clone());
-        }
     }
 
     pub fn background_task_ids(&self) -> &HashSet<u64> {
@@ -627,7 +611,6 @@ impl Agent {
         let context = self.context();
         let model = &mut self.model;
         let event_handler = &mut self.event_handler;
-        let observers = &self.observers;
         let mut on_delta = |kind: ModelDeltaKind, delta: &str| {
             if kind == ModelDeltaKind::Content {
                 produced_content_delta = true;
@@ -638,9 +621,6 @@ impl Agent {
             };
             if let Some(handler) = event_handler {
                 handler(event.clone());
-            }
-            for sink in observers {
-                sink.emit(event.clone());
             }
         };
         let (assistant, usage) = model.complete(&context, specs, Some(&mut on_delta)).await?;
@@ -741,7 +721,6 @@ impl Agent {
         if let Some(handler) = &mut self.event_handler {
             handler(event.clone());
         }
-        self.fanout(&event);
     }
 
     fn inject_pending_background(&mut self) {
@@ -779,12 +758,11 @@ impl Agent {
     }
 
     pub(crate) fn ack_background_entry(&mut self) {
-        if let Some((id, output, label)) = self.pending_background.pop_front() {
+        if let Some((id, _output, _label)) = self.pending_background.pop_front() {
             self.running_background.remove(&id);
             if let Some((root, session)) = &self.background_record {
                 crate::session::Session::clear_background_task(root, session, id);
             }
-            self.fanout(&AgentEvent::BackgroundCompletionNotice { id, output, label });
         }
     }
 
@@ -855,7 +833,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::handle::SessionHandle;
 
     struct ScriptedModel {
         replies: Vec<AssistantMessage>,
@@ -1168,49 +1145,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observed_events_survive_without_any_subscriber() {
-        // Regression: sinks used to be dropped when no broadcast receiver
-        // existed (TUI not attached yet), wiping the session log — an
-        // attach then saw an empty snapshot.
-        let (handle, sink, _source) = crate::handle::session_channel();
-        use crate::handle::SessionHandle as _;
-        let model = ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some("working".into()),
-                    tool_calls: vec![call("call-1", "echo", r#"{"value":"ok"}"#)],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some("done".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: Arc::new(Mutex::new(Vec::new())),
-            delays: Default::default(),
-        };
-        let mut agent = Agent::new(Box::new(model), vec![Box::new(EchoTool)]);
-        agent.observe(sink);
-        // No handle.subscribe() call: nobody is listening live.
-        assert_eq!(agent.run("hello".into()).await.unwrap(), "done");
-        assert_eq!(
-            handle.snapshot(),
-            vec![
-                AgentEvent::AssistantText("working".into()),
-                AgentEvent::ToolCall {
-                    name: "echo".into(),
-                    arguments: r#"{"value":"ok"}"#.into(),
-                },
-                AgentEvent::ToolResult {
-                    is_error: false,
-                    content: "\"ok\"".into(),
-                },
-            ]
-        );
-    }
-
-    #[tokio::test]
     async fn emits_deltas_without_duplicate_assistant_text() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut agent = Agent::new(Box::new(DeltaModel { calls: 0 }), vec![Box::new(EchoTool)]);
@@ -1236,101 +1170,6 @@ mod tests {
             message,
             Message::Assistant(AssistantMessage { content: Some(content), .. }) if content.contains("thinking")
         )));
-    }
-
-    #[tokio::test]
-    async fn background_completion_notifies_subscriber_once_and_observers_at_turn_boundary() {
-        // Regression: drain_background used to fanout to observers AND the
-        // completion reappeared in the model context as a user message, so
-        // the TUI (which listens to both paths) showed it twice. Now the
-        // transient BackgroundCompleted goes only to the per-turn
-        // subscriber and the observer log gets it as UserPrompt at the
-        // turn boundary.
-        let model = ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: None,
-                    tool_calls: vec![call(
-                        "background-1",
-                        "bash",
-                        r#"{"command":"echo done","background":true}"#,
-                    )],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some("started".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some("next".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: Arc::new(Mutex::new(Vec::new())),
-            delays: Default::default(),
-        };
-        let mut agent = Agent::new(
-            Box::new(model),
-            vec![Box::new(ScriptedBackgroundTool { sender: None })],
-        );
-        let (handle, sink, _source) = crate::handle::session_channel();
-        agent.observe(sink);
-        assert_eq!(agent.run("first".into()).await.unwrap(), "started");
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        // Completion lands while idle: no observer event yet.
-        assert!(
-            handle
-                .snapshot()
-                .iter()
-                .all(|event| !matches!(event, AgentEvent::BackgroundCompleted { .. }))
-        );
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        agent.subscribe(sender);
-        assert_eq!(agent.run("second".into()).await.unwrap(), "next");
-        // Subscriber saw the transient completion exactly once, and the
-        // turn-boundary notice is NOT sent to it (that would render twice
-        // in the TUI, which listens to both paths).
-        let mut transient = 0;
-        let mut notice_notifications = 0;
-        while let Ok(event) = receiver.try_recv() {
-            match event {
-                AgentEvent::BackgroundCompleted { id: 1, .. } => transient += 1,
-                AgentEvent::Notice(text) if text.starts_with("[background task 1 completed]") => {
-                    notice_notifications += 1
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(transient, 1);
-        assert_eq!(notice_notifications, 0);
-        // ...and the observer log holds it once, as the BackgroundCompletionNotice,
-        // never as the transient variant.
-        let snapshot = handle.snapshot();
-        assert!(
-            snapshot
-                .iter()
-                .all(|event| !matches!(event, AgentEvent::BackgroundCompleted { .. }))
-        );
-        assert_eq!(
-            snapshot
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    AgentEvent::BackgroundCompletionNotice { id: 1, .. }
-                ))
-                .count(),
-            1
-        );
-        // The old Notice variant must not be emitted for background completions.
-        assert_eq!(
-            snapshot
-                .iter()
-                .filter(|event| matches!(event, AgentEvent::Notice(text) if text.starts_with("[background task 1 completed]")))
-                .count(),
-            0
-        );
     }
 
     #[tokio::test]
@@ -1430,88 +1269,6 @@ mod tests {
         assert_eq!(agent.run("go".into()).await.unwrap(), "done");
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert!(matches!(
-            requests[2].last().unwrap(),
-            Message::User { content } if content.starts_with("[background task 1 completed]\n")
-        ));
-    }
-
-    #[tokio::test]
-    async fn completion_arriving_during_the_final_tool_call_gets_a_follow_up_turn() {
-        // Regression: a completion that landed while the LAST tool call of a
-        // turn was still executing was drained into pending but never
-        // injected (run_loop had no next round), so the finished line and
-        // the model's reaction both waited for the next user prompt. run()
-        // must inject at turn end and immediately run a follow-up turn so
-        // the model reacts to the completion.
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let model = ScriptedModel {
-            replies: vec![
-                // Round 1: launch the background task.
-                AssistantMessage {
-                    content: None,
-                    tool_calls: vec![call(
-                        "background-1",
-                        "bash",
-                        r#"{"command":"echo done","background":true}"#,
-                    )],
-                    reasoning: None,
-                },
-                // Round 2: the model finishes with no tool call. Its call
-                // is delayed past the background completion (10ms), which
-                // therefore lands mid-turn; with no further rounds, only
-                // turn-end injection keeps it from stranding until the next
-                // prompt.
-                AssistantMessage {
-                    content: Some("done".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                // Follow-up turn: the model reacts to the injected
-                // completion.
-                AssistantMessage {
-                    content: Some("acknowledged".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            // Only round 2 (the final answer) is delayed, so the 10ms
-            // completion lands during the LAST model call of the turn
-            // instead of being picked up by a later round's inject.
-            delays: vec![None, Some(std::time::Duration::from_millis(30))].into(),
-        };
-        let mut agent = Agent::new(
-            Box::new(model),
-            vec![Box::new(ScriptedBackgroundTool { sender: None })],
-        );
-        let (handle, sink, _source) = crate::handle::session_channel();
-        use crate::handle::SessionHandle;
-        agent.observe(sink);
-
-        // run() keeps going until the model has reacted to the completion;
-        // the returned answer is the follow-up turn's.
-        assert_eq!(agent.run("go".into()).await.unwrap(), "acknowledged");
-        // The completion is in the history as a BackgroundCompletion entry...
-        assert!(agent.history().iter().any(|entry| matches!(
-            entry,
-            crate::agent::SessionEntry::BackgroundCompletion { id: 1, .. }
-        )));
-        // ...the observer log shows it exactly once (the BackgroundCompletionNotice)...
-        assert_eq!(
-            handle
-                .snapshot()
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    AgentEvent::BackgroundCompletionNotice { id: 1, .. }
-                ))
-                .count(),
-            1
-        );
-        // ...and the follow-up turn's request carried it to the model.
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 3, "requests: {requests:#?}");
         assert!(matches!(
             requests[2].last().unwrap(),
             Message::User { content } if content.starts_with("[background task 1 completed]\n")
@@ -1675,61 +1432,6 @@ mod tests {
                 .to_string()
                 .contains("nothing to compact")
         );
-    }
-
-    struct CompactDeltaModel;
-
-    #[async_trait]
-    impl Model for CompactDeltaModel {
-        async fn complete(
-            &mut self,
-            _: &[Message],
-            _: &[ToolSpec],
-            mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
-        ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
-            if let Some(callback) = &mut on_delta {
-                callback(ModelDeltaKind::Content, "sum");
-                callback(ModelDeltaKind::Content, "mary");
-            }
-            Ok((
-                AssistantMessage {
-                    content: Some("summary".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                None,
-            ))
-        }
-    }
-
-    #[tokio::test]
-    async fn compact_does_not_stream_deltas_to_observers() {
-        // Per AGENTS.md, compaction deltas go to the handler only, not
-        // observers. The TUI renders /compact from the returned summary,
-        // not from observer deltas.
-        let (handle, sink, _source) = crate::handle::session_channel();
-        use crate::handle::SessionHandle as _;
-        let mut agent = Agent::new(Box::new(CompactDeltaModel), vec![]);
-        agent.observe(sink);
-        agent.restore_history(vec![
-            Message::User {
-                content: "one".into(),
-            }
-            .into(),
-            Message::Assistant(AssistantMessage {
-                content: Some("two".into()),
-                tool_calls: vec![],
-                reasoning: None,
-            })
-            .into(),
-            Message::User {
-                content: "current turn".into(),
-            }
-            .into(),
-        ]);
-        assert_eq!(agent.compact().await.unwrap(), "summary");
-        // Observers see nothing from compaction (no delta events).
-        assert!(handle.snapshot().is_empty());
     }
 
     #[tokio::test]
@@ -2010,82 +1712,5 @@ mod tests {
             &msgs[1],
             Message::User { content } if content == "[background task 2 completed]\nnew style"
         ));
-    }
-
-    #[tokio::test]
-    async fn inject_pending_background_emits_structured_event_and_entry() {
-        // Integration-style: verify the full pipeline from drain→inject
-        // produces the right event type and entry type.
-        let model = ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: None,
-                    tool_calls: vec![call(
-                        "background-1",
-                        "bash",
-                        r#"{"command":"echo done","background":true}"#,
-                    )],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some("started".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some("reacted".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: Arc::new(Mutex::new(Vec::new())),
-            delays: Default::default(),
-        };
-        let mut agent = Agent::new(
-            Box::new(model),
-            vec![Box::new(ScriptedBackgroundTool { sender: None })],
-        );
-        let (handle, sink, _source) = crate::handle::session_channel();
-        agent.observe(sink);
-        // First turn starts the background task and finishes before the
-        // 10ms completion lands.
-        assert_eq!(agent.run("start bg".into()).await.unwrap(), "started");
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        // Second turn: the completion was pending and gets injected at the
-        // turn boundary.
-        assert_eq!(agent.run("react".into()).await.unwrap(), "reacted");
-
-        // The observer log must contain a BackgroundCompletionNotice (not a Notice).
-        let snapshot = handle.snapshot();
-        let completion_notices: Vec<_> = snapshot
-            .iter()
-            .filter(|e| matches!(e, AgentEvent::BackgroundCompletionNotice { .. }))
-            .collect();
-        assert_eq!(
-            completion_notices.len(),
-            1,
-            "expected exactly one BackgroundCompletionNotice, got {snapshot:?}"
-        );
-        // The old Notice variant must NOT contain the background completion text.
-        let old_notices: Vec<_> = snapshot
-            .iter()
-            .filter(|e| matches!(e, AgentEvent::Notice(t) if t.contains("[background task")))
-            .collect();
-        assert!(
-            old_notices.is_empty(),
-            "old Notice variant must not carry background completions: {old_notices:?}"
-        );
-        // The history must contain a BackgroundCompletion entry (not a Notice).
-        assert!(
-            agent
-                .history()
-                .iter()
-                .any(|entry| matches!(entry, SessionEntry::BackgroundCompletion { id: 1, .. }))
-        );
-        // Old Notice entries in history must be zero (no notices for background).
-        assert!(!agent.history().iter().any(|entry| matches!(
-            entry,
-            SessionEntry::Notice { text } if text.contains("[background task")
-        )));
     }
 }

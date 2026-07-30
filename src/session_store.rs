@@ -7,7 +7,7 @@
 //! - **Jsonl** — stateless marker; every call provides `root` + `name`.
 //! - **Greptime** — a connected + session-bound client behind a Mutex so
 //!   `&self` methods work everywhere (including the delegate's closure-based
-//!   `persist_turn` which receives `&PersistConfig`).
+//!   the runner persistence path).
 
 use std::path::Path;
 #[cfg(feature = "greptime")]

@@ -79,7 +79,7 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionCommand {
     Prompt(String),
     Cancel,
@@ -156,19 +156,38 @@ impl SessionHandle {
     }
 }
 
-impl crate::handle::SessionHandle for SessionHandle {
-    fn snapshot(&self) -> Vec<AgentEvent> {
-        self.snapshot()
+#[cfg(test)]
+pub(crate) struct TestSessionEmitter {
+    shared: Arc<Mutex<Shared>>,
+}
+#[cfg(test)]
+impl TestSessionEmitter {
+    pub(crate) fn emit(&self, event: AgentEvent) {
+        self.shared.lock().unwrap().emit(event);
     }
-    fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
-        self.attach().1
-    }
-    fn send_input(&self, prompt: String) {
-        self.prompt(prompt);
-    }
-    fn cancel(&self) {
-        self.cancel();
-    }
+}
+#[cfg(test)]
+pub(crate) fn session_test_channel() -> (
+    SessionHandle,
+    TestSessionEmitter,
+    mpsc::UnboundedReceiver<SessionCommand>,
+) {
+    let (events, _) = broadcast::channel(EVENT_CAPACITY);
+    let (status, _) = watch::channel(SessionStatus::Idle);
+    let shared = Arc::new(Mutex::new(Shared {
+        log: Vec::new(),
+        events,
+        status,
+    }));
+    let (commands, receiver) = mpsc::unbounded_channel();
+    (
+        SessionHandle {
+            shared: shared.clone(),
+            commands,
+        },
+        TestSessionEmitter { shared },
+        receiver,
+    )
 }
 
 pub struct SessionTask {
