@@ -75,6 +75,7 @@ fn entry_kind(entry: &SessionEntry) -> &'static str {
         SessionEntry::Message { .. } => "message",
         SessionEntry::Compaction { .. } => "compaction",
         SessionEntry::Notice { .. } => "notice",
+        SessionEntry::BackgroundCompletion { .. } => "background_completion",
     }
 }
 
@@ -337,6 +338,10 @@ mod tests {
             },
             SessionEntry::Notice {
                 text: "[background task 1 completed]\nexit: 0".into(),
+            },
+            SessionEntry::BackgroundCompletion {
+                id: 2,
+                output: "exit code: 0\nstdout:\nbuilt successfully\nstderr:\n".into(),
             },
             Message::User {
                 content: "你好世界👋\n多行".into(),

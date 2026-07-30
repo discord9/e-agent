@@ -110,6 +110,15 @@ pub enum AgentEvent {
         id: u64,
         output: String,
     },
+    /// A structured background completion notice for TUI scrollback display.
+    /// Unlike `BackgroundCompleted` (the transient arrival/drain signal),
+    /// this is fanned out to observers and persisted as a
+    /// `SessionEntry::BackgroundCompletion`. The TUI renders it once as a
+    /// dim line; the model sees the full text via `context()`.
+    BackgroundCompletionNotice {
+        id: u64,
+        output: String,
+    },
     Usage {
         /// Input tokens of the most recent regular turn, approximating the
         /// context window currently in use. Compaction calls do not refresh
@@ -152,6 +161,14 @@ pub enum SessionEntry {
     /// user message.
     Notice {
         text: String,
+    },
+    /// A structured background completion entry. Persisted in the session
+    /// log with the full output. The TUI renders a truncated preview; the
+    /// model context sees the full text. Backwards-compatible: old
+    /// `Notice` entries are read without guessing string prefixes.
+    BackgroundCompletion {
+        id: u64,
+        output: String,
     },
 }
 
@@ -337,6 +354,12 @@ impl Agent {
                     // completions and task-death notices.
                     SessionEntry::Notice { text } => Some(Message::User {
                         content: text.clone(),
+                    }),
+                    // Structured background completions: same surface as
+                    // before, but derived from the structured variant rather
+                    // than a string-prefixed Notice.
+                    SessionEntry::BackgroundCompletion { id, output } => Some(Message::User {
+                        content: format!("[background task {id} completed]\n{output}"),
                     }),
                 }),
         );
@@ -656,15 +679,18 @@ impl Agent {
 
     fn inject_pending_background(&mut self) {
         while let Some((id, output)) = self.pending_background.pop_front() {
-            let text = format!("[background task {id} completed]\n{output}");
-            // The completion joins the history as a structured Notice entry;
-            // emit it to the session observers only (their event log is the
-            // TUI's scrollback and the attach snapshot). The per-turn
-            // subscriber is for transient signals (deltas, the
-            // BackgroundCompleted fired at drain time) — sending this too
-            // would render the line twice in the TUI, which listens to both.
-            self.fanout(&AgentEvent::Notice(text.clone()));
-            self.history.push(SessionEntry::Notice { text });
+            // Fanout structured display event to session observers (TUI
+            // scrollback, snapshot). The per-turn subscriber does NOT get
+            // this — it already received the transient BackgroundCompleted
+            // at drain time; sending this too would duplicate the line.
+            self.fanout(&AgentEvent::BackgroundCompletionNotice {
+                id,
+                output: output.clone(),
+            });
+            // Persist as a structured entry so the model context sees the
+            // full text and backwards-compatible deserialisation works.
+            self.history
+                .push(SessionEntry::BackgroundCompletion { id, output });
         }
     }
 
@@ -707,13 +733,26 @@ fn started_task_id(output: &str) -> Option<u64> {
 }
 
 pub fn preview(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let head: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
+    let total: Vec<char> = text.chars().collect();
+    if total.len() <= max_chars || max_chars <= 1 {
+        // max_chars 0 → empty; max_chars 1 → a single ellipsis only
+        if max_chars == 0 {
+            return String::new();
+        }
+        if total.len() <= max_chars {
+            return text.to_owned();
+        }
+        // max_chars == 1 and text longer than 1: show just "…"
+        return "\u{2026}".to_owned();
     }
+    // Keep a 2:1 head-to-tail ratio within a budget of max_chars (including "…").
+    let marker_len = 1; // "…"
+    let available = max_chars - marker_len;
+    let head_count = (available * 2 / 3).max(1);
+    let tail_count = available - head_count;
+    let head: String = total[..head_count].iter().collect();
+    let tail: String = total[total.len() - tail_count..].iter().collect();
+    format!("{head}\u{2026}{tail}")
 }
 
 #[cfg(test)]
@@ -1172,8 +1211,8 @@ mod tests {
         }
         assert_eq!(transient, 1);
         assert_eq!(notice_notifications, 0);
-        // ...and the observer log holds it once, as the Notice, never as
-        // the transient variant.
+        // ...and the observer log holds it once, as the BackgroundCompletionNotice,
+        // never as the transient variant.
         let snapshot = handle.snapshot();
         assert!(
             snapshot
@@ -1183,9 +1222,20 @@ mod tests {
         assert_eq!(
             snapshot
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::Notice(text) if text.starts_with("[background task 1 completed]")))
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::BackgroundCompletionNotice { id: 1, .. }
+                ))
                 .count(),
             1
+        );
+        // The old Notice variant must not be emitted for background completions.
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Notice(text) if text.starts_with("[background task 1 completed]")))
+                .count(),
+            0
         );
     }
 
@@ -1235,8 +1285,8 @@ mod tests {
             &requests[1][2],
             Message::Tool { content, is_error: false, .. } if content.starts_with("started background task 1:")
         ));
-        // The completion is injected as a Notice, which context() surfaces
-        // as a Message::User so the model sees it.
+        // The completion is injected as a BackgroundCompletion, which
+        // context() surfaces as a Message::User so the model sees it.
         assert!(matches!(
             &requests[2][4],
             Message::User { content } if content.starts_with("[background task 1 completed]\n")
@@ -1348,17 +1398,20 @@ mod tests {
         // run() keeps going until the model has reacted to the completion;
         // the returned answer is the follow-up turn's.
         assert_eq!(agent.run("go".into()).await.unwrap(), "acknowledged");
-        // The completion is in the history as a Notice entry...
+        // The completion is in the history as a BackgroundCompletion entry...
         assert!(agent.history().iter().any(|entry| matches!(
             entry,
-            crate::agent::SessionEntry::Notice { text } if text.starts_with("[background task 1 completed]\n")
+            crate::agent::SessionEntry::BackgroundCompletion { id: 1, .. }
         )));
-        // ...the observer log shows it exactly once (the finished line)...
+        // ...the observer log shows it exactly once (the BackgroundCompletionNotice)...
         assert_eq!(
             handle
                 .snapshot()
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::Notice(t) if t.starts_with("[background task 1 completed]")))
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::BackgroundCompletionNotice { id: 1, .. }
+                ))
                 .count(),
             1
         );
@@ -1669,5 +1722,232 @@ mod tests {
         // The follow-up run drains the completion and clears the record.
         assert_eq!(agent.run("next".into()).await.unwrap(), "reacted");
         assert!(!record.exists());
+    }
+
+    // ── Preview tests (middle-ellipsis) ──────────────────────────────────
+
+    #[test]
+    fn preview_short_text_unchanged() {
+        assert_eq!(preview("hello", 10), "hello");
+        assert_eq!(preview("hi", 2), "hi");
+        assert_eq!(preview("", 5), "");
+    }
+
+    #[test]
+    fn preview_exact_fit() {
+        assert_eq!(preview("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn preview_zero_or_one() {
+        assert_eq!(preview("hello", 0), "");
+        assert_eq!(preview("h", 1), "h");
+        assert_eq!(preview("hello", 1), "\u{2026}");
+    }
+
+    #[test]
+    fn preview_max_2() {
+        let r = preview("abcdef", 2);
+        assert_eq!(r.chars().count(), 2);
+        assert!(r.contains('\u{2026}'));
+    }
+
+    #[test]
+    fn preview_middle_ellipsis_ascii() {
+        let r = preview("abcdefghijklmno", 10);
+        assert_eq!(r.chars().count(), 10);
+        assert!(r.contains('\u{2026}'));
+        // 2:1 head:tail => head=6, tail=3 (available=9)
+        assert!(r.starts_with("abcdef"), "head preserved, got {r:?}");
+        assert!(r.ends_with("mno"), "tail preserved, got {r:?}");
+    }
+
+    #[test]
+    fn preview_middle_ellipsis_cjk() {
+        let text = "你好世界数据驱动开发";
+        let r = preview(text, 8);
+        assert_eq!(r.chars().count(), 8);
+        assert!(r.contains('\u{2026}'));
+        // head=5 chars, tail=2 chars (available=7, 2:1 ratio)
+        assert!(r.starts_with("你好世界"), "CJK head, got {r:?}");
+        assert!(r.ends_with("开发"), "CJK tail, got {r:?}");
+    }
+
+    #[test]
+    fn preview_middle_ellipsis_emoji() {
+        let text = "a😊b😊c😊d😊e😊f😊g";
+        let r = preview(text, 8);
+        assert_eq!(r.chars().count(), 8);
+        assert!(
+            r.contains('\u{2026}'),
+            "emoji preview has ellipsis, got {r:?}"
+        );
+        // char-count respects Unicode, not bytes
+    }
+
+    #[test]
+    fn preview_char_count_never_exceeds_max() {
+        for max in [3usize, 5, 10, 50, 100] {
+            let text = "a".repeat(max * 2);
+            let r = preview(&text, max);
+            assert!(
+                r.chars().count() <= max,
+                "max={max}: actual {} > {max}, result: {r:?}",
+                r.chars().count()
+            );
+        }
+    }
+
+    // ── BackgroundCompletion structured entry tests ──────────────────────
+
+    #[test]
+    fn background_completion_entry_serde_roundtrip() {
+        let entry = SessionEntry::BackgroundCompletion {
+            id: 42,
+            output: "exit code: 0\nstdout:\nbuilt".into(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let deserialized: SessionEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, entry);
+        // Must deserialize as BackgroundCompletion, not as a generic JSON object.
+        assert!(
+            matches!(
+                deserialized,
+                SessionEntry::BackgroundCompletion { id: 42, .. }
+            ),
+            "wrong variant: {deserialized:?}"
+        );
+    }
+
+    #[test]
+    fn context_formats_background_completion() {
+        // Test context() with a BackgroundCompletion entry.
+        let mut agent = Agent::new(
+            Box::new(ScriptedModel {
+                replies: vec![],
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delays: Default::default(),
+            }),
+            vec![],
+        );
+        agent.restore_history(vec![SessionEntry::BackgroundCompletion {
+            id: 7,
+            output: "output text".into(),
+        }]);
+        let msgs = agent.context();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(
+            &msgs[0],
+            Message::User { content } if content == "[background task 7 completed]\noutput text"
+        ));
+    }
+
+    #[test]
+    fn background_completion_and_notice_coexist_in_context() {
+        // Old Notice entries must still work alongside new BackgroundCompletion.
+        let mut agent = Agent::new(
+            Box::new(ScriptedModel {
+                replies: vec![],
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delays: Default::default(),
+            }),
+            vec![],
+        );
+        agent.restore_history(vec![
+            SessionEntry::Notice {
+                text: "[background task 1 completed]\nold style".into(),
+            },
+            SessionEntry::BackgroundCompletion {
+                id: 2,
+                output: "new style".into(),
+            },
+        ]);
+        let msgs = agent.context();
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(
+            &msgs[0],
+            Message::User { content } if content.contains("old style")
+        ));
+        assert!(matches!(
+            &msgs[1],
+            Message::User { content } if content == "[background task 2 completed]\nnew style"
+        ));
+    }
+
+    #[tokio::test]
+    async fn inject_pending_background_emits_structured_event_and_entry() {
+        // Integration-style: verify the full pipeline from drain→inject
+        // produces the right event type and entry type.
+        let model = ScriptedModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![call(
+                        "background-1",
+                        "bash",
+                        r#"{"command":"echo done","background":true}"#,
+                    )],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("started".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("reacted".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        };
+        let mut agent = Agent::new(
+            Box::new(model),
+            vec![Box::new(ScriptedBackgroundTool { sender: None })],
+        );
+        let (handle, sink, _source) = crate::handle::session_channel();
+        agent.observe(sink);
+        // First turn starts the background task and finishes before the
+        // 10ms completion lands.
+        assert_eq!(agent.run("start bg".into()).await.unwrap(), "started");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        // Second turn: the completion was pending and gets injected at the
+        // turn boundary.
+        assert_eq!(agent.run("react".into()).await.unwrap(), "reacted");
+
+        // The observer log must contain a BackgroundCompletionNotice (not a Notice).
+        let snapshot = handle.snapshot();
+        let completion_notices: Vec<_> = snapshot
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::BackgroundCompletionNotice { .. }))
+            .collect();
+        assert_eq!(
+            completion_notices.len(),
+            1,
+            "expected exactly one BackgroundCompletionNotice, got {snapshot:?}"
+        );
+        // The old Notice variant must NOT contain the background completion text.
+        let old_notices: Vec<_> = snapshot
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Notice(t) if t.contains("[background task")))
+            .collect();
+        assert!(
+            old_notices.is_empty(),
+            "old Notice variant must not carry background completions: {old_notices:?}"
+        );
+        // The history must contain a BackgroundCompletion entry (not a Notice).
+        assert!(
+            agent
+                .history()
+                .iter()
+                .any(|entry| matches!(entry, SessionEntry::BackgroundCompletion { id: 1, .. }))
+        );
+        // Old Notice entries in history must be zero (no notices for background).
+        assert!(!agent.history().iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Notice { text } if text.contains("[background task")
+        )));
     }
 }

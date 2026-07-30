@@ -352,6 +352,32 @@ fn set_stderr_events(agent: &mut Agent) {
         AgentEvent::BackgroundCompleted { id, output } => {
             eprintln!("background task {id} finished: {}", preview(&output, 500))
         }
+        AgentEvent::BackgroundCompletionNotice { id: _, output } => {
+            // REPL/stderr: show a finite preview with middle ellipsis
+            let lines: Vec<&str> = output.lines().collect();
+            if lines.len() <= 8 && output.len() <= 500 {
+                for line in &lines {
+                    eprintln!("  {line}");
+                }
+            } else {
+                let head: Vec<&str> = lines.iter().take(5).copied().collect();
+                let tail: Vec<&str> = lines.iter().rev().take(3).rev().copied().collect();
+                let omitted = lines.len() - head.len() - tail.len();
+                for line in &head {
+                    eprintln!("  {line}");
+                }
+                eprintln!(
+                    "  … ({omitted} lines, {} chars omitted)",
+                    output.len().saturating_sub(
+                        head.iter().map(|l| l.len()).sum::<usize>()
+                            + tail.iter().map(|l| l.len()).sum::<usize>()
+                    )
+                );
+                for line in &tail {
+                    eprintln!("  {line}");
+                }
+            }
+        }
         AgentEvent::Usage {
             context_input,
             session,

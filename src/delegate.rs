@@ -292,6 +292,12 @@ impl Delegate {
                     AgentEvent::Notice(format!("──── compaction ────\ncompacted: {summary}"))
                 }
                 crate::agent::SessionEntry::Notice { text } => AgentEvent::Notice(text.clone()),
+                crate::agent::SessionEntry::BackgroundCompletion { id, output } => {
+                    AgentEvent::BackgroundCompletionNotice {
+                        id: *id,
+                        output: output.clone(),
+                    }
+                }
             };
             sink.emit(event);
         }
@@ -960,8 +966,8 @@ mod tests {
         let long = "x".repeat(200);
         let capped = task_label(Some(&long), None, "task");
         assert!(
-            capped.chars().count() <= 61 && capped.ends_with('…'),
-            "caller label is capped with an ellipsis, got: {capped:?}"
+            capped.chars().count() <= 61 && capped.contains('\u{2026}'),
+            "caller label is capped with a middle ellipsis, got: {capped:?}"
         );
     }
 
