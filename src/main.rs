@@ -95,13 +95,25 @@ async fn run() -> anyhow::Result<()> {
     .context("cannot open workspace")?;
     let root = workspace.root().to_path_buf();
     let agents_instructions = read_agents(&root)?;
-    // Migrate pre-session-id files (the old implicit `default` session and
-    // task-id-named subagent files) to unique ids before anything loads.
-    for (old, new) in e_agent::session::migrate_legacy(&root) {
-        eprintln!("e-agent: migrated session {old} -> {new}");
+    let config = Config::load()?;
+    let backend = config
+        .as_ref()
+        .map(|c| &c.session)
+        .cloned()
+        .unwrap_or_default();
+    // Migrate pre-session-id files only when using the JSONL backend;
+    // GreptimeDB has its own session namespace and does not need file
+    // migration.
+    if matches!(backend, e_agent::config::SessionBackend::Jsonl) {
+        for (old, new) in e_agent::session::migrate_legacy(&root) {
+            eprintln!("e-agent: migrated session {old} -> {new}");
+        }
     }
     let session = match session {
-        Some(name) => name,
+        Some(name) => {
+            e_agent::session::validate_session_name(&name)?;
+            name
+        }
         None => {
             let id = e_agent::session::new_id();
             // TUI mode shows the id in the input border instead (printing
@@ -112,7 +124,6 @@ async fn run() -> anyhow::Result<()> {
             id
         }
     };
-    let config = Config::load()?;
     // Web search reads EXA_API_KEY from the process env (tools.rs and
     // subagents pick it up there). When unset, fall back to the `[web_search]`
     // config section by injecting it into the env once at startup — this keeps
@@ -124,12 +135,7 @@ async fn run() -> anyhow::Result<()> {
     {
         unsafe { std::env::set_var("EXA_API_KEY", key) };
     }
-    let backend = config
-        .as_ref()
-        .map(|c| &c.session)
-        .cloned()
-        .unwrap_or_default();
-    let store = SessionStore::connect(&backend, &session).await?;
+    let store = SessionStore::connect(&backend, &root, &session).await?;
     let (main_resolved, role_resolved, all_roles) = match &config {
         Some(config) => (
             Some(config.resolve(profile.as_deref())?),

@@ -1,3 +1,6 @@
 /target
 /.e-agent/
 .slim/
+
+# GreptimeDB PoC data (artifact from storage research branch)
+/.greptimedb-poc/

@@ -125,6 +125,21 @@ pub struct LoadedSession {
     pub legacy: bool,
 }
 
+/// Validate that a session name contains only [a-zA-Z0-9_-]. Shared by all
+/// backends — JSONL files need this for file-system safety, and Greptime
+/// sessions are persisted as JSONL background records and must therefore
+/// pass the same check.
+pub fn validate_session_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        anyhow::bail!("session name must contain only [a-zA-Z0-9_-]");
+    }
+    Ok(())
+}
+
 pub struct Session;
 
 impl Session {

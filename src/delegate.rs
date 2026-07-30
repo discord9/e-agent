@@ -340,7 +340,7 @@ impl Delegate {
                 // session id. Best-effort: on failure, log and continue
                 // without persistence.
                 let persist_store: Option<SessionStore> = match &persist {
-                    Some(p) => match SessionStore::connect(&p.backend, &p.session_id).await {
+                    Some(p) => match SessionStore::connect(&p.backend, &p.root, &p.session_id).await {
                         Ok(store) => Some(store),
                         Err(e) => {
                             eprintln!("e-agent: subagent persistence unavailable: {e:#}");
@@ -698,7 +698,7 @@ impl Tool for Delegate {
                     .ok_or("`resume` requires subagent session persistence (disabled in tests)")?;
                 // Connect a temporary store bound to the resumed session id
                 // so we load from the correct rows, not the main session's.
-                let temp_store = SessionStore::connect(&self.persist_backend, &id)
+                let temp_store = SessionStore::connect(&self.persist_backend, &root, &id)
                     .await
                     .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
                 let loaded = temp_store

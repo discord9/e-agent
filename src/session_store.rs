@@ -43,18 +43,25 @@ impl SessionStore {
     ///
     /// For `Jsonl` this is a zero-cost marker; for `Greptime` it connects to
     /// the database and ensures the session table exists. The `session_id`
-    /// is bound at connect time for Greptime (the backend is per-session).
+    /// and `workspace_id` are bound at connect time for Greptime (the
+    /// backend is per-session).  The `workspace_id` is derived from the
+    /// canonical workspace root to namespace sessions by workspace.
     ///
     /// When the `greptime` feature is not enabled and the config selects
     /// Greptime, returns an error explaining the missing feature.
     #[allow(unused_variables)]
-    pub async fn connect(backend: &SessionBackend, session_id: &str) -> Result<Self> {
+    pub async fn connect(backend: &SessionBackend, root: &Path, session_id: &str) -> Result<Self> {
         match backend {
             SessionBackend::Jsonl => Ok(SessionStore::Jsonl),
             #[cfg(feature = "greptime")]
             SessionBackend::Greptime { conn } => {
-                let session =
-                    crate::session_greptime::GreptimeSession::connect(conn, session_id).await?;
+                let workspace_id = crate::session_greptime::derive_workspace_id(root);
+                let session = crate::session_greptime::GreptimeSession::connect(
+                    conn,
+                    &workspace_id,
+                    session_id,
+                )
+                .await?;
                 Ok(SessionStore::Greptime {
                     session: Arc::new(Mutex::new(session)),
                     conn: conn.clone(),

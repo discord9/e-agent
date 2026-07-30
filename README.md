@@ -275,10 +275,84 @@ response: error decoding response body: ...`), and provider HTTP failures
 include a preview of the response body. Provider requests time out after
 600 seconds in total, including the complete streaming response body.
 
+## GreptimeDB session backend (experimental)
+
+An optional GreptimeDB-backed session storage backend can be selected at
+runtime via the TOML config file. It replaces the JSONL file backend for
+session persistence while keeping background-task bookkeeping in JSONL.
+
+### Build
+
+```sh
+cargo build --features greptime
+```
+
+### Configure
+
+```toml
+[session]
+backend = "greptime"
+conn = "host=127.0.0.1 port=4002 dbname=public"
+```
+
+The connection string is passed directly to `tokio-postgres`. Default port
+for GreptimeDB's pg-wire protocol is `4002`. The server must be running
+before e-agent starts (no auto-discovery or embedded mode).
+
+### Table schema
+
+```sql
+CREATE TABLE IF NOT EXISTS session_entries (
+    workspace_id    STRING       NOT NULL,
+    session_id      STRING       NOT NULL,
+    seq             BIGINT       NOT NULL,
+    event_time      TIMESTAMP(9) NOT NULL TIME INDEX,
+    entry_kind      STRING       NOT NULL,
+    payload         STRING       NOT NULL,
+    schema_version  INT          NOT NULL DEFAULT 1,
+    agent_role      STRING       NOT NULL DEFAULT 'main',
+    is_error        BOOLEAN      NOT NULL DEFAULT FALSE,
+    appended_at     TIMESTAMP(9) NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, session_id)
+) WITH (append_mode = 'true', sst_format = 'flat')
+```
+
+`workspace_id` is derived from the canonical workspace root path, so sessions
+with the same name in different workspaces remain isolated.
+
+### Known limitations
+
+- GreptimeDB server must be running before e-agent starts
+- `tokio-postgres` needs the `with-chrono-0_4` feature for TIMESTAMP params
+  (already included in the `greptime` feature)
+- `event_time` is real wall-clock time but may have nanosecond collisions
+  across processes (same-ns entries get prev+1 via a monotonic atomic guard)
+- No transactions — atomicity is per multi-row INSERT statement
+- Subagents each open their own database connection (bounded, fine for
+  single-user agents)
+
+### Query patterns
+
+| Operation | Query | Optimization |
+|-----------|-------|-------------|
+| connect (find max seq) | `last_value(seq ORDER BY event_time ASC) GROUP BY workspace_id, session_id` | LastRow scan hint → reads ~2 rows |
+| load (all entries) | `SELECT seq, payload ... ORDER BY event_time DESC` | WindowedSortExec + app-side HashMap dedup |
+| append | Parameterized multi-row INSERT | Single statement, all-or-nothing per chunk |
+
+### Tests
+
+Integration tests require a live GreptimeDB and opt-in via the `GREPTIME_PG`
+environment variable:
+
+```sh
+GREPTIME_PG="host=127.0.0.1 port=4002 dbname=public" cargo test --features greptime
+```
+
+Without `GREPTIME_PG` the integration tests skip with a message.
 ## Non-goals
 
 This is deliberately not a daemon, JSONL protocol,
-automatic compaction trigger, database, event store, subagent
+automatic compaction trigger, subagent
 framework, permission framework, plugin host, generic provider/auth framework,
 parallel tool executor, task scheduler, priority system, or concurrency pool.
 It deliberately does not fetch provider/model catalogs (including
@@ -286,7 +360,7 @@ models.dev), generate configuration, cache provider metadata, or infer
 context windows; TOML profiles are local static settings only. `AGENTS.md`
 loading is workspace-root-only: there is no parent/nested discovery or merging.
 Subagents exist but are deliberately minimal: no agent-to-agent messaging,
-no delegation deeper than 1 level, no subagent session persistence, no
+no delegation deeper than 1 level, no
 process-level isolation yet (subagents are threads, not subprocesses).
 It does speak MCP to local stdio servers (tools only), but it does NOT do
 remote MCP over HTTP/SSE, MCP OAuth, MCP resources/prompts, server-initiated
@@ -299,3 +373,19 @@ display/audit; it is never sent back to the API.
 Web search deliberately has no browser, crawler, URL fetch, citations, domain
 filters, multiple providers or provider trait, retries, cache, background
 search, or remote MCP support.
+
+GreptimeDB-specific non-goals (when built with `--features greptime`):
+
+- No automatic migration of existing JSONL sessions — existing JSONL sessions
+  are not migrated to GreptimeDB at startup (a one-shot importer was built and
+  used during the PoC; removed before merge as an experiment artifact)
+- No automatic migration between backends — switching backends in config does
+  not transfer session data
+- No cross-workspace session sharing — sessions with the same name in
+  different workspaces are fully isolated by workspace_id
+- No transaction support — atomicity is per multi-row INSERT statement, not
+  across statements
+- No background task persistence in GreptimeDB — background bookkeeping stays
+  in JSONL files regardless of backend
+- No distributed/cluster deployment — standalone GreptimeDB only
+- No generic storage abstraction for future third backends
