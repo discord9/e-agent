@@ -43,7 +43,7 @@ Add an optional GreptimeDB-backed session storage backend alongside the existing
 # ~/.config/e-agent/config.toml
 [session]
 backend = "greptime"
-conn = "host=127.0.0.1 port=4002 dbname=public"
+conn = "host=127.0.0.1 port=15403 dbname=public"
 ```
 
 ```sh
