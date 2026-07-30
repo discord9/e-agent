@@ -892,7 +892,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
             frame.render_widget(
                 Paragraph::new(lines)
                     .style(SOLARIZED_LIGHT.panel_style())
-                    .block(SOLARIZED_LIGHT.block("tasks (F2 hide  Enter attach  x cancel)")),
+                    .block(SOLARIZED_LIGHT.block("tasks (F2 hide  ↑↓ attach  x cancel)")),
                 tasks_bar,
             );
         }
@@ -1739,7 +1739,7 @@ impl TuiState {
     }
 
     /// Keys pressed while the tasks panel is open return here first:
-    /// Up/Down move the attach cursor, Enter attaches to a subagent task.
+    /// Up/Down move the cursor and immediately attach to the selected task.
     /// Returns the attach request `(task_id)` if one was made.
     fn handle_tasks_panel_key(&mut self, key: KeyEvent) -> Option<u64> {
         let running = self
@@ -1756,18 +1756,17 @@ impl TuiState {
                     self.task_cursor = (self.task_cursor + 1).min(running.len() - 1);
                 }
             }
-            KeyCode::Enter => {
-                let task = running.get(self.task_cursor)?;
-                // Only tasks with a live session handle can be attached.
-                let attachable = self.attachable.as_ref()?;
-                if !attachable(task.id) {
-                    return None;
-                }
-                return Some(task.id);
-            }
-            _ => {}
+            _ => return None,
         }
-        None
+        // After any cursor move, attach to the newly selected task (if
+        // attachable). Attaching is cheap — it replays an in-memory snapshot
+        // and opens a broadcast channel, no I/O.
+        let task = running.get(self.task_cursor)?;
+        let attachable = self.attachable.as_ref()?;
+        if !attachable(task.id) {
+            return None;
+        }
+        Some(task.id)
     }
 
     /// `x` in the tasks panel cancels the selected background task, unless it
