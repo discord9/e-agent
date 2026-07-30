@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS session_entries (
 
 ## Verification
 
-- 134/134 project tests pass (default features); 137/137 with `--features greptime` (3 integration tests run against a live GreptimeDB at 127.0.0.1:15403)
+- 134/134 project tests pass (default features); 138/138 with `--features greptime` (4 integration tests run against a live GreptimeDB at 127.0.0.1:15403, dbname=e_agent)
 - 8601 real JSONL entries imported from 84 sessions during the PoC (incremental importer)
 - EXPLAIN ANALYZE VERBOSE confirmed LastRow scan (2 rows vs 5780) and WindowedSortExec during the PoC
 - kill -9 durability verified (sync_write=true, 1083 rows survived)
@@ -98,13 +98,18 @@ CREATE TABLE IF NOT EXISTS session_entries (
 - `tokio-postgres` needs `with-chrono-0_4` feature for TIMESTAMP params
 - `event_time` is real wall-clock time but may have nanosecond collisions across processes (same-ns entries get prev+1)
 
-## Review Notes (pre-merge self-review, resolved)
+## Review Notes (two rounds, all resolved)
 
-Findings from reviewing the branch, severity-ordered. Items 1, 2, and 6 were fixed in cleanup commit `3789e93`:
+Round 1 (self-review) — items fixed in cleanup commit `3789e93`:
 
-1. ~~**Low — dead code**: `append_batch` / `next_seq()` unused by production paths.~~ **Fixed**: removed.
-2. ~~**Low — doc inconsistency**: module header said "not a replacement yet".~~ **Fixed**: header updated.
-3. **Accepted — rewrite() no-op for Greptime**: legacy-v1 sessions loaded from DB get `legacy=false`, so the no-op rewrite is unreachable in practice; behavior is correct.
-4. **Accepted — per-subagent DB connections**: one tokio-postgres connection per live subagent; bounded by live subagent count. Fine for single-user agent.
-5. **Known limitation — concurrent same-session writers**: two processes on the same session id can interleave seqs; read-side dedup (first-wins by event_time DESC) makes this safe and is tested (`duplicate_retry_dedup`).
-6. ~~**Note — `merge_mode = 'last_non_null'`** ineffective under `append_mode = 'true'`.~~ **Fixed**: removed from DDL.
+1. ~~Dead code: `append_batch` / `next_seq()` unused by production.~~ **Fixed**: removed.
+2. ~~Module header said "not a replacement yet".~~ **Fixed**.
+3. **Accepted — rewrite() no-op for Greptime**: legacy sessions loaded from DB get `legacy=false`; unreachable in practice, behavior correct.
+4. **Accepted — per-subagent DB connections**: one connection per live subagent; bounded, fine for single-user agent.
+5. ~~`merge_mode = 'last_non_null'` ineffective under append_mode.~~ **Fixed**: removed from DDL.
+
+Round 2 (oracle review) — items fixed in commits `7d7e648` and `8dc6054`:
+
+6. ~~**Critical — subagents shared the main session's bound store**: Greptime `SessionStore` is bound to one session_id at connect; cloning it into `Delegate` wrote all subagent transcripts into the main session.~~ **Fixed**: `Delegate` now carries `SessionBackend` config and each subagent connects its own session-bound store; resume connects a temporary store bound to the resumed id.
+7. ~~**High — append partial commit**: per-row INSERTs advanced `next_seq` for a committed prefix while callers treated the call as all-or-nothing; retries re-sent the slice with shifted seqs. First fix attempt used a transaction, but live-wire testing proved **GreptimeDB pg-wire has NO transaction support** (server warns "transaction is not supported"; ROLLBACK is a no-op).~~ **Fixed**: single multi-row parameterized INSERT per chunk (verified: any row failure → zero rows committed), `next_seq` advances only on success, so retries reuse the same seq range and read-side dedup handles full-batch duplicate retries.
+8. ~~**Medium — µs-precision ties**: nanosecond monotonic timestamps collapsed to equal values on the µs-precision PG wire, making first-wins dedup nondeterministic on retry duplicates.~~ **Fixed**: monotonic clock now quantizes to microseconds (`next_event_time_us`).
