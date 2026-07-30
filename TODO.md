@@ -41,6 +41,15 @@ Temporary session tracker until the persisted Todo tool and `session_state` stor
   - Port old prototype after incremental persistence lands; do not merge old baseline directly.
   - Validate marker bounds, checked ordinal conversion, orphan tool results, compaction/external facts, overlap, Greptime roundtrip, README non-goals.
 
+- [ ] **Fork session**
+  - Implement only after incremental persistence and Undo semantics stabilize.
+  - Do not copy parent history. The child session's first entry is an immutable `Fork { source_session_id, source_seq, source_event_time }` parent pointer.
+  - Resolve the parent snapshot using `seq <= source_seq` and, per seq, the latest row whose `event_time <= source_event_time`; the timestamp is both the target-row identity and snapshot cutoff.
+  - JSONL uses its stable entry ordinal/seq prefix as the cutoff; cross-backend fork resolution/migration is not automatic in v1.
+  - New fork gets its own session ID and independent mutable `session_state`; never inherit Todo/background recovery state.
+  - Reject or repair fork points with incomplete tool-call/tool-result pairing; preserve compaction semantics through the inherited prefix.
+  - A session has one immutable direct parent; recursive parents require cycle/corruption detection. No merge, rebase, live synchronization, or shared writer in v1.
+
 - [ ] **Persisted Todo tool + mutable session state**
   - One `session_state` row per workspace/session; JSONL parity via `<session>.state.json` atomic replacement.
   - Initial real fields: `todos` and `unfinished_background_tasks`.
