@@ -1,7 +1,3 @@
 /target
 /.e-agent/
 .slim/
-.greptimedb-poc/data_home/
-.greptimedb-poc/logs/
-.greptimedb-poc/server.pid
-poc-harness/target/

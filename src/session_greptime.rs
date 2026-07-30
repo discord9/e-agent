@@ -1,6 +1,7 @@
-//! GreptimeDB-backed session storage. Experimental — parallel to the JSONL
-//! `session.rs`, not a replacement yet. Uses tokio-postgres for both read
-//! and write against the `session_entries` table.
+//! GreptimeDB-backed session storage. Optional runtime-selectable
+//! backend via `[session] backend = "greptime"`. Still experimental.
+//! Uses tokio-postgres for both read and write against the
+//! `session_entries` table.
 //!
 //! Non-goals: no Storage trait, no migration of existing JSONL sessions,
 //! no background-task bookkeeping (that's still JSONL).
@@ -25,7 +26,6 @@ CREATE TABLE IF NOT EXISTS session_entries (
 ) WITH (
     append_mode = 'true',
     sst_format = 'flat',
-    merge_mode = 'last_non_null'
 )
 "#;
 
@@ -181,50 +181,6 @@ impl GreptimeSession {
         }
         Ok(())
     }
-
-    /// Batch append using a multi-row INSERT. More efficient for large
-    /// batches (e.g. rewrite after compaction).
-    pub async fn append_batch(&mut self, entries: &[SessionEntry]) -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        // Build a multi-VALUES INSERT. Payloads are serialized to JSON
-        // strings; SQL quoting is escaped by doubling single quotes.
-        let mut values = Vec::with_capacity(entries.len());
-        let base_seq = self.next_seq;
-        for (i, entry) in entries.iter().enumerate() {
-            let payload = serde_json::to_string(entry).context("cannot serialize entry")?;
-            let kind = entry_kind(entry);
-            let err = is_error(entry);
-            let seq = base_seq + i as i64;
-            let ts = ns_to_datetime(next_event_time());
-            let ts_str = ts.format("%Y-%m-%d %H:%M:%S%.9f").to_string();
-            // SQL-escape: double single quotes
-            let escaped = payload.replace('\'', "''");
-            values.push(format!(
-                "('{}', {seq}, '{ts_str}', '{kind}', '{escaped}', 1, 'main', {err})",
-                self.session_id
-            ));
-        }
-        let sql = format!(
-            "INSERT INTO session_entries
-                (session_id, seq, event_time, entry_kind, payload,
-                 schema_version, agent_role, is_error)
-             VALUES {}",
-            values.join(",\n")
-        );
-        self.client
-            .execute(&sql, &[])
-            .await
-            .context("cannot batch append session entries")?;
-        self.next_seq += entries.len() as i64;
-        Ok(())
-    }
-
-    /// Number of entries in the next append batch.
-    pub fn next_seq(&self) -> i64 {
-        self.next_seq
-    }
 }
 
 #[cfg(test)]
@@ -300,7 +256,6 @@ mod tests {
         let mut session = GreptimeSession::connect(&conn_str(), &sid).await.unwrap();
         let entries = test_entries();
         session.append(&entries).await.unwrap();
-        assert_eq!(session.next_seq(), entries.len() as i64);
 
         let loaded = session.load().await.unwrap();
         assert_eq!(loaded.len(), entries.len());
@@ -319,7 +274,6 @@ mod tests {
         drop(s1);
 
         let mut s2 = GreptimeSession::connect(&conn_str(), &sid).await.unwrap();
-        assert_eq!(s2.next_seq(), 3);
         s2.append(&entries[3..]).await.unwrap();
 
         let loaded = s2.load().await.unwrap();
@@ -346,24 +300,5 @@ mod tests {
         for (got, want) in loaded.iter().zip(entries[..3].iter()) {
             assert_eq!(got, want);
         }
-    }
-
-    #[tokio::test]
-    async fn batch_append() {
-        let sid = format!("test-gt-batch-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn_str(), &sid).await.unwrap();
-        let entries: Vec<SessionEntry> = (0..100)
-            .map(|i| {
-                Message::User {
-                    content: format!("batch message {i}"),
-                }
-                .into()
-            })
-            .collect();
-        session.append_batch(&entries).await.unwrap();
-        assert_eq!(session.next_seq(), 100);
-
-        let loaded = session.load().await.unwrap();
-        assert_eq!(loaded.len(), 100);
     }
 }
