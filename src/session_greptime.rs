@@ -136,89 +136,89 @@ impl GreptimeSession {
             .context("cannot query max seq")?;
         let max_seq: i64 = row.get("max_seq");
 
+        let next_seq = max_seq.checked_add(1).context(format!(
+            "max_seq overflow in connect for session '{session_id}'"
+        ))?;
+
         Ok(Self {
             client,
-            next_seq: max_seq + 1,
+            next_seq,
             workspace_id: workspace_id.to_string(),
             session_id: session_id.to_string(),
         })
     }
 
-    /// Load all entries for this session. Delegates to `load_with_seq`.
+    /// Advance next_seq from a snapshot length (the number of contiguous
+    /// seq 0..N entries that were just loaded).
+    ///
+    /// - Rejects `len < current next_seq` (rewind / monotonicity violation).
+    /// - Rejects lengths that overflow `i64` (impossible for a real session).
+    /// - The caller must have verified that the loaded snapshot is a
+    ///   complete 0..N range so that `len` is the correct next seq
+    ///   (importer TOCTOU re-read pattern).
+    pub fn advance_next_seq_from_snapshot_len(&mut self, len: usize) -> Result<()> {
+        let next: i64 = i64::try_from(len)
+            .context("snapshot length overflowed i64 (impossible for a real session)")?;
+        if next < self.next_seq {
+            anyhow::bail!(
+                "next_seq rewind: current={}, requested={}; \
+                 monotonic advance only (use snapshot length, not DB row count)",
+                self.next_seq,
+                next,
+            );
+        }
+        self.next_seq = next;
+        Ok(())
+    }
+
+    /// Load all entries for this session, deduplicated by seq (latest
+    /// event_time wins) and sorted by seq ASC.  Delegates to `load_with_seq`.
     pub async fn load(&self) -> Result<Vec<SessionEntry>> {
         self.load_with_seq()
             .await
             .map(|v| v.into_iter().map(|(_, e)| e).collect())
     }
 
-    /// Load entries paired with their sequence numbers. Used by the JSONL
-    /// import tool to validate that seq values are strictly 0..N continuous.
+    /// Load entries paired with their sequence numbers, deduplicated by
+    /// seq (latest event_time wins per seq) and sorted by seq ASC.
     ///
-    /// **Duplicate handling**: if the same seq has multiple physical rows
-    /// with identical payload (identical deserialized `SessionEntry`), they
-    /// are folded into one logical entry. If any duplicate seq has
-    /// **divergent** payloads (different `SessionEntry`), this returns an
-    /// error with the seq, session id, and manual-inspection guidance.
+    /// **Duplicate handling per seq**:
+    ///
+    /// 1. Among all physical rows for a given seq, only the row(s) with
+    ///    the **latest** `event_time` are retained. Older rows are silently
+    ///    discarded (they are considered overwritten).
+    ///
+    /// 2. If the latest event_time has **multiple** physical rows (same
+    ///    seq, same max event_time), their payloads are deserialised and
+    ///    compared.  If all are identical (idempotent retry at the same
+    ///    microsecond), they are folded into one logical entry.  If **any**
+    ///    differ, this returns an error with the seq, event_time, session
+    ///    id, and manual-inspection guidance.
+    ///
+    /// 3. Output is ordered by seq ASC.
     pub async fn load_with_seq(&self) -> Result<Vec<(i64, SessionEntry)>> {
         let rows = self
             .client
             .query(
-                "SELECT seq, payload FROM session_entries \
+                "SELECT seq, event_time, payload FROM session_entries \
                  WHERE workspace_id = $1 AND session_id = $2 \
-                 ORDER BY seq, event_time DESC",
+                 ORDER BY seq ASC",
                 &[&self.workspace_id, &self.session_id],
             )
             .await
             .context("cannot load session entries")?;
 
-        // Group all payloads per seq, then validate rather than picking a
-        // winner.
-        let mut per_seq: std::collections::HashMap<i64, Vec<&str>> =
-            std::collections::HashMap::with_capacity(rows.len().min(64));
-        for row in &rows {
-            let seq: i64 = row.get("seq");
-            let payload: &str = row.get("payload");
-            per_seq.entry(seq).or_default().push(payload);
-        }
+        let raw: Vec<(i64, chrono::NaiveDateTime, String)> = rows
+            .iter()
+            .map(|r| {
+                let seq: i64 = r.get("seq");
+                let et: chrono::NaiveDateTime = r.get("event_time");
+                let p: String = r.get("payload");
+                (seq, et, p)
+            })
+            .collect();
 
-        let mut seqs: Vec<i64> = per_seq.keys().copied().collect();
-        seqs.sort_unstable();
-
-        let mut entries = Vec::with_capacity(seqs.len());
-        for seq in seqs {
-            let payloads = &per_seq[&seq];
-
-            // Deserialize first occurrence to check for divergence.
-            let first_entry: SessionEntry = serde_json::from_str(payloads[0])
-                .with_context(|| format!("cannot decode session {} seq {seq}", self.session_id))?;
-
-            // Check duplicates for divergent payloads.
-            for (i, &payload) in payloads.iter().enumerate().skip(1) {
-                let other: SessionEntry = serde_json::from_str(payload).with_context(|| {
-                    format!(
-                        "cannot decode session {} seq {seq} (dup {i})",
-                        self.session_id
-                    )
-                })?;
-                if other != first_entry {
-                    anyhow::bail!(
-                        "session '{}' seq {seq} has divergent physical duplicates; \
-                         cannot safely load. Stop writers, inspect with SQL:\n\
-                         SELECT * FROM session_entries \
-                         WHERE workspace_id = '{}' AND session_id = '{}' AND seq = {seq}\n\
-                         ORDER BY event_time;\n\
-                         Resolve manually (new session or repair) then re-run import.",
-                        self.session_id,
-                        self.workspace_id,
-                        self.session_id,
-                    );
-                }
-            }
-
-            entries.push((seq, first_entry));
-        }
-
-        Ok(entries)
+        dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)
     }
 
     /// Append new entries atomically per multi-row INSERT statement.
@@ -243,13 +243,22 @@ impl GreptimeSession {
         let n = entries.len();
         const CHUNK_SIZE: usize = 9000;
 
+        // Validate the complete write range before any DB write.
+        // All seqs from base_seq..base_seq+n must be representable as i64
+        // and the final cursor must also be in range.
+        let base_seq = self.next_seq;
+        let n_i64 = i64::try_from(n).context("append count overflowed i64")?;
+        let final_cursor = base_seq.checked_add(n_i64).ok_or_else(|| {
+            anyhow::anyhow!(
+                "seq range overflow: base_seq={base_seq} count={n}; \
+                 max seq would exceed i64::MAX"
+            )
+        })?;
+
         // Serialize all entries upfront so serialization errors happen
         // before any database write.
         let mut prepped: Vec<(i64, chrono::NaiveDateTime, String, String, bool)> =
             Vec::with_capacity(n);
-        // Compute base seq once — all chunks share the same range so retry
-        // of a partially-committed chunk does not shift seqs.
-        let base_seq = self.next_seq;
         for (i, entry) in entries.iter().enumerate() {
             let seq = base_seq + i as i64;
             let payload = serde_json::to_string(entry)
@@ -288,7 +297,7 @@ impl GreptimeSession {
 
         // Advance next_seq only after all chunks succeed, so a partial
         // failure does not shift sequence numbers on retry.
-        self.next_seq = base_seq + entries.len() as i64;
+        self.next_seq = final_cursor;
 
         Ok(())
     }
@@ -324,6 +333,89 @@ fn build_multi_row_insert(row_count: usize) -> String {
         ));
     }
     sql
+}
+
+/// Group raw DB entries by seq, keeping only the row(s) with the latest
+/// `event_time` per seq.
+///
+/// - Older event_time rows for the same seq are silently discarded
+///   (they are considered overwritten by the newer write).
+/// - If the latest event_time has multiple physical rows (same microsecond),
+///   their deserialised payloads are compared.  All identical → folded;
+///   any divergent → `Err` with diagnostic guidance.
+/// - Output is sorted by seq ASC.
+///
+/// Exported as `pub(crate)` for testing without a live DB connection.
+pub(crate) fn dedup_raw_entries(
+    raw: &[(i64, chrono::NaiveDateTime, String)],
+    session_id: &str,
+    workspace_id: &str,
+) -> Result<Vec<(i64, SessionEntry)>> {
+    // Group by seq: keep max event_time and all payloads at that max.
+    let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
+        std::collections::HashMap::with_capacity(raw.len().min(64));
+
+    for (seq, et, payload) in raw {
+        let entry = per_seq.entry(*seq).or_insert((*et, Vec::new()));
+        match (*et).cmp(&entry.0) {
+            std::cmp::Ordering::Greater => {
+                // Newer event_time → overwrite older entries entirely.
+                entry.0 = *et;
+                entry.1 = vec![payload.clone()];
+            }
+            std::cmp::Ordering::Equal => {
+                // Same max event_time → accumulate for conflict check.
+                entry.1.push(payload.clone());
+            }
+            std::cmp::Ordering::Less => {
+                // Older event_time → silently discard.
+            }
+        }
+    }
+
+    let mut seqs: Vec<i64> = per_seq.keys().copied().collect();
+    seqs.sort_unstable();
+
+    let mut entries = Vec::with_capacity(seqs.len());
+    for seq in seqs {
+        let (max_et, payloads) = per_seq.remove(&seq).unwrap();
+
+        let first_entry: SessionEntry = serde_json::from_str(&payloads[0]).with_context(|| {
+            format!(
+                "cannot decode session {} (seq {} event_time {})",
+                session_id, seq, max_et
+            )
+        })?;
+
+        for (i, payload) in payloads.iter().enumerate().skip(1) {
+            let other: SessionEntry = serde_json::from_str(payload).with_context(|| {
+                format!(
+                    "cannot decode session {} seq {} max_event_time {} (dup {})",
+                    session_id, seq, max_et, i
+                )
+            })?;
+            if other != first_entry {
+                anyhow::bail!(
+                    "session '{}' seq {} event_time {} has divergent physical \
+                     duplicates; cannot safely load. Stop writers, inspect with SQL:\n\
+                     SELECT * FROM session_entries \
+                     WHERE workspace_id = '{}' AND session_id = '{}' AND seq = {} \
+                     ORDER BY event_time;\n\
+                     Resolve manually (new session or repair) then re-run import.",
+                    session_id,
+                    seq,
+                    max_et,
+                    workspace_id,
+                    session_id,
+                    seq,
+                );
+            }
+        }
+
+        entries.push((seq, first_entry));
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -457,27 +549,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_retry_fold_identical() {
+    async fn retry_latest_event_time_wins_per_seq() {
         let conn = conn_str();
         if conn == "skipped" {
             eprintln!("skipping: GREPTIME_PG not set");
             return;
         }
         let wid = workspace_id();
-        let sid = format!("test-gt-dup-{}", crate::session::new_id());
+        let sid = format!("test-gt-retry-{}", crate::session::new_id());
         let entries = test_entries();
         let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
-        // Write twice (simulating retry)
+        // First write: seq 0..3
         session.append(&entries[..3]).await.unwrap();
-        // Reset seq to simulate reconnect-retry
+        // Simulate reconnect-retry: same seq range, but new event_times
         session.next_seq = 0;
         session.append(&entries[..3]).await.unwrap();
 
+        // With the new dedup (group by seq, latest event_time wins), each
+        // retried seq should keep only the newer write → 3 entries.
         let loaded = session.load().await.unwrap();
-        assert_eq!(loaded.len(), 3);
+        assert_eq!(
+            loaded.len(),
+            3,
+            "retry at different event_times: latest per seq wins (expected 3, got {})",
+            loaded.len(),
+        );
+        // Content assertion: retry wrote the same entries, so all match.
         for (got, want) in loaded.iter().zip(entries[..3].iter()) {
-            assert_eq!(got, want);
+            assert_eq!(got, want, "retry content mismatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_different_payload_newer_wins() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-payload-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // First write: seq 0 with "old_content"
+        let old_entry: SessionEntry = Message::User {
+            content: "old_content".into(),
+        }
+        .into();
+        let new_entry: SessionEntry = Message::User {
+            content: "new_content".into(),
+        }
+        .into();
+
+        session
+            .append(std::slice::from_ref(&old_entry))
+            .await
+            .unwrap();
+        // Retry same seq 0 with different payload, newer event_time
+        session.next_seq = 0;
+        session
+            .append(std::slice::from_ref(&new_entry))
+            .await
+            .unwrap();
+
+        let loaded = session.load().await.unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "retry with different payload: latest event_time wins (expected 1, got {})",
+            loaded.len(),
+        );
+        assert_eq!(
+            loaded[0], new_entry,
+            "newer event_time entry should win over older"
+        );
+    }
+
+    #[tokio::test]
+    async fn toctou_sync_next_seq_from_load() {
+        // Simulate: connect → concurrent writer appends → load + advance_next_seq_from_snapshot_len → safe append.
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-toctou-{}", crate::session::new_id());
+        let entries = test_entries();
+
+        // Writer A: write seq 0..2 (3 entries)
+        let mut writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_a.append(&entries[..3]).await.unwrap();
+        drop(writer_a);
+
+        // Writer B: connect (reads max_seq=2, sets next_seq=3).
+        let mut writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // Simulate concurrent writer A' appending seq 3..4 between connect and load.
+        let mut writer_a2 = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_a2.append(&entries[3..5]).await.unwrap();
+        drop(writer_a2);
+
+        // Now writer B loads — gets 5 entries (0..4) even though its next_seq
+        // is still 3 (stale from connect).  This is the TOCTOU re-read.
+        let loaded = writer_b.load_with_seq().await.unwrap();
+        assert_eq!(
+            loaded.len(),
+            5,
+            "writer B sees all 5 entries despite stale next_seq"
+        );
+
+        // Sync next_seq from the loaded snapshot (what the importer does
+        // after TOCTOU check).  Next seq should be 5.
+        writer_b
+            .advance_next_seq_from_snapshot_len(loaded.len())
+            .unwrap();
+        assert_eq!(
+            writer_b.next_seq, 5,
+            "next_seq updated from loaded snapshot"
+        );
+
+        // Now append 2 more entries; they should get seq 5..6, not overlap.
+        writer_b.append(&entries[5..7]).await.unwrap();
+        let all = writer_b.load().await.unwrap();
+        assert_eq!(all.len(), 7, "all 7 entries present, no overlap");
+        for (got, want) in all.iter().zip(entries[..7].iter()) {
+            assert_eq!(got, want, "content mismatch after TOCTOU-safe append");
         }
     }
 
@@ -501,7 +699,7 @@ mod tests {
             assert_eq!(got, want);
         }
 
-        // Append 2 more; verify seqs remain contiguous (0..7, no gaps).
+        // Append 2 more; verify all 7 entries recovered.
         session.append(&entries[5..7]).await.unwrap();
         let loaded = session.load().await.unwrap();
         assert_eq!(loaded.len(), 7);
@@ -540,10 +738,237 @@ mod tests {
         assert_eq!(loaded_a.len(), 1);
     }
 
+    // ------------------------------------------------------------------
+    // dedup_raw_entries — pure unit tests (no live DB)
+    // ------------------------------------------------------------------
+
+    fn et(sec: i64) -> chrono::NaiveDateTime {
+        chrono::DateTime::from_timestamp(sec, 0)
+            .unwrap()
+            .naive_utc()
+    }
+
+    fn msg_entry(content: &str) -> String {
+        serde_json::to_string(&SessionEntry::from(Message::User {
+            content: content.to_owned(),
+        }))
+        .unwrap()
+    }
+
+    // --- older overwritten ---
+
+    #[test]
+    fn dedup_older_overwritten_different_payload() {
+        // Same seq=5, older event_time with payload "old" gets overwritten
+        // by newer event_time with payload "new" → only "new" survives.
+        let raw = vec![
+            (5i64, et(2000), msg_entry("new")),
+            (5i64, et(1000), msg_entry("old")),
+        ];
+        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 5);
+        let payload = serde_json::to_string(&result[0].1).unwrap();
+        assert_eq!(payload, msg_entry("new"));
+    }
+
+    #[test]
+    fn dedup_older_overwritten_three_versions() {
+        // Three event_times for same seq; only the latest survives.
+        let raw = vec![
+            (1i64, et(3000), msg_entry("v3")),
+            (1i64, et(1000), msg_entry("v1")),
+            (1i64, et(2000), msg_entry("v2")),
+        ];
+        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        assert_eq!(result.len(), 1);
+        let payload = serde_json::to_string(&result[0].1).unwrap();
+        assert_eq!(payload, msg_entry("v3"));
+    }
+
+    #[test]
+    fn dedup_older_overwritten_identical_payload() {
+        // Same seq, older and newer but same payload → only one entry (no conflict).
+        let raw = vec![
+            (5i64, et(2000), msg_entry("hello")),
+            (5i64, et(1000), msg_entry("hello")),
+        ];
+        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    // --- latest tie identical folded ---
+
+    #[test]
+    fn dedup_latest_tie_identical_folded() {
+        // Two rows with same (seq=3, event_time) and same payload → folded
+        let raw = vec![
+            (3i64, et(500), msg_entry("hello")),
+            (3i64, et(500), msg_entry("hello")),
+        ];
+        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 3);
+    }
+
+    #[test]
+    fn dedup_latest_tie_three_identical_folded() {
+        // Three rows with same (seq=7, event_time, payload) → folded
+        let raw = vec![
+            (7i64, et(999), msg_entry("triple")),
+            (7i64, et(999), msg_entry("triple")),
+            (7i64, et(999), msg_entry("triple")),
+        ];
+        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    // --- latest tie divergent rejected ---
+
+    #[test]
+    fn dedup_latest_tie_divergent_rejected() {
+        // Same (seq=3, event_time=500) but different payloads → conflict error
+        let raw = vec![
+            (3i64, et(500), msg_entry("hello")),
+            (3i64, et(500), msg_entry("world")),
+        ];
+        let err = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("divergent physical duplicates"), "got: {msg}");
+        assert!(msg.contains("seq 3"), "got: {msg}");
+    }
+
+    #[test]
+    fn dedup_latest_tie_divergent_with_older_rows() {
+        // seq=5 has two rows at max event_time (divergent), plus an older row.
+        // The older row is discarded but the conflict at max ET is still detected.
+        let raw = vec![
+            (5i64, et(2000), msg_entry("new_a")),
+            (5i64, et(2000), msg_entry("new_b")), // divergent!
+            (5i64, et(1000), msg_entry("old")),
+        ];
+        let err = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("divergent physical duplicates"), "got: {msg}");
+        assert!(msg.contains("seq 5"), "got: {msg}");
+    }
+
+    // --- output seq order ---
+
+    #[test]
+    fn dedup_output_seq_order() {
+        // Entries in random order; output must be sorted by seq ASC.
+        let raw = vec![
+            (10i64, et(3000), msg_entry("ten")),
+            (5i64, et(1000), msg_entry("five")),
+            (1i64, et(2000), msg_entry("one")),
+        ];
+        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, 1, "first seq=1");
+        assert_eq!(result[1].0, 5, "second seq=5");
+        assert_eq!(result[2].0, 10, "third seq=10");
+    }
+
+    #[test]
+    fn dedup_output_seq_order_same_event_time() {
+        // Same event_time across different seqs → still ordered by seq ASC.
+        let raw = vec![
+            (20i64, et(1000), msg_entry("seq20")),
+            (5i64, et(1000), msg_entry("seq5")),
+        ];
+        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 5, "lower seq first");
+        assert_eq!(result[1].0, 20, "higher seq second");
+    }
+
+    // --- edge cases ---
+
+    #[test]
+    fn dedup_empty_input() {
+        let result = dedup_raw_entries(&[], "test-session", "test-workspace").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn dedup_multi_seq_mixed_older_latest() {
+        // Mix of seqs with various age relationships.
+        let raw = vec![
+            (1i64, et(100), msg_entry("seq1-old")),
+            (1i64, et(300), msg_entry("seq1-latest")),
+            (2i64, et(200), msg_entry("seq2-only")),
+            (3i64, et(150), msg_entry("seq3-only")),
+            (3i64, et(150), msg_entry("seq3-only")), // folded: same et, same payload
+        ];
+        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, 1);
+        assert_eq!(
+            serde_json::to_string(&result[0].1).unwrap(),
+            msg_entry("seq1-latest")
+        );
+        assert_eq!(result[1].0, 2);
+        assert_eq!(result[2].0, 3);
+    }
+
     #[test]
     fn workspace_id_is_stable() {
         let a = derive_workspace_id(Path::new("/tmp/ws"));
         let b = derive_workspace_id(Path::new("/tmp/ws"));
         assert_eq!(a, b);
+    }
+
+    // ------------------------------------------------------------------
+    // advance_next_seq_from_snapshot_len — fallible monotonic advance
+    // ------------------------------------------------------------------
+    // Pure-unit testing is deferred because GreptimeSession owns a
+    // tokio_postgres::Client that cannot be cheaply constructed without
+    // a real or mock connection.  The two scenarios below are exercised
+    // via integration tests (require GREPTIME_PG).
+
+    #[tokio::test]
+    async fn advance_next_seq_rewind_rejected_integration() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-rewind-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        // After connect, next_seq is 0 (empty session → max_seq=-1 → +1 = 0).
+
+        // Advance to 5, then try to rewind to 3.
+        session.advance_next_seq_from_snapshot_len(5).unwrap();
+        let err = session.advance_next_seq_from_snapshot_len(3).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("rewind"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn advance_next_seq_toctou_refresh_integration() {
+        // This is the same test as toctou_sync_next_seq_from_load but
+        // focused specifically on advance_next_seq_from_snapshot_len
+        // normal-advance behavior.
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-seqadv-{}", crate::session::new_id());
+        let entries = test_entries();
+        let mut s = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        s.append(&entries[..3]).await.unwrap();
+        assert_eq!(s.next_seq, 3);
+
+        // Normal advance: 3 → 10
+        s.advance_next_seq_from_snapshot_len(10).unwrap();
+        assert_eq!(s.next_seq, 10);
+
+        // Same value is allowed (no-op advance).
+        s.advance_next_seq_from_snapshot_len(10).unwrap();
+        assert_eq!(s.next_seq, 10);
     }
 }

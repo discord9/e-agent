@@ -201,10 +201,13 @@ SQL
 ```
 
 - **physical_rows** — every row in the table (may include retry duplicates).
-- **logical_entries** — distinct `seq` values. The model context is built from
-  logical entries, not physical rows. Duplicates do not inflate context.
+- **logical_entries** — distinct `seq` values after dedup. The dedup logic
+  for each seq keeps only the row(s) with the latest `event_time`; identical
+  payloads at the same max `event_time` are folded, divergent ones cause an
+  error. Model context is built from these logical entries.
 - **duplicate_rows** = physical - logical. Expected to be 0 in normal
-  operation; >0 indicates retries after partial write failures.
+  operation; >0 indicates retries after partial write failures or same-µs
+  retries.
 - **gap_slots** = `(max-min+1) - count(distinct seq)`. **Assumes** seq starts
   at 0 and increments contiguously. A value >0 means seq values are missing,
   which should not happen in normal operation.
@@ -228,54 +231,110 @@ The `left(replace(...), 120)` strips newlines and truncates to 120 characters
 so the output fits in a terminal without scrolling. The payload is a
 `SessionEntry` JSON blob (see `SessionEntry` enum in the Rust source).
 
-### 7. Reconstruct logical transcript (deduplicated, seq-ordered)
+### 7. Reconstruct logical transcript (deduplicated by seq, latest event_time wins)
 
-Use the production dedup strategy: scan newest-first by `event_time`, keep the
-first row per `seq` (which is the latest write), then sort by `seq` ASC.
+The production code loads entries ordered by `seq ASC` and deduplicates by
+seq: for each seq, only the row(s) with the latest `event_time` are kept
+(identical-payload rows at the same max event_time are folded; divergent
+payloads error). The result is a flat list in seq order.
 
-For ad hoc inspection, a `ROW_NUMBER()` window query is clearer:
+For ad hoc inspection, first find the max `event_time` per seq, then keep
+**all** rows that match that max time — a tie at max event_time is not
+silently hidden:
 
 ```sql
-WITH dedup AS (
-  SELECT *,
-    ROW_NUMBER() OVER (
-      PARTITION BY seq
-      ORDER BY event_time DESC
-    ) AS rn
+WITH max_et AS (
+  SELECT seq, MAX(event_time) AS max_event_time
   FROM session_entries
   WHERE workspace_id=:'wid' AND session_id=:'sid'
+  GROUP BY seq
 )
-SELECT seq, entry_kind, is_error,
-       left(replace(payload, E'\n', ' '), 120) AS preview
-FROM dedup
-WHERE rn = 1
-ORDER BY seq ASC;
+SELECT s.seq, s.entry_kind, s.is_error,
+       left(replace(s.payload, E'\n', ' '), 120) AS preview
+FROM session_entries s
+JOIN max_et m ON s.seq = m.seq AND s.event_time = m.max_event_time
+WHERE s.workspace_id=:'wid' AND s.session_id=:'sid'
+ORDER BY s.seq ASC;
 ```
 
-> **Performance note**: The window function scans all rows for this session.
-> The production code avoids it by scanning `ORDER BY event_time DESC` and
-> deduplicating in the Rust application (first occurrence wins). For ad hoc
-> investigation of sessions with <10K rows, the window is fine.
+> **Note**: This scans all rows for the session, which is fine for ad hoc
+> investigation of sessions with <10K rows. The production code avoids the
+> JOIN by grouping in Rust (`dedup_raw_entries`). At the same max event_time,
+> multiple physical rows with identical deserialised `SessionEntry` values
+> are folded; if **any** deserialised `SessionEntry` differs, the production
+> code raises a hard error (divergent duplicates at the same timestamp).
+> Raw-string differences alone (whitespace, key order) are not sufficient
+> to trigger the hard error — see the "raw-string divergence candidate"
+> discussion below.
+
+To detect ties (multiple rows at the same max event_time for the same seq)
+and determine whether they have divergent payloads:
+
+```sql
+WITH max_et AS (
+  SELECT seq, MAX(event_time) AS max_event_time
+  FROM session_entries
+  WHERE workspace_id=:'wid' AND session_id=:'sid'
+  GROUP BY seq
+),
+tie_rows AS (
+  SELECT s.seq, s.event_time, s.payload
+  FROM session_entries s
+  JOIN max_et m ON s.seq = m.seq AND s.event_time = m.max_event_time
+  WHERE s.workspace_id=:'wid' AND s.session_id=:'sid'
+)
+SELECT seq, event_time, count(*) AS row_count,
+       count(DISTINCT payload) AS distinct_payloads
+FROM tie_rows
+GROUP BY seq, event_time
+HAVING count(*) > 1
+ORDER BY seq;
+```
+
+A result with `distinct_payloads = 1` means identical idempotent retry
+(safe fold).  `distinct_payloads > 1` is a **raw-string divergence
+candidate** — the JSON text differs, but that does **not** guarantee the
+production code would raise a hard error, because the production
+`dedup_raw_entries` deserialises each `payload` into a `SessionEntry` and
+compares the deserialised values.  Two JSON strings that differ in
+whitespace, key ordering, or non-semantic formatting may produce the same
+`SessionEntry` and be silently folded.
+
+To inspect the actual raw payloads that differ (without truncation), query
+with a `payload AS raw_payload` alias for a given seq N:
+
+```sql
+WITH max_et AS (
+  SELECT MAX(event_time) AS max_event_time
+  FROM session_entries
+  WHERE workspace_id=:'wid' AND session_id=:'sid' AND seq = N
+)
+SELECT seq, event_time, payload AS raw_payload
+FROM session_entries
+WHERE workspace_id=:'wid' AND session_id=:'sid' AND seq = N
+  AND event_time = (SELECT max_event_time FROM max_et)
+ORDER BY event_time;
+```
 
 ### 8. Inspect entry kinds, errors, notices, compactions
 
-Grouped counts — logical-dedup aware:
+Grouped counts — candidate rows (all rows at latest event_time per seq; ties
+produce multiple rows and must be folded with SessionEntry semantics in
+production):
 
 ```sql
-WITH dedup AS (
-  SELECT *,
-    ROW_NUMBER() OVER (
-      PARTITION BY seq
-      ORDER BY event_time DESC
-    ) AS rn
+WITH max_et AS (
+  SELECT seq, MAX(event_time) AS max_event_time
   FROM session_entries
   WHERE workspace_id=:'wid' AND session_id=:'sid'
+  GROUP BY seq
 )
-SELECT entry_kind, is_error, count(*) AS cnt
-FROM dedup
-WHERE rn = 1
-GROUP BY entry_kind, is_error
-ORDER BY entry_kind, is_error;
+SELECT s.entry_kind, s.is_error, count(*) AS cnt
+FROM session_entries s
+JOIN max_et m ON s.seq = m.seq AND s.event_time = m.max_event_time
+WHERE s.workspace_id=:'wid' AND s.session_id=:'sid'
+GROUP BY s.entry_kind, s.is_error
+ORDER BY s.entry_kind, s.is_error;
 ```
 
 Or a simpler physical count (usually identical when duplicate_rows=0):
@@ -298,28 +357,40 @@ SQL
 | `compaction` | A `SessionEntry::Compaction` — a summary of earlier history produced by the compaction feature. |
 | `notice` | A `SessionEntry::Notice` — system notices such as background task completion. |
 
+> **Candidate-row count ≠ logical entry count**: The query above counts every
+> physical row at the latest `event_time` per seq.  If a seq has multiple rows
+> at that max event_time (same-µs retry tie), they each contribute to `cnt`.
+> The production code (`dedup_raw_entries`) folds identical-payload ties into
+> one logical entry, so the candidate-row count may overcount when ties exist.
+> True logical entry-kind counts require SessionEntry deserialisation and
+> folding — the candidate query is a diagnostic approximation.
+
 ### 9. Inspect last compaction and understand effective history
 
-List all compaction entries (logical-dedup aware, ordered by seq):
+List all compaction entries (candidate rows from latest event_time per seq, ordered by seq):
 
 ```bash
 psql "$CONN" -v sid="$SESSION" -v wid="$WORKSPACE" -P pager=off <<'SQL'
-WITH dedup AS (
-  SELECT *,
-    ROW_NUMBER() OVER (
-      PARTITION BY seq
-      ORDER BY event_time DESC
-    ) AS rn
+WITH max_et AS (
+  SELECT seq, MAX(event_time) AS max_event_time
   FROM session_entries
   WHERE workspace_id=:'wid' AND session_id=:'sid'
-  AND entry_kind = 'compaction'
+  GROUP BY seq
 )
-SELECT seq, left(replace(payload, E'\n', ' '), 200) AS preview
-FROM dedup
-WHERE rn = 1
-ORDER BY seq ASC;
+SELECT s.seq, left(replace(s.payload, E'\n', ' '), 200) AS preview
+FROM session_entries s
+JOIN max_et m ON s.seq = m.seq AND s.event_time = m.max_event_time
+WHERE s.workspace_id=:'wid' AND s.session_id=:'sid'
+  AND s.entry_kind = 'compaction'
+ORDER BY s.seq ASC;
 SQL
 ```
+
+> **Compaction filtering after latest-per-seq**: The `entry_kind = 'compaction'`
+> filter is applied **after** the JOIN that narrows to latest-event_time rows
+> per seq.  This ensures that if a compaction entry was retried (same seq,
+> later event_time), only the retried copy appears, never the replayed older
+> one.
 
 **How compaction works — effective history**:
 
@@ -373,7 +444,7 @@ other databases unless the user explicitly identifies one as relevant.
 |---|---|
 | **Session shows 0 rows in TUI** | 1. Verify the canonical workspace path with `pwd -P`.<br>2. Check the configured `dbname`.<br>3. Is the session newer than the last completed turn? Let the turn finish, then check again. |
 | **Rows exist but TUI shows old state** | Persistence occurs at **turn boundaries**. The active turn's newest events are not flushed until the turn completes. Run `/compact` or send a new prompt to trigger a write. |
-| **duplicate_rows > 0** | Expected after a write retry (e.g., connection drop after INSERT succeeded but before the client received acknowledgment). The dedup logic in `load()` handles this: first row per seq (latest write) wins. |
+| **duplicate_rows > 0** | Expected after a write retry (e.g., connection drop after INSERT succeeded but before the client received acknowledgment). The dedup logic in `load_with_seq` handles this: per seq, latest event_time wins. |
 | **gap_slots > 0** | Seq values are missing. This should not happen in normal operation — seq is assigned atomically in `append()`. If it occurs, check for concurrent writers or manual interference. |
 | **JSONL file is absent but DB has rows** | Config is using GreptimeDB backend. This is the correct state. |
 | **JSONL file is present and recent but DB has no rows** | Config may have switched back to JSONL, or the session started on JSONL before the switch. |
@@ -443,46 +514,52 @@ ORDER BY seq DESC
 LIMIT 10;
 SQL
 
-# 3. Logical deduped transcript (ROW_NUMBER)
+# 3. Logical deduped transcript (seq order, latest event_time per seq — all tie rows)
 psql "$CONN" -v sid="$SESSION" -v wid="$WORKSPACE" -P pager=off <<'SQL'
-WITH dedup AS (
-  SELECT *,
-    ROW_NUMBER() OVER (PARTITION BY seq ORDER BY event_time DESC) AS rn
+WITH max_et AS (
+  SELECT seq, MAX(event_time) AS max_event_time
   FROM session_entries
   WHERE workspace_id=:'wid' AND session_id=:'sid'
+  GROUP BY seq
 )
-SELECT seq, entry_kind, is_error,
-       left(replace(payload, E'\n', ' '), 120) AS preview
-FROM dedup WHERE rn = 1
-ORDER BY seq ASC;
+SELECT s.seq, s.entry_kind, s.is_error,
+       left(replace(s.payload, E'\n', ' '), 120) AS preview
+FROM session_entries s
+JOIN max_et m ON s.seq = m.seq AND s.event_time = m.max_event_time
+WHERE s.workspace_id=:'wid' AND s.session_id=:'sid'
+ORDER BY s.seq ASC;
 SQL
 
-# 4. Entry kind / error counts (logical-dedup aware)
+# 4. Entry kind / error counts (candidate rows)
 psql "$CONN" -v sid="$SESSION" -v wid="$WORKSPACE" -P pager=off <<'SQL'
-WITH dedup AS (
-  SELECT *,
-    ROW_NUMBER() OVER (PARTITION BY seq ORDER BY event_time DESC) AS rn
+WITH max_et AS (
+  SELECT seq, MAX(event_time) AS max_event_time
   FROM session_entries
   WHERE workspace_id=:'wid' AND session_id=:'sid'
+  GROUP BY seq
 )
-SELECT entry_kind, is_error, count(*) AS cnt
-FROM dedup WHERE rn = 1
-GROUP BY entry_kind, is_error
-ORDER BY entry_kind, is_error;
+SELECT s.entry_kind, s.is_error, count(*) AS cnt
+FROM session_entries s
+JOIN max_et m ON s.seq = m.seq AND s.event_time = m.max_event_time
+WHERE s.workspace_id=:'wid' AND s.session_id=:'sid'
+GROUP BY s.entry_kind, s.is_error
+ORDER BY s.entry_kind, s.is_error;
 SQL
 
-# 5. Last compaction (logical-dedup aware)
+# 5. Last compaction (candidate rows)
 psql "$CONN" -v sid="$SESSION" -v wid="$WORKSPACE" -P pager=off <<'SQL'
-WITH dedup AS (
-  SELECT *,
-    ROW_NUMBER() OVER (PARTITION BY seq ORDER BY event_time DESC) AS rn
+WITH max_et AS (
+  SELECT seq, MAX(event_time) AS max_event_time
   FROM session_entries
   WHERE workspace_id=:'wid' AND session_id=:'sid'
-    AND entry_kind = 'compaction'
+  GROUP BY seq
 )
-SELECT seq, left(replace(payload, E'\n', ' '), 200) AS preview
-FROM dedup WHERE rn = 1
-ORDER BY seq DESC
+SELECT s.seq, left(replace(s.payload, E'\n', ' '), 200) AS preview
+FROM session_entries s
+JOIN max_et m ON s.seq = m.seq AND s.event_time = m.max_event_time
+WHERE s.workspace_id=:'wid' AND s.session_id=:'sid'
+  AND s.entry_kind = 'compaction'
+ORDER BY s.seq DESC
 LIMIT 1;
 SQL
 
@@ -539,9 +616,10 @@ SQL
 - **Workspace IDs use the canonical workspace root.** e-agent canonicalizes
   the workspace before deriving `workspace_id`. Run `pwd -P` from the same
   workspace when constructing diagnostic queries.
-- **Physical row count ≠ model context size.** The Rust `load()` function
-  deduplicates by `seq` and resolves compaction. Model context is built from
-  logical entries, not physical rows.
+- **Physical row count ≠ logical entry count.** The Rust `load_with_seq()`
+  function groups by seq, keeping only the row(s) with the latest event_time
+  per seq (latest wins). Model context is built from these logical entries,
+  not physical rows.
 - **Background task JSONL is separate.** `*.background.jsonl` files in the
   `.e-agent/sessions/` directory are never stored in the DB. Their absence
   does not indicate a backend failure.

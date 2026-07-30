@@ -48,31 +48,43 @@ cargo build
 
 ```sql
 CREATE TABLE IF NOT EXISTS session_entries (
-    session_id      STRING       PRIMARY KEY,
+    workspace_id    STRING       NOT NULL,
+    session_id      STRING       NOT NULL,
     seq             BIGINT       NOT NULL,
     event_time      TIMESTAMP(9) NOT NULL TIME INDEX,
-    entry_kind      STRING       NOT NULL,   -- message / compaction / notice
+    entry_kind      STRING       NOT NULL,   -- message / compaction / notice / background_completion
     payload         STRING       NOT NULL,   -- SessionEntry as JSON
     schema_version  INT          NOT NULL DEFAULT 1,
-    agent_role      STRING       NOT NULL DEFAULT 'main',
     is_error        BOOLEAN      NOT NULL DEFAULT FALSE,
-    appended_at     TIMESTAMP(9) NOT NULL DEFAULT now()
+    appended_at     TIMESTAMP(9) NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, session_id)
 ) WITH (append_mode = 'true', sst_format = 'flat')
 ```
 
-## Query Patterns (leveraging TIME INDEX optimizations)
+## Query Patterns
 
 | Operation | Query | Optimization |
 |-----------|-------|-------------|
-| `connect` (find max seq) | `last_value(seq ORDER BY event_time ASC) GROUP BY session_id` | LastRow scan hint → reads 2 rows instead of full scan |
-| `load` (read all entries) | `SELECT seq, payload ... ORDER BY event_time DESC` | WindowedSortExec + app-side HashMap dedup (no window function) |
-| `append` | Parameterized INSERT | tokio-postgres byte-identical (verified with 1MB, CJK, multiline, injection) |
+| `connect` (find max seq) | `SELECT COALESCE(MAX(seq), -1)::BIGINT ... WHERE workspace_id=$1 AND session_id=$2` | Full partition scan (acceptable, sessions are bounded) |
+| `load` (read all entries) | `SELECT seq, event_time, payload ... ORDER BY seq ASC` | App-side dedup (`dedup_raw_entries`) — group by seq, keep only rows with the latest `event_time` per seq, sort output by seq ASC |
+| `append` | Parameterized multi-row INSERT | Single statement (all-or-nothing per chunk of ≤9000 rows); `next_seq` advances only after all chunks succeed |
+
+### Dedup semantics (load_with_seq → dedup_raw_entries)
+
+1. Among all physical rows for a given seq, only the row(s) with the **latest**
+   `event_time` are retained. Older rows are silently discarded (they are
+   considered overwritten by the newer write).
+2. If the latest event_time has **multiple** physical rows (same seq, same
+   max event_time), their payloads are deserialised and compared. If all are
+   identical (idempotent retry at the same microsecond), they are folded into
+   one logical entry. If **any** differ, an error is returned with the seq,
+   event_time, session id, and manual-inspection guidance.
+3. Output is ordered by seq ASC.
 
 ## Verification
 
-- 134/134 project tests pass (default features); 138/138 with `--features greptime` (4 integration tests run against a live GreptimeDB at 127.0.0.1:15403, dbname=e_agent)
+- All project tests pass (both default and `--features greptime`; integration tests require a live GreptimeDB)
 - 8601 real JSONL entries imported from 84 sessions during the PoC (incremental importer)
-- EXPLAIN ANALYZE VERBOSE confirmed LastRow scan (2 rows vs 5780) and WindowedSortExec during the PoC
 - kill -9 durability verified (sync_write=true, 1083 rows survived)
 - tokio-postgres and gRPC ingester both byte-identical (psycopg2 \n issue is Python-only)
 - clippy clean (both feature sets), fmt clean
@@ -83,11 +95,11 @@ CREATE TABLE IF NOT EXISTS session_entries (
 - **No dual-write** — config selects one backend at a time. Default stays JSONL.
 - **No rewrite for Greptime** — compaction is append-only (Compaction entry appended at end; agent's `effective_history` finds it via `rposition`). `rewrite()` is a no-op for Greptime.
 - **Background tasks stay JSONL** — `record_background_start` / `clear_background_task` / `take_unfinished_background` are unchanged.
-- **append_mode = true** — no DELETE/UPDATE. Retries produce duplicates, deduplicated on read (app-side HashMap, first-wins by event_time DESC).
+- **append_mode = true** — no DELETE/UPDATE. Retries produce duplicates, deduplicated on read (`dedup_raw_entries` — latest event_time per seq wins, same-seq ties checked by deserialised equality).
 
 ## Non-goals
 
-- No automatic migration of existing JSONL sessions at startup (a one-shot importer was built and used during the PoC; removed before merge as an experiment artifact)
+- No automatic migration of existing JSONL sessions at startup (manual import via `e-agent-import-jsonl`)
 - No background task persistence in GreptimeDB
 - No distributed/cluster deployment — standalone GreptimeDB only
 - No generic storage abstraction for future third backends
@@ -96,7 +108,12 @@ CREATE TABLE IF NOT EXISTS session_entries (
 
 - GreptimeDB server must be running before e-agent starts (no auto-discovery or embedded mode)
 - `tokio-postgres` needs `with-chrono-0_4` feature for TIMESTAMP params
-- `event_time` is real wall-clock time but may have nanosecond collisions across processes (same-ns entries get prev+1)
+- `event_time` is wall-clock time with microsecond precision.  Within a single
+  process, the monotonic `next_event_time_us` atomic guarantees strict ordering
+  (same-µs or backward clock → prev+1).  Dedup: per seq, only rows with the
+  latest `event_time` are retained; at the same max `event_time`, identical
+  deserialised `SessionEntry` values are folded and divergent ones cause a
+  hard error.
 
 ## Review Notes (two rounds, all resolved)
 
@@ -112,4 +129,4 @@ Round 2 (oracle review) — items fixed in commits `7d7e648` and `8dc6054`:
 
 6. ~~**Critical — subagents shared the main session's bound store**: Greptime `SessionStore` is bound to one session_id at connect; cloning it into `Delegate` wrote all subagent transcripts into the main session.~~ **Fixed**: `Delegate` now carries `SessionBackend` config and each subagent connects its own session-bound store; resume connects a temporary store bound to the resumed id.
 7. ~~**High — append partial commit**: per-row INSERTs advanced `next_seq` for a committed prefix while callers treated the call as all-or-nothing; retries re-sent the slice with shifted seqs. First fix attempt used a transaction, but live-wire testing proved **GreptimeDB pg-wire has NO transaction support** (server warns "transaction is not supported"; ROLLBACK is a no-op).~~ **Fixed**: single multi-row parameterized INSERT per chunk (verified: any row failure → zero rows committed), `next_seq` advances only on success, so retries reuse the same seq range and read-side dedup handles full-batch duplicate retries.
-8. ~~**Medium — µs-precision ties**: nanosecond monotonic timestamps collapsed to equal values on the µs-precision PG wire, making first-wins dedup nondeterministic on retry duplicates.~~ **Fixed**: monotonic clock now quantizes to microseconds (`next_event_time_us`).
+8. ~~**Medium — µs-precision ties**: nanosecond monotonic timestamps collapsed to equal values on the µs-precision PG wire, making retry duplicates indistinguishable at the same microsecond.~~ **Fixed**: monotonic clock now quantizes to microseconds (`next_event_time_us`); duplicate detection uses deserialised `SessionEntry` equality at the same max event_time.

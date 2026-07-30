@@ -333,7 +333,7 @@ async fn run() -> anyhow::Result<()> {
             let range_start = db_len;
             let range_end = db_len + missing.len();
             println!(
-                "append: {} entries (seq {range_start}..{range_end})",
+                "append: {} entries (positions {range_start}..{range_end})",
                 missing.len(),
             );
 
@@ -362,6 +362,11 @@ async fn run() -> anyhow::Result<()> {
                         check.len(),
                     );
                 }
+
+                // Sync next_seq from the TOCTOU-re-read snapshot so that
+                // stale connect-time next_seq does not cause overwrites.
+                db.advance_next_seq_from_snapshot_len(check.len())
+                    .context("cannot advance next_seq from TOCTOU snapshot")?;
 
                 db.append(missing)
                     .await
@@ -416,7 +421,7 @@ async fn verify_db_matches(db: &GreptimeSession, expected: &[SessionEntry]) -> a
     for (i, (got, want)) in got_entries.iter().zip(expected.iter()).enumerate() {
         if *got != want {
             bail!(
-                "verification FAILED at seq {i}: DB entry content differs from JSONL; \
+                "verification FAILED at position {i}: DB entry content differs from JSONL; \
                  partial commit may have occurred. Fix the issue and re-run.",
             );
         }
@@ -454,54 +459,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // verify_seq_continuity
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn seq_continuity_ok() {
-        let data: Vec<(i64, SessionEntry)> = (0..5).map(|i| (i, msg("x"))).collect();
-        assert!(verify_seq_continuity(&data).is_ok());
-    }
-
-    #[test]
-    fn seq_continuity_empty() {
-        let data: Vec<(i64, SessionEntry)> = vec![];
-        assert!(verify_seq_continuity(&data).is_ok());
-    }
-
-    #[test]
-    fn seq_continuity_gap() {
-        let data: Vec<(i64, SessionEntry)> = vec![
-            (0, msg("a")),
-            (2, msg("b")), // gap: seq 1 missing
-        ];
-        let err = verify_seq_continuity(&data).unwrap_err();
-        assert!(format!("{err:#}").contains("seq discontinuity at index 1"));
-    }
-
-    #[test]
-    fn seq_continuity_wrong_start() {
-        let data: Vec<(i64, SessionEntry)> = vec![
-            (1, msg("a")), // should start at 0
-        ];
-        let err = verify_seq_continuity(&data).unwrap_err();
-        assert!(format!("{err:#}").contains("seq discontinuity at index 0"));
-    }
-
-    #[test]
-    fn seq_continuity_duplicate_seq() {
-        let data: Vec<(i64, SessionEntry)> = vec![
-            (0, msg("a")),
-            (0, msg("b")), // duplicate
-        ];
-        // Dedup handled in load_with_seq, but verify catches if duplicates
-        // somehow survive.
-        let err = verify_seq_continuity(&data).unwrap_err();
-        assert!(format!("{err:#}").contains("seq discontinuity at index 1"));
-    }
-
-    // ------------------------------------------------------------------
-    // plan_import
+    // plan_import (payload-stream comparison after seq-0..N dedup)
     // ------------------------------------------------------------------
 
     #[test]
@@ -596,6 +554,53 @@ mod tests {
             ImportPlan::Diverged { at } => assert_eq!(at, 0),
             other => panic!("expected Diverged, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // verify_seq_continuity
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn seq_continuity_ok() {
+        let data: Vec<(i64, SessionEntry)> = (0..5).map(|i| (i, msg("x"))).collect();
+        assert!(verify_seq_continuity(&data).is_ok());
+    }
+
+    #[test]
+    fn seq_continuity_empty() {
+        let data: Vec<(i64, SessionEntry)> = vec![];
+        assert!(verify_seq_continuity(&data).is_ok());
+    }
+
+    #[test]
+    fn seq_continuity_gap() {
+        let data: Vec<(i64, SessionEntry)> = vec![
+            (0, msg("a")),
+            (2, msg("b")), // gap: seq 1 missing
+        ];
+        let err = verify_seq_continuity(&data).unwrap_err();
+        assert!(format!("{err:#}").contains("seq discontinuity at index 1"));
+    }
+
+    #[test]
+    fn seq_continuity_wrong_start() {
+        let data: Vec<(i64, SessionEntry)> = vec![
+            (1, msg("a")), // should start at 0
+        ];
+        let err = verify_seq_continuity(&data).unwrap_err();
+        assert!(format!("{err:#}").contains("seq discontinuity at index 0"));
+    }
+
+    #[test]
+    fn seq_continuity_duplicate_seq() {
+        let data: Vec<(i64, SessionEntry)> = vec![
+            (0, msg("a")),
+            (0, msg("b")), // duplicate
+        ];
+        // Dedup handled in load_with_seq, but verify catches if duplicates
+        // somehow survive.
+        let err = verify_seq_continuity(&data).unwrap_err();
+        assert!(format!("{err:#}").contains("seq discontinuity at index 1"));
     }
 
     // ------------------------------------------------------------------

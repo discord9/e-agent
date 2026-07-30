@@ -380,8 +380,12 @@ with the same name in different workspaces remain isolated.
 - GreptimeDB server must be running before e-agent starts
 - `tokio-postgres` needs the `with-chrono-0_4` feature for TIMESTAMP params
   (already included in the `greptime` feature)
-- `event_time` is real wall-clock time but may have nanosecond collisions
-  across processes (same-ns entries get prev+1 via a monotonic atomic guard)
+- `event_time` is wall-clock time with microsecond precision.  Within a
+  single process, the monotonic `next_event_time_us` atomic guarantees strict
+  ordering (same-µs or backward clock → prev+1).  Dedup: per seq, only rows
+  with the latest `event_time` are retained; at the same max `event_time`,
+  identical deserialised `SessionEntry` values are folded and divergent ones
+  cause a hard error.
 - No transactions — atomicity is per multi-row INSERT statement
 - Subagents each open their own database connection (bounded, fine for
   single-user agents)
@@ -391,14 +395,17 @@ with the same name in different workspaces remain isolated.
 | Operation | Query | Optimization |
 |-----------|-------|-------------|
 | connect (find max seq) | `SELECT MAX(seq) ... WHERE workspace_id=$1 AND session_id=$2` | Full partition scan (acceptable, sessions are bounded) |
-| load (all entries) | `SELECT seq, payload ... ORDER BY event_time DESC` | WindowedSortExec + app-side HashMap dedup |
+| load (all entries) | `SELECT seq, event_time, payload ... ORDER BY seq ASC` | App-side dedup (group by seq, latest event_time wins) |
 | append | Parameterized multi-row INSERT | Single statement, all-or-nothing per chunk |
 
 ### Import tool: `e-agent-import-jsonl`
 
 A standalone binary for manual, incremental JSONL-to-GreptimeDB import. Only
 appends entries that do not yet exist, and refuses to write when the existing
-DB prefix diverges from the JSONL file. Re-runnable under idle target+strict prefix conditions; not physically idempotent (identical-payload duplicates are folded, divergent duplicates rejected).
+DB prefix diverges from the JSONL file. Re-runnable under idle target + strict
+prefix conditions.  Duplicates (identical-deserialised-`SessionEntry` retries
+at the same max event_time) are folded; divergent duplicates at the same
+event_time are rejected.
 
 #### Build
 
@@ -426,8 +433,8 @@ e-agent-import-jsonl --session <SESSION_ID> [--workspace <PATH>] [--conn <CONN>]
 1. The tool requires the JSONL file at exactly `.e-agent/sessions/<id>.jsonl`
    to exist (empty files are valid). Legacy `.json` format is rejected.
 2. The DB's seq values are verified to be strictly 0..N continuous before
-   planning (gaps or divergent duplicates cause a hard error; identical-payload
-   duplicates are silently folded).
+   planning (gaps or divergent-deserialised-`SessionEntry` duplicates cause a
+   hard error; identical deserialised entries are silently folded).
 3. If the DB has **more** entries than the JSONL file, the tool errors out
    without writing — it will never truncate.
 4. If the existing DB prefix **differs** from the same-length prefix of the
@@ -445,9 +452,12 @@ e-agent-import-jsonl --session <SESSION_ID> [--workspace <PATH>] [--conn <CONN>]
 8. **Partial commits**: chunks of >9000 entries use separate INSERT
    statements. If the first chunk commits and the second fails, some entries
    are written. Fix the issue (e.g. network, JSONL source) and re-run.
-9. **Duplicate handling**: identical physical duplicates (same seq, same
-   payload) are folded silently. Divergent duplicates (same seq, different
-   payload) cause a hard error — stop writers, inspect with SQL, and resolve
+9. **Duplicate handling**: within a seq, older `event_time` rows are
+   silently overwritten by the latest `event_time` row. If the latest
+   `event_time` has multiple physical rows (same microsecond), their
+   payloads are deserialised and compared as `SessionEntry` values.
+   Identical deserialised entries are folded silently; divergent entries
+   cause a hard error — stop writers, inspect with SQL, and resolve
    manually.
 
 
