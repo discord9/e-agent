@@ -1771,16 +1771,15 @@ impl ScrollWindow {
         self.frozen_source_end = 0;
         self.source_end = total;
         // Walk backward counting visual rows until we have enough.
+        // Include the first preceding DisplayLine that crosses the
+        // viewport-height boundary so a giant assistant block is not
+        // excluded entirely when followed by a short user line.
         self.source_start = total;
         let mut accumulated = 0usize;
-        while self.source_start > 0 {
-            let prev = self.source_start - 1;
-            let rows = line_visual_rows(&lines[prev], width);
-            if accumulated + rows > height && accumulated > 0 {
-                break;
-            }
-            accumulated += rows;
-            self.source_start = prev;
+        while self.source_start > 0 && accumulated < height {
+            self.source_start -= 1;
+            accumulated =
+                accumulated.saturating_add(line_visual_rows(&lines[self.source_start], width));
         }
         self.local_offset = 0; // will be set after rendering
     }
@@ -5500,5 +5499,33 @@ mod ux_tests {
         assert_eq!(state.window.source_start, 0);
         assert_eq!(state.window.local_offset, 0);
         assert!(!state.window.follow_bottom);
+    }
+
+    #[test]
+    fn anchor_tail_includes_long_crossing_line() {
+        let lines = vec![
+            DisplayLine {
+                text: "x".repeat(2400),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "you> hello".into(),
+                kind: LineKind::User,
+            },
+        ];
+        let mut window = ScrollWindow::new();
+        window.anchor_tail(&lines, 80, 6);
+        assert_eq!(window.source_start, 0);
+
+        let rendered = render_window(&lines, 0, window.source_end, 80);
+        let visible = &rendered[rendered.len() - 6..];
+        let text = |row: &ratatui::text::Line<'_>| {
+            row.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert_eq!(text(visible.first().unwrap()), "x".repeat(80));
+        assert_eq!(text(visible.last().unwrap()), "you> hello");
     }
 }
