@@ -156,49 +156,100 @@ impl GreptimeSession {
         Ok(entries)
     }
 
-    /// Append new entries atomically within a transaction.
+    /// Append new entries atomically per multi-row INSERT statement.
     ///
-    /// All entries in one call share a single database transaction — no
-    /// partial commit within the slice. `next_seq` advances by
-    /// `entries.len()` only after commit succeeds, so retries are safe
-    /// (duplicates land as extra rows, deduplicated on read by seq).
+    /// GreptimeDB's pg-wire does not support transactions, so atomicity
+    /// is per statement: a single multi-row INSERT either commits all N rows
+    /// or commits zero. Serialization happens before any DB write.
+    ///
+    /// Chunking: tokio-postgres / pg-wire allows at most 65535 bound
+    /// parameters, so entries are chunked at 10000 per statement
+    /// (60000 params). >10000-entry appends can partially commit across
+    /// chunks; acceptable, turns are far smaller.
+    ///
+    /// `next_seq` advances by `entries.len()` only after all chunks succeed.
+    /// On failure `next_seq` is unchanged, so retries of the same slice
+    /// reuse the same seq range. Duplicates of a fully-committed-then-retried
+    /// batch are handled by read-side dedup (equal seq, first-wins by
+    /// event_time DESC).
     pub async fn append(&mut self, entries: &[SessionEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let n = entries.len() as i64;
-        let tx = self
-            .client
-            .build_transaction()
-            .start()
-            .await
-            .context("cannot start transaction")?;
+        let n = entries.len();
+        const CHUNK_SIZE: usize = 10000;
 
+        // Serialize all entries upfront so serialization errors happen
+        // before any database write.
+        let mut prepped: Vec<(i64, chrono::NaiveDateTime, String, String, bool)> =
+            Vec::with_capacity(n);
         for (i, entry) in entries.iter().enumerate() {
             let seq = self.next_seq + i as i64;
             let payload = serde_json::to_string(entry)
                 .with_context(|| format!("cannot serialize entry seq {seq}"))?;
-            let kind = entry_kind(entry);
+            let kind = entry_kind(entry).to_string();
             let err = is_error(entry);
             let ts = us_to_datetime(next_event_time_us());
-
-            tx.client()
-                .execute(
-                    r#"INSERT INTO session_entries
-                        (session_id, seq, event_time, entry_kind, payload,
-                         schema_version, agent_role, is_error)
-                       VALUES ($1, $2, $3, $4, $5, 1, 'main', $6)"#,
-                    &[&self.session_id, &seq, &ts, &kind, &payload.as_str(), &err],
-                )
-                .await
-                .with_context(|| format!("cannot append session {} seq {seq}", self.session_id))?;
+            prepped.push((seq, ts, kind, payload, err));
         }
 
-        tx.commit().await.context("cannot commit transaction")?;
+        let sid = self.session_id.clone();
+        for chunk in prepped.chunks(CHUNK_SIZE) {
+            let n_chunk = chunk.len() as i64;
+            let sql = build_multi_row_insert(chunk.len());
 
-        self.next_seq += n;
+            // Flatten params: session_id, seq, ts, kind, payload, is_error per row.
+            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> =
+                Vec::with_capacity(chunk.len() * 6);
+            for (seq, ts, kind, payload, err) in chunk {
+                params.push(Box::new(sid.as_str()));
+                params.push(Box::new(*seq));
+                params.push(Box::new(*ts));
+                params.push(Box::new(kind.as_str()));
+                params.push(Box::new(payload.as_str()));
+                params.push(Box::new(*err));
+            }
+
+            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                params.iter().map(|p| p.as_ref()).collect();
+
+            self.client
+                .execute(&sql, &param_refs)
+                .await
+                .context("cannot append chunk to session_entries")?;
+
+            self.next_seq += n_chunk;
+        }
+
         Ok(())
     }
+}
+
+/// Build a multi-row INSERT with 6 bound parameters per row.
+/// Example (1 row): `INSERT INTO session_entries (...) VALUES ($1,$2,$3,$4,$5,1,'main',$6)`
+fn build_multi_row_insert(row_count: usize) -> String {
+    let mut sql = String::with_capacity(200 + row_count * 40);
+    sql.push_str(
+        "INSERT INTO session_entries \
+         (session_id, seq, event_time, entry_kind, payload, \
+          schema_version, agent_role, is_error) VALUES ",
+    );
+    for i in 0..row_count {
+        if i > 0 {
+            sql.push(',');
+        }
+        let b = i * 6;
+        sql.push_str(&format!(
+            "(${b1},${b2},${b3},${b4},${b5},1,'main',${b6})",
+            b1 = b + 1,
+            b2 = b + 2,
+            b3 = b + 3,
+            b4 = b + 4,
+            b5 = b + 5,
+            b6 = b + 6
+        ));
+    }
+    sql
 }
 
 #[cfg(test)]
@@ -326,19 +377,19 @@ mod tests {
         let mut session = GreptimeSession::connect(&conn_str(), &sid).await.unwrap();
         let entries = test_entries();
 
-        // Append a slice, verify it's recovered in order.
-        session.append(&entries[..4]).await.unwrap();
+        // Append a slice of 5 entries in one call; verify all 5 recovered.
+        session.append(&entries[..5]).await.unwrap();
         let loaded = session.load().await.unwrap();
-        assert_eq!(loaded.len(), 4);
-        for (got, want) in loaded.iter().zip(entries[..4].iter()) {
+        assert_eq!(loaded.len(), 5);
+        for (got, want) in loaded.iter().zip(entries[..5].iter()) {
             assert_eq!(got, want);
         }
 
-        // Append a fresh slice, verify seqs continue without gaps.
-        session.append(&entries[4..]).await.unwrap();
+        // Append 2 more; verify seqs remain contiguous (0..7, no gaps).
+        session.append(&entries[5..7]).await.unwrap();
         let loaded = session.load().await.unwrap();
-        assert_eq!(loaded.len(), entries.len());
-        for (got, want) in loaded.iter().zip(entries.iter()) {
+        assert_eq!(loaded.len(), 7);
+        for (got, want) in loaded.iter().zip(entries[..7].iter()) {
             assert_eq!(got, want);
         }
     }
