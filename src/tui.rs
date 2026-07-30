@@ -969,11 +969,16 @@ fn draw<'a, B: ratatui::backend::Backend>(
             }
         }
         if let Some(attached) = &mut state.attached {
-            let status = if attached.finished {
-                "finished"
-            } else {
-                "running"
-            };
+            let status: String = attached.state.busy.map_or_else(
+                || {
+                    if attached.finished {
+                        "finished".into()
+                    } else {
+                        "running".into()
+                    }
+                },
+                BusyState::title,
+            );
             let block = SOLARIZED_LIGHT
                 .block(format!(
                     "subagent #{}: {} ({}) — Esc detach  Enter steer  Ctrl-C interrupt",
@@ -1600,6 +1605,9 @@ impl TuiState {
             state.push_agent_event(event);
         }
         state.follow();
+        if !finished {
+            state.busy = Some(BusyState::thinking());
+        }
         self.attached = Some(Box::new(AttachedView {
             id,
             label,
@@ -1668,6 +1676,7 @@ impl TuiState {
                     && attached.id == *id
                 {
                     attached.finished = true;
+                    attached.state.busy = None;
                     attached.state.push_agent_event(ui.event.clone());
                 }
                 self.push_agent_event(ui.event);
