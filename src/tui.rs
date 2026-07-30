@@ -167,10 +167,9 @@ impl Palette {
 /// bridges forwarding every future delta.
 fn bridge(
     session_id: u64,
-    handle: &RunnerHandle,
+    mut stream: tokio::sync::broadcast::Receiver<AgentEvent>,
     sender: mpsc::UnboundedSender<UiEvent>,
 ) -> tokio::task::AbortHandle {
-    let mut stream = handle.attach().1;
     tokio::spawn(async move {
         loop {
             match stream.recv().await {
@@ -217,6 +216,7 @@ fn attach_to_task(
         })
         .map(|task| task.label)
         .unwrap_or_default();
+    let (snapshot, live, _) = entry.handle.attach();
     state.attach(
         task_id,
         label,
@@ -226,8 +226,9 @@ fn attach_to_task(
         entry.cwd.clone(),
         entry.session_id.clone(),
         entry.context_window,
+        snapshot,
     );
-    let bridge = bridge(task_id, &entry.handle, sender.clone());
+    let bridge = bridge(task_id, live, sender.clone());
     state.attached.as_mut().unwrap().bridge = Some(bridge);
 }
 
@@ -1553,6 +1554,7 @@ impl TuiState {
         cwd: String,
         session_id: String,
         context_window: Option<u64>,
+        snapshot: Vec<AgentEvent>,
     ) {
         let mut state = TuiState {
             model_name,
@@ -1563,7 +1565,7 @@ impl TuiState {
             ..TuiState::default()
         };
         let mut finished = false;
-        for event in handle.snapshot() {
+        for event in snapshot {
             // The completion may have raced into the log before the attach;
             // the view must still flip to finished.
             if matches!(event, AgentEvent::BackgroundCompleted { .. }) {
@@ -2595,6 +2597,7 @@ mod tests {
     /// Test helper: attach with default metadata, mirroring the old 3-arg
     /// signature for minimal test churn.
     fn attach_test(state: &mut TuiState, id: u64, label: &str, handle: RunnerHandle) {
+        let snapshot = handle.snapshot();
         state.attach(
             id,
             label.into(),
@@ -2604,6 +2607,7 @@ mod tests {
             String::new(),
             String::new(),
             None,
+            snapshot,
         );
     }
 
@@ -2705,6 +2709,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn atomic_attach_snapshot_and_live_receiver_have_no_gap() {
+        let (handle, sink, _source) = crate::runner::session_test_channel();
+        sink.emit(AgentEvent::AssistantText("snapshot".into()));
+        let (snapshot, mut live, _) = handle.attach();
+        sink.emit(AgentEvent::AssistantDelta("live".into()));
+
+        assert_eq!(snapshot, vec![AgentEvent::AssistantText("snapshot".into())]);
+        assert_eq!(
+            live.recv().await.unwrap(),
+            AgentEvent::AssistantDelta("live".into())
+        );
+    }
+
+    #[tokio::test]
     async fn idle_attached_view_routes_ready_deltas_without_reattach() {
         let (handle, _sink, _source) = crate::runner::session_test_channel();
         let mut state = TuiState::default();
@@ -2733,12 +2751,13 @@ mod tests {
         let (sender, mut inbox) = mpsc::unbounded_channel();
         let mut state = TuiState::default();
         attach_test(&mut state, 7, "demo", handle.clone());
-        state.attached.as_mut().unwrap().bridge = Some(bridge(7, &handle, sender.clone()));
+        state.attached.as_mut().unwrap().bridge =
+            Some(bridge(7, handle.attach().1, sender.clone()));
         state.detach();
         tokio::task::yield_now().await;
 
         attach_test(&mut state, 7, "demo", handle.clone());
-        state.attached.as_mut().unwrap().bridge = Some(bridge(7, &handle, sender));
+        state.attached.as_mut().unwrap().bridge = Some(bridge(7, handle.attach().1, sender));
         sink.emit(AgentEvent::AssistantDelta("你".into()));
         let first = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
             .await
@@ -2885,8 +2904,8 @@ mod tests {
                 "please also check tests".into()
             ))
         );
-        // The runner records UserPrompt only after persistence succeeds;
-        // this channel-only fixture has no running persistence loop.
+        // Steering projects UserPrompt immediately, while the command is
+        // consumed by the runner through this channel.
         state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
         assert_eq!(
             source.try_recv().ok(),
@@ -3373,6 +3392,7 @@ mod tests {
             },
         });
         let mut state = TuiState::default();
+        let snapshot = handle.snapshot();
         state.attach(
             7,
             "demo task".into(),
@@ -3382,6 +3402,7 @@ mod tests {
             "/repo".into(),
             "sub-abc123".into(),
             None,
+            snapshot,
         );
 
         draw(&mut terminal, &mut state).unwrap();
@@ -3437,6 +3458,7 @@ mod tests {
             label: None,
         });
         let mut state = TuiState::default();
+        let snapshot = _handle.snapshot();
         state.attach(
             3,
             "quick job".into(),
@@ -3446,6 +3468,7 @@ mod tests {
             String::new(),
             String::new(),
             None,
+            snapshot,
         );
         draw(&mut terminal, &mut state).unwrap();
 
@@ -3481,6 +3504,7 @@ mod tests {
         sink.emit(AgentEvent::AssistantText("working...".into()));
         let (handle2, _sink2, _source2) = crate::runner::session_test_channel();
         let mut state = TuiState::default();
+        let snapshot = handle2.snapshot();
         state.attach(
             5,
             "long job".into(),
@@ -3490,6 +3514,7 @@ mod tests {
             String::new(),
             String::new(),
             None,
+            snapshot,
         );
         // The attach with no messages sets busy=thinking; override to
         // simulate a running (not thinking) state.
@@ -4305,6 +4330,7 @@ mod ux_tests {
             busy: Some(BusyState::thinking()),
             ..Default::default()
         };
+        let snapshot = handle.snapshot();
         parent.attach(
             1,
             "task".into(),
@@ -4314,6 +4340,7 @@ mod ux_tests {
             String::new(),
             String::new(),
             None,
+            snapshot,
         );
         let attached = parent.attached.as_mut().unwrap();
         attached.state.busy = Some(BusyState::thinking());

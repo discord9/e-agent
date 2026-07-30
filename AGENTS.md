@@ -58,12 +58,12 @@ without an explicit user request.
 - MCP support is limited to local stdio servers, tools only. No remote
   HTTP/SSE MCP, MCP OAuth, resources/prompts, notifications, `listChanged`
   refresh, server restart, or concurrent initialization.
-- Subagents (`delegate` tool) are threads with isolated agent state: fresh
-  history and builtin tools only (no MCP, no nested `delegate`). They share the
-  parent's unbounded running-task registry so nested background bash stays
-  visible. No agent-to-agent messaging or worker/concurrency pool.
-  Process-level isolation (subagents as subprocesses) is the planned evolution
-  but not implemented.
+- Subagents (`delegate` tool) are independent `SessionRunner` tasks on the
+  shared Tokio runtime, with isolated Agent state: fresh history and builtin
+  tools only (no MCP, no nested `delegate`). They share the parent's unbounded
+  running-task registry so nested background bash stays visible. No
+  agent-to-agent messaging or worker/concurrency pool. Process-level isolation
+  (subagents as subprocesses) is the planned evolution but not implemented.
 
 ## Commands
 
@@ -93,19 +93,10 @@ contract through `Agent::emit` → fanout to `event_handler` + all `observers`:
 - A failed turn emits its error as an event too; a session must never fail
   silently into an empty log.
 
-## Steering transport: main agent vs subagent
+## Steering transport: main agent and subagent
 
-Every session supports the same two steering operations — queue a prompt,
-cancel the in-flight turn. Only the *transport* differs, and only because of
-where the frontend lives:
-
-- **Subagent (cross-thread):** the frontend steers through `SessionHandle`'s
-  `Steer::{Prompt, Cancel}` channel. `send_input` also records a
-  `UserPrompt` event in the session log first (see event semantics above).
-- **Main agent (same task):** the TUI holds `&mut Agent`, so it calls
-  `agent.run(prompt)` and cancels by dropping the in-flight future directly —
-  no `Steer` channel is used.
-
-These are two transports for one semantic contract, not two message types.
-Do not add a third path; if the main agent is ever moved behind a handle, it
-should adopt the same `Steer` channel rather than inventing a new one.
+Every session supports the same steering operations through its concrete
+`SessionHandle` command channel: queue a prompt, request compaction, or cancel
+the in-flight turn. Main-agent and subagent frontends use this same transport;
+`prompt` also records its `UserPrompt` projection in the session log before the
+runner consumes it. Do not add a second steering path.

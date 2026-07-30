@@ -1,24 +1,18 @@
 //! `delegate` tool: spawn a subagent with a fresh context to work on a task.
 //!
-//! Each subagent runs on its own OS thread with its own current-thread
-//! tokio runtime and an empty history. Its agent state (history, pending
-//! background results, token counts) is isolated from the parent.
+//! Each subagent runs as an independent [`SessionRunner`] task on the shared
+//! tokio runtime with isolated agent state (history, pending background results,
+//! and token counts).
 //!
 //! The subagent gets the builtin file/bash tools and, when configured, public
 //! web search (no MCP tools, no `delegate` itself — depth is capped at 1 by
 //! construction). In background mode the answer is delivered as a
 //! [`AgentEvent::BackgroundCompleted`] through the parent's event channel,
-//! waking an idle agent (see Slice 1).
+//! waking an idle agent.
 //!
-//! Every background subagent is exposed through a runner [`SessionHandle`]
-//! steer it (queue prompts / cancel the in-flight turn). Sync delegates
-//! stay single-turn and handle-less.
-//!
-//! Future evolution: the thread boundary is deliberately the same shape as a
-//! process boundary — swapping `std::thread::spawn` for a spawned
-//! `e-agent --subagent` subprocess with a stdio JSONL protocol is the
-//! planned path to stronger isolation. MCP tools can be added later by
-//! letting the subagent run `mcp::connect_all` inside its own runtime.
+//! Every subagent uses a runner [`SessionHandle`] to queue prompts, request
+//! compaction, or cancel its in-flight turn. Process-level isolation through a
+//! spawned `e-agent --subagent` remains a planned future evolution.
 
 use std::sync::{Arc, Mutex};
 
@@ -962,7 +956,7 @@ mod tests {
             .and_then(|s| s.trim().parse().ok())
             .expect("could not extract task id");
 
-        // Give the subagent thread a moment to emit the scrollback events.
+        // Give the subagent task a moment to emit the scrollback events.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let entry = tool.sessions().get(id).expect("session entry missing");

@@ -111,10 +111,10 @@ an interactive TUI (scrollback plus an input line with proper Unicode editing);
 use `--repl` for a plain line-based REPL instead. If stdin is piped, the prompt
 is read from standard input. Sessions persist to
 `.e-agent/sessions/<name>.jsonl` in the workspace (default name `default`) as
-an append-only log of message and compaction entries; the whole history is
-restored and replayed in the TUI on startup, while the model only sees the
-latest compaction summary and everything after it. Legacy `.json` sessions
-are migrated on first load. Optional CLI overrides are `--base-url URL`,
+an append-only log of message and compaction entries. History is restored for
+model context on startup, while display projections are replayed in the TUI;
+the model only sees the latest compaction summary and everything after it.
+Legacy `.json` sessions are migrated on first load. Optional CLI overrides are `--base-url URL`,
 `--model MODEL`, `--profile PROFILE`, `--workspace PATH`, `--session NAME`, and `--max-rounds N`
 (tool-call rounds are unlimited by default; the flag sets an explicit cap).
 `--profile` selects a TOML profile and requires a TOML config. When config is
@@ -239,8 +239,9 @@ context.
 
 The `bash` tool accepts `background: true` to run a command without blocking.
 Bash tasks and subagents share one running-task registry with no built-in
-concurrency limit. Each bash task starts a process and each subagent starts an
-OS thread, so callers remain responsible for resource use. Background bash has
+concurrency limit. Each bash task starts a process; subagents run as independent
+SessionRunner tasks on the shared Tokio runtime. Callers remain responsible for
+resource use. Background bash has
 the same workspace cwd, process-group handling, and per-stream 64 KiB output
 limit as foreground Bash, with a 30-minute timeout.
 Completions surface as a TUI notification while a
@@ -259,8 +260,9 @@ self-contained task and returns its final answer. Use it for subtasks whose
 intermediate steps (searching, reading many files, focused edits) would
 clutter the main context.
 
-Each subagent runs on its own OS thread with its own tokio runtime and an empty
-history. It shares the parent's running-task registry so nested background bash
+Each subagent runs as an independent SessionRunner task on the shared Tokio
+runtime with an empty history and isolated Agent state. It shares the parent's
+running-task registry so nested background bash
 commands stay visible and report completion to the parent. It gets the same
 builtins as its parent: file/bash tools and, when
 configured, `web_search`; no MCP tools and no `delegate` itself, so delegation
@@ -268,7 +270,7 @@ depth is capped at 1 by construction. Tool rounds are unlimited.
 
 With `background: true` the subagent runs without blocking and its answer is
 delivered as a background task completion (waking an idle agent). Sync mode
-(the default) waits for the answer with a 30-minute ceiling.
+(the default) waits for the answer.
 
 A running background subagent can be watched live in the TUI: open the tasks
 panel with F2, select it with Up/Down, and press Enter to attach. The
@@ -276,8 +278,9 @@ attached view replays everything the subagent has done so far and then
 follows its stream (text, tool calls, results) with the same rendering as the
 main view; the footer shows the task and whether it is still running. Esc
 detaches back to the main view (it never cancels the main turn), and the
-subagent keeps running after detach. Attaching is read-only; bash tasks have
-no event stream and cannot be attached.
+subagent keeps running after detach. While attached, prompts can be queued and
+an in-flight turn can be cancelled; bash tasks have no event stream and cannot
+be attached.
 
 ## Compaction
 
@@ -285,8 +288,9 @@ Use `/compact` in the TUI or `--repl` to manually summarize earlier history.
 The agent summarizes everything before the current turn and appends a
 compaction entry (summary plus the retained turn) to the append-only session
 log; earlier messages stay persisted and visible in the TUI. Subsequent model
-calls use the latest summary plus everything after it. Compaction has no
-automatic trigger.
+calls use the latest summary plus everything after it. When a configured model
+profile provides a context window, the agent also compacts automatically at
+80% usage.
 
 ## MCP (local servers)
 
@@ -487,8 +491,7 @@ GREPTIME_PG="host=127.0.0.1 port=4002 dbname=public" cargo test --features grept
 Without `GREPTIME_PG` the integration tests skip with a message.
 ## Non-goals
 
-This is deliberately not a daemon, JSONL protocol,
-automatic compaction trigger, subagent
+This is deliberately not a daemon, JSONL protocol, subagent
 framework, permission framework, plugin host, generic provider/auth framework,
 parallel tool executor, task scheduler, priority system, or concurrency pool.
 It deliberately does not fetch provider/model catalogs (including
@@ -496,8 +499,8 @@ models.dev), generate configuration, cache provider metadata, or infer
 context windows; TOML profiles are local static settings only. `AGENTS.md`
 loading is workspace-root-only: there is no parent/nested discovery or merging.
 Subagents exist but are deliberately minimal: no agent-to-agent messaging,
-no delegation deeper than 1 level, no
-process-level isolation yet (subagents are threads, not subprocesses).
+no delegation deeper than 1 level, and no process-level isolation yet
+(subagents are runtime tasks, not subprocesses).
 It does speak MCP to local stdio servers (tools only), but it does NOT do
 remote MCP over HTTP/SSE, MCP OAuth, MCP resources/prompts, server-initiated
 notifications, `listChanged` refresh, server restart on crash, or concurrent
