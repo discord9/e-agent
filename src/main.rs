@@ -397,10 +397,25 @@ fn set_stderr_events(agent: &mut Agent) {
             if is_error { "error" } else { "ok" },
             preview(&content, 500)
         ),
-        AgentEvent::BackgroundCompleted { id, output } => {
-            eprintln!("background task {id} finished: {}", preview(&output, 500))
+        AgentEvent::BackgroundCompleted {
+            id, output, label, ..
+        } => {
+            let title = label
+                .as_deref()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| format!(": {l}"))
+                .unwrap_or_default();
+            eprintln!(
+                "background task {id} finished{title}: {}",
+                preview(&output, 500)
+            )
         }
-        AgentEvent::BackgroundCompletionNotice { id: _, output } => {
+        AgentEvent::BackgroundCompletionNotice {
+            id: _,
+            output,
+            label: _,
+            ..
+        } => {
             // REPL/stderr: show a finite preview with middle ellipsis
             let lines: Vec<&str> = output.lines().collect();
             if lines.len() <= 8 && output.len() <= 500 {
@@ -507,8 +522,19 @@ async fn repl(
             Ok(answer) => println!("{answer}"),
             Err(error) => eprintln!("e-agent: {error:#}"),
         }
-        while let Ok(AgentEvent::BackgroundCompleted { id, output }) = receiver.try_recv() {
-            eprintln!("background task {id} finished: {}", preview(&output, 500));
+        while let Ok(AgentEvent::BackgroundCompleted {
+            id, output, label, ..
+        }) = receiver.try_recv()
+        {
+            let title = label
+                .as_deref()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| format!(": {l}"))
+                .unwrap_or_default();
+            eprintln!(
+                "background task {id} finished{title}: {}",
+                preview(&output, 500)
+            );
         }
     }
     Ok(())

@@ -778,6 +778,7 @@ impl BackgroundTasks {
             .sender
             .clone()
             .ok_or("background task delivery is unavailable")?;
+        let completion_label = label.clone();
         self.spawn_inner(
             label,
             role,
@@ -786,7 +787,11 @@ impl BackgroundTasks {
             on_id,
             work,
             move |id, output| {
-                let _ = sender.send(AgentEvent::BackgroundCompleted { id, output });
+                let _ = sender.send(AgentEvent::BackgroundCompleted {
+                    id,
+                    output,
+                    label: Some(completion_label.clone()),
+                });
             },
         )
     }
@@ -2395,6 +2400,41 @@ mod tests {
             output,
             "1 background task(s) running:\n#1: search the logs (explorer)"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_id_delivers_label_in_background_completed() {
+        // Verify that the label registered via spawn_with_id is delivered
+        // as BackgroundCompleted.label — sourced from RunningTask, not parsed.
+        let temp = tempfile::tempdir().unwrap();
+        let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+        let bg = bash.background.clone();
+        bg.spawn_with_id(
+            "my custom label".into(),
+            None,
+            None,
+            None,
+            |_id| {},
+            || async { "output from task".into() },
+        )
+        .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("timeout waiting for completion")
+            .unwrap();
+        match event {
+            AgentEvent::BackgroundCompleted {
+                ref label, output, ..
+            } => {
+                assert_eq!(
+                    label.as_deref(),
+                    Some("my custom label"),
+                    "label must match the registration label"
+                );
+                assert_eq!(output, "output from task");
+            }
+            other => panic!("expected BackgroundCompleted, got {other:?}"),
+        }
     }
 
     /// Verify that BackgroundTasks::start propagates protect_git by checking

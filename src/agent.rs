@@ -109,6 +109,7 @@ pub enum AgentEvent {
     BackgroundCompleted {
         id: u64,
         output: String,
+        label: Option<String>,
     },
     /// A structured background completion notice for TUI scrollback display.
     /// Unlike `BackgroundCompleted` (the transient arrival/drain signal),
@@ -118,6 +119,7 @@ pub enum AgentEvent {
     BackgroundCompletionNotice {
         id: u64,
         output: String,
+        label: Option<String>,
     },
     Usage {
         /// Input tokens of the most recent regular turn, approximating the
@@ -169,6 +171,8 @@ pub enum SessionEntry {
     BackgroundCompletion {
         id: u64,
         output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
 }
 
@@ -215,7 +219,7 @@ pub struct Agent {
     event_handler: Option<Box<dyn FnMut(AgentEvent) + Send>>,
     max_tool_rounds: Option<usize>,
     background_receiver: mpsc::UnboundedReceiver<AgentEvent>,
-    pending_background: VecDeque<(u64, String)>,
+    pending_background: VecDeque<(u64, String, Option<String>)>,
     subscriber: Option<mpsc::UnboundedSender<AgentEvent>>,
     /// Long-lived session sinks (e.g. a TUI view). Unlike
     /// `event_handler` and `subscriber` (per-turn), these survive across
@@ -358,9 +362,16 @@ impl Agent {
                     // Structured background completions: same surface as
                     // before, but derived from the structured variant rather
                     // than a string-prefixed Notice.
-                    SessionEntry::BackgroundCompletion { id, output } => Some(Message::User {
-                        content: format!("[background task {id} completed]\n{output}"),
-                    }),
+                    SessionEntry::BackgroundCompletion { id, output, label } => {
+                        let header =
+                            match label.as_ref().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+                                Some(l) => format!("[background task {id} completed: {l}]"),
+                                None => format!("[background task {id} completed]"),
+                            };
+                        Some(Message::User {
+                            content: format!("{header}\n{output}"),
+                        })
+                    }
                 }),
         );
         repair_tool_pairs(messages)
@@ -396,20 +407,21 @@ impl Agent {
     /// Wait for the next background task completion. Used by the TUI to
     /// wake an idle agent. The event is also queued for injection into the
     /// next model call.
-    pub async fn next_background_completion(&mut self) -> Option<(u64, String)> {
+    pub async fn next_background_completion(&mut self) -> Option<(u64, String, Option<String>)> {
         loop {
             match self.background_receiver.recv().await {
-                Some(AgentEvent::BackgroundCompleted { id, output }) => {
+                Some(AgentEvent::BackgroundCompleted { id, output, label }) => {
                     self.running_background.remove(&id);
                     if let Some((root, session)) = &self.background_record {
                         crate::session::Session::clear_background_task(root, session, id);
                     }
-                    self.pending_background.push_back((id, output.clone()));
+                    self.pending_background
+                        .push_back((id, output.clone(), label.clone()));
                     // No fanout here either: idle and mid-turn completions
                     // both land in the session log as a user message at the
                     // next turn boundary. The TUI prints this return value
                     // itself; fanning out would duplicate the line.
-                    return Some((id, output));
+                    return Some((id, output, label));
                 }
                 Some(_) => {}
                 None => return None,
@@ -678,7 +690,7 @@ impl Agent {
     }
 
     fn inject_pending_background(&mut self) {
-        while let Some((id, output)) = self.pending_background.pop_front() {
+        while let Some((id, output, label)) = self.pending_background.pop_front() {
             // Fanout structured display event to session observers (TUI
             // scrollback, snapshot). The per-turn subscriber does NOT get
             // this — it already received the transient BackgroundCompleted
@@ -686,16 +698,17 @@ impl Agent {
             self.fanout(&AgentEvent::BackgroundCompletionNotice {
                 id,
                 output: output.clone(),
+                label: label.clone(),
             });
             // Persist as a structured entry so the model context sees the
             // full text and backwards-compatible deserialisation works.
             self.history
-                .push(SessionEntry::BackgroundCompletion { id, output });
+                .push(SessionEntry::BackgroundCompletion { id, output, label });
         }
     }
 
     fn drain_background(&mut self) {
-        while let Ok(AgentEvent::BackgroundCompleted { id, output }) =
+        while let Ok(AgentEvent::BackgroundCompleted { id, output, label }) =
             self.background_receiver.try_recv()
         {
             self.running_background.remove(&id);
@@ -703,14 +716,15 @@ impl Agent {
             if let Some((root, session)) = &self.background_record {
                 crate::session::Session::clear_background_task(root, session, id);
             }
-            self.pending_background.push_back((id, output.clone()));
+            self.pending_background
+                .push_back((id, output.clone(), label.clone()));
             // Notify only the per-turn subscriber (the TUI's live display).
             // The long-lived observers' log gets this completion at the
             // turn boundary, when `pending_background` is folded into a
             // `[background task N completed]` user message — emitting here
             // too would surface it twice.
             if let Some(subscriber) = &self.subscriber {
-                let _ = subscriber.send(AgentEvent::BackgroundCompleted { id, output });
+                let _ = subscriber.send(AgentEvent::BackgroundCompleted { id, output, label });
             }
         }
     }
@@ -845,6 +859,7 @@ mod tests {
                 let _ = sender.send(AgentEvent::BackgroundCompleted {
                     id: 1,
                     output: "exit code: 0\nstdout:\ndone\nstderr:\n".into(),
+                    label: None,
                 });
             });
             Ok("started background task 1: echo done".into())
@@ -1801,45 +1816,88 @@ mod tests {
     // ── BackgroundCompletion structured entry tests ──────────────────────
 
     #[test]
-    fn background_completion_entry_serde_roundtrip() {
-        let entry = SessionEntry::BackgroundCompletion {
-            id: 42,
-            output: "exit code: 0\nstdout:\nbuilt".into(),
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        let deserialized: SessionEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized, entry);
-        // Must deserialize as BackgroundCompletion, not as a generic JSON object.
+    fn background_completion_entry_serde_old_and_new() {
+        // Old JSON without label → deserializes with label: None
+        let old_json = r#"{"type":"background_completion","id":42,"output":"done"}"#;
+        let deserialized: SessionEntry = serde_json::from_str(old_json).unwrap();
         assert!(
             matches!(
                 deserialized,
-                SessionEntry::BackgroundCompletion { id: 42, .. }
+                SessionEntry::BackgroundCompletion {
+                    id: 42,
+                    label: None,
+                    ..
+                }
             ),
-            "wrong variant: {deserialized:?}"
+            "old payload must have label=None, got {deserialized:?}"
         );
+        // Roundtrip with a label
+        let entry = SessionEntry::BackgroundCompletion {
+            id: 43,
+            output: "done".into(),
+            label: Some("build project".into()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            json.contains(r#""label":"build project""#),
+            "label must be present: {json}"
+        );
+        let deserialized: SessionEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, entry);
+        // Roundtrip with None label (serialized without label field)
+        let entry_none = SessionEntry::BackgroundCompletion {
+            id: 44,
+            output: "done".into(),
+            label: None,
+        };
+        let json_none = serde_json::to_string(&entry_none).unwrap();
+        assert!(
+            !json_none.contains("label"),
+            "None label must be skipped: {json_none}"
+        );
+        let deserialized_none: SessionEntry = serde_json::from_str(&json_none).unwrap();
+        assert_eq!(deserialized_none, entry_none);
     }
 
     #[test]
-    fn context_formats_background_completion() {
-        // Test context() with a BackgroundCompletion entry.
-        let mut agent = Agent::new(
-            Box::new(ScriptedModel {
-                replies: vec![],
-                requests: Arc::new(Mutex::new(Vec::new())),
-                delays: Default::default(),
-            }),
-            vec![],
-        );
-        agent.restore_history(vec![SessionEntry::BackgroundCompletion {
-            id: 7,
-            output: "output text".into(),
-        }]);
-        let msgs = agent.context();
-        assert_eq!(msgs.len(), 1);
-        assert!(matches!(
-            &msgs[0],
-            Message::User { content } if content == "[background task 7 completed]\noutput text"
-        ));
+    fn context_formats_background_completion_with_label_variants() {
+        // Verify context() output for label=Some("build"), whitespace, and None.
+        let cases: &[(&str, Option<&str>, &str)] = &[
+            (
+                "build",
+                Some("build"),
+                "[background task 7 completed: build]",
+            ),
+            ("", None, "[background task 7 completed]"),
+            ("  ", None, "[background task 7 completed]"),
+        ];
+        for (_name, label_val, expected_header) in cases {
+            let label = label_val.map(|s| s.to_string());
+            let mut agent = Agent::new(
+                Box::new(ScriptedModel {
+                    replies: vec![],
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                    delays: Default::default(),
+                }),
+                vec![],
+            );
+            agent.restore_history(vec![SessionEntry::BackgroundCompletion {
+                id: 7,
+                output: "full output text\nwith multiple\nlines".into(),
+                label,
+            }]);
+            let msgs = agent.context();
+            assert_eq!(msgs.len(), 1);
+            let expected = format!("{expected_header}\nfull output text\nwith multiple\nlines");
+            assert!(
+                matches!(&msgs[0], Message::User { content } if content == &expected),
+                "label={label_val:?}: expected {expected:?}, got {:?}",
+                match &msgs[0] {
+                    Message::User { content } => content,
+                    _ => "(wrong variant)",
+                }
+            );
+        }
     }
 
     #[test]
@@ -1860,6 +1918,7 @@ mod tests {
             SessionEntry::BackgroundCompletion {
                 id: 2,
                 output: "new style".into(),
+                label: None,
             },
         ]);
         let msgs = agent.context();

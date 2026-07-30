@@ -292,10 +292,11 @@ impl Delegate {
                     AgentEvent::Notice(format!("──── compaction ────\ncompacted: {summary}"))
                 }
                 crate::agent::SessionEntry::Notice { text } => AgentEvent::Notice(text.clone()),
-                crate::agent::SessionEntry::BackgroundCompletion { id, output } => {
+                crate::agent::SessionEntry::BackgroundCompletion { id, output, label } => {
                     AgentEvent::BackgroundCompletionNotice {
                         id: *id,
                         output: output.clone(),
+                        label: label.clone(),
                     }
                 }
             };

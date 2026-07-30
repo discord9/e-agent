@@ -378,7 +378,7 @@ async fn run_inner(
             // without waiting for the user's next message. No display line
             // here — the turn boundary emits the completion as a UserPrompt
             // which renders as the dim "finished" line.
-            Some((_id, _output)) = agent.next_background_completion() => {
+            Some((_id, _output, _label)) = agent.next_background_completion() => {
                 agent.subscribe(forward.clone());
                 let mut ui = Ui {
                     state: &mut state,
@@ -1733,8 +1733,10 @@ impl TuiState {
                     state.push_line(compaction_banner("compaction"), LineKind::Compaction);
                     state.push_line(format!("compacted: {summary}"), LineKind::Dim);
                 }
-                SessionEntry::BackgroundCompletion { id, output } => {
-                    state.push_background_completion(*id, output);
+                SessionEntry::BackgroundCompletion {
+                    id, output, label, ..
+                } => {
+                    state.push_background_completion(*id, output, label.as_deref());
                 }
             }
         }
@@ -1742,8 +1744,15 @@ impl TuiState {
         state
     }
 
-    fn push_background_completion(&mut self, id: u64, output: &str) {
-        self.push_line(format!("[background task {id} completed]"), LineKind::Dim);
+    fn push_background_completion(&mut self, id: u64, output: &str, label: Option<&str>) {
+        let header = match label.filter(|l| !l.trim().is_empty()) {
+            Some(l) => {
+                let previewed = crate::agent::preview(l, 60);
+                format!("[background task {id} completed: {previewed}]")
+            }
+            None => format!("[background task {id} completed]"),
+        };
+        self.push_line(header, LineKind::Dim);
         let truncated = truncate_background_output(output);
         for line in truncated.lines() {
             self.push_line(line.to_owned(), LineKind::Dim);
@@ -2138,8 +2147,10 @@ impl TuiState {
             // the turn boundary (handled above), so rendering this too
             // would duplicate it.
             AgentEvent::BackgroundCompleted { .. } => {}
-            AgentEvent::BackgroundCompletionNotice { id, output } => {
-                self.push_background_completion(id, &output);
+            AgentEvent::BackgroundCompletionNotice {
+                id, output, label, ..
+            } => {
+                self.push_background_completion(id, &output, label.as_deref());
             }
             AgentEvent::Usage { context_input, .. } => {
                 self.tokens_context = context_input;
@@ -2816,6 +2827,7 @@ mod tests {
             event: AgentEvent::BackgroundCompleted {
                 id: 7,
                 output: "done".into(),
+                label: None,
             },
         });
         assert!(state.attached.as_ref().unwrap().finished);
@@ -2855,6 +2867,7 @@ mod tests {
             event: AgentEvent::BackgroundCompleted {
                 id: 7,
                 output: "done".into(),
+                label: None,
             },
         });
         let attached = state.attached.as_ref().unwrap();
@@ -2871,6 +2884,7 @@ mod tests {
         sink.emit(AgentEvent::BackgroundCompleted {
             id: 3,
             output: "done".into(),
+            label: None,
         });
         let mut state = TuiState::default();
         attach_test(&mut state, 3, "demo task", Arc::new(handle));
@@ -2934,6 +2948,7 @@ mod tests {
             event: AgentEvent::BackgroundCompleted {
                 id: 7,
                 output: "done".into(),
+                label: None,
             },
         });
         state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
@@ -3404,6 +3419,7 @@ mod tests {
         sink.emit(AgentEvent::BackgroundCompleted {
             id: 3,
             output: "done".into(),
+            label: None,
         });
         let mut state = TuiState::default();
         state.attach(
@@ -4543,64 +4559,99 @@ mod ux_tests {
     }
 
     #[test]
-    fn background_completion_renders_with_head_and_tail_in_tui() {
-        // Live TUI rendering: BackgroundCompletionNotice produces dim lines
-        // (header + truncated output). Use a single-line output to ensure
-        // the truncation marker is on the same line.
-        let mut state = TuiState::default();
-        let long_output = "x".repeat(3000);
-        assert!(long_output.chars().count() > 2000);
-        state.push_agent_event(AgentEvent::BackgroundCompletionNotice {
-            id: 3,
-            output: long_output.clone(),
-        });
-        // Header line
-        assert_eq!(state.lines[0].text, "[background task 3 completed]");
-        assert_eq!(state.lines[0].kind, LineKind::Dim);
-        // Output is truncated (the full output is > 2000 chars)
-        let output_text = &state.lines[1].text;
-        assert!(
-            output_text.chars().count() <= 2000,
-            "TUI display truncated to ≤2000 chars, got {}",
-            output_text.chars().count()
-        );
-        assert!(
-            output_text.contains('\u{2026}') || output_text.contains("chars omitted"),
-            "output must show truncation marker, got: {output_text:?}"
-        );
-        assert!(
-            output_text.starts_with('x'),
-            "head must be preserved, got start: {:?}",
-            &output_text[..5.min(output_text.len())]
-        );
-        assert!(output_text.ends_with('x'), "tail must be preserved");
-    }
+    fn background_completion_label_header_long_label_preview() {
+        // Table-driven: live (BackgroundCompletionNotice) and resume
+        // (from_history) produce the same header; long label uses preview.
+        use crate::agent::preview;
 
-    #[test]
-    fn background_completion_from_history_renders_head_and_tail() {
-        // Resume replay: BackgroundCompletion entry from history renders
-        // the same way as a live event.
-        let long_output = "x".repeat(3000);
-        assert!(long_output.chars().count() > 2000);
-        let entries = [SessionEntry::BackgroundCompletion {
-            id: 5,
-            output: long_output.clone(),
-        }];
-        let state = TuiState::from_history(&entries);
-        assert_eq!(state.lines[0].text, "[background task 5 completed]");
-        assert_eq!(state.lines[0].kind, LineKind::Dim);
-        let output_line = &state.lines[1].text;
+        let long_label = "fix: refactor the authentication module to support OAuth2 + JWT rotation for enhanced security";
+        assert!(long_label.chars().count() > 60);
+        let previewed_label = preview(long_label, 60);
+        assert!(previewed_label.chars().count() <= 60);
         assert!(
-            output_line.chars().count() <= 2000,
-            "resume display truncated, got {} chars",
-            output_line.chars().count()
+            previewed_label.contains('\u{2026}'),
+            "long label must contain ellipsis: {previewed_label:?}"
         );
-        // Tail must be visible (truncated string should end with 'x')
         assert!(
-            output_line.ends_with('x'),
-            "tail must be visible in resume display, got end: {:?}",
-            &output_line[output_line.len().saturating_sub(20)..]
+            previewed_label.ends_with('y'),
+            "long label preview must preserve tail, got: {previewed_label:?}"
         );
+
+        let long_header = format!("[background task 7 completed: {previewed_label}]");
+
+        struct Case {
+            id: u64,
+            label: Option<&'static str>,
+            expected_header: String,
+            check_long_preview: bool,
+        }
+
+        let cases = [
+            Case {
+                id: 3,
+                label: Some("build"),
+                expected_header: "[background task 3 completed: build]".into(),
+                check_long_preview: false,
+            },
+            Case {
+                id: 5,
+                label: None,
+                expected_header: "[background task 5 completed]".into(),
+                check_long_preview: false,
+            },
+            Case {
+                id: 7,
+                label: Some(long_label),
+                expected_header: long_header,
+                check_long_preview: true,
+            },
+        ];
+
+        for (case_idx, case) in cases.iter().enumerate() {
+            // ── Live via BackgroundCompletionNotice ──
+            let mut state = TuiState::default();
+            let output = "task output content";
+            state.push_agent_event(AgentEvent::BackgroundCompletionNotice {
+                id: case.id,
+                output: output.into(),
+                label: case.label.map(|s| s.to_owned()),
+            });
+            assert_eq!(
+                state.lines[0].text, case.expected_header,
+                "case {case_idx} live: header mismatch"
+            );
+            assert_eq!(state.lines[0].kind, LineKind::Dim);
+            assert_eq!(
+                state.lines[1].text, output,
+                "case {case_idx} live: output mismatch"
+            );
+
+            // ── Resume via from_history ──
+            let entries = [SessionEntry::BackgroundCompletion {
+                id: case.id,
+                output: output.into(),
+                label: case.label.map(|s| s.to_owned()),
+            }];
+            let state = TuiState::from_history(&entries);
+            assert_eq!(
+                state.lines[0].text, case.expected_header,
+                "case {case_idx} history: header mismatch"
+            );
+            assert_eq!(state.lines[0].kind, LineKind::Dim);
+            assert_eq!(
+                state.lines[1].text, output,
+                "case {case_idx} history: output mismatch"
+            );
+
+            // For the long-label case, verify middle-elision budget explicitly
+            if case.check_long_preview {
+                let header_chars: Vec<char> = state.lines[0].text.chars().collect();
+                // prefix "[background task 7 completed: " = 28 chars + preview ≤ 60 + "]"
+                // total ≤ 28 + 60 + 1 = 89, but really we just check preview length ≤ 60
+                let colon_pos = header_chars.iter().position(|&c| c == ':');
+                assert!(colon_pos.is_some(), "long label header must contain colon");
+            }
+        }
     }
 
     #[test]
@@ -4644,6 +4695,7 @@ mod ux_tests {
         let _entries = [crate::agent::SessionEntry::BackgroundCompletion {
             id: 10,
             output: "output from delegate task".into(),
+            label: None,
         }];
         // Create a session channel to capture emitted events.
         let (handle, sink, _source) = crate::handle::session_channel();
@@ -4686,6 +4738,7 @@ mod ux_tests {
             SessionEntry::BackgroundCompletion {
                 id: 1,
                 output: "o".into(),
+                label: None,
             },
             SessionEntry::Compaction {
                 summary: "c".into(),

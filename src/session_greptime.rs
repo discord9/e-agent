@@ -342,6 +342,13 @@ mod tests {
             SessionEntry::BackgroundCompletion {
                 id: 2,
                 output: "exit code: 0\nstdout:\nbuilt successfully\nstderr:\n".into(),
+                label: None,
+            },
+            // Entry with a label to verify serde roundtrip with label.
+            SessionEntry::BackgroundCompletion {
+                id: 3,
+                output: "some output".into(),
+                label: Some("build project".into()),
             },
             Message::User {
                 content: "你好世界👋\n多行".into(),
