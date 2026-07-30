@@ -895,6 +895,14 @@ async fn run_bash(
                 args.push(path.clone());
                 args.push(path.clone());
             }
+            // Protect the project-local sandbox config from the agent:
+            // bind /dev/null over it so writes are silently discarded.
+            // This must come after all other binds (including extra paths)
+            // to ensure it is not shadowed.
+            let project_config = format!("{}/.e-agent/config.toml", root_str);
+            args.push("--ro-bind".into());
+            args.push("/dev/null".into());
+            args.push(project_config);
             args.extend([
                 "--unshare-pid".into(),
                 "--unshare-ipc".into(),
