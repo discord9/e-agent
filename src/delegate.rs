@@ -22,7 +22,6 @@
 //! letting the subagent run `mcp::connect_all` inside its own runtime.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -33,10 +32,6 @@ use crate::model::ConfiguredModel;
 use crate::session::Session;
 use crate::tools::BackgroundTasks;
 use crate::workspace::Workspace;
-
-/// Ceiling for a synchronous delegate call.
-const SYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-
 /// Metadata about a live subagent session, stored alongside its handle in
 /// the registry so frontends can display the model name, role, cwd, etc.
 pub struct SessionEntry {
@@ -731,17 +726,9 @@ impl Tool for Delegate {
         // it stops instead of running on as an orphan. Normal completion
         // disarms the guard before returning.
         let mut cancel_guard = SubagentCancelGuard::armed(cancel_handle);
-        let result = match tokio::time::timeout(SYNC_TIMEOUT, done_rx).await {
-            Ok(Ok(answer)) => Ok(answer),
-            Ok(Err(_)) => Err("subagent result channel closed".into()),
-            Err(_) => {
-                // Timed out: cancel the subagent thread so it stops instead
-                // of running on as an orphan (same as a dropped turn).
-                if let Some(handle) = cancel_guard.handle.take() {
-                    handle.cancel();
-                }
-                Err("subagent timed out after 30 minutes".into())
-            }
+        let result = match done_rx.await {
+            Ok(answer) => Ok(answer),
+            Err(_) => Err("subagent result channel closed".into()),
         };
         cancel_guard.disarm();
         result
