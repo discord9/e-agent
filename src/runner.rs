@@ -245,7 +245,9 @@ impl Drop for SessionTask {
 }
 impl SessionTask {
     pub async fn join(mut self) -> Result<(), tokio::task::JoinError> {
-        self.task.take().expect("task already joined").await
+        let result = self.task.as_mut().expect("task already joined").await;
+        self.task = None;
+        result
     }
 }
 
@@ -853,7 +855,10 @@ mod tests {
     use crate::agent::{AssistantMessage, Model, ModelDeltaKind, Tool, Usage};
     use async_trait::async_trait;
     use serde_json::Value;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tokio::sync::Notify;
 
     struct ControlledModel {
@@ -887,6 +892,44 @@ mod tests {
             Ok((
                 AssistantMessage {
                     content: Some(content),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+                None,
+            ))
+        }
+    }
+
+    struct DropProbeModel {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        dropped: Arc<Notify>,
+        side_effects: Arc<AtomicUsize>,
+    }
+
+    struct DropProbe(Arc<Notify>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl Model for DropProbeModel {
+        async fn complete(
+            &mut self,
+            _: &[Message],
+            _: &[ToolSpec],
+            _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+        ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+            let _probe = DropProbe(self.dropped.clone());
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.side_effects.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                AssistantMessage {
+                    content: Some("too late".into()),
                     tool_calls: Vec::new(),
                     reasoning: None,
                 },
@@ -1043,6 +1086,41 @@ mod tests {
             entered,
             release,
         )
+    }
+
+    #[tokio::test]
+    async fn aborting_join_waiter_still_aborts_inner_runner() {
+        let temp = tempfile::tempdir().unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let side_effects = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::new(
+            Box::new(DropProbeModel {
+                entered: entered.clone(),
+                release: release.clone(),
+                dropped: dropped.clone(),
+                side_effects: side_effects.clone(),
+            }),
+            vec![],
+        );
+        let (runner, _handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            "abort-join".into(),
+            IdlePolicy::FinishWhenIdle,
+        );
+        let task = runner.start(Some("start".into()));
+        let waiter = tokio::spawn(task.join());
+
+        entered.notified().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        dropped.notified().await;
+        release.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(side_effects.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

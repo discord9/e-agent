@@ -890,29 +890,40 @@ impl BackgroundTasks {
     {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let started = format!("started background task {id}: {label}");
+        let (work_tx, work_rx) = tokio::sync::oneshot::channel::<F>();
+        let running = self.running.clone();
+        let handle = tokio::spawn(async move {
+            let Ok(work) = work_rx.await else {
+                running.lock().unwrap().retain(|task| task.id != id);
+                return;
+            };
+            let output = work().await;
+            let completed = {
+                let mut running = running.lock().unwrap();
+                if let Some(index) = running.iter().position(|task| task.id == id) {
+                    running.remove(index);
+                    true
+                } else {
+                    false
+                }
+            };
+            if completed {
+                on_complete(id, output);
+            }
+        });
         self.running.lock().unwrap().push(RunningTask {
             id,
-            label: label.clone(),
+            label,
             role,
             process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),
-            handle: Arc::new(tokio::spawn(async {})),
+            handle: Arc::new(handle),
             output: None,
             display_meta,
         });
         on_id(id);
-        let running = self.running.clone();
-        let handle = tokio::spawn(async move {
-            let output = work().await;
-            running.lock().unwrap().retain(|task| task.id != id);
-            on_complete(id, output);
-        });
-        self.running
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .find(|task| task.id == id)
-            .unwrap()
-            .handle = Arc::new(handle);
+        if let Err(work) = work_tx.send(work) {
+            drop(work);
+        }
         Ok(started)
     }
 }
@@ -1278,6 +1289,7 @@ fn format_output(code: Option<i32>, stdout: &Captured, stderr: &Captured) -> Str
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2500,6 +2512,98 @@ mod tests {
             receiver.recv().await,
             Some(AgentEvent::BackgroundCompleted { id: 1, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn panicking_on_id_removes_registration_without_work_or_completion() {
+        let mut background = BackgroundTasks::new(Duration::from_secs(30), None);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        let work_runs = Arc::new(AtomicU64::new(0));
+        let completions = Arc::new(AtomicU64::new(0));
+        let work_runs_in_task = work_runs.clone();
+        let completions_in_task = completions.clone();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = background.spawn_inner(
+                "panicking registration".into(),
+                None,
+                None,
+                None,
+                |_| panic!("controlled on_id panic"),
+                move || async move {
+                    work_runs_in_task.fetch_add(1, Ordering::SeqCst);
+                    "unexpected".into()
+                },
+                move |_, _| {
+                    completions_in_task.fetch_add(1, Ordering::SeqCst);
+                },
+            );
+        }));
+        assert!(panic.is_err(), "on_id panic must propagate");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !background.running().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("wrapper must remove registration after handoff closes");
+        assert_eq!(work_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_during_on_id_suppresses_work_and_completion() {
+        let mut background = BackgroundTasks::new(Duration::from_secs(30), None);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let work_runs = Arc::new(AtomicU64::new(0));
+        let completions = Arc::new(AtomicU64::new(0));
+        let spawn_background = background.clone();
+        let spawn_entered = entered.clone();
+        let spawn_release = release.clone();
+        let spawn_work_runs = work_runs.clone();
+        let spawn_completions = completions.clone();
+
+        let spawn = tokio::task::spawn_blocking(move || {
+            spawn_background.spawn_inner(
+                "blocked registration".into(),
+                None,
+                None,
+                None,
+                move |_| {
+                    spawn_entered.wait();
+                    spawn_release.wait();
+                },
+                move || async move {
+                    spawn_work_runs.fetch_add(1, Ordering::SeqCst);
+                    "unexpected".into()
+                },
+                move |_, _| {
+                    spawn_completions.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+        });
+
+        entered.wait();
+        assert_eq!(
+            background.cancel(1).as_deref(),
+            Some("blocked registration")
+        );
+        release.wait();
+        assert_eq!(
+            spawn.await.unwrap().unwrap(),
+            "started background task 1: blocked registration"
+        );
+        tokio::task::yield_now().await;
+        assert!(background.running().is_empty());
+        assert_eq!(work_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]

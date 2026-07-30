@@ -61,6 +61,62 @@ impl Sessions {
     }
 }
 
+/// Cancellation-safe ownership of delegate registration side effects.
+///
+/// This guard is captured by the scheduler's `FnOnce`, rather than created in
+/// its async body, so aborting the wrapper before its first poll still cleans
+/// up the session and parent recovery record.
+struct DelegateCleanup {
+    id: Arc<Mutex<Option<u64>>>,
+    sessions: Sessions,
+    recovery: Option<(std::path::PathBuf, String)>,
+}
+
+impl DelegateCleanup {
+    fn new(
+        id: Arc<Mutex<Option<u64>>>,
+        sessions: Sessions,
+        recovery: Option<(std::path::PathBuf, String)>,
+    ) -> Self {
+        Self {
+            id,
+            sessions,
+            recovery,
+        }
+    }
+
+    fn finish(mut self) {
+        self.cleanup();
+    }
+
+    fn cleanup(&mut self) {
+        let id = match self.id.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        let Some(id) = id else {
+            return;
+        };
+        match self.sessions.sessions.lock() {
+            Ok(mut sessions) => {
+                sessions.remove(&id);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(&id);
+            }
+        }
+        if let Some((root, session)) = &self.recovery {
+            crate::session::Session::clear_background_task(root, session, id);
+        }
+    }
+}
+
+impl Drop for DelegateCleanup {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 pub struct Delegate {
     /// Subagents run on the role-routed model when configured, otherwise
     /// on the main model.
@@ -520,10 +576,8 @@ impl Tool for Delegate {
         )
         .await?;
         let sessions = self.sessions.clone();
-        let sessions_in_work = self.sessions.clone();
         let slot = Arc::new(Mutex::new(None::<u64>));
         let slot_in_hook = slot.clone();
-        let slot_in_work = slot.clone();
         let entry = Arc::new(SessionEntry {
             handle: handle.clone(),
             model: model_name,
@@ -535,7 +589,7 @@ impl Tool for Delegate {
         let entry_for_hook = entry.clone();
         if background {
             let record = self.record_in.clone();
-            let record_in_work = record.clone();
+            let cleanup = DelegateCleanup::new(slot, self.sessions.clone(), record.clone());
             let record_label = label.clone();
             let record_session_id = session_id.clone();
             let output_session_id = session_id.clone();
@@ -545,8 +599,11 @@ impl Tool for Delegate {
                 None,
                 Some(task_display),
                 move |id| {
+                    match slot_in_hook.lock() {
+                        Ok(mut slot) => *slot = Some(id),
+                        Err(poisoned) => *poisoned.into_inner() = Some(id),
+                    }
                     sessions.insert(id, entry_for_hook);
-                    *slot_in_hook.lock().unwrap() = Some(id);
                     if let Some((root, session)) = &record {
                         let _ = crate::session::Session::record_background_start(
                             root,
@@ -557,20 +614,19 @@ impl Tool for Delegate {
                         );
                     }
                 },
-                move || async move {
-                    let (_, output) =
-                        result_output(Self::runner_result(&handle, runner_task).await);
-                    if let Some(id) = *slot_in_work.lock().unwrap() {
-                        sessions_in_work.remove(id);
-                        if let Some((root, session)) = &record_in_work {
-                            crate::session::Session::clear_background_task(root, session, id);
-                        }
+                move || {
+                    let cleanup = cleanup;
+                    async move {
+                        let (_, output) =
+                            result_output(Self::runner_result(&handle, runner_task).await);
+                        cleanup.finish();
+                        format!("subagent session: {output_session_id}\n{output}")
                     }
-                    format!("subagent session: {output_session_id}\n{output}")
                 },
             )?;
             return Ok(format!("{started}\nsubagent session: {session_id}"));
         }
+        let cleanup = DelegateCleanup::new(slot, self.sessions.clone(), None);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         self.background.spawn_silent(
             label,
@@ -578,16 +634,20 @@ impl Tool for Delegate {
             None,
             Some(task_display),
             move |id| {
-                sessions.insert(id, entry_for_hook);
-                *slot_in_hook.lock().unwrap() = Some(id);
-            },
-            move || async move {
-                let result = Self::runner_result(&handle, runner_task).await;
-                if let Some(id) = *slot_in_work.lock().unwrap() {
-                    sessions_in_work.remove(id);
+                match slot_in_hook.lock() {
+                    Ok(mut slot) => *slot = Some(id),
+                    Err(poisoned) => *poisoned.into_inner() = Some(id),
                 }
-                let _ = done_tx.send(result.clone());
-                result_output(result).1
+                sessions.insert(id, entry_for_hook);
+            },
+            move || {
+                let cleanup = cleanup;
+                async move {
+                    let result = Self::runner_result(&handle, runner_task).await;
+                    cleanup.finish();
+                    let _ = done_tx.send(result.clone());
+                    result_output(result).1
+                }
             },
         )?;
         let result = done_rx
@@ -604,9 +664,13 @@ impl Tool for Delegate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{AssistantMessage, Message, Model, ModelDeltaKind, Usage};
     use crate::tools::builtins;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::Notify;
 
     #[test]
     fn task_label_falls_back_label_then_role_then_task() {
@@ -707,6 +771,402 @@ mod tests {
 
     fn delegate(workspace: &std::path::Path) -> Delegate {
         delegate_with_url(workspace, "http://localhost".into())
+    }
+
+    struct ProbeModel {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        future_dropped: Arc<Notify>,
+        model_dropped: Arc<Notify>,
+        side_effects: Arc<AtomicUsize>,
+        panic: bool,
+    }
+
+    struct FutureDropProbe(Arc<Notify>);
+
+    impl Drop for FutureDropProbe {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    impl Drop for ProbeModel {
+        fn drop(&mut self) {
+            self.model_dropped.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl Model for ProbeModel {
+        async fn complete(
+            &mut self,
+            _: &[Message],
+            _: &[ToolSpec],
+            _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+        ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+            let _probe = FutureDropProbe(self.future_dropped.clone());
+            self.entered.notify_one();
+            assert!(!self.panic, "controlled model panic");
+            self.release.notified().await;
+            self.side_effects.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                AssistantMessage {
+                    content: Some("finished".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            ))
+        }
+    }
+
+    struct ProbeSignals {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        future_dropped: Arc<Notify>,
+        model_dropped: Arc<Notify>,
+        side_effects: Arc<AtomicUsize>,
+    }
+
+    fn probe_runner(
+        root: &std::path::Path,
+        panic: bool,
+    ) -> (SessionHandle, crate::runner::SessionTask, ProbeSignals) {
+        let signals = ProbeSignals {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            future_dropped: Arc::new(Notify::new()),
+            model_dropped: Arc::new(Notify::new()),
+            side_effects: Arc::new(AtomicUsize::new(0)),
+        };
+        let agent = Agent::new(
+            Box::new(ProbeModel {
+                entered: signals.entered.clone(),
+                release: signals.release.clone(),
+                future_dropped: signals.future_dropped.clone(),
+                model_dropped: signals.model_dropped.clone(),
+                side_effects: signals.side_effects.clone(),
+                panic,
+            }),
+            vec![],
+        );
+        let (runner, handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            root.to_path_buf(),
+            "probe".into(),
+            IdlePolicy::FinishWhenIdle,
+        );
+        (handle, runner.start(Some("start".into())), signals)
+    }
+
+    fn probe_entry(handle: SessionHandle) -> Arc<SessionEntry> {
+        Arc::new(SessionEntry {
+            handle,
+            model: "probe".into(),
+            role: None,
+            cwd: "/tmp".into(),
+            session_id: "sub-probe".into(),
+            context_window: None,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_cancel_during_on_id_cleans_registration_without_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let workspace = Workspace::new(&root).unwrap();
+        let (_, mut background) = builtins(workspace, None);
+        let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        let (handle, runner_task, signals) = probe_runner(&root, false);
+        let sessions = Sessions::default();
+        let slot = Arc::new(Mutex::new(None));
+        let cleanup = DelegateCleanup::new(
+            slot.clone(),
+            sessions.clone(),
+            Some((root.clone(), "parent".into())),
+        );
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let work_runs = Arc::new(AtomicUsize::new(0));
+        let spawn_background = background.clone();
+        let hook_slot = slot.clone();
+        let hook_sessions = sessions.clone();
+        let hook_handle = handle.clone();
+        let hook_root = root.clone();
+        let hook_entered = entered.clone();
+        let hook_release = release.clone();
+        let spawn_work_runs = work_runs.clone();
+
+        let spawn = tokio::task::spawn_blocking(move || {
+            spawn_background.spawn_with_id(
+                "probe".into(),
+                None,
+                None,
+                None,
+                move |id| {
+                    *hook_slot.lock().unwrap() = Some(id);
+                    hook_sessions.insert(id, probe_entry(hook_handle));
+                    crate::session::Session::record_background_start(
+                        &hook_root,
+                        "parent",
+                        id,
+                        "probe",
+                        Some("sub-probe"),
+                    )
+                    .unwrap();
+                    hook_entered.wait();
+                    hook_release.wait();
+                },
+                move || {
+                    spawn_work_runs.fetch_add(1, Ordering::SeqCst);
+                    let cleanup = cleanup;
+                    async move {
+                        let result = Delegate::runner_result(&handle, runner_task).await;
+                        cleanup.finish();
+                        result_output(result).1
+                    }
+                },
+            )
+        });
+
+        entered.wait();
+        assert!(sessions.get(1).is_some());
+        assert_eq!(background.cancel(1).as_deref(), Some("probe"));
+        release.wait();
+        assert!(spawn.await.unwrap().is_ok(), "spawn must not panic or fail");
+        signals.model_dropped.notified().await;
+        signals.release.notify_one();
+        tokio::task::yield_now().await;
+        assert!(background.running().is_empty());
+        assert!(sessions.sessions.lock().unwrap().is_empty());
+        assert!(crate::session::Session::take_unfinished_background(&root, "parent").is_empty());
+        assert_eq!(work_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(signals.side_effects.load(Ordering::SeqCst), 0);
+        assert!(completions.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_cancel_before_first_yield_cleans_everything() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+        let (_, mut background) = builtins(workspace, None);
+        let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        let (handle, runner_task, signals) = probe_runner(temp.path(), false);
+        let sessions = Sessions::default();
+        let slot = Arc::new(Mutex::new(None));
+        let cleanup = DelegateCleanup::new(
+            slot.clone(),
+            sessions.clone(),
+            Some((temp.path().to_path_buf(), "parent".into())),
+        );
+        let hook_slot = slot.clone();
+        let hook_sessions = sessions.clone();
+        let hook_handle = handle.clone();
+        let hook_root = temp.path().to_path_buf();
+        background
+            .spawn_with_id(
+                "probe".into(),
+                None,
+                None,
+                None,
+                move |id| {
+                    *hook_slot.lock().unwrap() = Some(id);
+                    hook_sessions.insert(id, probe_entry(hook_handle.clone()));
+                    crate::session::Session::record_background_start(
+                        &hook_root,
+                        "parent",
+                        id,
+                        "probe",
+                        Some("sub-probe"),
+                    )
+                    .unwrap();
+                },
+                move || {
+                    let cleanup = cleanup;
+                    async move {
+                        let result = Delegate::runner_result(&handle, runner_task).await;
+                        cleanup.finish();
+                        result_output(result).1
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(background.cancel(1).as_deref(), Some("probe"));
+        signals.model_dropped.notified().await;
+        signals.release.notify_one();
+        tokio::task::yield_now().await;
+        assert!(background.running().is_empty());
+        assert!(sessions.sessions.lock().unwrap().is_empty());
+        assert!(
+            crate::session::Session::take_unfinished_background(temp.path(), "parent").is_empty()
+        );
+        assert_eq!(signals.side_effects.load(Ordering::SeqCst), 0);
+        assert!(completions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn background_cancel_while_joining_aborts_inner_without_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+        let (_, mut background) = builtins(workspace, None);
+        let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        let (handle, runner_task, signals) = probe_runner(temp.path(), false);
+        let sessions = Sessions::default();
+        let slot = Arc::new(Mutex::new(None));
+        let cleanup = DelegateCleanup::new(
+            slot.clone(),
+            sessions.clone(),
+            Some((temp.path().to_path_buf(), "parent".into())),
+        );
+        let hook_sessions = sessions.clone();
+        let hook_handle = handle.clone();
+        let hook_root = temp.path().to_path_buf();
+        background
+            .spawn_with_id(
+                "probe".into(),
+                None,
+                None,
+                None,
+                move |id| {
+                    *slot.lock().unwrap() = Some(id);
+                    hook_sessions.insert(id, probe_entry(hook_handle.clone()));
+                    crate::session::Session::record_background_start(
+                        &hook_root,
+                        "parent",
+                        id,
+                        "probe",
+                        Some("sub-probe"),
+                    )
+                    .unwrap();
+                },
+                move || {
+                    let cleanup = cleanup;
+                    async move {
+                        let result = Delegate::runner_result(&handle, runner_task).await;
+                        cleanup.finish();
+                        result_output(result).1
+                    }
+                },
+            )
+            .unwrap();
+
+        signals.entered.notified().await;
+        assert_eq!(background.cancel(1).as_deref(), Some("probe"));
+        signals.future_dropped.notified().await;
+        signals.model_dropped.notified().await;
+        signals.release.notify_one();
+        tokio::task::yield_now().await;
+        assert!(background.running().is_empty());
+        assert!(sessions.sessions.lock().unwrap().is_empty());
+        assert!(
+            crate::session::Session::take_unfinished_background(temp.path(), "parent").is_empty()
+        );
+        assert_eq!(signals.side_effects.load(Ordering::SeqCst), 0);
+        assert!(completions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sync_cancel_cleans_session_and_closes_result_channel() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+        let (_, mut background) = builtins(workspace, None);
+        let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        let (handle, runner_task, signals) = probe_runner(temp.path(), false);
+        let sessions = Sessions::default();
+        let slot = Arc::new(Mutex::new(None));
+        let cleanup = DelegateCleanup::new(slot.clone(), sessions.clone(), None);
+        let hook_sessions = sessions.clone();
+        let hook_handle = handle.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        background
+            .spawn_silent(
+                "probe".into(),
+                None,
+                None,
+                None,
+                move |id| {
+                    *slot.lock().unwrap() = Some(id);
+                    hook_sessions.insert(id, probe_entry(hook_handle.clone()));
+                },
+                move || {
+                    let cleanup = cleanup;
+                    async move {
+                        let result = Delegate::runner_result(&handle, runner_task).await;
+                        cleanup.finish();
+                        let _ = done_tx.send(result.clone());
+                        result_output(result).1
+                    }
+                },
+            )
+            .unwrap();
+
+        signals.entered.notified().await;
+        assert_eq!(background.cancel(1).as_deref(), Some("probe"));
+        assert_eq!(
+            done_rx.await.unwrap_err().to_string(),
+            "channel closed",
+            "sync delegate reports its existing channel-closed error"
+        );
+        signals.future_dropped.notified().await;
+        signals.model_dropped.notified().await;
+        assert!(background.running().is_empty());
+        assert!(sessions.sessions.lock().unwrap().is_empty());
+        assert!(completions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn panicking_inner_model_cleans_up_and_sends_one_failure_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+        let (_, mut background) = builtins(workspace, None);
+        let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        let (handle, runner_task, signals) = probe_runner(temp.path(), true);
+        let sessions = Sessions::default();
+        let slot = Arc::new(Mutex::new(None));
+        let cleanup = DelegateCleanup::new(slot.clone(), sessions.clone(), None);
+        let hook_sessions = sessions.clone();
+        let hook_handle = handle.clone();
+        background
+            .spawn_with_id(
+                "probe".into(),
+                None,
+                None,
+                None,
+                move |id| {
+                    *slot.lock().unwrap() = Some(id);
+                    hook_sessions.insert(id, probe_entry(hook_handle.clone()));
+                },
+                move || {
+                    let cleanup = cleanup;
+                    async move {
+                        let result = Delegate::runner_result(&handle, runner_task).await;
+                        cleanup.finish();
+                        result_output(result).1
+                    }
+                },
+            )
+            .unwrap();
+
+        let event = completions.recv().await.unwrap();
+        assert!(matches!(
+            event,
+            AgentEvent::BackgroundCompleted { output, .. }
+                if output.starts_with("subagent failed:") && output.contains("controlled model panic")
+        ));
+        signals.model_dropped.notified().await;
+        assert!(background.running().is_empty());
+        assert!(sessions.sessions.lock().unwrap().is_empty());
+        assert!(
+            completions.try_recv().is_err(),
+            "exactly one completion is sent"
+        );
     }
 
     async fn successful_model(answer: &str) -> String {
@@ -1036,6 +1496,12 @@ mod tests {
             .await
             .expect("timed out waiting for background completion")
             .unwrap();
+        assert!(tool.background.running().is_empty());
+        assert!(tool.sessions.sessions.lock().unwrap().is_empty());
+        assert!(
+            receiver.try_recv().is_err(),
+            "exactly one completion is sent"
+        );
         match event {
             AgentEvent::BackgroundCompleted { output, .. } => {
                 assert_eq!(
