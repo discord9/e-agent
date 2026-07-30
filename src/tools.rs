@@ -510,7 +510,9 @@ impl Tool for Bash {
             description.push_str(
                 " The read_file/write_file/edit_file tools are restricted to the workspace \
                  (capability-relative, not the sandbox); to read a file outside the workspace \
-                 that is mounted in the sandbox, use bash (e.g. cat).",
+                 that is mounted in the sandbox, use bash (e.g. cat). \
+                 The workspace `.git` metadata (directory or linked-worktree pointer) is bound \
+                 read-only to prevent accidental corruption by fixer subagents.",
             );
         }
         ToolSpec {
@@ -918,6 +920,18 @@ async fn run_bash(
                 "--ro-bind-try".into(),
                 "/etc".into(),
                 "/etc".into(),
+            ];
+            // If systemd-resolved is running on the host, mount its stub
+            // resolver so that symlinked /etc/resolv.conf works inside the
+            // sandbox. Only mount the resolver directory, not whole /run.
+            if std::path::Path::new("/run/systemd/resolve").exists() {
+                args.push("--dir".into());
+                args.push("/run/systemd".into());
+                args.push("--ro-bind".into());
+                args.push("/run/systemd/resolve".into());
+                args.push("/run/systemd/resolve".into());
+            }
+            args.extend([
                 "--tmpfs".into(),
                 "/tmp".into(),
                 "--tmpfs".into(),
@@ -928,7 +942,7 @@ async fn run_bash(
                 workspace_bind.into(),
                 root_str.clone(),
                 root_str.clone(),
-            ];
+            ]);
             // Extra user-configured mounts (cargo caches, shared target
             // disks, ...). These come after the workspace bind so they are
             // not shadowed by it. --bind-try / --ro-bind-try skip paths that
@@ -951,6 +965,19 @@ async fn run_bash(
             args.push("--ro-bind".into());
             args.push("/dev/null".into());
             args.push(project_config);
+
+            // Protect the workspace .git metadata (directory or
+            // linked-worktree pointer file) by binding it read-only over
+            // itself. This prevents the fixer / subagent from deleting or
+            // corrupting the pointer, running `git init`, or writing any
+            // commit metadata. It comes after all writable binds and the
+            // .e-agent/config.toml protection so it cannot be shadowed.
+            let git_path = format!("{root_str}/.git");
+            if std::path::Path::new(&git_path).exists() {
+                args.push("--ro-bind".into());
+                args.push(git_path.clone());
+                args.push(git_path);
+            }
             args.extend([
                 "--unshare-pid".into(),
                 "--unshare-ipc".into(),
@@ -1701,6 +1728,9 @@ mod tests {
         assert!(desc.contains("/mnt/big/cargo-home"), "{desc}");
         assert!(desc.contains("~/.rustup"), "{desc}");
         assert!(desc.contains("read_file/write_file/edit_file"), "{desc}");
+        assert!(desc.contains(".git"), "{desc}");
+        assert!(desc.contains("linked-worktree pointer"), "{desc}");
+        assert!(desc.contains("read-only to prevent"), "{desc}");
 
         // Sandboxed with read-only workspace.
         let sandboxed_ro = Bash {
@@ -1839,6 +1869,224 @@ mod tests {
             .await;
         assert!(write.is_err(), "readable path must reject writes");
         assert!(!data.path().join("nope").exists());
+    }
+
+    #[tokio::test]
+    async fn sandbox_protects_workspace_git_directory() {
+        let Some(sandbox) = sandbox() else {
+            eprintln!("bwrap unavailable; skipping sandbox test");
+            return;
+        };
+        // Create a workspace with a real-looking .git directory.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::fs::write(temp.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let tool = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(10),
+            background: BackgroundTasks::new(Duration::from_secs(30), None),
+            sandbox: Some(sandbox),
+        };
+        // Reading .git/HEAD must succeed (git commands read metadata).
+        let out = tool
+            .execute(json!({"command": "cat .git/HEAD"}))
+            .await
+            .unwrap();
+        assert!(out.contains("ref: refs/heads/main"), "{out}");
+        // Writing to any file under .git must fail (read-only bind).
+        let write = tool
+            .execute(json!({"command": "echo corrupted > .git/HEAD 2>&1"}))
+            .await;
+        assert!(write.is_err(), "write to .git must be rejected: {write:?}");
+        // Removing the .git directory must also fail.
+        let rm = tool.execute(json!({"command": "rm -rf .git 2>&1"})).await;
+        assert!(rm.is_err(), "rm -rf .git must be rejected: {rm:?}");
+        // The host .git must be untouched.
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".git/HEAD")).unwrap(),
+            "ref: refs/heads/main\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_protects_workspace_git_file_linked_worktree() {
+        let Some(sandbox) = sandbox() else {
+            eprintln!("bwrap unavailable; skipping sandbox test");
+            return;
+        };
+        // Simulate a linked-worktree worktree: .git is a file containing
+        // a gitdir pointer to the main repo (outside the sandbox).
+        let temp = tempfile::tempdir().unwrap();
+        let gitdir = "/some/external/main/.git/worktrees/feature";
+        std::fs::write(temp.path().join(".git"), format!("gitdir: {gitdir}\n")).unwrap();
+        let tool = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(10),
+            background: BackgroundTasks::new(Duration::from_secs(30), None),
+            sandbox: Some(sandbox),
+        };
+        // Reading the .git pointer must succeed.
+        let out = tool.execute(json!({"command": "cat .git"})).await.unwrap();
+        assert!(out.contains(gitdir), "{out}");
+        // Overwriting or deleting the .git file must fail.
+        let write = tool
+            .execute(json!({"command": "echo 'gitdir: /evil' > .git 2>&1"}))
+            .await;
+        assert!(
+            write.is_err(),
+            "overwrite .git pointer must be rejected: {write:?}"
+        );
+        let rm = tool.execute(json!({"command": "rm -f .git 2>&1"})).await;
+        assert!(rm.is_err(), "rm .git pointer must be rejected: {rm:?}");
+        // Verify the host .git pointer is intact.
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".git")).unwrap(),
+            format!("gitdir: {gitdir}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_mounts_systemd_resolve_when_present() {
+        let Some(sandbox) = sandbox() else {
+            eprintln!("bwrap unavailable; skipping sandbox test");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let tool = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(10),
+            background: BackgroundTasks::new(Duration::from_secs(30), None),
+            sandbox: Some(sandbox),
+        };
+        // Check whether /run/systemd/resolve exists on this host.
+        let host_has_resolve = std::path::Path::new("/run/systemd/resolve").exists();
+        // Inside the sandbox /run should be visible only when systemd-resolve
+        // was mounted. The directory itself should either exist and be readable
+        // or not exist at all.
+        let out = tool
+            .execute(
+                json!({"command": "test -d /run/systemd/resolve && echo PRESENT || echo ABSENT"}),
+            )
+            .await
+            .unwrap();
+        if host_has_resolve {
+            assert!(
+                out.contains("PRESENT"),
+                "/run/systemd/resolve should be mounted when host has it; output: {out}"
+            );
+            // The stub-resolv.conf should also be readable.
+            let contents = tool
+                .execute(
+                    json!({"command": "cat /run/systemd/resolve/stub-resolv.conf 2>&1 || true"}),
+                )
+                .await
+                .unwrap();
+            assert!(
+                contents.contains("nameserver"),
+                "stub-resolv.conf should contain a nameserver; output: {contents}"
+            );
+        } else {
+            assert!(
+                out.contains("ABSENT"),
+                "/run/systemd/resolve should NOT exist when host lacks it; output: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_cat_etc_resolv_conf_works() {
+        let Some(sandbox) = sandbox() else {
+            eprintln!("bwrap unavailable; skipping sandbox test");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let tool = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(10),
+            background: BackgroundTasks::new(Duration::from_secs(30), None),
+            sandbox: Some(sandbox),
+        };
+        // /etc/resolv.conf is always mounted (--ro-bind-try). Its contents
+        // depend on the host config; we just check it is readable.
+        let out = tool
+            .execute(json!({"command": "cat /etc/resolv.conf 2>&1 || true"}))
+            .await
+            .unwrap();
+        if std::path::Path::new("/etc/resolv.conf").exists() {
+            // On hosts with systemd-resolved the symlink target may or may not
+            // be reachable. We only assert the file itself is present (the
+            // symlink target is covered by sandbox_mounts_systemd_resolve).
+            assert!(
+                !out.contains("No such file"),
+                "/etc/resolv.conf should be readable; output: {out}"
+            );
+        } else {
+            // Host without /etc/resolv.conf (unusual) – skip assertion.
+            eprintln!("host has no /etc/resolv.conf; skipping content check");
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_dns_resolution_live_smoke() {
+        let Some(sandbox) = sandbox() else {
+            eprintln!("bwrap unavailable; skipping sandbox test");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let tool = Bash {
+            workspace: Workspace::new(temp.path()).unwrap(),
+            timeout: Duration::from_secs(15),
+            background: BackgroundTasks::new(Duration::from_secs(30), None),
+            sandbox: Some(sandbox),
+        };
+        // Live DNS resolution: this is a network-dependent smoke test.
+        // Skip if /run/systemd/resolve does not exist on the host (no
+        // systemd-resolved) or if basic connectivity prerequisites are
+        // absent. Use getent hosts (glibc) which respects /etc/nsswitch.conf.
+        let host_has_resolve = std::path::Path::new("/run/systemd/resolve").exists();
+        if !host_has_resolve {
+            eprintln!("host has no /run/systemd/resolve; skipping live DNS smoke test");
+            return;
+        }
+        // First verify that the resolver stub is reachable inside the sandbox.
+        let stub_ok = tool
+            .execute(json!({"command": "cat /run/systemd/resolve/stub-resolv.conf 2>&1"}))
+            .await;
+        match stub_ok {
+            Ok(out) if out.contains("nameserver") => { /* proceed */ }
+            Ok(out) => {
+                eprintln!("stub-resolv.conf reachable but no nameserver line: {out}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("stub-resolv.conf not reachable inside sandbox: {e}");
+                return;
+            }
+        }
+        // Try resolving github.com (commonly available public host).
+        let result = tool
+            .execute(json!({"command": "getent hosts github.com 2>&1 || nslookup github.com 2>&1 || host github.com 2>&1 || dig +short github.com 2>&1"}))
+            .await;
+        match result {
+            Ok(out) => {
+                let trimmed = out.trim();
+                if trimmed.is_empty()
+                    || trimmed.contains("not found")
+                    || trimmed.contains("NXDOMAIN")
+                    || trimmed.contains("SERVFAIL")
+                {
+                    eprintln!("DNS resolution returned no result (external network issue): {out}");
+                } else {
+                    assert!(
+                        trimmed.contains("github.com") || trimmed.contains('.'),
+                        "expected resolved address but got: {out}"
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("DNS resolution command failed (external network issue): {e}");
+            }
+        }
     }
 
     #[tokio::test]

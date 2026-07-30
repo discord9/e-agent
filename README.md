@@ -176,12 +176,28 @@ and subagents alike — is then wrapped in `bwrap`: system directories are
 mounted read-only, the workspace is mounted read-write (`workspace_writable =
 false` makes it read-only), `/tmp` and `/home` are fresh tmpfs, PID/IPC/UTS
 namespaces are unshared, and TIOCSTI is blocked via `--new-session`. Network
-stays available by default; `network = false` unshares it. The sandbox constrains
+stays available by default; `network = false` unshares it. When the host uses
+systemd-resolved, the stub resolver at `/run/systemd/resolve` is mounted
+read-only so that DNS resolution via the symlinked `/etc/resolv.conf` works
+inside the sandbox. The sandbox constrains
 the spawned command, not the agent process itself. This sandbox is best-effort:
 it is not setuid bwrap, the host network is shared by default, and environment
 variables of the parent process other than the stripped credential names
 (`EXA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`,
 `MOONSHOT_API_KEY`, `KIMI_API_KEY`) remain visible inside the sandbox.
+
+Additionally, when the sandbox is enabled and the workspace root contains a
+`.git` entry (a regular repository directory or a linked-worktree pointer
+file), the sandbox binds `<workspace>/.git` read-only **over itself** after
+all writable mounts. This prevents the agent from deleting or corrupting the
+pointer, running `git init`, or writing directly into `<workspace>/.git` — protecting
+workspace Git metadata against accidental corruption by a fixer subagent.
+This protection covers only the `.git` entry inside the workspace; it does
+not cover a repository's object store, packed references, or other data that
+resides outside the workspace (e.g. in a common Git directory referenced by a
+linked-worktree pointer). This protection does not prevent `git` commands from reading
+the repository, and it does not extend to any repository outside the workspace
+that happens to be mounted via `writable_paths`.
 
 Every `web_search` query is disclosed to Exa, a third party. Never include
 credentials, tokens, private repository contents, customer data, personal data,
