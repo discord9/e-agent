@@ -476,6 +476,17 @@ impl Tool for Delegate {
     }
 
     async fn execute(&self, arguments: Value) -> Result<String, String> {
+        const KNOWN: &[&str] = &["task", "role", "label", "background", "resume", "workspace"];
+        if let Some(args) = arguments.as_object() {
+            for key in args.keys() {
+                if !KNOWN.contains(&key.as_str()) {
+                    return Err(format!(
+                        "unknown delegate parameter `{key}` (known: {})",
+                        KNOWN.join(", ")
+                    ));
+                }
+            }
+        }
         let task = arguments
             .as_object()
             .and_then(|args| args.get("task"))
