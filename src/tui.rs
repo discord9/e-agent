@@ -2313,6 +2313,11 @@ impl TuiState {
             return;
         };
         if let Some(label) = self.background.as_ref().and_then(|b| b.cancel(task.id)) {
+            crate::session::Session::clear_background_task(
+                std::path::Path::new(&self.cwd),
+                &self.session_id,
+                task.id,
+            );
             self.push_line(
                 format!("cancelled task #{}: {}", task.id, label),
                 LineKind::Dim,
@@ -4212,6 +4217,47 @@ mod tests {
             buf[(1, 8)].bg,
             SOLARIZED_LIGHT.panel,
             "non-selected first task keeps panel background"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, mut background) =
+            crate::tools::builtins(crate::workspace::Workspace::new(temp.path()).unwrap(), None);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        background
+            .spawn_with_id(
+                "task".into(),
+                None,
+                None,
+                None,
+                |_| {},
+                || async { std::future::pending::<String>().await },
+            )
+            .unwrap();
+        let id = background.running()[0].id;
+        crate::session::Session::record_background_start(
+            temp.path(),
+            "cancel-store",
+            id,
+            "task",
+            None,
+        )
+        .unwrap();
+        let mut state = TuiState {
+            background: Some(background),
+            cwd: temp.path().display().to_string(),
+            session_id: "cancel-store".into(),
+            ..Default::default()
+        };
+
+        state.cancel_selected_task();
+
+        assert!(
+            crate::session::Session::take_unfinished_background(temp.path(), "cancel-store")
+                .is_empty()
         );
     }
 
