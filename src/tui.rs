@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,10 +23,10 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::agent::{Agent, AgentEvent, Message, SessionEntry, preview};
+use crate::agent::{AgentEvent, preview};
 use crate::delegate::Sessions;
 use crate::handle::SessionHandle;
-use crate::session_store::SessionStore;
+use crate::runner::{SessionHandle as RunnerHandle, SessionStatus, SessionTask};
 
 /// Events on the shared UI channel are tagged by session id: `0` is the
 /// main agent, anything else is an attached background session. The TUI
@@ -37,8 +36,6 @@ struct UiEvent {
     session: u64,
     event: AgentEvent,
 }
-
-type UiEventStream = futures_util::stream::Peekable<EventStream>;
 
 /// The one built-in look for the deliberately small TUI. This mirrors the
 /// adjusted Solarized Light OpenCode theme instead of offering a theme system.
@@ -246,11 +243,10 @@ fn attached_input_width(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
-    mut agent: Agent,
+    handle: RunnerHandle,
+    _task: SessionTask,
     root: PathBuf,
     session_name: String,
-    store: SessionStore,
-    mut persisted: usize,
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
     model_name: String,
@@ -271,21 +267,13 @@ pub async fn run(
     };
     let result = run_inner(
         &mut terminal,
-        &mut agent,
-        &root,
+        handle,
         &labels,
-        &mut persisted,
-        store,
         background,
         sessions,
         context_window,
     )
     .await;
-    // Do not return into main: the tokio runtime would then wait on
-    // still-running tasks (MCP stdio servers block forever reading their
-    // child's stdout), which is why exit used to need a second Ctrl-C.
-    // Dropping the terminal restores the shell screen first; the OS reaps
-    // any spawned MCP children.
     drop(terminal);
     drop(_guard);
     result
@@ -321,375 +309,69 @@ impl Drop for TerminalGuard {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    agent: &mut Agent,
-    root: &std::path::Path,
+    handle: RunnerHandle,
     labels: &InputLabels,
-    persisted: &mut usize,
-    store: SessionStore,
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
     context_window: Option<u64>,
 ) -> anyhow::Result<()> {
-    // One UI channel carrying every session's events, tagged by session id
-    // (0 = main agent). Main-agent events route to the main scrollback,
-    // attached-session events route to the attached view (see push_event).
     let (sender, mut inbox) = mpsc::unbounded_channel::<UiEvent>();
-    let (main_handle, main_sink, _main_source) = crate::handle::session_channel();
-    let _main_bridge = bridge(0, &main_handle, sender.clone());
-    agent.observe(main_sink);
-    // Per-turn event forwarder (deltas bypass the session log).
-    let (forward, mut forward_inbox) = mpsc::unbounded_channel::<AgentEvent>();
-    let forward_sender = sender.clone();
+    let (snapshot, mut live, mut status) = handle.attach();
+    let forward = sender.clone();
     tokio::spawn(async move {
-        while let Some(event) = forward_inbox.recv().await {
-            if forward_sender.send(UiEvent { session: 0, event }).is_err() {
+        while let Ok(event) = live.recv().await {
+            if forward.send(UiEvent { session: 0, event }).is_err() {
                 break;
             }
         }
     });
     let mut events = EventStream::new().peekable();
-    let mut state = TuiState::from_history(agent.history());
+    let mut state = TuiState::default();
+    for event in snapshot {
+        state.push_event(UiEvent { session: 0, event });
+    }
     state.session_id = labels.session.clone();
     state.model_name = labels.model.clone();
     state.cwd = labels.cwd.clone();
     state.role_name = labels.role.clone();
     state.context_window = context_window;
-
     state.background = Some(background);
-    // Resume: if history has a first User message, set the terminal title
-    // immediately and mark it as set so subsequent prompts never overwrite.
-    if let Some(title) = derive_session_title(agent.history()) {
-        set_terminal_title(&title);
-        state.session_title_set = true;
-    } else {
-        // New empty session: show the session id until the first prompt.
-        set_terminal_title(&labels.session);
-    }
+    set_terminal_title(&labels.session);
     let probe = sessions.clone();
     state.attachable = Some(Box::new(move |id| probe.get(id).is_some()));
     loop {
+        state.busy = match &*status.borrow() {
+            SessionStatus::Busy => Some(BusyState::thinking()),
+            SessionStatus::Compacting => Some(BusyState::compacting()),
+            _ => None,
+        };
         draw(terminal, &mut state)?;
         tokio::select! {
-            // Background task completed while idle: fold it into the model
-            // context and kick off a turn immediately so the agent reacts
-            // without waiting for the user's next message. No display line
-            // here — the turn boundary emits the completion as a UserPrompt
-            // which renders as the dim "finished" line.
-            Some((_id, _output, _label)) = agent.next_background_completion() => {
-                agent.subscribe(forward.clone());
-                let mut ui = Ui {
-                    state: &mut state,
-                    events: &mut events,
-                    inbox: &mut inbox,
-                    sessions: &sessions,
-                    sender: &sender,
-                };
-                if run_request(
-                    terminal,
-                    agent,
-                    &mut ui,
-                    &store,
-                    (root, &labels.session, persisted),
-                    String::new(),
-                )
-                .await?
+            changed = status.changed() => {
+                if changed.is_err()
+                    || matches!(&*status.borrow(), SessionStatus::Finished(_))
                 {
                     return Ok(());
                 }
-                // Drain all queued prompts as a single batch; repeat only
-                // if new prompts accumulated while the follow-up ran.
-                loop {
-                    let Some(next) = state.take_queued_batch() else { break };
-                    state.push_line(format!("you> {next}"), LineKind::User);
-                    state.follow();
-                    agent.subscribe(forward.clone());
-                    let mut ui = Ui {
-                        state: &mut state,
-                        events: &mut events,
-                        inbox: &mut inbox,
-                        sessions: &sessions,
-                        sender: &sender,
-                    };
-                    if run_request(
-                        terminal,
-                        agent,
-                        &mut ui,
-                        &store,
-                        (root, &labels.session, persisted),
-                        next,
-                    )
-                    .await?
-                    {
-                        return Ok(());
-                    }
-                }
             }
-            Some(first) = inbox.recv() => {
-                route_idle_events(&mut state, first, &mut inbox);
-            }
+            Some(first) = inbox.recv() => route_idle_events(&mut state, first, &mut inbox),
             event = events.next() => match event {
-            Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
-                // Tasks panel open: navigation keys belong to the panel
-                // (also while attached, so another session can be picked).
-                if state.show_tasks {
-                    if let Some(task_id) = state.handle_tasks_panel_key(key) {
-                        attach_to_task(&mut state, task_id, &sessions, &sender);
-                    } else {
-                        match state.handle_panel_key(key) {
-                            PanelAction::ClosePanel | PanelAction::CancelTask => {}
-                            PanelAction::Passthrough => {
-                                if let Some(attached) = &mut state.attached {
-                                    let width = attached_input_width(terminal)?;
-                                    AttachedView::edit_input(&mut attached.input, key, width);
-                                }
-                            }
-                        }
-                    }
-                    continue;
+                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
+                    if state.show_tasks { if let Some(id)=state.handle_tasks_panel_key(key) { attach_to_task(&mut state,id,&sessions,&sender); } else { let _=state.handle_panel_key(key); } continue; }
+                    if state.attached.is_some() { if key.code==KeyCode::Esc { state.detach(); } else if is_scroll_key(key) { state.attached.as_mut().unwrap().state.handle_scroll(key); } else { let width=attached_input_width(terminal)?; state.handle_attached_key(key,width); } continue; }
+                    let active = matches!(&*status.borrow(), SessionStatus::Busy | SessionStatus::Compacting);
+                    if active && is_cancel(key) { handle.cancel(); continue; }
+                    if !active && is_exit(key) { return Ok(()); }
+                    if is_scroll_key(key) { state.handle_scroll(key); drain_ready_scroll_keys(&mut events,&mut state).await; }
+                    else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
-                // Attached to a session view: Esc detaches; scroll and
-                // steering keys are handled there (the main agent is idle
-                // here so there is no turn to cancel).
-                if state.attached.is_some() {
-                    if key.code == KeyCode::Esc {
-                        state.detach();
-                    } else if is_scroll_key(key) {
-                        let attached = state.attached.as_mut().unwrap();
-                        attached.state.handle_scroll(key);
-                        drain_ready_scroll_keys(&mut events, &mut attached.state).await;
-                    } else {
-                        let width = attached_input_width(terminal)?;
-                        state.handle_attached_key(key, width);
-                    }
-                    continue;
-                }
-                if is_exit(key) {
-                    return Ok(());
-                }
-                if is_scroll_key(key) {
-                    state.handle_scroll(key);
-                    drain_ready_scroll_keys(&mut events, &mut state).await;
-                } else if let Some(prompt) = state.handle_key(key) {
-                    if prompt == "/compact" {
-                        state.push_line(compaction_banner("compacting…"), LineKind::Compaction);
-                        state.busy = Some(BusyState::compacting());
-                        state.streamed = false;
-                        draw(terminal, &mut state)?;
-                        let (result, interruption) = drive(
-                            terminal,
-                            &mut state,
-                            &mut events,
-                            &mut inbox,
-                            &sessions,
-                            &sender,
-                            agent.compact(),
-                        )
-                        .await?;
-                        state.busy = None;
-                        while let Ok(event) = inbox.try_recv() {
-                            state.push_event(event);
-                        }
-                        if let Some(result) = result {
-                            match result {
-                                Ok(summary) => {
-                                    state.push_line(
-                                        compaction_banner("compaction"),
-                                        LineKind::Compaction,
-                                    );
-                                    state.push_line(
-                                        format!("compacted: {summary}"),
-                                        LineKind::Dim,
-                                    );
-                                }
-                                Err(error) => {
-                                    state
-                                        .push_line(format!("error: {error:#}"), LineKind::ToolError)
-                                }
-                            }
-                        }
-                        store.append(root, &labels.session, &agent.history()[*persisted..]).await?;
-                        *persisted = agent.history().len();
-                        if matches!(interruption, Some(Interruption::ExitApp)) {
-                            return Ok(());
-                        }
-                        if matches!(interruption, Some(Interruption::CancelTurn)) {
-                            state.push_line("cancelled".into(), LineKind::Dim);
-                        }
-                        // Queued prompts drain into a single follow-up turn.
-                        loop {
-                            let Some(next) = state.take_queued_batch() else { break };
-                            state.push_line(format!("you> {next}"), LineKind::User);
-                            state.follow();
-                            agent.subscribe(forward.clone());
-                            let mut ui = Ui {
-                                state: &mut state,
-                                events: &mut events,
-                                inbox: &mut inbox,
-                                sessions: &sessions,
-                                sender: &sender,
-                            };
-                            if run_request(
-                                terminal,
-                                agent,
-                                &mut ui,
-                                &store,
-                                (root, &labels.session, persisted),
-                                next,
-                            )
-                            .await?
-                            {
-                                return Ok(());
-                            }
-                        }
-                        continue;
-                    }
-                    // First real user prompt: derive terminal title from it
-                    // and never overwrite on subsequent prompts.
-                    if !state.session_title_set {
-                        let title = sanitize_title(&prompt);
-                        let title = if title.is_empty() {
-                            labels.session.clone()
-                        } else {
-                            title
-                        };
-                        set_terminal_title(&title);
-                        state.session_title_set = true;
-                    }
-                    state.push_line(format!("you> {prompt}"), LineKind::User);
-                    state.follow();
-                    agent.subscribe(forward.clone());
-                    let mut ui = Ui {
-                        state: &mut state,
-                        events: &mut events,
-                        inbox: &mut inbox,
-                        sessions: &sessions,
-                        sender: &sender,
-                    };
-                    if run_request(
-                        terminal,
-                        agent,
-                        &mut ui,
-                        &store,
-                        (root, &labels.session, persisted),
-                        prompt,
-                    )
-                    .await?
-                    {
-                        return Ok(());
-                    }
-                    loop {
-                        let Some(next) = state.take_queued_batch() else { break };
-                        state.push_line(format!("you> {next}"), LineKind::User);
-                        state.follow();
-                        agent.subscribe(forward.clone());
-                        let mut ui = Ui {
-                            state: &mut state,
-                            events: &mut events,
-                            inbox: &mut inbox,
-                            sessions: &sessions,
-                            sender: &sender,
-                        };
-                        if run_request(
-                            terminal,
-                            agent,
-                            &mut ui,
-                            &store,
-                            (root, &labels.session, persisted),
-                            next,
-                        )
-                        .await?
-                        {
-                            return Ok(());
-                        }
-                    }
-                }
+                Some(Ok(Event::Paste(text))) => state.input.insert(&text.replace("\r\n","\n").replace('\r',"\n")),
+                Some(Ok(_)) => {}, Some(Err(error)) => return Err(error.into()), None => return Ok(()),
             }
-            Some(Ok(Event::Paste(text))) => {
-                // Windows-style pastes arrive as \r\n; hard_wrap only splits
-                // on \n, so normalize or the newlines are swallowed.
-                let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                if let Some(attached) = &mut state.attached {
-                    attached.input.insert(&text);
-                } else {
-                    state.input.insert(&text);
-                }
-            }
-            Some(Ok(_)) => {}
-            Some(Err(error)) => return Err(error.into()),
-            None => return Ok(()),
-        }
         }
     }
-}
-
-/// Bundles the per-run UI plumbing so `run_request` stays readable.
-struct Ui<'a> {
-    state: &'a mut TuiState,
-    events: &'a mut UiEventStream,
-    inbox: &'a mut mpsc::UnboundedReceiver<UiEvent>,
-    sessions: &'a Sessions,
-    sender: &'a mpsc::UnboundedSender<UiEvent>,
-}
-
-async fn run_request(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    agent: &mut Agent,
-    ui: &mut Ui<'_>,
-    store: &SessionStore,
-    session: (&std::path::Path, &str, &mut usize),
-    prompt: String,
-) -> anyhow::Result<bool> {
-    let (root, session_name, persisted) = session;
-    ui.state.busy = Some(BusyState::thinking());
-    // Reset the per-turn stream state. A turn that ended on a plain text
-    // answer leaves active_lane = Content (no tool result reset it); without
-    // clearing it here the next turn's first delta would append onto the
-    // `you> …` user line, dyeing the whole reply in the user color.
-    ui.state.streamed = false;
-    ui.state.active_lane = None;
-    draw(terminal, ui.state)?;
-    // Agent::run keeps turning until the model has reacted to every
-    // background completion that arrived along the way, so one drive()
-    // covers any completion-triggered follow-up turns too.
-    let (result, interruption) = drive(
-        terminal,
-        ui.state,
-        ui.events,
-        ui.inbox,
-        ui.sessions,
-        ui.sender,
-        agent.run(prompt),
-    )
-    .await?;
-    ui.state.busy = None;
-    while let Ok(event) = ui.inbox.try_recv() {
-        ui.state.push_event(event);
-    }
-    if let Some(result) = result {
-        match result {
-            Ok(answer) => ui.state.push_final_answer(answer),
-            Err(error) => ui
-                .state
-                .push_line(format!("error: {error:#}"), LineKind::ToolError),
-        }
-    }
-    if matches!(interruption, Some(Interruption::CancelTurn)) {
-        ui.state.push_line("cancelled".into(), LineKind::Dim);
-    }
-    store
-        .append(root, session_name, &agent.history()[*persisted..])
-        .await?;
-    *persisted = agent.history().len();
-    draw(terminal, ui.state)?;
-    Ok(matches!(interruption, Some(Interruption::ExitApp)))
-}
-
-enum Interruption {
-    ExitApp,
-    CancelTurn,
 }
 
 fn route_idle_events(
@@ -698,165 +380,8 @@ fn route_idle_events(
     inbox: &mut mpsc::UnboundedReceiver<UiEvent>,
 ) {
     state.push_event(first);
-    for _ in 1..256 {
-        let Ok(event) = inbox.try_recv() else { break };
+    while let Ok(event) = inbox.try_recv() {
         state.push_event(event);
-    }
-}
-
-/// Decide whether a key press should interrupt the active main-agent turn.
-/// Returns `Some(CancelTurn)` only when not attached to a subagent view
-/// (Ctrl-C while attached goes through `handle_attached_key` for local
-/// cancellation) and the key is a Press-kind Ctrl-C. Esc is intentionally
-/// excluded — it is reserved for "leave the current view".
-fn active_main_interruption(key: KeyEvent, attached: bool) -> Option<Interruption> {
-    if key.kind == crossterm::event::KeyEventKind::Press && !attached && is_cancel(key) {
-        Some(Interruption::CancelTurn)
-    } else {
-        None
-    }
-}
-
-/// Pump an agent future while keeping the UI responsive. Scroll and input
-/// editing stay available; Ctrl-C (unattached) cancels the main turn.
-/// When attached, Ctrl-C goes through `handle_attached_key` for local
-/// cancellation. The task panel always takes priority over all other keys.
-async fn drive<T>(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    state: &mut TuiState,
-    events: &mut UiEventStream,
-    inbox: &mut mpsc::UnboundedReceiver<UiEvent>,
-    sessions: &Sessions,
-    sender: &mpsc::UnboundedSender<UiEvent>,
-    work: impl Future<Output = anyhow::Result<T>>,
-) -> anyhow::Result<(Option<anyhow::Result<T>>, Option<Interruption>)> {
-    tokio::pin!(work);
-    let mut needs_redraw = false;
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(33));
-    interval.reset(); // skip the immediate-first-tick so the first real fire is ~33ms in
-    loop {
-        tokio::select! {
-            result = &mut work => {
-                // Final draw before returning so the last throttled event
-                // is visible before `run_request` does its own draw.
-                if needs_redraw {
-                    draw(terminal, state)?;
-                }
-                return Ok((Some(result), None));
-            }
-            _ = interval.tick() => {
-                if needs_redraw {
-                    draw(terminal, state)?;
-                    needs_redraw = false;
-                }
-            }
-            Some(event) = inbox.recv() => {
-                state.push_event(event);
-                needs_redraw = true;
-            }
-            event = events.next() => match event {
-                // Attached: Esc detaches from the session view instead of
-                // cancelling the in-flight turn.
-                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
-                    && key.code == KeyCode::Esc
-                    && state.attached.is_some() =>
-                {
-                    state.detach();
-                    draw(terminal, state)?;
-                }
-                // Tasks panel open takes priority: Ctrl-C cancels the selected
-                // task; it never cancels the main turn or exits the app.
-                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
-                    && state.show_tasks =>
-                {
-                    if let Some(task_id) = state.handle_tasks_panel_key(key) {
-                        attach_to_task(state, task_id, sessions, sender);
-                    } else {
-                        match state.handle_panel_key(key) {
-                            PanelAction::ClosePanel | PanelAction::CancelTask => {}
-                            PanelAction::Passthrough => {
-                                if key.code == KeyCode::Enter {
-                                    // Enter on a non-attachable task: nothing to attach.
-                                } else if let Some(attached) = &mut state.attached {
-                                    // Panel open while attached: remaining keys edit the
-                                    // steering input (panel already consumed nav keys).
-                                    let width = attached_input_width(terminal)?;
-                                    AttachedView::edit_input(&mut attached.input, key, width);
-                                } else {
-                                    state.handle_scroll(key);
-                                    state.edit_input(key);
-                                }
-                            }
-                        }
-                    }
-                    draw(terminal, state)?;
-                }
-                Some(Ok(Event::Key(key)))
-                    if active_main_interruption(key, state.attached.is_some()).is_some() =>
-                {
-                    let interruption = active_main_interruption(key, state.attached.is_some())
-                        .expect("guard requires an active-main interruption");
-                    return Ok((None, Some(interruption)));
-                }
-                // Not attached: Esc during a turn closes the tasks panel
-                // (leave-the-current-view), it never cancels the turn.
-                // When the panel is open this is handled by the show_tasks
-                // arm above via handle_panel_key; when the panel is closed
-                // this arm is a no-op.
-                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
-                    && key.code == KeyCode::Esc =>
-                {
-                    if state.show_tasks {
-                        state.show_tasks = false;
-                        draw(terminal, state)?;
-                    }
-                }
-                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
-                    && state.attached.is_some() =>
-                {
-                    if is_scroll_key(key) {
-                        let attached = state.attached.as_mut().unwrap();
-                        attached.state.handle_scroll(key);
-                        drain_ready_scroll_keys(events, &mut attached.state).await;
-                    } else {
-                        let width = attached_input_width(terminal)?;
-                        state.handle_attached_key(key, width);
-                    }
-                    draw(terminal, state)?;
-                }
-                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
-                    if key.code == KeyCode::F(2) {
-                        state.show_tasks = true;
-                        state.task_cursor = state.cursor_at_attached();
-                    } else if key.code == KeyCode::Enter {
-                        if key.modifiers == KeyModifiers::ALT {
-                            state.input.insert_char('\n');
-                        } else if let Some(prompt) = state.take_input() {
-                            state.queued.push(prompt);
-                        }
-                    } else if is_scroll_key(key) {
-                        state.handle_scroll(key);
-                        drain_ready_scroll_keys(events, state).await;
-                    } else {
-                        state.edit_input(key);
-                    }
-                    draw(terminal, state)?;
-                }
-                Some(Ok(Event::Paste(text))) => {
-                    // Same \r\n normalization as the idle loop.
-                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                    if let Some(attached) = &mut state.attached {
-                        attached.input.insert(&text);
-                    } else {
-                        state.input.insert(&text);
-                    }
-                    draw(terminal, state)?;
-                }
-                Some(Ok(_)) => {}
-                Some(Err(error)) => return Ok((Some(Err(error.into())), Some(Interruption::ExitApp))),
-                None => return Ok((None, Some(Interruption::ExitApp))),
-            }
-        }
     }
 }
 
@@ -1415,10 +940,6 @@ fn shorten_home(cwd: &str) -> std::borrow::Cow<'_, str> {
 /// Horizontal rule marking compaction boundaries in the scrollback. Rendered
 /// with LineKind::Compaction (violet on the element surface) so it stands
 /// out from regular log lines.
-fn compaction_banner(label: &str) -> String {
-    format!("──── {label} ────")
-}
-
 /// Truncate background completion output for TUI display. Shows head and
 /// tail with a middle marker indicating how many lines and chars were
 /// omitted. The full output is always preserved in the session entry /
@@ -1588,18 +1109,6 @@ fn sanitize_title(raw: &str) -> String {
 }
 
 /// First `Message::User` from history, skipping Notice/Compaction/BackgroundCompletion.
-fn derive_session_title(entries: &[SessionEntry]) -> Option<String> {
-    for entry in entries {
-        if let SessionEntry::Message { message } = entry
-            && let Message::User { content } = message
-        {
-            let t = sanitize_title(content);
-            return if t.is_empty() { None } else { Some(t) };
-        }
-    }
-    None
-}
-
 fn set_terminal_title(title: &str) {
     let _ = execute!(io::stdout(), SetTitle(format!("e-agent — {title}")));
 }
@@ -2007,29 +1516,6 @@ enum PanelAction {
 }
 
 impl TuiState {
-    fn from_history(entries: &[SessionEntry]) -> Self {
-        let mut state = Self::default();
-        for entry in entries {
-            match entry {
-                SessionEntry::Message { message } => state.push_message(message),
-                SessionEntry::Notice { text } => {
-                    state.push_line(text.clone(), LineKind::Dim);
-                }
-                SessionEntry::Compaction { summary, .. } => {
-                    state.push_line(compaction_banner("compaction"), LineKind::Compaction);
-                    state.push_line(format!("compacted: {summary}"), LineKind::Dim);
-                }
-                SessionEntry::BackgroundCompletion {
-                    id, output, label, ..
-                } => {
-                    state.push_background_completion(*id, output, label.as_deref());
-                }
-            }
-        }
-        state.follow();
-        state
-    }
-
     fn push_background_completion(&mut self, id: u64, output: &str, label: Option<&str>) {
         let header = match label.filter(|l| !l.trim().is_empty()) {
             Some(l) => {
@@ -2045,36 +1531,6 @@ impl TuiState {
         }
     }
 
-    fn push_message(&mut self, message: &Message) {
-        match message {
-            Message::System { content } => {
-                self.push_line(format!("system: {}", preview(content, 500)), LineKind::Dim);
-            }
-            Message::User { content } => {
-                self.push_line(format!("you> {content}"), LineKind::User);
-            }
-            Message::Assistant(message) => {
-                if let Some(reasoning) =
-                    message.reasoning.as_deref().filter(|text| !text.is_empty())
-                {
-                    self.push_line(
-                        format!("thinking: {}", preview(reasoning, 1000)),
-                        LineKind::Thinking,
-                    );
-                }
-                if let Some(content) = message.content.as_deref().filter(|text| !text.is_empty()) {
-                    self.push_line(content.to_owned(), LineKind::Normal);
-                }
-                for call in &message.tool_calls {
-                    self.push_tool_call(&call.name, &call.arguments);
-                }
-            }
-            Message::Tool {
-                content, is_error, ..
-            } => self.push_tool_result(content, *is_error),
-        }
-    }
-
     fn take_input(&mut self) -> Option<String> {
         let prompt = std::mem::take(&mut self.input.text);
         self.input.cursor = 0;
@@ -2086,14 +1542,6 @@ impl TuiState {
     /// Each call leaves the queue empty, so the caller should loop over
     /// this helper only until it returns None — any prompts enqueued
     /// during the follow-up turn become a separate batch on the next call.
-    fn take_queued_batch(&mut self) -> Option<String> {
-        if self.queued.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.queued).join("\n\n"))
-        }
-    }
-
     /// Attach to a background session: snapshot its event log into a fresh
     /// scrollback and follow its live stream from now on (see `bridge`).
     #[allow(clippy::too_many_arguments)]
@@ -2553,12 +2001,6 @@ impl TuiState {
         self.window.frozen_tail_text = None;
         self.window.frozen_source_end = 0;
         // source_start/source_end will be anchored at the tail on next draw.
-    }
-
-    fn push_final_answer(&mut self, answer: String) {
-        if !self.streamed {
-            self.push_line(answer, LineKind::Normal);
-        }
     }
 
     fn push_line(&mut self, text: String, kind: LineKind) {
@@ -3219,29 +2661,6 @@ mod tests {
             KeyCode::Char('c'),
             KeyModifiers::empty(),
         )));
-    }
-
-    #[test]
-    fn active_main_interruption_unattached_ctrl_c_yields_cancel_turn() {
-        // Unattached Ctrl+C => CancelTurn.
-        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(matches!(
-            active_main_interruption(ctrl_c, false),
-            Some(Interruption::CancelTurn)
-        ));
-        // Attached Ctrl+C => None (goes through handle_attached_key).
-        assert!(active_main_interruption(ctrl_c, true).is_none());
-        // Esc => None (esc is for "leave the current view").
-        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(active_main_interruption(esc, false).is_none());
-        assert!(active_main_interruption(esc, true).is_none());
-        // Release-kind Ctrl+C => None.
-        let ctrl_c_release = KeyEvent::new_with_kind(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL,
-            crossterm::event::KeyEventKind::Release,
-        );
-        assert!(active_main_interruption(ctrl_c_release, false).is_none());
     }
 
     #[test]
@@ -4634,21 +4053,6 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_and_content_deltas_use_separate_lines_without_final_duplicate() {
-        let mut state = TuiState::default();
-        state.push_agent_event(AgentEvent::ReasoningDelta("plan".into()));
-        state.push_agent_event(AgentEvent::ReasoningDelta(" more".into()));
-        state.push_agent_event(AgentEvent::AssistantDelta("hel".into()));
-        state.push_agent_event(AgentEvent::AssistantDelta("lo".into()));
-        state.push_final_answer("hello".into());
-        assert_eq!(state.lines.len(), 2);
-        assert_eq!(state.lines[0].text, "thinking: plan more");
-        assert_eq!(state.lines[0].kind, LineKind::Thinking);
-        assert_eq!(state.lines[1].text, "hello");
-        assert_eq!(state.lines[1].kind, LineKind::Normal);
-    }
-
-    #[test]
     fn empty_content_delta_does_not_split_the_reasoning_line() {
         // kimi interleaves empty `content: ""` chunks into the reasoning
         // stream. Each one must NOT flip the active lane, or the reasoning
@@ -4701,49 +4105,6 @@ mod tests {
         state.push_agent_event(AgentEvent::AssistantDelta("second".into()));
         assert_eq!(state.lines[1].text, "you> next questionsecond");
         assert_eq!(state.lines[1].kind, LineKind::User);
-    }
-
-    #[test]
-    fn restored_transcript_is_replayed_as_tui_lines() {
-        let messages = vec![
-            Message::User {
-                content: "hello".into(),
-            },
-            Message::Assistant(crate::agent::AssistantMessage {
-                content: Some("checking".into()),
-                tool_calls: vec![crate::agent::ToolCall {
-                    id: "call-1".into(),
-                    name: "read_file".into(),
-                    arguments: r#"{"path":"README.md"}"#.into(),
-                }],
-                reasoning: None,
-            }),
-            Message::Tool {
-                call_id: "call-1".into(),
-                name: "read_file".into(),
-                content: "contents".into(),
-                is_error: false,
-            },
-            Message::Assistant(crate::agent::AssistantMessage {
-                content: Some("done".into()),
-                tool_calls: vec![],
-                reasoning: None,
-            }),
-        ];
-        let state =
-            TuiState::from_history(&messages.into_iter().map(Into::into).collect::<Vec<_>>());
-        let lines: Vec<_> = state.lines.iter().map(|line| line.text.as_str()).collect();
-        assert_eq!(
-            lines,
-            [
-                "you> hello",
-                "checking",
-                "read: README.md",
-                "  ok: contents",
-                "done",
-            ]
-        );
-        assert!(state.window.follow_bottom);
     }
 
     #[test]
@@ -4876,27 +4237,6 @@ mod tests {
     }
 
     #[test]
-    fn prompts_submitted_while_thinking_queue_and_drain_in_batches() {
-        let mut state = TuiState::default();
-        state.input.insert("first");
-        let first = state.take_input().unwrap();
-        state.queued.push(first);
-        state.input.insert("second");
-        let second = state.take_input().unwrap();
-        state.queued.push(second);
-        assert!(state.input.text.is_empty());
-        // First call drains all into one joined batch.
-        assert_eq!(state.take_queued_batch().unwrap(), "first\n\nsecond");
-        // Queue is now empty.
-        assert!(state.take_queued_batch().is_none());
-        // New batch arrives after the first was drained.
-        state.queued.push("third".into());
-        state.queued.push("fourth".into());
-        assert_eq!(state.take_queued_batch().unwrap(), "third\n\nfourth");
-        assert!(state.take_queued_batch().is_none());
-    }
-
-    #[test]
     fn edit_file_tool_calls_render_as_a_numbered_diff_on_result() {
         let mut state = TuiState::default();
         state.push_agent_event(AgentEvent::ToolCall {
@@ -4934,111 +4274,6 @@ mod tests {
         assert_eq!(state.lines.len(), 1);
         assert!(state.lines[0].text.starts_with("tool: edit_file not json"));
         assert_eq!(state.lines[0].kind, LineKind::ToolCall);
-    }
-
-    #[test]
-    fn replay_marks_internal_messages_and_reasoning_dim() {
-        let entries = vec![
-            SessionEntry::Notice {
-                text: "[background task 1 completed]\nexit code: 0".into(),
-            },
-            SessionEntry::Notice {
-                text: "[compacted summary of earlier conversation]\nwe did things".into(),
-            },
-            SessionEntry::Message {
-                message: Message::Assistant(crate::agent::AssistantMessage {
-                    content: Some("answer".into()),
-                    tool_calls: vec![],
-                    reasoning: Some("plan".into()),
-                }),
-            },
-        ];
-        let state = TuiState::from_history(&entries);
-        assert_eq!(state.lines.len(), 4);
-        assert_eq!(
-            state.lines[0].kind,
-            LineKind::Dim,
-            "background completion stays dim"
-        );
-        assert_eq!(
-            state.lines[1].kind,
-            LineKind::Dim,
-            "compacted summary stays a muted notice"
-        );
-        assert_eq!(state.lines[2].text, "thinking: plan");
-        assert_eq!(state.lines[2].kind, LineKind::Thinking);
-        assert_eq!(state.lines[3].text, "answer");
-        assert_eq!(state.lines[3].kind, LineKind::Normal);
-    }
-
-    #[test]
-    fn replay_shows_compaction_entries_as_a_banner_and_summary_line() {
-        let entries = vec![
-            SessionEntry::Message {
-                message: Message::User {
-                    content: "old work".into(),
-                },
-            },
-            SessionEntry::Compaction {
-                summary: "summary of old work".into(),
-                retained: vec![Message::User {
-                    content: "kept".into(),
-                }],
-            },
-            SessionEntry::Message {
-                message: Message::User {
-                    content: "new work".into(),
-                },
-            },
-        ];
-        let state = TuiState::from_history(&entries);
-        let lines: Vec<_> = state
-            .lines
-            .iter()
-            .map(|line| (line.text.as_str(), line.kind))
-            .collect();
-        assert_eq!(
-            lines,
-            [
-                ("you> old work", LineKind::User),
-                ("──── compaction ────", LineKind::Compaction),
-                ("compacted: summary of old work", LineKind::Dim),
-                ("you> new work", LineKind::User),
-            ],
-            "retained tail must not be duplicated in the scrollback"
-        );
-    }
-
-    #[test]
-    fn replay_compaction_long_summary_not_truncated() {
-        // A summary longer than any preview limit must appear in full.
-        let long = "long summary: ".to_owned() + &"data ".repeat(200);
-        assert!(long.len() > 500, "test needs a long summary");
-        let entries = vec![SessionEntry::Compaction {
-            summary: long.clone(),
-            retained: vec![],
-        }];
-        let state = TuiState::from_history(&entries);
-        assert_eq!(state.lines.len(), 2);
-        assert_eq!(state.lines[0].kind, LineKind::Compaction);
-        assert_eq!(state.lines[1].text, format!("compacted: {long}"));
-        assert_eq!(state.lines[1].kind, LineKind::Dim);
-    }
-
-    #[test]
-    fn replay_compaction_multiline_summary_preserves_newlines() {
-        let multi = "line one\nline two\nline three\n";
-        let entries = vec![SessionEntry::Compaction {
-            summary: multi.into(),
-            retained: vec![],
-        }];
-        let state = TuiState::from_history(&entries);
-        assert_eq!(state.lines.len(), 2);
-        assert_eq!(state.lines[1].text, format!("compacted: {multi}"));
-        // hard_wrap splits on \n: the stored text is one DisplayLine with
-        // embedded newlines; rendering splits them into multiple visual rows.
-        let rows = hard_wrap(&state.lines[1].text, 100);
-        assert_eq!(rows.len(), 4, "multi-line summary: one row per line");
     }
 }
 
@@ -5106,26 +4341,6 @@ mod ux_tests {
             0,
             "attached-session events do not move the main spinner"
         );
-    }
-
-    #[test]
-    fn cancelling_take_queued_batch_joins_multiple_prompts() {
-        let mut state = TuiState {
-            queued: vec!["one".into(), "two".into(), "three".into()],
-            ..Default::default()
-        };
-        assert_eq!(state.take_queued_batch().unwrap(), "one\n\ntwo\n\nthree");
-        assert!(state.queued.is_empty());
-        // A single queued prompt is returned as-is.
-        let mut state = TuiState {
-            queued: vec!["only".into()],
-            ..Default::default()
-        };
-        assert_eq!(state.take_queued_batch().unwrap(), "only");
-        assert!(state.queued.is_empty());
-        // Empty queue returns None.
-        let mut state = TuiState::default();
-        assert!(state.take_queued_batch().is_none());
     }
 
     #[test]
@@ -5293,102 +4508,6 @@ mod ux_tests {
     }
 
     #[test]
-    fn background_completion_label_header_long_label_preview() {
-        // Table-driven: live (BackgroundCompletionNotice) and resume
-        // (from_history) produce the same header; long label uses preview.
-        use crate::agent::preview;
-
-        let long_label = "fix: refactor the authentication module to support OAuth2 + JWT rotation for enhanced security";
-        assert!(long_label.chars().count() > 60);
-        let previewed_label = preview(long_label, 60);
-        assert!(previewed_label.chars().count() <= 60);
-        assert!(
-            previewed_label.contains('\u{2026}'),
-            "long label must contain ellipsis: {previewed_label:?}"
-        );
-        assert!(
-            previewed_label.ends_with('y'),
-            "long label preview must preserve tail, got: {previewed_label:?}"
-        );
-
-        let long_header = format!("[background task 7 completed: {previewed_label}]");
-
-        struct Case {
-            id: u64,
-            label: Option<&'static str>,
-            expected_header: String,
-            check_long_preview: bool,
-        }
-
-        let cases = [
-            Case {
-                id: 3,
-                label: Some("build"),
-                expected_header: "[background task 3 completed: build]".into(),
-                check_long_preview: false,
-            },
-            Case {
-                id: 5,
-                label: None,
-                expected_header: "[background task 5 completed]".into(),
-                check_long_preview: false,
-            },
-            Case {
-                id: 7,
-                label: Some(long_label),
-                expected_header: long_header,
-                check_long_preview: true,
-            },
-        ];
-
-        for (case_idx, case) in cases.iter().enumerate() {
-            // ── Live via BackgroundCompletionNotice ──
-            let mut state = TuiState::default();
-            let output = "task output content";
-            state.push_agent_event(AgentEvent::BackgroundCompletionNotice {
-                id: case.id,
-                output: output.into(),
-                label: case.label.map(|s| s.to_owned()),
-            });
-            assert_eq!(
-                state.lines[0].text, case.expected_header,
-                "case {case_idx} live: header mismatch"
-            );
-            assert_eq!(state.lines[0].kind, LineKind::Dim);
-            assert_eq!(
-                state.lines[1].text, output,
-                "case {case_idx} live: output mismatch"
-            );
-
-            // ── Resume via from_history ──
-            let entries = [SessionEntry::BackgroundCompletion {
-                id: case.id,
-                output: output.into(),
-                label: case.label.map(|s| s.to_owned()),
-            }];
-            let state = TuiState::from_history(&entries);
-            assert_eq!(
-                state.lines[0].text, case.expected_header,
-                "case {case_idx} history: header mismatch"
-            );
-            assert_eq!(state.lines[0].kind, LineKind::Dim);
-            assert_eq!(
-                state.lines[1].text, output,
-                "case {case_idx} history: output mismatch"
-            );
-
-            // For the long-label case, verify middle-elision budget explicitly
-            if case.check_long_preview {
-                let header_chars: Vec<char> = state.lines[0].text.chars().collect();
-                // prefix "[background task 7 completed: " = 28 chars + preview ≤ 60 + "]"
-                // total ≤ 28 + 60 + 1 = 89, but really we just check preview length ≤ 60
-                let colon_pos = header_chars.iter().position(|&c| c == ':');
-                assert!(colon_pos.is_some(), "long label header must contain colon");
-            }
-        }
-    }
-
-    #[test]
     fn ordinary_notice_not_truncated() {
         // Regular Notice entries are NOT truncated by the background-output
         // truncation logic.
@@ -5399,23 +4518,6 @@ mod ux_tests {
             state.lines[0].text.len(),
             long.len(),
             "ordinary Notice must not be truncated"
-        );
-    }
-
-    #[test]
-    fn compaction_long_summary_not_truncated() {
-        // Compaction summary appears in full even when long (existing
-        // contract).
-        let long = "long summary: ".to_owned() + &"data ".repeat(200);
-        assert!(long.len() > 500);
-        let entries = [SessionEntry::Compaction {
-            summary: long.clone(),
-            retained: vec![],
-        }];
-        let state = TuiState::from_history(&entries);
-        assert!(
-            state.lines[1].text.contains(&long),
-            "compaction summary must not be truncated"
         );
     }
 
@@ -5462,58 +4564,6 @@ mod ux_tests {
         // Long text truncated to ≤40 Unicode chars
         let long = "a".repeat(100);
         assert!(sanitize_title(&long).chars().count() <= 40);
-    }
-
-    #[test]
-    fn derive_title_skips_non_user_and_picks_first() {
-        use crate::agent::{AssistantMessage, Message, SessionEntry};
-        let entries = [
-            SessionEntry::Notice { text: "n".into() },
-            SessionEntry::BackgroundCompletion {
-                id: 1,
-                output: "o".into(),
-                label: None,
-            },
-            SessionEntry::Compaction {
-                summary: "c".into(),
-                retained: vec![],
-            },
-            SessionEntry::Message {
-                message: Message::System {
-                    content: "s".into(),
-                },
-            },
-            SessionEntry::Message {
-                message: Message::Assistant(AssistantMessage {
-                    content: None,
-                    tool_calls: vec![],
-                    reasoning: None,
-                }),
-            },
-            SessionEntry::Message {
-                message: Message::User {
-                    content: "  first   msg  ".into(),
-                },
-            },
-            SessionEntry::Message {
-                message: Message::User {
-                    content: "second".into(),
-                },
-            },
-        ];
-        assert_eq!(derive_session_title(&entries).unwrap(), "first msg");
-    }
-
-    #[test]
-    fn derive_title_none_when_no_user_msg_or_all_control() {
-        use crate::agent::Message;
-        assert!(derive_session_title(&[]).is_none());
-        let entries = [SessionEntry::Message {
-            message: Message::User {
-                content: "\x00\x01\x02".into(),
-            },
-        }];
-        assert!(derive_session_title(&entries).is_none());
     }
 
     // ── Frozen-viewport regression tests ────────────────────────────────

@@ -12,6 +12,7 @@ use e_agent::config::{AuthMode, ResolvedModel};
 use e_agent::delegate::Delegate;
 use e_agent::mcp;
 use e_agent::model::{ConfiguredModel, OpenAiModel};
+use e_agent::runner::{IdlePolicy, SessionRunner};
 use e_agent::session::Session;
 use e_agent::session_store::SessionStore;
 use e_agent::tools::builtins;
@@ -303,12 +304,19 @@ async fn run() -> anyhow::Result<()> {
     }
 
     if tui_mode {
-        let result = tui::run(
+        let (runner, handle) = SessionRunner::new(
             agent,
+            store,
+            root.clone(),
+            session.clone(),
+            IdlePolicy::WaitForInput,
+        );
+        let task = runner.start(None);
+        let result = tui::run(
+            handle,
+            task,
             root,
             session,
-            store,
-            persisted,
             background,
             subagent_sessions,
             model_name,

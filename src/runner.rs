@@ -238,7 +238,16 @@ impl SessionRunner {
         self.store
             .append(&self.root, &self.session, std::slice::from_ref(&entry))
             .await?;
+        let event = match &entry {
+            SessionEntry::Message {
+                message: Message::User { content },
+            } => Some(AgentEvent::UserPrompt(content.clone())),
+            _ => None,
+        };
         self.agent.apply_entry(entry);
+        if let Some(event) = event {
+            self.shared.lock().unwrap().emit(event);
+        }
         Ok(())
     }
     fn status(&self, status: SessionStatus) {
