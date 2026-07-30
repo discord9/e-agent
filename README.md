@@ -260,17 +260,22 @@ self-contained task and returns its final answer. Use it for subtasks whose
 intermediate steps (searching, reading many files, focused edits) would
 clutter the main context.
 
-Each subagent runs as an independent SessionRunner task on the shared Tokio
-runtime with an empty history and isolated Agent state. It shares the parent's
-running-task registry so nested background bash
-commands stay visible and report completion to the parent. It gets the same
-builtins as its parent: file/bash tools and, when
+Each subagent runs as an independent `SessionRunner` task on the shared Tokio
+runtime with an empty history. Its isolated Agent state and event log are
+exposed through a `SessionHandle`, while the parent's running-task registry
+remains shared so nested background bash commands stay visible and report
+completion to the parent. It gets the same builtins as its parent: file/bash
+tools and, when
 configured, `web_search`; no MCP tools and no `delegate` itself, so delegation
 depth is capped at 1 by construction. Tool rounds are unlimited.
 
-With `background: true` the subagent runs without blocking and its answer is
-delivered as a background task completion (waking an idle agent). Sync mode
-(the default) waits for the answer.
+With `background: true` the subagent runs without blocking; the immediate tool
+result includes both the background task number and subagent session ID, and
+its completion includes that same session ID when delivered as a background
+task completion (waking an idle agent). Sync mode (the default) waits without a
+fixed time ceiling. A completed answer is returned with the subagent session ID;
+cancellation, failure, or closure returns an error beginning with
+`subagent session: <id>`.
 
 A running background subagent can be watched live in the TUI: open the tasks
 panel with F2, select it with Up/Down, and press Enter to attach. The

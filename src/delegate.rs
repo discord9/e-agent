@@ -1,8 +1,9 @@
 //! `delegate` tool: spawn a subagent with a fresh context to work on a task.
 //!
 //! Each subagent runs as an independent [`SessionRunner`] task on the shared
-//! tokio runtime with isolated agent state (history, pending background results,
-//! and token counts).
+//! tokio runtime with an empty history. Its agent state (history, pending
+//! background results, and token counts) is isolated from the parent and
+//! exposed through a [`SessionHandle`].
 //!
 //! The subagent gets the builtin file/bash tools and, when configured, public
 //! web search (no MCP tools, no `delegate` itself — depth is capped at 1 by
@@ -110,12 +111,13 @@ pub struct PersistConfig {
 /// Task-panel title for a delegation: the caller's `label` wins (trimmed,
 /// non-empty, capped), then the role name, then a task preview.
 fn task_label(label: Option<&str>, role: Option<&str>, task: &str) -> String {
+    let single_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     label
         .map(str::trim)
         .filter(|label| !label.is_empty())
-        .map(|label| preview(label, 60))
-        .or_else(|| role.map(str::to_owned))
-        .unwrap_or_else(|| preview(task, 60))
+        .map(|label| preview(&single_line(label), 60))
+        .or_else(|| role.map(single_line))
+        .unwrap_or_else(|| preview(&single_line(task), 60))
 }
 
 /// A delegated task plus the role template (if any) that shapes the
@@ -267,26 +269,33 @@ impl Delegate {
         Ok((handle, runner_task))
     }
 
-    async fn runner_result(handle: &SessionHandle, task: crate::runner::SessionTask) -> String {
+    async fn runner_result(
+        handle: &SessionHandle,
+        task: crate::runner::SessionTask,
+    ) -> SessionResult {
         if let Err(error) = task.join().await {
-            return format!("subagent failed: {error}");
+            return SessionResult::Failed(error.to_string());
         }
         match handle.status().borrow().clone() {
-            crate::runner::SessionStatus::Finished(SessionResult::Completed(answer)) => {
-                answer.unwrap_or_default()
-            }
-            crate::runner::SessionStatus::Finished(SessionResult::Failed(error)) => {
-                format!("subagent failed: {error}")
-            }
-            crate::runner::SessionStatus::Finished(SessionResult::Cancelled) => {
-                "subagent cancelled".into()
-            }
-            crate::runner::SessionStatus::Finished(SessionResult::Closed) => {
-                "subagent closed".into()
-            }
-            _ => "subagent closed".into(),
+            crate::runner::SessionStatus::Finished(result) => result,
+            _ => SessionResult::Closed,
         }
     }
+}
+
+fn result_output(result: SessionResult) -> (bool, String) {
+    match result {
+        SessionResult::Completed(answer) => (true, answer.unwrap_or_default()),
+        SessionResult::Failed(error) => (false, format!("subagent failed: {error}")),
+        SessionResult::Cancelled => (false, "subagent cancelled".into()),
+        SessionResult::Closed => (false, "subagent closed".into()),
+    }
+}
+
+fn sync_result(session_id: &str, result: SessionResult) -> Result<String, String> {
+    let (completed, output) = result_output(result);
+    let output = format!("subagent session: {session_id}\n{output}");
+    if completed { Ok(output) } else { Err(output) }
 }
 
 #[async_trait]
@@ -525,8 +534,9 @@ impl Tool for Delegate {
             let record = self.record_in.clone();
             let record_in_work = record.clone();
             let record_label = label.clone();
+            let record_session_id = session_id.clone();
             let output_session_id = session_id.clone();
-            return self.background.spawn_with_id(
+            let started = self.background.spawn_with_id(
                 label,
                 role,
                 None,
@@ -540,12 +550,13 @@ impl Tool for Delegate {
                             session,
                             id,
                             &record_label,
-                            Some(&session_id),
+                            Some(&record_session_id),
                         );
                     }
                 },
                 move || async move {
-                    let output = Self::runner_result(&handle, runner_task).await;
+                    let (_, output) =
+                        result_output(Self::runner_result(&handle, runner_task).await);
                     if let Some(id) = *slot_in_work.lock().unwrap() {
                         sessions_in_work.remove(id);
                         if let Some((root, session)) = &record_in_work {
@@ -554,7 +565,8 @@ impl Tool for Delegate {
                     }
                     format!("subagent session: {output_session_id}\n{output}")
                 },
-            );
+            )?;
+            return Ok(format!("{started}\nsubagent session: {session_id}"));
         }
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         self.background.spawn_silent(
@@ -567,17 +579,18 @@ impl Tool for Delegate {
                 *slot_in_hook.lock().unwrap() = Some(id);
             },
             move || async move {
-                let output = Self::runner_result(&handle, runner_task).await;
+                let result = Self::runner_result(&handle, runner_task).await;
                 if let Some(id) = *slot_in_work.lock().unwrap() {
                     sessions_in_work.remove(id);
                 }
-                let _ = done_tx.send(output.clone());
-                output
+                let _ = done_tx.send(result.clone());
+                result_output(result).1
             },
         )?;
-        done_rx
+        let result = done_rx
             .await
-            .map_err(|_| "subagent result channel closed".into())
+            .map_err(|_| "subagent result channel closed".to_owned())?;
+        sync_result(&session_id, result)
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
@@ -589,6 +602,8 @@ impl Tool for Delegate {
 mod tests {
     use super::*;
     use crate::tools::builtins;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn task_label_falls_back_label_then_role_then_task() {
@@ -612,11 +627,30 @@ mod tests {
             "a long task",
             "no label and no role previews the task"
         );
+        assert_eq!(
+            task_label(Some("first line\nsecond\tline"), None, "task"),
+            "first line second line",
+            "labels are normalized onto one started-task line"
+        );
+        assert_eq!(
+            task_label(None, None, "first line\nsecond line"),
+            "first line second line",
+            "task-preview labels are normalized too"
+        );
         let long = "x".repeat(200);
         let capped = task_label(Some(&long), None, "task");
         assert!(
             capped.chars().count() <= 61 && capped.contains('\u{2026}'),
             "caller label is capped with a middle ellipsis, got: {capped:?}"
+        );
+    }
+
+    #[test]
+    fn sync_cancelled_is_an_error_with_session_id() {
+        let error = sync_result("sub-cancelled", SessionResult::Cancelled).unwrap_err();
+        assert_eq!(
+            error, "subagent session: sub-cancelled\nsubagent cancelled",
+            "cancelled must never be formatted as a successful sync answer"
         );
     }
 
@@ -656,21 +690,60 @@ mod tests {
         assert!(sessions.get(1).is_none());
     }
 
-    fn delegate(workspace: &std::path::Path) -> Delegate {
+    fn delegate_with_url(workspace: &std::path::Path, base_url: String) -> Delegate {
         let workspace = Workspace::new(workspace).unwrap();
-        // Construct the model with a dummy key directly: no request is ever
-        // sent, and tests must not depend on (or mutate) process env.
+        // Construct the model with a dummy key directly: tests must not
+        // depend on (or mutate) process env.
         let model = ConfiguredModel::chat(
-            crate::model::OpenAiModel::new(
-                "http://localhost".into(),
-                "test-key".into(),
-                "test-model".into(),
-                None,
-            )
-            .unwrap(),
+            crate::model::OpenAiModel::new(base_url, "test-key".into(), "test-model".into(), None)
+                .unwrap(),
         );
         let (_, background) = builtins(workspace.clone(), None);
         Delegate::new(model, workspace, background)
+    }
+
+    fn delegate(workspace: &std::path::Path) -> Delegate {
+        delegate_with_url(workspace, "http://localhost".into())
+    }
+
+    async fn successful_model(answer: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let answer = serde_json::to_string(answer).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0; 1024];
+                let count = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            let received_body = request.len() - header_end;
+            let mut rest = vec![0; content_length - received_body];
+            stream.read_exact(&mut rest).await.unwrap();
+
+            let body = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":{answer}}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{address}")
     }
 
     #[tokio::test]
@@ -879,10 +952,14 @@ mod tests {
                 "workspace": custom.path().to_str().unwrap()
             }))
             .await
-            .unwrap();
+            .unwrap_err();
         assert!(
-            answer.starts_with("subagent failed:"),
+            answer.contains("\nsubagent failed:"),
             "expected model-connection failure, got: {answer}"
+        );
+        assert!(
+            answer.starts_with("subagent session: sub-"),
+            "sync failure must identify its subagent session, got: {answer}"
         );
         assert!(
             !answer.contains("invalid `workspace`"),
@@ -891,18 +968,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_success_contains_session_id_and_answer() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_url = successful_model("finished answer").await;
+        let tool = delegate_with_url(temp.path(), base_url);
+
+        let output = tool.execute(json!({"task": "hello"})).await.unwrap();
+        let mut lines = output.lines();
+        let session_id = lines
+            .next()
+            .and_then(|line| line.strip_prefix("subagent session: "))
+            .expect("sync success contains the subagent session id");
+        assert!(session_id.starts_with("sub-"));
+        assert_eq!(lines.collect::<Vec<_>>(), ["finished answer"]);
+    }
+
+    #[tokio::test]
     async fn background_delegate_completion_contains_session_id() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("sessions");
-        let mut tool = delegate(temp.path()).persist_sessions(root);
+        let base_url = successful_model("finished answer").await;
+        let mut tool = delegate_with_url(temp.path(), base_url).persist_sessions(root);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         tool.set_event_sender(sender);
 
         let answer = tool
-            .execute(json!({"task": "hello", "background": true}))
+            .execute(json!({
+                "task": "hello",
+                "label": "first line\nsecond line",
+                "background": true
+            }))
             .await
             .unwrap();
-        assert!(answer.starts_with("started background task"));
+        let mut lines = answer.lines();
+        assert_eq!(
+            lines.next(),
+            Some("started background task 1: first line second line")
+        );
+        let immediate_session = lines
+            .next()
+            .and_then(|line| line.strip_prefix("subagent session: "))
+            .expect("immediate result contains the subagent session id");
+        assert!(immediate_session.starts_with("sub-"));
+        assert_eq!(lines.next(), None);
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
             .await
@@ -910,11 +1018,44 @@ mod tests {
             .unwrap();
         match event {
             AgentEvent::BackgroundCompleted { output, .. } => {
-                assert!(
-                    output.starts_with("subagent session: sub-"),
-                    "expected subagent session prefix, got: {output}"
+                assert_eq!(
+                    output,
+                    format!("subagent session: {immediate_session}\nfinished answer"),
+                    "successful completion must retain the immediate session id and answer"
                 );
             }
+            other => panic!("expected BackgroundCompleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn background_failure_completion_retains_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut tool = delegate(temp.path());
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tool.set_event_sender(sender);
+
+        let answer = tool
+            .execute(json!({"task": "hello", "background": true}))
+            .await
+            .unwrap();
+        let immediate_session = answer
+            .lines()
+            .nth(1)
+            .and_then(|line| line.strip_prefix("subagent session: "))
+            .expect("immediate result contains the subagent session id");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("timed out waiting for background failure")
+            .unwrap();
+        match event {
+            AgentEvent::BackgroundCompleted { output, .. } => assert!(
+                output.starts_with(&format!(
+                    "subagent session: {immediate_session}\nsubagent failed:"
+                )),
+                "failed completion must retain the main-branch session format, got: {output}"
+            ),
             other => panic!("expected BackgroundCompleted, got {other:?}"),
         }
     }
