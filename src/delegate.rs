@@ -96,30 +96,6 @@ fn next_queued_prompt(source: &mut SessionSource, pending: &mut Vec<String>) -> 
     }
 }
 
-/// Append the history entries produced since the last call to the
-/// subagent's own session file (`subagent-<task-id>`). Every subagent has
-/// its own file, so no marker or locking is needed. Best-effort: a
-/// persistence failure is logged, not fatal.
-async fn persist_turn(
-    store: &SessionStore,
-    persist: &PersistConfig,
-    agent: &Agent,
-    persisted: &mut usize,
-) {
-    let new_entries = &agent.history()[*persisted..];
-    if new_entries.is_empty() {
-        return;
-    }
-    if let Err(error) = store
-        .append(&persist.root, &persist.session_id, new_entries)
-        .await
-    {
-        eprintln!("e-agent: cannot persist subagent transcript: {error:#}");
-        return;
-    }
-    *persisted = agent.history().len();
-}
-
 pub struct Delegate {
     /// Subagents run on the role-routed model when configured, otherwise
     /// on the main model.
@@ -354,14 +330,13 @@ impl Delegate {
             };
             runtime.block_on(async move {
                 // Connect the subagent's own session store, bound to its own
-                // session id. Best-effort: on failure, log and continue
-                // without persistence.
+                // session id. On failure the error propagates — silent
+                // persistence loss hides bugs.
                 let persist_store: Option<SessionStore> = match &persist {
                     Some(p) => match SessionStore::connect(&p.backend, &p.root, &p.session_id).await {
                         Ok(store) => Some(store),
-                        Err(e) => {
-                            eprintln!("e-agent: subagent persistence unavailable: {e:#}");
-                            None
+                        Err(error) => {
+                            return format!("subagent persistence unavailable: {error:#}");
                         }
                     },
                     None => None,
@@ -408,18 +383,19 @@ impl Delegate {
                     None => (None, None),
                 };
                 // Resuming: seed the agent with the previous session's
-                // transcript and mark it already persisted, so persist_turn
-                // only appends the NEW turns (no duplicate replay of the
-                // loaded history).
-                let mut persisted_len = 0usize;
+                // transcript.
                 if let Some(entries) = &resume_entries {
-                    persisted_len = entries.len();
                     agent.restore_history(entries.clone());
                     // Seed the display log so an attached view shows the
                     // prior conversation, not just the new prompt.
                     if let Some(sink) = &sink {
                         Self::replay_scrollback(sink, entries);
                     }
+                }
+                // Enable proactive per-entry persistence so every new entry
+                // is written immediately — no batch-append at turn boundaries.
+                if let (Some(store), Some(p)) = (&persist_store, &persist) {
+                    agent.set_persist(store.clone(), p.root.clone(), p.session_id.clone());
                 }
                 // Prompts stashed while a turn was running, in arrival order.
                 let mut pending: Vec<String> = Vec::new();
@@ -509,12 +485,6 @@ impl Delegate {
                             }
                         }
                     };
-                    // Persist this turn's entries (append-only) so the full
-                    // transcript survives restarts; entries are tagged with
-                    // the subagent's label for display.
-                    if let (Some(store), Some(persist)) = (&persist_store, &persist) {
-                        persist_turn(store, persist, &agent, &mut persisted_len).await;
-                    }
                     // Turn ended. Drain all queued prompts in one batch
                     // (non-blocking); subsequent batches wait for the next
                     // turn boundary.
