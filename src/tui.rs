@@ -222,14 +222,14 @@ fn attach_to_task(
     state.attach(
         task_id,
         label,
-        entry.handle.clone(),
+        Arc::new(entry.handle.clone()),
         entry.model.clone(),
         entry.role.clone(),
         entry.cwd.clone(),
         entry.session_id.clone(),
         entry.context_window,
     );
-    let bridge = bridge(task_id, entry.handle.as_ref(), sender.clone());
+    let bridge = bridge(task_id, &entry.handle, sender.clone());
     state.attached.as_mut().unwrap().bridge = Some(bridge);
 }
 
@@ -365,7 +365,7 @@ async fn run_inner(
                     if active && is_cancel(key) { handle.cancel(); continue; }
                     if !active && is_exit(key) { return Ok(()); }
                     if is_scroll_key(key) { state.handle_scroll(key); drain_ready_scroll_keys(&mut events,&mut state).await; }
-                    else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
+                    else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.send_input(prompt); } }
                 }
                 Some(Ok(Event::Paste(text))) => state.input.insert(&text.replace("\r\n","\n").replace('\r',"\n")),
                 Some(Ok(_)) => {}, Some(Err(error)) => return Err(error.into()), None => return Ok(()),

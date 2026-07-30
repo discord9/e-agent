@@ -28,15 +28,15 @@ use serde_json::{Value, json};
 
 use crate::agent::{Agent, AgentEvent, Tool, ToolSpec, preview};
 use crate::config::SessionBackend;
-use crate::handle::{SessionHandle, SessionSink, SessionSource, Steer, session_channel};
 use crate::model::ConfiguredModel;
+use crate::runner::{IdlePolicy, SessionHandle, SessionResult, SessionRunner};
 use crate::session_store::SessionStore;
 use crate::tools::BackgroundTasks;
 use crate::workspace::Workspace;
 /// Metadata about a live subagent session, stored alongside its handle in
 /// the registry so frontends can display the model name, role, cwd, etc.
 pub struct SessionEntry {
-    pub handle: Arc<dyn SessionHandle>,
+    pub handle: SessionHandle,
     pub model: String,
     pub role: Option<String>,
     pub cwd: String,
@@ -65,59 +65,6 @@ impl Sessions {
     pub fn remove(&self, id: u64) {
         self.sessions.lock().unwrap().remove(&id);
     }
-}
-
-/// Pick the next prompt batch for a steerable subagent at a turn
-/// boundary: drain ALL stashed prompts (arrival order) and ALL currently
-/// ready `Steer::Prompt` values from the channel into one joined batch.
-/// Returns `Some(joined)` or `None` when nothing is available — the
-/// caller treats `None` as "subagent done" because the session handle
-/// keeps the steer channel open until the work returns, so blocking
-/// here would never see `None`.
-///
-/// `Steer::Cancel` messages that arrive here are stale — the turn they
-/// were meant to cancel has already completed. They are silently ignored;
-/// they must not discard already-collected prompts or terminate the
-/// session.
-fn next_queued_prompt(source: &mut SessionSource, pending: &mut Vec<String>) -> Option<String> {
-    let mut batch = Vec::new();
-    batch.append(pending);
-    while let Some(message) = source.try_recv() {
-        match message {
-            Steer::Prompt(text) => batch.push(text),
-            // Stale Cancel: the turn already ended, so this is a no-op.
-            Steer::Cancel => {}
-        }
-    }
-    if batch.is_empty() {
-        None
-    } else {
-        Some(batch.join("\n\n"))
-    }
-}
-
-/// Append the history entries produced since the last call to the
-/// subagent's own session file (`subagent-<task-id>`). Every subagent has
-/// its own file, so no marker or locking is needed. Best-effort: a
-/// persistence failure is logged, not fatal.
-async fn persist_turn(
-    store: &SessionStore,
-    persist: &PersistConfig,
-    agent: &Agent,
-    persisted: &mut usize,
-) {
-    let new_entries = &agent.history()[*persisted..];
-    if new_entries.is_empty() {
-        return;
-    }
-    if let Err(error) = store
-        .append(&persist.root, &persist.session_id, new_entries)
-        .await
-    {
-        eprintln!("e-agent: cannot persist subagent transcript: {error:#}");
-        return;
-    }
-    *persisted = agent.history().len();
 }
 
 pub struct Delegate {
@@ -277,288 +224,74 @@ impl Delegate {
         self.sessions.clone()
     }
 
-    /// Replay persisted [`SessionEntry`] values into a [`SessionSink`] so the
-    /// display log shows the prior conversation before the new prompt. Called
-    /// only when resuming a subagent session.
-    fn replay_scrollback(sink: &SessionSink, entries: &[crate::agent::SessionEntry]) {
-        for entry in entries {
-            let event = match entry {
-                crate::agent::SessionEntry::Message { message } => match message {
-                    crate::agent::Message::User { content } => {
-                        AgentEvent::UserPrompt(content.clone())
-                    }
-                    crate::agent::Message::Assistant(msg) => {
-                        AgentEvent::AssistantText(msg.content.clone().unwrap_or_default())
-                    }
-                    crate::agent::Message::Tool {
-                        content, is_error, ..
-                    } => AgentEvent::ToolResult {
-                        is_error: *is_error,
-                        content: content.clone(),
-                    },
-                    crate::agent::Message::System { .. } => continue,
-                },
-                crate::agent::SessionEntry::Compaction { summary, .. } => {
-                    AgentEvent::Notice(format!("──── compaction ────\ncompacted: {summary}"))
-                }
-                crate::agent::SessionEntry::Notice { text } => AgentEvent::Notice(text.clone()),
-                crate::agent::SessionEntry::BackgroundCompletion { id, output, label } => {
-                    AgentEvent::BackgroundCompletionNotice {
-                        id: *id,
-                        output: output.clone(),
-                        label: label.clone(),
-                    }
-                }
-            };
-            sink.emit(event);
-        }
-    }
-
-    /// Run `task` on a dedicated thread with a fresh agent and return the
-    /// final answer. Used by both sync and background execution so the two
-    /// modes share one code path. With a `steering` pair the subagent's
-    /// events are mirrored into the session (frontends rebuild their view
-    /// from snapshot + stream) and it accepts steering — queued prompts
-    /// become fresh turns, cancel drops the in-flight turn. Sync mode
-    /// passes None and keeps the original single-turn behaviour.
-    ///
-    /// The subagent's bash tool shares the parent's `background` registry,
-    /// so a background bash command started by a subagent shows up in the
-    /// parent's task panel and delivers its
-    /// completion to the PARENT agent — it survives the subagent's end
-    /// instead of being silently killed and forgotten.
     #[allow(clippy::too_many_arguments)]
-    fn run_on_thread(
+    async fn start_runner(
         model: ConfiguredModel,
         context_window: Option<u64>,
         workspace: Workspace,
         background: BackgroundTasks,
         task: DelegatedTask,
-        steering: Option<(SessionSink, SessionSource)>,
-        persist: Option<PersistConfig>,
+        persist: PersistConfig,
         resume_entries: Option<Vec<crate::agent::SessionEntry>>,
-    ) -> String {
-        let DelegatedTask {
-            task,
-            role_prompt,
-            sandbox,
-        } = task;
+    ) -> Result<(SessionHandle, crate::runner::SessionTask), String> {
         let model_name = model.display_name().to_owned();
-        std::thread::spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => return format!("cannot build subagent runtime: {error}"),
-            };
-            runtime.block_on(async move {
-                // Connect the subagent's own session store, bound to its own
-                // session id. Best-effort: on failure, log and continue
-                // without persistence.
-                let persist_store: Option<SessionStore> = match &persist {
-                    Some(p) => match SessionStore::connect(&p.backend, &p.root, &p.session_id).await {
-                        Ok(store) => Some(store),
-                        Err(e) => {
-                            eprintln!("e-agent: subagent persistence unavailable: {e:#}");
-                            None
-                        }
-                    },
-                    None => None,
-                };
-
-                let agents_instructions = workspace
-                    .read_to_string("AGENTS.md")
-                    .ok()
-                    .filter(|content| !content.trim().is_empty());
-                let tools =
-                    crate::tools::builtins_with_background(workspace, background, sandbox);
-                let mut agent = Agent::new(Box::new(model), tools);
-                if let Some(window) = context_window {
-                    agent.set_context_window(window);
-                }
-                // A bare single-user-message request is rejected by some
-                // providers (kimi k3 answers HTTP 403 to `msgs=1`); give the
-                // subagent a system prompt so its first call always carries a
-                // system + user pair. A role template (.e-agent/agents/<role>.md)
-                // takes the lead when delegated with one.
-                let mut instructions = match role_prompt {
-                    Some(template) => format!(
-                        "{template}\n\nYou are running as a subagent inside the e-agent coding \
-                         assistant (on the `{model_name}` model). Work autonomously on the \
-                         delegated task with the file/bash tools and, when configured, public \
-                         web search, then return a concise final answer."
-                    ),
-                    None => format!(
-                        "You are a subagent inside the e-agent coding assistant (running on the \
-                         `{model_name}` model). Work autonomously on the delegated task with the \
-                         file/bash tools and, when configured, public web search, then return a concise final answer."
-                    ),
-                };
-                if let Some(content) = agents_instructions {
-                    instructions.push_str("\n\n## AGENTS.md\n\n");
-                    instructions.push_str(&content);
-                }
-                agent.set_context_prefix(instructions);
-                let (sink, mut source) = match steering {
-                    Some((sink, source)) => {
-                        agent.observe(sink.clone());
-                        (Some(sink), Some(source))
-                    }
-                    None => (None, None),
-                };
-                // Resuming: seed the agent with the previous session's
-                // transcript and mark it already persisted, so persist_turn
-                // only appends the NEW turns (no duplicate replay of the
-                // loaded history).
-                let mut persisted_len = 0usize;
-                if let Some(entries) = &resume_entries {
-                    persisted_len = entries.len();
-                    agent.restore_history(entries.clone());
-                    // Seed the display log so an attached view shows the
-                    // prior conversation, not just the new prompt.
-                    if let Some(sink) = &sink {
-                        Self::replay_scrollback(sink, entries);
-                    }
-                }
-                // Prompts stashed while a turn was running, in arrival order.
-                let mut pending: Vec<String> = Vec::new();
-                let mut prompt = task;
-                let mut last_answer = String::new();
-                // Record the delegated task in the session log so an attached
-                // view shows what the subagent was asked to do, not just the
-                // tool calls that follow.
-                if let Some(sink) = &sink {
-                    sink.emit(AgentEvent::UserPrompt(prompt.clone()));
-                }
-                loop {
-                    let result = {
-                        let run = agent.run(prompt);
-                        tokio::pin!(run);
-                        match source.as_mut() {
-                            // Sync mode: no steering, just run to completion.
-                            None => run.await,
-                            Some(source) => {
-                                let mut cancelled = false;
-                                let result = loop {
-                                    tokio::select! {
-                                        result = &mut run => break Some(result),
-                                        message = source.recv() => match message {
-                                            // Cancel: drop the in-flight turn
-                                            // (bash subprocesses are killed via
-                                            // their process-group guard on
-                                            // drop); completed rounds stay in
-                                            // history.
-                                            Some(Steer::Cancel) => {
-                                                cancelled = true;
-                                                break None;
-                                            }
-                                            // Prompt mid-turn: stash it; the
-                                            // post-turn drain picks it up.
-                                            Some(Steer::Prompt(text)) => {
-                                                pending.push(text);
-                                            }
-                                            None => break Some(run.await),
-                                        },
-                                    }
-                                };
-                                if cancelled {
-                                    if let Some(sink) = &sink {
-                                        sink.emit(AgentEvent::AssistantText(
-                                            "[turn cancelled by user]".into(),
-                                        ));
-                                    }
-                                    Ok(String::new())
-                                } else {
-                                    result.expect("run completed")
-                                }
-                            }
-                        }
-                    };
-                    last_answer = match result {
-                        Ok(answer) => answer,
-                        Err(error) => {
-                            let error_str = format!("{error:#}");
-                            // Retry once when the provider stream dropped
-                            // mid-turn (prompt is already in history, so an
-                            // empty-string retry continues the round).
-                            if error_str.contains("Transport error:") {
-                                if let Some(sink) = &sink {
-                                    sink.emit(AgentEvent::Notice(
-                                        "transport disconnected; retrying once…".into(),
-                                    ));
-                                }
-                                match agent.run(String::new()).await {
-                                    Ok(answer) => answer,
-                                    Err(retry_error) => {
-                                        let msg = format!("subagent failed: {retry_error:#}");
-                                        if let Some(sink) = &sink {
-                                            sink.emit(AgentEvent::AssistantText(
-                                                msg.clone(),
-                                            ));
-                                        }
-                                        msg
-                                    }
-                                }
-                            } else {
-                                let message = format!("subagent failed: {error_str}");
-                                if let Some(sink) = &sink {
-                                    sink.emit(AgentEvent::AssistantText(message.clone()));
-                                }
-                                message
-                            }
-                        }
-                    };
-                    // Persist this turn's entries (append-only) so the full
-                    // transcript survives restarts; entries are tagged with
-                    // the subagent's label for display.
-                    if let (Some(store), Some(persist)) = (&persist_store, &persist) {
-                        persist_turn(store, persist, &agent, &mut persisted_len).await;
-                    }
-                    // Turn ended. Drain all queued prompts in one batch
-                    // (non-blocking); subsequent batches wait for the next
-                    // turn boundary.
-                    let Some(source) = source.as_mut() else {
-                        return last_answer;
-                    };
-                    prompt = match next_queued_prompt(source, &mut pending) {
-                        Some(text) => text,
-                        None => return last_answer,
-                    };
-                    // The steered prompt is already in the log (send_input
-                    // emits UserPrompt), so no extra echo here.
-                }
-            })
-        })
-        .join()
-        .unwrap_or_else(|_| "subagent thread panicked".into())
-    }
-}
-
-/// Cancels a synchronous subagent when the future blocked on it is dropped
-/// (the parent turn was cancelled). Mirrors [`crate::tools::ProcessGroupGuard`]:
-/// armed right after spawn, disarmed on the normal completion path, so only
-/// an actual drop-while-blocked fires the cancel.
-struct SubagentCancelGuard {
-    handle: Option<Arc<dyn SessionHandle>>,
-}
-
-impl SubagentCancelGuard {
-    fn armed(handle: Arc<dyn SessionHandle>) -> Self {
-        Self {
-            handle: Some(handle),
+        let agents_instructions = workspace
+            .read_to_string("AGENTS.md")
+            .ok()
+            .filter(|content| !content.trim().is_empty());
+        let tools = crate::tools::builtins_with_background(workspace, background, task.sandbox);
+        let mut agent = Agent::new(Box::new(model), tools);
+        if let Some(window) = context_window {
+            agent.set_context_window(window);
         }
+        let mut instructions = match task.role_prompt {
+            Some(template) => format!(
+                "{template}\n\nYou are running as a subagent inside the e-agent coding assistant (on the `{model_name}` model). Work autonomously on the delegated task with the file/bash tools and, when configured, public web search, then return a concise final answer."
+            ),
+            None => format!(
+                "You are a subagent inside the e-agent coding assistant (running on the `{model_name}` model). Work autonomously on the delegated task with the file/bash tools and, when configured, public web search, then return a concise final answer."
+            ),
+        };
+        if let Some(content) = agents_instructions {
+            instructions.push_str("\n\n## AGENTS.md\n\n");
+            instructions.push_str(&content);
+        }
+        agent.set_context_prefix(instructions);
+        if let Some(entries) = resume_entries {
+            agent.restore_history(entries);
+        }
+        let store = SessionStore::connect(&persist.backend, &persist.root, &persist.session_id)
+            .await
+            .map_err(|e| format!("subagent failed: {e:#}"))?;
+        let (runner, handle) = SessionRunner::new(
+            agent,
+            store,
+            persist.root,
+            persist.session_id,
+            IdlePolicy::FinishWhenIdle,
+        );
+        let runner_task = runner.start(Some(task.task));
+        Ok((handle, runner_task))
     }
 
-    fn disarm(&mut self) {
-        self.handle = None;
-    }
-}
-
-impl Drop for SubagentCancelGuard {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.cancel();
+    async fn runner_result(handle: &SessionHandle, task: crate::runner::SessionTask) -> String {
+        if let Err(error) = task.join().await {
+            return format!("subagent failed: {error}");
+        }
+        match handle.status().borrow().clone() {
+            crate::runner::SessionStatus::Finished(SessionResult::Completed(answer)) => {
+                answer.unwrap_or_default()
+            }
+            crate::runner::SessionStatus::Finished(SessionResult::Failed(error)) => {
+                format!("subagent failed: {error}")
+            }
+            crate::runner::SessionStatus::Finished(SessionResult::Cancelled) => {
+                "subagent cancelled".into()
+            }
+            crate::runner::SessionStatus::Finished(SessionResult::Closed) => {
+                "subagent closed".into()
+            }
+            _ => "subagent closed".into(),
         }
     }
 }
@@ -753,61 +486,58 @@ impl Tool for Delegate {
             workspace: explicit_workspace_arg.clone(),
         };
 
+        let model_name = model.display_name().to_string();
+        let (resume_id, resume_entries) = match resume {
+            Some((id, entries)) => (Some(id), Some(entries)),
+            None => (None, None),
+        };
+        let persist = PersistConfig {
+            root: self
+                .persist_root
+                .clone()
+                .unwrap_or_else(|| std::env::temp_dir().join("e-agent-subagents")),
+            session_id: resume_id.unwrap_or_else(|| crate::session::new_id_prefixed("sub-")),
+            backend: self.persist_backend.clone(),
+        };
+        let session_id = persist.session_id.clone();
+        let (handle, runner_task) = Self::start_runner(
+            model,
+            context_window,
+            workspace.clone(),
+            self.background.clone(),
+            DelegatedTask {
+                task,
+                role_prompt,
+                sandbox: self.sandbox.clone(),
+            },
+            persist,
+            resume_entries,
+        )
+        .await?;
+        let sessions = self.sessions.clone();
+        let sessions_in_work = self.sessions.clone();
+        let slot = Arc::new(Mutex::new(None::<u64>));
+        let slot_in_hook = slot.clone();
+        let slot_in_work = slot.clone();
+        let entry = Arc::new(SessionEntry {
+            handle: handle.clone(),
+            model: model_name,
+            role: role.clone(),
+            cwd: workspace.root().display().to_string(),
+            session_id: session_id.clone(),
+            context_window,
+        });
+        let entry_for_hook = entry.clone();
         if background {
-            let workspace = workspace.clone();
-            let background = self.background.clone();
-            let sandbox = self.sandbox.clone();
-            /* label computed above */
-            let (handle, sink, source) = session_channel();
-            let session: Arc<dyn SessionHandle> = Arc::new(handle.clone());
-            let sessions = self.sessions.clone();
-            let sessions_in_work = self.sessions.clone();
-            let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
-            let slot_in_hook = slot.clone();
-            let slot_in_work = slot.clone();
-            // Fresh unique session id per subagent (never the task id —
-            // task ids restart at 1 every process and would collide), unless
-            // resuming: then the resumed session's id is reused so new turns
-            // append to the same file.
-            let (resume_id, resume_entries) = match resume {
-                Some((id, entries)) => (Some(id), Some(entries)),
-                None => (None, None),
-            };
-            let backend = self.persist_backend.clone();
-            let persist = self.persist_root.clone().map(|root| PersistConfig {
-                root,
-                session_id: resume_id.unwrap_or_else(|| crate::session::new_id_prefixed("sub-")),
-                backend,
-            });
-            // run_on_thread blocks on thread::join, so push it onto the
-            // blocking thread pool to keep the executor responsive.
-            let model_name = model.display_name().to_string();
-            let role_name = role.clone();
-            let cwd = workspace.root().display().to_string();
-            let persist_session_id = persist
-                .as_ref()
-                .map(|p| p.session_id.clone())
-                .unwrap_or_default();
-            let record_session_id = persist_session_id.clone();
-            let output_session_id = persist_session_id.clone();
-            let entry = Arc::new(SessionEntry {
-                handle: session.clone(),
-                model: model_name,
-                role: role_name,
-                cwd,
-                session_id: persist_session_id,
-                context_window,
-            });
-            let entry_for_hook = entry.clone();
             let record = self.record_in.clone();
             let record_in_work = record.clone();
             let record_label = label.clone();
-            let task_display_bg = task_display.clone();
+            let output_session_id = session_id.clone();
             return self.background.spawn_with_id(
                 label,
-                role.clone(),
+                role,
                 None,
-                Some(task_display_bg),
+                Some(task_display),
                 move |id| {
                     sessions.insert(id, entry_for_hook);
                     *slot_in_hook.lock().unwrap() = Some(id);
@@ -817,94 +547,26 @@ impl Tool for Delegate {
                             session,
                             id,
                             &record_label,
-                            Some(&record_session_id),
+                            Some(&session_id),
                         );
                     }
                 },
                 move || async move {
-                    let output = tokio::task::spawn_blocking(move || {
-                        Self::run_on_thread(
-                            model,
-                            context_window,
-                            workspace,
-                            background,
-                            DelegatedTask {
-                                task,
-                                role_prompt,
-                                sandbox,
-                            },
-                            Some((sink, source)),
-                            persist,
-                            resume_entries,
-                        )
-                    })
-                    .await
-                    .unwrap_or_else(|error| format!("subagent blocking task failed: {error}"));
-                    let output = if output_session_id.is_empty() {
-                        output
-                    } else {
-                        format!("subagent session: {output_session_id}\n{output}")
-                    };
+                    let output = Self::runner_result(&handle, runner_task).await;
                     if let Some(id) = *slot_in_work.lock().unwrap() {
                         sessions_in_work.remove(id);
                         if let Some((root, session)) = &record_in_work {
                             crate::session::Session::clear_background_task(root, session, id);
                         }
                     }
-                    output
+                    format!("subagent session: {output_session_id}\n{output}")
                 },
             );
         }
-
-        let workspace = workspace.clone();
-        let background = self.background.clone();
-        let sandbox = self.sandbox.clone();
-        let (resume_id, resume_entries) = match resume {
-            Some((id, entries)) => (Some(id), Some(entries)),
-            None => (None, None),
-        };
-        let persist = self.persist_root.clone().map(|root| PersistConfig {
-            root,
-            session_id: resume_id.unwrap_or_else(|| crate::session::new_id_prefixed("sub-")),
-            backend: self.persist_backend.clone(),
-        });
-        // Even a synchronous subagent is registered as a running task with a
-        // live session, so it shows up in the task panel (F2) and can be
-        // attached while the main agent is blocked waiting for it.
-        let (handle, sink, source) = session_channel();
-        let session: Arc<dyn SessionHandle> = Arc::new(handle.clone());
-        // A second handle for the cancel guard: dropping the blocked-on
-        // `execute` future (the parent turn was cancelled) cancels the
-        // subagent, so it cannot outlive its turn as an orphan.
-        let cancel_handle: Arc<dyn SessionHandle> = Arc::new(handle.clone());
-        let sessions = self.sessions.clone();
-        let sessions_in_work = self.sessions.clone();
-        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
-        let slot_in_hook = slot.clone();
-        let slot_in_work = slot.clone();
-        // Block until the subagent finishes (this is the synchronous mode).
-        // spawn_silent keeps it visible in the task panel without emitting
-        // a duplicate completion event (the answer is the tool result).
-        let model_name = model.display_name().to_string();
-        let role_name = role.clone();
-        let cwd = workspace.root().display().to_string();
-        let persist_session_id = persist
-            .as_ref()
-            .map(|p| p.session_id.clone())
-            .unwrap_or_default();
-        let entry = Arc::new(SessionEntry {
-            handle: session.clone(),
-            model: model_name,
-            role: role_name,
-            cwd,
-            session_id: persist_session_id,
-            context_window,
-        });
-        let entry_for_hook = entry.clone();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<String>();
-        let started = self.background.spawn_silent(
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.background.spawn_silent(
             label,
-            role.clone(),
+            role,
             None,
             Some(task_display),
             move |id| {
@@ -912,43 +574,17 @@ impl Tool for Delegate {
                 *slot_in_hook.lock().unwrap() = Some(id);
             },
             move || async move {
-                let output = tokio::task::spawn_blocking(move || {
-                    Self::run_on_thread(
-                        model,
-                        context_window,
-                        workspace,
-                        background,
-                        DelegatedTask {
-                            task,
-                            role_prompt,
-                            sandbox,
-                        },
-                        Some((sink, source)),
-                        persist,
-                        resume_entries,
-                    )
-                })
-                .await
-                .unwrap_or_else(|error| format!("subagent blocking task failed: {error}"));
+                let output = Self::runner_result(&handle, runner_task).await;
                 if let Some(id) = *slot_in_work.lock().unwrap() {
                     sessions_in_work.remove(id);
                 }
                 let _ = done_tx.send(output.clone());
                 output
             },
-        );
-        started?;
-        // RAII: if this `execute` future is dropped while blocked on the
-        // subagent (the parent turn was cancelled), cancel the subagent so
-        // it stops instead of running on as an orphan. Normal completion
-        // disarms the guard before returning.
-        let mut cancel_guard = SubagentCancelGuard::armed(cancel_handle);
-        let result = match done_rx.await {
-            Ok(answer) => Ok(answer),
-            Err(_) => Err("subagent result channel closed".into()),
-        };
-        cancel_guard.disarm();
-        result
+        )?;
+        done_rx
+            .await
+            .map_err(|_| "subagent result channel closed".into())
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
@@ -995,9 +631,26 @@ mod tests {
     fn registry_tracks_live_sessions() {
         let sessions = Sessions::default();
         assert!(sessions.get(1).is_none());
-        let (handle, _sink, _source) = session_channel();
+        let workspace = tempfile::tempdir().unwrap();
+        let model = ConfiguredModel::chat(
+            crate::model::OpenAiModel::new(
+                "http://localhost".into(),
+                "test-key".into(),
+                "test-model".into(),
+                None,
+            )
+            .unwrap(),
+        );
+        let agent = Agent::new(Box::new(model), vec![]);
+        let (_runner, handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            workspace.path().to_path_buf(),
+            "sub-test".into(),
+            IdlePolicy::FinishWhenIdle,
+        );
         let entry = Arc::new(SessionEntry {
-            handle: Arc::new(handle),
+            handle,
             model: "test-model".into(),
             role: None,
             cwd: "/tmp".into(),
@@ -1348,137 +1001,5 @@ mod tests {
             assistant_texts.contains(&"earlier answer"),
             "expected 'earlier answer' in AssistantText events, got {assistant_texts:?}"
         );
-    }
-
-    #[test]
-    fn replay_scrollback_shows_full_compaction_summary() {
-        let (handle, sink, _source) = session_channel();
-        let entries = vec![
-            crate::agent::SessionEntry::from(crate::agent::Message::User {
-                content: "prior work".into(),
-            }),
-            crate::agent::SessionEntry::Compaction {
-                summary: "compacted content\nmulti-line detail".into(),
-                retained: vec![],
-            },
-        ];
-        Delegate::replay_scrollback(&sink, &entries);
-        let snapshot = handle.snapshot();
-        let notices: Vec<&str> = snapshot
-            .iter()
-            .filter_map(|e| match e {
-                AgentEvent::Notice(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(notices.len(), 1);
-        assert!(
-            notices[0].contains("──── compaction ────"),
-            "notice contains the banner, got: {:?}",
-            notices[0]
-        );
-        assert!(
-            notices[0].contains("compacted content"),
-            "notice contains summary text, got: {:?}",
-            notices[0]
-        );
-        assert!(
-            notices[0].contains("multi-line detail"),
-            "notice preserves multi-line content, got: {:?}",
-            notices[0]
-        );
-    }
-
-    #[test]
-    fn replay_scrollback_compaction_long_summary_not_truncated() {
-        let long = "long summary: ".to_owned() + &"data ".repeat(200);
-        assert!(long.len() > 500, "test needs long summary");
-        let (handle, sink, _source) = session_channel();
-        let entries = vec![crate::agent::SessionEntry::Compaction {
-            summary: long.clone(),
-            retained: vec![],
-        }];
-        Delegate::replay_scrollback(&sink, &entries);
-        let snapshot = handle.snapshot();
-        let notices: Vec<&str> = snapshot
-            .iter()
-            .filter_map(|e| match e {
-                AgentEvent::Notice(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(notices.len(), 1);
-        assert!(
-            notices[0].contains(&long),
-            "long summary not truncated in replay_scrollback"
-        );
-    }
-
-    // ── next_queued_prompt batch semantics ─────────────────────────────
-
-    #[test]
-    fn next_queued_prompt_pending_and_channel_join_in_order() {
-        let (_handle, _sink, mut source) = session_channel();
-        let mut pending = vec!["pending-a".into(), "pending-b".into()];
-
-        // Simulate channel-ready prompts arriving after the stashed ones.
-        // Use the handle to send into the steer channel.
-        let handle: Arc<dyn SessionHandle> = Arc::new(_handle);
-        handle.send_input("channel-c".into());
-        handle.send_input("channel-d".into());
-
-        let joined = next_queued_prompt(&mut source, &mut pending);
-        assert_eq!(
-            joined.unwrap(),
-            "pending-a\n\npending-b\n\nchannel-c\n\nchannel-d"
-        );
-        assert!(pending.is_empty(), "pending vector is drained");
-    }
-
-    #[test]
-    fn next_queued_prompt_stale_cancel_does_not_discard_prompts() {
-        let (_handle, _sink, mut source) = session_channel();
-        let mut pending = vec!["task".into()];
-
-        // Cancel races in after the turn already ended — stale.
-        let handle: Arc<dyn SessionHandle> = Arc::new(_handle);
-        handle.cancel();
-        handle.send_input("follow-up".into());
-
-        let joined = next_queued_prompt(&mut source, &mut pending);
-        // Stale Cancel is ignored; the prompt survives.
-        assert_eq!(joined.unwrap(), "task\n\nfollow-up");
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn next_queued_prompt_stale_cancel_and_no_prompts_returns_none() {
-        let (_handle, _sink, mut source) = session_channel();
-        let mut pending = Vec::<String>::new();
-
-        // Only a stale Cancel, no prompts — nothing to do.
-        let handle: Arc<dyn SessionHandle> = Arc::new(_handle);
-        handle.cancel();
-
-        let result = next_queued_prompt(&mut source, &mut pending);
-        assert!(result.is_none(), "no prompts means no batch");
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn next_queued_prompt_interleaved_cancel_preserves_order() {
-        let (_handle, _sink, mut source) = session_channel();
-        let mut pending = vec!["first".into()];
-
-        // Cancel interspersed between prompts: stale cancel ignored,
-        // prompts maintain arrival order.
-        let handle: Arc<dyn SessionHandle> = Arc::new(_handle);
-        handle.send_input("second".into());
-        handle.cancel();
-        handle.send_input("third".into());
-
-        let joined = next_queued_prompt(&mut source, &mut pending);
-        assert_eq!(joined.unwrap(), "first\n\nsecond\n\nthird");
-        assert!(pending.is_empty());
     }
 }

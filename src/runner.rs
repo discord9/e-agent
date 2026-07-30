@@ -156,6 +156,21 @@ impl SessionHandle {
     }
 }
 
+impl crate::handle::SessionHandle for SessionHandle {
+    fn snapshot(&self) -> Vec<AgentEvent> {
+        self.snapshot()
+    }
+    fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
+        self.attach().1
+    }
+    fn send_input(&self, prompt: String) {
+        self.prompt(prompt);
+    }
+    fn cancel(&self) {
+        self.cancel();
+    }
+}
+
 pub struct SessionTask {
     task: Option<JoinHandle<()>>,
 }
@@ -253,15 +268,15 @@ impl SessionRunner {
         Ok(())
     }
     fn status(&self, status: SessionStatus) {
-        let _ = self.shared.lock().unwrap().status.send(status);
+        self.shared.lock().unwrap().status.send_replace(status);
     }
     fn failed(&self, error: anyhow::Error) {
         let text = format!("{error:#}");
         let mut shared = self.shared.lock().unwrap();
         shared.emit(AgentEvent::Error(text.clone()));
-        let _ = shared
+        shared
             .status
-            .send(SessionStatus::Finished(SessionResult::Failed(text)));
+            .send_replace(SessionStatus::Finished(SessionResult::Failed(text)));
     }
     fn closed(&self) {
         self.status(SessionStatus::Finished(SessionResult::Closed));
