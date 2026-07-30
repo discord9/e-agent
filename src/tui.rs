@@ -16,7 +16,7 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::buffer::CellWidth;
+use ratatui::buffer::{CellDiffOption, CellWidth};
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -645,12 +645,28 @@ async fn drive<T>(
     work: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<(Option<anyhow::Result<T>>, Option<Interruption>)> {
     tokio::pin!(work);
+    let mut needs_redraw = false;
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(33));
+    interval.reset(); // skip the immediate-first-tick so the first real fire is ~33ms in
     loop {
         tokio::select! {
-            result = &mut work => return Ok((Some(result), None)),
+            result = &mut work => {
+                // Final draw before returning so the last throttled event
+                // is visible before `run_request` does its own draw.
+                if needs_redraw {
+                    draw(terminal, state)?;
+                }
+                return Ok((Some(result), None));
+            }
+            _ = interval.tick() => {
+                if needs_redraw {
+                    draw(terminal, state)?;
+                    needs_redraw = false;
+                }
+            }
             Some(event) = inbox.recv() => {
                 state.push_event(event);
-                draw(terminal, state)?;
+                needs_redraw = true;
             }
             event = events.next() => match event {
                 // Attached: Esc detaches from the session view instead of
@@ -741,6 +757,30 @@ async fn drive<T>(
                 Some(Ok(_)) => {}
                 Some(Err(error)) => return Ok((Some(Err(error.into())), Some(Interruption::ExitApp))),
                 None => return Ok((None, Some(Interruption::ExitApp))),
+            }
+        }
+    }
+}
+
+/// Ratatui's diff skips cells covered by wide glyphs. Mark the visible
+/// cell immediately after each wide glyph so it is always emitted, preventing
+/// stale terminal cells from persisting after scrolling.
+fn force_wide_trailing_cell_updates(
+    buffer: &mut ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+) {
+    for y in area.y..area.bottom() {
+        let mut x = area.x;
+        while x < area.right() {
+            let width = buffer[(x, y)].cell_width();
+            if width > 1 {
+                let after = x.saturating_add(width);
+                if after < area.right() {
+                    buffer[(after, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
+                }
+                x = after;
+            } else {
+                x += 1;
             }
         }
     }
@@ -1068,6 +1108,8 @@ fn draw<'a, B: ratatui::backend::Backend>(
                     + ((cursor_row - attached.input_scroll) as u16)
                         .min(input.height.saturating_sub(2)),
             ));
+            let area = frame.area();
+            force_wide_trailing_cell_updates(frame.buffer_mut(), area);
             return;
         }
         // Input-box chrome: top-left = status, top-right = session id,
@@ -1145,6 +1187,8 @@ fn draw<'a, B: ratatui::backend::Backend>(
             input.x + 1 + (cursor_col as u16).min(input.width.saturating_sub(2)),
             input.y + 1 + ((cursor_row - input_scroll) as u16).min(input.height.saturating_sub(2)),
         ));
+        let area = frame.area();
+        force_wide_trailing_cell_updates(frame.buffer_mut(), area);
     })
 }
 
@@ -2085,6 +2129,7 @@ impl InputBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::buffer::CellDiffOption;
 
     /// Test helper: attach with default metadata, mirroring the old 3-arg
     /// signature for minimal test churn.
@@ -2542,6 +2587,69 @@ mod tests {
         assert_eq!(frame_buf[(2, 0)].symbol(), "好");
         assert_eq!(frame_buf[(4, 0)].symbol(), "数");
         assert_eq!(frame_buf[(6, 0)].symbol(), "据");
+    }
+
+    #[test]
+    fn wide_glyph_scroll_emits_trailing_cell_after_glyph() {
+        // Regression: when a wide CJK glyph moves between frames (e.g. " 好"
+        // → "好 " after scrolling), Ratatui's diff skips the cell immediately
+        // after the wide glyph (x + width) because the logical content appears
+        // unchanged (both frames carry a Solarized background).  The terminal
+        // physically painted the old wide glyph across its trailing column,
+        // so that column must be force-emitted to clear the stale glyph half.
+        //
+        // The post-render pass in force_wide_trailing_cell_updates marks
+        // every cell at x + width with CellDiffOption::AlwaysUpdate so the
+        // diff always emits it regardless of logical equality.
+        let backend = ratatui::backend::TestBackend::new(6, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState {
+            lines: vec![
+                DisplayLine {
+                    text: " 好".into(),
+                    kind: LineKind::Normal,
+                },
+                DisplayLine {
+                    text: "好 ".into(),
+                    kind: LineKind::Normal,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Frame 1: display " 好" at scroll=0.
+        // The wide glyph 好 sits at column 1, width=2, so its trailing
+        // cell occupies column 2.  After the draw, the post-render pass
+        // marks column 1+2=3 (x + width) with AlwaysUpdate.
+        state.scroll = 0;
+        let completed = draw(&mut terminal, &mut state).unwrap();
+        let frame_buf = completed.buffer;
+
+        // 好 at (1), covers (1,2).  Column 3 (x+width=1+2) gets AlwaysUpdate.
+        assert_eq!(frame_buf[(1, 0)].symbol(), "好");
+        assert_eq!(
+            frame_buf[(3, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "cell after a wide glyph must be marked AlwaysUpdate"
+        );
+
+        // Frame 2: scroll to show "好 ".
+        // Now 好 sits at column 0, width=2, covering columns 0-1.
+        // Column 2 becomes a plain space.  The post-render pass marks
+        // column 0+2=2 with AlwaysUpdate so the diff emits it even though
+        // it logically compares equal to column 2 of of the previous frame
+        // (both had Solarized background, both have empty/space symbol).
+        state.scroll = 1;
+        let completed = draw(&mut terminal, &mut state).unwrap();
+        let frame_buf = completed.buffer;
+
+        assert_eq!(frame_buf[(0, 0)].symbol(), "好");
+        assert_eq!(
+            frame_buf[(2, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "cell exposed after wide-glyph scroll must be AlwaysUpdate"
+        );
+        assert_eq!(frame_buf[(2, 0)].symbol(), " ");
     }
     #[test]
     fn cursor_sits_at_the_insertion_point() {
