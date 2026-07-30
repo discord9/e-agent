@@ -1260,7 +1260,7 @@ fn cwd_usage_text(cwd: &str, tokens_context: u64, context_window: Option<u64>) -
             let high = (tokens_context as u128) * 100 >= (window as u128) * 80;
             (
                 format!(
-                    "{} ctx {} {}%",
+                    "{} {} {}%",
                     cwd,
                     format_tokens(tokens_context),
                     pct.min(100)
@@ -1268,10 +1268,7 @@ fn cwd_usage_text(cwd: &str, tokens_context: u64, context_window: Option<u64>) -
                 high,
             )
         }
-        _ => (
-            format!("{} ctx {}", cwd, format_tokens(tokens_context)),
-            false,
-        ),
+        _ => (format!("{} {}", cwd, format_tokens(tokens_context)), false),
     };
     let fg = if pct_high {
         SOLARIZED_LIGHT.red
@@ -3244,8 +3241,8 @@ mod tests {
             "bottom-left shows model role, got: {bottom:?}"
         );
         assert!(
-            bottom.contains("/repo ctx 1.5k"),
-            "bottom-right shows cwd ctx, got: {bottom:?}"
+            bottom.contains("/repo 1.5k"),
+            "bottom-right shows cwd usage, got: {bottom:?}"
         );
         let top = row_text(9);
         assert!(
@@ -3376,7 +3373,7 @@ mod tests {
         );
         let (text, _fg) = cwd_usage_text(&format!("{home}/work"), 1_500, None);
         assert_eq!(
-            text, "~/work ctx 1.5k",
+            text, "~/work 1.5k",
             "token count still appended after shortening"
         );
     }
@@ -3384,7 +3381,7 @@ mod tests {
     #[test]
     fn cwd_usage_text_shows_percentage_with_context_window() {
         let (text, fg) = cwd_usage_text("/repo", 45_000, Some(131_072));
-        assert_eq!(text, "/repo ctx 45.0k 34%");
+        assert_eq!(text, "/repo 45.0k 34%");
         assert_eq!(fg, SOLARIZED_LIGHT.orange, "34% < 80% uses orange");
     }
 
@@ -3406,7 +3403,7 @@ mod tests {
     #[test]
     fn cwd_usage_text_behaves_normally_without_window() {
         let (text, fg) = cwd_usage_text("/repo", 1_500, None);
-        assert_eq!(text, "/repo ctx 1.5k");
+        assert_eq!(text, "/repo 1.5k");
         assert_eq!(fg, SOLARIZED_LIGHT.orange);
     }
 
@@ -4136,7 +4133,7 @@ mod ux_tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(bottom.contains("/home/me/project"), "bottom row: {bottom}");
-        assert!(!bottom.contains("ctx"), "bottom row: {bottom}");
+        assert!(!bottom.contains("1.2k"), "bottom row: {bottom}");
 
         state.tokens_context = 1234;
         draw(&mut terminal, &mut state).unwrap();
@@ -4144,7 +4141,7 @@ mod ux_tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(bottom.contains("ctx 1.2k"), "bottom row: {bottom}");
+        assert!(bottom.contains("1.2k"), "bottom row: {bottom}");
     }
 
     #[test]
