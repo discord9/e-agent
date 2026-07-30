@@ -19,7 +19,8 @@ pub enum ConfiguredModelKind {
 
 /// A configured model with an optional display name (profile key) for UI
 /// rendering. `name()` always returns the wire model name; `display_name()`
-/// returns the profile key when set, falling back to the wire name.
+/// returns the short part of the profile key (after the last '/') when set,
+/// falling back to the wire name.
 #[derive(Clone)]
 pub struct ConfiguredModel {
     pub kind: ConfiguredModelKind,
@@ -41,10 +42,17 @@ impl ConfiguredModel {
         }
     }
 
-    /// UI-friendly display name: the profile key when configured, otherwise
-    /// the wire model name.
+    /// UI-friendly display name: the short part of the profile key (after the
+    /// last '/') when configured, otherwise the wire model name.
     pub fn display_name(&self) -> &str {
-        self.display.as_deref().unwrap_or_else(|| self.name())
+        match self.display.as_deref() {
+            Some(display) => display
+                .rsplit_once('/')
+                .map(|(_, short)| short)
+                .filter(|short| !short.is_empty())
+                .unwrap_or(display),
+            None => self.name(),
+        }
     }
 }
 
