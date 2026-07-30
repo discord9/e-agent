@@ -23,6 +23,16 @@ const WEB_SEARCH_TOKENS: u16 = 5000;
 const WEB_SEARCH_ERROR_PREVIEW_LIMIT: usize = 8 * 1024;
 const WEB_SEARCH_RESPONSE_LIMIT: usize = 128 * 1024;
 
+/// Check whether bwrap is installed and user namespaces work.
+/// Used at startup and by sandbox tests to skip when unavailable.
+pub fn bwrap_available() -> bool {
+    std::process::Command::new("bwrap")
+        .args(["--unshare-all", "--ro-bind", "/", "/", "/bin/true"])
+        .status()
+        .ok()
+        .is_some_and(|status| status.success())
+}
+
 /// Built-in tools plus the shared background-task registry, exposed so that
 /// other tools (e.g. delegate) can schedule background work too.
 pub fn builtins(
@@ -410,15 +420,20 @@ impl Tool for Bash {
         let mut description =
             "Run a shell command with the workspace as its current directory.".to_owned();
         if let Some(sandbox) = &self.sandbox {
-            description.push_str(
-                " The command runs inside a bubblewrap sandbox: the workspace is writable, \
+            let ws_mode = if sandbox.workspace_writable {
+                "writable"
+            } else {
+                "read-only"
+            };
+            description.push_str(&format!(
+                " The command runs inside a bubblewrap sandbox: the workspace is {ws_mode}, \
                  system dirs (/usr, /bin, /lib, /etc) are read-only, and most of $HOME is \
                  hidden behind a fresh tmpfs. Files that are not mounted — e.g. ~/.ssh or \
                  ~/.gitconfig — fail with \"No such file or directory\"; that means they are \
                  OUTSIDE the sandbox, not that they don't exist on the host. Do not try to \
                  create such files; if a needed path errors this way, tell the user it is \
                  outside the sandbox.",
-            );
+            ));
             if !sandbox.network {
                 description.push_str(" The network is disabled (no DNS, no connections).");
             }
@@ -789,8 +804,7 @@ async fn run_bash(
             // Order matters: extra paths under /home (e.g. ~/.cargo) must be
             // mounted AFTER the /home tmpfs, or the tmpfs would shadow them.
             let mut args: Vec<String> = vec![
-                "--dev-bind".into(),
-                "/dev".into(),
+                "--dev".into(),
                 "/dev".into(),
                 "--proc".into(),
                 "/proc".into(),
@@ -813,10 +827,17 @@ async fn run_bash(
                 "/tmp".into(),
                 "--tmpfs".into(),
                 "/home".into(),
+                // Workspace bind: must come before extra mounts so that an
+                // extra path *under* the workspace takes priority (bind-try
+                // will mount over the earlier workspace bind).
+                workspace_bind.into(),
+                root_str.clone(),
+                root_str.clone(),
             ];
             // Extra user-configured mounts (cargo caches, shared target
-            // disks, ...). --bind-try / --ro-bind-try skip paths that do not
-            // exist on the host so a missing cache dir cannot break the run.
+            // disks, ...). These come after the workspace bind so they are
+            // not shadowed by it. --bind-try / --ro-bind-try skip paths that
+            // do not exist on the host so a missing cache dir cannot break.
             for path in &sandbox.writable_paths {
                 args.push("--bind-try".into());
                 args.push(path.clone());
@@ -828,9 +849,6 @@ async fn run_bash(
                 args.push(path.clone());
             }
             args.extend([
-                workspace_bind.into(),
-                root_str.clone(),
-                root_str.clone(),
                 "--unshare-pid".into(),
                 "--unshare-ipc".into(),
                 "--unshare-uts".into(),
@@ -847,6 +865,16 @@ async fn run_bash(
             args.push(command.to_owned());
             let mut cmd = Command::new("bwrap");
             cmd.args(args);
+            // Strip credential env vars so they are not inherited by the
+            // sandboxed command. The agent reads these from the parent
+            // process env directly, not via bash, so removing them here
+            // does not break anything.
+            cmd.env_remove("EXA_API_KEY");
+            cmd.env_remove("OPENAI_API_KEY");
+            cmd.env_remove("ANTHROPIC_API_KEY");
+            cmd.env_remove("DEEPSEEK_API_KEY");
+            cmd.env_remove("MOONSHOT_API_KEY");
+            cmd.env_remove("KIMI_API_KEY");
             cmd
         }
         None => {
@@ -864,16 +892,11 @@ async fn run_bash(
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) if sandbox.is_some() && error.kind() == std::io::ErrorKind::NotFound => {
-            // bwrap not installed: fall back to a bare shell rather than fail.
-            return Box::pin(run_bash(
-                workspace,
-                command,
-                timeout,
-                process_group_slot,
-                output_slot,
-                None,
-            ))
-            .await;
+            // Fail closed: if bwrap is configured but missing, return the
+            // error so the model (or startup check) sees it.
+            return Err(format!(
+                "bwrap not found: sandbox requires bubblewrap (bwrap) to be installed: {error}"
+            ));
         }
         Err(error) => return Err(format!("failed to start shell: {error}")),
     };
@@ -1545,11 +1568,11 @@ mod tests {
         let plain_desc = plain.spec().description;
         assert!(!plain_desc.contains("sandbox"), "{plain_desc}");
 
-        // Sandboxed: explains the boundary and lists extra mounts.
+        // Sandboxed with writable workspace.
         let sandboxed = Bash {
-            workspace,
+            workspace: workspace.clone(),
             timeout: Duration::from_secs(1),
-            background,
+            background: background.clone(),
             sandbox: Some(crate::config::Sandbox {
                 enabled: true,
                 network: false,
@@ -1560,11 +1583,28 @@ mod tests {
         };
         let desc = sandboxed.spec().description;
         assert!(desc.contains("bubblewrap sandbox"), "{desc}");
+        assert!(desc.contains("workspace is writable"), "{desc}");
         assert!(desc.contains("OUTSIDE the sandbox"), "{desc}");
         assert!(desc.contains("network is disabled"), "{desc}");
         assert!(desc.contains("/mnt/big/cargo-home"), "{desc}");
         assert!(desc.contains("~/.rustup"), "{desc}");
         assert!(desc.contains("read_file/write_file/edit_file"), "{desc}");
+
+        // Sandboxed with read-only workspace.
+        let sandboxed_ro = Bash {
+            workspace,
+            timeout: Duration::from_secs(1),
+            background,
+            sandbox: Some(crate::config::Sandbox {
+                enabled: true,
+                network: true,
+                workspace_writable: false,
+                writable_paths: vec![],
+                readable_paths: vec![],
+            }),
+        };
+        let desc_ro = sandboxed_ro.spec().description;
+        assert!(desc_ro.contains("workspace is read-only"), "{desc_ro}");
     }
 
     fn background_bash(
@@ -1584,18 +1624,13 @@ mod tests {
 
     fn sandbox() -> Option<crate::config::Sandbox> {
         // Only run when bwrap is actually installed and user namespaces work.
-        std::process::Command::new("bwrap")
-            .args(["--unshare-all", "--ro-bind", "/", "/", "/bin/true"])
-            .status()
-            .ok()
-            .filter(|status| status.success())
-            .map(|_| crate::config::Sandbox {
-                enabled: true,
-                network: true,
-                workspace_writable: true,
-                writable_paths: Vec::new(),
-                readable_paths: Vec::new(),
-            })
+        bwrap_available().then(|| crate::config::Sandbox {
+            enabled: true,
+            network: true,
+            workspace_writable: true,
+            writable_paths: Vec::new(),
+            readable_paths: Vec::new(),
+        })
     }
 
     #[tokio::test]

@@ -164,9 +164,12 @@ and subagents alike — is then wrapped in `bwrap`: system directories are
 mounted read-only, the workspace is mounted read-write (`workspace_writable =
 false` makes it read-only), `/tmp` and `/home` are fresh tmpfs, PID/IPC/UTS
 namespaces are unshared, and TIOCSTI is blocked via `--new-session`. Network
-stays available by default; `network = false` unshares it. If `bwrap` is not
-installed, commands fall back to running unsandboxed. The sandbox constrains
-the spawned command, not the agent process itself.
+stays available by default; `network = false` unshares it. The sandbox constrains
+the spawned command, not the agent process itself. This sandbox is best-effort:
+it is not setuid bwrap, the host network is shared by default, and environment
+variables of the parent process other than the stripped credential names
+(`EXA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`,
+`MOONSHOT_API_KEY`, `KIMI_API_KEY`) remain visible inside the sandbox.
 
 Every `web_search` query is disclosed to Exa, a third party. Never include
 credentials, tokens, private repository contents, customer data, personal data,

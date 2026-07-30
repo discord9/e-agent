@@ -173,8 +173,16 @@ async fn run() -> anyhow::Result<()> {
     // The bash sandbox ([sandbox] in config) wraps every bash call — main
     // agent and subagents alike — in bwrap when enabled.
     let sandbox = config.as_ref().and_then(|config| config.sandbox(&root));
-    if sandbox.is_some() && !tui_mode {
-        eprintln!("e-agent: bash sandboxed with bwrap");
+    if sandbox.is_some() {
+        if !e_agent::tools::bwrap_available() {
+            return Err(anyhow!(
+                "[sandbox] enabled = true but bwrap is not available. \
+                 Install bubblewrap or disable the sandbox."
+            ));
+        }
+        if !tui_mode {
+            eprintln!("e-agent: bash sandboxed with bwrap");
+        }
     }
     let (mut tools, background) = builtins(workspace.clone(), sandbox.clone());
     let mcp_servers = config.map(|config| config.mcp).unwrap_or_default();
