@@ -1016,6 +1016,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
         };
         // Store the output width for scroll-accounting in handle_scroll.
         scroll_state.inner_width = inner_width;
+        scroll_state.output_height = usize::from(output.height);
         // When following, anchor the window at the tail.
         if scroll_state.window.follow_bottom {
             scroll_state.window.anchor_tail(
@@ -1053,12 +1054,19 @@ fn draw<'a, B: ratatui::backend::Backend>(
             .window
             .local_offset
             .min(total_rows.saturating_sub(height).max(0));
+        // When following with fewer rows than the viewport, bottom-align
+        // so the last visual row touches the input boundary.
+        let render_top = if scroll_state.window.follow_bottom && total_rows < height {
+            output.bottom() - total_rows as u16
+        } else {
+            output.y
+        };
         {
             let buf = frame.buffer_mut();
             buf.set_style(output, SOLARIZED_LIGHT.screen_style());
             let scroll_offset = scroll_state.window.local_offset;
             for (row_idx, line) in visual.iter().enumerate().skip(scroll_offset) {
-                let y = output.y + (row_idx - scroll_offset) as u16;
+                let y = render_top + (row_idx - scroll_offset) as u16;
                 if y >= output.bottom() {
                     break;
                 }
@@ -1610,6 +1618,8 @@ struct TuiState {
     window: ScrollWindow,
     /// Terminal width (in cells) for the output area, updated on every draw.
     inner_width: usize,
+    /// Terminal height (in rows) for the output area, updated on every draw.
+    output_height: usize,
     busy: Option<BusyState>,
     streamed: bool,
     active_lane: Option<ActiveStreamLane>,
@@ -1753,9 +1763,12 @@ impl ScrollWindow {
     /// `source_start` by walking backward far enough to fill `height` visual
     /// rows at `width`. After this call the window is ready for rendering
     /// and `local_offset` points to the bottom (follow mode).
+    /// Clears any frozen snapshot so follow shows the live tail.
     fn anchor_tail(&mut self, lines: &[DisplayLine], width: usize, height: usize) {
         let total = lines.len();
         self.follow_bottom = true;
+        self.frozen_tail_text = None;
+        self.frozen_source_end = 0;
         self.source_end = total;
         // Walk backward counting visual rows until we have enough.
         self.source_start = total;
@@ -2382,7 +2395,11 @@ impl TuiState {
                     prepended_rows += rows;
                     deficit = deficit.saturating_sub(rows);
                     if deficit == 0 {
-                        self.window.local_offset = prepended_rows - step;
+                        self.window.local_offset = self
+                            .window
+                            .local_offset
+                            .saturating_add(prepended_rows)
+                            .saturating_sub(step);
                         break;
                     }
                 }
@@ -2494,6 +2511,8 @@ impl TuiState {
 
     fn follow(&mut self) {
         self.window.follow_bottom = true;
+        self.window.frozen_tail_text = None;
+        self.window.frozen_source_end = 0;
         // source_start/source_end will be anchored at the tail on next draw.
     }
 
@@ -2576,14 +2595,18 @@ impl TuiState {
 /// frozen-tail snapshot once the user scrolls past the freeze point).
 fn extend_window_down(state: &mut TuiState, step: usize, on_extension: impl FnOnce(&mut TuiState)) {
     let w = state.inner_width.max(1);
+    let height = state.output_height.max(1);
     // Compute total visual rows in the current window.
     let mut total_visual = 0usize;
     for line in &state.lines[state.window.source_start..state.window.source_end] {
         total_visual += line_visual_rows(line, w);
     }
-    // If local_offset points past the last visual row and more source
-    // lines exist, extend the window forward.
-    if state.window.local_offset >= total_visual && state.window.source_end < state.lines.len() {
+    // The viewport-bottom check: the last visible row is
+    // local_offset + height - 1.  Scrolling can advance until
+    // local_offset + height >= total_visual.
+    let at_visual_bottom = state.window.local_offset.saturating_add(height) >= total_visual;
+    // If at the visual bottom and more source lines exist, extend forward.
+    if at_visual_bottom && state.window.source_end < state.lines.len() {
         let mut added = 0usize;
         while state.window.source_end < state.lines.len() && added < step {
             let rows = line_visual_rows(&state.lines[state.window.source_end], w);
@@ -2599,6 +2622,15 @@ fn extend_window_down(state: &mut TuiState, step: usize, on_extension: impl FnOn
             .local_offset
             .min(total_visual.saturating_sub(1).max(0));
         on_extension(state);
+    } else if !state.window.follow_bottom
+        && state.window.frozen_tail_text.is_some()
+        && state.window.source_end >= state.lines.len()
+        && at_visual_bottom
+    {
+        // Already at the true end — only deltas accumulated on the last
+        // line.  Switch to follow and clear the frozen snapshot.
+        state.window.follow_bottom = true;
+        state.window.frozen_tail_text = None;
     }
 }
 
@@ -3603,8 +3635,8 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(12, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = TuiState::default();
-
         state.push_line("你好数据".into(), LineKind::Normal);
+        state.window.follow_bottom = false;
 
         // Capture the CompletedFrame to check the rendered buffer.
         // The CompletedFrame.buffer is the non-current buffer after
@@ -4275,6 +4307,7 @@ mod tests {
         state.push_line("```".into(), LineKind::Normal);
         state.push_line("let x = 1;".into(), LineKind::Normal);
         state.push_line("```".into(), LineKind::Normal);
+        state.window.follow_bottom = false;
         draw(&mut terminal, &mut state).unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -4299,6 +4332,7 @@ mod tests {
             "before\n```\ncode line\n```\nafter".into(),
             LineKind::Normal,
         );
+        state.window.follow_bottom = false;
         draw(&mut terminal, &mut state).unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -4325,6 +4359,11 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(50, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = TuiState {
+            window: ScrollWindow {
+                follow_bottom: false,
+                source_end: 8, // matches lines.len()
+                ..Default::default()
+            },
             lines: vec![
                 DisplayLine {
                     text: "normal".into(),
@@ -5329,5 +5368,137 @@ mod ux_tests {
             },
         }];
         assert!(derive_session_title(&entries).is_none());
+    }
+
+    // ── Frozen-viewport regression tests ────────────────────────────────
+
+    /// Set up 3 lines with an active streaming lane, frozen snapshot at `hel`.
+    fn frozen_state() -> TuiState {
+        let mut s = TuiState::default();
+        s.push_line("earlier".into(), LineKind::Normal);
+        s.push_line("context".into(), LineKind::Normal);
+        s.push_line("hel".into(), LineKind::Normal);
+        s.active_lane = Some(ActiveStreamLane::Content);
+        s.streamed = true;
+        s.inner_width = 80;
+        s.output_height = 10;
+        s.window.follow_bottom = false;
+        s.window.source_end = s.lines.len();
+        s.window.frozen_source_end = s.window.source_end;
+        s.window.frozen_tail_text = s.lines.last().map(|l| l.text.clone());
+        s.window.local_offset = 0;
+        s
+    }
+
+    /// Apply deltas to `hel` → `hello world`.
+    fn append_deltas(s: &mut TuiState) {
+        for d in ["lo ", "wor", "ld"] {
+            s.push_agent_event(AgentEvent::AssistantDelta(d.into()));
+        }
+    }
+
+    /// Extract text of the rendered row at `y` from the buffer.
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn frozen_render_stable_then_end_shows_latest() {
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = frozen_state();
+
+        draw(&mut term, &mut state).unwrap();
+        assert_eq!(row_text(term.backend().buffer(), 2), "hel");
+        assert_eq!(state.lines.last().unwrap().text, "hel");
+        // A frozen draw keeps the captured tail snapshot intact.
+        assert_eq!(state.window.frozen_tail_text.as_deref(), Some("hel"));
+
+        append_deltas(&mut state);
+        assert_eq!(state.lines.last().unwrap().text, "hello world");
+        // Rendered viewport still shows frozen text (draw uses snapshot).
+        draw(&mut term, &mut state).unwrap();
+        assert_eq!(row_text(term.backend().buffer(), 2), "hel");
+        assert_eq!(state.window.frozen_tail_text.as_deref(), Some("hel"));
+
+        // End clears snapshot via follow(); next draw shows accumulated.
+        state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert!(state.window.frozen_tail_text.is_none());
+        draw(&mut term, &mut state).unwrap();
+        assert_eq!(row_text(term.backend().buffer(), 6), "hello world");
+        // Short content (3 lines < 7 output height) is bottom-aligned:
+        // rows 0-3 are empty (background paint), rows 4-6 show content.
+        assert_eq!(row_text(term.backend().buffer(), 0), "");
+        assert_eq!(row_text(term.backend().buffer(), 3), "");
+        assert_ne!(row_text(term.backend().buffer(), 4), "");
+    }
+
+    #[test]
+    fn frozen_down_or_pagedown_clears_at_true_bottom() {
+        for key in [KeyCode::Down, KeyCode::PageDown] {
+            let backend = ratatui::backend::TestBackend::new(40, 6);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut state = frozen_state();
+            // Override output_height (frozen_state sets 10, use 6 here).
+            state.output_height = 6;
+            // Re-freeze so the window uses height=6.
+            state.window.source_end = state.lines.len();
+            state.window.frozen_source_end = state.window.source_end;
+            state.window.frozen_tail_text = state.lines.last().map(|l| l.text.clone());
+
+            append_deltas(&mut state);
+            assert_eq!(state.lines.last().unwrap().text, "hello world");
+            assert!(state.window.frozen_tail_text.is_some());
+
+            let mut safety = 0usize;
+            loop {
+                state.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+                safety += 1;
+                if state.window.follow_bottom || safety > 20 {
+                    break;
+                }
+            }
+            assert!(state.window.follow_bottom, "{key:?} must resume follow");
+            assert!(
+                state.window.frozen_tail_text.is_none(),
+                "{key:?} must clear frozen snapshot"
+            );
+
+            // After follow, draw must show the accumulated tail text.
+            draw(&mut term, &mut state).unwrap();
+            // output height = 6 - 3 = 3, render_top = 3 - 3 = 0, last row = 2.
+            assert_eq!(
+                row_text(term.backend().buffer(), 2),
+                "hello world",
+                "{key:?} latest rendered content"
+            );
+        }
+    }
+
+    #[test]
+    fn pageup_no_underflow_near_top() {
+        // PageUp with local_offset=8 and a prepended line producing ~2 rows
+        // would underflow with the old `prepended_rows - step` formula.
+        let mut state = TuiState::default();
+        state.push_line("earlier line data".into(), LineKind::Dim);
+        for ch in 'a'..='h' {
+            state.push_line(ch.to_string(), LineKind::Dim);
+        }
+        state.inner_width = 10;
+        state.window.source_start = 1;
+        state.window.source_end = 9;
+        state.window.local_offset = 8;
+        state.window.follow_bottom = false;
+
+        state.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        // Must not panic/wrap. L0 wraps to 2 visual rows; prepended_rows=2,
+        // deficit=2 → 0. Correct local_offset = 8 + 2 - 10 = 0.
+        assert_eq!(state.window.source_start, 0);
+        assert_eq!(state.window.local_offset, 0);
+        assert!(!state.window.follow_bottom);
     }
 }
