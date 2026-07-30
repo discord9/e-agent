@@ -399,7 +399,10 @@ async fn run_inner(
                 {
                     return Ok(());
                 }
-                while let Some(next) = state.next_queued() {
+                // Drain all queued prompts as a single batch; repeat only
+                // if new prompts accumulated while the follow-up ran.
+                loop {
+                    let Some(next) = state.take_queued_batch() else { break };
                     state.push_line(format!("you> {next}"), LineKind::User);
                     state.follow();
                     agent.subscribe(forward.clone());
@@ -511,12 +514,35 @@ async fn run_inner(
                         }
                         if matches!(interruption, Some(Interruption::CancelTurn)) {
                             state.push_line("cancelled".into(), LineKind::Dim);
-                            // Cancelling with queued prompts should not need
-                            // one Ctrl-C per queued turn: fold everything
-                            // queued into a single follow-up turn.
-                            state.collapse_queue();
                         }
                         state.follow();
+                        // Cancelling with queued prompts: drain all into
+                        // a single follow-up turn.
+                        loop {
+                            let Some(next) = state.take_queued_batch() else { break };
+                            state.push_line(format!("you> {next}"), LineKind::User);
+                            state.follow();
+                            agent.subscribe(forward.clone());
+                            let mut ui = Ui {
+                                state: &mut state,
+                                events: &mut events,
+                                inbox: &mut inbox,
+                                sessions: &sessions,
+                                sender: &sender,
+                            };
+                            if run_request(
+                                terminal,
+                                agent,
+                                &mut ui,
+                                &store,
+                                (root, &labels.session, persisted),
+                                next,
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
+                        }
                         continue;
                     }
                     // First real user prompt: derive terminal title from it
@@ -553,7 +579,8 @@ async fn run_inner(
                     {
                         return Ok(());
                     }
-                    while let Some(next) = state.next_queued() {
+                    loop {
+                        let Some(next) = state.take_queued_batch() else { break };
                         state.push_line(format!("you> {next}"), LineKind::User);
                         state.follow();
                         agent.subscribe(forward.clone());
@@ -650,7 +677,6 @@ async fn run_request(
     }
     if matches!(interruption, Some(Interruption::CancelTurn)) {
         ui.state.push_line("cancelled".into(), LineKind::Dim);
-        ui.state.collapse_queue();
     }
     store
         .append(root, session_name, &agent.history()[*persisted..])
@@ -1979,20 +2005,16 @@ impl TuiState {
         (!prompt.trim().is_empty()).then_some(prompt)
     }
 
-    fn next_queued(&mut self) -> Option<String> {
+    /// Atomically drain ALL queued prompts, join them with `\n\n`, and
+    /// return the combined batch (or None when the queue is empty).
+    /// Each call leaves the queue empty, so the caller should loop over
+    /// this helper only until it returns None — any prompts enqueued
+    /// during the follow-up turn become a separate batch on the next call.
+    fn take_queued_batch(&mut self) -> Option<String> {
         if self.queued.is_empty() {
             None
         } else {
-            Some(self.queued.remove(0))
-        }
-    }
-
-    /// Fold every queued prompt into one so a cancelled turn is followed by
-    /// a single combined turn instead of N turns needing N cancels.
-    fn collapse_queue(&mut self) {
-        if self.queued.len() > 1 {
-            let joined = self.queued.join("\n\n");
-            self.queued = vec![joined];
+            Some(std::mem::take(&mut self.queued).join("\n\n"))
         }
     }
 
@@ -4539,7 +4561,7 @@ mod tests {
     }
 
     #[test]
-    fn prompts_submitted_while_thinking_queue_and_drain_in_order() {
+    fn prompts_submitted_while_thinking_queue_and_drain_in_batches() {
         let mut state = TuiState::default();
         state.input.insert("first");
         let first = state.take_input().unwrap();
@@ -4548,9 +4570,15 @@ mod tests {
         let second = state.take_input().unwrap();
         state.queued.push(second);
         assert!(state.input.text.is_empty());
-        assert_eq!(state.next_queued().unwrap(), "first");
-        assert_eq!(state.next_queued().unwrap(), "second");
-        assert!(state.next_queued().is_none());
+        // First call drains all into one joined batch.
+        assert_eq!(state.take_queued_batch().unwrap(), "first\n\nsecond");
+        // Queue is now empty.
+        assert!(state.take_queued_batch().is_none());
+        // New batch arrives after the first was drained.
+        state.queued.push("third".into());
+        state.queued.push("fourth".into());
+        assert_eq!(state.take_queued_batch().unwrap(), "third\n\nfourth");
+        assert!(state.take_queued_batch().is_none());
     }
 
     #[test]
@@ -4766,20 +4794,23 @@ mod ux_tests {
     }
 
     #[test]
-    fn cancelling_collapses_queued_prompts_into_one_turn() {
+    fn cancelling_take_queued_batch_joins_multiple_prompts() {
         let mut state = TuiState {
             queued: vec!["one".into(), "two".into(), "three".into()],
             ..Default::default()
         };
-        state.collapse_queue();
-        assert_eq!(state.queued, vec!["one\n\ntwo\n\nthree".to_owned()]);
-        // A single queued prompt (or none) is left alone.
+        assert_eq!(state.take_queued_batch().unwrap(), "one\n\ntwo\n\nthree");
+        assert!(state.queued.is_empty());
+        // A single queued prompt is returned as-is.
         let mut state = TuiState {
             queued: vec!["only".into()],
             ..Default::default()
         };
-        state.collapse_queue();
-        assert_eq!(state.queued, vec!["only".to_owned()]);
+        assert_eq!(state.take_queued_batch().unwrap(), "only");
+        assert!(state.queued.is_empty());
+        // Empty queue returns None.
+        let mut state = TuiState::default();
+        assert!(state.take_queued_batch().is_none());
     }
 
     #[test]

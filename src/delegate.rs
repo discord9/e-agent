@@ -67,23 +67,33 @@ impl Sessions {
     }
 }
 
-/// Pick the next prompt for a steerable subagent: stashed prompts first
-/// (arrival order), then whatever is queued in the channel, then block until
-/// a prompt arrives or the channel closes (None = shut down).
-/// Take the next already-queued prompt (stashed mid-turn), if any, without
-/// blocking. Returns None when nothing is queued — the caller treats that
-/// as "subagent done", because the session handle keeps the steer channel
-/// open until the work returns, so blocking here would never see `None`.
+/// Pick the next prompt batch for a steerable subagent at a turn
+/// boundary: drain ALL stashed prompts (arrival order) and ALL currently
+/// ready `Steer::Prompt` values from the channel into one joined batch.
+/// Returns `Some(joined)` or `None` when nothing is available — the
+/// caller treats `None` as "subagent done" because the session handle
+/// keeps the steer channel open until the work returns, so blocking
+/// here would never see `None`.
+///
+/// `Steer::Cancel` messages that arrive here are stale — the turn they
+/// were meant to cancel has already completed. They are silently ignored;
+/// they must not discard already-collected prompts or terminate the
+/// session.
 fn next_queued_prompt(source: &mut SessionSource, pending: &mut Vec<String>) -> Option<String> {
-    if !pending.is_empty() {
-        return Some(pending.remove(0));
-    }
+    let mut batch = Vec::new();
+    batch.append(pending);
     while let Some(message) = source.try_recv() {
-        if let Steer::Prompt(text) = message {
-            return Some(text);
+        match message {
+            Steer::Prompt(text) => batch.push(text),
+            // Stale Cancel: the turn already ended, so this is a no-op.
+            Steer::Cancel => {}
         }
     }
-    None
+    if batch.is_empty() {
+        None
+    } else {
+        Some(batch.join("\n\n"))
+    }
 }
 
 /// Append the history entries produced since the last call to the
@@ -505,17 +515,12 @@ impl Delegate {
                     if let (Some(store), Some(persist)) = (&persist_store, &persist) {
                         persist_turn(store, persist, &agent, &mut persisted_len).await;
                     }
-                    // Turn ended. Prompts stashed mid-turn still get their
-                    // own follow-up turns; once those are drained the
-                    // subagent is done. We must NOT block waiting for new
-                    // steer messages here: the session handle is held by the
-                    // registry until this work returns, so the steer channel
-                    // never closes and waiting would deadlock (the completion
-                    // event would never reach the parent).
+                    // Turn ended. Drain all queued prompts in one batch
+                    // (non-blocking); subsequent batches wait for the next
+                    // turn boundary.
                     let Some(source) = source.as_mut() else {
                         return last_answer;
                     };
-                    // Drain only already-queued prompts (non-blocking).
                     prompt = match next_queued_prompt(source, &mut pending) {
                         Some(text) => text,
                         None => return last_answer,
@@ -1407,5 +1412,73 @@ mod tests {
             notices[0].contains(&long),
             "long summary not truncated in replay_scrollback"
         );
+    }
+
+    // ── next_queued_prompt batch semantics ─────────────────────────────
+
+    #[test]
+    fn next_queued_prompt_pending_and_channel_join_in_order() {
+        let (_handle, _sink, mut source) = session_channel();
+        let mut pending = vec!["pending-a".into(), "pending-b".into()];
+
+        // Simulate channel-ready prompts arriving after the stashed ones.
+        // Use the handle to send into the steer channel.
+        let handle: Arc<dyn SessionHandle> = Arc::new(_handle);
+        handle.send_input("channel-c".into());
+        handle.send_input("channel-d".into());
+
+        let joined = next_queued_prompt(&mut source, &mut pending);
+        assert_eq!(
+            joined.unwrap(),
+            "pending-a\n\npending-b\n\nchannel-c\n\nchannel-d"
+        );
+        assert!(pending.is_empty(), "pending vector is drained");
+    }
+
+    #[test]
+    fn next_queued_prompt_stale_cancel_does_not_discard_prompts() {
+        let (_handle, _sink, mut source) = session_channel();
+        let mut pending = vec!["task".into()];
+
+        // Cancel races in after the turn already ended — stale.
+        let handle: Arc<dyn SessionHandle> = Arc::new(_handle);
+        handle.cancel();
+        handle.send_input("follow-up".into());
+
+        let joined = next_queued_prompt(&mut source, &mut pending);
+        // Stale Cancel is ignored; the prompt survives.
+        assert_eq!(joined.unwrap(), "task\n\nfollow-up");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn next_queued_prompt_stale_cancel_and_no_prompts_returns_none() {
+        let (_handle, _sink, mut source) = session_channel();
+        let mut pending = Vec::<String>::new();
+
+        // Only a stale Cancel, no prompts — nothing to do.
+        let handle: Arc<dyn SessionHandle> = Arc::new(_handle);
+        handle.cancel();
+
+        let result = next_queued_prompt(&mut source, &mut pending);
+        assert!(result.is_none(), "no prompts means no batch");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn next_queued_prompt_interleaved_cancel_preserves_order() {
+        let (_handle, _sink, mut source) = session_channel();
+        let mut pending = vec!["first".into()];
+
+        // Cancel interspersed between prompts: stale cancel ignored,
+        // prompts maintain arrival order.
+        let handle: Arc<dyn SessionHandle> = Arc::new(_handle);
+        handle.send_input("second".into());
+        handle.cancel();
+        handle.send_input("third".into());
+
+        let joined = next_queued_prompt(&mut source, &mut pending);
+        assert_eq!(joined.unwrap(), "first\n\nsecond\n\nthird");
+        assert!(pending.is_empty());
     }
 }
