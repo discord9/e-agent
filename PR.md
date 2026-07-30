@@ -4,15 +4,7 @@
 
 Add an optional GreptimeDB-backed session storage backend alongside the existing JSONL file backend. Controlled by runtime config (`[session] backend = "greptime"`), gated by compile-time feature flag (`--features greptime`). Default behavior (JSONL) is unchanged.
 
-**Branch**: `omos/greptimedb-storage-research` (3 commits on `44794ce`)
-
-## Commits
-
-| Commit | Description |
-|--------|-------------|
-| `0c1f4fd` | PoC: session_greptime module + experiment results + verification harness |
-| `1f08d58` | import_jsonl: incremental JSONL→DB migration tool |
-| `12e0552` | Runtime backend config: SessionStore enum dispatch |
+**Branch**: `omos/greptimedb-storage-research` (on base `44794ce`). Cleanup commit `3789e93` removed experiment artifacts (`poc-harness/`, `.greptimedb-poc/`) and dead code before merge.
 
 ## What Changed
 
@@ -20,11 +12,9 @@ Add an optional GreptimeDB-backed session storage backend alongside the existing
 
 | File | Purpose |
 |------|---------|
-| `src/session_greptime.rs` | GreptimeDB session storage via tokio-postgres. connect/load/append/append_batch. |
+| `src/session_greptime.rs` | GreptimeDB session storage via tokio-postgres. connect/load/append. |
 | `src/session_store.rs` | Runtime dispatch enum (`Jsonl` / `Greptime`). No trait — per AGENTS.md. |
-| `poc-harness/` | Standalone verification tools (not part of e-agent binary). |
-| `GREPTIMEDB_STORAGE_MIGRATION_PITFALLS.md` | Migration pitfalls report. |
-| `.greptimedb-poc/results/` | EXPLAIN ANALYZE VERBOSE outputs + query analysis. |
+| `GREPTIMEDB_STORAGE_MIGRATION_PITFALLS.md` | Migration pitfalls report (evidence-locked to specific commits). |
 
 ### Modified files
 
@@ -77,17 +67,15 @@ CREATE TABLE IF NOT EXISTS session_entries (
 | `connect` (find max seq) | `last_value(seq ORDER BY event_time ASC) GROUP BY session_id` | LastRow scan hint → reads 2 rows instead of full scan |
 | `load` (read all entries) | `SELECT seq, payload ... ORDER BY event_time DESC` | WindowedSortExec + app-side HashMap dedup (no window function) |
 | `append` | Parameterized INSERT | tokio-postgres byte-identical (verified with 1MB, CJK, multiline, injection) |
-| `append_batch` | Multi-row VALUES INSERT | 55k+ rows/s |
 
 ## Verification
 
-- 134/134 project tests pass (both with and without `--features greptime`)
-- 4/4 session_greptime integration tests pass (roundtrip, reconnect, dedup, batch)
-- 8601 real JSONL entries imported from 84 sessions via incremental importer
-- EXPLAIN ANALYZE VERBOSE confirms LastRow scan (2 rows vs 5780) and WindowedSortExec
+- 134/134 project tests pass (default features); 137/137 with `--features greptime` (3 integration tests run against a live GreptimeDB at 127.0.0.1:15403)
+- 8601 real JSONL entries imported from 84 sessions during the PoC (incremental importer)
+- EXPLAIN ANALYZE VERBOSE confirmed LastRow scan (2 rows vs 5780) and WindowedSortExec during the PoC
 - kill -9 durability verified (sync_write=true, 1083 rows survived)
 - tokio-postgres and gRPC ingester both byte-identical (psycopg2 \n issue is Python-only)
-- clippy clean, fmt clean
+- clippy clean (both feature sets), fmt clean
 
 ## Design Decisions
 
@@ -99,7 +87,7 @@ CREATE TABLE IF NOT EXISTS session_entries (
 
 ## Non-goals
 
-- No migration of existing JSONL sessions at startup (use `poc-harness import_jsonl` manually)
+- No automatic migration of existing JSONL sessions at startup (a one-shot importer was built and used during the PoC; removed before merge as an experiment artifact)
 - No background task persistence in GreptimeDB
 - No distributed/cluster deployment — standalone GreptimeDB only
 - No generic storage abstraction for future third backends
@@ -108,29 +96,15 @@ CREATE TABLE IF NOT EXISTS session_entries (
 
 - GreptimeDB server must be running before e-agent starts (no auto-discovery or embedded mode)
 - `tokio-postgres` needs `with-chrono-0_4` feature for TIMESTAMP params
-- memtable flush requires admin API (not SQL) — all current PoC data is in memtable
 - `event_time` is real wall-clock time but may have nanosecond collisions across processes (same-ns entries get prev+1)
 
-## Review Notes (pre-merge self-review)
+## Review Notes (pre-merge self-review, resolved)
 
-Findings from reviewing `44794ce..HEAD`, severity-ordered:
+Findings from reviewing the branch, severity-ordered. Items 1, 2, and 6 were fixed in cleanup commit `3789e93`:
 
-1. **Low — dead code**: `GreptimeSession::append_batch` is never called by production
-   paths (SessionStore only uses `append`); used only by poc-harness importer and its
-   own test. `next_seq()` getter likewise test-only. Options: keep as documented PoC
-   surface, or strip before merge.
-2. **Low — doc inconsistency**: module header says "not a replacement yet" but
-   SessionStore makes it user-selectable. Consider updating the header.
-3. **Accepted — rewrite() no-op for Greptime**: legacy-v1 sessions loaded from DB get
-   `legacy=false`, so the no-op rewrite is unreachable in practice; behavior is correct.
-4. **Accepted — per-subagent DB connections**: one tokio-postgres connection per live
-   subagent; bounded by live subagent count. Fine for single-user agent.
-5. **Known limitation — concurrent same-session writers**: two processes on the same
-   session id can interleave seqs; read-side dedup (first-wins by event_time DESC)
-   makes this safe and is tested (`duplicate_retry_dedup`).
-6. **Note — `merge_mode = 'last_non_null'`** in DDL is ineffective under
-   `append_mode = 'true'`; harmless but could be dropped.
-
-Merge hygiene suggestion: consider excluding `poc-harness/`, `.greptimedb-poc/`,
-and `PR.md` from the merge to main (or moving to a docs/ location) — they are
-experiment artifacts. `GREPTIMEDB_STORAGE_MIGRATION_PITFALLS.md` is worth keeping.
+1. ~~**Low — dead code**: `append_batch` / `next_seq()` unused by production paths.~~ **Fixed**: removed.
+2. ~~**Low — doc inconsistency**: module header said "not a replacement yet".~~ **Fixed**: header updated.
+3. **Accepted — rewrite() no-op for Greptime**: legacy-v1 sessions loaded from DB get `legacy=false`, so the no-op rewrite is unreachable in practice; behavior is correct.
+4. **Accepted — per-subagent DB connections**: one tokio-postgres connection per live subagent; bounded by live subagent count. Fine for single-user agent.
+5. **Known limitation — concurrent same-session writers**: two processes on the same session id can interleave seqs; read-side dedup (first-wins by event_time DESC) makes this safe and is tested (`duplicate_retry_dedup`).
+6. ~~**Note — `merge_mode = 'last_non_null'`** ineffective under `append_mode = 'true'`.~~ **Fixed**: removed from DDL.
