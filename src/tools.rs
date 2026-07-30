@@ -407,9 +407,42 @@ struct Bash {
 #[async_trait]
 impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
+        let mut description =
+            "Run a shell command with the workspace as its current directory.".to_owned();
+        if let Some(sandbox) = &self.sandbox {
+            description.push_str(
+                " The command runs inside a bubblewrap sandbox: the workspace is writable, \
+                 system dirs (/usr, /bin, /lib, /etc) are read-only, and most of $HOME is \
+                 hidden behind a fresh tmpfs. Files that are not mounted — e.g. ~/.ssh or \
+                 ~/.gitconfig — fail with \"No such file or directory\"; that means they are \
+                 OUTSIDE the sandbox, not that they don't exist on the host. Do not try to \
+                 create such files; if a needed path errors this way, tell the user it is \
+                 outside the sandbox.",
+            );
+            if !sandbox.network {
+                description.push_str(" The network is disabled (no DNS, no connections).");
+            }
+            if !sandbox.writable_paths.is_empty() {
+                description.push_str(&format!(
+                    " Extra writable paths: {}.",
+                    sandbox.writable_paths.join(", ")
+                ));
+            }
+            if !sandbox.readable_paths.is_empty() {
+                description.push_str(&format!(
+                    " Extra read-only paths: {}.",
+                    sandbox.readable_paths.join(", ")
+                ));
+            }
+            description.push_str(
+                " The read_file/write_file/edit_file tools are restricted to the workspace \
+                 (capability-relative, not the sandbox); to read a file outside the workspace \
+                 that is mounted in the sandbox, use bash (e.g. cat).",
+            );
+        }
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command with the workspace as its current directory.".into(),
+            description,
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1494,6 +1527,44 @@ mod tests {
             .status()
             .unwrap();
         assert!(!status.success(), "background child survived timeout");
+    }
+
+    #[test]
+    fn bash_description_explains_the_sandbox_only_when_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+        let background = BackgroundTasks::new(Duration::from_secs(30), None);
+
+        // No sandbox: plain description, no sandbox caveats.
+        let plain = Bash {
+            workspace: workspace.clone(),
+            timeout: Duration::from_secs(1),
+            background: background.clone(),
+            sandbox: None,
+        };
+        let plain_desc = plain.spec().description;
+        assert!(!plain_desc.contains("sandbox"), "{plain_desc}");
+
+        // Sandboxed: explains the boundary and lists extra mounts.
+        let sandboxed = Bash {
+            workspace,
+            timeout: Duration::from_secs(1),
+            background,
+            sandbox: Some(crate::config::Sandbox {
+                enabled: true,
+                network: false,
+                workspace_writable: true,
+                writable_paths: vec!["/mnt/big/cargo-home".into()],
+                readable_paths: vec!["~/.rustup".into()],
+            }),
+        };
+        let desc = sandboxed.spec().description;
+        assert!(desc.contains("bubblewrap sandbox"), "{desc}");
+        assert!(desc.contains("OUTSIDE the sandbox"), "{desc}");
+        assert!(desc.contains("network is disabled"), "{desc}");
+        assert!(desc.contains("/mnt/big/cargo-home"), "{desc}");
+        assert!(desc.contains("~/.rustup"), "{desc}");
+        assert!(desc.contains("read_file/write_file/edit_file"), "{desc}");
     }
 
     fn background_bash(
