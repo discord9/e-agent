@@ -431,13 +431,16 @@ async fn run_inner(
                 if state.show_tasks {
                     if let Some(task_id) = state.handle_tasks_panel_key(key) {
                         attach_to_task(&mut state, task_id, &sessions, &sender);
-                    } else if key.code == KeyCode::Esc || key.code == KeyCode::F(2) {
-                        state.show_tasks = false;
-                    } else if key.code == KeyCode::Char('x') {
-                        state.cancel_selected_task();
-                    } else if let Some(attached) = &mut state.attached {
-                        let width = attached_input_width(terminal)?;
-                        AttachedView::edit_input(&mut attached.input, key, width);
+                    } else {
+                        match state.handle_panel_key(key) {
+                            PanelAction::ClosePanel | PanelAction::CancelTask => {}
+                            PanelAction::Passthrough => {
+                                if let Some(attached) = &mut state.attached {
+                                    let width = attached_input_width(terminal)?;
+                                    AttachedView::edit_input(&mut attached.input, key, width);
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
@@ -710,11 +713,41 @@ async fn drive<T>(
                     state.detach();
                     draw(terminal, state)?;
                 }
+                // Tasks panel open takes priority: Ctrl-C cancels the selected
+                // task; it never cancels the main turn or exits the app.
+                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
+                    && state.show_tasks =>
+                {
+                    if let Some(task_id) = state.handle_tasks_panel_key(key) {
+                        attach_to_task(state, task_id, sessions, sender);
+                    } else {
+                        match state.handle_panel_key(key) {
+                            PanelAction::ClosePanel | PanelAction::CancelTask => {}
+                            PanelAction::Passthrough => {
+                                if key.code == KeyCode::Enter {
+                                    // Enter on a non-attachable task: nothing to attach.
+                                } else if let Some(attached) = &mut state.attached {
+                                    // Panel open while attached: remaining keys edit the
+                                    // steering input (panel already consumed nav keys).
+                                    let width = attached_input_width(terminal)?;
+                                    AttachedView::edit_input(&mut attached.input, key, width);
+                                } else {
+                                    state.handle_scroll(key);
+                                    state.edit_input(key);
+                                }
+                            }
+                        }
+                    }
+                    draw(terminal, state)?;
+                }
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press && is_cancel(key) => {
                     return Ok((None, Some(Interruption::CancelTurn)));
                 }
-                // Not attached: Esc during a turn only closes the tasks
-                // panel (leave-the-current-view), it never cancels the turn.
+                // Not attached: Esc during a turn closes the tasks panel
+                // (leave-the-current-view), it never cancels the turn.
+                // When the panel is open this is handled by the show_tasks
+                // arm above via handle_panel_key; when the panel is closed
+                // this arm is a no-op.
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
                     && key.code == KeyCode::Esc =>
                 {
@@ -722,28 +755,6 @@ async fn drive<T>(
                         state.show_tasks = false;
                         draw(terminal, state)?;
                     }
-                }
-                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
-                    && state.show_tasks =>
-                {
-                    if let Some(task_id) = state.handle_tasks_panel_key(key) {
-                        attach_to_task(state, task_id, sessions, sender);
-                    } else if key.code == KeyCode::F(2) {
-                        state.show_tasks = false;
-                    } else if key.code == KeyCode::Char('x') {
-                        state.cancel_selected_task();
-                    } else if key.code == KeyCode::Enter {
-                        // Enter on a non-attachable task: nothing to attach.
-                    } else if let Some(attached) = &mut state.attached {
-                        // Panel open while attached: remaining keys edit the
-                        // steering input (panel already consumed nav keys).
-                        let width = attached_input_width(terminal)?;
-                        AttachedView::edit_input(&mut attached.input, key, width);
-                    } else {
-                        state.handle_scroll(key);
-                        state.edit_input(key);
-                    }
-                    draw(terminal, state)?;
                 }
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press
                     && state.attached.is_some() =>
@@ -851,6 +862,9 @@ fn draw<'a, B: ratatui::backend::Backend>(
             .as_ref()
             .map(|background| background.running())
             .unwrap_or_default();
+        // Clamp cursor so it never points past the end (tasks may have
+        // completed since the last render).
+        state.task_cursor = state.task_cursor.min(running.len().saturating_sub(1));
         // Panel open: full list. Panel closed but tasks running: a one-line
         // hint so background work never goes completely unnoticed.
         const OUTPUT_LINES: usize = 8;
@@ -936,7 +950,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
                 let mut style = Style::default()
                     .fg(SOLARIZED_LIGHT.muted)
                     .bg(SOLARIZED_LIGHT.panel);
-                if index == state.task_cursor && attachable(task.id) {
+                if index == state.task_cursor {
                     style = Style::default()
                         .fg(SOLARIZED_LIGHT.text)
                         .bg(SOLARIZED_LIGHT.selection)
@@ -965,7 +979,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
             frame.render_widget(
                 Paragraph::new(lines)
                     .style(SOLARIZED_LIGHT.panel_style())
-                    .block(SOLARIZED_LIGHT.block("tasks (F2 hide  ↑↓ attach  x cancel)")),
+                    .block(SOLARIZED_LIGHT.block("tasks (F2 hide  ↑↓ attach  Ctrl-C/x cancel)")),
                 tasks_bar,
             );
         }
@@ -1693,6 +1707,19 @@ enum ActiveStreamLane {
     Content,
 }
 
+/// Outcome of processing a key press while the tasks panel is open.
+/// Shared by the idle and drive event loops so the routing logic is
+/// tested once instead of duplicated.
+#[derive(Debug, PartialEq, Eq)]
+enum PanelAction {
+    /// Esc or F2: close the panel.
+    ClosePanel,
+    /// `x` or Ctrl-C: cancel the selected task.
+    CancelTask,
+    /// Key was not a panel action; caller should fall through.
+    Passthrough,
+}
+
 impl TuiState {
     fn from_history(entries: &[SessionEntry]) -> Self {
         let mut state = Self::default();
@@ -1978,6 +2005,9 @@ impl TuiState {
             .as_ref()
             .map(|background| background.running())
             .unwrap_or_default();
+        // Clamp cursor before any navigation: tasks may have finished since
+        // the last key press, leaving the cursor past the end.
+        self.task_cursor = self.task_cursor.min(running.len().saturating_sub(1));
         match key.code {
             KeyCode::Up => {
                 self.task_cursor = self.task_cursor.saturating_sub(1);
@@ -2001,25 +2031,46 @@ impl TuiState {
         Some(task.id)
     }
 
-    /// `x` in the tasks panel cancels the selected background task, unless it
-    /// is an attachable subagent session (those steer through their own view).
+    /// `x` / Ctrl-C in the tasks panel cancels the selected background task.
     fn cancel_selected_task(&mut self) {
         let running = self
             .background
             .as_ref()
             .map(|background| background.running())
             .unwrap_or_default();
-        let Some(task) = running.get(self.task_cursor.min(running.len().saturating_sub(1))) else {
+        let index = self.task_cursor.min(running.len().saturating_sub(1));
+        let Some(task) = running.get(index) else {
             return;
         };
-        if self.attachable.as_ref().is_some_and(|probe| probe(task.id)) {
-            return;
-        }
         if let Some(label) = self.background.as_ref().and_then(|b| b.cancel(task.id)) {
             self.push_line(
                 format!("cancelled task #{}: {}", task.id, label),
                 LineKind::Dim,
             );
+        }
+        // Clamp cursor after removal so it never points past the end.
+        let len = self
+            .background
+            .as_ref()
+            .map(|b| b.running().len())
+            .unwrap_or(0);
+        self.task_cursor = self.task_cursor.min(len.saturating_sub(1));
+    }
+
+    /// Process a non-navigation key while the tasks panel is open.
+    /// Returns the action taken; the caller dispatches side effects
+    /// (attach, edit input, draw) that are not part of the panel state.
+    fn handle_panel_key(&mut self, key: KeyEvent) -> PanelAction {
+        match key.code {
+            KeyCode::F(2) | KeyCode::Esc => {
+                self.show_tasks = false;
+                PanelAction::ClosePanel
+            }
+            _ if key.code == KeyCode::Char('x') || is_cancel(key) => {
+                self.cancel_selected_task();
+                PanelAction::CancelTask
+            }
+            _ => PanelAction::Passthrough,
         }
     }
 
@@ -3537,6 +3588,191 @@ mod tests {
             !text.contains("[] sleep 5"),
             "bash row has no empty role tag"
         );
+    }
+
+    #[tokio::test]
+    async fn tasks_panel_selection_highlight_shows_on_non_attachable_task() {
+        // Every selected task row uses SOLARIZED_LIGHT.selection as the
+        // background, regardless of attachability (the old guard only
+        // highlighted attachable tasks).
+        let (_, mut background) =
+            crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        background.set_event_sender(sender);
+        for label in ["task-alpha", "task-beta"] {
+            background
+                .spawn_with_id(
+                    label.into(),
+                    None,
+                    None,
+                    None,
+                    |_| {},
+                    || async { std::future::pending::<String>().await },
+                )
+                .unwrap();
+        }
+        let mut state = TuiState {
+            background: Some(background),
+            show_tasks: true,
+            task_cursor: 0,
+            ..Default::default()
+        };
+
+        let backend = ratatui::backend::TestBackend::new(50, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw(&mut terminal, &mut state).unwrap();
+
+        let buf = terminal.backend().buffer();
+        // tasks_bar starts at y=6 (height 5); block inner starts at (1, 7).
+        // Header is at y=7, task rows at y=8 (cursor=0) and y=9.
+        assert_eq!(
+            buf[(1, 8)].bg,
+            SOLARIZED_LIGHT.selection,
+            "selected task row has selection background"
+        );
+        assert_eq!(
+            buf[(1, 9)].bg,
+            SOLARIZED_LIGHT.panel,
+            "non-selected task row keeps panel background"
+        );
+
+        // Same selection for cursor=1 (second task).
+        state.task_cursor = 1;
+        draw(&mut terminal, &mut state).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf[(1, 9)].bg,
+            SOLARIZED_LIGHT.selection,
+            "cursor=1 highlights the second task"
+        );
+        assert_eq!(
+            buf[(1, 8)].bg,
+            SOLARIZED_LIGHT.panel,
+            "non-selected first task keeps panel background"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_selected_task_cancels_any_task_and_clamps_cursor() {
+        // cancel_selected_task must remove the task at cursor even when the
+        // attachable probe returns true for that id, then clamp cursor.
+        let (_, mut background) =
+            crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        background.set_event_sender(sender);
+
+        // Three never-finishing tasks (ids 1, 2, 3).
+        for _ in 0..3 {
+            background
+                .spawn_with_id(
+                    "task".into(),
+                    None,
+                    None,
+                    None,
+                    |_| {},
+                    || async { std::future::pending::<String>().await },
+                )
+                .unwrap();
+        }
+        let running = background.running();
+        assert_eq!(running.len(), 3);
+        let task2_id = running[1].id; // middle task
+
+        // Attachable probe returns true for task2_id specifically.
+        let mut state = TuiState {
+            background: Some(background),
+            task_cursor: 1,
+            ..Default::default()
+        };
+        state.attachable = Some(Box::new(move |id| id == task2_id));
+
+        // Cancel the attachable task — should succeed despite the probe.
+        state.cancel_selected_task();
+        tokio::task::yield_now().await; // let spawned task abort settle
+
+        let updated = state
+            .background
+            .as_ref()
+            .map(|b| b.running())
+            .unwrap_or_default();
+        assert_eq!(
+            updated.len(),
+            2,
+            "cancelled attachable task was removed from registry"
+        );
+        assert!(
+            !updated.iter().any(|t| t.id == task2_id),
+            "task {task2_id} was cancelled"
+        );
+        // Cursor clamped to min(1, 2-1) = 1 (still valid).
+        assert_eq!(state.task_cursor, 1);
+
+        // Cancel the last task: cursor should clamp downward.
+        state.task_cursor = 1;
+        let last_id = state
+            .background
+            .as_ref()
+            .map(|b| b.running())
+            .unwrap_or_default()[1]
+            .id;
+        state.cancel_selected_task();
+        tokio::task::yield_now().await;
+
+        let remaining = state
+            .background
+            .as_ref()
+            .map(|b| b.running())
+            .unwrap_or_default();
+        assert_eq!(remaining.len(), 1);
+        assert!(!remaining.iter().any(|t| t.id == last_id));
+        // Cursor clamped from 1 to min(1, 1-1) = 0.
+        assert_eq!(state.task_cursor, 0);
+
+        // Cancel the last remaining task: cursor stays at 0 (empty list).
+        state.cancel_selected_task();
+        tokio::task::yield_now().await;
+        let empty = state
+            .background
+            .as_ref()
+            .map(|b| b.running())
+            .unwrap_or_default();
+        assert!(empty.is_empty());
+        assert_eq!(state.task_cursor, 0, "cursor at 0 when list is empty");
+    }
+
+    #[test]
+    fn handle_panel_key_routes_x_ctrl_c_esc_f2() {
+        let mut state = TuiState {
+            show_tasks: true,
+            ..Default::default()
+        };
+
+        // Ctrl-C → CancelTask (does not close panel).
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(state.handle_panel_key(ctrl_c), PanelAction::CancelTask);
+        assert!(state.show_tasks, "CancelTask does not close panel");
+
+        // x → CancelTask.
+        let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty());
+        assert_eq!(state.handle_panel_key(x), PanelAction::CancelTask);
+        assert!(state.show_tasks);
+
+        // Esc → ClosePanel.
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
+        assert_eq!(state.handle_panel_key(esc), PanelAction::ClosePanel);
+        assert!(!state.show_tasks, "ClosePanel hides the panel");
+
+        // F2 → ClosePanel.
+        state.show_tasks = true;
+        let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::empty());
+        assert_eq!(state.handle_panel_key(f2), PanelAction::ClosePanel);
+        assert!(!state.show_tasks);
+
+        // Plain character → Passthrough (panel stays open).
+        state.show_tasks = true;
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
+        assert_eq!(state.handle_panel_key(a), PanelAction::Passthrough);
+        assert!(state.show_tasks, "Passthrough leaves the panel open");
     }
 
     #[test]
