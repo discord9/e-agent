@@ -722,7 +722,14 @@ impl Tool for Delegate {
         let result = match tokio::time::timeout(SYNC_TIMEOUT, done_rx).await {
             Ok(Ok(answer)) => Ok(answer),
             Ok(Err(_)) => Err("subagent result channel closed".into()),
-            Err(_) => Err("subagent timed out after 30 minutes".into()),
+            Err(_) => {
+                // Timed out: cancel the subagent thread so it stops instead
+                // of running on as an orphan (same as a dropped turn).
+                if let Some(handle) = cancel_guard.handle.take() {
+                    handle.cancel();
+                }
+                Err("subagent timed out after 30 minutes".into())
+            }
         };
         cancel_guard.disarm();
         result
