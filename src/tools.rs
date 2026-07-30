@@ -77,6 +77,9 @@ fn tools_with_background_and_exa_key(
     sandbox: Option<crate::config::Sandbox>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools = file_tools(&workspace);
+    tools.push(Box::new(GetBackgroundTasks {
+        background: background.clone(),
+    }));
     tools.push(bash_tool(workspace, background, sandbox));
     if let Some(key) = exa_api_key
         .map(|key| key.trim().to_owned())
@@ -116,6 +119,40 @@ pub fn bash_tool(
         background,
         sandbox,
     })
+}
+
+struct GetBackgroundTasks {
+    background: BackgroundTasks,
+}
+
+#[async_trait]
+impl Tool for GetBackgroundTasks {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "get_background_tasks".into(),
+            description: "List currently running background tasks with their labels and roles."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    async fn execute(&self, _arguments: Value) -> Result<String, String> {
+        let tasks = self.background.running();
+        if tasks.is_empty() {
+            return Ok("No background tasks running.".into());
+        }
+        let mut out = format!("{} background task(s) running:\n", tasks.len());
+        for task in tasks.iter() {
+            let role = task.role.as_deref().unwrap_or(&task.kind);
+            out.push_str(&format!("#{}: {} ({})\n", task.id, task.label, role));
+        }
+        out.truncate(out.trim_end().len());
+        Ok(out)
+    }
 }
 
 struct WebSearch {
@@ -537,6 +574,8 @@ pub struct BackgroundTaskInfo {
     pub id: u64,
     pub label: String,
     pub role: Option<String>,
+    /// "bash" for background shell commands, "delegate" for subagent tasks.
+    pub kind: String,
     /// Combined stdout/stderr tail so far; empty for non-bash tasks.
     pub output: Vec<u8>,
 }
@@ -568,6 +607,11 @@ impl BackgroundTasks {
                 id: task.id,
                 label: task.label.clone(),
                 role: task.role.clone(),
+                kind: if task.output.is_some() {
+                    "bash".into()
+                } else {
+                    "delegate".into()
+                },
                 output: task
                     .output
                     .as_ref()
@@ -1161,6 +1205,7 @@ mod tests {
             "read_file".to_string(),
             "write_file".to_string(),
             "edit_file".to_string(),
+            "get_background_tasks".to_string(),
             "bash".to_string(),
         ];
         for key in [None, Some("   ".into())] {
@@ -1172,7 +1217,15 @@ mod tests {
         let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
         assert_eq!(
             names,
-            ["read_file", "write_file", "edit_file", "bash", "web_search"].map(String::from)
+            [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "get_background_tasks",
+                "bash",
+                "web_search"
+            ]
+            .map(String::from)
         );
     }
 
@@ -1835,6 +1888,130 @@ mod tests {
                 .unwrap()
                 .success(),
             "background child survived cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_background_tasks_lists_running_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+        let background = bash.background.clone();
+        let tool = GetBackgroundTasks {
+            background: background.clone(),
+        };
+
+        // No tasks running initially.
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap(),
+            "No background tasks running."
+        );
+
+        // Start a background task (id=1).
+        bash.execute(json!({"command": "echo hello; sleep 30", "background": true}))
+            .await
+            .unwrap();
+        let mut tasks = background.running();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, 1);
+        assert_eq!(tasks[0].kind, "bash");
+
+        // The tool reports the running task with correct id, label, and role.
+        let output = tool.execute(json!({})).await.unwrap();
+        assert_eq!(
+            output,
+            "1 background task(s) running:\n#1: echo hello; sleep 30 (bash)"
+        );
+
+        // Start a second background task (id=2).
+        bash.execute(json!({"command": "echo world; sleep 30", "background": true}))
+            .await
+            .unwrap();
+        tasks = background.running();
+        assert_eq!(tasks.len(), 2);
+
+        // Both tasks display with their actual ids, not list positions.
+        let output = tool.execute(json!({})).await.unwrap();
+        assert_eq!(
+            output,
+            "2 background task(s) running:\n#1: echo hello; sleep 30 (bash)\n#2: echo world; sleep 30 (bash)"
+        );
+
+        // Cancel the first task (id=1).
+        background.cancel(1);
+        let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+
+        // The remaining task (id=2) still shows as #2, NOT renumbered to #1.
+        let output = tool.execute(json!({})).await.unwrap();
+        assert_eq!(
+            output,
+            "1 background task(s) running:\n#2: echo world; sleep 30 (bash)"
+        );
+
+        // Cleanup.
+        background.cancel(2);
+        let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap(),
+            "No background tasks running."
+        );
+    }
+
+    #[tokio::test]
+    async fn get_background_tasks_shows_delegate_tasks_as_delegate_not_bash() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bash, _receiver) = background_bash(&temp, Duration::from_secs(10));
+        let background = bash.background.clone();
+
+        let tool = GetBackgroundTasks {
+            background: background.clone(),
+        };
+
+        // Spawn a delegate-style task (no role, no output slot) via spawn().
+        background
+            .spawn(
+                "search codebase".into(),
+                None, // role
+                None, // process_group
+                || async { "done".into() },
+            )
+            .unwrap();
+
+        let output = tool.execute(json!({})).await.unwrap();
+        // Delegate tasks without a role show their kind ("delegate") instead
+        // of being mislabeled as "bash".
+        assert_eq!(
+            output,
+            "1 background task(s) running:\n#1: search codebase (delegate)"
+        );
+
+        let tasks = background.running();
+        assert_eq!(tasks[0].kind, "delegate");
+    }
+
+    #[tokio::test]
+    async fn get_background_tasks_shows_roled_delegate_with_role_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bash, _receiver) = background_bash(&temp, Duration::from_secs(10));
+        let background = bash.background.clone();
+
+        let tool = GetBackgroundTasks {
+            background: background.clone(),
+        };
+
+        // A delegate with a known role (e.g. "explorer").
+        background
+            .spawn(
+                "search the logs".into(),
+                Some("explorer".into()),
+                None,
+                || async { "done".into() },
+            )
+            .unwrap();
+
+        let output = tool.execute(json!({})).await.unwrap();
+        assert_eq!(
+            output,
+            "1 background task(s) running:\n#1: search the logs (explorer)"
         );
     }
 }
