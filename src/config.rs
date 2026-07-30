@@ -114,7 +114,10 @@ impl Config {
     pub fn resolve(&self, requested_profile: Option<&str>) -> anyhow::Result<ResolvedModel> {
         let profile = requested_profile
             .or(self.default.as_deref())
-            .ok_or_else(|| anyhow!("config requires `default` or --profile PROFILE"))?;
+            .or_else(|| self.roles.get("main").map(String::as_str))
+            .ok_or_else(|| {
+                anyhow!("config requires `default`, `[roles] main`, or --profile PROFILE")
+            })?;
         self.resolve_profile(profile)
     }
 
@@ -371,6 +374,54 @@ reasoning_effort = "max"
         assert_eq!(resolved.display, "kimi/k3");
         assert_eq!(resolved.api_key, "key");
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn roles_main_falls_back_when_no_default() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("key"), "key").unwrap();
+        let path = write_config(
+            temp.path(),
+            r#"
+[providers.kimi]
+base_url = "https://api.kimi.com/coding/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[roles]
+main = "kimi/k3"
+subagent = "kimi/k3"
+"#,
+        );
+        let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
+        assert_eq!(resolved.model, "k3");
+        assert_eq!(resolved.display, "kimi/k3");
+    }
+
+    #[test]
+    fn explicit_default_wins_over_roles_main() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("key"), "key").unwrap();
+        let path = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k2"
+[providers.kimi]
+base_url = "https://api.kimi.com/coding/v1"
+api_key_file = "key"
+[models."kimi/k2"]
+model = "k2"
+[models."kimi/k3"]
+model = "k3"
+[roles]
+main = "kimi/k3"
+"#,
+        );
+        let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
+        assert_eq!(
+            resolved.model, "k2",
+            "explicit default wins over [roles] main"
+        );
     }
 
     #[test]
