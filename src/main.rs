@@ -91,6 +91,17 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     let mut port = None;
     let mut prompt = Vec::new();
     let read_only = read_only_requested(&raw_arguments);
+    let mut raw_arguments = raw_arguments;
+    // `e-agent web` subcommand: a first non-empty positional "web" selects
+    // headless serve mode, equivalent to `--serve`.
+    if let Some(position) = raw_arguments
+        .iter()
+        .position(|argument| !argument.is_empty())
+        && raw_arguments[position] == "web"
+    {
+        raw_arguments.remove(position);
+        serve_mode = true;
+    }
     let mut arguments = raw_arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -117,9 +128,9 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             "--repl" => repl_mode = true,
             "--serve" => serve_mode = true,
             "--host" => host = Some(next_value(&mut arguments, "--host")?),
-            "--port" => {
+            "--port" | "-p" => {
                 port = Some(
-                    next_value(&mut arguments, "--port")?
+                    next_value(&mut arguments, &argument)?
                         .parse::<u16>()
                         .context("--port must be a number between 0 and 65535")?,
                 )
@@ -127,7 +138,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             "--read-only" => {} // consumed via read_only_requested above
             "--help" | "-h" => {
                 println!(
-                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent --serve [--host ADDR] [--port PORT] [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--read-only]\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--fork SESSION] [--at N] [--max-rounds N] [--read-only] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup);\npass --fork <id> to start a new session from a completed turn of an existing one\n(--at N forks at the N-th entry, 1-based and inclusive, and must be a turn boundary);\n--read-only applies the read-only role policy to the main session only (no write/edit tools, no MCP tools, narrowed bash sandbox); delegated subagents keep their full default toolset and can write — give their role template read_only = true to make them read-only too;\n--serve runs a headless HTTP server (default http://127.0.0.1:8766) with a token-authenticated /api and a web UI"
+                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent --serve [--host ADDR] [--port PORT] [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--read-only]\n       e-agent web [-p PORT] [--host ADDR] [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--read-only]\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--fork SESSION] [--at N] [--max-rounds N] [--read-only] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup);\npass --fork <id> to start a new session from a completed turn of an existing one\n(--at N forks at the N-th entry, 1-based and inclusive, and must be a turn boundary);\n--read-only applies the read-only role policy to the main session only (no write/edit tools, no MCP tools, narrowed bash sandbox); delegated subagents keep their full default toolset and can write — give their role template read_only = true to make them read-only too;\nthe web subcommand starts a headless HTTP server (default http://127.0.0.1:8766);\n--serve runs a headless HTTP server (default http://127.0.0.1:8766) with a token-authenticated /api and a web UI"
                 );
                 return Ok(());
             }
