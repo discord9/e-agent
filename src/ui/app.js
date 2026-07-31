@@ -5,6 +5,10 @@
    导致移动/桌面浏览器滚动卡死。 */
 const HISTORY_PAGE = 200;
 
+/* 输入框默认 placeholder；applyStatus 在 Finished 之外的状态恢复它
+   （openSession 每次 applyStatus("Idle") 都会重置输入区）。 */
+const PROMPT_PLACEHOLDER = "输入消息：Enter 发送，Shift+Enter 换行…";
+
 /* =====================================================================
  * 全局状态
  * ===================================================================*/
@@ -38,6 +42,7 @@ const state = {
     panelTimer: null,        // 侧边栏打开时的任务列表刷新（2s）
     cancelling: new Set(),   // 正在取消的任务 id（防重复点击）
   },
+  renameActive: false,       // 行内重命名进行中：列表页 1s 轮询重绘跳过，防编辑框被冲掉
 };
 
 /* 常用 DOM 引用 */
@@ -252,13 +257,16 @@ function maybeHandleDeepLink(list) {
 }
 
 function renderSessionList(list) {
+  // 行内重命名进行中：跳过本轮重绘（列表页轮询 1s 一次，会冲掉编辑框）；
+  // 保存/取消后由 enterRename 清除标志并自行重绘
+  if (state.renameActive) return;
   state.lastList = Array.isArray(list) ? list : [];
   let rows = state.lastList;
   if (state.searchQuery) {
     const q = state.searchQuery;
     rows = rows.filter((s) => {
-      // 对 id / model / parent_session_id 子串匹配，大小写不敏感
-      const hay = [s.id, s.model, s.parent_session_id]
+      // 对 id / title / model / parent_session_id 子串匹配，大小写不敏感
+      const hay = [s.id, s.title, s.model, s.parent_session_id]
         .map((v) => String(v || "").toLowerCase());
       return hay.some((h) => h.includes(q));
     });
@@ -282,6 +290,13 @@ function renderSessionList(list) {
 
     const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
     const sid = el("span", "sid", s.id);   // 完整 ID：用户需要知道是哪个会话
+    const edit = el("button", "tree-edit", "✎");
+    edit.type = "button";
+    edit.title = "重命名";
+    edit.addEventListener("click", (ev) => {
+      ev.stopPropagation();                // 不触发打开会话
+      enterRename(sid, s, () => { renderSessionList(state.lastList); });
+    });
     const chip = el("span", "status-chip " + statusChipClass(s.status), statusLabel(s.status));
     const model = el("span", "smodel", s.model || "");
     const meta = el("span", "smeta",
@@ -305,7 +320,7 @@ function renderSessionList(list) {
       if (inactive) { resumeSession(s.id); return; }
       openSession(s.id);
     });
-    row.append(dot, sid, chip, model, meta, del);
+    row.append(dot, sid, edit, chip, model, meta, del);
     els.sessionList.appendChild(row);
   }
 }
@@ -758,7 +773,18 @@ function applyStatus(status) {
   const busy = state.status === "Busy" || state.status === "Compacting";
   els.cancelBtn.disabled = !busy;         // Busy/Compacting 时可取消
   els.compactBtn.disabled = busy;         // 空闲时才压缩
-  els.sendBtn.disabled = false;           // 允许排队输入
+  // Finished：会话不再接受输入，禁用输入区（busy 的 subagent 仍可排队输入）
+  const finished = !!state.status && state.status.startsWith("Finished");
+  els.sendBtn.disabled = finished;
+  els.promptInput.disabled = finished;
+  if (finished) {
+    const s = (state.lastList || []).find((x) => x.id === state.sessionId);
+    els.promptInput.placeholder = s && s.parent_session_id
+      ? "子任务已结束，无法继续发送"
+      : "会话已结束";
+  } else {
+    els.promptInput.placeholder = PROMPT_PLACEHOLDER;  // 恢复默认（openSession 每次 applyStatus("Idle") 已重置）
+  }
   // 回合结束（回到 Idle）：流式 delta 期间是纯文本（快），此刻用完整
   // 文本重算一次 markdown，让表格/代码块/公式正确渲染；同时停思考动画。
   if (!busy && state.acc) {
@@ -1126,6 +1152,7 @@ function saveSessionState() {
 
 function openSession(id) {
   saveSessionState();          // 切走：保存当前会话（消息/滚动/分页/草稿）
+  state.renameActive = false;  // 切换会话会销毁编辑框：清标志，恢复轮询重绘
   stopSSE();
   state.sessionId = id;
   state.view = "chat";
@@ -1178,6 +1205,7 @@ function openSession(id) {
 
 function backToList() {
   saveSessionState();          // 返回列表也保存视图状态：再次打开该会话时恢复
+  state.renameActive = false;  // 同 openSession：视图切换即销毁编辑框
   stopSSE();
   state.sessionId = null;
   state.view = "list";
@@ -1198,6 +1226,12 @@ async function sendPrompt() {
   const text = els.promptInput.value.trim();
   if (!text || !state.sessionId) return;
   if (!state.token) { setBanner("⚠ 请先输入 Token。", true); return; }
+  // 防御：Finished 会话的按钮/输入框已被 applyStatus 禁用，这里再挡一道，
+  // 避免陈旧状态或直接调用时对 finished 会话发出 409
+  if (state.status && state.status.startsWith("Finished")) {
+    setBanner("⚠ 会话已结束，无法发送消息。", true);
+    return;
+  }
   els.promptInput.value = "";
   autosizeInput();
   try {
@@ -1507,8 +1541,15 @@ function buildTreeRoot(s, kids) {
   const title = s.title || shortId(s.id);
   const titleEl = el("span", "tree-id", title);
   titleEl.title = s.title || s.id;        // 完整 title（无 title 时回退完整 id）
+  const edit = el("button", "tree-edit", "✎");
+  edit.type = "button";
+  edit.title = "重命名";
+  edit.addEventListener("click", (ev) => {
+    ev.stopPropagation();                  // 不触发切换会话
+    enterRename(titleEl, s, () => { renderSidebarTree(true); });
+  });
   const count = el("span", "tree-count", (s.entry_count ?? 0) + " 条");
-  row.append(toggle, dot, titleEl, count);
+  row.append(toggle, dot, titleEl, edit, count);
   row.title = (s.title || s.id) + (s.model ? " · " + s.model : "") + (s.busy ? "（处理中）" : "");
   row.addEventListener("click", () => {
     if (s.active === false) { resumeSession(s.id); return; }   // 与列表页一致：历史会话先恢复
@@ -1556,8 +1597,17 @@ function renderTreeChildren(container, kids) {
     const title = k.title || shortId(k.id);
     const titleEl = el("span", "tree-id", title);
     titleEl.title = k.title || k.id;
+    const edit = el("button", "tree-edit", "✎");
+    edit.type = "button";
+    edit.title = "重命名";
+    edit.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      enterRename(titleEl, k, () => { renderSidebarTree(true); });
+    });
     const badge = el("span", "child-badge", "子");
-    row.append(dot, titleEl, badge);
+    row.append(dot, titleEl, edit, badge);
+    // busy 的 subagent：title 提示可发送消息（点击行 openSession 是现有行为，保持不变）
+    row.title = (k.title || k.id) + (k.busy ? "（处理中）· 可发送消息" : "");
     row.addEventListener("click", () => {
       if (k.active === false) { resumeSession(k.id); return; }
       openSession(k.id);
@@ -1594,6 +1644,94 @@ function buildTreeGroup(label, kids) {
   renderTreeChildren(children, kids);
   node.appendChild(children);
   return node;
+}
+
+/* =====================================================================
+ * 会话重命名（✎ → PUT /api/sessions/{id}/title）
+ * 侧边栏树节点与列表页行共用 enterRename：点击 ✎ 后标题文本原位换成
+ * <input> + ✓/×，box 上的点击 stopPropagation 屏蔽行点击（打开会话）。
+ * Enter 保存、Esc 取消；空输入保存 = 清除标题（树/列表回退显示 id）。
+ * 旧服务器没有该端点：404/405/409 统一提示「服务器不支持重命名」。
+ * 失败提示走顶部 banner（setBanner，与应用其余错误一致）而非行内红字：
+ * 实现简单、不打断编辑流程——编辑框保留，可改完重试。
+ * ===================================================================*/
+function enterRename(titleEl, s, afterSave) {
+  const box = el("span", "rename-box");
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "rename-input";
+  input.value = s.title || "";
+  input.spellcheck = false;
+  input.title = "Enter 保存，Esc 取消；留空保存 = 清除标题";
+  const save = el("button", "rename-save", "✓");
+  save.type = "button";
+  save.title = "保存";
+  const cancel = el("button", "rename-cancel", "×");
+  cancel.type = "button";
+  cancel.title = "取消";
+  box.append(input, save, cancel);
+  titleEl.replaceWith(box);
+
+  // 编辑态内的任何点击都不冒泡到行（行点击 = 打开会话）
+  box.addEventListener("click", (ev) => ev.stopPropagation());
+
+  const leave = () => {
+    state.renameActive = false;
+    box.replaceWith(titleEl);   // 取消：恢复原标题元素（若已随重绘 detached，安全无操作）
+  };
+
+  const doSave = async () => {
+    const val = input.value.trim();
+    input.disabled = true;      // 防重复提交
+    // 树 DOM 可能持有轮询前旧数组里的对象引用（列表数据未变时 renderSidebarTree
+    // 被签名跳过、不重绘，但 state.lastList 每次轮询都是新数组）：保存时按 id
+    // 从 state.lastList 重新解析，确保写回的是当前渲染所用的对象
+    const cur = (state.lastList || []).find((x) => x.id === s.id) || s;
+    const ok = await saveTitle(cur, val);
+    if (!ok) { input.disabled = false; input.focus(); return; }   // 失败：保留编辑框可重试
+    state.renameActive = false;
+    afterSave();                // 成功：调用方重绘（树 renderSidebarTree(true) / 列表 renderSessionList）
+  };
+
+  save.addEventListener("click", () => doSave());
+  cancel.addEventListener("click", () => leave());
+  input.addEventListener("keydown", (ev) => {
+    ev.stopPropagation();       // 不冒泡：Esc 不触发关侧边栏等全局处理
+    if (ev.key === "Enter") { ev.preventDefault(); doSave(); }
+    else if (ev.key === "Escape") { ev.preventDefault(); leave(); }
+  });
+  input.focus();
+  input.select();
+  state.renameActive = true;    // 编辑期间列表页轮询重绘跳过，避免编辑框被冲掉
+}
+
+/* PUT 保存标题；成功写回传入的会话对象（即 state.lastList 里的对象，
+   空=清除 → null，树/列表回退显示 id）。返回是否成功（false 时调用方
+   保留编辑框）。 */
+async function saveTitle(s, newTitle) {
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(s.id) + "/title",
+      { method: "PUT", body: JSON.stringify({ title: newTitle }) });
+    if (res.status === 401 || res.status === 403) {
+      setBanner("⚠ 认证失败：请检查 Token。");
+      return false;
+    }
+    if (!res.ok) {
+      // 旧服务器没有 title 端点：axum 对未知路径回 404、对已知路径错方法回 405；
+      // 409 归入同一类，统一提示不支持重命名
+      if (res.status === 404 || res.status === 405 || res.status === 409) {
+        setBanner("⚠ 服务器不支持重命名。", true);
+      } else {
+        setBanner("⚠ 重命名失败：HTTP " + res.status, true);
+      }
+      return false;
+    }
+    s.title = newTitle || null;
+    return true;
+  } catch (e) {
+    setBanner("⚠ 重命名失败：" + e.message, true);
+    return false;
+  }
 }
 
 function stopTasksPanelPolling() {
