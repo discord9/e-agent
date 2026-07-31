@@ -185,6 +185,10 @@ fn task_label(label: Option<&str>, role: Option<&str>, task: &str) -> String {
 struct DelegatedTask {
     task: String,
     role_prompt: Option<String>,
+    /// True when the role's frontmatter declared `read_only = true` (or the
+    /// caller's policy demands it): the subagent gets no write/edit tools and
+    /// its bash runs in a narrowed read-only sandbox with network disabled.
+    read_only: bool,
     sandbox: Option<crate::config::Sandbox>,
 }
 
@@ -252,6 +256,14 @@ impl Delegate {
         self
     }
 
+    /// Narrow the inherited bwrap policy for a read-only role: workspace
+    /// read-only, extra writable roots dropped, network disabled. `None`
+    /// (sandbox disabled / bwrap unavailable) stays `None` — a read-only
+    /// role then gets no bash tool at all (fail closed).
+    fn read_only_sandbox(&self) -> Option<crate::config::Sandbox> {
+        self.sandbox.as_ref().map(crate::tools::read_only_sandbox)
+    }
+
     /// Record subagent background tasks in the parent session's record so a
     /// restart can warn about killed subagents alongside killed bash tasks.
     pub fn record_background_tasks_in(
@@ -303,7 +315,12 @@ impl Delegate {
             .read_to_string("AGENTS.md")
             .ok()
             .filter(|content| !content.trim().is_empty());
-        let tools = crate::tools::builtins_with_background(workspace, background, task.sandbox);
+        let tools = crate::tools::builtins_with_background(
+            workspace,
+            background,
+            task.sandbox,
+            task.read_only,
+        );
         let mut agent = Agent::new(Box::new(model), tools);
         if let Some(window) = context_window {
             agent.set_context_window(window);
@@ -316,6 +333,11 @@ impl Delegate {
                 "You are a subagent inside the e-agent coding assistant (running on the `{model_name}` model). Work autonomously on the delegated task with the file/bash tools and, when configured, public web search, then return a concise final answer."
             ),
         };
+        if task.read_only {
+            instructions.push_str(
+                "\n\nThis role is read-only: no write_file/edit_file; bash, when present, runs in a read-only sandbox with network disabled.",
+            );
+        }
         if let Some(content) = agents_instructions {
             instructions.push_str("\n\n## AGENTS.md\n\n");
             instructions.push_str(&content);
@@ -462,16 +484,18 @@ impl Tool for Delegate {
             .and_then(|args| args.get("role"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        // Resolve the role: its model ([roles] <role> > subagent > main) and
-        // its prompt template (.e-agent/agents/<role>.md). An unknown role is
-        // rejected unless no roles are configured at all.
-        let (model, context_window, role_prompt) = match role.as_deref() {
+        // Resolve the role: its model ([roles] <role> > subagent > main), its
+        // prompt template and read_only declaration
+        // (.e-agent/agents/<role>.md frontmatter). An unknown role is
+        // rejected unless no roles are configured at all; a malformed
+        // frontmatter is an error (fail closed — the role is not spawned).
+        let (model, context_window, role_prompt, read_only) = match role.as_deref() {
             Some(role) => {
                 let root = self
                     .roles_root
                     .as_deref()
                     .ok_or("roles are not configured (no workspace roles root)")?;
-                let prompt = crate::roles::role_prompt(root, role)
+                let template = crate::roles::role_template(root, role)
                     .map_err(|error| format!("cannot read role `{role}`: {error}"))?
                     .ok_or_else(|| {
                         let available = crate::roles::available_roles(root);
@@ -495,12 +519,13 @@ impl Tool for Delegate {
                     .copied()
                     .flatten()
                     .or(self.subagent_context_window);
-                (model, cw, Some(prompt))
+                (model, cw, Some(template.prompt), template.read_only)
             }
             None => (
                 self.subagent_model.clone(),
                 self.subagent_context_window,
                 None,
+                false,
             ),
         };
         let resume = arguments
@@ -615,6 +640,13 @@ impl Tool for Delegate {
             backend: self.persist_backend.clone(),
         };
         let session_id = persist.session_id.clone();
+        // Read-only roles run under a narrowed bwrap policy: the workspace is
+        // read-only, extra writable roots are dropped, network is disabled.
+        let task_sandbox = if read_only {
+            self.read_only_sandbox()
+        } else {
+            self.sandbox.clone()
+        };
         let (handle, runner_task) = Self::start_runner(
             model,
             context_window,
@@ -623,7 +655,8 @@ impl Tool for Delegate {
             DelegatedTask {
                 task,
                 role_prompt,
-                sandbox: self.sandbox.clone(),
+                read_only,
+                sandbox: task_sandbox,
             },
             persist,
             resume_entries,

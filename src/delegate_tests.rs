@@ -100,7 +100,7 @@ fn delegate_with_url(workspace: &std::path::Path, base_url: String) -> Delegate 
         crate::model::OpenAiModel::new(base_url, "test-key".into(), "test-model".into(), None)
             .unwrap(),
     );
-    let (_, background) = builtins(workspace.clone(), None);
+    let (_, background) = builtins(workspace.clone(), None, false);
     Delegate::new(model, workspace, background)
 }
 
@@ -221,7 +221,7 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     let workspace = Workspace::new(&root).unwrap();
-    let (_, mut background) = builtins(workspace, None);
+    let (_, mut background) = builtins(workspace, None, false);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(&root, false);
@@ -299,7 +299,7 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
 async fn background_cancel_before_first_yield_cleans_everything() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None);
+    let (_, mut background) = builtins(workspace, None, false);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(temp.path(), false);
@@ -361,7 +361,7 @@ async fn background_cancel_before_first_yield_cleans_everything() {
 async fn background_cancel_while_joining_aborts_inner_without_completion() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None);
+    let (_, mut background) = builtins(workspace, None, false);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(temp.path(), false);
@@ -424,7 +424,7 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
 async fn sync_cancel_cleans_session_and_closes_result_channel() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None);
+    let (_, mut background) = builtins(workspace, None, false);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(temp.path(), false);
@@ -474,7 +474,7 @@ async fn sync_cancel_cleans_session_and_closes_result_channel() {
 async fn panicking_inner_model_cleans_up_and_sends_one_failure_completion() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None);
+    let (_, mut background) = builtins(workspace, None, false);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(temp.path(), true);
@@ -557,6 +557,50 @@ async fn successful_model(answer: &str) -> String {
         stream.write_all(response.as_bytes()).await.unwrap();
     });
     format!("http://{address}")
+}
+
+/// Like `successful_model`, but also captures the full HTTP request body so
+/// tests can assert on the wire `tools` array and the system prompt.
+async fn capturing_model() -> (String, Arc<Mutex<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let received_body = request.len() - header_end;
+        let mut rest = vec![0; content_length - received_body];
+        stream.read_exact(&mut rest).await.unwrap();
+        request.extend_from_slice(&rest);
+        *captured_clone.lock().unwrap() = request;
+
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    (format!("http://{address}"), captured)
 }
 
 #[tokio::test]
@@ -695,7 +739,7 @@ fn resume_loads_the_previous_transcript_as_starting_context() {
 async fn spec_disallows_nested_delegation_by_design() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (tools, _) = builtins(workspace, None);
+    let (tools, _) = builtins(workspace, None, false);
     let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
     assert!(!names.contains(&"delegate".to_owned()));
     assert!(names.contains(&"bash".to_owned()));
@@ -745,6 +789,140 @@ async fn role_requires_a_roles_root_and_a_known_role() {
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
 }
 
+/// Run one subagent through a capturing mock model and return the wire
+/// request body (tools array + system prompt) plus the tool result.
+async fn run_subagent_and_capture(
+    temp: &tempfile::TempDir,
+    role_template: &str,
+    with_sandbox: bool,
+) -> (String, String) {
+    let directory = temp.path().join("agents");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("auditor.md"), role_template).unwrap();
+
+    let (url, captured) = capturing_model().await;
+    let mut tool = delegate_with_url(temp.path(), url).with_roles_root(temp.path().to_path_buf());
+    if with_sandbox {
+        tool = tool.with_sandbox(Some(crate::config::Sandbox {
+            enabled: true,
+            network: true,
+            workspace_writable: true,
+            writable_paths: vec!["/mnt/big/cargo-home".into()],
+            readable_paths: vec!["~/.rustup".into()],
+        }));
+    }
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+
+    let output = tool
+        .execute(json!({"task": "audit", "role": "auditor", "background": false}))
+        .await
+        .unwrap();
+    let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    (output, request)
+}
+
+#[tokio::test]
+// Test-only env isolation: the std Mutex guard is held across .execute()
+// awaits to serialize XDG_CONFIG_HOME mutation with roles.rs tests.
+#[allow(clippy::await_holding_lock)]
+async fn read_only_role_subagent_gets_no_write_tools_and_a_read_only_system_note() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg-empty");
+    std::fs::create_dir_all(&xdg).unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+    let (output, request) = run_subagent_and_capture(
+        &temp,
+        "---\nread_only = true\n---\nAudit the workspace and report.\n",
+        false,
+    )
+    .await;
+    assert!(output.contains("done"), "{output}");
+
+    // Tool list: no write/edit; no bash either (fail closed: the delegate
+    // inherits no sandbox policy in these tests).
+    assert!(request.contains("\"read_file\""), "{request}");
+    assert!(!request.contains("\"write_file\""), "{request}");
+    assert!(!request.contains("\"edit_file\""), "{request}");
+    assert!(!request.contains("\"bash\""), "{request}");
+    assert!(
+        request.contains("get_background_tasks") && request.contains("cancel_background_task"),
+        "{request}"
+    );
+    // The system prompt carries the read-only declaration.
+    assert!(
+        request.contains(
+            "This role is read-only: no write_file/edit_file; bash, when present, runs in a read-only sandbox with network disabled."
+        ),
+        "{request}"
+    );
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+#[tokio::test]
+// Test-only env isolation: the std Mutex guard is held across .execute()
+// awaits to serialize XDG_CONFIG_HOME mutation with roles.rs tests.
+#[allow(clippy::await_holding_lock)]
+async fn read_only_role_subagent_keeps_bash_when_a_sandbox_is_configured() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg-empty");
+    std::fs::create_dir_all(&xdg).unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+    let (output, request) = run_subagent_and_capture(
+        &temp,
+        "---\nread_only = true\n---\nAudit the workspace and report.\n",
+        true,
+    )
+    .await;
+    assert!(output.contains("done"), "{output}");
+
+    assert!(request.contains("\"read_file\""), "{request}");
+    assert!(!request.contains("\"write_file\""), "{request}");
+    assert!(!request.contains("\"edit_file\""), "{request}");
+    assert!(request.contains("\"bash\""), "{request}");
+    // The sandboxed bash description reflects the narrowed read-only policy.
+    assert!(
+        request.contains("workspace is read-only") && request.contains("network is disabled"),
+        "{request}"
+    );
+    assert!(
+        request.contains("~/.rustup"),
+        "readable roots survive into the subagent's sandbox description: {request}"
+    );
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+#[tokio::test]
+// Test-only env isolation: the std Mutex guard is held across .execute()
+// awaits to serialize XDG_CONFIG_HOME mutation with roles.rs tests.
+#[allow(clippy::await_holding_lock)]
+async fn ordinary_role_keeps_write_tools_without_the_read_only_note() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg-empty");
+    std::fs::create_dir_all(&xdg).unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+    let (output, request) = run_subagent_and_capture(&temp, "Fix things.", false).await;
+    assert!(output.contains("done"), "{output}");
+
+    assert!(request.contains("\"write_file\""), "{request}");
+    assert!(request.contains("\"edit_file\""), "{request}");
+    assert!(request.contains("\"bash\""), "{request}");
+    assert!(
+        !request.contains("This role is read-only"),
+        "ordinary roles must not carry the read-only system note: {request}"
+    );
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
 #[tokio::test]
 async fn shared_background_registry_completion_reaches_its_configured_channel() {
     // A bash tool bound to the parent's BackgroundTasks keeps that
@@ -755,7 +933,7 @@ async fn shared_background_registry_completion_reaches_its_configured_channel() 
     // pin the runner wiring.
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut parent_background) = builtins(workspace.clone(), None);
+    let (_, mut parent_background) = builtins(workspace.clone(), None, false);
     let (parent_sender, mut parent_receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     parent_background.set_event_sender(parent_sender);
 

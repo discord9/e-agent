@@ -66,6 +66,43 @@ model = "k2"
 subagent = "kimi/k2"
 ```
 
+### Read-only roles
+
+A role template can declare itself read-only with a leading TOML frontmatter
+block: the file's first line must be exactly `---`, the block may contain
+`read_only = true` (unknown keys are ignored), and a second `---` line closes
+it. The prompt is everything after the closing delimiter:
+
+```markdown
+---
+read_only = true
+---
+Audit the workspace and report findings; do not modify anything.
+```
+
+A read-only role gets no `write_file`/`edit_file` tools. Its `bash`, when the
+sandbox is enabled, runs in a narrowed bubblewrap policy: the workspace is
+mounted read-only, extra writable roots are dropped, and the network is
+disabled (`--unshare-net`). `read_file`, `get_background_tasks`,
+`cancel_background_task`, and `web_search` (when configured) stay available —
+`web_search` deliberately still reaches the network. Background bash commands
+started inside the subagent inherit the role's narrowed sandbox too (they
+never fall back to the parent's wider policy). If the sandbox is not enabled
+(or bwrap is unavailable), a read-only role gets **no `bash` tool at all** —
+fail closed rather than an unsandboxed shell.
+
+Read-only is a tool boundary, not a host security framework: it constrains
+which tools the model may call, and the bash sandbox remains a best-effort
+bwrap policy (see "Safety boundaries"). Inside that sandbox `/tmp` and the
+`$HOME` tmpfs remain writable scratch space; the file tools are the
+authoritative write path, and they are absent.
+
+The main session can request the same policy with `--read-only`: no
+write/edit tools, no MCP tools (MCP tools carry no read-only marker), and the
+main bash sandbox narrowed the same way — no bash at all when the sandbox is
+disabled. Delegation stays available (spawning a subagent does not mutate the
+host session), and each subagent resolves its own role template.
+
 The `bash` tool can be sandboxed with `bubblewrap` when it is installed. The
 sandbox is off unless explicitly enabled:
 
@@ -144,7 +181,8 @@ Legacy `.json` sessions are migrated on first load. `--version` (or `-V`) prints
 package build version without loading the workspace or configuration. Optional CLI overrides
 are `--base-url URL`, `--model MODEL`, `--profile PROFILE`, `--workspace PATH`, `--session NAME`,
 `--fork SESSION`, `--at N`, and `--max-rounds N` (tool-call rounds are unlimited by default;
-the flag sets an explicit cap).
+the flag sets an explicit cap). `--read-only` applies the read-only role policy to the main
+session (see "Read-only roles").
 `--profile` selects a TOML profile and requires a TOML config. When config is
 used, `--base-url` and `--model` are raw API wire-value overrides and take
 precedence over the selected profile values.

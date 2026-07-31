@@ -107,11 +107,11 @@ fn web_search_registration_requires_a_nonempty_key() {
         "bash".to_string(),
     ];
     for key in [None, Some("   ".into())] {
-        let (tools, _) = builtins_with_exa_key(workspace.clone(), key, None);
+        let (tools, _) = builtins_with_exa_key(workspace.clone(), key, None, false);
         let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
         assert_eq!(names, local_tools);
     }
-    let (tools, _) = builtins_with_exa_key(workspace, Some(" key ".into()), None);
+    let (tools, _) = builtins_with_exa_key(workspace, Some(" key ".into()), None, false);
     let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
     assert_eq!(
         names,
@@ -746,6 +746,142 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
     assert!(
         !desc_main.contains("`.git`"),
         "main agent description must not claim .git is read-only: {desc_main}"
+    );
+}
+
+#[test]
+fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let (tools, _) = builtins_with_exa_key(workspace, None, None, true);
+    let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
+    assert_eq!(
+        names,
+        [
+            "read_file",
+            "get_background_tasks",
+            "cancel_background_task"
+        ],
+        "read-only without a sandbox: no write/edit and fail-closed no bash"
+    );
+}
+
+#[test]
+fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let (tools, _) = builtins_with_exa_key(
+        workspace,
+        Some("key".into()),
+        Some(crate::config::Sandbox {
+            enabled: true,
+            network: true,
+            workspace_writable: true,
+            writable_paths: vec!["/mnt/big/cargo-home".into()],
+            readable_paths: vec!["~/.rustup".into()],
+        }),
+        true,
+    );
+    let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
+    assert_eq!(
+        names,
+        [
+            "read_file",
+            "get_background_tasks",
+            "cancel_background_task",
+            "bash",
+            "web_search"
+        ],
+        "read-only with a sandbox keeps bash and web_search"
+    );
+    // The bash description must reflect the narrowed policy.
+    let bash_desc = tools
+        .iter()
+        .find(|tool| tool.spec().name == "bash")
+        .unwrap()
+        .spec()
+        .description;
+    assert!(bash_desc.contains("workspace is read-only"), "{bash_desc}");
+    assert!(bash_desc.contains("network is disabled"), "{bash_desc}");
+    assert!(
+        bash_desc.contains("~/.rustup"),
+        "readable roots survive the narrowing: {bash_desc}"
+    );
+    assert!(
+        !bash_desc.contains("/mnt/big/cargo-home"),
+        "writable roots are dropped from the description: {bash_desc}"
+    );
+}
+
+#[test]
+fn read_only_sandbox_derivation_narrows_and_keeps_readable_roots() {
+    let sandbox = crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        writable_paths: vec!["/mnt/big/cargo-home".into()],
+        readable_paths: vec!["~/.rustup".into(), "~/.local".into()],
+    };
+    let narrowed = read_only_sandbox(&sandbox);
+    assert!(narrowed.enabled);
+    assert!(!narrowed.network, "network must be disabled");
+    assert!(!narrowed.workspace_writable, "workspace must be read-only");
+    assert!(
+        narrowed.writable_paths.is_empty(),
+        "extra writable roots must be dropped"
+    );
+    assert_eq!(
+        narrowed.readable_paths,
+        vec!["~/.rustup".to_owned(), "~/.local".to_owned()],
+        "readable roots must be preserved"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn background_bash_uses_the_facade_sandbox_not_the_registry_one() {
+    // Regression: a background command must run under THIS Bash facade's
+    // sandbox (a read-only role's narrowed policy), never the shared
+    // registry's wider one — otherwise a read-only subagent's background
+    // bash could write to the workspace.
+    let Some(mut registry_sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    // The registry (parent) policy is deliberately writable + networked.
+    registry_sandbox.workspace_writable = true;
+    registry_sandbox.network = true;
+    let narrowed = read_only_sandbox(&registry_sandbox);
+
+    let temp = tempfile::tempdir().unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut bash = Bash {
+        workspace: Workspace::new(temp.path()).unwrap(),
+        timeout: Duration::from_secs(30),
+        sender: None,
+        background: BackgroundTasks::new(Duration::from_secs(30 * 60), Some(registry_sandbox)),
+        sandbox: Some(narrowed),
+        protect_git: false,
+    };
+    bash.set_event_sender(sender.clone());
+    bash.background.set_event_sender(sender);
+
+    let started = bash
+        .execute(json!({"command": "touch escape.txt", "background": true}))
+        .await
+        .unwrap();
+    assert!(started.starts_with("started background task"), "{started}");
+
+    let event = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+        .await
+        .expect("timed out waiting for the background completion")
+        .unwrap();
+    let AgentEvent::BackgroundCompleted { output, .. } = event else {
+        panic!("expected BackgroundCompleted");
+    };
+    assert!(
+        !temp.path().join("escape.txt").exists(),
+        "background bash escaped the facade's read-only sandbox; output: {output}"
     );
 }
 
