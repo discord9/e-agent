@@ -1144,15 +1144,20 @@ impl TuiState {
             }
             KeyCode::Home => {
                 self.window.follow_bottom = false;
-                // Home is bounded too: exposing the beginning of an
-                // unbounded transcript would force a full-history render.
+                // Home goes to the true start of the loaded scrollback.
+                // Rendering is bounded elsewhere (local_window_lines +
+                // render_bounded_window), so an unbounded source range is
+                // safe; a bounded Home (last MAX_RENDER_SOURCE_LINES) left
+                // long sessions unable to reach the beginning.
                 self.window.source_end = self.lines.len();
-                self.window.source_start = self
-                    .window
-                    .source_end
-                    .saturating_sub(MAX_RENDER_SOURCE_LINES);
+                self.window.source_start = 0;
                 self.window.local_offset = 0;
                 self.window.frozen_tail_cursor = None;
+                // If the loaded scrollback still has older history behind
+                // it, queue a segment load (same as PageUp at the top).
+                if self.at_scrollback_top() {
+                    self.request_older();
+                }
             }
             KeyCode::End => {
                 self.window.follow_bottom = true;

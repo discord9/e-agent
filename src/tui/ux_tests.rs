@@ -561,17 +561,30 @@ fn local_window_obeys_all_limits_without_splitting_utf8() {
 }
 
 #[test]
-fn home_starts_at_bounded_history_tail() {
+fn home_starts_at_true_beginning() {
+    // Home must reach the true start of the loaded scrollback, not a
+    // bounded tail window (which left long sessions unreachable).
     let mut state = TuiState::default();
     for index in 0..(MAX_RENDER_SOURCE_LINES + 10) {
         state.push_line(index.to_string(), LineKind::Normal);
     }
     state.handle_scroll(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-    assert_eq!(
-        state.window.source_start,
-        state.lines.len() - MAX_RENDER_SOURCE_LINES
-    );
+    assert_eq!(state.window.source_start, 0);
     assert_eq!(state.window.local_offset, 0);
+    // With a store wired and older history available, Home at the top
+    // queues an older-segment load (same as PageUp at the top).
+    assert!(!state.older_pending, "no store: nothing to queue");
+    state.store = Some(crate::session_store::SessionStore::Jsonl);
+    state.handle_scroll(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    assert!(
+        state.older_pending,
+        "Home at top with store queues older load (JSONL store resolves it to done on load)"
+    );
+    // Once exhausted, Home no longer queues (pending stays false).
+    state.older_done = true;
+    state.older_pending = false;
+    state.handle_scroll(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    assert!(!state.older_pending, "older_done suppresses the request");
 }
 
 #[test]
