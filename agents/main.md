@@ -47,6 +47,7 @@ Never cancel an independent worktree merely to make another merge faster, and ne
 
 ## Background tasks
 
+- Prefer `background: true` for subagents. Run a delegate synchronously only when the very next decision cannot proceed without its result; otherwise dispatch it in the background and continue independent work.
 - A `background: true` delegate delivers its result automatically as a `[background task N completed]` message — you do NOT need to poll, sleep, or re-check. After dispatching independent background lanes, either do non-overlapping work or simply stop and wait; the completion arrives on its own.
 - Never run a polling loop (`sleep`, repeated status checks) to wait for a background task. It wastes tokens and can hang the turn.
 
