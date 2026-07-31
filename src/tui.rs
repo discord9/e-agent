@@ -1257,6 +1257,11 @@ struct TaskDetail {
     lines: Vec<DisplayLine>,
     /// Page-internal window (source_* index into `lines`).
     window: ScrollWindow,
+    /// Spool line count observed at the last reload (open or tail slide).
+    /// While following, draw reloads the tail only when the spool has
+    /// grown past this — opening shows the head page, and new output
+    /// slides the view to the live tail (like `tail -f` from the top).
+    last_seen_lines: usize,
 }
 
 impl TaskDetail {
@@ -1269,6 +1274,7 @@ impl TaskDetail {
             base_line: 0,
             lines: Vec::new(),
             window: ScrollWindow::new(),
+            last_seen_lines: 0,
         }
     }
 
@@ -1325,6 +1331,18 @@ impl TaskDetail {
             width,
             height,
         );
+        self.window.follow_bottom = true;
+        self.window.frozen_tail_cursor = None;
+        self.window.frozen_source_end = 0;
+    }
+
+    /// Anchor the page at the spool head and enable follow. Draw reloads
+    /// the tail only once the spool has grown past `last_seen_lines`, so
+    /// opening a large task shows the first page and then slides to the
+    /// live tail as output streams in.
+    fn load_head(&mut self, width: usize, height: usize) {
+        let capacity = height.max(1);
+        self.load_page(0, capacity, false, width, height);
         self.window.follow_bottom = true;
         self.window.frozen_tail_cursor = None;
         self.window.frozen_source_end = 0;
@@ -1509,7 +1527,8 @@ fn render_bounded_window(lines: &[DisplayLine], width: usize) -> Vec<ratatui::te
 /// (#id: label — status — N lines · X MiB (truncated) — key hints) plus the
 /// current spool page rendered as plain Dim text through the bounded window
 /// pipeline (no markdown). While `follow_bottom` the tail page is re-fetched
-/// every frame so a running task's output keeps streaming in.
+/// only when the spool has grown since the last reload, so a running task's
+/// output keeps streaming in while a paused one keeps its current page.
 fn render_task_detail(
     frame: &mut ratatui::Frame,
     detail: &mut TaskDetail,
@@ -1517,14 +1536,18 @@ fn render_task_detail(
 ) {
     let width = usize::from(area.width.saturating_sub(2)).max(1);
     let height = usize::from(area.height.saturating_sub(2)).max(1);
-    if detail.window.follow_bottom {
-        detail.load_tail(width, height);
-    }
     let (bytes, lines, truncated) = (
         detail.spool.len(),
         detail.spool.line_count(),
         detail.spool.truncated(),
     );
+    // Follow slides to the tail only when the spool has grown since the
+    // last reload: opening shows the head page, a paused task keeps the
+    // current page, and new output pulls the view to the live tail.
+    if detail.window.follow_bottom && lines > detail.last_seen_lines {
+        detail.last_seen_lines = lines;
+        detail.load_tail(width, height);
+    }
     let status = if detail.finished {
         "finished"
     } else {
@@ -2157,8 +2180,10 @@ impl TuiState {
         }
     }
 
-    /// Open the full-output detail view for a background bash task,
-    /// anchored at the spool tail (follow mode).
+    /// Open the full-output detail view for a background bash task. The
+    /// first frame shows the head page with follow armed; while output
+    /// keeps growing the view slides to the live tail, and a paused task
+    /// stays on the current page.
     fn open_task_detail(&mut self, id: u64) {
         let Some(background) = &self.background else {
             return;
@@ -2173,7 +2198,8 @@ impl TuiState {
             .map(|task| task.label)
             .unwrap_or_default();
         let mut detail = TaskDetail::new(id, label, spool, false);
-        detail.load_tail(self.inner_width.max(1), self.output_height.max(1));
+        detail.load_head(self.inner_width.max(1), self.output_height.max(1));
+        detail.last_seen_lines = detail.spool.line_count();
         self.task_detail = Some(detail);
     }
 
@@ -2220,7 +2246,12 @@ impl TuiState {
                 detail.window.follow_bottom = false;
                 detail.load_page(0, height, false, width, height);
             }
-            KeyCode::End => detail.load_tail(width, height),
+            KeyCode::End => {
+                detail.load_tail(width, height);
+                // Sync so the next draw does not re-jump the freshly
+                // anchored tail page.
+                detail.last_seen_lines = detail.spool.line_count();
+            }
             _ => {}
         }
     }
@@ -3283,7 +3314,7 @@ mod tests {
     }
 
     #[test]
-    fn task_detail_opens_anchored_at_tail_and_pages() {
+    fn task_detail_opens_at_head_and_pages() {
         let spool = Arc::new(crate::tools::TaskSpool::new());
         let mut text = String::new();
         for i in 0..300 {
@@ -3297,23 +3328,25 @@ mod tests {
         };
         let scroll = |code| KeyEvent::new(code, KeyModifiers::empty());
 
-        // Open anchors at the tail in follow mode (one viewport of lines).
+        // Open shows the head page (first viewport of lines) in follow
+        // mode; the view only slides to the tail once output grows.
         let mut detail = TaskDetail::new(1, "demo".into(), spool, false);
-        detail.load_tail(80, 10);
+        detail.load_head(80, 10);
+        detail.last_seen_lines = detail.spool.line_count();
         assert!(detail.window.follow_bottom);
-        assert_eq!(detail.base_line, 290);
-        assert_eq!(detail.lines.first().unwrap().text, "line 290");
-        assert_eq!(detail.lines.last().unwrap().text, "line 299");
+        assert_eq!(detail.base_line, 0);
+        assert_eq!(detail.lines.first().unwrap().text, "line 000");
+        assert_eq!(detail.lines.last().unwrap().text, "line 009");
         state.task_detail = Some(detail);
 
         // PgUp freezes and pages up one viewport at a time.
         state.handle_detail_scroll(scroll(KeyCode::PageUp));
         let detail = state.task_detail.as_ref().unwrap();
         assert!(!detail.window.follow_bottom);
-        assert_eq!(detail.base_line, 280);
-        assert_eq!(detail.lines.first().unwrap().text, "line 280");
+        assert_eq!(detail.base_line, 0);
+        assert_eq!(detail.lines.first().unwrap().text, "line 000");
         state.handle_detail_scroll(scroll(KeyCode::PageUp));
-        assert_eq!(state.task_detail.as_ref().unwrap().base_line, 270);
+        assert_eq!(state.task_detail.as_ref().unwrap().base_line, 0);
 
         // Home jumps to the first page.
         state.handle_detail_scroll(scroll(KeyCode::Home));
@@ -3325,11 +3358,13 @@ mod tests {
         state.handle_detail_scroll(scroll(KeyCode::Up));
         assert_eq!(state.task_detail.as_ref().unwrap().base_line, 0);
 
-        // End restores follow at the tail.
+        // End restores follow at the tail and syncs last_seen_lines so
+        // the next draw does not re-jump the anchored tail page.
         state.handle_detail_scroll(scroll(KeyCode::End));
         let detail = state.task_detail.as_ref().unwrap();
         assert!(detail.window.follow_bottom);
         assert_eq!(detail.base_line, 290);
+        assert_eq!(detail.last_seen_lines, 300);
         // Down while following is a no-op.
         state.handle_detail_scroll(scroll(KeyCode::Down));
         assert!(state.task_detail.as_ref().unwrap().window.follow_bottom);
@@ -3346,6 +3381,89 @@ mod tests {
         assert!(!detail.window.follow_bottom);
         state.handle_detail_scroll(scroll(KeyCode::Down));
         assert!(state.task_detail.as_ref().unwrap().window.follow_bottom);
+    }
+
+    #[test]
+    fn task_detail_growth_follows_tail_from_head() {
+        let spool = Arc::new(crate::tools::TaskSpool::new());
+        let mut text = String::new();
+        for i in 0..300 {
+            text.push_str(&format!("line {i:03}\n"));
+        }
+        spool.append(text.as_bytes());
+        let mut state = TuiState {
+            inner_width: 80,
+            output_height: 10,
+            ..Default::default()
+        };
+        let scroll = |code| KeyEvent::new(code, KeyModifiers::empty());
+        // Same open path as open_task_detail: head page + follow armed
+        // with last_seen_lines at the current spool count.
+        let mut detail = TaskDetail::new(1, "demo".into(), spool.clone(), false);
+        detail.load_head(80, 10);
+        detail.last_seen_lines = detail.spool.line_count();
+        state.task_detail = Some(detail);
+
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // First draw with no growth: the head page stays on screen.
+        draw(&mut terminal, &mut state).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (1..79)
+            .map(|x| buffer[(x, 1)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert_eq!(row.trim_end(), "line 000");
+        assert!(state.task_detail.as_ref().unwrap().window.follow_bottom);
+
+        // Output grows -> the next draw slides to the live tail.
+        let mut more = String::new();
+        for i in 300..320 {
+            more.push_str(&format!("line {i:03}\n"));
+        }
+        spool.append(more.as_bytes());
+        draw(&mut terminal, &mut state).unwrap();
+        let detail = state.task_detail.as_ref().unwrap();
+        assert!(detail.window.follow_bottom);
+        assert_eq!(detail.base_line, 310);
+        assert_eq!(detail.lines.last().unwrap().text, "line 319");
+        let buffer = terminal.backend().buffer();
+        let row: String = (1..79)
+            .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert_eq!(row.trim_end(), "line 319");
+
+        // No growth -> a draw leaves the page untouched.
+        draw(&mut terminal, &mut state).unwrap();
+        let detail = state.task_detail.as_ref().unwrap();
+        assert_eq!(detail.base_line, 310);
+        assert_eq!(detail.last_seen_lines, 320);
+
+        // PgUp freezes; growth while frozen does not move the view.
+        state.handle_detail_scroll(scroll(KeyCode::PageUp));
+        let detail = state.task_detail.as_ref().unwrap();
+        assert!(!detail.window.follow_bottom);
+        assert_eq!(detail.base_line, 300);
+        let mut more = String::new();
+        for i in 320..325 {
+            more.push_str(&format!("line {i:03}\n"));
+        }
+        spool.append(more.as_bytes());
+        draw(&mut terminal, &mut state).unwrap();
+        let detail = state.task_detail.as_ref().unwrap();
+        assert!(!detail.window.follow_bottom);
+        assert_eq!(detail.base_line, 300);
+
+        // End resumes follow at the new tail and syncs last_seen_lines,
+        // so the following draw does not re-jump.
+        state.handle_detail_scroll(scroll(KeyCode::End));
+        let detail = state.task_detail.as_ref().unwrap();
+        assert!(detail.window.follow_bottom);
+        assert_eq!(detail.base_line, 315);
+        assert_eq!(detail.last_seen_lines, 325);
+        draw(&mut terminal, &mut state).unwrap();
+        let detail = state.task_detail.as_ref().unwrap();
+        assert_eq!(detail.base_line, 315);
     }
 
     #[test]
