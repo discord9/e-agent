@@ -1030,16 +1030,34 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 #[cfg(web_ui)]
 async fn index() -> impl IntoResponse {
     use axum::http::Response as HttpResponse;
-    // Dev-friendly: read the single-file UI from disk on every request so
-    // frontend edits show up on refresh without recompiling. Located via
-    // CARGO_MANIFEST_DIR (stable regardless of the process cwd).
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/index.html");
-    match std::fs::read_to_string(&path) {
+    // Dev-friendly: read the UI skeleton from disk and inline the CSS/JS
+    // pieces on every request, so frontend edits (style.css, app.js, vendor
+    // libs) show up on refresh without recompiling. The response stays a
+    // single self-contained HTML file. Located via CARGO_MANIFEST_DIR
+    // (stable regardless of the process cwd).
+    let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+    let read = |name: &str| -> Result<String, String> {
+        std::fs::read_to_string(ui.join(name))
+            .map_err(|e| format!("cannot read {}: {e}", ui.join(name).display()))
+    };
+    let assembled = read("index.html")
+        .and_then(|skeleton| {
+            let katex_css = read("vendor/katex.min.css")?;
+            let css = read("style.css")?;
+            let vendor_js = read("vendor/marked.min.js")?;
+            let app_js = read("app.js")?;
+            Ok(skeleton
+                .replace("/*__KATEX_CSS__*/", &katex_css)
+                .replace("/*__CSS__*/", &css)
+                .replace("/*__JS_VENDOR__*/", &vendor_js)
+                .replace("/*__JS_APP__*/", &app_js))
+        });
+    match assembled {
         Ok(html) => HttpResponse::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             // Never cache the dev UI: browsers would serve a stale HTML
-            // (missing the latest scroll/flex fixes) after a reload.
+            // after a reload.
             .header(header::CACHE_CONTROL, "no-store")
             .body(html)
             .unwrap(),
@@ -1049,8 +1067,7 @@ async fn index() -> impl IntoResponse {
             .body(format!(
                 "<!doctype html><meta charset=\"utf-8\"><title>e-agent UI error</title>\
                  <body style=\"font-family:system-ui,sans-serif;padding:2rem\">\
-                 <h1>Cannot read {}</h1><pre>{error}</pre></body>",
-                path.display()
+                 <h1>Cannot assemble UI</h1><pre>{error}</pre></body>"
             ))
             .unwrap(),
     }
