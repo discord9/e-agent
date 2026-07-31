@@ -32,6 +32,9 @@ pub struct Config {
     /// Optional `[background]` policy (background-task timeout).
     #[serde(default)]
     background: Option<BackgroundConfig>,
+    /// Optional `[bash]` policy (foreground bash timeout).
+    #[serde(default)]
+    bash: Option<BashConfig>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -48,6 +51,19 @@ pub struct BackgroundConfig {
 
 /// Default background-task timeout: 30 minutes.
 pub const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Foreground bash tool policy, from `[bash]`.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct BashConfig {
+    /// Foreground bash timeout in seconds. `0` disables the timeout
+    /// (runs until the command finishes). Absent defaults to
+    /// [`DEFAULT_BASH_TIMEOUT_SECS`].
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Default foreground bash timeout: 30 seconds.
+pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 
 /// Runtime sandbox configuration for the bash tool, from `[sandbox]`.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -517,6 +533,43 @@ fn project_background(workspace: &Path) -> anyhow::Result<Option<BackgroundConfi
     let parsed: ProjectConfig = toml::from_str(&source)
         .with_context(|| format!("cannot parse project config {}", path.display()))?;
     Ok(parsed.background)
+}
+
+/// Resolve the foreground bash timeout policy for a workspace: workspace
+/// `<workspace>/.e-agent/config.toml` `[bash]` overrides the global config;
+/// `timeout_secs = 0` means no timeout (`None`); absent everywhere returns
+/// the default 30s. Mirrors `resolve_background_timeout`/`project_background`.
+pub fn resolve_bash_timeout(
+    config: Option<&Config>,
+    workspace: &Path,
+) -> anyhow::Result<Option<Duration>> {
+    let global = config
+        .and_then(|c| c.bash.as_ref())
+        .and_then(|b| b.timeout_secs);
+    let local = project_bash(workspace)?.and_then(|b| b.timeout_secs);
+    match local.or(global) {
+        Some(0) => Ok(None),
+        Some(secs) => Ok(Some(Duration::from_secs(secs))),
+        None => Ok(Some(Duration::from_secs(DEFAULT_BASH_TIMEOUT_SECS))),
+    }
+}
+
+/// Read `[bash]` from `<workspace>/.e-agent/config.toml` (same pattern as
+/// `project_background`); `None` when absent.
+fn project_bash(workspace: &Path) -> anyhow::Result<Option<BashConfig>> {
+    #[derive(Deserialize)]
+    struct ProjectConfig {
+        bash: Option<BashConfig>,
+    }
+    let path = workspace.join(".e-agent/config.toml");
+    let source = match std::fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let parsed: ProjectConfig = toml::from_str(&source)
+        .with_context(|| format!("cannot parse project config {}", path.display()))?;
+    Ok(parsed.bash)
 }
 
 fn project_sandbox(workspace: &Path) -> anyhow::Result<Option<ProjectSandbox>> {

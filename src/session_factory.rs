@@ -24,7 +24,7 @@ use crate::mcp;
 use crate::model::{ConfiguredModel, OpenAiModel};
 use crate::runner::{IdlePolicy, SessionHandle, SessionRunner};
 use crate::session_store::SessionStore;
-use crate::tools::{BackgroundTasks, builtins};
+use crate::tools::{BackgroundTasks, builtins_with_bash_timeout};
 use crate::workspace::Workspace;
 
 /// Everything resolved once at startup and shared by every built session.
@@ -289,11 +289,14 @@ impl SessionFactory {
         let background_timeout =
             crate::config::resolve_background_timeout(self.config.as_ref(), &self.root)
                 .unwrap_or(None);
-        let (mut tools, background) = builtins(
+        let bash_timeout =
+            crate::config::resolve_bash_timeout(self.config.as_ref(), &self.root).unwrap_or(None);
+        let (mut tools, background) = builtins_with_bash_timeout(
             self.workspace.clone(),
             self.sandbox.clone(),
             self.read_only,
             background_timeout,
+            bash_timeout,
         );
         // Read-only sessions skip MCP entirely: MCP tools carry no read-only
         // marker, so exposing them would defeat the policy. Delegation stays —

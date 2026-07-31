@@ -58,11 +58,36 @@ pub fn bwrap_available() -> bool {
 ///
 /// `background_timeout` is the background bash timeout
 /// (`Some(Duration)` = timeout, `None` = no timeout / run forever).
+///
+/// The foreground bash timeout is resolved from the workspace's
+/// `<workspace>/.e-agent/config.toml` `[bash]` override plus the 30s default
+/// (no global config is available here). The main session factory passes the
+/// full global + workspace policy via [`builtins_with_bash_timeout`].
 pub fn builtins(
     workspace: Workspace,
     sandbox: Option<crate::config::Sandbox>,
     read_only: bool,
     background_timeout: Option<Duration>,
+) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
+    let bash_timeout = crate::config::resolve_bash_timeout(None, workspace.root()).unwrap_or(None);
+    builtins_with_bash_timeout(
+        workspace,
+        sandbox,
+        read_only,
+        background_timeout,
+        bash_timeout,
+    )
+}
+
+/// Like [`builtins`], with the foreground bash timeout passed explicitly.
+/// The main session resolves it from the full config (`[bash]` global +
+/// workspace override) via [`crate::config::resolve_bash_timeout`].
+pub fn builtins_with_bash_timeout(
+    workspace: Workspace,
+    sandbox: Option<crate::config::Sandbox>,
+    read_only: bool,
+    background_timeout: Option<Duration>,
+    bash_timeout: Option<Duration>,
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
     builtins_with_exa_key(
         workspace,
@@ -70,6 +95,7 @@ pub fn builtins(
         sandbox,
         read_only,
         background_timeout,
+        bash_timeout,
     )
 }
 
@@ -84,6 +110,9 @@ pub fn builtins_with_background(
     sandbox: Option<crate::config::Sandbox>,
     read_only: bool,
 ) -> Vec<Box<dyn Tool>> {
+    // Subagents have no loaded global Config; apply the workspace `[bash]`
+    // override plus the default (mirrors `builtins`).
+    let bash_timeout = crate::config::resolve_bash_timeout(None, workspace.root()).unwrap_or(None);
     // Subagent / fixer: protect_git = true so .git is read-only.
     tools_with_background_and_exa_key(
         workspace,
@@ -92,6 +121,7 @@ pub fn builtins_with_background(
         sandbox,
         true,
         read_only,
+        bash_timeout,
     )
 }
 
@@ -101,6 +131,7 @@ fn builtins_with_exa_key(
     sandbox: Option<crate::config::Sandbox>,
     read_only: bool,
     background_timeout: Option<Duration>,
+    bash_timeout: Option<Duration>,
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
     let background = BackgroundTasks::new(background_timeout, sandbox.clone());
     // Main agent: protect_git = false so git worktree/add/commit work.
@@ -111,6 +142,7 @@ fn builtins_with_exa_key(
         sandbox,
         false,
         read_only,
+        bash_timeout,
     );
     (tools, background)
 }
@@ -135,6 +167,7 @@ fn tools_with_background_and_exa_key(
     sandbox: Option<crate::config::Sandbox>,
     protect_git: bool,
     read_only: bool,
+    bash_timeout: Option<Duration>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools = if read_only {
         // Read-only roles get no write/edit tools at all.
@@ -159,7 +192,13 @@ fn tools_with_background_and_exa_key(
         sandbox
     };
     if !read_only || bash_sandbox.is_some() {
-        tools.push(bash_tool(workspace, background, bash_sandbox, protect_git));
+        tools.push(bash_tool(
+            workspace,
+            background,
+            bash_sandbox,
+            protect_git,
+            bash_timeout,
+        ));
     }
     if let Some(key) = exa_api_key
         .map(|key| key.trim().to_owned())

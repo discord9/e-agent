@@ -15,15 +15,18 @@ use super::background::{BackgroundTasks, OutputSlot, TaskSpool, slot_append};
 /// A bash tool bound to a shared background-task registry.
 /// `protect_git`: when true, `<workspace>/.git` is bound read-only
 /// (subagent / fixer); main agent passes false so orchestration works.
+/// `timeout`: foreground command timeout; `None` means no timeout.
+/// Callers resolve it from config (`[bash]`), defaulting to 30s.
 pub fn bash_tool(
     workspace: Workspace,
     background: BackgroundTasks,
     sandbox: Option<crate::config::Sandbox>,
     protect_git: bool,
+    timeout: Option<Duration>,
 ) -> Box<dyn Tool> {
     Box::new(Bash {
         workspace,
-        timeout: Duration::from_secs(30),
+        timeout,
         background,
         sender: None,
         sandbox,
@@ -33,7 +36,8 @@ pub fn bash_tool(
 
 pub(super) struct Bash {
     pub(super) workspace: Workspace,
-    pub(super) timeout: Duration,
+    /// Foreground command timeout; `None` = no timeout (runs until done).
+    pub(super) timeout: Option<Duration>,
     pub(super) background: BackgroundTasks,
     /// Completion delivery belongs to this bash facade's Agent, not the
     /// shared registry. Spawned tasks retain this origin sender.
@@ -122,7 +126,7 @@ impl Tool for Bash {
         run_bash(
             &self.workspace,
             command,
-            Some(self.timeout),
+            self.timeout,
             self.protect_git,
             None,
             None,
