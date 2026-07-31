@@ -275,7 +275,16 @@ pub async fn run(
     .await;
     drop(terminal);
     drop(_guard);
-    result
+    match result {
+        // The session failed. The main screen is restored now (terminal and
+        // guard dropped above), so the failure text is safe to surface via
+        // Err: main prints it on stderr and exits non-zero. Printing it
+        // before LeaveAlternateScreen would write into the alternate screen
+        // buffer and be discarded on rmcup (silent EXIT 0).
+        Ok(Some(failure)) => Err(anyhow::anyhow!("session failed: {failure}")),
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Text painted around the input box border (session id, model, role, cwd).
@@ -315,7 +324,7 @@ async fn run_inner(
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
     context_window: Option<u64>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let (sender, mut inbox) = mpsc::unbounded_channel::<UiEvent>();
     let (snapshot, mut live, mut status) = handle.attach();
     let forward = sender.clone();
@@ -350,15 +359,17 @@ async fn run_inner(
         tokio::select! {
             changed = status.changed() => {
                 if changed.is_err() {
-                    return Ok(());
+                    return Ok(None);
                 }
                 if let SessionStatus::Finished(result) = &*status.borrow() {
                     // A terminal state with a failure must be visible: the
                     // TUI exits silently otherwise and looks like a crash.
-                    if let SessionResult::Failed(text) = result {
-                        eprintln!("e-agent: session failed: {text}");
-                    }
-                    return Ok(());
+                    // Carry the failure text out of the alternate screen;
+                    // run() prints it only after the main screen is restored.
+                    return match result {
+                        SessionResult::Failed(text) => Ok(Some(text.clone())),
+                        _ => Ok(None),
+                    };
                 }
             }
             Some(first) = inbox.recv() => route_idle_events(&mut state, first, &mut inbox),
@@ -368,12 +379,12 @@ async fn run_inner(
                     if state.attached.is_some() { if key.code==KeyCode::Esc { state.detach(); } else if is_scroll_key(key) { state.attached.as_mut().unwrap().state.handle_scroll(key); } else { let width=attached_input_width(terminal)?; state.handle_attached_key(key,width); } continue; }
                     let active = matches!(&*status.borrow(), SessionStatus::Busy | SessionStatus::Compacting);
                     if active && is_cancel(key) { handle.cancel(); continue; }
-                    if !active && is_exit(key) { return Ok(()); }
+                    if !active && is_exit(key) { return Ok(None); }
                     if is_scroll_key(key) { state.handle_scroll(key); drain_ready_scroll_keys(&mut events,&mut state).await; }
                     else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
                 Some(Ok(Event::Paste(text))) => state.handle_paste(&text),
-                Some(Ok(_)) => {}, Some(Err(error)) => return Err(error.into()), None => return Ok(()),
+                Some(Ok(_)) => {}, Some(Err(error)) => return Err(error.into()), None => return Ok(None),
             }
         }
     }

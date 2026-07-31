@@ -508,7 +508,19 @@ async fn repl(handle: SessionHandle, task: e_agent::runner::SessionTask) -> anyh
     let render = tokio::spawn(consume_stderr_events(events));
     let stdin = std::io::stdin();
     loop {
+        // Wait for the runner to become idle again. Finished is a terminal
+        // state: the watch channel gets no further values, so waiting for
+        // Idle would hang forever. Report a failure and end the REPL.
         while !matches!(*status.borrow(), SessionStatus::Idle) {
+            if let SessionStatus::Finished(result) = &*status.borrow() {
+                if let SessionResult::Failed(text) = result {
+                    eprintln!("e-agent: session failed: {text}");
+                }
+                drop(handle);
+                drop(task);
+                render.abort();
+                return Ok(());
+            }
             status.changed().await?;
         }
         print!("e-agent> ");
