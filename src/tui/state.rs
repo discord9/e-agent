@@ -148,6 +148,10 @@ pub(crate) struct TuiState {
     /// Full-output detail view for a selected background bash task; when
     /// set, draw renders it full-screen and keys route to it first.
     pub(crate) task_detail: Option<TaskDetail>,
+    /// Panel visibility at the moment the detail view opened; Esc restores
+    /// it (return to the tasks panel if it was open, else to the main
+    /// view). F2 closes both, so it ignores this.
+    pub(crate) detail_return_panel: bool,
     /// Whether the terminal title has been set to a user-derived value.
     /// Once true, subsequent prompts never overwrite the title.
     pub(crate) session_title_set: bool,
@@ -512,7 +516,8 @@ pub(crate) enum TaskSelection {
     /// Attach to the selected task's session (delegate tasks, and cursor
     /// moves to an attachable task).
     Attach(u64),
-    /// Open the full-output detail view (Enter on a bash task).
+    /// Open the full-output detail view (bash task selected with Enter or
+    /// a cursor move).
     OpenDetail(u64),
     /// Key was not a selection; caller should fall through.
     None,
@@ -815,9 +820,9 @@ impl TuiState {
             .unwrap_or(0)
     }
 
-    /// Up/Down move the cursor and immediately attach to the selected task;
-    /// Enter opens the full-output detail view for bash tasks and attaches
-    /// for delegate tasks. Returns the requested action, if any.
+    /// Up/Down move the cursor and immediately open the selected task's
+    /// view — full-output detail for bash tasks, attach for delegate tasks;
+    /// Enter does the same. Returns the requested action, if any.
     pub(crate) fn handle_tasks_panel_key(&mut self, key: KeyEvent) -> TaskSelection {
         let running = self
             .background
@@ -857,13 +862,16 @@ impl TuiState {
             }
             _ => return TaskSelection::None,
         }
-        // After any cursor move, attach to the newly selected task (if
-        // attachable). Attaching is cheap — it replays an in-memory snapshot
-        // and opens a broadcast channel, no I/O.
+        // After any cursor move, open the selected task's view immediately:
+        // bash tasks open the full-output detail, delegate sessions attach
+        // (live steering) — the same instant-open UX as Enter, so the panel
+        // never leaves the cursor on a task the user has already picked.
         let Some(task) = running.get(self.task_cursor) else {
             return TaskSelection::None;
         };
-        if attachable(self, task.id) {
+        if task.kind == "bash" {
+            TaskSelection::OpenDetail(task.id)
+        } else if attachable(self, task.id) {
             TaskSelection::Attach(task.id)
         } else {
             TaskSelection::None
@@ -873,7 +881,10 @@ impl TuiState {
     /// Open the full-output detail view for a background bash task. The
     /// first frame shows the head page with follow armed; while output
     /// keeps growing the view slides to the live tail, and a paused task
-    /// stays on the current page.
+    /// stays on the current page. The detail view is an independent
+    /// full-screen view: it never stacks on the tasks panel or an attached
+    /// session, and Esc returns to the view that was showing before it
+    /// opened (panel or main view).
     pub(crate) fn open_task_detail(&mut self, id: u64) {
         let Some(background) = &self.background else {
             return;
@@ -892,14 +903,24 @@ impl TuiState {
         detail.load_head(self.inner_width.max(1), self.output_height.max(1));
         detail.last_seen_lines = detail.spool.line_count();
         self.task_detail = Some(detail);
+        // Remember where Esc should land, then make the detail view truly
+        // full-screen: panel hidden, attached session dropped (its
+        // half-typed input is stashed for a later re-attach).
+        self.detail_return_panel = self.show_tasks;
+        self.show_tasks = false;
+        self.detach();
     }
 
     /// Keys while the full-output detail view is open. Esc returns to the
-    /// tasks panel, F2 closes both, x/Ctrl-C cancels the task by id, scroll
-    /// keys page through the spool.
+    /// view that was showing before the detail opened (the tasks panel when
+    /// it was open, the main view otherwise), F2 closes both, x/Ctrl-C
+    /// cancels the task by id, scroll keys page through the spool.
     pub(crate) fn handle_task_detail_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.task_detail = None,
+            KeyCode::Esc => {
+                self.task_detail = None;
+                self.show_tasks = self.detail_return_panel;
+            }
             KeyCode::F(2) => {
                 self.task_detail = None;
                 self.show_tasks = false;
