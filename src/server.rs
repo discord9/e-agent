@@ -9,6 +9,7 @@
 //! | GET    | `/api/sessions`                   | list active sessions               |
 //! | POST   | `/api/sessions`                   | create a session                   |
 //! | GET    | `/api/sessions/{id}/events`       | SSE: snapshot, then live events    |
+//! | GET    | `/api/sessions/{id}/history`      | segmented history (head or older)  |
 //! | POST   | `/api/sessions/{id}/prompt`       | queue a prompt                     |
 //! | POST   | `/api/sessions/{id}/cancel`       | cancel the in-flight turn          |
 //! | POST   | `/api/sessions/{id}/compact`      | request compaction                 |
@@ -26,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context as AnyhowContext, anyhow};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::sse::{Event, Sse};
@@ -38,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, SessionEntry};
 use crate::delegate::Sessions;
 use crate::runner::{IdlePolicy, SessionHandle, SessionStatus, SessionTask};
 use crate::session_factory::{SessionBuild, SessionFactory};
@@ -96,6 +97,7 @@ fn router(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}/events", get(session_events))
+        .route("/api/sessions/{id}/history", get(session_history))
         .route("/api/sessions/{id}/prompt", post(session_prompt))
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/compact", post(session_compact))
@@ -454,6 +456,88 @@ async fn delete_session(
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// History
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// `GET /api/sessions/{id}/history` query parameters, both optional:
+/// omit `before_seq` for the head segment, or pass the previous response's
+/// `next_before_seq` to page one compaction segment further back. `limit`
+/// caps the number of entries returned (the newest are kept).
+#[derive(Deserialize)]
+pub struct HistoryParams {
+    pub before_seq: Option<i64>,
+    pub limit: Option<usize>,
+}
+
+/// One history page: a compaction segment of [`SessionEntry`] values plus
+/// the cursor for the next older page. `next_before_seq` is `Some` when an
+/// older segment exists (feed it back as `before_seq`), `None` when this
+/// was the oldest segment or the session has no compaction at all.
+#[derive(Serialize)]
+pub struct HistoryResponse {
+    pub entries: Vec<SessionEntry>,
+    pub next_before_seq: Option<i64>,
+}
+
+/// Cap entries to the newest `limit` (oldest dropped); `None` = no cap.
+/// Kept as a separate function so the wire shape and the cap are each
+/// unit-testable without a session backend. Dropped entries inside one
+/// segment are not paged individually: segments are compaction-bounded on
+/// Greptime, and JSONL sessions have no older pages (`head_seq`/`load_older`
+/// are both empty there), so the cap only ever trims the initial render.
+fn cap_entries(entries: Vec<SessionEntry>, limit: Option<usize>) -> Vec<SessionEntry> {
+    match limit {
+        Some(limit) if entries.len() > limit => entries[entries.len() - limit..].to_vec(),
+        _ => entries,
+    }
+}
+
+/// `GET /api/sessions/{id}/history` — the frontend's initial-render path.
+/// Returns one compaction segment of the session log: the head segment
+/// (last compaction + everything after) without `before_seq`, or the
+/// segment immediately older than `before_seq` when paging. `next_before_seq`
+/// is the compaction seq that opens the returned segment (feed it back to
+/// page further back); `null` means the oldest segment or no compaction.
+async fn session_history(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<HistoryParams>,
+) -> Result<Json<HistoryResponse>, (StatusCode, String)> {
+    let session = live(&state, &id)?;
+    let root = state.factory.root();
+    let (entries, next_before_seq) = match params.before_seq {
+        None => {
+            // Head segment; the cursor is the seq of the compaction that
+            // opens it (None = the whole session is one head segment).
+            let loaded = session
+                .store
+                .load_head(root, &id)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let cursor = session
+                .store
+                .head_seq(root, &id)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            (loaded.entries, cursor)
+        }
+        Some(before_seq) => {
+            // Older segment: [prev_comp, before_seq); cursor = prev_comp.
+            let (entries, cursor) = session
+                .store
+                .load_older(root, &id, before_seq)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            (entries, cursor)
+        }
+    };
+    Ok(Json(HistoryResponse {
+        entries: cap_entries(entries, params.limit),
+        next_before_seq,
+    }))
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // SSE
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -783,5 +867,73 @@ mod tests {
         assert!(snapshot_event(&[AgentEvent::Notice("hi".into())]).is_ok());
         assert!(message_event(&AgentEvent::AssistantText("x".into())).is_ok());
         assert!(status_event(&SessionStatus::Busy).is_ok());
+    }
+
+    /// The frontend contract (contract item 5): `SessionEntry` is internally
+    /// tagged with `type` and `Message` stays externally tagged, so a history
+    /// page serializes as `{type:"message", message:{User:{content,images?}}}`.
+    /// The `{entries, next_before_seq}` wrapper is compatible with the
+    /// frontend's defensive parsing (bare array or `{entries:[...]}`).
+    #[test]
+    fn history_response_wire_shape() {
+        use crate::agent::{Message, SessionEntry};
+        let entries = vec![
+            SessionEntry::Message {
+                message: Message::User {
+                    content: "hello".into(),
+                    images: vec![],
+                },
+            },
+            SessionEntry::Compaction {
+                summary: "rolled up".into(),
+                retained: vec![],
+            },
+        ];
+        assert_eq!(
+            serde_json::to_value(HistoryResponse {
+                entries,
+                next_before_seq: Some(42),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "entries": [
+                    {"type": "message", "message": {"User": {"content": "hello"}}},
+                    {"type": "compaction", "summary": "rolled up", "retained": []},
+                ],
+                "next_before_seq": 42,
+            })
+        );
+        // No compaction: the whole session is one head segment, nothing
+        // older to page — cursor must serialize as JSON null.
+        assert_eq!(
+            serde_json::to_value(HistoryResponse {
+                entries: vec![],
+                next_before_seq: None,
+            })
+            .unwrap(),
+            serde_json::json!({"entries": [], "next_before_seq": null})
+        );
+    }
+
+    #[test]
+    fn history_limit_keeps_newest_entries() {
+        use crate::agent::{Message, SessionEntry};
+        let entry = |i: usize| SessionEntry::Message {
+            message: Message::User {
+                content: format!("m{i}"),
+                images: vec![],
+            },
+        };
+        let entries = vec![entry(1), entry(2), entry(3), entry(4)];
+        assert_eq!(
+            serde_json::to_value(cap_entries(entries.clone(), Some(2))).unwrap(),
+            serde_json::json!([
+                {"type": "message", "message": {"User": {"content": "m3"}}},
+                {"type": "message", "message": {"User": {"content": "m4"}}},
+            ])
+        );
+        // No cap or an oversized cap: unchanged.
+        assert_eq!(cap_entries(entries.clone(), None).len(), 4);
+        assert_eq!(cap_entries(entries, Some(99)).len(), 4);
     }
 }
