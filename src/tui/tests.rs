@@ -2570,3 +2570,287 @@ fn edit_file_tool_calls_render_as_a_numbered_diff_on_result() {
     assert!(state.lines[0].text.starts_with("tool: edit_file not json"));
     assert_eq!(state.lines[0].kind, LineKind::ToolCall);
 }
+
+// ── older-history paging (Greptime segmented load) ──────────────────────
+
+#[test]
+fn up_at_scrollback_top_requests_older_history() {
+    let scroll = |code| KeyEvent::new(code, KeyModifiers::empty());
+    let mut state = TuiState {
+        store: Some(crate::session_store::SessionStore::Jsonl),
+        session_id: "s1".into(),
+        root: std::path::PathBuf::from("/tmp"),
+        lines: vec![DisplayLine {
+            text: "only line".into(),
+            kind: LineKind::Normal,
+        }],
+        window: ScrollWindow {
+            source_start: 0,
+            source_end: 1,
+            local_offset: 0,
+            follow_bottom: false,
+            ..Default::default()
+        },
+        inner_width: 80,
+        ..Default::default()
+    };
+    // Up at the local top queues one request…
+    state.handle_scroll(scroll(KeyCode::Up));
+    assert!(state.older_pending);
+    // …repeated scroll keys collapse into the same single request…
+    state.handle_scroll(scroll(KeyCode::Up));
+    state.handle_scroll(scroll(KeyCode::PageUp));
+    assert!(state.older_pending);
+    // …and once history is exhausted no further requests fire.
+    state.older_pending = false;
+    state.older_done = true;
+    state.handle_scroll(scroll(KeyCode::Up));
+    assert!(!state.older_pending);
+}
+
+#[test]
+fn scrolled_up_mid_scrollback_or_without_store_never_requests_older() {
+    let scroll = |code| KeyEvent::new(code, KeyModifiers::empty());
+    let mut state = TuiState {
+        store: Some(crate::session_store::SessionStore::Jsonl),
+        lines: vec![
+            DisplayLine {
+                text: "a".into(),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "b".into(),
+                kind: LineKind::Normal,
+            },
+        ],
+        window: ScrollWindow {
+            source_start: 1,
+            source_end: 2,
+            local_offset: 5,
+            follow_bottom: false,
+            ..Default::default()
+        },
+        inner_width: 80,
+        ..Default::default()
+    };
+    state.handle_scroll(scroll(KeyCode::Up));
+    assert!(!state.older_pending, "mid-window Up does not reach the top");
+    assert_eq!(state.window.local_offset, 4);
+
+    // No store wired (tests, Default): even at the very top nothing is
+    // requested.
+    let mut state = TuiState {
+        lines: vec![DisplayLine {
+            text: "a".into(),
+            kind: LineKind::Normal,
+        }],
+        window: ScrollWindow {
+            source_start: 0,
+            source_end: 1,
+            local_offset: 0,
+            follow_bottom: false,
+            ..Default::default()
+        },
+        inner_width: 80,
+        ..Default::default()
+    };
+    state.handle_scroll(scroll(KeyCode::Up));
+    assert!(!state.older_pending);
+}
+
+#[test]
+fn prepend_lines_shifts_window_indices_and_keeps_viewport() {
+    let mut state = TuiState {
+        lines: vec![
+            DisplayLine {
+                text: "head-1".into(),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "head-2".into(),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "head-3".into(),
+                kind: LineKind::Normal,
+            },
+        ],
+        window: ScrollWindow {
+            source_start: 1,
+            source_end: 3,
+            local_offset: 2,
+            follow_bottom: false,
+            frozen_source_end: 3,
+            ..Default::default()
+        },
+        inner_width: 80,
+        ..Default::default()
+    };
+    state.prepend_lines(vec![
+        DisplayLine {
+            text: "old-1".into(),
+            kind: LineKind::Dim,
+        },
+        DisplayLine {
+            text: "old-2".into(),
+            kind: LineKind::Dim,
+        },
+    ]);
+    assert_eq!(state.lines.len(), 5);
+    assert_eq!(state.lines[0].text, "old-1");
+    assert_eq!(state.lines[2].text, "head-1");
+    // The window still covers head-2..head-3, now at shifted indices;
+    // local_offset (a visual-row offset) and frozen state are untouched.
+    assert_eq!(state.window.source_start, 3);
+    assert_eq!(state.window.source_end, 5);
+    assert_eq!(state.window.local_offset, 2);
+    assert_eq!(state.window.frozen_source_end, 3);
+
+    // An empty prepend is a no-op.
+    let before = (
+        state.lines.len(),
+        state.window.source_start,
+        state.window.source_end,
+    );
+    state.prepend_lines(Vec::new());
+    assert_eq!(
+        (state.lines.len(), state.window.source_start, state.window.source_end),
+        before
+    );
+}
+
+#[test]
+fn session_entry_to_lines_maps_persisted_entry_kinds() {
+    use crate::agent::{AssistantMessage, Message, SessionEntry, ToolCall};
+
+    let lines = |entry: &SessionEntry| session_entry_to_lines(entry);
+
+    // User prompt → User line, same as the live UserPrompt rendering.
+    let out = lines(&SessionEntry::Message {
+        message: Message::User {
+            content: "hello".into(),
+            images: vec![],
+        },
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].text, "you> hello");
+    assert_eq!(out[0].kind, LineKind::User);
+
+    // Assistant text → Normal line; a tool-call-only assistant renders
+    // nothing (matches the resume replay, which has no ToolCall events).
+    let out = lines(&SessionEntry::Message {
+        message: Message::Assistant(AssistantMessage {
+            content: Some("answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        }),
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].text, "answer");
+    assert_eq!(out[0].kind, LineKind::Normal);
+    let out = lines(&SessionEntry::Message {
+        message: Message::Assistant(AssistantMessage {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+            }],
+            reasoning: None,
+        }),
+    });
+    assert!(out.is_empty(), "tool-call-only assistant renders nothing on replay");
+
+    // Tool result → ok/error line like push_tool_result.
+    let out = lines(&SessionEntry::Message {
+        message: Message::Tool {
+            call_id: "c1".into(),
+            name: "bash".into(),
+            content: "done".into(),
+            is_error: false,
+            synthetic: false,
+        },
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].text, "  ok: done");
+    assert_eq!(out[0].kind, LineKind::ToolResult);
+    let out = lines(&SessionEntry::Message {
+        message: Message::Tool {
+            call_id: "c1".into(),
+            name: "bash".into(),
+            content: "boom".into(),
+            is_error: true,
+            synthetic: false,
+        },
+    });
+    assert_eq!(out[0].text, "  error: boom");
+    assert_eq!(out[0].kind, LineKind::ToolError);
+
+    // System messages are never displayed.
+    let out = lines(&SessionEntry::Message {
+        message: Message::System {
+            content: "AGENTS.md".into(),
+        },
+    });
+    assert!(out.is_empty());
+
+    // Compaction → dim summary line (same as the resume replay).
+    let out = lines(&SessionEntry::Compaction {
+        summary: "did things".into(),
+        retained: vec![],
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].text, "compacted: did things");
+    assert_eq!(out[0].kind, LineKind::Dim);
+
+    // Notice → dim; persisted compaction banners keep their banner kind.
+    let out = lines(&SessionEntry::Notice {
+        text: "background done".into(),
+    });
+    assert_eq!(out[0].kind, LineKind::Dim);
+    let out = lines(&SessionEntry::Notice {
+        text: "──── auto-compaction ────".into(),
+    });
+    assert_eq!(out[0].kind, LineKind::Compaction);
+
+    // BackgroundCompletion → header + truncated body, all dim.
+    let out = lines(&SessionEntry::BackgroundCompletion {
+        id: 7,
+        output: "line1\nline2".into(),
+        label: Some("demo".into()),
+    });
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0].text, "[background task 7 completed: demo]");
+    assert!(out.iter().all(|line| line.kind == LineKind::Dim));
+
+    // ForkedFrom → dim provenance notice.
+    let out = lines(&SessionEntry::ForkedFrom {
+        source: "abc".into(),
+        at: 3,
+        event_time: None,
+        seq: None,
+    });
+    assert_eq!(out[0].text, "forked from abc at entry 3");
+    assert_eq!(out[0].kind, LineKind::Dim);
+}
+
+#[tokio::test]
+async fn jsonl_store_load_older_marks_history_done_without_lines() {
+    let mut state = TuiState {
+        store: Some(crate::session_store::SessionStore::Jsonl),
+        session_id: "s1".into(),
+        root: std::path::PathBuf::from("/tmp"),
+        older_pending: true,
+        lines: vec![DisplayLine {
+            text: "head".into(),
+            kind: LineKind::Normal,
+        }],
+        ..Default::default()
+    };
+    state.load_older_history().await;
+    assert!(!state.older_pending);
+    assert!(!state.older_loading);
+    assert!(state.older_done, "JSONL already holds the full session");
+    assert_eq!(state.lines.len(), 1, "nothing older to splice in");
+    assert_eq!(state.older_cursor, None);
+}

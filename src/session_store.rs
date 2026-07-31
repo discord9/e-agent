@@ -170,6 +170,22 @@ impl SessionStore {
         }
     }
 
+    /// The backend seq of the newest compaction entry — the first seq of
+    /// the head segment loaded by [`Self::load_head`]. `None` means the
+    /// session has no compaction (the head covers the whole session, so
+    /// there is nothing older to load). The TUI uses this to seed the
+    /// first [`Self::load_older`] call.
+    ///
+    /// For JSONL there is no seq column and the full session was already
+    /// loaded: always `None`.
+    pub async fn head_seq(&self, _root: &Path, _name: &str) -> Result<Option<i64>> {
+        match self {
+            SessionStore::Jsonl => Ok(None),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session.lock().await.head_seq().await,
+        }
+    }
+
     /// Load entries paired with their backend sequence number, in load
     /// order. Used by `--fork` to record the source entry's seq as
     /// provenance on the `ForkedFrom` marker.

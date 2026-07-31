@@ -315,6 +315,26 @@ impl GreptimeSession {
             .map(|v| v.into_iter().map(|(_, e)| e).collect())
     }
 
+    /// The backend seq of the newest compaction entry — the first seq of
+    /// the head segment returned by [`Self::load_head`]. `None` when the
+    /// session has no compaction at all, i.e. the whole session is one
+    /// head segment and there is nothing older to load. The TUI uses this
+    /// to seed the first [`Self::load_older`] call:
+    /// `load_older(head_seq)` fetches the segment immediately before the
+    /// head.
+    pub async fn head_seq(&self) -> Result<Option<i64>> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT MAX(seq) AS max_seq FROM session_entries \
+                 WHERE workspace_id = $1 AND session_id = $2 AND entry_kind = 'compaction'",
+                &[&self.workspace_id, &self.session_id],
+            )
+            .await
+            .context("cannot query last compaction seq")?;
+        Ok(row.and_then(|r| r.get("max_seq")))
+    }
+
     /// Load the compaction segment immediately older than `before_seq`:
     /// seq ∈ `[prev_comp, before)` where `prev_comp` is the newest
     /// compaction with `seq < before_seq`. The compaction row that opens

@@ -287,6 +287,7 @@ pub async fn run(
         &mut terminal,
         handle,
         &labels,
+        root,
         background,
         sessions,
         context_window,
@@ -337,10 +338,12 @@ impl Drop for TerminalGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     handle: RunnerHandle,
     labels: &InputLabels,
+    root: PathBuf,
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
     context_window: Option<u64>,
@@ -364,6 +367,7 @@ async fn run_inner(
     state.session_id = labels.session.clone();
     state.model_name = labels.model.clone();
     state.cwd = labels.cwd.clone();
+    state.root = root;
     state.role_name = labels.role.clone();
     state.context_window = context_window;
     state.background = Some(background);
@@ -418,7 +422,13 @@ async fn run_inner(
                     let active = matches!(&*status.borrow(), SessionStatus::Busy | SessionStatus::Compacting);
                     if active && is_cancel(key) { handle.cancel(); continue; }
                     if !active && is_exit(key) { return Ok(None); }
-                    if is_scroll_key(key) { state.handle_scroll(key); drain_ready_scroll_keys(&mut events,&mut state).await; }
+                    if is_scroll_key(key) {
+                        state.handle_scroll(key);
+                        drain_ready_scroll_keys(&mut events, &mut state).await;
+                        if state.older_pending {
+                            state.load_older_history().await;
+                        }
+                    }
                     else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
                 Some(Ok(Event::Paste(text))) => state.handle_paste(&text),
