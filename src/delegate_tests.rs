@@ -560,6 +560,34 @@ async fn rejects_empty_task() {
     );
 }
 
+#[test]
+fn spec_defaults_background_true_without_requiring_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = delegate(temp.path()).spec();
+    let background = &spec.parameters["properties"]["background"];
+    assert_eq!(background["type"], "boolean");
+    assert_eq!(background["default"], true);
+    assert_eq!(spec.parameters["required"], json!(["task"]));
+    assert!(
+        spec.description
+            .contains("By default it runs in the background")
+    );
+    assert!(spec.description.contains("`background: false`"));
+}
+
+#[tokio::test]
+async fn rejects_present_non_boolean_background_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let tool = delegate(temp.path());
+    for value in [Value::Null, json!("true"), json!(1), json!({}), json!([])] {
+        let error = tool
+            .execute(json!({"task": "hello", "background": value}))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "`background` must be a boolean");
+    }
+}
+
 #[tokio::test]
 async fn background_delivery_preflight_fails_before_later_work() {
     // The missing sender must win over resume loading and workspace
@@ -574,7 +602,6 @@ async fn background_delivery_preflight_fails_before_later_work() {
     let error = delegate
         .execute(json!({
             "task": "hi",
-            "background": true,
             "resume": "sub-does-not-exist",
             "workspace": "/nonexistent-path-that-surely-does-not-exist-12345"
         }))
@@ -598,7 +625,7 @@ async fn resume_requires_persistence_and_an_existing_session() {
     let no_persist = delegate(temp.path());
     assert!(
         no_persist
-            .execute(json!({"task": "hi", "resume": "sub-x"}))
+            .execute(json!({"task": "hi", "resume": "sub-x", "background": false}))
             .await
             .unwrap_err()
             .contains("requires subagent session persistence")
@@ -609,7 +636,7 @@ async fn resume_requires_persistence_and_an_existing_session() {
     let root = temp.path().join("sessions");
     let tool: Delegate = delegate(temp.path()).persist_sessions(root);
     assert!(
-        tool.execute(json!({"task": "hi", "resume": "sub-does-not-exist"}))
+        tool.execute(json!({"task": "hi", "resume": "sub-does-not-exist", "background": false}))
             .await
             .unwrap_err()
             .contains("no such subagent session")
@@ -672,7 +699,7 @@ async fn role_requires_a_roles_root_and_a_known_role() {
     let plain = delegate(temp.path());
     assert!(
         plain
-            .execute(json!({"task": "hi", "role": "fixer"}))
+            .execute(json!({"task": "hi", "role": "fixer", "background": false}))
             .await
             .unwrap_err()
             .contains("roles are not configured")
@@ -681,7 +708,7 @@ async fn role_requires_a_roles_root_and_a_known_role() {
     // Roles root set, but the requested role has no template file.
     let rooted = delegate(temp.path()).with_roles_root(temp.path().to_path_buf());
     let error = rooted
-        .execute(json!({"task": "hi", "role": "fixer"}))
+        .execute(json!({"task": "hi", "role": "fixer", "background": false}))
         .await
         .unwrap_err();
     assert!(error.contains("unknown role `fixer`"), "{error}");
@@ -743,7 +770,8 @@ async fn delegate_uses_custom_workspace() {
     let err = tool
         .execute(json!({
             "task": "irrelevant",
-            "workspace": "/nonexistent-path-that-surely-does-not-exist-12345"
+            "workspace": "/nonexistent-path-that-surely-does-not-exist-12345",
+            "background": false
         }))
         .await
         .unwrap_err();
@@ -759,7 +787,8 @@ async fn delegate_uses_custom_workspace() {
     let answer = tool
         .execute(json!({
             "task": "read sentinel.txt and report its content",
-            "workspace": custom.path().to_str().unwrap()
+            "workspace": custom.path().to_str().unwrap(),
+            "background": false
         }))
         .await
         .unwrap_err();
@@ -783,7 +812,10 @@ async fn sync_success_contains_session_id_and_answer() {
     let base_url = successful_model("finished answer").await;
     let tool = delegate_with_url(temp.path(), base_url);
 
-    let output = tool.execute(json!({"task": "hello"})).await.unwrap();
+    let output = tool
+        .execute(json!({"task": "hello", "background": false}))
+        .await
+        .unwrap();
     let mut lines = output.lines();
     let session_id = lines
         .next()
@@ -794,7 +826,7 @@ async fn sync_success_contains_session_id_and_answer() {
 }
 
 #[tokio::test]
-async fn background_delegate_completion_contains_session_id() {
+async fn omitted_background_defaults_to_one_completion_with_session_id() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("sessions");
     let base_url = successful_model("finished answer").await;
@@ -805,8 +837,7 @@ async fn background_delegate_completion_contains_session_id() {
     let answer = tool
         .execute(json!({
             "task": "hello",
-            "label": "first line\nsecond line",
-            "background": true
+            "label": "first line\nsecond line"
         }))
         .await
         .unwrap();
@@ -900,11 +931,9 @@ async fn resume_replays_scrollback_into_session_sink() {
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     tool.set_event_sender(sender);
 
-    // Spawn a background delegate that resumes the prior session.
+    // Omitting background defaults to a background delegate while resuming.
     let answer = tool
-        .execute(
-            json!({"task": "new prompt", "background": true, "resume": "sub-resume-scrollback"}),
-        )
+        .execute(json!({"task": "new prompt", "resume": "sub-resume-scrollback"}))
         .await
         .unwrap();
     assert!(answer.starts_with("started background task"));

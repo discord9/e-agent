@@ -2153,8 +2153,9 @@ fn parse_edit_arguments(arguments: &str) -> Option<(String, String, String)> {
 /// display metadata from delegate calls.
 ///
 /// Output format: `  #<id>: [<role>] <label>[background][ workspace: <ws>]`
-/// where `[background]` and `[workspace: …]` are only shown when the
-/// delegate explicitly set them. "bash" tasks never have these tags.
+/// where `[background]` reflects the effective execution mode and
+/// `[workspace: …]` is only shown when explicitly set. "bash" tasks never
+/// have these tags.
 pub fn format_task_label(
     task: &crate::tools::BackgroundTaskInfo,
     hint: &str,
@@ -2235,8 +2236,7 @@ fn format_tool_call(name: &str, arguments: &str) -> String {
                 .filter(|s| !s.is_empty());
             let bg = value
                 .get("background")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .is_none_or(|v| v.as_bool().unwrap_or(false));
             let ws = value
                 .get("workspace")
                 .and_then(|v| v.as_str())
@@ -2283,22 +2283,32 @@ mod format_tool_call_tests {
                 Some("coder"),
                 Some("My Label"),
                 "Do the thing",
-                "coder: My Label — Do the thing",
+                "coder: My Label — Do the thing [background]",
             ),
-            (Some("coder"), None, "Do the thing", "coder: Do the thing"),
+            (
+                Some("coder"),
+                None,
+                "Do the thing",
+                "coder: Do the thing [background]",
+            ),
             (
                 Some("coder"),
                 Some("  "),
                 "Do the thing",
-                "coder: Do the thing",
+                "coder: Do the thing [background]",
             ),
             (
                 Some("coder"),
                 Some("  My Label  "),
                 "Do the thing",
-                "coder: My Label — Do the thing",
+                "coder: My Label — Do the thing [background]",
             ),
-            (None, None, "just a task", "delegate: just a task"),
+            (
+                None,
+                None,
+                "just a task",
+                "delegate: just a task [background]",
+            ),
         ];
         for (role, label, task, expected) in &cases {
             let mut map = serde_json::Map::new();
@@ -2323,7 +2333,6 @@ mod format_tool_call_tests {
         let cases = [
             (true, "delegate: bg task [background]"),
             (false, "delegate: sync task"),
-            // absent maps to None
         ];
         // background:true
         let out = format_tool_call("delegate", r#"{"task":"bg task","background":true}"#);
@@ -2332,8 +2341,9 @@ mod format_tool_call_tests {
         let out = format_tool_call("delegate", r#"{"task":"sync task","background":false}"#);
         assert_eq!(out, cases[1].1);
         // absent
+        // omitted background defaults to the effective background mode
         let out = format_tool_call("delegate", r#"{"task":"plain task"}"#);
-        assert_eq!(out, "delegate: plain task");
+        assert_eq!(out, "delegate: plain task [background]");
     }
 
     #[test]
@@ -2341,12 +2351,15 @@ mod format_tool_call_tests {
         let cases = [
             (
                 Some("/some/path"),
-                "delegate: with ws [workspace: /some/path]",
+                "delegate: with ws [background] [workspace: /some/path]",
             ),
-            (Some("  /a/b  "), "delegate: trim ws [workspace: /a/b]"),
-            (Some(""), "delegate: no ws"),
-            (None, "delegate: no ws key"),
-            (Some("   "), "delegate: ws blank"),
+            (
+                Some("  /a/b  "),
+                "delegate: trim ws [background] [workspace: /a/b]",
+            ),
+            (Some(""), "delegate: no ws [background]"),
+            (None, "delegate: no ws key [background]"),
+            (Some("   "), "delegate: ws blank [background]"),
         ];
         for (workspace, expected) in &cases {
             let mut map = serde_json::Map::new();
@@ -2393,7 +2406,7 @@ mod format_tool_call_tests {
         let json = format!(r#"{{"label":"{long_label}","task":"short"}}"#);
         let out = format_tool_call("delegate", &json);
         let previewed = preview(&long_label, 40);
-        assert_eq!(out, format!("delegate: {previewed} — short"));
+        assert_eq!(out, format!("delegate: {previewed} — short [background]"));
         assert!(out.contains('…'), "long label must contain ellipsis");
 
         // Long task (200 chars → preview at 120)
@@ -2401,7 +2414,7 @@ mod format_tool_call_tests {
         let json = format!(r#"{{"task":"{long_task}"}}"#);
         let out = format_tool_call("delegate", &json);
         let previewed = preview(&long_task, 120);
-        assert_eq!(out, format!("delegate: {previewed}"));
+        assert_eq!(out, format!("delegate: {previewed} [background]"));
         assert!(out.contains('…'), "long task must contain ellipsis");
 
         // Long workspace (preview at 40)
@@ -2409,7 +2422,10 @@ mod format_tool_call_tests {
         let json = format!(r#"{{"task":"x","workspace":"{long_ws}"}}"#);
         let out = format_tool_call("delegate", &json);
         let previewed = preview(long_ws, 40);
-        assert_eq!(out, format!("delegate: x [workspace: {previewed}]"));
+        assert_eq!(
+            out,
+            format!("delegate: x [background] [workspace: {previewed}]")
+        );
         assert!(out.contains('…'), "long workspace must contain ellipsis");
     }
 
@@ -2432,9 +2448,9 @@ mod format_tool_call_tests {
             "invalid json fallback: {out}"
         );
 
-        // Empty JSON
+        // Empty JSON still reflects the default execution mode.
         let out = format_tool_call("delegate", "{}");
-        assert_eq!(out, "delegate: ");
+        assert_eq!(out, "delegate:  [background]");
     }
 }
 
@@ -2476,6 +2492,8 @@ mod format_task_label_tests {
 
     #[test]
     fn task_label_background() {
+        // Metadata stores the effective mode, including an omitted argument
+        // that defaulted to background execution.
         let meta = TaskDisplayMeta {
             background: true,
             workspace: None,

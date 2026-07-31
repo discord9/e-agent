@@ -358,17 +358,18 @@ fn sync_result(session_id: &str, result: SessionResult) -> Result<String, String
 impl Tool for Delegate {
     fn spec(&self) -> ToolSpec {
         let mut description =
-            "Spawn a subagent with a fresh context to work on a task and return its \
-                final answer. Use this for self-contained subtasks (searching, reading many files, \
-                focused edits) whose intermediate steps would clutter your own context. The \
-                subagent has the file and bash tools and, when configured, public web search, but cannot delegate further."
+            "Spawn a subagent with a fresh context to work on a task. Use this for \
+                self-contained subtasks (searching, reading many files, focused edits) whose \
+                intermediate steps would clutter your own context. The subagent has the file and \
+                bash tools and, when configured, public web search, but cannot delegate further."
                 .to_owned();
         let model = self.subagent_model.display_name();
         description.push_str(&format!(" The subagent runs on the `{model}` model."));
         description.push_str(
-            " With `background: true` it runs without blocking; the answer arrives \
-                automatically as a `[background task N completed]` message. Do not poll, \
-                sleep, or re-check a background task — just dispatch it and wait; the \
+            " By default it runs in the background without blocking; the answer arrives \
+                automatically as a `[background task N completed]` message. Pass \
+                `background: false` to wait for and return the final answer directly. Do not \
+                poll, sleep, or re-check a background task — just dispatch it and wait; the \
                 completion arrives on its own.",
         );
         if self.persist_root.is_some() {
@@ -403,7 +404,7 @@ impl Tool for Delegate {
                     "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"},
                     "role": role_property,
                     "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
-                    "background": {"type": "boolean", "description": "run without blocking; the answer arrives as a background completion (default false)"},
+                    "background": {"type": "boolean", "default": true, "description": "run without blocking and deliver the answer as a background completion (default true); pass false to wait for the final answer"},
                     "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
                     "workspace": {"type": "string", "description": "working directory for the subagent (absolute path); defaults to the parent's workspace"}
                 },
@@ -433,11 +434,13 @@ impl Tool for Delegate {
         if task.trim().is_empty() {
             return Err("`task` must not be empty".into());
         }
-        let background = arguments
+        let background = match arguments
             .as_object()
             .and_then(|args| args.get("background"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        {
+            None => true,
+            Some(value) => value.as_bool().ok_or("`background` must be a boolean")?,
+        };
         if background && !self.background.completion_delivery_available() {
             return Err("background task delivery is unavailable".into());
         }
@@ -540,8 +543,8 @@ impl Tool for Delegate {
             None => self.workspace.clone(),
         };
 
-        // Build structured display metadata for the F2 task panel.
-        // Only tracks explicitly-provided values; inherited defaults are not shown.
+        // Build structured display metadata for the F2 task panel. Background
+        // reflects the effective execution mode; workspace remains explicit-only.
         let task_display = crate::tools::TaskDisplayMeta {
             background,
             workspace: explicit_workspace_arg.clone(),

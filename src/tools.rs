@@ -657,7 +657,7 @@ struct RunningTask {
 /// Avoids label/string re-parsing. Only populated for delegate tasks.
 #[derive(Clone, Debug, Default)]
 pub struct TaskDisplayMeta {
-    /// Whether `background: true` was explicitly set.
+    /// Effective delegate execution mode (`true` for background).
     pub background: bool,
     /// Explicit user-provided workspace path (trimmed, non-empty); `None`
     /// means the parent's default workspace was inherited.
