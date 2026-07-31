@@ -571,12 +571,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
                         .bg(SOLARIZED_LIGHT.selection)
                         .add_modifier(Modifier::BOLD);
                 }
-                let hint = if attachable(task.id) {
-                    ""
-                } else {
-                    "  (no view)"
-                };
-                let row = format_task_label(task, hint, 40);
+                let row = format_task_label(task, "", 40);
                 lines.push(Line::styled(row, style));
             }
             if !selected_output.is_empty() {
