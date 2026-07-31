@@ -1171,11 +1171,11 @@ impl TuiState {
             KeyCode::Home => {
                 self.window.follow_bottom = false;
                 // Home goes to the true start of the loaded scrollback.
-                // Rendering is bounded elsewhere (local_window_lines +
-                // render_bounded_window), so an unbounded source range is
-                // safe; a bounded Home (last MAX_RENDER_SOURCE_LINES) left
-                // long sessions unable to reach the beginning.
-                self.window.source_end = self.lines.len();
+                // The window covers the FIRST lines, not the whole range:
+                // local_window_lines renders the *last*
+                // MAX_RENDER_SOURCE_LINES of the window, so a [0, len)
+                // window would show the tail 256 lines, not the beginning.
+                self.window.source_end = self.lines.len().min(MAX_RENDER_SOURCE_LINES);
                 self.window.source_start = 0;
                 self.window.local_offset = 0;
                 self.window.frozen_tail_cursor = None;
@@ -1264,8 +1264,11 @@ impl TuiState {
                     };
                     self.older_done = true;
                     // Show the true beginning: prepend_lines shifted
-                    // source_start forward by the loaded lines.
+                    // source_start forward by the loaded lines. The window
+                    // covers the FIRST lines (local_window_lines renders
+                    // the last MAX_RENDER_SOURCE_LINES of the window).
                     self.window.source_start = 0;
+                    self.window.source_end = self.lines.len().min(MAX_RENDER_SOURCE_LINES);
                     self.window.local_offset = 0;
                 }
                 Err(error) => {

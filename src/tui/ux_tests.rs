@@ -97,6 +97,33 @@ fn cwd_shows_in_the_input_border_before_any_token_usage() {
 }
 
 #[test]
+fn home_renders_the_true_beginning_not_the_256_tail() {
+    // Regression: Home set source_start=0 but left source_end=lines.len();
+    // local_window_lines renders the LAST MAX_RENDER_SOURCE_LINES of the
+    // window, so the viewport showed line len-256 instead of line 0.
+    let backend = ratatui::backend::TestBackend::new(60, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    for index in 0..(MAX_RENDER_SOURCE_LINES + 10) {
+        state.push_line(format!("line {index}"), LineKind::Normal);
+    }
+    state.handle_scroll(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    draw(&mut terminal, &mut state).unwrap();
+    let top: String = terminal.backend().buffer().content()[0..60]
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        top.contains("line 0"),
+        "Home must show the first line, got: {top:?}"
+    );
+    assert!(
+        !top.contains("line 26"),
+        "must not show the 256-tail line, got: {top:?}"
+    );
+}
+
+#[test]
 fn pasted_crlf_is_normalized_to_plain_newlines() {
     let mut input = InputBuffer::default();
     let pasted = "one\r\ntwo\rthree"
@@ -571,6 +598,11 @@ fn home_starts_at_true_beginning() {
     state.handle_scroll(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
     assert_eq!(state.window.source_start, 0);
     assert_eq!(state.window.local_offset, 0);
+    // The window covers the FIRST lines: local_window_lines renders the
+    // last MAX_RENDER_SOURCE_LINES of the window, so source_end must be
+    // clamped to the beginning, not the whole range (which would show
+    // the tail 256 lines).
+    assert_eq!(state.window.source_end, MAX_RENDER_SOURCE_LINES);
     // With a store wired and older history available, Home at the top
     // queues an older-segment load (same as PageUp at the top).
     assert!(!state.older_pending, "no store: nothing to queue");
