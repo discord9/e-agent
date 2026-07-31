@@ -4,11 +4,16 @@ use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 use tokio::sync::mpsc;
 
+/// Content of the synthetic error result inserted for every tool call left
+/// unanswered by an interrupted turn (cancel, provider error, crash). Also
+/// the legacy marker: sessions written before the `synthetic` flag existed
+/// (commit 92159c7) recognized these placeholders by this literal text.
+const INTERRUPTED: &str = "[turn interrupted before a tool result was produced]";
+
 /// Insert a synthetic error result for every tool call left unanswered by an
 /// interrupted turn (cancel, provider error, crash), so the derived context
 /// always satisfies the provider's tool_call/tool-result pairing rule.
-fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
-    const INTERRUPTED: &str = "[turn interrupted before a tool result was produced]";
+pub(crate) fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
     fn flush(pending: &mut Vec<ToolCall>, out: &mut Vec<Message>) {
         for call in pending.drain(..) {
             out.push(Message::Tool {
@@ -47,6 +52,14 @@ fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
                 // synthetic entry captured in a compaction snapshot, or the
                 // call itself was compacted away). Dropping it keeps the
                 // provider's tool_call/tool-result pairing rule intact.
+                //
+                // Ordering invariant: the real result for a tool_call always
+                // lands inside the retained context window, so an orphan here
+                // can only be a duplicate of a result that already paired —
+                // never a first-time result. If a future change inserts
+                // messages between a placeholder and its real result, this
+                // drop would silently lose a real result; keep the
+                // "real result within the retained window" invariant in mind.
             }
             Message::Assistant(assistant) => {
                 flush(&mut pending, &mut out);
@@ -358,13 +371,56 @@ impl Agent {
     /// already-loaded history, use [`Self::push_entry`] — calling this again
     /// would wipe the restored entries.
     pub fn restore_history(&mut self, history: Vec<SessionEntry>) {
-        self.history = history;
+        self.history = Self::migrate_legacy_placeholders(history);
     }
 
     /// Append a single entry to the history (e.g. a startup notice injected
     /// after resume).
     pub fn push_entry(&mut self, entry: SessionEntry) {
         self.history.push(entry);
+    }
+
+    /// One-time migration for sessions written before the `synthetic` flag
+    /// existed (commit 92159c7). Back then the interrupted-turn placeholder
+    /// was recognized only by its literal text, and placeholders captured in
+    /// compaction `retained` snapshots persist WITHOUT the flag — they
+    /// deserialize as `synthetic: false`, so `repair_tool_pairs` would
+    /// consume them like real results and the real result arriving later
+    /// would become a silently dropped orphan (the model would never see
+    /// it). Mark legacy placeholders here at load time so the structured
+    /// field alone decides from now on.
+    fn migrate_legacy_placeholders(history: Vec<SessionEntry>) -> Vec<SessionEntry> {
+        let mut history = history;
+        for entry in &mut history {
+            match entry {
+                SessionEntry::Message { message } => Self::mark_legacy_placeholder(message),
+                SessionEntry::Compaction { retained, .. } => {
+                    for message in retained {
+                        Self::mark_legacy_placeholder(message);
+                    }
+                }
+                SessionEntry::Notice { .. } | SessionEntry::BackgroundCompletion { .. } => {}
+            }
+        }
+        history
+    }
+
+    /// Flag a placeholder written before the `synthetic` field existed:
+    /// exactly the interrupted-turn text, an error result, and no flag yet.
+    /// A real result with identical text but `is_error: false` is left
+    /// untouched.
+    fn mark_legacy_placeholder(message: &mut Message) {
+        if let Message::Tool {
+            content,
+            is_error: true,
+            synthetic,
+            ..
+        } = message
+            && !*synthetic
+            && content == INTERRUPTED
+        {
+            *synthetic = true;
+        }
     }
 
     /// Messages sent to the provider: the latest compaction summary plus
@@ -1151,6 +1207,254 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn restore_history_migrates_legacy_interrupted_placeholders() {
+        // A session file written before commit 92159c7: its interrupted-turn
+        // placeholders — both a plain message entry and one inside a
+        // compaction `retained` snapshot — carry no `synthetic` field and
+        // deserialize as synthetic: false. restore_history must flag them so
+        // repair_tool_pairs skips them instead of consuming them like real
+        // results.
+        let legacy_message = serde_json::json!({
+            "type": "message",
+            "message": {
+                "Tool": {
+                    "call_id": "call-1",
+                    "name": "bash",
+                    "content": INTERRUPTED,
+                    "is_error": true,
+                }
+            }
+        });
+        let legacy_compaction = serde_json::json!({
+            "type": "compaction",
+            "summary": "old summary",
+            "retained": [
+                {
+                    "User": { "content": "current question" }
+                },
+                {
+                    "Assistant": {
+                        "content": null,
+                        "tool_calls": [
+                            {
+                                "id": "call-2",
+                                "name": "bash",
+                                "arguments": "{\"command\":\"make\"}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "Tool": {
+                        "call_id": "call-2",
+                        "name": "bash",
+                        "content": INTERRUPTED,
+                        "is_error": true,
+                    }
+                }
+            ]
+        });
+        let entries: Vec<SessionEntry> = vec![
+            serde_json::from_value(legacy_message).unwrap(),
+            serde_json::from_value(legacy_compaction).unwrap(),
+        ];
+        let mut agent = Agent::new(
+            Box::new(ScriptedModel {
+                replies: vec![],
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delays: Default::default(),
+            }),
+            vec![],
+        );
+        agent.restore_history(entries);
+        assert!(matches!(
+            &agent.history()[0],
+            SessionEntry::Message {
+                message: Message::Tool {
+                    content,
+                    is_error: true,
+                    synthetic: true,
+                    ..
+                }
+            } if content == INTERRUPTED
+        ));
+        let SessionEntry::Compaction { retained, .. } = &agent.history()[1] else {
+            panic!("expected compaction entry");
+        };
+        // The assistant turn is untouched; the legacy placeholder is flagged.
+        assert!(matches!(&retained[1], Message::Assistant(_)));
+        assert!(matches!(
+            &retained[2],
+            Message::Tool {
+                content,
+                is_error: true,
+                synthetic: true,
+                ..
+            } if content == INTERRUPTED
+        ));
+    }
+
+    #[test]
+    fn restore_history_migrates_legacy_placeholders_end_to_end() {
+        // Full regression for the legacy gap: a pre-92159c7 session whose
+        // compaction `retained` snapshot holds the assistant tool_call plus
+        // the text-only interrupted placeholder, with the REAL result
+        // persisted after the Compaction entry. After the load-time
+        // migration, context() must skip the placeholder and pair the real
+        // result — the model sees the real result, nothing is orphaned.
+        let legacy_compaction = serde_json::json!({
+            "type": "compaction",
+            "summary": "old summary",
+            "retained": [
+                {
+                    "User": { "content": "current question" }
+                },
+                {
+                    "Assistant": {
+                        "content": null,
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "name": "bash",
+                                "arguments": "{\"command\":\"make\"}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "Tool": {
+                        "call_id": "call-1",
+                        "name": "bash",
+                        "content": INTERRUPTED,
+                        "is_error": true,
+                    }
+                }
+            ]
+        });
+        let mut agent = Agent::new(
+            Box::new(ScriptedModel {
+                replies: vec![],
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delays: Default::default(),
+            }),
+            vec![],
+        );
+        agent.restore_history(vec![
+            serde_json::from_value(legacy_compaction).unwrap(),
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "bash".into(),
+                content: "real result".into(),
+                is_error: false,
+                synthetic: false,
+            }
+            .into(),
+        ]);
+        let context = agent.context();
+        assert_eq!(context.len(), 4);
+        assert!(matches!(
+            &context[0],
+            Message::User { content }
+                if content == "[compacted summary of earlier conversation]\nold summary"
+        ));
+        assert!(matches!(&context[1], Message::User { .. }));
+        assert!(matches!(
+            &context[2],
+            Message::Assistant(message)
+                if message.tool_calls == vec![call("call-1", "bash", r#"{"command":"make"}"#)]
+        ));
+        assert!(matches!(
+            &context[3],
+            Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
+                if call_id == "call-1" && content == "real result"
+        ));
+        // No placeholder reaches the provider, and nothing is left orphaned:
+        // re-running the repair over the derived context is a fixed point.
+        assert!(!context.iter().any(|m| matches!(
+            m,
+            Message::Tool {
+                synthetic: true,
+                ..
+            }
+        )));
+        assert_eq!(repair_tool_pairs(context.clone()), context);
+    }
+
+    #[test]
+    fn context_pairs_real_result_across_a_compaction_snapshot() {
+        // End-to-end (c): a compaction `retained` snapshot holds the
+        // assistant tool_call plus its synthetic interrupted placeholder
+        // (post-92159c7 shape); the real tool result landed in the history
+        // AFTER the Compaction entry. context() must skip the placeholder
+        // and pair the real result with its tool_call — no orphan, no
+        // unpaired call (the 400-class malformation).
+        let mut agent = Agent::new(
+            Box::new(ScriptedModel {
+                replies: vec![],
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delays: Default::default(),
+            }),
+            vec![],
+        );
+        agent.restore_history(vec![
+            SessionEntry::Compaction {
+                summary: "summary text".into(),
+                retained: vec![
+                    Message::User {
+                        content: "current question".into(),
+                    },
+                    Message::Assistant(AssistantMessage {
+                        content: None,
+                        tool_calls: vec![call("call-1", "bash", r#"{"command":"make"}"#)],
+                        reasoning: None,
+                    }),
+                    Message::Tool {
+                        call_id: "call-1".into(),
+                        name: "bash".into(),
+                        content: INTERRUPTED.into(),
+                        is_error: true,
+                        synthetic: true,
+                    },
+                ],
+            },
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "bash".into(),
+                content: "real result".into(),
+                is_error: false,
+                synthetic: false,
+            }
+            .into(),
+        ]);
+        let context = agent.context();
+        assert_eq!(context.len(), 4);
+        assert!(matches!(
+            &context[0],
+            Message::User { content }
+                if content == "[compacted summary of earlier conversation]\nsummary text"
+        ));
+        assert!(matches!(&context[1], Message::User { .. }));
+        assert!(matches!(
+            &context[2],
+            Message::Assistant(message)
+                if message.tool_calls == vec![call("call-1", "bash", r#"{"command":"make"}"#)]
+        ));
+        assert!(matches!(
+            &context[3],
+            Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
+                if call_id == "call-1" && content == "real result"
+        ));
+        assert!(!context.iter().any(|m| matches!(
+            m,
+            Message::Tool {
+                synthetic: true,
+                ..
+            }
+        )));
+        assert_eq!(repair_tool_pairs(context.clone()), context);
     }
 
     fn message_tool_content(message: &Message) -> &str {

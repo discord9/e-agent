@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::{AssistantMessage, Model, ModelDeltaKind, Tool, Usage};
+use crate::agent::{AssistantMessage, Model, ModelDeltaKind, Tool, Usage, repair_tool_pairs};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::{
@@ -101,6 +101,26 @@ impl Model for ScriptedAssistantModel {
             self.replies.pop_front().expect("unexpected model call"),
             None,
         ))
+    }
+}
+
+/// Scripted replies with per-call usage, capturing every context the model
+/// is called with, so a test can inspect the derived context of later calls.
+struct ScriptedContextCaptureModel {
+    replies: VecDeque<(AssistantMessage, Option<Usage>)>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+#[async_trait]
+impl Model for ScriptedContextCaptureModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        Ok(self.replies.pop_front().expect("unexpected model call"))
     }
 }
 
@@ -800,6 +820,188 @@ async fn completed_tool_result_is_committed_before_stale_cancel() {
         } if content == "completed tool result"
     )));
     task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
+    // End-to-end race (d): the assistant tool_call is committed, then the
+    // in-turn auto-compact fires BEFORE the tool executes. At that point
+    // history holds the assistant without its result, so prepare_compaction
+    // (via context() -> repair_tool_pairs) synthesizes an interrupted
+    // placeholder, which is captured verbatim in the Compaction entry's
+    // `retained` snapshot. Only afterwards does the real tool result get
+    // committed — i.e. AFTER the Compaction entry. The final derived
+    // context must skip the placeholder and pair the real result with its
+    // tool_call: no orphan, no unpaired call (the 400-class malformation).
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call-1".into(),
+                            name: "keep_alive".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    // 80% of the 1000-token window: triggers the in-turn
+                    // auto-compact right after the assistant is committed.
+                    Some(Usage {
+                        input_tokens: 800,
+                        output_tokens: 10,
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 900,
+                        output_tokens: 20,
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 100,
+                        output_tokens: 5,
+                    }),
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.set_context_window(1000);
+    // Prior conversation so there is something before the current turn to
+    // compact (prepare_compaction requires an assistant/tool message before
+    // the retained user turn).
+    agent.restore_history(vec![
+        Message::User {
+            content: "old question".into(),
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("old answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "auto-compact-race".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("current question".into()));
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
+    );
+    task.join().await.unwrap();
+
+    // Model calls: [0] first round, [1] compaction summary, [2] round after
+    // the real result landed. The last context must be well-formed. The
+    // guard is scoped so it is dropped before the awaited reload below.
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            3,
+            "expected round, compaction, round: {calls:?}"
+        );
+        let final_context = &calls[2];
+        assert!(matches!(
+            &final_context[0],
+            Message::User { content }
+                if content == "[compacted summary of earlier conversation]\nsummary"
+        ));
+        // Placeholder skipped entirely: the only Tool message is the real
+        // result, paired with its tool_call.
+        assert!(
+            !final_context
+                .iter()
+                .any(|m| matches!(m, Message::Tool { content, .. }
+                if content == "[turn interrupted before a tool result was produced]"))
+        );
+        assert_eq!(
+            final_context
+                .iter()
+                .filter(|m| matches!(m, Message::Tool { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            final_context.last().unwrap(),
+            Message::Tool {
+                call_id,
+                name,
+                content,
+                is_error: false,
+                synthetic: false,
+                ..
+            } if call_id == "call-1" && name == "keep_alive" && content.is_empty()
+        ));
+        // No orphan and no unpaired call: repairing the derived context is
+        // a fixed point (a 400-class malformation would repair into
+        // something different, dropping the orphan or flushing a
+        // placeholder).
+        assert_eq!(repair_tool_pairs(final_context.clone()), *final_context);
+    }
+
+    // The persisted log pins the race order: the Compaction entry's
+    // retained snapshot holds the synthetic placeholder, and the real
+    // result entry comes AFTER the Compaction entry.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "auto-compact-race")
+        .await
+        .unwrap();
+    let compaction_index = loaded
+        .entries
+        .iter()
+        .position(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+        .expect("auto-compact must persist a Compaction entry");
+    assert!(matches!(
+        &loaded.entries[compaction_index],
+        SessionEntry::Compaction { retained, .. }
+            if retained.iter().any(|m| matches!(
+                m,
+                Message::Tool { content, is_error: true, synthetic: true, .. }
+                    if content == "[turn interrupted before a tool result was produced]"
+            ))
+    ));
+    assert!(
+        loaded.entries[compaction_index + 1..]
+            .iter()
+            .any(|entry| matches!(
+                entry,
+                SessionEntry::Message {
+                    message: Message::Tool {
+                        call_id,
+                        name,
+                        content,
+                        is_error: false,
+                        synthetic: false,
+                        ..
+                    }
+                } if call_id == "call-1" && name == "keep_alive" && content.is_empty()
+            ))
+    );
 }
 
 #[tokio::test]
