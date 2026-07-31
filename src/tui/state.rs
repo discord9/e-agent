@@ -1,9 +1,10 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthStr;
 
-use crate::agent::{AgentEvent, preview};
+use crate::agent::{AgentEvent, Message, SessionEntry, preview};
 use crate::runner::{SessionHandle as RunnerHandle, SessionResult, SessionStatus};
 
 use super::*;
@@ -109,6 +110,11 @@ pub(crate) struct TuiState {
     /// template exists.
     pub(crate) role_name: Option<String>,
     pub(crate) cwd: String,
+    /// Workspace root for store-backed history loads: older compaction
+    /// segments are read on demand when the user scrolls to the top.
+    /// `cwd` is the display string; this is the real `&Path` the store
+    /// needs.
+    pub(crate) root: PathBuf,
     pub(crate) input: InputBuffer,
     pub(crate) lines: Vec<DisplayLine>,
     /// Bounded local rendering window.
@@ -136,6 +142,19 @@ pub(crate) struct TuiState {
     /// from the tasks panel; `None` (tests, `Default`) falls back to the
     /// JSONL record file directly.
     pub(crate) store: Option<crate::session_store::SessionStore>,
+    /// Older-history paging state, driven by `handle_scroll` + the run loop:
+    ///
+    /// - `older_pending`: an Up/PageUp at the scrollback top asked for the
+    ///   next older segment; the run loop performs the async load.
+    /// - `older_loading`: a load is in flight (re-entrancy guard).
+    /// - `older_done`: the store reported no more history (or JSONL, whose
+    ///   full session was already loaded at startup).
+    /// - `older_cursor`: next `before_seq` for `load_older`; `None` until
+    ///   the first load seeds it from `head_seq`.
+    pub(crate) older_pending: bool,
+    pub(crate) older_loading: bool,
+    pub(crate) older_done: bool,
+    pub(crate) older_cursor: Option<i64>,
     /// Probe for whether a background task has an attachable session
     /// (wired to the session registry by the runner).
     pub(crate) attachable: Option<Box<dyn Fn(u64) -> bool + Send>>,
@@ -531,14 +550,7 @@ impl TuiState {
         output: &str,
         label: Option<&str>,
     ) {
-        let header = match label.filter(|l| !l.trim().is_empty()) {
-            Some(l) => {
-                let previewed = crate::agent::preview(l, 60);
-                format!("[background task {id} completed: {previewed}]")
-            }
-            None => format!("[background task {id} completed]"),
-        };
-        self.push_line(header, LineKind::Dim);
+        self.push_line(background_completion_header(id, label), LineKind::Dim);
         let truncated = truncate_background_output(output);
         for line in truncated.lines() {
             self.push_line(line.to_owned(), LineKind::Dim);
@@ -1057,6 +1069,9 @@ impl TuiState {
                     let n = line_visual_rows(&self.lines[self.window.source_start], w);
                     self.window.local_offset = n.saturating_sub(1);
                 }
+                if self.at_scrollback_top() {
+                    self.request_older();
+                }
             }
             KeyCode::Down => {
                 if self.window.follow_bottom {
@@ -1107,6 +1122,9 @@ impl TuiState {
                 } else if prepended_rows == 0 {
                     self.window.local_offset = self.window.local_offset.saturating_sub(step);
                 }
+                if self.at_scrollback_top() {
+                    self.request_older();
+                }
             }
             KeyCode::PageDown => {
                 if self.window.follow_bottom {
@@ -1146,6 +1164,97 @@ impl TuiState {
 
     pub(crate) fn at_bottom(&self) -> bool {
         self.window.follow_bottom
+    }
+
+    /// True when the viewport shows the very first loaded line (no local
+    /// lines above it) — the trigger point for loading older history.
+    pub(crate) fn at_scrollback_top(&self) -> bool {
+        self.window.source_start == 0 && self.window.local_offset == 0
+    }
+
+    /// Queue an asynchronous load of the next older compaction segment. The
+    /// run loop performs the actual load (`load_older_history`) when this
+    /// flag is set; repeated scroll keys at the top collapse into a single
+    /// request. No-op without a store, once history is exhausted, or while
+    /// a load is pending/in flight.
+    pub(crate) fn request_older(&mut self) {
+        if self.store.is_some() && !self.older_done && !self.older_loading && !self.older_pending {
+            self.older_pending = true;
+        }
+    }
+
+    /// Load the next older compaction segment from the store and splice it
+    /// in front of the scrollback. Called by the run loop after
+    /// `handle_scroll` set `older_pending`. The first call seeds
+    /// `older_cursor` from the store's head-start seq; later calls page
+    /// with the cursor returned by `load_older` until it reports `None`.
+    /// Errors surface as a dim line and never abort the loop; a JSONL
+    /// store (already fully loaded) reports "done" immediately.
+    pub(crate) async fn load_older_history(&mut self) {
+        self.older_pending = false;
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let root = self.root.clone();
+        let session_id = self.session_id.clone();
+        self.older_loading = true;
+        let before = match self.older_cursor {
+            Some(cursor) => cursor,
+            None => match store.head_seq(&root, &session_id).await {
+                Ok(Some(seq)) => seq,
+                Ok(None) => {
+                    // No compaction entry at all: the head segment covers
+                    // the whole session, so there is nothing older.
+                    self.older_done = true;
+                    self.older_loading = false;
+                    return;
+                }
+                Err(error) => {
+                    self.push_line(
+                        format!("failed to load older history: {error:#}"),
+                        LineKind::Dim,
+                    );
+                    self.older_loading = false;
+                    return;
+                }
+            },
+        };
+        match store.load_older(&root, &session_id, before).await {
+            Ok((entries, cursor)) => {
+                let lines: Vec<DisplayLine> =
+                    entries.iter().flat_map(session_entry_to_lines).collect();
+                if !lines.is_empty() {
+                    self.prepend_lines(lines);
+                }
+                self.older_cursor = cursor;
+                if cursor.is_none() {
+                    self.older_done = true;
+                }
+            }
+            Err(error) => {
+                self.push_line(
+                    format!("failed to load older history: {error:#}"),
+                    LineKind::Dim,
+                );
+            }
+        }
+        self.older_loading = false;
+    }
+
+    /// Splice `older` in front of the scrollback, keeping the visible
+    /// window anchored on the same content: both window indices shift by
+    /// the number of prepended lines while `local_offset` (a visual-row
+    /// offset inside the window) is untouched. Only reached while scrolled
+    /// away from the bottom (Up/PageUp at the local top), so follow mode
+    /// is already off; frozen-tail state is unchanged.
+    pub(crate) fn prepend_lines(&mut self, older: Vec<DisplayLine>) {
+        let n = older.len();
+        if n == 0 {
+            return;
+        }
+        self.lines.splice(0..0, older);
+        self.window.source_start += n;
+        self.window.source_end += n;
     }
 
     pub(crate) fn push_agent_event_inner(&mut self, event: AgentEvent) {
@@ -1296,6 +1405,97 @@ impl TuiState {
         if remaining > 0 {
             self.push_line(format!("{prefix}… ({remaining} more lines)"), kind);
         }
+    }
+}
+
+/// Header line for a background-task completion, shared by the live event
+/// path (`push_background_completion`) and the persisted-entry replay
+/// (`session_entry_to_lines`) so the two can never drift apart.
+fn background_completion_header(id: u64, label: Option<&str>) -> String {
+    match label.filter(|l| !l.trim().is_empty()) {
+        Some(l) => {
+            let previewed = crate::agent::preview(l, 60);
+            format!("[background task {id} completed: {previewed}]")
+        }
+        None => format!("[background task {id} completed]"),
+    }
+}
+
+/// Convert one persisted `SessionEntry` into the display lines the TUI
+/// would have rendered for the same event, mirroring `push_agent_event_inner`
+/// (the replay projection is `runner::entry_event` → the same event kinds).
+/// Older compaction segments loaded from the store splice in front of the
+/// head segment, which the TUI renders through exactly this replay path, so
+/// the seam is invisible. `Message::System` and assistant messages without
+/// text render nothing, matching the replay.
+pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
+    match entry {
+        SessionEntry::Message {
+            message: Message::System { .. },
+        } => Vec::new(),
+        SessionEntry::Message {
+            message: Message::User { content, .. },
+        } => vec![DisplayLine {
+            text: format!("you> {content}"),
+            kind: LineKind::User,
+        }],
+        SessionEntry::Message {
+            message: Message::Assistant(message),
+        } => message
+            .content
+            .clone()
+            .map(|text| vec![DisplayLine {
+                text,
+                kind: LineKind::Normal,
+            }])
+            .unwrap_or_default(),
+        SessionEntry::Message {
+            message: Message::Tool {
+                content, is_error, ..
+            },
+        } => vec![DisplayLine {
+            text: format!(
+                "  {}: {}",
+                if *is_error { "error" } else { "ok" },
+                preview(content, 500)
+            ),
+            kind: if *is_error {
+                LineKind::ToolError
+            } else {
+                LineKind::ToolResult
+            },
+        }],
+        SessionEntry::Compaction { summary, .. } => vec![DisplayLine {
+            text: format!("compacted: {summary}"),
+            kind: LineKind::Dim,
+        }],
+        SessionEntry::Notice { text } => vec![DisplayLine {
+            text: text.clone(),
+            kind: if text.starts_with("──── auto-compact") {
+                LineKind::Compaction
+            } else {
+                LineKind::Dim
+            },
+        }],
+        SessionEntry::BackgroundCompletion {
+            id, output, label, ..
+        } => {
+            let mut lines = vec![DisplayLine {
+                text: background_completion_header(*id, label.as_deref()),
+                kind: LineKind::Dim,
+            }];
+            for line in truncate_background_output(output).lines() {
+                lines.push(DisplayLine {
+                    text: line.to_owned(),
+                    kind: LineKind::Dim,
+                });
+            }
+            lines
+        }
+        SessionEntry::ForkedFrom { source, at, .. } => vec![DisplayLine {
+            text: format!("forked from {source} at entry {at}"),
+            kind: LineKind::Dim,
+        }],
     }
 }
 
