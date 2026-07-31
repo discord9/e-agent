@@ -442,6 +442,9 @@ const state = {
   pollTimer: null,
   sse: { ctrl: null, retryTimer: null, stopped: false },
   acc: null,                 // 增量渲染累积器（见 newAccumulator）
+  nextBeforeSeq: null,       // 历史分页游标：下一段更早历史的 before_seq（loadHistory 响应里取；null=没有更多）
+  loadingOlder: false,       // 是否正在加载更早历史（防重入）
+  olderDone: false,          // 更早历史已全部加载（next_before_seq 为 null）
 };
 
 /* 常用 DOM 引用 */
@@ -690,8 +693,12 @@ function freezeAssistant(acc) {
   acc.thinkBody = null;
 }
 
+/* 历史前置插入期间抑制自动滚动：loadOlder 自己负责保持滚动位置 */
+let suppressScroll = false;
+
 function scrollBottom(force) {
   const m = els.messages;
+  if (suppressScroll) return;
   const near = m.scrollHeight - m.scrollTop - m.clientHeight < 80;
   if (force || near) m.scrollTop = m.scrollHeight;
 }
@@ -935,14 +942,46 @@ function renderMessage(m, acc, pendingCards) {
   appendNotice("消息: " + truncate(JSON.stringify(m), 300));
 }
 
-function renderHistory(entries) {
+/* 渲染一批 SessionEntry。prepend=true 时把新条目插入容器开头（保留既有内容），
+   用于滚动分页加载更早历史；prepend=false 时整体替换（初始 history 渲染）。 */
+function renderEntries(entries, prepend) {
   const acc = newAccumulator();
-  state.acc = acc;
-  els.messages.innerHTML = "";
   const pendingCards = new Map();
-  for (const e of (Array.isArray(entries) ? entries : [])) {
-    renderEntry(e, acc, pendingCards);
+  const list = Array.isArray(entries) ? entries : [];
+  const prevAcc = state.acc;
+  let sentinel = null;
+  if (prepend) {
+    // 末尾放一个哨兵注释节点标记「旧内容结束」；渲染后把哨兵之后的节点按序移到开头
+    sentinel = document.createComment("older-boundary");
+    els.messages.appendChild(sentinel);
+    suppressScroll = true;   // 渲染期间禁止自动滚动，避免跳动
+    // history 条目（compaction / user 消息等）会 freezeAssistant(state.acc)；
+    // 前置插入不能动底部当前流的累积器。整批渲染是同步的，事件不会穿插，可安全临时切换。
+    state.acc = acc;
+  } else {
+    state.acc = acc;
+    els.messages.innerHTML = "";
   }
+  try {
+    for (const e of list) renderEntry(e, acc, pendingCards);
+  } finally {
+    suppressScroll = false;
+    if (prepend) state.acc = prevAcc;
+  }
+  if (prepend && sentinel) {
+    const firstOld = els.messages.firstChild;   // 旧内容第一个节点（或哨兵自身）
+    let n = sentinel.nextSibling;
+    while (n) {
+      const next = n.nextSibling;
+      els.messages.insertBefore(n, firstOld);
+      n = next;
+    }
+    sentinel.remove();
+  }
+}
+
+function renderHistory(entries) {
+  renderEntries(entries, false);
   scrollBottom(true);
 }
 
@@ -1185,6 +1224,8 @@ async function loadHistory(id) {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     const entries = Array.isArray(data) ? data : (data.entries || []);
+    state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
+    state.olderDone = (state.nextBeforeSeq === null);
     if (state.initSource !== "snapshot") {
       renderHistory(entries);
       state.initSource = "history";
@@ -1196,6 +1237,32 @@ async function loadHistory(id) {
       setBanner("⚠ 加载历史失败：" + e.message + "（等待 SSE 快照…）", true);
     }
     return "fail";
+  }
+}
+
+/* 滚动到顶部时加载更早历史（分页：一次一个 compaction 段） */
+async function loadOlder() {
+  if (state.loadingOlder || state.olderDone || !state.sessionId || state.nextBeforeSeq === null) return;
+  state.loadingOlder = true;
+  const prevHeight = els.messages.scrollHeight;   // 插入前高度
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId)
+      + "/history?before_seq=" + state.nextBeforeSeq);
+    if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
+    if (!res.ok) return;                          // 静默失败，下次滚动重试
+    const data = await res.json();
+    const entries = Array.isArray(data) ? data : (data.entries || []);
+    state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
+    if (state.nextBeforeSeq === null) state.olderDone = true;
+    if (entries.length) {
+      renderEntries(entries, true);               // 前置插入
+      // 保持滚动位置：内容在顶部增高，scrollTop 相应下移
+      els.messages.scrollTop += els.messages.scrollHeight - prevHeight;
+    }
+  } catch (e) {
+    // 静默失败，下次滚动重试
+  } finally {
+    state.loadingOlder = false;
   }
 }
 
@@ -1214,6 +1281,9 @@ function openSession(id) {
   state.sessionId = id;
   state.view = "chat";
   state.initSource = null;
+  state.nextBeforeSeq = null;
+  state.loadingOlder = false;
+  state.olderDone = false;
   state.status = "Idle";
   state.acc = newAccumulator();
   els.listView.classList.add("hidden");
@@ -1232,6 +1302,9 @@ function backToList() {
   state.sessionId = null;
   state.view = "list";
   state.acc = null;
+  state.nextBeforeSeq = null;
+  state.loadingOlder = false;
+  state.olderDone = false;
   els.chatView.classList.add("hidden");
   els.listView.classList.remove("hidden");
   els.topActions.hidden = true;
@@ -1329,6 +1402,9 @@ els.messages.addEventListener("scroll", () => {
   // 用户滚到接近底部时恢复自动跟随
   const m = els.messages;
   if (m.scrollHeight - m.scrollTop - m.clientHeight < 80) scrollBottom(true);
+  // 滚到接近顶部时加载更早历史（分页；防重入 / 已全部加载 / 未开会话时跳过）
+  if (state.loadingOlder || state.olderDone || !state.sessionId) return;
+  if (m.scrollTop < 30) loadOlder();
 });
 
 function init() {

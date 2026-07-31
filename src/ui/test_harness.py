@@ -39,18 +39,31 @@ class El {
     this._className=""; this.textContent=""; this._innerHTML=""; this.hidden=false;
     this.disabled=false; this.value=""; this.title=""; this.style={};
     this.scrollHeight=0; this.scrollTop=0; this.clientHeight=0;
+    this._parent=null; this._listeners={};
     this.classList={ add:(...c)=>c.forEach(x=>this._classes.add(x)),
       remove:(...c)=>c.forEach(x=>this._classes.delete(x)),
       contains:(c)=>this._classes.has(c) }; }
   get children(){ return this._children; }
+  get firstChild(){ return this._children[0] ?? null; }
+  get nextSibling(){ if(!this._parent) return null;
+    const i=this._parent._children.indexOf(this);
+    return i>=0 && i+1<this._parent._children.length ? this._parent._children[i+1] : null; }
   get className(){ return this._className; }
   set className(v){ this._className=String(v); this._classes=new Set(String(v).split(/\s+/).filter(Boolean)); }
   get innerHTML(){ return this._innerHTML; }
   set innerHTML(v){ if(v==="") this._children=[]; this._innerHTML=v; }
-  append(...nodes){ for(const n of nodes){ if(n==null) continue; this._children.push(typeof n==="string"?{text:n}:n); } }
-  appendChild(n){ this._children.push(n); return n; }
+  append(...nodes){ for(const n of nodes){ if(n==null) continue;
+    const c=typeof n==="string"?{text:n}:n; this._children.push(c); if(c._parent===undefined) c._parent=this; } }
+  appendChild(n){ this._children.push(n); n._parent=this; return n; }
+  insertBefore(n, ref){ const p=n._parent; if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
+    const i=this._children.indexOf(ref);
+    if(i<0) this._children.push(n); else this._children.splice(i,0,n);
+    n._parent=this; return n; }
+  remove(){ if(this._parent){ const p=this._parent;
+    const i=p._children.indexOf(this); if(i>=0) p._children.splice(i,1);
+    this._parent=null; } }
   insertAdjacentText(pos, t){ if(pos==="beforeend") this._children.push({text:t}); }
-  addEventListener(){}
+  addEventListener(type, fn){ (this._listeners[type] || (this._listeners[type]=[])).push(fn); }
   querySelector(sel){ const cls=sel.replace(".","");
     const walk=(e)=>{ for(const c of e._children){ if(c._classes&&c._classes.has(cls)) return c; const r=walk(c); if(r) return r; } return null; };
     return walk(this); }
@@ -62,7 +75,8 @@ for(const id of ["topActions","backBtn","connState","banner","tokenInput","listV
 
 const _ls={};
 globalThis.localStorage={ getItem:k=>_ls[k]??null, setItem:(k,v)=>{_ls[k]=v;}, removeItem:k=>{delete _ls[k];} };
-globalThis.document={ createElement:t=>new El(t), getElementById:id=>elsById[id] };
+globalThis.document={ createElement:t=>new El(t), createComment:t=>new El("#comment"),
+  getElementById:id=>elsById[id] };
 globalThis.navigator={ onLine:true };
 globalThis.confirm=()=>true;
 globalThis.AbortController=class{ constructor(){this.signal={};} abort(){} };
@@ -83,7 +97,13 @@ const history={entries:[
   {type:"notice", text:"后台任务 #1 完成"},
   {type:"background_completion", id:7, output:"build ok", label:"cargo"},
   {type:"forked_from", source:"sess-old", at:3},
-]};
+], next_before_seq:100};
+/* 滚动分页：更早的一页（before_seq=100 之后没有更老的段） */
+const historyOlder={entries:[
+  {type:"message", message:{User:{content:"更早的历史消息：这是更老的一段", images:[]}}},
+  {type:"notice", text:"更早的通知行"},
+], next_before_seq:null};
+const FETCHES=[];
 const sseChunks = [
   "event: snapshot\ndata: [{\"type\":\"notice\",\"text\":\"SNAPSHOT-SHOULD-BE-SKIPPED\"}]\n\n",
   "event: status\ndata: {\"status\":\"Busy\"}\n\n",
@@ -109,10 +129,15 @@ function stream(){
 function resp(status, body){ return Promise.resolve({ ok:status>=200&&status<300, status, body,
   json:async()=>typeof body==="string"?JSON.parse(body):body }); }
 globalThis.fetch=(url,opts={})=>{
+  FETCHES.push(url);
   const m=(opts.method||"GET").toUpperCase();
   if(url==="/api/sessions"&&m==="GET") return resp(200,[{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}]);
   if(url==="/api/sessions"&&m==="POST") return resp(201,{id:"sess-new",status:"Idle"});
   if(url==="/api/sessions/s1/history") return resp(200,history);
+  if(url.startsWith("/api/sessions/s1/history?before_seq=")) {
+    const seq=url.split("before_seq=")[1];
+    return resp(200, seq==="100" ? historyOlder : {entries:[], next_before_seq:null});
+  }
   if(url==="/api/sessions/s1/events") return resp(200, stream());
   if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{});
@@ -150,6 +175,8 @@ async function main(){
       chk("direct loadHistory ok", r==="ok", "="+r);
       chk("direct history rendered", elsById["messages"]._children.length>=1,
           "n="+elsById["messages"]._children.length);
+      chk("direct nextBeforeSeq", state.nextBeforeSeq === 100, "="+state.nextBeforeSeq);
+      chk("direct olderDone false", state.olderDone === false, "="+state.olderDone);
       console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
       imports.system.exit(0);
     }
@@ -203,6 +230,44 @@ async function main(){
     chk("resync replayed deltas", t3.includes("重放-") && t3.includes("增量"));
     chk("resync rerenders", elsById["messages"]._children.length >= 2,
         "n=" + elsById["messages"]._children.length);
+
+    // ---- 滚动分页：滚动到顶部加载更早历史 ----
+    const msgEl = elsById["messages"];
+    chk("paging nextBeforeSeq set", state.nextBeforeSeq === 100, "="+state.nextBeforeSeq);
+    chk("paging olderDone false", state.olderDone === false, "="+state.olderDone);
+    const beforeCount = msgEl.children.length;
+    const beforeScrollHeight = 2000;
+    msgEl.scrollHeight = beforeScrollHeight;
+    msgEl.clientHeight = 400;
+    msgEl.scrollTop = 0;
+    const handlers = (msgEl._listeners && msgEl._listeners["scroll"]) || [];
+    chk("scroll listener registered", handlers.length >= 1, "n="+handlers.length);
+    // 模拟浏览器：children 增加时 scrollHeight 随之增长（每插入一个节点 +25px）
+    const realAppend = msgEl.appendChild.bind(msgEl);
+    msgEl.appendChild = (n) => { const r = realAppend(n); msgEl.scrollHeight += 25; return r; };
+    const oldFetchCount = FETCHES.filter(u=>u.includes("before_seq=")).length;
+    for (const fn of handlers) fn();        // scrollTop=0 < 30 → 触发 loadOlder
+    await flush();
+    await flush();
+    chk("older fetch issued", FETCHES.filter(u=>u.includes("before_seq=100")).length === oldFetchCount + 1,
+        "n="+FETCHES.filter(u=>u.includes("before_seq=")).length);
+    const t4 = allText();
+    const idxOlder = t4.indexOf("更早的历史消息");
+    const idxHead  = t4.indexOf("重放-用户");
+    chk("older entries prepended", idxOlder !== -1 && idxHead !== -1 && idxOlder < idxHead,
+        "older="+idxOlder+" head="+idxHead);
+    chk("older children added", msgEl.children.length > beforeCount,
+        "before="+beforeCount+" after="+msgEl.children.length);
+    chk("scroll position preserved", msgEl.scrollTop === msgEl.scrollHeight - beforeScrollHeight,
+        "scrollTop="+msgEl.scrollTop+" delta="+(msgEl.scrollHeight-beforeScrollHeight));
+    chk("paging nextBeforeSeq updated", state.nextBeforeSeq === null, "="+state.nextBeforeSeq);
+    chk("paging olderDone true", state.olderDone === true, "="+state.olderDone);
+    // null 后不再触发：再次滚动到顶部不应发起任何请求
+    const fetchAfterDone = FETCHES.length;
+    for (const fn of handlers) fn();
+    await flush();
+    chk("no fetch when olderDone", FETCHES.length === fetchAfterDone,
+        "delta="+(FETCHES.length-fetchAfterDone));
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);
