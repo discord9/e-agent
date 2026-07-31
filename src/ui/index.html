@@ -211,6 +211,19 @@
   .chat-head .dim { font-size: 13px; }
   #usageInfo { margin-left: auto; }
 
+  /* 顶部信息栏的压缩按钮：小号低调，避免与输入区的取消/发送相邻 */
+  .compact-head {
+    font-size: 11px;
+    padding: 1px 8px;
+    color: var(--base01);
+    background: transparent;
+    border: 1px solid var(--base1);
+    border-radius: 3px;
+    cursor: pointer;
+    opacity: 0.8;
+  }
+  .compact-head:hover { color: var(--blue); border-color: var(--blue); opacity: 1; }
+
   .messages {
     flex: 1 1 auto;
     min-height: 0;   /* 同上：保证内容多时自身收缩并启用内部滚动 */
@@ -421,12 +434,13 @@
     <span id="chatSessionId" class="dim"></span>
     <span id="chatStatus" class="status-chip idle">空闲</span>
     <span id="usageInfo" class="dim"></span>
+    <!-- 压缩是低频操作：放顶部信息栏最右侧，避免与取消/发送相邻误触 -->
+    <button id="compactBtn" class="compact-head" title="压缩上下文（释放 token）">压缩</button>
   </div>
   <div id="messages" class="messages"></div>
   <div class="composer">
     <textarea id="promptInput" rows="1" placeholder="输入消息：Enter 发送，Shift+Enter 换行…"></textarea>
     <div class="composer-actions">
-      <button id="compactBtn" title="压缩上下文">压缩</button>
       <button id="cancelBtn" disabled title="取消当前回合">取消</button>
       <button id="sendBtn" class="primary">发送</button>
     </div>
