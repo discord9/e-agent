@@ -1512,6 +1512,11 @@ async fn background_task_output_is_visible_while_running() {
     for _ in 0..50 {
         let running = bash.background.running();
         assert_eq!(running.len(), 1);
+        // The snapshot carries the FULL command, not the truncated label.
+        assert_eq!(
+            running[0].full_command.as_deref(),
+            Some("echo hello; sleep 30")
+        );
         saw = String::from_utf8_lossy(&running[0].output).into_owned();
         if saw.contains("hello") {
             break;
@@ -1519,6 +1524,38 @@ async fn background_task_output_is_visible_while_running() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(saw.contains("hello"), "output slot never filled: {saw:?}");
+}
+
+#[tokio::test]
+async fn background_snapshot_keeps_full_command_beyond_truncated_label() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+    // Longer than the 100-char label preview: the label must be truncated
+    // while full_command keeps the entire command for the detail view.
+    let command = format!(
+        "echo {}; sleep 30",
+        "abcdefghijklmnopqrstuvwxyz0123456789".repeat(10)
+    );
+    assert!(command.len() > 100);
+    bash.execute(json!({
+        "command": command.clone(),
+        "background": true
+    }))
+    .await
+    .unwrap();
+    let running = bash.background.running();
+    assert_eq!(running.len(), 1);
+    assert_ne!(
+        running[0].label, command,
+        "label must stay preview-truncated"
+    );
+    assert!(
+        running[0].label.contains('\u{2026}'),
+        "label shows ellipsis"
+    );
+    assert_eq!(running[0].full_command.as_deref(), Some(command.as_str()));
+    bash.background.cancel(running[0].id);
+    let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
 }
 
 #[tokio::test]
@@ -1649,6 +1686,8 @@ async fn get_background_tasks_shows_delegate_tasks_as_delegate_not_bash() {
 
     let tasks = background.running();
     assert_eq!(tasks[0].kind, "delegate");
+    // Delegate tasks have no full command (bash-only field).
+    assert_eq!(tasks[0].full_command, None);
 }
 
 #[tokio::test]
