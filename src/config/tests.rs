@@ -1041,3 +1041,58 @@ fn resolve_sandbox_adds_linked_worktree_main_repo_readonly() {
         sandbox.readable_paths
     );
 }
+
+#[test]
+fn linked_worktree_main_repo_rejects_malicious_pointers() {
+    let temp = tempfile::tempdir().unwrap();
+    let worktree = temp.path().join("wt");
+    std::fs::create_dir_all(&worktree).unwrap();
+
+    // gitdir: pointing at ~/.ssh (or any non-.git/worktrees shape) → None.
+    std::fs::write(worktree.join(".git"), "gitdir: /home/victim/.ssh
+").unwrap();
+    assert_eq!(
+        linked_worktree_main_repo(&worktree).unwrap(),
+        None,
+        "non-worktree gitdir shape must be rejected"
+    );
+
+    // Relative pointer → None.
+    std::fs::write(worktree.join(".git"), "gitdir: ../.git/worktrees/x
+").unwrap();
+    assert_eq!(linked_worktree_main_repo(&worktree).unwrap(), None);
+
+    // Pointer with .. inside → None.
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: /home/victim/.git/worktrees/../../.ssh
+",
+    )
+    .unwrap();
+    assert_eq!(linked_worktree_main_repo(&worktree).unwrap(), None);
+
+    // Pointer to the filesystem root → None.
+    std::fs::write(worktree.join(".git"), "gitdir: /.git/worktrees/x
+").unwrap();
+    assert_eq!(linked_worktree_main_repo(&worktree).unwrap(), None);
+
+    // Valid-shaped pointer but <main>/.git is not a directory → None.
+    let main_repo = temp.path().join("main-repo");
+    std::fs::create_dir_all(&main_repo).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}/.git/worktrees/feature
+", main_repo.display()),
+    )
+    .unwrap();
+    assert_eq!(
+        linked_worktree_main_repo(&worktree).unwrap(),
+        None,
+        "missing <main>/.git must be rejected"
+    );
+
+    // Valid worktree → Some(main_repo).
+    std::fs::create_dir_all(main_repo.join(".git/worktrees/feature")).unwrap();
+    let resolved = linked_worktree_main_repo(&worktree).unwrap();
+    assert_eq!(resolved, Some(main_repo.canonicalize().unwrap()));
+}

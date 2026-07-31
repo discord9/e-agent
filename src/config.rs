@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
@@ -443,12 +443,34 @@ fn linked_worktree_main_repo(workspace: &Path) -> anyhow::Result<Option<PathBuf>
         return Ok(None);
     };
     let target = PathBuf::from(target.trim());
+    // Structural validation (HIGH-1): the pointer must be an absolute,
+    // component-clean path of the shape <main>/.git/worktrees/<name>. A
+    // malicious project archive could otherwise point gitdir: at ~/.ssh or
+    // / and get that path auto-added as a read-only external root.
+    if !target.is_absolute() || target.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
+        return Ok(None);
+    }
     // <main>/.git/worktrees/<name>  →  main repo root = <main>
-    let main_repo = target
-        .parent() // .../worktrees/<name> → .../worktrees
-        .and_then(|p| p.parent()) // .../worktrees → .../.git
-        .and_then(|p| p.parent()); // .../.git → <main>
-    Ok(main_repo.map(PathBuf::from))
+    let Some(git_dir) = target.parent().and_then(|p| p.parent()) else {
+        return Ok(None);
+    };
+    let Some(main_repo) = git_dir.parent() else {
+        return Ok(None);
+    };
+    // Reject the filesystem root and require <main>/.git to be a real
+    // directory (the gitdir of the main repository).
+    if main_repo.as_os_str().is_empty() || main_repo == Path::new("/") {
+        return Ok(None);
+    }
+    if !git_dir.is_dir() {
+        return Ok(None);
+    }
+    let main_repo = main_repo.to_path_buf();
+    // Canonicalize to defeat symlink tricks and normalize the root.
+    match std::fs::canonicalize(&main_repo) {
+        Ok(canonical) if canonical.is_dir() => Ok(Some(canonical)),
+        _ => Ok(None),
+    }
 }
 
 /// Resolve the background-task timeout policy for a workspace: workspace
