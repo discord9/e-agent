@@ -5,10 +5,11 @@ Guidance for coding agents (and humans) working on e-agent.
 ## What this is
 
 e-agent is a deliberately minimal Rust coding agent: single crate, streaming
-OpenAI-compatible Chat Completions plus ChatGPT Codex Responses, four always-on
-local tools (`read_file`, `write_file`, `edit_file`, `bash`) plus conditional
-`web_search`, a text REPL, a ratatui TUI, and JSON session persistence. Keep it
-that way.
+OpenAI-compatible Chat Completions plus ChatGPT Codex Responses, six always-on
+local tools (`read_file`, `write_file`, `edit_file`, `bash`,
+`get_background_tasks`, `cancel_background_task`) plus conditional
+`web_search` and main-agent-only `delegate`, a text REPL, a ratatui TUI, and
+JSON session persistence. Keep it that way.
 
 ## Prime directive: do not over-design
 

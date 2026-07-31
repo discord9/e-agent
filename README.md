@@ -50,9 +50,13 @@ usual. `e-agent logout` removes only `$XDG_CONFIG_HOME/e-agent/auth.json` (or
 workspace session. `--model` is allowed for these profiles; `--base-url` is
 rejected because the Codex endpoint is fixed.
 
-Built-in roles can be routed to a different profile with `[roles]`. The only
-role today is `subagent` (the model the `delegate` tool spawns); unrouted
-roles fall back to the main profile:
+The default delegated model can be routed with `[roles] subagent`; named
+role templates can also be routed by role name. Role templates are discovered
+from `$XDG_CONFIG_HOME/e-agent/agents/<role>.md` (falling back to
+`~/.config/e-agent/agents/`) and `<workspace>/agents/<role>.md`, with the
+workspace file winning. This repository includes `designer`; unrouted named
+roles fall back to the default subagent model, which itself falls back to the
+main profile:
 
 ```toml
 [models."kimi/k2"]
@@ -110,8 +114,9 @@ When no prompt argument is supplied and stdout is a terminal, e-agent starts
 an interactive TUI (scrollback plus an input line with proper Unicode editing);
 use `--repl` for a plain line-based REPL instead. If stdin is piped, the prompt
 is read from standard input. Sessions persist to
-`.e-agent/sessions/<name>.jsonl` in the workspace (default name `default`) as
-an append-only log of message and compaction entries. History is restored for
+`.e-agent/sessions/<name>.jsonl` in the workspace as an append-only log of
+message and compaction entries. Without `--session`, each launch creates a
+fresh unique session ID. History is restored for
 model context on startup, while display projections are replayed in the TUI;
 the model only sees the latest compaction summary and everything after it.
 Legacy `.json` sessions are migrated on first load. Optional CLI overrides are `--base-url URL`,
@@ -135,12 +140,16 @@ The title is never persisted or used as a session key. Users who prefer an
 explicit label can override it with `zellij action rename-pane
 "<custom>"` at any time — Zellij's own title takes precedence.
 
-The four always-present tools are `read_file`, `write_file`, `edit_file`, and
-`bash`. `web_search` is a fifth tool that searches public documentation and
-code examples through the Exa Context API; it is enabled when `EXA_API_KEY` is
-set to a non-whitespace value, or when `[web_search]` sets `api_key_file` /
-`api_key_env` in the config (process env wins). OpenCode's own Exa
-configuration is not inherited.
+The built-in local tool set always includes the capability-relative file tools
+`read_file`, `write_file`, and `edit_file`, plus `bash`,
+`get_background_tasks`, and `cancel_background_task`. Main-agent sessions also
+register `delegate`; delegated subagents do not, which caps delegation depth at
+1. `web_search` is registered for either kind of session only when
+`EXA_API_KEY` is set to a non-whitespace value, or when `[web_search]` sets
+`api_key_file` / `api_key_env` in the config (process env wins). It searches
+public documentation and code examples through the Exa Context API. OpenCode's
+own Exa configuration is not inherited. Configured local MCP servers may add
+their tools to the main agent separately.
 The three file tools use a capability-relative directory rooted at the
 canonical workspace (the current directory by default). At startup, e-agent
 loads a non-empty `AGENTS.md` from that workspace root into the system context
@@ -161,7 +170,7 @@ both, the workspace version **fully replaces** the global one (no
 concatenation). The merged set is sorted by `<name>` in dictionary order, and
 each skill is injected as a `## Skill: <name>\n\n<content>` block — all skills
 form a single context segment. The injection order is: main role template
-(`.e-agent/agents/main.md`) → workspace `AGENTS.md` → skills → MCP server
+(`agents/main.md`) → workspace `AGENTS.md` → skills → MCP server
 instructions. Missing directories, empty directories, non-directory entries,
 subdirectories without `SKILL.md`, and empty `SKILL.md` files are silently
 skipped. Real I/O or UTF-8 errors on a `SKILL.md` that should be readable
