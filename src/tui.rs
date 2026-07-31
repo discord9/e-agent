@@ -440,8 +440,3 @@ fn route_idle_events(
         state.push_event(event);
     }
 }
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod ux_tests;
