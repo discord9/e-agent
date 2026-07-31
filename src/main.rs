@@ -926,7 +926,6 @@ fn install_panic_hook() {
             let _ = crossterm::execute!(
                 std::io::stderr(),
                 crossterm::terminal::LeaveAlternateScreen,
-                crossterm::event::DisableMouseCapture,
                 crossterm::cursor::Show,
             );
         }

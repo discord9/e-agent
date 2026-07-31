@@ -44,11 +44,26 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
             Block::default().style(SOLARIZED_LIGHT.screen_style()),
             frame.area(),
         );
+        let inner_input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
+        let input_rows = if let Some(attached) = &state.attached {
+            attached.input.visual_rows(inner_input_width)
+        } else {
+            state.input.visual_rows(inner_input_width)
+        };
+        let input_height = (input_rows + 2)
+            .min((usize::from(frame.area().height) / 3).max(3))
+            .max(3) as u16;
         let queued = state
             .attached
             .as_ref()
             .map_or(&state.queued, |attached| &attached.state.queued);
-        let inner_input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
+        let queue_height = if queued.is_empty() {
+            0
+        } else {
+            // One row per queued prompt, so every pending message is
+            // visible (not just the head).
+            queued.len() as u16
+        };
         let running: Vec<crate::tools::BackgroundTaskInfo> = state
             .background
             .as_ref()
@@ -79,13 +94,13 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
         } else {
             String::new()
         };
-        let (queue_height, tasks_height, input_height) = bottom_region_heights(
-            state,
-            frame.area().width,
-            frame.area().height,
-            &running,
-            &selected_output,
-        );
+        let output_line_count = selected_output.lines().count().min(OUTPUT_LINES);
+        let tasks_height = if state.show_tasks {
+            // border (2) + header (1) + one row per task + output tail
+            (running.len() as u16 + 3 + output_line_count as u16).max(3)
+        } else {
+            u16::from(!running.is_empty())
+        };
         let [output, queue_bar, tasks_bar, input] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(queue_height),
@@ -439,65 +454,6 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
         let area = frame.area();
         force_wide_trailing_cell_updates(frame.buffer_mut(), area);
     })
-}
-
-/// Heights of the three fixed bottom regions as laid out by `draw()`: the
-/// queued-prompt bar, the tasks panel, and the steering input. Shared with
-/// the mouse tap handler in `tui.rs` so the tap→task-row mapping can never
-/// drift from what draw() actually paints.
-pub(crate) fn bottom_region_heights(
-    state: &TuiState,
-    width: u16,
-    height: u16,
-    running: &[crate::tools::BackgroundTaskInfo],
-    selected_output: &str,
-) -> (u16, u16, u16) {
-    let inner_input_width = usize::from(width.saturating_sub(2)).max(1);
-    let input_rows = if let Some(attached) = &state.attached {
-        attached.input.visual_rows(inner_input_width)
-    } else {
-        state.input.visual_rows(inner_input_width)
-    };
-    let input_height = (input_rows + 2)
-        .min((usize::from(height) / 3).max(3))
-        .max(3) as u16;
-    let queued = state
-        .attached
-        .as_ref()
-        .map_or(&state.queued, |attached| &attached.state.queued);
-    let queue_height = if queued.is_empty() {
-        0
-    } else {
-        // One row per queued prompt, so every pending message is
-        // visible (not just the head).
-        queued.len() as u16
-    };
-    const OUTPUT_LINES: usize = 1;
-    let output_line_count = selected_output.lines().count().min(OUTPUT_LINES);
-    let tasks_height = if state.show_tasks {
-        // border (2) + header (1) + one row per task + output tail
-        (running.len() as u16 + 3 + output_line_count as u16).max(3)
-    } else {
-        u16::from(!running.is_empty())
-    };
-    (queue_height, tasks_height, input_height)
-}
-
-/// Map a terminal row (the `row` field of a crossterm `MouseEvent`, counted
-/// from the top of the screen) to an index into the running-task list shown
-/// in the open tasks panel. `tasks_top` is the panel's top border row as
-/// derived from [`bottom_region_heights`]. Returns `None` for rows that are
-/// not over a task row: the border, the header, the output tail, or outside
-/// the panel entirely.
-pub(crate) fn task_row_at(row: u16, tasks_top: u16, task_count: usize) -> Option<usize> {
-    // The panel's content starts one row below the top border (the header
-    // line); task rows follow from the second content row.
-    let index = i64::from(row) - i64::from(tasks_top) - 2;
-    if index >= 0 && (index as usize) < task_count {
-        Some(index as usize)
-    } else {
-        None
-    }
 }
 
 /// Keep wrapping text-only so scroll accounting is unchanged, then add the
