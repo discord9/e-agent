@@ -337,7 +337,25 @@ supported — no resources, prompts, or server-initiated notifications.
 - `OPENAI_MODEL` — model name, default: `gpt-4o-mini`.
 - `EXA_API_KEY` — optional; a non-whitespace value enables `web_search` through
   Exa Context.
-- `RUST_BACKTRACE=1` — optional; appends a backtrace to printed error chains.
+- `RUST_BACKTRACE=1` — optional; appends a backtrace to ordinary `anyhow` error
+  chains (and enables their full Rust verbosity). Rust panics always print a
+  forced stack regardless of this setting.
+
+### Panic reports
+
+A Rust panic prints its thread, location, and forced stack to stderr while
+omitting the panic payload. It also writes a private crash report to
+`$XDG_STATE_HOME/e-agent/crash/latest.log`, or, when `XDG_STATE_HOME` is unset,
+`~/.config/e-agent/crash/latest.log`. On the next startup, e-agent reports the
+previous crash and renames `latest.log` to `previous.log`.
+
+The global panic hook also observes Tokio worker and subagent task panics. Such
+a panic may be caught by Tokio as a `JoinError`, so its diagnostic and report do
+not by themselves mean the main TUI exited or that the application is fatal.
+
+Panic reports are not guaranteed for `SIGKILL`, OOM termination, aborts,
+segmentation faults, or a top-level `Err` return; those are not ordinary Rust
+panics.
 
 TOML config is optional. When present, it supplies the selected provider
 credential and profile values instead of `OPENAI_*`; see [Run](#run). A

@@ -1,5 +1,6 @@
 use std::backtrace::Backtrace;
 use std::ffi::OsStr;
+use std::fmt;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -685,13 +686,118 @@ fn format_crash_report(ts: u64, thread: &str, location: Option<&str>, bt: &str) 
     r
 }
 
-/// Install global panic hook: restore terminal only when panicking on the
-/// main thread, call the previous hook, write crash file (best-effort, no
-/// payload content). No re-entrancy guard — every operation is fallible.
+/// Create the crash directory without changing permissions on its config parent.
+///
+/// The directory may already exist from an older version; in that case only the
+/// `crash` directory itself is made private.
+fn create_private_crash_dir(dir: &Path) -> Result<(), String> {
+    let parent = dir
+        .parent()
+        .ok_or_else(|| format!("invalid crash directory: {}", dir.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create {}: {error}", parent.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("create {}: {error}", dir.display())),
+        }
+        if !dir.is_dir() {
+            return Err(format!("create {}: not a directory", dir.display()));
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("set permissions on {}: {error}", dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(dir)
+            .or_else(|error| {
+                if error.kind() == ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(|error| format!("create {}: {error}", dir.display()))?;
+        if !dir.is_dir() {
+            return Err(format!("create {}: not a directory", dir.display()));
+        }
+    }
+    Ok(())
+}
+
+fn open_private_crash_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn make_crash_file_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Atomically replace `latest.log` with a private crash report.
+///
+/// Errors are returned to the panic hook, which is deliberately responsible
+/// for printing them without invoking any further error-handling machinery.
+fn write_crash_report(dir: &Path, report: &str) -> Result<PathBuf, String> {
+    create_private_crash_dir(dir)?;
+    let latest = dir.join("latest.log");
+    let tmp = latest.with_extension("tmp");
+    let mut file = open_private_crash_file(&tmp)
+        .map_err(|error| format!("create {}: {error}", tmp.display()))?;
+    make_crash_file_private(&tmp)
+        .map_err(|error| format!("set permissions on {}: {error}", tmp.display()))?;
+    file.write_all(report.as_bytes())
+        .map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("sync {}: {error}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, &latest)
+        .map_err(|error| format!("rename {} to {}: {error}", tmp.display(), latest.display()))?;
+    Ok(latest)
+}
+
+/// Write a panic diagnostic without panicking again if stderr is unavailable.
+fn panic_stderr(args: fmt::Arguments<'_>) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_fmt(args);
+}
+
+/// Install the global hook. Rust calls it even for a Tokio task panic that is
+/// later observed as a `JoinError`, so this hook only restores the TUI on the
+/// main thread. It reports all panics but does not decide process fatality.
 fn install_panic_hook() {
-    let prev = std::panic::take_hook();
+    // Do not call the previous hook: it conditionally prints a backtrace based
+    // on RUST_BACKTRACE, and would duplicate the forced stack below. The panic
+    // payload remains deliberately omitted because it can contain secrets.
+    let _previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current().name() == Some("main") {
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        if thread == "main" {
+            // A main-thread panic is normally fatal. Restore before writing a
+            // potentially long stack so it is visible outside the TUI.
             let _ = crossterm::terminal::disable_raw_mode();
             let _ = crossterm::execute!(
                 std::io::stderr(),
@@ -699,30 +805,46 @@ fn install_panic_hook() {
                 crossterm::cursor::Show,
             );
         }
-        prev(info);
 
         let location = info
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
-        let thread = std::thread::current()
-            .name()
-            .unwrap_or("<unnamed>")
-            .to_owned();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let bt = Backtrace::force_capture();
-        let report = format_crash_report(ts, &thread, location.as_deref(), &format!("{bt:#}"));
-        if let Some(dir) = crash_dir() {
-            let _ = std::fs::create_dir_all(&dir);
-            let latest = dir.join("latest.log");
-            let tmp = latest.with_extension("tmp");
-            if std::fs::write(&tmp, &report).is_ok() {
-                let _ = std::fs::rename(&tmp, &latest);
-            }
-            let _ = std::fs::remove_file(&tmp);
+        let backtrace = format!("{bt:#}");
+        let report = format_crash_report(ts, &thread, location.as_deref(), &backtrace);
+        let write_result = crash_dir().map(|dir| write_crash_report(&dir, &report));
+
+        // Keep this self-contained and non-recursive: a hook can run while
+        // unwinding, and a Tokio worker panic may be caught by its JoinHandle.
+        let mut diagnostic =
+            format!("e-agent: Rust panic on thread {thread} (panic payload omitted)\n");
+        if let Some(location) = location {
+            diagnostic.push_str(&format!("  location: {location}\n"));
         }
+        if thread != "main" {
+            diagnostic.push_str(
+                "  note: a non-main Tokio task panic may be caught as a JoinError; this diagnostic alone is not a fatal application status.\n",
+            );
+        }
+        diagnostic.push_str(&format!("  backtrace:\n{backtrace}"));
+        if !diagnostic.ends_with('\n') {
+            diagnostic.push('\n');
+        }
+        match write_result {
+            Some(Ok(path)) => {
+                diagnostic.push_str(&format!("e-agent: crash report: {}\n", path.display()))
+            }
+            Some(Err(error)) => {
+                diagnostic.push_str(&format!("e-agent: crash report write failed: {error}\n"))
+            }
+            None => diagnostic
+                .push_str("e-agent: crash report write failed: no XDG_STATE_HOME or HOME\n"),
+        }
+        panic_stderr(format_args!("{diagnostic}"));
     }));
 }
 
@@ -731,18 +853,31 @@ fn install_panic_hook() {
 /// file was found and acknowledged.
 fn acknowledge_crash(latest: &Path, previous: &Path) -> bool {
     let content = match std::fs::read_to_string(latest) {
-        Ok(c) => c,
-        Err(_) => return false,
+        Ok(content) => content,
+        Err(error) if error.kind() == ErrorKind::NotFound => return false,
+        Err(error) => {
+            eprintln!(
+                "e-agent: crash report read failed ({}): {error}",
+                latest.display()
+            );
+            return false;
+        }
     };
     let location = content
         .lines()
-        .find_map(|l| l.strip_prefix("location: "))
+        .find_map(|line| line.strip_prefix("location: "))
         .unwrap_or("<unknown>");
     eprintln!("e-agent: previous crash at {location}");
-    let report_path = if std::fs::rename(latest, previous).is_ok() {
-        previous
-    } else {
-        latest
+    let report_path = match std::fs::rename(latest, previous) {
+        Ok(()) => previous,
+        Err(error) => {
+            eprintln!(
+                "e-agent: crash report rename failed ({} to {}): {error}",
+                latest.display(),
+                previous.display()
+            );
+            latest
+        }
     };
     eprintln!("  crash report: {}", report_path.display());
     true
