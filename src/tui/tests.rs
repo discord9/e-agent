@@ -446,15 +446,28 @@ fn task_detail_render_shows_full_command_banner_below_header() {
     );
     // Banner is Dim like the spool output text.
     assert!(buffer[(1, 1)].modifier.contains(Modifier::DIM));
-    // Output still renders below the fixed banner (bottom-aligned tail).
+    // Output renders top-aligned directly below the fixed banner: the
+    // short spool starts at the content top, no blank gap in between.
+    let row: String = (1..119)
+        .map(|x| buffer[(x, 3)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "line 0");
+    let row: String = (1..119)
+        .map(|x| buffer[(x, 4)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "line 1");
     let row: String = (1..119)
         .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
         .collect();
-    assert_eq!(row.trim_end(), "line 1");
+    assert_eq!(
+        row.trim_end(),
+        "",
+        "no bottom-aligned tail below short output"
+    );
 }
 
 #[test]
-fn task_detail_follow_bottom_aligns_short_output_and_esc_f2_close() {
+fn task_detail_top_aligns_short_output_and_esc_f2_close() {
     let spool = Arc::new(crate::tools::TaskSpool::new());
     spool.append(b"one\ntwo\nthree\n");
     let mut state = TuiState {
@@ -466,11 +479,29 @@ fn task_detail_follow_bottom_aligns_short_output_and_esc_f2_close() {
     let mut terminal = Terminal::new(backend).unwrap();
     draw(&mut terminal, &mut state).unwrap();
     let buffer = terminal.backend().buffer();
-    // Fewer rows than the viewport: bottom-aligned like the scrollback.
+    // The detail view is a viewer: fewer rows than the viewport still
+    // render top-aligned from the content top (first row at the top, no
+    // blank gap, no bottom-aligned tail).
+    let row: String = (1..39)
+        .map(|x| buffer[(x, 1)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "one");
+    let row: String = (1..39)
+        .map(|x| buffer[(x, 2)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "two");
+    let row: String = (1..39)
+        .map(|x| buffer[(x, 3)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "three");
     let row: String = (1..39)
         .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
         .collect();
-    assert_eq!(row.trim_end(), "three");
+    assert_eq!(
+        row.trim_end(),
+        "",
+        "short detail output must not be bottom-aligned"
+    );
 
     // Esc closes the detail and returns to the panel.
     state.handle_task_detail_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
@@ -484,6 +515,48 @@ fn task_detail_follow_bottom_aligns_short_output_and_esc_f2_close() {
     state.handle_task_detail_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()));
     assert!(state.task_detail.is_none());
     assert!(!state.show_tasks, "F2 closes the detail and the panel");
+}
+
+#[test]
+fn task_detail_open_anchor_head_top_aligns_short_output() {
+    // Opening a detail anchors the head page (load_head) in follow mode;
+    // with fewer rows than the viewport the page must still render
+    // top-aligned from the content top, not bottom-aligned with a blank
+    // gap between the fixed command banner and the output.
+    let spool = Arc::new(crate::tools::TaskSpool::new());
+    spool.append(b"first\nsecond\n");
+    let mut detail = TaskDetail::new(1, "demo".into(), spool, false);
+    detail.load_head(38, 10);
+    detail.last_seen_lines = detail.spool.line_count();
+    assert!(detail.window.follow_bottom);
+    assert_eq!(detail.base_line, 0);
+    assert_eq!(detail.lines.len(), 2);
+    let mut state = TuiState {
+        show_tasks: true,
+        task_detail: Some(detail),
+        ..Default::default()
+    };
+    let backend = ratatui::backend::TestBackend::new(40, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    draw(&mut terminal, &mut state).unwrap();
+    let buffer = terminal.backend().buffer();
+    // First row at the content top (below the header border), no gap.
+    let row: String = (1..39)
+        .map(|x| buffer[(x, 1)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "first");
+    let row: String = (1..39)
+        .map(|x| buffer[(x, 2)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "second");
+    let row: String = (1..39)
+        .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(
+        row.trim_end(),
+        "",
+        "opened head page must not be bottom-aligned"
+    );
 }
 
 #[tokio::test]

@@ -679,17 +679,12 @@ pub(crate) fn render_task_detail(
         }
         let scroll_offset = detail.window.local_offset;
         let content_top = inner.y + banner_rows as u16;
-        // When following with fewer rows than the content viewport,
-        // bottom-align like the main scrollback so the tail touches the
-        // bottom border (below the fixed command banner).
-        let render_top = if detail.window.follow_bottom && total_rows < content_height {
-            inner
-                .bottom()
-                .saturating_sub(total_rows as u16)
-                .max(content_top)
-        } else {
-            content_top
-        };
+        // The detail view is a viewer, not a chat scrollback: content
+        // always renders top-aligned from the content viewport top, so a
+        // page shorter than the viewport (opened head page or a short
+        // tail page) starts at the top instead of leaving a blank gap
+        // between the fixed command banner and bottom-aligned rows.
+        let render_top = content_top;
         for (row_idx, line) in visual.iter().enumerate().skip(scroll_offset) {
             let y = render_top + (row_idx - scroll_offset) as u16;
             if y >= inner.bottom() {
