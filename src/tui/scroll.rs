@@ -421,13 +421,18 @@ pub(crate) fn extend_window_down(
         state.window.follow_bottom = true;
         state.window.frozen_tail_cursor = None;
     }
-    // Reached the end of the loaded lines while scrolling down: queue the
-    // next newer middle segment (request_newer is self-guarding, so
-    // repeated keys collapse and done/loading states suppress it). The
-    // loaded lines always end with the head segment, so this fires once
-    // per middle segment as the user pages down, until load_newer reports
-    // None (the head segment is already loaded — nothing to fetch).
-    if state.window.source_end >= state.lines.len() && state.newer_cursor.is_some() {
+    // Reached the end of the *logically loaded* content while scrolling
+    // down: queue the next newer middle segment. The trigger is
+    // `source_end >= head_start` — NOT `lines.len()`: after Home the
+    // oldest segment sits in front of the head segment, so the loaded
+    // lines are [oldest][head] with the middle segments absent. Scrolling
+    // to the head segment's start (the end of what precedes it) must
+    // fetch the next middle segment so it splices in before the head and
+    // the user pages through it seamlessly. `request_newer` is
+    // self-guarding (repeated keys collapse, done/loading/cursor states
+    // suppress), and the head segment itself never triggers a fetch
+    // (load_newer never returns it).
+    if state.window.source_end >= state.head_start && state.newer_cursor.is_some() {
         state.request_newer();
     }
 }
