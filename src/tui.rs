@@ -583,13 +583,9 @@ fn draw<'a, B: ratatui::backend::Backend>(
         // Render the window range into visual rows. If the viewport is
         // frozen with a tail-text snapshot, build a temporary line copy so
         // streaming deltas cannot mutate the rendered output.
-        let visual = if let Some(frozen_text) = &scroll_state.window.frozen_tail_text {
-            let mut frozen_lines: Vec<DisplayLine> = scroll_state.lines
-                [scroll_state.window.source_start..scroll_state.window.source_end]
-                .to_vec();
-            if let Some(last) = frozen_lines.last_mut() {
-                last.text = frozen_text.clone();
-            }
+        let visual = if let Some(frozen_lines) =
+            frozen_window_lines(&scroll_state.lines, &scroll_state.window)
+        {
             render_window(&frozen_lines, 0, frozen_lines.len(), inner_width)
         } else {
             render_window(
@@ -1246,6 +1242,18 @@ impl AttachedView {
 struct DisplayLine {
     text: String,
     kind: LineKind,
+}
+
+/// Copy the current window with its frozen streaming tail substituted.
+/// Keeping this shared by rendering and scroll accounting ensures both see
+/// the same visual height while live deltas continue growing the source line.
+fn frozen_window_lines(lines: &[DisplayLine], window: &ScrollWindow) -> Option<Vec<DisplayLine>> {
+    let frozen_text = window.frozen_tail_text.as_ref()?;
+    let mut frozen_lines = lines[window.source_start..window.source_end].to_vec();
+    if let Some(last) = frozen_lines.last_mut() {
+        last.text = frozen_text.clone();
+    }
+    Some(frozen_lines)
 }
 
 /// Bounded local rendering window over a sub-range of the scrollback's
@@ -2077,11 +2085,20 @@ impl TuiState {
 fn extend_window_down(state: &mut TuiState, step: usize, on_extension: impl FnOnce(&mut TuiState)) {
     let w = state.inner_width.max(1);
     let height = state.output_height.max(1);
-    // Compute total visual rows in the current window.
-    let mut total_visual = 0usize;
-    for line in &state.lines[state.window.source_start..state.window.source_end] {
-        total_visual += line_visual_rows(line, w);
-    }
+    // Compute the same frozen visual snapshot that draw uses. Live deltas may
+    // have made the source tail taller without changing the frozen viewport.
+    let mut total_visual =
+        if let Some(frozen_lines) = frozen_window_lines(&state.lines, &state.window) {
+            frozen_lines
+                .iter()
+                .map(|line| line_visual_rows(line, w))
+                .sum()
+        } else {
+            state.lines[state.window.source_start..state.window.source_end]
+                .iter()
+                .map(|line| line_visual_rows(line, w))
+                .sum()
+        };
     // The viewport-bottom check: the last visible row is
     // local_offset + height - 1.  Scrolling can advance until
     // local_offset + height >= total_visual.
@@ -4649,45 +4666,87 @@ mod ux_tests {
     }
 
     #[test]
-    fn frozen_down_or_pagedown_clears_at_true_bottom() {
-        for key in [KeyCode::Down, KeyCode::PageDown] {
-            let backend = ratatui::backend::TestBackend::new(40, 6);
-            let mut term = Terminal::new(backend).unwrap();
-            let mut state = frozen_state();
-            // Override output_height (frozen_state sets 10, use 6 here).
-            state.output_height = 6;
-            // Re-freeze so the window uses height=6.
-            state.window.source_end = state.lines.len();
-            state.window.frozen_source_end = state.window.source_end;
-            state.window.frozen_tail_text = state.lines.last().map(|l| l.text.clone());
+    fn assistant_delta_down_resumes_live_follow_at_frozen_visual_bottom() {
+        let backend = ratatui::backend::TestBackend::new(20, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        state.push_agent_event(AgentEvent::AssistantDelta("initial ".repeat(45)));
+        draw(&mut term, &mut state).unwrap();
 
-            append_deltas(&mut state);
-            assert_eq!(state.lines.last().unwrap().text, "hello world");
-            assert!(state.window.frozen_tail_text.is_some());
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let frozen = state.window.frozen_tail_text.clone().unwrap();
+        state.push_agent_event(AgentEvent::AssistantDelta("growth ".repeat(60)));
+        assert!(state.lines.last().unwrap().text.len() > frozen.len());
+        assert!(
+            line_visual_rows(state.lines.last().unwrap(), state.inner_width)
+                > line_visual_rows(
+                    &DisplayLine {
+                        text: frozen,
+                        kind: LineKind::Normal,
+                    },
+                    state.inner_width,
+                )
+        );
+        draw(&mut term, &mut state).unwrap();
 
-            let mut safety = 0usize;
-            loop {
-                state.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
-                safety += 1;
-                if state.window.follow_bottom || safety > 20 {
-                    break;
-                }
-            }
-            assert!(state.window.follow_bottom, "{key:?} must resume follow");
-            assert!(
-                state.window.frozen_tail_text.is_none(),
-                "{key:?} must clear frozen snapshot"
-            );
-
-            // After follow, draw must show the accumulated tail text.
+        let mut presses = 0;
+        while !state.window.follow_bottom && presses < 20 {
+            state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
             draw(&mut term, &mut state).unwrap();
-            // output height = 6 - 3 = 3, render_top = 3 - 3 = 0, last row = 2.
-            assert_eq!(
-                row_text(term.backend().buffer(), 2),
-                "hello world",
-                "{key:?} latest rendered content"
-            );
+            presses += 1;
         }
+        assert!(state.window.follow_bottom, "Down must resume follow");
+        assert!(state.window.frozen_tail_text.is_none());
+
+        state.push_agent_event(AgentEvent::AssistantDelta("\nLIVE_ASSISTANT_TAIL".into()));
+        draw(&mut term, &mut state).unwrap();
+        let rendered = (0..term.backend().buffer().area.height)
+            .map(|y| row_text(term.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("LIVE_ASSISTANT_TAIL"));
+    }
+
+    #[test]
+    fn reasoning_delta_pagedown_resumes_live_follow_at_frozen_visual_bottom() {
+        let backend = ratatui::backend::TestBackend::new(20, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        state.push_agent_event(AgentEvent::ReasoningDelta("initial ".repeat(45)));
+        draw(&mut term, &mut state).unwrap();
+
+        state.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        let frozen = state.window.frozen_tail_text.clone().unwrap();
+        state.push_agent_event(AgentEvent::ReasoningDelta("growth ".repeat(60)));
+        assert!(state.lines.last().unwrap().text.len() > frozen.len());
+        assert!(
+            line_visual_rows(state.lines.last().unwrap(), state.inner_width)
+                > line_visual_rows(
+                    &DisplayLine {
+                        text: frozen,
+                        kind: LineKind::Thinking,
+                    },
+                    state.inner_width,
+                )
+        );
+        draw(&mut term, &mut state).unwrap();
+
+        let mut presses = 0;
+        while !state.window.follow_bottom && presses < 20 {
+            state.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+            draw(&mut term, &mut state).unwrap();
+            presses += 1;
+        }
+        assert!(state.window.follow_bottom, "PageDown must resume follow");
+        assert!(state.window.frozen_tail_text.is_none());
+
+        state.push_agent_event(AgentEvent::ReasoningDelta("\nLIVE_REASONING_TAIL".into()));
+        draw(&mut term, &mut state).unwrap();
+        let rendered = (0..term.backend().buffer().area.height)
+            .map(|y| row_text(term.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("LIVE_REASONING_TAIL"));
     }
 
     #[test]
