@@ -126,10 +126,14 @@ impl Shared {
                 AgentEvent::AssistantDelta(_) | AgentEvent::ReasoningDelta(_)
             )
         {
-            let _ = self.events.send(event);
+            self.emit_transient(event);
         } else {
             self.emit(event);
         }
+    }
+
+    fn emit_transient(&self, event: AgentEvent) {
+        let _ = self.events.send(event);
     }
 }
 
@@ -151,7 +155,12 @@ impl SessionHandle {
             .send(SessionCommand::Prompt(prompt.clone()))
             .is_ok()
         {
-            shared.emit(AgentEvent::UserPrompt(prompt));
+            if matches!(
+                *shared.status.borrow(),
+                SessionStatus::Busy | SessionStatus::Compacting
+            ) {
+                shared.emit(AgentEvent::PromptQueued(prompt));
+            }
         } else {
             shared.commands_open = false;
         }
@@ -278,7 +287,7 @@ enum OperationFlow {
 }
 
 enum PendingCommand {
-    Prompt { text: String, projected: bool },
+    Prompt { text: String, queued: bool },
     Compact,
 }
 
@@ -353,7 +362,7 @@ impl SessionRunner {
         if let Some(prompt) = initial_prompt {
             self.pending.push_back(PendingCommand::Prompt {
                 text: prompt,
-                projected: false,
+                queued: false,
             });
         }
         SessionTask {
@@ -380,7 +389,7 @@ impl SessionRunner {
     async fn commit_user_batch(
         &mut self,
         content: String,
-        unprojected: Vec<String>,
+        consumed: Vec<(bool, String)>,
     ) -> anyhow::Result<()> {
         let entry: SessionEntry = Message::User { content }.into();
         self.store
@@ -388,7 +397,10 @@ impl SessionRunner {
             .await?;
         self.agent.apply_entry(entry);
         let mut shared = self.shared.lock().unwrap();
-        for prompt in unprojected {
+        for (queued, prompt) in consumed {
+            if queued {
+                shared.emit(AgentEvent::PromptConsumed);
+            }
             shared.emit(AgentEvent::UserPrompt(prompt));
         }
         Ok(())
@@ -437,9 +449,9 @@ impl SessionRunner {
             while self.has_work() {
                 match self.pending.front() {
                     Some(PendingCommand::Prompt { .. }) => {
-                        let (prompt, unprojected) = self.take_prompt_batch();
+                        let (prompt, consumed) = self.take_prompt_batch();
                         if !prompt.is_empty()
-                            && let Err(error) = self.commit_user_batch(prompt, unprojected).await
+                            && let Err(error) = self.commit_user_batch(prompt, consumed).await
                         {
                             self.shared.lock().unwrap().emit(AgentEvent::Error(format!(
                                 "persisting accepted prompt while terminating: {error:#}"
@@ -463,7 +475,7 @@ impl SessionRunner {
             SessionCommand::Prompt(prompt) => {
                 self.pending.push_back(PendingCommand::Prompt {
                     text: prompt,
-                    projected: true,
+                    queued: true,
                 });
                 false
             }
@@ -508,19 +520,19 @@ impl SessionRunner {
         !self.pending.is_empty()
     }
 
-    fn take_prompt_batch(&mut self) -> (String, Vec<String>) {
+    fn take_prompt_batch(&mut self) -> (String, Vec<(bool, String)>) {
         let mut prompts = Vec::new();
-        let mut unprojected = Vec::new();
+        let mut consumed = Vec::new();
         while matches!(self.pending.front(), Some(PendingCommand::Prompt { .. })) {
-            let Some(PendingCommand::Prompt { text, projected }) = self.pending.pop_front() else {
+            let Some(PendingCommand::Prompt { text, queued }) = self.pending.pop_front() else {
                 unreachable!()
             };
-            if !projected && !text.is_empty() {
-                unprojected.push(text.clone());
+            if !text.is_empty() {
+                consumed.push((queued, text.clone()));
             }
             prompts.push(text);
         }
-        (prompts.join("\n\n"), unprojected)
+        (prompts.join("\n\n"), consumed)
     }
 
     fn finish_cancelled_or_idle(&mut self) -> bool {
@@ -606,7 +618,7 @@ impl SessionRunner {
                 Ok(true) if self.pending.is_empty() => {
                     self.pending.push_back(PendingCommand::Prompt {
                         text: String::new(),
-                        projected: false,
+                        queued: false,
                     })
                 }
                 Ok(_) => {}
@@ -682,10 +694,10 @@ impl SessionRunner {
                     }
                 }
             }
-            let (prompt, unprojected) = self.take_prompt_batch();
+            let (prompt, consumed) = self.take_prompt_batch();
             self.status(SessionStatus::Busy);
             if !prompt.is_empty()
-                && let Err(error) = self.commit_user_batch(prompt, unprojected).await
+                && let Err(error) = self.commit_user_batch(prompt, consumed).await
             {
                 self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
                     .await;

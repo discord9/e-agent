@@ -98,6 +98,6 @@ contract through `Agent::emit` → fanout to `event_handler` + all `observers`:
 
 Every session supports the same steering operations through its concrete
 `SessionHandle` command channel: queue a prompt, request compaction, or cancel
-the in-flight turn. Main-agent and subagent frontends use this same transport;
-`prompt` also records its `UserPrompt` projection in the session log before the
-runner consumes it. Do not add a second steering path.
+the in-flight turn. Main-agent and subagent frontends use this same transport.
+Queued prompts are transient UI state; `UserPrompt` is emitted and persisted
+only when the runner consumes the prompt. Do not add a second steering path.

@@ -88,6 +88,12 @@ pub struct ToolSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentEvent {
+    /// A prompt accepted while the runner is busy. Transient UI projection;
+    /// kept in the in-memory event log for attach replay, but never persisted
+    /// as a `SessionEntry`.
+    PromptQueued(String),
+    /// The runner consumed the oldest queued prompt. Transient UI projection.
+    PromptConsumed,
     UserPrompt(String),
     AssistantText(String),
     AssistantDelta(String),

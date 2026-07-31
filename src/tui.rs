@@ -419,7 +419,6 @@ fn draw<'a, B: ratatui::backend::Backend>(
             Block::default().style(SOLARIZED_LIGHT.screen_style()),
             frame.area(),
         );
-        let attached = state.attached.is_some();
         let inner_input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
         let input_rows = if let Some(attached) = &state.attached {
             attached.input.visual_rows(inner_input_width)
@@ -429,12 +428,16 @@ fn draw<'a, B: ratatui::backend::Backend>(
         let input_height = (input_rows + 2)
             .min((usize::from(frame.area().height) / 3).max(3))
             .max(3) as u16;
-        let queue_height = if attached || state.queued.is_empty() {
+        let queued = state
+            .attached
+            .as_ref()
+            .map_or(&state.queued, |attached| &attached.state.queued);
+        let queue_height = if queued.is_empty() {
             0
         } else {
             // One row per queued prompt, so every pending message is
             // visible (not just the head).
-            state.queued.len() as u16
+            queued.len() as u16
         };
         let running: Vec<crate::tools::BackgroundTaskInfo> = state
             .background
@@ -470,8 +473,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
         ])
         .areas(frame.area());
         if queue_height > 0 {
-            let queued_lines: Vec<Line> = state
-                .queued
+            let queued_lines: Vec<Line> = queued
                 .iter()
                 .enumerate()
                 .map(|(index, prompt)| {
@@ -1162,9 +1164,9 @@ struct TuiState {
     /// Configured context window (token count) from the model profile, used
     /// to display a usage percentage and trigger the red style at >= 80%.
     context_window: Option<u64>,
-    /// Prompts submitted while a turn is in flight; drained (never persisted)
-    /// once the current turn ends.
-    queued: Vec<String>,
+    /// Transient projection of prompts accepted while a turn is in flight.
+    /// Consumption removes one item from the front; this is never persisted.
+    queued: std::collections::VecDeque<String>,
     /// Arguments of an in-flight edit_file call, rendered as a numbered diff
     /// when its result (which carries the line number) arrives.
     pending_edit: Option<(String, String, String)>,
@@ -1628,9 +1630,6 @@ impl TuiState {
                 let prompt = std::mem::take(&mut attached.input.text);
                 attached.input.cursor = 0;
                 if !prompt.trim().is_empty() && !attached.finished {
-                    // send_input records a UserPrompt event in the session
-                    // log/stream, which renders the `you>` line (queued or
-                    // not) via the normal event path.
                     attached.handle.prompt(prompt);
                 }
             }
@@ -1938,9 +1937,13 @@ impl TuiState {
     fn push_agent_event_inner(&mut self, event: AgentEvent) {
         let ends_delta = matches!(
             &event,
-            AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
+            AgentEvent::UserPrompt(_) | AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
         );
         match event {
+            AgentEvent::PromptQueued(text) => self.queued.push_back(text),
+            AgentEvent::PromptConsumed => {
+                self.queued.pop_front();
+            }
             AgentEvent::Notice(text) => {
                 self.active_lane = None;
                 if text.starts_with("──── auto-compact") {
@@ -2939,8 +2942,6 @@ mod tests {
                 "please also check tests".into()
             ))
         );
-        // Steering projects UserPrompt immediately, while the command is
-        // consumed by the runner through this channel.
         state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
         assert_eq!(
             source.try_recv().ok(),
@@ -4037,20 +4038,57 @@ mod tests {
     }
 
     #[test]
-    fn queued_bar_is_bold_high_contrast_and_fills_its_row() {
+    fn busy_enqueue_renders_queue_bar() {
         let backend = ratatui::backend::TestBackend::new(50, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut state = TuiState::default();
-        state.queued.push("follow up".into());
+        let mut state = TuiState {
+            busy: Some(BusyState::thinking()),
+            ..TuiState::default()
+        };
+        state.push_agent_event(AgentEvent::PromptQueued("follow up".into()));
         draw(&mut terminal, &mut state).unwrap();
 
         let buffer = terminal.backend().buffer();
         // input is three rows high; with one queue row, the banner sits at y=6.
+        let row: String = buffer.content()[6 * 50..7 * 50]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(row.contains("queued 1: follow up"));
         let first = &buffer[(0, 6)];
         assert_eq!(first.fg, SOLARIZED_LIGHT.ink);
         assert_eq!(first.bg, SOLARIZED_LIGHT.blue);
         assert!(first.modifier.contains(Modifier::BOLD));
         assert_eq!(buffer[(49, 6)].bg, SOLARIZED_LIGHT.blue);
+        assert!(state.lines.is_empty(), "queued prompt entered scrollback");
+    }
+
+    #[test]
+    fn prompt_consumption_drains_duplicate_prompts_fifo() {
+        let mut state = TuiState::default();
+        state.push_agent_event(AgentEvent::PromptQueued("same".into()));
+        state.push_agent_event(AgentEvent::PromptQueued("same".into()));
+        state.push_agent_event(AgentEvent::PromptQueued("last".into()));
+
+        state.push_agent_event(AgentEvent::PromptConsumed);
+        assert_eq!(
+            state.queued.iter().cloned().collect::<Vec<_>>(),
+            ["same", "last"]
+        );
+        state.push_agent_event(AgentEvent::UserPrompt("same".into()));
+        assert_eq!(state.lines.last().unwrap().text, "you> same");
+    }
+
+    #[test]
+    fn user_prompt_resets_active_stream_lane() {
+        let mut state = TuiState::default();
+        state.push_agent_event(AgentEvent::AssistantDelta("answer".into()));
+        state.push_agent_event(AgentEvent::UserPrompt("next".into()));
+        state.push_agent_event(AgentEvent::AssistantDelta("new answer".into()));
+
+        assert_eq!(state.lines.len(), 3);
+        assert_eq!(state.lines[1].text, "you> next");
+        assert_eq!(state.lines[2].text, "new answer");
     }
 
     #[test]

@@ -385,8 +385,7 @@ async fn consume_stderr_events(mut events: tokio::sync::broadcast::Receiver<Agen
     let mut reasoning = false;
     while let Ok(event) = events.recv().await {
         match event {
-            // Steering prompts are recorded by the session handle; the stderr
-            // frontend never sends any, so nothing to print.
+            AgentEvent::PromptQueued(_) | AgentEvent::PromptConsumed => {}
             AgentEvent::UserPrompt(_) => {}
             AgentEvent::Notice(text) => {
                 eprintln!("{}", text);

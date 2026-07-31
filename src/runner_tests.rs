@@ -607,7 +607,7 @@ async fn prompt_after_finished_has_no_projection_or_persistence() {
 }
 
 #[tokio::test]
-async fn queued_handle_prompt_is_projected_immediately_and_only_once() {
+async fn queued_handle_prompt_is_transient_until_consumed() {
     let temp = tempfile::tempdir().unwrap();
     let (agent, entered, release) = controlled(vec![Ok("first".into()), Ok("second".into())], true);
     let (runner, handle) = SessionRunner::new(
@@ -623,20 +623,15 @@ async fn queued_handle_prompt_is_projected_immediately_and_only_once() {
     handle.prompt("queued while busy");
 
     loop {
-        if matches!(live.recv().await.unwrap(), AgentEvent::UserPrompt(text) if text == "queued while busy")
+        if matches!(live.recv().await.unwrap(), AgentEvent::PromptQueued(text) if text == "queued while busy")
         {
             break;
         }
     }
-    assert_eq!(
-        handle
-            .snapshot()
-            .iter()
-            .filter(
-                |event| matches!(event, AgentEvent::UserPrompt(text) if text == "queued while busy")
-            )
-            .count(),
-        1
+    assert!(
+        !handle.snapshot().iter().any(
+            |event| matches!(event, AgentEvent::UserPrompt(text) if text == "queued while busy")
+        )
     );
 
     release.notify_one();
