@@ -1601,6 +1601,7 @@ fn attached_view_paints_input_corners_like_the_main_view() {
     let (handle, sink, _source) = crate::runner::session_test_channel();
     sink.emit(AgentEvent::Usage {
         context_input: 1_500,
+        context_window: Some(4_096),
         session: crate::agent::Usage {
             input_tokens: 1_500,
             output_tokens: 0,

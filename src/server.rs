@@ -944,9 +944,14 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
         }
         AgentEvent::Usage {
             context_input,
+            context_window,
             session,
         } => {
-            json!({ "context_input": context_input, "session": session })
+            json!({
+                "context_input": context_input,
+                "context_window": context_window,
+                "session": session
+            })
         }
     }
 }
@@ -1229,6 +1234,7 @@ mod tests {
         assert_eq!(
             name(&AgentEvent::Usage {
                 context_input: 1,
+                context_window: None,
                 session: crate::agent::Usage {
                     input_tokens: 1,
                     output_tokens: 2
@@ -1302,12 +1308,13 @@ mod tests {
         assert_eq!(
             event_payload(&AgentEvent::Usage {
                 context_input: 1234,
+                context_window: Some(4096),
                 session: crate::agent::Usage {
                     input_tokens: 100,
                     output_tokens: 50
                 },
             }),
-            json!({"context_input": 1234, "session": {"input_tokens": 100, "output_tokens": 50}})
+            json!({"context_input": 1234, "context_window": 4096, "session": {"input_tokens": 100, "output_tokens": 50}})
         );
     }
 

@@ -377,6 +377,7 @@ async fn consume_stderr_events(mut events: tokio::sync::broadcast::Receiver<Agen
             }
             AgentEvent::Usage {
                 context_input,
+                context_window: _,
                 session,
             } => eprintln!(
                 "\x1b[2mctx {}, session {} in / {} out\x1b[0m",

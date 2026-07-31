@@ -337,6 +337,9 @@ pub enum AgentEvent {
         /// context window currently in use. Compaction calls do not refresh
         /// this (their input is the pre-compaction context).
         context_input: u64,
+        /// Configured model context window in tokens (`None` when the model
+        /// profile did not set one); lets clients render a usage percentage.
+        context_window: Option<u64>,
         /// Cumulative tokens for this process.
         session: Usage,
     },
@@ -945,6 +948,7 @@ impl Agent {
             }
             self.emit(AgentEvent::Usage {
                 context_input: self.last_context_input,
+                context_window: self.context_window,
                 session: Usage {
                     input_tokens: self.session_input_tokens,
                     output_tokens: self.session_output_tokens,

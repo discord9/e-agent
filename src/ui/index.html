@@ -244,6 +244,7 @@
   }
   .chat-head .dim { font-size: 13px; }
   #usageInfo { margin-left: auto; }
+  #usageInfo.usage-high { color: var(--red); font-weight: bold; }
 
   /* 顶部信息栏的压缩按钮：小号低调，避免与输入区的取消/发送相邻 */
   .compact-head {
@@ -1451,10 +1452,21 @@ function applyUsage(usage) {
   if (!usage || typeof usage !== "object") return;
   const s = usage.session || {};
   const parts = [];
-  if (usage.context_input != null) parts.push("上下文 " + usage.context_input + " tok");
+  let pct = null;
+  // context_window 配置了才显示百分比（TUI 同语义：>=80% 标红提示接近压缩阈值）
+  if (usage.context_input != null && usage.context_window) {
+    pct = Math.round(usage.context_input / usage.context_window * 100);
+    parts.push("上下文 " + usage.context_input + "/" + usage.context_window + " tok (" + pct + "%)");
+  } else if (usage.context_input != null) {
+    parts.push("上下文 " + usage.context_input + " tok");
+  }
   if (s.input_tokens != null) parts.push("输入 " + s.input_tokens);
   if (s.output_tokens != null) parts.push("输出 " + s.output_tokens);
-  if (parts.length) els.usageInfo.textContent = "用量: " + parts.join(" · ");
+  if (parts.length) {
+    els.usageInfo.textContent = "用量: " + parts.join(" · ");
+    // >=80% 接近自动压缩阈值：标红提醒
+    els.usageInfo.classList.toggle("usage-high", pct !== null && pct >= 80);
+  }
 }
 
 /* =====================================================================
