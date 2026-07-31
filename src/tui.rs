@@ -366,7 +366,7 @@ async fn run_inner(
                     if is_scroll_key(key) { state.handle_scroll(key); drain_ready_scroll_keys(&mut events,&mut state).await; }
                     else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
-                Some(Ok(Event::Paste(text))) => state.input.insert(&text.replace("\r\n","\n").replace('\r',"\n")),
+                Some(Ok(Event::Paste(text))) => state.handle_paste(&text),
                 Some(Ok(_)) => {}, Some(Err(error)) => return Err(error.into()), None => return Ok(()),
             }
         }
@@ -1684,6 +1684,17 @@ impl TuiState {
         self.push_agent_event_inner(event);
     }
 
+    /// Paste into whichever input is currently active, normalizing terminal
+    /// line endings exactly as ordinary main-input paste did.
+    fn handle_paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(attached) = &mut self.attached {
+            attached.input.insert(&text);
+        } else {
+            self.input.insert(&text);
+        }
+    }
+
     fn edit_input(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(character)
@@ -2701,6 +2712,27 @@ mod tests {
             KeyCode::Char('c'),
             KeyModifiers::empty(),
         )));
+    }
+
+    #[test]
+    fn paste_routes_to_active_input_and_normalizes_line_endings() {
+        let pasted = "one\r\ntwo\rthree";
+        let mut state = TuiState::default();
+
+        state.handle_paste(pasted);
+        assert_eq!(state.input.text, "one\ntwo\nthree", "main paste");
+
+        state.input.insert(" main");
+        let (handle, _sink, _source) = crate::runner::session_test_channel();
+        attach_test(&mut state, 7, "demo", handle);
+        state.handle_paste(pasted);
+
+        assert_eq!(
+            state.attached.as_ref().unwrap().input.text,
+            "one\ntwo\nthree",
+            "attached paste uses the same CRLF/CR normalization"
+        );
+        assert_eq!(state.input.text, "one\ntwo\nthree main");
     }
 
     #[test]
