@@ -177,9 +177,9 @@ fn token_path() -> Option<PathBuf> {
     state_dir().map(|dir| dir.join("server.token"))
 }
 
-/// Generate a fresh random token and write it to the state dir with mode
-/// 0600. A new token every start: the previous server's clients (if any)
-/// are invalidated, which is fine because only one server can bind the port.
+/// Load the server token, generating and persisting one only when absent.
+/// The token is reused across restarts so clients (browser localStorage)
+/// keep working; it is written with mode 0600 on Unix.
 pub fn load_or_create_token() -> anyhow::Result<String> {
     let path = token_path()
         .ok_or_else(|| anyhow!("cannot resolve server token path: no XDG_STATE_HOME or HOME"))?;
@@ -189,6 +189,14 @@ pub fn load_or_create_token() -> anyhow::Result<String> {
 fn load_or_create_token_at(path: PathBuf) -> anyhow::Result<String> {
     let dir = path.parent().expect("token path always has a parent");
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    // Reuse an existing token across restarts; generate only when absent
+    // or empty (a previous server's clients stay valid).
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        let token = contents.trim();
+        if !token.is_empty() {
+            return Ok(token.to_string());
+        }
+    }
     let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
     let token = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes);
@@ -935,6 +943,21 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_is_reused_across_calls() {
+        // Own unique dir: test_state_dir() is shared per-process and other
+        // tests remove it at the end, which would race this one in parallel.
+        let dir = std::env::temp_dir()
+            .join(format!("e-agent-server-test-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.token");
+        let first = load_or_create_token_at(path.clone()).unwrap();
+        let second = load_or_create_token_at(path.clone()).unwrap();
+        assert_eq!(first, second, "existing token must be reused, not regenerated");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
