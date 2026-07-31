@@ -144,13 +144,14 @@ impl Palette {
                 .fg(self.violet)
                 .bg(self.element)
                 .add_modifier(Modifier::BOLD),
-            // Bright violet + italic reads clearly as "the model is
-            // thinking" against the dark body text and the grey dim
-            // notices (a DIM violet previously collapsed toward grey).
+            // Bright violet reads clearly as "the model is thinking"
+            // against the dark body text and the grey dim notices (a DIM
+            // violet previously collapsed toward grey). No ITALIC: some
+            // terminals (e.g. Termux's Android fonts) render synthetic
+            // italics with clipped glyphs.
             LineKind::Thinking => Style::default()
                 .fg(self.violet)
-                .bg(self.background)
-                .add_modifier(Modifier::ITALIC),
+                .bg(self.background),
         }
     }
 
