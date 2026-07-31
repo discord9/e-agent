@@ -870,6 +870,49 @@ impl TuiState {
         }
     }
 
+    /// A tap (mouse Down) on a task row of the open tasks panel selects that
+    /// task, mirroring an Up/Down cursor move (including auto-attach for
+    /// attachable delegate sessions). `row` is the terminal row from the
+    /// `MouseEvent`; `tasks_top` is the panel's top border row as derived
+    /// from `render::bottom_region_heights`. Taps outside a task row, and
+    /// any tap while the panel is closed or the detail view is open, do
+    /// nothing.
+    pub(crate) fn handle_tasks_panel_tap(&mut self, row: u16, tasks_top: u16) -> TaskSelection {
+        if !self.show_tasks || self.task_detail.is_some() {
+            return TaskSelection::None;
+        }
+        let running = self
+            .background
+            .as_ref()
+            .map(|background| background.running())
+            .unwrap_or_default();
+        let Some(index) = super::render::task_row_at(row, tasks_top, running.len()) else {
+            return TaskSelection::None;
+        };
+        if index == self.task_cursor {
+            // Already selected; a repeated tap is a no-op (Enter is what
+            // opens the detail view).
+            return TaskSelection::None;
+        }
+        self.task_cursor = index;
+        // Mirror the tail of handle_tasks_panel_key: a cursor move attaches
+        // to the newly selected task when it is attachable.
+        let attachable = |state: &TuiState, id: u64| -> bool {
+            state
+                .attachable
+                .as_ref()
+                .is_some_and(|attachable| attachable(id))
+        };
+        let Some(task) = running.get(self.task_cursor) else {
+            return TaskSelection::None;
+        };
+        if attachable(self, task.id) {
+            TaskSelection::Attach(task.id)
+        } else {
+            TaskSelection::None
+        }
+    }
+
     /// Open the full-output detail view for a background bash task. The
     /// first frame shows the head page with follow armed; while output
     /// keeps growing the view slides to the live tail, and a paused task
@@ -1627,5 +1670,106 @@ impl InputBuffer {
             col = segment_width % width;
         }
         (row, col)
+    }
+}
+
+#[cfg(test)]
+mod tasks_panel_tap_tests {
+    use super::*;
+
+    #[test]
+    fn task_row_at_maps_terminal_rows_to_task_rows() {
+        // Panel top border at row 10: content starts at 11 (header),
+        // task rows at 12, 13, 14.
+        assert_eq!(render::task_row_at(12, 10, 3), Some(0));
+        assert_eq!(render::task_row_at(14, 10, 3), Some(2));
+        // Border, header, output tail, and outside-the-panel rows: no task.
+        assert_eq!(render::task_row_at(10, 10, 3), None);
+        assert_eq!(render::task_row_at(11, 10, 3), None);
+        assert_eq!(render::task_row_at(15, 10, 3), None);
+        assert_eq!(render::task_row_at(9, 10, 3), None);
+        assert_eq!(render::task_row_at(20, 10, 3), None);
+        // Empty task list.
+        assert_eq!(render::task_row_at(12, 10, 0), None);
+    }
+
+    /// With no background tasks the panel list is empty, so no tap can ever
+    /// move the cursor — and with the panel closed taps are ignored too.
+    #[test]
+    fn tap_without_tasks_never_moves_cursor() {
+        let mut state = TuiState {
+            show_tasks: true,
+            ..Default::default()
+        };
+        assert_eq!(state.handle_tasks_panel_tap(5, 0), TaskSelection::None);
+        assert_eq!(state.task_cursor, 0);
+        state.show_tasks = false;
+        assert_eq!(state.handle_tasks_panel_tap(5, 0), TaskSelection::None);
+        assert_eq!(state.task_cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn tap_attaches_delegate_and_ignores_closed_panel() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, mut background) = crate::tools::builtins(
+            crate::workspace::Workspace::new(temp.path()).unwrap(),
+            None,
+            false,
+        );
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        for label in ["first", "second", "third"] {
+            background
+                .spawn_with_id(
+                    label.into(),
+                    None,
+                    None,
+                    None,
+                    |_| {},
+                    || async { std::future::pending::<String>().await },
+                )
+                .unwrap();
+        }
+        let running = background.running();
+        assert_eq!(running.len(), 3);
+        let delegate_id = running[1].id;
+
+        let mut state = TuiState {
+            background: Some(background.clone()),
+            show_tasks: true,
+            ..Default::default()
+        };
+        state.attachable = Some(Box::new(move |id| id == delegate_id));
+
+        let width = 80u16;
+        let height = 24u16;
+        let (queue_height, tasks_height, input_height) =
+            crate::tui::render::bottom_region_heights(&state, width, height, &running, "");
+        let tasks_top = height - queue_height - tasks_height - input_height;
+        // Tap the third row: cursor moves, non-attachable task → no action.
+        let third_row = tasks_top + 2 + 2;
+        assert_eq!(
+            state.handle_tasks_panel_tap(third_row, tasks_top),
+            TaskSelection::None
+        );
+        assert_eq!(state.task_cursor, 2);
+        // Tap the delegate row: attach, exactly like an Up/Down cursor move.
+        let delegate_row = tasks_top + 2 + 1;
+        assert_eq!(
+            state.handle_tasks_panel_tap(delegate_row, tasks_top),
+            TaskSelection::Attach(delegate_id)
+        );
+        assert_eq!(state.task_cursor, 1);
+
+        // Panel closed: taps are ignored entirely.
+        state.show_tasks = false;
+        assert_eq!(
+            state.handle_tasks_panel_tap(delegate_row, tasks_top),
+            TaskSelection::None
+        );
+        assert_eq!(
+            state.task_cursor, 1,
+            "closed panel: tap must not move the cursor"
+        );
     }
 }

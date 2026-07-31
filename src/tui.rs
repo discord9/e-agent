@@ -2,7 +2,10 @@ use std::io;
 use std::path::PathBuf;
 
 use crossterm::cursor::Show;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, MouseButton, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
@@ -274,7 +277,12 @@ pub async fn run(
     enable_raw_mode()?;
     let _guard = TerminalGuard::new();
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let labels = InputLabels {
@@ -331,6 +339,7 @@ impl Drop for TerminalGuard {
             io::stdout(),
             SetTitle(""),
             DisableBracketedPaste,
+            DisableMouseCapture,
             LeaveAlternateScreen,
             Show
         );
@@ -422,6 +431,46 @@ async fn run_inner(
                     else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
                 Some(Ok(Event::Paste(text))) => state.handle_paste(&text),
+                Some(Ok(Event::Mouse(mouse))) => {
+                    // Tap support: a left-button Down on a task row of the
+                    // open tasks panel selects that task. Selection fires on
+                    // Down so Termux taps, which may never deliver an Up,
+                    // still work. Taps anywhere else — closed panel, detail
+                    // view, scrollback, input — do nothing.
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                        && state.show_tasks
+                        && state.task_detail.is_none()
+                    {
+                        let size = terminal.size()?;
+                        // Mirror draw()'s snapshot (render::bottom_region_heights
+                        // derives the heights from these same inputs).
+                        let running: Vec<crate::tools::BackgroundTaskInfo> = state
+                            .background
+                            .as_ref()
+                            .map(|background| background.running())
+                            .unwrap_or_default();
+                        let selected_output = running
+                            .get(state.task_cursor.min(running.len().saturating_sub(1)))
+                            .map(|task| String::from_utf8_lossy(&task.output).into_owned())
+                            .unwrap_or_default();
+                        let (queue_height, tasks_height, input_height) =
+                            render::bottom_region_heights(
+                                &state,
+                                size.width,
+                                size.height,
+                                &running,
+                                &selected_output,
+                            );
+                        let tasks_top = size
+                            .height
+                            .saturating_sub(queue_height + tasks_height + input_height);
+                        if let TaskSelection::Attach(id) =
+                            state.handle_tasks_panel_tap(mouse.row, tasks_top)
+                        {
+                            attach_to_task(&mut state, id, &sessions, &sender);
+                        }
+                    }
+                }
                 // Resize needs no explicit handling: the next draw()
                 // re-derives the layout from the new terminal size, and a
                 // scrolled-up (non-follow) window is re-anchored inside
