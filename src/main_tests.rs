@@ -160,6 +160,68 @@ fn test_crash_dir_inner() {
 }
 
 #[test]
+fn test_write_crash_report_replaces_latest_and_is_private() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("config/e-agent/crash");
+    let path = write_crash_report(&dir, "first report\n").unwrap();
+    assert_eq!(path, dir.join("latest.log"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "first report\n");
+    assert!(!dir.join("latest.tmp").exists());
+
+    write_crash_report(&dir, "second report\n").unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "second report\n");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+// This is invoked only by the integration-style test below in a fresh test
+// process. It is not a command-line feature.
+#[test]
+fn panic_hook_subprocess() {
+    if std::env::var_os("E_AGENT_PANIC_HOOK_TEST").is_some() {
+        install_panic_hook();
+        panic!("test payload must stay private");
+    }
+}
+
+#[test]
+fn test_panic_hook_forces_stack_and_writes_report_without_rust_backtrace() {
+    let state = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::panic_hook_subprocess", "--nocapture"])
+        .env("E_AGENT_PANIC_HOOK_TEST", "1")
+        .env("XDG_STATE_HOME", state.path())
+        .env_remove("RUST_BACKTRACE")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("e-agent: Rust panic on thread"), "{stderr}");
+    assert!(stderr.contains("backtrace:"), "{stderr}");
+    assert!(stderr.contains("crash report:"), "{stderr}");
+    assert!(
+        !stderr.contains("test payload must stay private"),
+        "{stderr}"
+    );
+
+    let report = fs::read_to_string(state.path().join("e-agent/crash/latest.log")).unwrap();
+    assert!(report.contains("backtrace:"), "{report}");
+    assert!(report.contains("panic payload omitted"), "{report}");
+}
+
+#[test]
 fn test_acknowledge_crash_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     let latest = tmp.path().join("latest.log");
