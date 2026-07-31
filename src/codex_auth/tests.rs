@@ -54,9 +54,8 @@ fn jwt_metadata_and_private_atomic_storage_work() {
     );
     #[cfg(unix)]
     assert_eq!(
-        std::os::unix::fs::PermissionsExt::mode(
-            &std::fs::metadata(path).unwrap().permissions()
-        ) & 0o777,
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions())
+            & 0o777,
         0o600
     );
 }
@@ -181,9 +180,7 @@ async fn fragmented_callback_reads_complete_get_request_without_secret_leakage()
     let receiver = tokio::spawn(receive_callback(listener, "right"));
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
     stream
-        .write_all(
-            b"GET /wrong?code=secret-code&state=right HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        )
+        .write_all(b"GET /wrong?code=secret-code&state=right HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await
         .unwrap();
     let error = receiver.await.unwrap().unwrap_err();
@@ -252,8 +249,7 @@ async fn permanent_refresh_errors_are_actionable_and_token_safe() {
         stream.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
     });
     let temp = tempfile::tempdir().unwrap();
-    let auth =
-        CodexAuth::test_auth(temp.path().join("auth.json")).with_token_endpoint(endpoint);
+    let auth = CodexAuth::test_auth(temp.path().join("auth.json")).with_token_endpoint(endpoint);
     let error = auth.refresh_after_unauthorized("access").await.unwrap_err();
     let error = format!("{error:#}");
     assert!(error.contains("run `e-agent login`"));
