@@ -78,16 +78,17 @@ pub(crate) fn truncate_background_output(output: &str) -> String {
 
     // Build marker.  The marker text itself is part of the visible result,
     // so we need an estimated length to compute the chars-omitted value,
-    // then refine once.
+    // then refine once. Blank lines around the marker make the elision
+    // obvious instead of blending into the head/tail output.
     let est_marker_len = 64usize;
     let rough_omitted = total_orig_chars.saturating_sub(head_chars + tail_chars + est_marker_len);
     let marker =
-        format!("\n\u{2026} ({omitted_lines} lines omitted, {rough_omitted} chars omitted)");
+        format!("\n\n\u{2026} ({omitted_lines} lines omitted, {rough_omitted} chars omitted)\n");
     // Refine with actual marker length.
     let actual_omitted =
         total_orig_chars.saturating_sub(head_chars + tail_chars + marker.chars().count());
     let marker =
-        format!("\n\u{2026} ({omitted_lines} lines omitted, {actual_omitted} chars omitted)");
+        format!("\n\n\u{2026} ({omitted_lines} lines omitted, {actual_omitted} chars omitted)\n");
 
     let mut result = elided_head.join("\n");
     result.push_str(&marker);

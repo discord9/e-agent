@@ -160,10 +160,10 @@ fn truncate_background_long_multi_line() {
     assert!(long.chars().count() > 2000);
     let result = truncate_background_output(&long);
     // Each line is ~42 chars (< 120) so no per-line elision; 200 lines > 8
-    // so we get head 5 + marker + tail 3 = 9 visual lines.
+    // so we get head 5 + blank + marker + blank + tail 3 = 11 visual lines.
     assert!(
-        result.lines().count() <= 9,
-        "expected ≤ 9 visual lines, got {}",
+        result.lines().count() <= 11,
+        "expected ≤ 11 visual lines, got {}",
         result.lines().count()
     );
     assert!(result.contains('\u{2026}'), "must contain ellipsis marker");
@@ -187,22 +187,27 @@ fn truncate_background_includes_omitted_char_count() {
 
 #[test]
 fn truncate_background_10_lines_head_tail_and_marker() {
-    // Exactly 9 lines (5+1+3) after truncation from 15 lines.
+    // 5 head + blank + marker + blank + 3 tail = 11 lines after truncation
+    // from 15 lines. Blank lines around the marker make the elision obvious.
     let lines: Vec<String> = (0..15).map(|i| format!("line {i}")).collect();
     let output = lines.join("\n");
     let result = truncate_background_output(&output);
     let result_lines: Vec<&str> = result.lines().collect();
-    assert_eq!(result_lines.len(), 9, "expected 9 visual lines");
+    assert_eq!(result_lines.len(), 11, "expected 11 visual lines");
     // Head: first 5 lines
     for (i, line) in result_lines[..5].iter().enumerate() {
         assert_eq!(*line, format!("line {i}"));
     }
+    // Blank line before the marker
+    assert_eq!(result_lines[5], "", "blank line before marker");
     // Marker line
-    assert!(result_lines[5].contains("lines omitted"));
-    assert!(result_lines[5].contains("chars omitted"));
+    assert!(result_lines[6].contains("lines omitted"));
+    assert!(result_lines[6].contains("chars omitted"));
+    // Blank line after the marker
+    assert_eq!(result_lines[7], "", "blank line after marker");
     // Tail: last 3 lines (indices 12, 13, 14)
     for (j, i) in (12..=14).enumerate() {
-        assert_eq!(result_lines[6 + j], format!("line {i}"));
+        assert_eq!(result_lines[8 + j], format!("line {i}"));
     }
 }
 
@@ -216,8 +221,8 @@ fn truncate_background_long_lines_many_lines_under_9_visual() {
     let result = truncate_background_output(&output);
     let result_lines: Vec<&str> = result.lines().collect();
     assert!(
-        result_lines.len() <= 9,
-        "expected ≤ 9 visual lines, got {}",
+        result_lines.len() <= 11,
+        "expected ≤ 11 visual lines, got {}",
         result_lines.len()
     );
     // Every line is ≤ 120 chars
