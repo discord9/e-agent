@@ -267,7 +267,27 @@
     flex-direction: column;
     gap: 10px;
     scrollbar-width: thin;
+    position: relative;   /* 回到底部按钮的定位锚点 */
   }
+
+  /* 回到底部按钮：右下角悬浮，离开底部时出现 */
+  .jump-bottom {
+    position: sticky;
+    bottom: 8px;
+    align-self: flex-end;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 1px solid var(--base1);
+    background: var(--base2);
+    color: var(--base01);
+    font-size: 16px;
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+    z-index: 5;
+    margin-top: -34px;   /* 悬浮在最后一条消息上方，不占文档流高度 */
+  }
+  .jump-bottom:hover { color: var(--blue); border-color: var(--blue); }
 
   .msg { display: flex; gap: 8px; line-height: 1.6; }
   .msg .who { flex: 0 0 auto; font-weight: bold; }
@@ -328,10 +348,27 @@
     color: var(--violet);
     user-select: none;
     font-style: italic;
+    display: flex;
+    align-items: center;
+    gap: 6px;
   }
+
+  /* 思考进行中的转圈动画点；思考停止后静止（由 JS 加/去 .active） */
+  .think-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 2px solid var(--violet);
+    border-top-color: transparent;
+    display: inline-block;
+    flex: 0 0 auto;
+  }
+  .think-dot.active { animation: think-spin 0.9s linear infinite; }
+  @keyframes think-spin { to { transform: rotate(360deg); } }
+
   details.thinking .think-body { white-space: pre-wrap; overflow-wrap: break-word; margin-top: 2px; }
 
-  /* 工具调用卡片 */
+  /* 工具调用卡片：details 可折叠（summary=标题行） */
   .tool-card {
     border: 1px solid var(--base1);
     border-left: 3px solid var(--blue);
@@ -341,9 +378,23 @@
     background: var(--base3);
     max-width: 92%;
   }
-  .tool-card .tool-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .tool-card .tool-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;          /* summary 可点击折叠 */
+    user-select: none;
+  }
+  .tool-card .tool-head::-webkit-details-marker { display: none; }  /* 隐藏默认三角，用统一风格 */
+  .tool-card .tool-head::before {
+    content: "▸";
+    color: var(--base01);
+    font-size: 10px;
+    transition: transform 0.15s;
+  }
+  .tool-card[open] .tool-head::before { transform: rotate(90deg); }
   .tool-card .tool-name { font-weight: bold; color: var(--blue); }
-  .tool-card .tool-state { font-size: 12px; color: var(--base01); }
+  .tool-card .tool-state { font-size: 12px; color: var(--base01); margin-left: auto; }
   .tool-card .tool-args {
     margin: 0 0 4px;
     font-size: 12px;
@@ -506,7 +557,9 @@
     <!-- 压缩是低频操作：放顶部信息栏最右侧，避免与取消/发送相邻误触 -->
     <button id="compactBtn" class="compact-head" title="压缩上下文（释放 token）">压缩</button>
   </div>
-  <div id="messages" class="messages"></div>
+  <div id="messages" class="messages">
+    <button id="jumpBottomBtn" class="jump-bottom" title="回到底部" hidden>↓</button>
+  </div>
   <div class="composer">
     <div id="queueBar" class="queue-bar" hidden></div>
     <textarea id="promptInput" rows="1" placeholder="输入消息：Enter 发送，Shift+Enter 换行…"></textarea>
@@ -563,6 +616,7 @@ const els = {
   searchInput: $("searchInput"),
   chatSessionId: $("chatSessionId"), chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
   messages: $("messages"), promptInput: $("promptInput"), queueBar: $("queueBar"),
+  jumpBottomBtn: $("jumpBottomBtn"),
   sendBtn: $("sendBtn"), cancelBtn: $("cancelBtn"), compactBtn: $("compactBtn"),
 };
 
@@ -868,6 +922,11 @@ function freezeAssistant(acc) {
   if (acc && acc.assistantBody && acc.assistantText) {
     acc.assistantBody.innerHTML = renderMarkdown(acc.assistantText);
   }
+  // 思考结束：停止转圈动画
+  if (acc && acc.thinkingEl) {
+    const dot = acc.thinkingEl.querySelector(".think-dot");
+    if (dot) dot.classList.remove("active");
+  }
   acc.assistantEl = null;
   acc.assistantBody = null;
   acc.assistantText = "";
@@ -942,12 +1001,16 @@ function setAssistantText(text, acc) {
   scrollBottom(false);
 }
 
-/* thinking 折叠块 */
+/* thinking 折叠块：默认折叠（页面不再被大段思考内容撑爆）；
+   折叠时 summary 左侧有转圈动画指示「思考进行中」。 */
 function thinkingBlock(acc) {
   if (!acc.thinkingEl) {
     const det = el("details", "thinking");
-    det.open = true;
-    const sum = el("summary", "", "思考中…");
+    det.open = false;                       // 默认折叠
+    const sum = el("summary", "", "");
+    const dot = el("span", "think-dot");    // 转圈动画（活跃时转，停止时静止）
+    const label = el("span", "think-label", "思考中…");
+    sum.append(dot, label);
     const body = el("div", "think-body");
     det.append(sum, body);
     els.messages.appendChild(det);
@@ -960,6 +1023,11 @@ function thinkingBlock(acc) {
 function appendReasoningDelta(text, acc) {
   const body = thinkingBlock(acc);
   body.insertAdjacentText("beforeend", text);
+  // 思考进行中：折叠栏的圆点转圈
+  if (acc.thinkingEl) {
+    const dot = acc.thinkingEl.querySelector(".think-dot");
+    if (dot) dot.classList.add("active");
+  }
   scrollBottom(false);
 }
 
@@ -991,6 +1059,7 @@ function appendToolResult(isError, content, acc, callId) {
     const resEl = card.querySelector(".tool-result");
     resEl.className = "tool-result" + (isError ? " err" : "");
     resEl.textContent = content || (isError ? "(无错误信息)" : "(无输出)");
+    card.removeAttribute("open");   // 结果到达：收起为标题行（默认折叠）
   } else {
     // 没有可配对的卡片：独立展示结果行
     const card2 = buildToolCard("工具结果", "", isError ? "失败" : "完成",
@@ -1002,8 +1071,11 @@ function appendToolResult(isError, content, acc, callId) {
 }
 
 function buildToolCard(name, args, stateText, stateCls, resultText) {
-  const card = el("div", "tool-card");
-  const head = el("div", "tool-head");
+  // 工具卡片：details 可折叠。pending（执行中/等待结果）时默认展开，
+  // 结果到达后由 appendToolResult 收起（details.removeAttribute("open")）。
+  const card = el("details", "tool-card");
+  if (stateCls === "pending") card.setAttribute("open", "");
+  const head = el("summary", "tool-head");
   const nm = el("span", "tool-name", name || "tool");
   const st = el("span", "tool-state", stateText);
   head.append(nm, st);
@@ -1183,7 +1255,11 @@ function renderEntries(entries, prepend) {
     state.acc = acc;
   } else {
     state.acc = acc;
-    els.messages.innerHTML = "";
+    // 清空消息区但保留 jumpBottomBtn（悬浮按钮在 messages 容器内）
+    while (els.messages.firstChild && els.messages.firstChild !== els.jumpBottomBtn) {
+      els.messages.removeChild(els.messages.firstChild);
+    }
+    els.jumpBottomBtn.hidden = true;
   }
   try {
     for (const e of list) renderEntry(e, acc, pendingCards);
@@ -1220,9 +1296,15 @@ function applyStatus(status) {
   els.compactBtn.disabled = busy;         // 空闲时才压缩
   els.sendBtn.disabled = false;           // 允许排队输入
   // 回合结束（回到 Idle）：流式 delta 期间是纯文本（快），此刻用完整
-  // 文本重算一次 markdown，让表格/代码块/公式正确渲染。
-  if (!busy && state.acc && state.acc.assistantBody && state.acc.assistantText) {
-    state.acc.assistantBody.innerHTML = renderMarkdown(state.acc.assistantText);
+  // 文本重算一次 markdown，让表格/代码块/公式正确渲染；同时停思考动画。
+  if (!busy && state.acc) {
+    if (state.acc.assistantBody && state.acc.assistantText) {
+      state.acc.assistantBody.innerHTML = renderMarkdown(state.acc.assistantText);
+    }
+    if (state.acc.thinkingEl) {
+      const dot = state.acc.thinkingEl.querySelector(".think-dot");
+      if (dot) dot.classList.remove("active");
+    }
   }
 }
 
@@ -1335,6 +1417,15 @@ function handleSSEBlock(block, id) {
     const backup = real.innerHTML;
     const temp = real.cloneNode(false);   // 同 class/id，无子节点
     temp.innerHTML = "";
+    // 保留 jumpBottomBtn：渲染后它仍在 real 里，但 temp 替换会覆盖——
+    // 在 temp 里也放一个同 id 的按钮占位，避免替换后按钮丢失。
+    const btn = document.createElement("button");
+    btn.id = "jumpBottomBtn";
+    btn.className = "jump-bottom";
+    btn.title = "回到底部";
+    btn.hidden = true;
+    btn.textContent = "↓";
+    temp.appendChild(btn);
     els.messages = temp;
     state.acc = newAccumulator();
     // 排队提示是「当下」状态，重放的是过去事件：清空 queueBar 并跳过重放
@@ -1362,6 +1453,8 @@ function handleSSEBlock(block, id) {
       }
       real.innerHTML = temp.innerHTML;
       els.messages = real;
+      // temp 里的按钮是新建节点：重新绑定 els（旧节点已被 innerHTML 替换销毁）
+      els.jumpBottomBtn = document.getElementById("jumpBottomBtn");
       state.initSource = "snapshot";
     } catch (e) {
       els.messages = real;
@@ -1539,7 +1632,11 @@ function openSession(id) {
   els.chatView.classList.remove("hidden");
   els.topActions.hidden = false;
   els.chatSessionId.textContent = "会话 " + id;
-  els.messages.innerHTML = "";
+  // 清空消息区但保留 jumpBottomBtn（悬浮按钮在 messages 容器内）
+  while (els.messages.firstChild && els.messages.firstChild !== els.jumpBottomBtn) {
+    els.messages.removeChild(els.messages.firstChild);
+  }
+  els.jumpBottomBtn.hidden = true;
   els.usageInfo.textContent = "";
   applyStatus("Idle");
   refreshBanner();
@@ -1656,10 +1753,17 @@ els.promptInput.addEventListener("input", autosizeInput);
 els.messages.addEventListener("scroll", () => {
   // 用户滚到接近底部时恢复自动跟随
   const m = els.messages;
-  if (m.scrollHeight - m.scrollTop - m.clientHeight < 80) scrollBottom(true);
+  const nearBottom = m.scrollHeight - m.scrollTop - m.clientHeight < 80;
+  if (nearBottom) scrollBottom(true);
+  // 离开底部时显示「回到底部」按钮；在底部则隐藏
+  els.jumpBottomBtn.hidden = nearBottom;
   // 滚到接近顶部时加载更早历史（分页；防重入 / 已全部加载 / 未开会话时跳过）
   if (state.loadingOlder || state.olderDone || !state.sessionId) return;
   if (m.scrollTop < 30) loadOlder();
+});
+els.jumpBottomBtn.addEventListener("click", () => {
+  scrollBottom(true);
+  els.jumpBottomBtn.hidden = true;
 });
 
 function init() {
