@@ -34,7 +34,15 @@
     margin: 0;
   }
 
+  /* 移动浏览器（地址栏收展）里 100% 不等于可视高度：用 100dvh 兜底，
+     并禁止 body 滚动——所有滚动都必须发生在内部容器（messages / 列表
+     card），否则顶栏/状态行会跟着 body 一起滚出屏幕 */
+  @supports (height: 100dvh) {
+    html, body { height: 100dvh; }
+  }
   body {
+    overflow: hidden;
+    overscroll-behavior: none;
     background: var(--base3);
     color: var(--base02);
     font-family: "SF Mono", "Cascadia Mono", Consolas, "Noto Sans Mono CJK SC",
@@ -53,6 +61,9 @@
     background: var(--base2);
     border-bottom: 1px solid var(--base1);
     flex: 0 0 auto;
+    position: sticky;   /* 双保险：即使 body 意外滚动，顶栏也钉在视口顶部 */
+    top: 0;
+    z-index: 10;
   }
   .brand { font-weight: bold; color: var(--base02); }
   .brand .dot { color: var(--green); }
