@@ -252,6 +252,7 @@ pub async fn run(
     model_name: String,
     role_name: Option<String>,
     context_window: Option<u64>,
+    store: crate::session_store::SessionStore,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard::new();
@@ -272,6 +273,7 @@ pub async fn run(
         background,
         sessions,
         context_window,
+        store,
     )
     .await;
     drop(terminal);
@@ -325,6 +327,7 @@ async fn run_inner(
     background: crate::tools::BackgroundTasks,
     sessions: Sessions,
     context_window: Option<u64>,
+    store: crate::session_store::SessionStore,
 ) -> anyhow::Result<Option<String>> {
     let (sender, mut inbox) = mpsc::unbounded_channel::<UiEvent>();
     let (snapshot, mut live, mut status) = handle.attach();
@@ -347,6 +350,7 @@ async fn run_inner(
     state.role_name = labels.role.clone();
     state.context_window = context_window;
     state.background = Some(background);
+    state.store = Some(store);
     set_terminal_title(&labels.session);
     let probe = sessions.clone();
     state.attachable = Some(Box::new(move |id| probe.get(id).is_some()));
@@ -1191,6 +1195,10 @@ struct TuiState {
     pending_edit: Option<(String, String, String)>,
     /// Shared running-task registry, for the tasks panel.
     background: Option<crate::tools::BackgroundTasks>,
+    /// Session store for background-task record bookkeeping when cancelling
+    /// from the tasks panel; `None` (tests, `Default`) falls back to the
+    /// JSONL record file directly.
+    store: Option<crate::session_store::SessionStore>,
     /// Probe for whether a background task has an attachable session
     /// (wired to the session registry by the runner).
     attachable: Option<Box<dyn Fn(u64) -> bool + Send>>,
@@ -2233,11 +2241,19 @@ impl TuiState {
             .as_ref()
             .and_then(|background| background.cancel(id))
         {
-            crate::session::Session::clear_background_task(
-                std::path::Path::new(&self.cwd),
-                &self.session_id,
-                id,
-            );
+            match &self.store {
+                Some(store) => store.clear_background_task(
+                    std::path::Path::new(&self.cwd),
+                    &self.session_id,
+                    id,
+                ),
+                // No store wired (tests): JSONL record file directly.
+                None => crate::session::Session::clear_background_task(
+                    std::path::Path::new(&self.cwd),
+                    &self.session_id,
+                    id,
+                ),
+            }
             self.push_line(format!("cancelled task #{id}: {label}"), LineKind::Dim);
         }
     }

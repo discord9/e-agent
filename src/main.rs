@@ -14,7 +14,6 @@ use e_agent::delegate::Delegate;
 use e_agent::mcp;
 use e_agent::model::{ConfiguredModel, OpenAiModel};
 use e_agent::runner::{IdlePolicy, SessionHandle, SessionResult, SessionRunner, SessionStatus};
-use e_agent::session::Session;
 use e_agent::session_store::SessionStore;
 use e_agent::tools::builtins;
 use e_agent::tui;
@@ -272,7 +271,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
         .with_subagent_context_window(subagent_context_window)
         .with_roles_root(root.clone())
         .with_sandbox(sandbox)
-        .record_background_tasks_in(root.clone(), &session)
+        .record_background_tasks_in(root.clone(), &session, store.clone())
         .with_persist_store(backend);
     if let Some(subagent_model) = subagent_model {
         let name = subagent_model.display_name().to_owned();
@@ -310,8 +309,8 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     let loaded = store.load(&root, &session).await?;
     let legacy = loaded.legacy;
     agent.restore_history(loaded.entries);
-    agent.record_background_tasks_in(root.clone(), &session);
-    let unfinished = Session::take_unfinished_background(&root, &session);
+    agent.record_background_tasks_in(root.clone(), &session, store.clone());
+    let unfinished = store.take_unfinished_background(&root, &session).await?;
     if !unfinished.is_empty() {
         let notice = format!(
             "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
@@ -340,7 +339,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     if tui_mode {
         let (runner, handle) = SessionRunner::new(
             agent,
-            store,
+            store.clone(),
             root.clone(),
             session.clone(),
             IdlePolicy::WaitForInput,
@@ -356,6 +355,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             model_name,
             role_name,
             main_context_window,
+            store,
         )
         .await;
         _tui_report.success = result.is_ok();

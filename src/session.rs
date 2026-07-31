@@ -331,16 +331,28 @@ impl Session {
             if let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) {
                 let id = record["id"].as_u64().unwrap_or(0);
                 let label = record["label"].as_str().unwrap_or("?");
-                match record["session_id"].as_str() {
-                    Some(sid) if !sid.is_empty() => {
-                        labels.push(format!("task {id}: {label} (session: {sid})"));
-                    }
-                    _ => labels.push(format!("task {id}: {label}")),
-                }
+                let sid = record["session_id"].as_str();
+                labels.push(format_unfinished(id, label, sid));
             }
         }
         let _ = std::fs::remove_file(&path);
         labels
+    }
+}
+
+/// Render one unfinished-task record for the "killed on exit" notice,
+/// shared by the JSONL file backend and the GreptimeDB `running_tasks`
+/// table so both report tasks identically.
+pub(crate) fn format_unfinished(
+    task_id: u64,
+    label: &str,
+    subagent_session_id: Option<&str>,
+) -> String {
+    match subagent_session_id {
+        Some(sid) if !sid.is_empty() => {
+            format!("task {task_id}: {label} (session: {sid})")
+        }
+        _ => format!("task {task_id}: {label}"),
     }
 }
 
@@ -538,5 +550,17 @@ mod tests {
                 .join(".e-agent/sessions/a.background.jsonl")
                 .exists()
         );
+    }
+
+    #[test]
+    fn format_unfinished_includes_subagent_session_only_when_present() {
+        assert_eq!(format_unfinished(1, "sleep 100", None), "task 1: sleep 100");
+        assert_eq!(
+            format_unfinished(2, "cargo build", Some("sub-abc")),
+            "task 2: cargo build (session: sub-abc)"
+        );
+        // Empty subagent session id is treated as absent (JSONL never
+        // writes an empty string, but be defensive).
+        assert_eq!(format_unfinished(3, "x", Some("")), "task 3: x");
     }
 }

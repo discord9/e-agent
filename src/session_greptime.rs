@@ -1,10 +1,9 @@
 //! GreptimeDB-backed session storage. Optional runtime-selectable
 //! backend via `[session] backend = "greptime"`. Still experimental.
 //! Uses tokio-postgres for both read and write against the
-//! `session_entries` table.
+//! `session_entries` transcript table and the `running_tasks` state table.
 //!
-//! Non-goals: no Storage trait, no migration of existing JSONL sessions,
-//! no background-task bookkeeping (that's still JSONL).
+//! Non-goals: no Storage trait, no migration of existing JSONL sessions.
 
 use std::path::Path;
 
@@ -28,6 +27,34 @@ CREATE TABLE IF NOT EXISTS session_entries (
     PRIMARY KEY (workspace_id, session_id)
 ) WITH (
     append_mode = 'true',
+    sst_format = 'flat',
+)
+"#;
+
+/// DDL for the background-task state table. Idempotent. One row per
+/// in-flight background task (bash or delegate), scoped to
+/// (workspace, session) like `session_entries`; `subagent_session_id`
+/// links delegate rows back to the subagent session they spawned, so a
+/// resumed subagent can find its own killed tasks by a global lookup.
+///
+/// Rows are consumed (DELETE) on completion (`clear_task`) or on resume
+/// (`take_unfinished_tasks`), so a surviving row always means "the process
+/// died with this task running". Unlike `session_entries` this is a state
+/// table, not a log: default (non-append) mode, because GreptimeDB forbids
+/// DELETE under `append_mode = 'true'` and last-write-wins per primary key
+/// is exactly the semantics a task registry wants (`task_id` is the
+/// per-process background counter and may repeat across restarts — the new
+/// row simply overwrites the old one).
+const CREATE_TABLE_RUNNING_TASKS: &str = r#"
+CREATE TABLE IF NOT EXISTS running_tasks (
+    workspace_id STRING NOT NULL,
+    session_id STRING NOT NULL,
+    task_id BIGINT NOT NULL,
+    label STRING NOT NULL,
+    subagent_session_id STRING NULL,
+    started_at TIMESTAMP(9) NOT NULL TIME INDEX,
+    PRIMARY KEY (workspace_id, session_id, task_id)
+) WITH (
     sst_format = 'flat',
 )
 "#;
@@ -120,6 +147,10 @@ impl GreptimeSession {
             .execute(CREATE_TABLE, &[])
             .await
             .context("cannot create session_entries table")?;
+        client
+            .execute(CREATE_TABLE_RUNNING_TASKS, &[])
+            .await
+            .context("cannot create running_tasks table")?;
 
         // Find the current max seq via COALESCE(MAX(seq), -1).
         // Returns -1 for an empty session (no rows for the workspace/session).
@@ -305,6 +336,145 @@ impl GreptimeSession {
         self.next_seq = final_cursor;
 
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // running_tasks — background-task state table
+    // ------------------------------------------------------------------
+    //
+    // These are the GreptimeDB counterpart of the JSONL
+    // `*.background.jsonl` record files (`session::Session`). Unlike the
+    // transcript, they are keyed by the *recording* session (the one whose
+    // task list owns the row) and may be written by a store bound to a
+    // different transcript session (a delegate row lives under the parent
+    // session, with the subagent session id in `subagent_session_id`).
+    // That is why every method takes the session id explicitly instead of
+    // reusing the bound `self.session_id`.
+
+    /// Record a freshly started background task so a later launch can tell
+    /// the user what died with the previous process.
+    pub async fn record_task_start(
+        &self,
+        session_id: &str,
+        task_id: u64,
+        label: &str,
+        subagent_session_id: Option<&str>,
+    ) -> Result<()> {
+        let started_at = us_to_datetime(next_event_time_us());
+        let task_id =
+            i64::try_from(task_id).context("background task id does not fit in BIGINT")?;
+        self.client
+            .execute(
+                "INSERT INTO running_tasks \
+                 (workspace_id, session_id, task_id, label, subagent_session_id, started_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &self.workspace_id,
+                    &session_id,
+                    &task_id,
+                    &label,
+                    &subagent_session_id,
+                    &started_at,
+                ],
+            )
+            .await
+            .context("cannot record background task start")?;
+        Ok(())
+    }
+
+    /// Forget one task: its completion arrived while the process was alive.
+    pub async fn clear_task(&self, session_id: &str, task_id: u64) -> Result<()> {
+        let task_id =
+            i64::try_from(task_id).context("background task id does not fit in BIGINT")?;
+        self.client
+            .execute(
+                "DELETE FROM running_tasks \
+                 WHERE workspace_id = $1 AND session_id = $2 AND task_id = $3",
+                &[&self.workspace_id, &session_id, &task_id],
+            )
+            .await
+            .context("cannot clear background task")?;
+        Ok(())
+    }
+
+    /// Tasks recorded by a previous process that died before their
+    /// completion arrived. Consumes (deletes) all rows for the session and
+    /// returns the labels so the caller can inject the "killed on exit"
+    /// notice. Rows scoped to another session are untouched.
+    pub async fn take_unfinished_tasks(&self, session_id: &str) -> Result<Vec<String>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT task_id, label, subagent_session_id FROM running_tasks \
+                 WHERE workspace_id = $1 AND session_id = $2",
+                &[&self.workspace_id, &session_id],
+            )
+            .await
+            .context("cannot load unfinished background tasks")?;
+        let labels = rows
+            .iter()
+            .map(|row| {
+                let task_id: i64 = row.get("task_id");
+                let label: String = row.get("label");
+                let subagent: Option<String> = row.get("subagent_session_id");
+                crate::session::format_unfinished(
+                    task_id.max(0) as u64,
+                    &label,
+                    subagent.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !rows.is_empty() {
+            self.client
+                .execute(
+                    "DELETE FROM running_tasks \
+                     WHERE workspace_id = $1 AND session_id = $2",
+                    &[&self.workspace_id, &session_id],
+                )
+                .await
+                .context("cannot clear unfinished background tasks")?;
+        }
+        Ok(labels)
+    }
+
+    /// Same as [`Self::take_unfinished_tasks`] but keyed by
+    /// `subagent_session_id`: the rows a killed parent left for one of its
+    /// background delegate subagents. The table is global (unlike JSONL
+    /// per-session files), so a resumed subagent can look up its own
+    /// leftovers from any parent session. The subagent session id is
+    /// implied by the lookup, so labels carry no `(session: …)` suffix.
+    pub async fn take_unfinished_tasks_for_subagent(
+        &self,
+        subagent_session_id: &str,
+    ) -> Result<Vec<String>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT task_id, label FROM running_tasks \
+                 WHERE workspace_id = $1 AND subagent_session_id = $2",
+                &[&self.workspace_id, &subagent_session_id],
+            )
+            .await
+            .context("cannot load unfinished subagent tasks")?;
+        let labels = rows
+            .iter()
+            .map(|row| {
+                let task_id: i64 = row.get("task_id");
+                let label: String = row.get("label");
+                crate::session::format_unfinished(task_id.max(0) as u64, &label, None)
+            })
+            .collect::<Vec<_>>();
+        if !rows.is_empty() {
+            self.client
+                .execute(
+                    "DELETE FROM running_tasks \
+                     WHERE workspace_id = $1 AND subagent_session_id = $2",
+                    &[&self.workspace_id, &subagent_session_id],
+                )
+                .await
+                .context("cannot clear unfinished subagent tasks")?;
+        }
+        Ok(labels)
     }
 }
 
@@ -996,5 +1166,142 @@ mod tests {
         // Same value is allowed (no-op advance).
         s.advance_next_seq_from_snapshot_len(10).unwrap();
         assert_eq!(s.next_seq, 10);
+    }
+
+    // ------------------------------------------------------------------
+    // running_tasks — background-task state table (integration)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn running_tasks_lifecycle() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-rt-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // Nothing recorded: nothing to report.
+        assert!(
+            session
+                .take_unfinished_tasks(&sid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        session
+            .record_task_start(&sid, 1, "sleep 100", None)
+            .await
+            .unwrap();
+        session
+            .record_task_start(&sid, 2, "cargo build", Some("sub-probe"))
+            .await
+            .unwrap();
+
+        // Records are scoped per session: another session sees none.
+        let other = format!("test-gt-rt-other-{}", crate::session::new_id());
+        assert!(
+            session
+                .take_unfinished_tasks(&other)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Task 1 completes while we are alive: only task 2 stays on record.
+        session.clear_task(&sid, 1).await.unwrap();
+        assert_eq!(
+            session.take_unfinished_tasks(&sid).await.unwrap(),
+            vec!["task 2: cargo build (session: sub-probe)".to_string(),]
+        );
+
+        // take consumes the rows: a second launch has nothing to report.
+        assert!(
+            session
+                .take_unfinished_tasks(&sid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Task ids restart per process: re-inserting id 1 after the delete
+        // tombstone must remain visible (fresh started_at wins).
+        session
+            .record_task_start(&sid, 1, "restarted", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            session.take_unfinished_tasks(&sid).await.unwrap(),
+            vec!["task 1: restarted".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn running_tasks_subagent_lookup_crosses_parent_sessions() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let subagent = format!("sub-rt-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &subagent)
+            .await
+            .unwrap();
+
+        // Two different parent sessions each left a delegate row for the
+        // same subagent session id.
+        let parent_a = format!("parent-a-{}", crate::session::new_id());
+        let parent_b = format!("parent-b-{}", crate::session::new_id());
+        session
+            .record_task_start(&parent_a, 10, "probe a", Some(&subagent))
+            .await
+            .unwrap();
+        session
+            .record_task_start(&parent_b, 11, "probe b", Some(&subagent))
+            .await
+            .unwrap();
+
+        // The subagent's own session id sees no direct rows...
+        assert!(
+            session
+                .take_unfinished_tasks(&subagent)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // ...but the subagent-scoped lookup finds both leftover delegates.
+        let labels = session
+            .take_unfinished_tasks_for_subagent(&subagent)
+            .await
+            .unwrap();
+        assert_eq!(labels.len(), 2);
+        assert!(labels.contains(&"task 10: probe a".to_string()));
+        assert!(labels.contains(&"task 11: probe b".to_string())); // Consumed: a second lookup finds nothing.
+        assert!(
+            session
+                .take_unfinished_tasks_for_subagent(&subagent)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The parents' own take sees nothing either (rows are gone).
+        assert!(
+            session
+                .take_unfinished_tasks(&parent_a)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            session
+                .take_unfinished_tasks(&parent_b)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

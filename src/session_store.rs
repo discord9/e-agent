@@ -8,8 +8,14 @@
 //! - **Greptime** — a connected + session-bound client behind a Mutex so
 //!   `&self` methods work everywhere (including the delegate's closure-based
 //!   the runner persistence path).
+//!
+//! Background-task state (`*.background.jsonl` files on JSONL, the
+//! `running_tasks` table on Greptime) is dispatched through the same enum:
+//! [`SessionStore::record_background_start`] /
+//! [`SessionStore::clear_background_task`] /
+//! [`SessionStore::take_unfinished_background`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "greptime")]
 use std::sync::Arc;
 #[cfg(feature = "greptime")]
@@ -36,6 +42,18 @@ pub enum SessionStore {
         /// recovered for subagent session binding.
         conn: String,
     },
+}
+
+/// Where a live agent records its in-flight background tasks: the workspace
+/// root, the session name the record belongs to, and the store that owns
+/// the record. Carried by the main agent (`agent.background_record`) and
+/// the delegate tool (`delegate.record_in`) so background bash and delegate
+/// tasks are reported as "killed on exit" when their session is resumed.
+#[derive(Clone)]
+pub struct BackgroundRecord {
+    pub root: PathBuf,
+    pub session: String,
+    pub store: SessionStore,
 }
 
 impl SessionStore {
@@ -128,6 +146,143 @@ impl SessionStore {
             SessionStore::Jsonl => Session::rewrite(root, name, entries),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { .. } => Ok(()), // Append-only; rewriting is a no-op.
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Background-task state records
+    // ------------------------------------------------------------------
+    //
+    // Sync facade for the record/clear paths: JSONL writes the record file
+    // synchronously; Greptime schedules the write onto the current tokio
+    // runtime (every production call site — tool completion, task ack,
+    // delegate cleanup, TUI cancel — runs inside one). Errors are reported
+    // on stderr: recording must never break the agent loop, matching the
+    // `let _ =` callers of the old `Session::record_background_start`.
+
+    /// Record a freshly started background task so a later launch can tell
+    /// the user what died with the previous process.
+    pub fn record_background_start(
+        &self,
+        root: &Path,
+        session: &str,
+        id: u64,
+        label: &str,
+        subagent_session_id: Option<&str>,
+    ) {
+        match self {
+            SessionStore::Jsonl => {
+                if let Err(error) =
+                    Session::record_background_start(root, session, id, label, subagent_session_id)
+                {
+                    eprintln!("e-agent: cannot record background task: {error:#}");
+                }
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                let greptime = greptime_session.clone();
+                let session_id = session.to_owned();
+                let label = label.to_owned();
+                let subagent = subagent_session_id.map(str::to_owned);
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        handle.spawn(async move {
+                            if let Err(error) = greptime
+                                .lock()
+                                .await
+                                .record_task_start(&session_id, id, &label, subagent.as_deref())
+                                .await
+                            {
+                                eprintln!("e-agent: cannot record background task: {error:#}");
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        eprintln!("e-agent: cannot record background task: no tokio runtime");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Forget one task: its completion arrived while the process was alive.
+    pub fn clear_background_task(&self, root: &Path, session: &str, id: u64) {
+        match self {
+            SessionStore::Jsonl => Session::clear_background_task(root, session, id),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                let greptime = greptime_session.clone();
+                let session_id = session.to_owned();
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        handle.spawn(async move {
+                            if let Err(error) =
+                                greptime.lock().await.clear_task(&session_id, id).await
+                            {
+                                eprintln!("e-agent: cannot clear background task: {error:#}");
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        eprintln!("e-agent: cannot clear background task: no tokio runtime");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tasks recorded by a previous process that died before their
+    /// completion arrived. Consumes the record (file or table rows) and
+    /// returns the labels so the caller can inject the "killed on exit"
+    /// notice. Only this session's own records are returned.
+    pub async fn take_unfinished_background(
+        &self,
+        root: &Path,
+        session: &str,
+    ) -> Result<Vec<String>> {
+        match self {
+            SessionStore::Jsonl => Ok(Session::take_unfinished_background(root, session)),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                let session_id = session.to_owned();
+                greptime_session
+                    .lock()
+                    .await
+                    .take_unfinished_tasks(&session_id)
+                    .await
+            }
+        }
+    }
+
+    /// Like [`Self::take_unfinished_background`] but scoped to rows whose
+    /// `subagent_session_id` matches — used when resuming a subagent
+    /// session so it learns what died with its background delegates. The
+    /// Greptime table is global and supports the cross-session lookup;
+    /// JSONL has no per-subagent record file, so it always reports nothing.
+    pub async fn take_unfinished_background_for_subagent(
+        &self,
+        _root: &Path,
+        subagent_session_id: &str,
+    ) -> Result<Vec<String>> {
+        match self {
+            SessionStore::Jsonl => Ok(Vec::new()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session
+                    .lock()
+                    .await
+                    .take_unfinished_tasks_for_subagent(subagent_session_id)
+                    .await
+            }
         }
     }
 }

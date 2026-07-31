@@ -206,6 +206,16 @@ fn probe_entry(handle: SessionHandle) -> Arc<SessionEntry> {
     })
 }
 
+/// A JSONL-backed record for the tests below, mirroring how the delegate
+/// tool wires `record_background_tasks_in` in production.
+fn jsonl_record(root: std::path::PathBuf) -> crate::session_store::BackgroundRecord {
+    crate::session_store::BackgroundRecord {
+        root,
+        session: "parent".into(),
+        store: crate::session_store::SessionStore::Jsonl,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_cancel_during_on_id_cleans_registration_without_completion() {
     let temp = tempfile::tempdir().unwrap();
@@ -220,7 +230,7 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
     let cleanup = DelegateCleanup::new(
         slot.clone(),
         sessions.clone(),
-        Some((root.clone(), "parent".into())),
+        Some(jsonl_record(root.clone())),
     );
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
@@ -298,7 +308,7 @@ async fn background_cancel_before_first_yield_cleans_everything() {
     let cleanup = DelegateCleanup::new(
         slot.clone(),
         sessions.clone(),
-        Some((temp.path().to_path_buf(), "parent".into())),
+        Some(jsonl_record(temp.path().to_path_buf())),
     );
     let hook_slot = slot.clone();
     let hook_sessions = sessions.clone();
@@ -360,7 +370,7 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
     let cleanup = DelegateCleanup::new(
         slot.clone(),
         sessions.clone(),
-        Some((temp.path().to_path_buf(), "parent".into())),
+        Some(jsonl_record(temp.path().to_path_buf())),
     );
     let hook_sessions = sessions.clone();
     let hook_handle = handle.clone();
@@ -606,7 +616,7 @@ async fn background_delivery_preflight_fails_before_later_work() {
     let record_root = temp.path().join("parent-session");
     let delegate = delegate(temp.path())
         .persist_sessions(persist_root.clone())
-        .record_background_tasks_in(record_root.clone(), "parent");
+        .record_background_tasks_in(record_root.clone(), "parent", SessionStore::Jsonl);
 
     let error = delegate
         .execute(json!({
