@@ -1305,7 +1305,7 @@ impl TuiState {
                 }
             },
         };
-        match store.load_older(&root, &session_id, before).await {
+        match store.load_older(&root, &session_id, before, None).await {
             Ok((entries, cursor)) => {
                 let lines: Vec<DisplayLine> =
                     entries.iter().flat_map(session_entry_to_lines).collect();

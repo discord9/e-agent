@@ -676,18 +676,21 @@ async fn cancel_task(
 
 /// `GET /api/sessions/{id}/history` query parameters, both optional:
 /// omit `before_seq` for the head segment, or pass the previous response's
-/// `next_before_seq` to page one compaction segment further back. `limit`
-/// caps the number of entries returned (the newest are kept).
+/// `next_before_seq` to page further back. `limit` bounds the page: for the
+/// head segment it caps the returned entries (newest kept); for older
+/// pages it is passed to the backend for intra-segment paging (~`limit`
+/// entries per request, cursor = next older page).
 #[derive(Deserialize)]
 pub struct HistoryParams {
     pub before_seq: Option<i64>,
     pub limit: Option<usize>,
 }
 
-/// One history page: a compaction segment of [`SessionEntry`] values plus
-/// the cursor for the next older page. `next_before_seq` is `Some` when an
-/// older segment exists (feed it back as `before_seq`), `None` when this
-/// was the oldest segment or the session has no compaction at all.
+/// One history page: a compaction segment (or an intra-segment slice of
+/// it) of [`SessionEntry`] values plus the cursor for the next older page.
+/// `next_before_seq` is `Some` when older entries exist (feed it back as
+/// `before_seq`), `None` when this was the oldest segment, the oldest page
+/// was reached, or the session has no compaction at all.
 #[derive(Serialize)]
 pub struct HistoryResponse {
     pub entries: Vec<SessionEntry>,
@@ -696,10 +699,10 @@ pub struct HistoryResponse {
 
 /// Cap entries to the newest `limit` (oldest dropped); `None` = no cap.
 /// Kept as a separate function so the wire shape and the cap are each
-/// unit-testable without a session backend. Dropped entries inside one
-/// segment are not paged individually: segments are compaction-bounded on
-/// Greptime, and JSONL sessions have no older pages (`head_seq`/`load_older`
-/// are both empty there), so the cap only ever trims the initial render.
+/// unit-testable without a session backend. With intra-segment paging the
+/// `limit` already bounds every `load_older` page on Greptime, so this cap
+/// is pure defense (it only ever trims the initial head render, which is
+/// not paged server-side).
 fn cap_entries(entries: Vec<SessionEntry>, limit: Option<usize>) -> Vec<SessionEntry> {
     match limit {
         Some(limit) if entries.len() > limit => entries[entries.len() - limit..].to_vec(),
@@ -708,11 +711,12 @@ fn cap_entries(entries: Vec<SessionEntry>, limit: Option<usize>) -> Vec<SessionE
 }
 
 /// `GET /api/sessions/{id}/history` — the frontend's initial-render path.
-/// Returns one compaction segment of the session log: the head segment
-/// (last compaction + everything after) without `before_seq`, or the
-/// segment immediately older than `before_seq` when paging. `next_before_seq`
-/// is the compaction seq that opens the returned segment (feed it back to
-/// page further back); `null` means the oldest segment or no compaction.
+/// Returns the head segment (last compaction + everything after) without
+/// `before_seq`, or the entries immediately older than `before_seq` when
+/// paging (whole segment with no `limit`, or an intra-segment page of
+/// `limit` entries with one). `next_before_seq` is the cursor for the next
+/// older page (feed it back to page further back); `null` means the oldest
+/// segment/page or no compaction.
 async fn session_history(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -737,10 +741,12 @@ async fn session_history(
             (loaded.entries, cursor)
         }
         Some(before_seq) => {
-            // Older segment: [prev_comp, before_seq); cursor = prev_comp.
+            // Older entries: [prev_comp, before_seq), paged intra-segment
+            // by `limit` when present (cursor = oldest seq of the page,
+            // crossing into the older segment at a compaction boundary).
             let (entries, cursor) = session
                 .store
-                .load_older(root, &id, before_seq)
+                .load_older(root, &id, before_seq, params.limit)
                 .await
                 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             (entries, cursor)
@@ -1758,6 +1764,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// M5: `session_history` with a `before_seq` cursor must forward
+    /// `limit` to `load_older` and surface the returned cursor. Exercised
+    /// with the JSONL store, whose `load_older` always answers empty +
+    /// `None` — the endpoint must still accept `before_seq` + `limit`
+    /// together and serialize the page (the Greptime paging itself is
+    /// covered by `session_greptime`'s integration tests).
+    #[tokio::test]
+    async fn session_history_pages_older_with_limit() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let state = test_app_state("sekrit");
+        let (id, session) = live_session("web-paged");
+        state.registry.insert(id.clone(), session);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions/{id}/history?before_seq=42&limit=200"
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["entries"], serde_json::json!([]));
+        assert_eq!(value["next_before_seq"], serde_json::Value::Null);
     }
 
     /// M5: `HistoryParams` must deserialize from the query strings the

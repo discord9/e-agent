@@ -406,19 +406,48 @@ impl GreptimeSession {
     /// compaction with `seq < before_seq`. The compaction row that opens
     /// the segment rides with it.
     ///
-    /// Returns `(entries, cursor)` where `cursor` is `Some(prev_comp)` when
-    /// an older segment exists (pass it as the next `before_seq`) and
-    /// `None` when this is the oldest segment (`[0, before)` — the full
-    /// remaining history was returned and nothing older exists).
+    /// `limit` enables fixed-size intra-segment paging: when `Some(n)`, the
+    /// `n` entries closest to `before_seq` (the segment's tail, i.e. the
+    /// newest of the segment) are returned instead of the whole segment,
+    /// and the cursor is the seq of the oldest entry of the page — feed it
+    /// back as the next `before_seq` to fetch the next older page *within
+    /// the same segment*. This keeps the wire size bounded (~`limit` rows)
+    /// on very long sessions instead of shipping a whole compaction segment
+    /// (potentially hundreds of entries) per request. `n == 0` is treated
+    /// as "no limit" (whole segment).
+    ///
+    /// Returns `(entries, cursor)` where:
+    ///
+    /// - `limit = None`: `cursor` is `Some(prev_comp)` when an older
+    ///   segment exists (pass it as the next `before_seq`) and `None` when
+    ///   this is the oldest segment (`[0, before)` — the full remaining
+    ///   history was returned and nothing older exists).
+    /// - `limit = Some(n)`: `cursor` is `Some(oldest page seq)` to continue
+    ///   paging. When a page reaches the segment's opening compaction row
+    ///   (`prev_comp`) the cursor is `Some(prev_comp)` — the next call
+    ///   crosses into the older segment, exactly like the `limit = None`
+    ///   chain. The cursor is `None` only when the page reaches seq `0` /
+    ///   the oldest segment: nothing older exists.
+    ///
+    /// So the cursor contract is identical with or without a limit:
+    /// `next_before_seq = null` ⇔ no older entries exist, and every row is
+    /// loaded exactly once across the head + older chain.
     ///
     /// Segment boundary semantics (shared with [`Self::load_head`]):
     ///
     /// - head = `[last_comp, ∞)`;
     /// - `load_older(before)` = `[prev_comp, before)`;
-    /// - the oldest segment = `[0, before)` and returns `None` as cursor.
+    /// - the oldest segment = `[0, before)`.
     ///
-    /// Every row is loaded exactly once across the head + older chain.
-    pub async fn load_older(&self, before_seq: i64) -> Result<(Vec<SessionEntry>, Option<i64>)> {
+    /// seq is not necessarily contiguous (compaction rows, retried writes),
+    /// so paging uses `seq >= start AND seq < before_seq ORDER BY seq DESC
+    /// LIMIT n` (the tail of the segment) and reverses the page to
+    /// ascending order.
+    pub async fn load_older(
+        &self,
+        before_seq: i64,
+        limit: Option<usize>,
+    ) -> Result<(Vec<SessionEntry>, Option<i64>)> {
         let row = self
             .client
             .query_opt(
@@ -430,21 +459,40 @@ impl GreptimeSession {
             .await
             .context("cannot query previous compaction seq")?;
         let prev_comp: Option<i64> = row.and_then(|r| r.get("max_seq"));
+        let page = limit.filter(|&n| n > 0);
 
-        let raw: Vec<(i64, chrono::NaiveDateTime, String)> = match prev_comp {
+        let mut raw: Vec<(i64, chrono::NaiveDateTime, String)> = match prev_comp {
             // Middle segment: [prev_comp, before).
             Some(prev) => {
-                let rows = self
-                    .client
-                    .query(
-                        "SELECT seq, event_time, payload FROM session_entries \
-                         WHERE workspace_id = $1 AND session_id = $2 \
-                         AND seq >= $3 AND seq < $4 \
-                         ORDER BY event_time ASC, seq ASC",
-                        &[&self.workspace_id, &self.session_id, &prev, &before_seq],
-                    )
-                    .await
-                    .context("cannot load middle segment")?;
+                let rows = if let Some(n) = page {
+                    self.client
+                        .query(
+                            "SELECT seq, event_time, payload FROM session_entries \
+                             WHERE workspace_id = $1 AND session_id = $2 \
+                             AND seq >= $3 AND seq < $4 \
+                             ORDER BY seq DESC LIMIT $5",
+                            &[
+                                &self.workspace_id,
+                                &self.session_id,
+                                &prev,
+                                &before_seq,
+                                &(n as i64),
+                            ],
+                        )
+                        .await
+                        .context("cannot load middle segment page")?
+                } else {
+                    self.client
+                        .query(
+                            "SELECT seq, event_time, payload FROM session_entries \
+                             WHERE workspace_id = $1 AND session_id = $2 \
+                             AND seq >= $3 AND seq < $4 \
+                             ORDER BY event_time ASC, seq ASC",
+                            &[&self.workspace_id, &self.session_id, &prev, &before_seq],
+                        )
+                        .await
+                        .context("cannot load middle segment")?
+                };
                 rows.iter()
                     .map(|r| {
                         let seq: i64 = r.get("seq");
@@ -456,16 +504,32 @@ impl GreptimeSession {
             }
             // Oldest segment: [0, before). Nothing older follows.
             None => {
-                let rows = self
-                    .client
-                    .query(
-                        "SELECT seq, event_time, payload FROM session_entries \
-                         WHERE workspace_id = $1 AND session_id = $2 AND seq < $3 \
-                         ORDER BY event_time ASC, seq ASC",
-                        &[&self.workspace_id, &self.session_id, &before_seq],
-                    )
-                    .await
-                    .context("cannot load oldest segment")?;
+                let rows = if let Some(n) = page {
+                    self.client
+                        .query(
+                            "SELECT seq, event_time, payload FROM session_entries \
+                             WHERE workspace_id = $1 AND session_id = $2 AND seq < $3 \
+                             ORDER BY seq DESC LIMIT $4",
+                            &[
+                                &self.workspace_id,
+                                &self.session_id,
+                                &before_seq,
+                                &(n as i64),
+                            ],
+                        )
+                        .await
+                        .context("cannot load oldest segment page")?
+                } else {
+                    self.client
+                        .query(
+                            "SELECT seq, event_time, payload FROM session_entries \
+                             WHERE workspace_id = $1 AND session_id = $2 AND seq < $3 \
+                             ORDER BY event_time ASC, seq ASC",
+                            &[&self.workspace_id, &self.session_id, &before_seq],
+                        )
+                        .await
+                        .context("cannot load oldest segment")?
+                };
                 rows.iter()
                     .map(|r| {
                         let seq: i64 = r.get("seq");
@@ -477,11 +541,24 @@ impl GreptimeSession {
             }
         };
 
+        // Paged fetch: rows came back newest-first (ORDER BY seq DESC);
+        // flip to ascending and derive the next cursor = the oldest seq of
+        // the page. `Some(seq)` keeps paging (within the segment, or across
+        // the segment boundary when seq == prev_comp); `None` only when the
+        // page reaches seq 0 — the true start of the session.
+        let cursor = if page.is_some() {
+            let oldest = raw.last().map(|(seq, _, _)| *seq).filter(|&seq| seq > 0);
+            raw.reverse();
+            oldest
+        } else {
+            prev_comp
+        };
+
         let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)?
             .into_iter()
             .map(|(_, e)| e)
             .collect();
-        Ok((entries, prev_comp))
+        Ok((entries, cursor))
     }
 
     /// Load the oldest compaction segment: everything before the first
@@ -1647,9 +1724,9 @@ mod tests {
             assert_eq!(got, want, "head tail mismatch");
         }
 
-        // Middle segment: load_older(comp2_seq) = [comp1, comp2) = comp1 +
-        // middle, cursor = comp1_seq.
-        let (seg, cursor) = session.load_older(comp2_seq).await.unwrap();
+        // Middle segment: load_older(comp2_seq, None) = [comp1, comp2) =
+        // comp1 + middle, cursor = comp1_seq.
+        let (seg, cursor) = session.load_older(comp2_seq, None).await.unwrap();
         assert_eq!(
             cursor,
             Some(comp1_seq),
@@ -1666,9 +1743,9 @@ mod tests {
             assert_eq!(got, want, "middle segment tail mismatch");
         }
 
-        // Oldest segment: load_older(comp1_seq) = [0, comp1) = early, and
-        // cursor None (nothing older).
-        let (oldest, cursor) = session.load_older(comp1_seq).await.unwrap();
+        // Oldest segment: load_older(comp1_seq, None) = [0, comp1) = early,
+        // and cursor None (nothing older).
+        let (oldest, cursor) = session.load_older(comp1_seq, None).await.unwrap();
         assert_eq!(cursor, None, "oldest segment cursor must be None");
         assert_eq!(
             oldest, early,
@@ -1680,6 +1757,145 @@ mod tests {
         // exactly one segment.
         let total: usize = head.len() + seg.len() + oldest.len();
         assert_eq!(total, all.len(), "segments must cover the whole session");
+    }
+
+    /// Intra-segment paging: with `limit` set, `load_older` returns only
+    /// the `limit` entries closest to `before_seq` (the segment tail) and a
+    /// cursor pointing at the page's oldest entry, so the caller pages
+    /// backward through a long segment in fixed-size chunks. The cursor
+    /// stays `Some` across a middle segment's compaction boundary (the next
+    /// call crosses into the older segment) and becomes `None` only at the
+    /// true start of the session; every entry is returned exactly once.
+    #[tokio::test]
+    async fn load_older_pages_within_segment() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-paged-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        let early: Vec<SessionEntry> = vec![
+            Message::User {
+                content: "early 1".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::User {
+                content: "early 2".into(),
+                images: vec![],
+            }
+            .into(),
+        ];
+        let comp1 = SessionEntry::Compaction {
+            summary: "compaction 1".into(),
+            retained: vec![],
+        };
+        // 7 middle entries: enough that one segment needs several 2-entry
+        // pages.
+        let middle: Vec<SessionEntry> = (0..7)
+            .map(|i| {
+                Message::User {
+                    content: format!("middle {i}"),
+                    images: vec![],
+                }
+                .into()
+            })
+            .collect();
+        let comp2 = SessionEntry::Compaction {
+            summary: "compaction 2".into(),
+            retained: vec![],
+        };
+        let latest: Vec<SessionEntry> = vec![
+            Message::User {
+                content: "latest 1".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::User {
+                content: "latest 2".into(),
+                images: vec![],
+            }
+            .into(),
+        ];
+
+        let mut all = Vec::new();
+        all.extend(early.iter().cloned());
+        all.push(comp1.clone());
+        all.extend(middle.iter().cloned());
+        all.push(comp2.clone());
+        all.extend(latest.iter().cloned());
+        session.append(&all).await.unwrap();
+
+        // Append order = contiguous seqs: early=0,1, comp1=2, middle=3..9,
+        // comp2=10, latest=11,12. So middle[i] sits at seq 3+i, comp1 at 2,
+        // comp2 at 10.
+        let comp1_seq = 2i64;
+        let comp2_seq = 10i64;
+
+        // Page 1 of the middle segment [2,10): the 2 entries closest to
+        // comp2 (tail) = seqs 9,8 → ascending [middle 5, middle 6];
+        // cursor = oldest page seq = 8 (still inside the segment).
+        let (page1, cursor1) = session.load_older(comp2_seq, Some(2)).await.unwrap();
+        assert_eq!(
+            page1,
+            vec![middle[5].clone(), middle[6].clone()],
+            "first page must be the segment tail (newest entries), ascending"
+        );
+        assert_eq!(
+            cursor1,
+            Some(8),
+            "cursor must point at the page's oldest entry"
+        );
+
+        // Page 2: [2,8) tail = seqs 7,6 → [middle 3, middle 4]; cursor 6.
+        let (page2, cursor2) = session.load_older(cursor1.unwrap(), Some(2)).await.unwrap();
+        assert_eq!(
+            page2,
+            vec![middle[3].clone(), middle[4].clone()],
+            "second page must be the next older 2 entries"
+        );
+        assert_eq!(cursor2, Some(6));
+
+        // Page 3: [2,6) tail = seqs 5,4 → [middle 1, middle 2]; cursor 4.
+        let (page3, cursor3) = session.load_older(cursor2.unwrap(), Some(2)).await.unwrap();
+        assert_eq!(
+            page3,
+            vec![middle[1].clone(), middle[2].clone()],
+            "third page must be the next older 2 entries"
+        );
+        assert_eq!(cursor3, Some(4));
+
+        // Page 4: [2,4) = seqs 3,2 → [comp1, middle 0]; the page reaches
+        // the segment's opening compaction row (seq 2 = prev_comp), so the
+        // cursor stays Some(2) and the next call crosses into the older
+        // segment.
+        let (page4, cursor4) = session.load_older(cursor3.unwrap(), Some(2)).await.unwrap();
+        assert_eq!(
+            page4,
+            vec![comp1.clone(), middle[0].clone()],
+            "last page of the middle segment must reach its compaction row"
+        );
+        assert_eq!(
+            cursor4,
+            Some(comp1_seq),
+            "cursor must stay Some at the segment's compaction boundary"
+        );
+
+        // Page 5 (oldest segment [0,2) = early): 2 entries ≤ limit → whole
+        // segment, cursor None — nothing older exists.
+        let (page5, cursor5) = session.load_older(cursor4.unwrap(), Some(2)).await.unwrap();
+        assert_eq!(page5, early, "oldest segment must come back whole");
+        assert_eq!(cursor5, None, "cursor must be None at the true start");
+
+        // Exactly-once coverage across the paged chain: every appended
+        // entry appears in exactly one page (head + 5 pages).
+        let head = session.load_head().await.unwrap();
+        let total: usize =
+            head.len() + page1.len() + page2.len() + page3.len() + page4.len() + page5.len();
+        assert_eq!(total, all.len(), "paged chain must cover the whole session");
     }
 
     #[tokio::test]

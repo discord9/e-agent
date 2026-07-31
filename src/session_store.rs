@@ -206,21 +206,28 @@ impl SessionStore {
     /// next `before_seq` to page further back; `None` means the end of
     /// history.
     ///
+    /// `limit` is passed through to the Greptime backend: when `Some(n)`,
+    /// only the `n` entries of the segment closest to `before_seq` are
+    /// returned (intra-segment paging, cursor = oldest seq of the page),
+    /// so long sessions can be loaded in bounded pages instead of whole
+    /// compaction segments.
+    ///
     /// For JSONL the whole session was already loaded by [`Self::load`] /
     /// [`Self::load_head`], so there is nothing older to fetch: returns
-    /// `(vec![], None)`. For Greptime it delegates to
+    /// `(vec![], None)` regardless of `limit`. For Greptime it delegates to
     /// `GreptimeSession::load_older`.
     pub async fn load_older(
         &self,
         _root: &Path,
         _name: &str,
         before_seq: i64,
+        limit: Option<usize>,
     ) -> Result<(Vec<SessionEntry>, Option<i64>)> {
         match self {
             SessionStore::Jsonl => Ok((Vec::new(), None)),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
-                session.lock().await.load_older(before_seq).await
+                session.lock().await.load_older(before_seq, limit).await
             }
         }
     }
@@ -589,5 +596,34 @@ impl SessionStore {
                     .await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The JSONL backend has no older pages (the whole session was already
+    /// loaded by `load`/`load_head`): `load_older` must return empty + a
+    /// `None` cursor for any `before_seq`/`limit` — the wire contract the
+    /// frontend relies on (`next_before_seq: null` ⇔ nothing older).
+    #[tokio::test]
+    async fn jsonl_load_older_ignores_limit_and_returns_nothing() {
+        let root = std::env::temp_dir();
+        let store = SessionStore::Jsonl;
+        let (entries, cursor) = store
+            .load_older(&root, "some-session", 42, Some(200))
+            .await
+            .unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(cursor, None);
+
+        // Same without a limit, and with a cursor pointing at seq 0.
+        let (entries, cursor) = store
+            .load_older(&root, "some-session", 0, None)
+            .await
+            .unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(cursor, None);
     }
 }
