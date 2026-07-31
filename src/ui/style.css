@@ -592,6 +592,19 @@ mmlEqnNo}
   }
   .sidebar-head h2 { margin: 0; font-size: 14px; flex: 1; color: var(--base02); }
   #sidebarCloseBtn { padding: 0 10px; font-size: 16px; line-height: 1.4; color: var(--base01); }
+  .sidebar-filter { padding: 10px 14px 0; flex: 0 0 auto; }
+  .sidebar-filter input {
+    width: 100%;
+    font-size: 13px;
+    padding: 6px 9px;
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    background: var(--base3);
+    color: var(--base02);
+    outline: none;
+  }
+  .sidebar-filter input::placeholder { color: var(--base01); }
+  .sidebar-filter input:focus { border-color: var(--blue); }
   .sidebar-tree {
     overflow-y: auto;
     flex: 1 1 auto;
@@ -599,30 +612,42 @@ mmlEqnNo}
     padding: 8px;
     scrollbar-width: thin;
   }
-  .tree-empty { color: var(--base01); font-size: 13px; padding: 14px 2px; text-align: center; }
+  .tree-empty { color: var(--base01); font-size: 14px; padding: 14px 2px; text-align: center; }
   .tree-node { display: flex; flex-direction: column; }
   .tree-row {
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 5px 8px;
+    padding: 6px 8px;
     border-left: 3px solid transparent;
     border-radius: 3px;
     cursor: pointer;
     color: var(--base02);
+    font-size: 14px;
+    line-height: 1.4;
   }
   .tree-row:hover { background: var(--base3); }
   .tree-row.current { border-left-color: var(--blue); background: var(--base3); }
+  /* 折叠按钮：真正的 <button>，≥24px 点击区、16px 字号、hover 背景；
+     ▸→▾ 仍由 .open 旋转 90° 实现 */
   .tree-toggle {
     flex: 0 0 auto;
-    width: 14px;
-    text-align: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    background: transparent;
     color: var(--base01);
-    font-size: 10px;
+    font-size: 16px;
+    line-height: 1;
+    text-align: center;
     cursor: pointer;
     user-select: none;
-    transition: transform 0.15s;
+    transition: transform 0.15s, background 0.15s;
   }
+  .tree-toggle:hover:not(:disabled) { background: var(--base1); }
+  .tree-toggle:disabled { cursor: default; }
   .tree-toggle.open { transform: rotate(90deg); }
   .tree-row .busy-dot { width: 7px; height: 7px; flex: 0 0 auto; }
   .tree-id {
@@ -631,17 +656,30 @@ mmlEqnNo}
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 12px;
+    font-size: 14px;
     color: var(--blue);
   }
   .tree-group { color: var(--base01); }
-  .tree-count { color: var(--base01); font-size: 11px; flex: 0 0 auto; }
+  .tree-count { color: var(--base01); font-size: 12px; flex: 0 0 auto; }
+  /* 「+N 个更早的会话」按钮 */
+  .tree-more {
+    margin: 4px 8px 6px;
+    padding: 7px 10px;
+    border: 1px dashed var(--base1);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--base01);
+    font-size: 13px;
+    cursor: pointer;
+    text-align: center;
+  }
+  .tree-more:hover { border-color: var(--blue); color: var(--blue); background: var(--base3); }
   /* 子节点：缩进 16px + 紫色「子」徽章 */
   .tree-children { padding-left: 16px; }
   .tree-row-child .tree-id { color: var(--base00); }
   .child-badge {
-    font-size: 10px;
-    padding: 0 5px;
+    font-size: 11px;
+    padding: 0 6px;
     border-radius: 3px;
     background: #e5e2f5;
     color: var(--violet);
@@ -651,7 +689,7 @@ mmlEqnNo}
   .sidebar-divider { border-top: 1px solid var(--base1); margin: 0 14px; flex: 0 0 auto; }
   .sidebar-tasks-title {
     margin: 10px 14px 6px;
-    font-size: 13px;
+    font-size: 14px;
     color: var(--base02);
     flex: 0 0 auto;
   }
@@ -666,7 +704,7 @@ mmlEqnNo}
     max-height: 42%;
     scrollbar-width: thin;
   }
-  .tasks-empty { color: var(--base01); font-size: 13px; padding: 14px 2px; text-align: center; }
+  .tasks-empty { color: var(--base01); font-size: 14px; padding: 14px 2px; text-align: center; }
 
   .task-row {
     border: 1px solid var(--base1);
@@ -678,7 +716,7 @@ mmlEqnNo}
   .task-row:hover { border-color: var(--blue); }
   .task-row .task-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .kind-badge {
-    font-size: 11px;
+    font-size: 12px;
     padding: 1px 7px;
     border-radius: 3px;
     flex: 0 0 auto;
@@ -693,9 +731,9 @@ mmlEqnNo}
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--base02);
-    font-size: 13px;
+    font-size: 14px;
   }
-  .task-meta { color: var(--base01); font-size: 11px; display: flex; gap: 6px 10px; align-items: center; flex-wrap: wrap; }
+  .task-meta { color: var(--base01); font-size: 12px; display: flex; gap: 6px 10px; align-items: center; flex-wrap: wrap; }
   .task-meta .trole { color: var(--base00); }
   .task-meta .tsid { color: var(--cyan); }
   .task-cancel {
