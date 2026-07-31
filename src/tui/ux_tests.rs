@@ -124,6 +124,42 @@ fn home_renders_the_true_beginning_not_the_256_tail() {
 }
 
 #[test]
+fn home_budgets_from_start_when_head_segment_exceeds_byte_cap() {
+    // Regression: after Home the window covers the first lines, but
+    // local_window_lines budgeted MAX_RENDER_BYTES from the window TAIL,
+    // so when the beginning of the head segment exceeds 64KB the viewport
+    // showed a line ~96 rows in, not the true beginning (real main session:
+    // seq 12711..12806 = 163KB).
+    let backend = ratatui::backend::TestBackend::new(60, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    // First line big (like the compaction summary), then many big lines so
+    // the head of the window exceeds MAX_RENDER_BYTES.
+    state.push_line("FIRST_LINE_START".into(), LineKind::Normal);
+    for _ in 0..100 {
+        state.push_line("x".repeat(2048), LineKind::Normal);
+    }
+    state.handle_scroll(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    // Direct check of the local window (bypasses draw, isolates the bug).
+    let local = local_window_lines(&state.lines, &state.window);
+    assert_eq!(
+        local.first().map(|l| l.text.as_str()),
+        Some("FIRST_LINE_START"),
+        "local window must start at the true first line, got: {:?}",
+        local.first().map(|l| l.text.chars().take(30).collect::<String>())
+    );
+    draw(&mut terminal, &mut state).unwrap();
+    let top: String = terminal.backend().buffer().content()[0..60]
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        top.contains("FIRST_LINE_START"),
+        "Home must show the true first line, got: {top:?}"
+    );
+}
+
+#[test]
 fn pasted_crlf_is_normalized_to_plain_newlines() {
     let mut input = InputBuffer::default();
     let pasted = "one\r\ntwo\rthree"
@@ -584,7 +620,7 @@ fn local_window_obeys_all_limits_without_splitting_utf8() {
     assert!(local.iter().map(|line| line.text.len()).sum::<usize>() <= MAX_RENDER_BYTES);
     assert!(local.last().unwrap().text.is_char_boundary(0));
     assert!(local.last().unwrap().text.ends_with('尾'));
-    assert!(render_bounded_window(&local, 80).len() <= MAX_RENDER_VISUAL_ROWS);
+    assert!(render_bounded_window(&local, 80, false).len() <= MAX_RENDER_VISUAL_ROWS);
 }
 
 #[test]
@@ -806,7 +842,7 @@ fn resize_matrix_cjk_long_and_compaction_no_panic() {
         term.backend_mut().resize(w, h);
         draw(&mut term, &mut state).unwrap();
         let local = local_window_lines(&state.lines, &state.window);
-        let visual = render_bounded_window(&local, state.inner_width);
+        let visual = render_bounded_window(&local, state.inner_width, false);
         let total = visual.len();
         assert!(
             state.window.local_offset <= total.saturating_sub(state.output_height),

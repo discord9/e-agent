@@ -82,6 +82,31 @@ pub(crate) fn local_window_lines(lines: &[DisplayLine], window: &ScrollWindow) -
     let start = window.source_start.min(end);
     let mut remaining = MAX_RENDER_BYTES;
     let mut local = Vec::new();
+    // Viewport at the absolute top of the scrollback (Home / PageUp at the
+    // top): budget from the START of the window. The tail-biased reverse
+    // walk below would consume the byte budget on the window's tail and
+    // the viewport would show a later page — e.g. after Home the head
+    // segment's first ~96 lines can exceed MAX_RENDER_BYTES, and the user
+    // saw a line ~96 rows in instead of the true beginning. A window that
+    // covers the whole scrollback (source_end == len) is a general
+    // mid-scroll window and keeps the tail-biased budget.
+    let from_start = window.source_start == 0
+        && window.source_end <= MAX_RENDER_SOURCE_LINES
+        && window.frozen_tail_cursor.is_none();
+    if from_start {
+        for line in lines[start..end].iter().take(MAX_RENDER_SOURCE_LINES) {
+            if remaining == 0 {
+                break;
+            }
+            let text = utf8_tail(&line.text, line.text.len(), remaining);
+            remaining = remaining.saturating_sub(text.len());
+            local.push(DisplayLine {
+                text: text.to_owned(),
+                kind: line.kind,
+            });
+        }
+        return local;
+    }
     for index in (start..end).rev().take(MAX_RENDER_SOURCE_LINES) {
         if remaining == 0 {
             break;
@@ -389,7 +414,7 @@ pub(crate) fn extend_window_down(
     // Count the same bounded local copy that draw renders. Live deltas may
     // have made the source tail taller without changing the frozen cursor.
     let mut total_visual =
-        render_bounded_window(&local_window_lines(&state.lines, &state.window), w).len();
+        render_bounded_window(&local_window_lines(&state.lines, &state.window), w, false).len();
     // The viewport-bottom check: the last visible row is
     // local_offset + height - 1.  Scrolling can advance until
     // local_offset + height >= total_visual.

@@ -230,7 +230,10 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
         // Render a bounded local tail. The cursor captured when scrolling
         // away from a streaming tail keeps later deltas out of this view.
         let local_lines = local_window_lines(&scroll_state.lines, &scroll_state.window);
-        let visual = render_bounded_window(&local_lines, inner_width);
+        let at_top = scroll_state.window.source_start == 0
+            && scroll_state.window.source_end <= MAX_RENDER_SOURCE_LINES
+            && scroll_state.window.frozen_tail_cursor.is_none();
+        let visual = render_bounded_window(&local_lines, inner_width, at_top);
         let total_rows = visual.len();
         let height = usize::from(output.height);
         // Clamp local_offset in follow mode.
@@ -588,10 +591,19 @@ pub(crate) fn shorten_home(cwd: &str) -> std::borrow::Cow<'_, str> {
 pub(crate) fn render_bounded_window(
     lines: &[DisplayLine],
     width: usize,
+    keep_head: bool,
 ) -> Vec<ratatui::text::Line<'static>> {
     let mut rows = render_window(lines, 0, lines.len(), width);
     if rows.len() > MAX_RENDER_VISUAL_ROWS {
-        rows.drain(..rows.len() - MAX_RENDER_VISUAL_ROWS);
+        if keep_head {
+            // Viewport at the absolute top (Home / PageUp at the top): keep
+            // the FIRST visual rows so the true beginning is visible. The
+            // tail-biased drain would show a later page (the head segment's
+            // first lines can wrap to thousands of visual rows).
+            rows.truncate(MAX_RENDER_VISUAL_ROWS);
+        } else {
+            rows.drain(..rows.len() - MAX_RENDER_VISUAL_ROWS);
+        }
     }
     rows
 }
@@ -671,7 +683,7 @@ pub(crate) fn render_task_detail(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let local = local_window_lines(&detail.lines, &detail.window);
-    let visual = render_bounded_window(&local, width);
+    let visual = render_bounded_window(&local, width, false);
     let total_rows = visual.len();
     if detail.window.follow_bottom {
         detail.window.local_offset = total_rows.saturating_sub(content_height);
