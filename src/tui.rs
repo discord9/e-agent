@@ -390,6 +390,11 @@ async fn run_inner(
                     else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
                 Some(Ok(Event::Paste(text))) => state.handle_paste(&text),
+                // Resize needs no explicit handling: the next draw()
+                // re-derives the layout from the new terminal size, and a
+                // scrolled-up (non-follow) window is re-anchored inside
+                // draw on the width change, so the viewport top stays put.
+                Some(Ok(Event::Resize(_, _))) => {}
                 Some(Ok(_)) => {}, Some(Err(error)) => return Err(error.into()), None => return Ok(None),
             }
         }
@@ -540,16 +545,6 @@ fn draw<'a, B: ratatui::backend::Backend>(
             );
         }
         if tasks_height > 0 && state.show_tasks {
-            let attachable = |id: u64| {
-                state
-                    .attached
-                    .as_ref()
-                    .is_some_and(|attached| attached.id == id)
-                    || state
-                        .attachable
-                        .as_ref()
-                        .is_some_and(|attachable| attachable(id))
-            };
             let mut lines = vec![Line::styled(
                 if running.is_empty() {
                     "no background tasks running".to_owned()
@@ -601,8 +596,24 @@ fn draw<'a, B: ratatui::backend::Backend>(
             None => state,
         };
         // Store the output width for scroll-accounting in handle_scroll.
+        let old_width = scroll_state.inner_width;
         scroll_state.inner_width = inner_width;
         scroll_state.output_height = usize::from(output.height);
+        // A terminal width change re-wraps every line. In follow mode
+        // anchor_tail below re-derives the window from the tail; a
+        // scrolled-up (non-follow) window keeps a local_offset computed
+        // against the old width, which would drift the viewport top
+        // (shrink: jump to earlier content; grow: jump forward). Re-anchor
+        // it at the new width instead.
+        if !scroll_state.window.follow_bottom && old_width > 0 && old_width != inner_width {
+            reanchor_window_on_resize(
+                &scroll_state.lines,
+                &mut scroll_state.window,
+                old_width,
+                inner_width,
+                usize::from(output.height),
+            );
+        }
         // When following, anchor the window at the tail.
         if scroll_state.window.follow_bottom {
             scroll_state.window.anchor_tail(
@@ -1265,6 +1276,10 @@ struct TaskDetail {
     /// grown past this — opening shows the head page, and new output
     /// slides the view to the live tail (like `tail -f` from the top).
     last_seen_lines: usize,
+    /// Terminal width the page was last rendered at, used to detect a
+    /// resize so a scrolled-up (non-follow) page can be re-anchored at
+    /// the new width. `0` means "no frame rendered yet".
+    rendered_width: usize,
 }
 
 impl TaskDetail {
@@ -1278,6 +1293,7 @@ impl TaskDetail {
             lines: Vec::new(),
             window: ScrollWindow::new(),
             last_seen_lines: 0,
+            rendered_width: 0,
         }
     }
 
@@ -1551,6 +1567,15 @@ fn render_task_detail(
         detail.last_seen_lines = lines;
         detail.load_tail(width, height);
     }
+    // A terminal width change re-wraps the page; a scrolled-up
+    // (non-follow) window's local_offset is stale, so re-anchor it at the
+    // new width (base_line is untouched). Follow mode is handled above
+    // (load_tail on spool growth) and by the next page reload.
+    let old_width = detail.rendered_width;
+    detail.rendered_width = width;
+    if !detail.window.follow_bottom && old_width > 0 && old_width != width {
+        reanchor_window_on_resize(&detail.lines, &mut detail.window, old_width, width, height);
+    }
     let status = if detail.finished {
         "finished"
     } else {
@@ -1694,6 +1719,77 @@ impl ScrollWindow {
         }
         self.local_offset = 0; // will be set after rendering
     }
+}
+
+/// Replay the previous frame at the old width and find which source
+/// line held the viewport-top visual row, then rebuild the window at
+/// the new width with that line's first visual row at the viewport
+/// top. `local_offset` was computed against the old wrap geometry, so
+/// without this a width change would drift the scrolled-up viewport
+/// (shrink: top jumps to earlier content; grow: content jumps around).
+///
+/// Only `source_start`/`local_offset` are rewritten; `source_end`,
+/// `frozen_tail_cursor`, `frozen_source_end` and `follow_bottom` are
+/// left untouched so a frozen streaming snapshot stays frozen and a
+/// scrolled-up view stays scrolled up.
+fn reanchor_window_on_resize(
+    lines: &[DisplayLine],
+    window: &mut ScrollWindow,
+    old_width: usize,
+    new_width: usize,
+    height: usize,
+) {
+    let old_width = old_width.max(1);
+    let new_width = new_width.max(1);
+    let height = height.max(1);
+    let local_old = local_window_lines(lines, window);
+    if local_old.is_empty() {
+        return;
+    }
+    // Replay the previous frame's bounded rendering at the old width,
+    // with the same head-drain as render_bounded_window so the trimmed
+    // row stream matches what was drawn; `dropped` maps local_offset
+    // (an index into the trimmed stream) back onto the full stream.
+    let visual_old = render_window(&local_old, 0, local_old.len(), old_width);
+    let dropped = visual_old.len().saturating_sub(MAX_RENDER_VISUAL_ROWS);
+    let target_row = window.local_offset.saturating_add(dropped);
+    // Find the source line whose visual block contains the viewport
+    // top. local_old mirrors lines[base..source_end] with
+    // base = source_end - local_old.len(): local_window_lines keeps
+    // the *last* MAX_RENDER_SOURCE_LINES lines of the window, which is
+    // not necessarily lines[source_start] when the window is wider
+    // than the line budget.
+    let mut block = 0usize;
+    let mut rows_before = 0usize;
+    for (index, line) in local_old.iter().enumerate() {
+        let rows = line_visual_rows(line, old_width);
+        if target_row < rows_before.saturating_add(rows) {
+            block = index;
+            break;
+        }
+        rows_before = rows_before.saturating_add(rows);
+    }
+    let base = window.source_end.saturating_sub(local_old.len());
+    let anchor_source = base
+        .saturating_add(block)
+        .min(lines.len().saturating_sub(1));
+    // Rebuild at the new width: walk back from the anchor source line
+    // (same shape as anchor_tail) until the lines above it cover
+    // `height` visual rows, then point local_offset at the anchor
+    // line's first visual row in the new wrap. The draw-time clamp
+    // still fills the viewport when the anchor is too close to the
+    // window tail to fill `height` rows below it.
+    window.source_start = anchor_source;
+    let mut rows_above = 0usize;
+    while window.source_start > 0
+        && rows_above < height.min(MAX_RENDER_VISUAL_ROWS)
+        && anchor_source - window.source_start < MAX_RENDER_SOURCE_LINES
+    {
+        window.source_start -= 1;
+        rows_above =
+            rows_above.saturating_add(line_visual_rows(&lines[window.source_start], new_width));
+    }
+    window.local_offset = rows_above;
 }
 
 /// Count the visual rows a single DisplayLine would produce at `width`.
@@ -5745,5 +5841,208 @@ mod ux_tests {
         };
         assert_eq!(text(visible.first().unwrap()), "x".repeat(80));
         assert_eq!(text(visible.last().unwrap()), "you> hello");
+    }
+
+    // ── Terminal-resize re-anchoring ────────────────────────────────────
+
+    #[test]
+    fn resize_non_follow_keeps_viewport_top_and_is_reversible() {
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        for i in 0..20 {
+            state.push_line(format!("line {i:02}"), LineKind::Normal);
+        }
+        draw(&mut term, &mut state).unwrap();
+        // Scroll away from the tail so the window is frozen non-follow.
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        draw(&mut term, &mut state).unwrap();
+        assert!(!state.window.follow_bottom);
+        let top_before = row_text(term.backend().buffer(), 0);
+
+        // Shrink 80 → 40: the viewport-top source line must not drift.
+        term.backend_mut().resize(40, 12);
+        draw(&mut term, &mut state).unwrap();
+        assert!(!state.window.follow_bottom);
+        assert_eq!(row_text(term.backend().buffer(), 0), top_before);
+
+        // Grow 40 → 80: reversible, same top source line.
+        term.backend_mut().resize(80, 12);
+        draw(&mut term, &mut state).unwrap();
+        assert!(!state.window.follow_bottom);
+        assert_eq!(row_text(term.backend().buffer(), 0), top_before);
+    }
+
+    #[test]
+    fn resize_reanchors_mid_wrap_viewport_top() {
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        for i in 0..11 {
+            state.push_line(format!("line {i:02}"), LineKind::Normal);
+        }
+        // 150 chars: 2 visual rows at width 80, 4 at width 40.
+        state.push_line("x".repeat(150), LineKind::Normal);
+        for i in 11..21 {
+            state.push_line(format!("line {i:02}"), LineKind::Normal);
+        }
+        draw(&mut term, &mut state).unwrap();
+        // Up freezes; the second Up puts the viewport top inside the long
+        // line's wrap (its second visual row, "x"*70).
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        draw(&mut term, &mut state).unwrap();
+        assert!(!state.window.follow_bottom);
+        assert_eq!(row_text(term.backend().buffer(), 0), "x".repeat(70));
+
+        // Shrink: the anchor source line (the x-line) must stay at the
+        // viewport top, re-wrapped at the new width.
+        term.backend_mut().resize(40, 12);
+        draw(&mut term, &mut state).unwrap();
+        assert!(!state.window.follow_bottom);
+        assert_eq!(row_text(term.backend().buffer(), 0), "x".repeat(40));
+
+        // Grow back: same source line at the top again.
+        term.backend_mut().resize(80, 12);
+        draw(&mut term, &mut state).unwrap();
+        assert!(!state.window.follow_bottom);
+        assert_eq!(row_text(term.backend().buffer(), 0), "x".repeat(80));
+    }
+
+    #[test]
+    fn resize_follow_stays_at_tail() {
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        for i in 0..30 {
+            state.push_line(format!("line {i:02}"), LineKind::Normal);
+        }
+        draw(&mut term, &mut state).unwrap();
+        assert!(state.window.follow_bottom);
+        assert_eq!(state.window.source_end, state.lines.len());
+        assert_eq!(row_text(term.backend().buffer(), 8), "line 29");
+
+        // Follow re-anchors from the tail on every draw: resizing must not
+        // move the tail off the last visible row.
+        term.backend_mut().resize(40, 12);
+        draw(&mut term, &mut state).unwrap();
+        assert!(state.window.follow_bottom);
+        assert_eq!(state.window.source_end, state.lines.len());
+        assert_eq!(row_text(term.backend().buffer(), 8), "line 29");
+    }
+
+    #[test]
+    fn resize_frozen_stream_keeps_frozen_text() {
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = frozen_state();
+        draw(&mut term, &mut state).unwrap();
+        assert_eq!(row_text(term.backend().buffer(), 0), "earlier");
+        assert_eq!(row_text(term.backend().buffer(), 2), "hel");
+        assert_eq!(state.window.frozen_tail_cursor, Some(3));
+        assert!(!state.window.follow_bottom);
+
+        // Shrink the terminal: the frozen snapshot must keep showing the
+        // frozen text with the same top source line and the same cursor.
+        term.backend_mut().resize(20, 10);
+        draw(&mut term, &mut state).unwrap();
+        assert!(!state.window.follow_bottom);
+        assert_eq!(row_text(term.backend().buffer(), 0), "earlier");
+        assert_eq!(row_text(term.backend().buffer(), 2), "hel");
+        assert_eq!(state.window.frozen_tail_cursor, Some(3));
+    }
+
+    #[test]
+    fn resize_matrix_cjk_long_and_compaction_no_panic() {
+        let mut state = TuiState::default();
+        state.push_line("──── auto-compact".to_string(), LineKind::Compaction);
+        state.push_line(format!("前缀{}尾", "好".repeat(120)), LineKind::Normal);
+        for i in 0..40 {
+            state.push_line(format!("row {i:02}"), LineKind::Normal);
+        }
+        // Far beyond the byte budget: exercises the truncated-tail copy
+        // and the MAX_RENDER_VISUAL_ROWS head-drain inside re-anchoring.
+        state.push_line("x".repeat(MAX_RENDER_BYTES), LineKind::Normal);
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        draw(&mut term, &mut state).unwrap();
+        // Freeze (non-follow) near the tail.
+        state.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        draw(&mut term, &mut state).unwrap();
+        assert!(!state.window.follow_bottom);
+
+        // Resize through several widths: no panic, and the clamped offset
+        // always fits the bounded rendered window.
+        for (w, h) in [(20u16, 12u16), (120, 12), (40, 12)] {
+            term.backend_mut().resize(w, h);
+            draw(&mut term, &mut state).unwrap();
+            let local = local_window_lines(&state.lines, &state.window);
+            let visual = render_bounded_window(&local, state.inner_width);
+            let total = visual.len();
+            assert!(
+                state.window.local_offset <= total.saturating_sub(state.output_height),
+                "local_offset {} exceeds {total} - {}",
+                state.window.local_offset,
+                state.output_height
+            );
+        }
+        assert!(!state.window.follow_bottom);
+    }
+
+    #[test]
+    fn resize_task_detail_keeps_page_top_line() {
+        let spool = Arc::new(crate::tools::TaskSpool::new());
+        let mut text = String::new();
+        for i in 0..300 {
+            text.push_str(&format!("line {i:03}\n"));
+        }
+        spool.append(text.as_bytes());
+        let mut state = TuiState {
+            inner_width: 80,
+            output_height: 10,
+            ..Default::default()
+        };
+        let mut detail = TaskDetail::new(1, "demo".into(), spool, false);
+        // A 20-line page starting at spool line 100, scrolled 8 rows down
+        // (viewport top = spool line 108) and frozen non-follow.
+        detail.load_page(100, 20, false, 80, 10);
+        detail.window.follow_bottom = false;
+        detail.window.local_offset = 8;
+        state.task_detail = Some(detail);
+        let content_row = |term: &Terminal<ratatui::backend::TestBackend>| -> String {
+            let buf = term.backend().buffer();
+            (1..buf.area.width.saturating_sub(1))
+                .map(|x| buf[(x, 1)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        };
+
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        draw(&mut term, &mut state).unwrap();
+        let detail = state.task_detail.as_ref().unwrap();
+        assert!(!detail.window.follow_bottom);
+        assert_eq!(detail.base_line, 100);
+        assert_eq!(content_row(&term), "line 108");
+
+        // Resize: the page-top source line is preserved, base_line is
+        // untouched, and the page stays non-follow.
+        term.backend_mut().resize(40, 12);
+        draw(&mut term, &mut state).unwrap();
+        let detail = state.task_detail.as_ref().unwrap();
+        assert!(!detail.window.follow_bottom);
+        assert_eq!(detail.base_line, 100);
+        assert_eq!(content_row(&term), "line 108");
+
+        // And back: reversible.
+        term.backend_mut().resize(80, 12);
+        draw(&mut term, &mut state).unwrap();
+        let detail = state.task_detail.as_ref().unwrap();
+        assert!(!detail.window.follow_bottom);
+        assert_eq!(detail.base_line, 100);
+        assert_eq!(content_row(&term), "line 108");
     }
 }
