@@ -16,6 +16,7 @@ fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
                 name: call.name,
                 content: INTERRUPTED.into(),
                 is_error: true,
+                synthetic: true,
             });
         }
     }
@@ -26,15 +27,15 @@ fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
         match &message {
             Message::Tool {
                 call_id,
-                content,
-                is_error: true,
+                synthetic: true,
                 ..
-            } if content == INTERRUPTED => {
+            } => {
                 // Synthetic placeholder from an interrupted-turn snapshot
                 // (e.g. captured in a compaction `retained` window). Skip it
                 // without consuming the pending call: the real result may
                 // land later (compaction race), and if it never does the
                 // final flush re-synthesizes an equivalent placeholder.
+                let _ = call_id;
             }
             Message::Tool { call_id, .. } => {
                 if pending.iter().any(|call| call.id == *call_id) {
@@ -79,6 +80,12 @@ pub enum Message {
         name: String,
         content: String,
         is_error: bool,
+        /// Synthetic interrupted-turn placeholder from a snapshot/compaction
+        /// repair, never a real tool result. Used instead of matching the
+        /// placeholder text so a real result with identical content is not
+        /// mistaken for it.
+        #[serde(default)]
+        synthetic: bool,
     },
 }
 
@@ -728,6 +735,7 @@ impl Agent {
                         Ok(content) | Err(content) => content.clone(),
                     },
                     is_error: result.is_err(),
+                    synthetic: false,
                 });
             }
         }
@@ -1037,12 +1045,14 @@ mod tests {
                 name: "bash".into(),
                 content: "[turn interrupted before a tool result was produced]".into(),
                 is_error: true,
+                synthetic: true,
             },
             Message::Tool {
                 call_id: "call-1".into(),
                 name: "bash".into(),
                 content: "real result".into(),
                 is_error: false,
+                synthetic: false,
             },
         ];
         let repaired = repair_tool_pairs(messages);
@@ -1051,13 +1061,15 @@ mod tests {
         // the pending call: output = [User, Assistant(call-1), Tool(real)].
         assert!(matches!(
             &repaired[2],
-            Message::Tool { call_id, content, is_error: false, .. }
+            Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
                 if call_id == "call-1" && content == "real result"
         ));
         assert!(!repaired.iter().any(|m| matches!(
             m,
-            Message::Tool { content, is_error: true, .. }
-                if content == "[turn interrupted before a tool result was produced]"
+            Message::Tool {
+                synthetic: true,
+                ..
+            }
         )));
     }
 
@@ -1079,7 +1091,7 @@ mod tests {
         let repaired = repair_tool_pairs(messages);
         assert!(repaired.iter().any(|message| matches!(
             message,
-            Message::Tool { call_id, is_error: true, .. }
+            Message::Tool { call_id, is_error: true, synthetic: true, .. }
                 if call_id == "call-1" && message_tool_content(message) == "[turn interrupted before a tool result was produced]"
         )));
         // The synthetic result must precede the following user message.
@@ -1088,6 +1100,57 @@ mod tests {
             .position(|m| matches!(m, Message::Tool { call_id, .. } if call_id == "call-1"))
             .unwrap();
         assert!(matches!(&repaired[index + 1], Message::User { .. }));
+    }
+
+    #[test]
+    fn repair_tool_pairs_keeps_real_result_matching_placeholder_text() {
+        // A real tool result whose content happens to equal the interrupted
+        // placeholder text must still pair normally: it is not skipped and
+        // no placeholder is synthesized on top of it.
+        let messages = vec![
+            Message::User {
+                content: "u".into(),
+            },
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![call("call-1", "bash", r#"{}"#)],
+                reasoning: None,
+            }),
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "bash".into(),
+                content: "[turn interrupted before a tool result was produced]".into(),
+                is_error: false,
+                synthetic: false,
+            },
+        ];
+        let repaired = repair_tool_pairs(messages);
+        assert_eq!(repaired.len(), 3);
+        assert!(matches!(
+            &repaired[2],
+            Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
+                if call_id == "call-1"
+                    && content == "[turn interrupted before a tool result was produced]"
+        ));
+        // Only that one real result exists: no placeholder was flushed.
+        assert_eq!(
+            repaired
+                .iter()
+                .filter(|m| matches!(
+                    m,
+                    Message::Tool { content, .. }
+                        if *content == "[turn interrupted before a tool result was produced]"
+                ))
+                .count(),
+            1
+        );
+        assert!(!repaired.iter().any(|m| matches!(
+            m,
+            Message::Tool {
+                synthetic: true,
+                ..
+            }
+        )));
     }
 
     fn message_tool_content(message: &Message) -> &str {
@@ -1127,7 +1190,7 @@ mod tests {
         ));
         assert!(matches!(
             &requests[1][2],
-            Message::Tool { call_id, name, content, is_error: false }
+            Message::Tool { call_id, name, content, is_error: false, .. }
                 if call_id == "call-1" && name == "echo" && content == "\"ok\""
         ));
     }
@@ -1412,12 +1475,14 @@ mod tests {
                 name: "bash".into(),
                 content: "building".into(),
                 is_error: false,
+                synthetic: false,
             },
             Message::Tool {
                 call_id: "call-3".into(),
                 name: "bash".into(),
                 content: "still building".into(),
                 is_error: false,
+                synthetic: false,
             },
             Message::Assistant(AssistantMessage {
                 content: Some("recent answer".into()),
@@ -1439,6 +1504,7 @@ mod tests {
                 name: "echo".into(),
                 content: "old result".into(),
                 is_error: false,
+                synthetic: false,
             },
             Message::User {
                 content: "follow up".into(),
@@ -1496,6 +1562,7 @@ mod tests {
                 name: "bash".into(),
                 content: "built".into(),
                 is_error: false,
+                synthetic: false,
             },
         ];
         let mut agent = Agent::new(

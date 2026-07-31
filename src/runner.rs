@@ -869,6 +869,7 @@ fn tool_entry(call: &ToolCall, result: &Result<String, String>) -> SessionEntry 
         name: call.name.clone(),
         content: result.as_ref().unwrap_or_else(|e| e).clone(),
         is_error: result.is_err(),
+        synthetic: false,
     }
     .into()
 }

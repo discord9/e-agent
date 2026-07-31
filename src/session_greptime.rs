@@ -460,6 +460,7 @@ mod tests {
                 name: "bash".into(),
                 content: "exit code: 0\nstdout:\nok\n".into(),
                 is_error: false,
+                synthetic: false,
             }
             .into(),
             Message::Tool {
@@ -467,6 +468,7 @@ mod tests {
                 name: "bash".into(),
                 content: "command not found".into(),
                 is_error: true,
+                synthetic: false,
             }
             .into(),
             SessionEntry::Compaction {

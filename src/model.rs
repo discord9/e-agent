@@ -540,6 +540,7 @@ mod tests {
                     name: "read_file".into(),
                     content: "not found".into(),
                     is_error: true,
+                    synthetic: false,
                 },
             ],
             &tools,

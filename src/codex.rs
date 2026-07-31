@@ -305,6 +305,7 @@ mod tests {
                     name: "bash".into(),
                     content: "failed".into(),
                     is_error: true,
+                    synthetic: false,
                 },
             ],
             &[ToolSpec {
