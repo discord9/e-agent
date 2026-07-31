@@ -218,32 +218,39 @@ impl GreptimeSession {
             parent_task_id: row.get("parent_task_id"),
         });
 
-        // Find the current max seq via COALESCE(MAX(seq), -1).
-        // Returns -1 for an empty session (no rows for the workspace/session).
-        // Scans the full session partition, which is acceptable because
-        // sessions are append-only and bounded by typical turn counts.
-        let row = client
+        let mut session = Self {
+            client,
+            next_seq: 0,
+            workspace_id: workspace_id.to_string(),
+            session_id: session_id.to_string(),
+            cached_meta: std::sync::Mutex::new(cached_meta),
+        };
+
+        // Seed next_seq from the DB's current max seq (see db_max_seq).
+        let max_seq = session.db_max_seq().await?;
+        session.next_seq = max_seq.checked_add(1).context(format!(
+            "max_seq overflow in connect for session '{session_id}'"
+        ))?;
+        Ok(session)
+    }
+
+    /// Query the current DB max seq for this session
+    /// (`COALESCE(MAX(seq), -1)` → `-1` for an empty partition). Scans the
+    /// full session partition, acceptable because sessions are append-only
+    /// and bounded by typical turn counts. Used to seed `next_seq` at
+    /// connect and to detect concurrent writers before every append.
+    async fn db_max_seq(&self) -> Result<i64> {
+        let row = self
+            .client
             .query_one(
                 "SELECT COALESCE(MAX(seq), -1)::BIGINT AS max_seq \
                  FROM session_entries \
                  WHERE workspace_id = $1 AND session_id = $2",
-                &[&workspace_id, &session_id],
+                &[&self.workspace_id, &self.session_id],
             )
             .await
             .context("cannot query max seq")?;
-        let max_seq: i64 = row.get("max_seq");
-
-        let next_seq = max_seq.checked_add(1).context(format!(
-            "max_seq overflow in connect for session '{session_id}'"
-        ))?;
-
-        Ok(Self {
-            client,
-            next_seq,
-            workspace_id: workspace_id.to_string(),
-            session_id: session_id.to_string(),
-            cached_meta: std::sync::Mutex::new(cached_meta),
-        })
+        Ok(row.get("max_seq"))
     }
 
     /// Advance next_seq from a snapshot length (the number of contiguous
@@ -705,12 +712,24 @@ impl GreptimeSession {
     /// `next_seq` is unchanged, so retries of the same slice reuse the same
     /// seq range. Identical-payload duplicates from a fully-committed-then-retried
     /// batch are folded by the read path.
+    ///
+    /// **Concurrent-write detection**: before any DB write the current DB
+    /// max seq is re-read (see [`Self::db_max_seq`]) and compared against
+    /// our cursor. A second writer (TUI + Web window, two e-agent processes
+    /// sharing one GreptimeDB, import_jsonl) that committed rows at or above
+    /// our `base_seq` is otherwise invisible — both writers would resume
+    /// from their own `next_seq` and silently interleave. Detection is
+    /// best-effort: it closes the pre-write window but cannot be atomic
+    /// (no transactions on the pg-wire), so a write racing the check itself
+    /// can still slip through. The overlap comparison distinguishes
+    /// "our own earlier commit" (idempotent retry: payloads identical →
+    /// skip re-insertion) from "a foreign writer" (any payload mismatch →
+    /// conflict error).
     pub async fn append(&mut self, entries: &[SessionEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
         let n = entries.len();
-        const CHUNK_SIZE: usize = 9000;
 
         // Validate the complete write range before any DB write.
         // All seqs from base_seq..base_seq+n must be representable as i64
@@ -738,6 +757,67 @@ impl GreptimeSession {
             prepped.push((seq, ts, kind, payload, err));
         }
 
+        // Concurrent-write detection: re-read the DB max seq before any
+        // write. db_max < base_seq → nothing above our cursor, normal path.
+        // db_max >= base_seq → rows already exist in [base_seq, db_max];
+        // fold the overlapping part and compare with this batch.
+        let db_max = self.db_max_seq().await?;
+        if db_max >= base_seq {
+            let overlap_hi = db_max.min(final_cursor - 1);
+            let overlap_len = (overlap_hi - base_seq + 1) as usize;
+            let conflict_seq = self
+                .overlap_conflict_seq(&prepped, base_seq, overlap_hi)
+                .await?;
+            if let Some(seq) = conflict_seq {
+                anyhow::bail!(
+                    "concurrent write conflict on session '{}': database max \
+                     seq is {db_max} but this writer expected to start at seq \
+                     {base_seq}; this session is being written concurrently by \
+                     another client (another e-agent process / TUI / Web \
+                     window). First divergence at seq {seq}. Stop the other \
+                     writer or continue in a fresh session, then retry.",
+                    self.session_id,
+                );
+            }
+            // The whole overlap matches this batch: it is our own earlier
+            // commit (committed-then-errored append whose next_seq never
+            // advanced). Treat it as already written.
+            if overlap_len == n {
+                // The DB may have advanced beyond our batch (foreign rows);
+                // resume past the true max so we never reuse foreign seqs.
+                self.next_seq = db_max.checked_add(1).context(format!(
+                    "max_seq overflow advancing next_seq after idempotent \
+                     retry in session '{}'",
+                    self.session_id
+                ))?;
+                return Ok(());
+            }
+            // Partial overlap: the matching prefix stays committed; insert
+            // only the remainder. prepped seqs are base_seq+i, so
+            // prepped[overlap_len..] continues contiguously from db_max+1
+            // and needs no re-serialization.
+            self.insert_prepped(&prepped[overlap_len..]).await?;
+            self.next_seq = final_cursor;
+            return Ok(());
+        }
+
+        self.insert_prepped(&prepped).await?;
+
+        // Advance next_seq only after all chunks succeed, so a partial
+        // failure does not shift sequence numbers on retry.
+        self.next_seq = final_cursor;
+
+        Ok(())
+    }
+
+    /// Insert prepped rows in chunked multi-row INSERTs (see [`Self::append`]
+    /// for the chunk-size rationale). Atomicity is per statement: a chunk
+    /// either commits all its rows or none.
+    async fn insert_prepped(
+        &self,
+        prepped: &[(i64, chrono::NaiveDateTime, String, String, bool)],
+    ) -> Result<()> {
+        const CHUNK_SIZE: usize = 9000;
         let wid = &self.workspace_id;
         let sid = &self.session_id;
         for chunk in prepped.chunks(CHUNK_SIZE) {
@@ -765,12 +845,79 @@ impl GreptimeSession {
                 .await
                 .context("cannot append chunk to session_entries")?;
         }
-
-        // Advance next_seq only after all chunks succeed, so a partial
-        // failure does not shift sequence numbers on retry.
-        self.next_seq = final_cursor;
-
         Ok(())
+    }
+
+    /// Compare the DB rows already present in the overlapping seq window
+    /// `[base_seq, overlap_hi]` against this batch's prepped rows for the
+    /// same seqs.
+    ///
+    /// Folds per seq to the latest `event_time` (matching the read path's
+    /// dedup semantics) and compares the winning payload against the
+    /// prepped payload:
+    ///
+    /// - All match → our own earlier commit (idempotent retry) → `Ok(None)`.
+    /// - Any payload differs → a foreign writer → `Ok(Some(seq))` with the
+    ///   first divergent seq.
+    ///
+    /// A window with missing seqs (fewer rows than the window width) is
+    /// also reported as a conflict: our own commits are contiguous
+    /// multi-row INSERTs, so a hole can only have been left by a foreign
+    /// writer that advanced seqs without writing them.
+    async fn overlap_conflict_seq(
+        &self,
+        prepped: &[(i64, chrono::NaiveDateTime, String, String, bool)],
+        base_seq: i64,
+        overlap_hi: i64,
+    ) -> Result<Option<i64>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT seq, event_time, payload FROM session_entries \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 AND seq >= $3 AND seq <= $4 \
+                 ORDER BY seq ASC, event_time ASC",
+                &[&self.workspace_id, &self.session_id, &base_seq, &overlap_hi],
+            )
+            .await
+            .context("cannot read back seq range for concurrent-write check")?;
+
+        // Group by seq, keeping only the row(s) with the latest event_time.
+        let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
+            std::collections::HashMap::with_capacity(rows.len().min(64));
+        for row in &rows {
+            let seq: i64 = row.get("seq");
+            let et: chrono::NaiveDateTime = row.get("event_time");
+            let payload: String = row.get("payload");
+            let entry = per_seq.entry(seq).or_insert((et, Vec::new()));
+            match et.cmp(&entry.0) {
+                std::cmp::Ordering::Greater => {
+                    entry.0 = et;
+                    entry.1 = vec![payload];
+                }
+                std::cmp::Ordering::Equal => entry.1.push(payload),
+                std::cmp::Ordering::Less => {}
+            }
+        }
+
+        // Missing seqs in the window → a foreign writer owns (parts of) it.
+        let window_len = (overlap_hi - base_seq + 1) as usize;
+        if per_seq.len() < window_len {
+            for seq in base_seq..=overlap_hi {
+                if !per_seq.contains_key(&seq) {
+                    return Ok(Some(seq));
+                }
+            }
+        }
+
+        for (seq, (_, payloads)) in per_seq {
+            let idx = (seq - base_seq) as usize;
+            let want = &prepped[idx].3;
+            if payloads.iter().any(|p| p != want) {
+                return Ok(Some(seq));
+            }
+        }
+        Ok(None)
     }
 
     // ------------------------------------------------------------------
@@ -1477,7 +1624,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_different_payload_newer_wins() {
+    async fn retry_different_payload_rejected_as_conflict() {
+        // Same-instance retry with a DIFFERENT payload over an already
+        // written seq range is indistinguishable from a concurrent writer
+        // (the DB records no writer identity), so the new append-time
+        // detection rejects it as a conflict instead of silently
+        // overwriting. Read-path latest-event_time folding for divergent
+        // payloads is still covered by the dedup_raw_entries unit tests;
+        // the write path now refuses to produce such rows.
         let conn = conn_str();
         if conn == "skipped" {
             eprintln!("skipping: GREPTIME_PG not set");
@@ -1503,24 +1657,179 @@ mod tests {
             .append(std::slice::from_ref(&old_entry))
             .await
             .unwrap();
-        // Retry same seq 0 with different payload, newer event_time
+        // Retry same seq 0 with a different payload → conflict error.
         session.next_seq = 0;
-        session
+        let err = session
             .append(std::slice::from_ref(&new_entry))
             .await
-            .unwrap();
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("concurrent write conflict"), "got: {msg}");
+        assert!(msg.contains(&sid), "got: {msg}");
+
+        // Nothing was written by the rejected attempt; the original row
+        // survives intact.
+        let loaded = session.load().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0], old_entry,
+            "rejected retry must not alter the row"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_detects_concurrent_writer() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-conflict-{}", crate::session::new_id());
+        let entries = test_entries();
+
+        // Writer A: writes seqs 0..2 (2 entries).
+        let mut writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_a.append(&entries[..2]).await.unwrap();
+        assert_eq!(writer_a.next_seq, 2);
+        drop(writer_a);
+
+        // Writer A2: a second concurrent writer (fresh connect, as a TUI +
+        // Web pair or a second process would do) appends seqs 2..4.
+        let mut writer_a2 = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_a2.append(&entries[2..4]).await.unwrap();
+        assert_eq!(writer_a2.next_seq, 4);
+        drop(writer_a2);
+
+        // Writer B holds a stale next_seq (=2, from before A2's write) and
+        // appends DIFFERENT content for seqs 2..4 → must be a conflict.
+        let mut writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_b.next_seq = 2;
+        let foreign: Vec<SessionEntry> = vec![
+            Message::User {
+                content: "b-writer divergent 2".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::User {
+                content: "b-writer divergent 3".into(),
+                images: vec![],
+            }
+            .into(),
+        ];
+        let err = writer_b.append(&foreign).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("concurrent write conflict"), "got: {msg}");
+        assert!(msg.contains(&sid), "error must name the session: {msg}");
+        assert!(
+            msg.contains("max seq") && msg.contains("expected to start"),
+            "error must report both the DB max seq and this writer's start seq: {msg}"
+        );
+
+        // The rejected attempt wrote nothing (detection happens before any
+        // INSERT), so the DB is untouched.
+        let loaded = writer_b.load().await.unwrap();
+        assert_eq!(loaded.len(), 4, "rejected attempt must not write rows");
+
+        // Idempotent retry: writer B re-appends A2's EXACT seqs 2..4 →
+        // Ok (folded as its own earlier commit), no duplicate rows.
+        writer_b.next_seq = 2;
+        writer_b.append(&entries[2..4]).await.unwrap();
+        assert_eq!(
+            writer_b.next_seq, 4,
+            "cursor resumes past the committed rows"
+        );
+        let loaded = writer_b.load().await.unwrap();
+        assert_eq!(loaded.len(), 4, "idempotent retry must not duplicate rows");
+        for (got, want) in loaded.iter().zip(entries[..4].iter()) {
+            assert_eq!(got, want, "content mismatch after idempotent retry");
+        }
+    }
+
+    #[tokio::test]
+    async fn append_reuses_own_retry() {
+        // Same instance: write seqs 0..2, then simulate a
+        // "committed but the caller saw an error" retry — the append's
+        // next_seq never advanced, so the caller re-appends the exact same
+        // entries over the same seq range. The overlap matches this batch
+        // exactly, so it is folded as idempotent: Ok, nothing written,
+        // read path stays duplicate-free.
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-ownretry-{}", crate::session::new_id());
+        let entries = test_entries();
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // First append: seqs 0..2.
+        session.append(&entries[..2]).await.unwrap();
+        assert_eq!(session.next_seq, 2);
+        // Retry with the cursor the caller still holds after the (errored)
+        // first attempt: same seqs, same payloads.
+        session.next_seq = 0;
+        session.append(&entries[..2]).await.unwrap();
+        assert_eq!(session.next_seq, 2, "idempotent retry keeps the cursor");
 
         let loaded = session.load().await.unwrap();
         assert_eq!(
             loaded.len(),
-            1,
-            "retry with different payload: latest event_time wins (expected 1, got {})",
+            2,
+            "idempotent retry must fold, not duplicate (expected 2, got {})",
             loaded.len(),
         );
+        for (got, want) in loaded.iter().zip(entries[..2].iter()) {
+            assert_eq!(got, want, "content mismatch after idempotent retry");
+        }
+    }
+
+    #[tokio::test]
+    async fn append_partial_overlap_resumes_remainder() {
+        // Partial overlap: a chunked append commits its first chunk (seqs
+        // 2..4) but the caller sees an error, so next_seq stays at 2; the
+        // retry re-appends the whole 4-entry slice (seqs 2..6). The
+        // committed prefix [2,4) matches → folded; the remainder [4,6) is
+        // inserted contiguously from db_max+1. No data loss, no duplicates.
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-partial-{}", crate::session::new_id());
+        let entries = test_entries();
+
+        // Writer A: seqs 0..2.
+        let mut writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_a.append(&entries[..2]).await.unwrap();
+        drop(writer_a);
+
+        // The "first chunk" of writer B's slice: seqs 2..4 committed by
+        // another connection (same content B will retry).
+        let mut writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_b.next_seq = 2;
+        writer_b.append(&entries[2..4]).await.unwrap();
+        assert_eq!(writer_b.next_seq, 4);
+        // Simulate the error: B still holds the pre-append cursor.
+        writer_b.next_seq = 2;
+
+        // Retry the full 4-entry slice: overlap [2,4) matches, remainder
+        // [4,6) is inserted at seqs 4,5.
+        writer_b.append(&entries[2..6]).await.unwrap();
+        assert_eq!(writer_b.next_seq, 6, "cursor advances past the remainder");
+
+        let loaded = writer_b.load().await.unwrap();
         assert_eq!(
-            loaded[0], new_entry,
-            "newer event_time entry should win over older"
+            loaded.len(),
+            6,
+            "prefix folded + remainder inserted = 6 entries, no duplicates (got {})",
+            loaded.len(),
         );
+        for (got, want) in loaded.iter().zip(entries[..6].iter()) {
+            assert_eq!(got, want, "content mismatch after partial-overlap retry");
+        }
     }
 
     #[tokio::test]
