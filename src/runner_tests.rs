@@ -133,6 +133,30 @@ impl Model for RecoveringModel {
     }
 }
 
+#[test]
+fn entry_event_projects_forked_from_as_notice() {
+    let event = entry_event(&SessionEntry::ForkedFrom {
+        source: "src-123".into(),
+        at: 4,
+        event_time: Some(1_700_000_000_000_000),
+        seq: Some(3),
+    });
+    assert!(
+        matches!(event, Some(AgentEvent::Notice(text)) if text == "forked from src-123 at entry 4"),
+        "forked_from must project to a dim Notice line"
+    );
+    // Provenance fields never leak into the projection.
+    let event = entry_event(&SessionEntry::ForkedFrom {
+        source: "src-123".into(),
+        at: 4,
+        event_time: None,
+        seq: None,
+    });
+    assert!(
+        matches!(event, Some(AgentEvent::Notice(text)) if text == "forked from src-123 at entry 4")
+    );
+}
+
 fn recovering_agent(
     replies: Vec<anyhow::Result<AssistantMessage>>,
     block_first: bool,

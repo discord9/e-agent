@@ -222,12 +222,78 @@ pub enum SessionEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    /// A new session forked from an existing one: source session id, the
+    /// 1-based entry index it was forked at, and the source's event_time +
+    /// seq of that entry (provenance; never sent to the provider).
+    ForkedFrom {
+        source: String,
+        at: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<i64>,
+    },
 }
 
 impl From<Message> for SessionEntry {
     fn from(message: Message) -> Self {
         Self::Message { message }
     }
+}
+
+/// True for entries that end a completed turn: an assistant message with no
+/// pending tool calls, or a compaction. Forking may only cut the history at
+/// such a boundary, so the forked session never starts mid-turn.
+fn is_turn_boundary(entry: &SessionEntry) -> bool {
+    matches!(entry, SessionEntry::Compaction { .. })
+        || matches!(
+            entry,
+            SessionEntry::Message {
+                message: Message::Assistant(assistant),
+            } if assistant.tool_calls.is_empty()
+        )
+}
+
+/// The history prefix a fork keeps: `entries[0..=boundary]`, where
+/// `boundary` is the last completed-turn boundary when `at` is None, or
+/// exactly `at - 1` (1-based, inclusive) when `at` is given. Trailing
+/// `Notice` / `BackgroundCompletion` / `ForkedFrom` entries after the
+/// boundary are dropped.
+///
+/// Errors (returned as plain strings, model-facing style):
+/// - empty session, or no completed turn to fork at;
+/// - `at` out of range (1-based, so 0 is rejected too);
+/// - `at` pointing at an entry that is not a turn boundary.
+pub fn fork_prefix(
+    entries: &[SessionEntry],
+    at: Option<usize>,
+) -> Result<Vec<SessionEntry>, String> {
+    if entries.is_empty() {
+        return Err("no completed turn in session".into());
+    }
+    let boundary = match at {
+        Some(n) => {
+            if n == 0 || n > entries.len() {
+                return Err(format!(
+                    "fork point {n} is out of range: session has {} entries",
+                    entries.len()
+                ));
+            }
+            n - 1
+        }
+        None => match entries.iter().rposition(is_turn_boundary) {
+            Some(index) => index,
+            None => return Err("no completed turn in session".into()),
+        },
+    };
+    if at.is_some() && !is_turn_boundary(&entries[boundary]) {
+        return Err(format!(
+            "fork point {} is not a turn boundary \
+             (an assistant message with no pending tool calls, or a compaction)",
+            at.unwrap_or(0)
+        ));
+    }
+    Ok(entries[..=boundary].to_vec())
 }
 
 /// Token accounting for one provider call, if the provider reports it.
@@ -410,7 +476,9 @@ impl Agent {
                         Self::mark_legacy_placeholder(message);
                     }
                 }
-                SessionEntry::Notice { .. } | SessionEntry::BackgroundCompletion { .. } => {}
+                SessionEntry::Notice { .. }
+                | SessionEntry::BackgroundCompletion { .. }
+                | SessionEntry::ForkedFrom { .. } => {}
             }
         }
         history
@@ -483,6 +551,9 @@ impl Agent {
                             content: format!("{header}\n{output}"),
                         })
                     }
+                    // Fork provenance is audit/display only; never put it on
+                    // the provider wire.
+                    SessionEntry::ForkedFrom { .. } => None,
                 }),
         );
         repair_tool_pairs(messages)
@@ -2209,5 +2280,213 @@ mod tests {
             &msgs[1],
             Message::User { content } if content == "[background task 2 completed]\nnew style"
         ));
+    }
+
+    // ── fork_prefix ──────────────────────────────────────────────────────
+
+    fn completed_turn(question: &str, answer: &str) -> Vec<SessionEntry> {
+        vec![
+            Message::User {
+                content: question.into(),
+            }
+            .into(),
+            Message::Assistant(AssistantMessage {
+                content: Some(answer.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            })
+            .into(),
+        ]
+    }
+
+    fn forked_history() -> Vec<SessionEntry> {
+        let mut entries = completed_turn("q1", "a1");
+        entries.extend(completed_turn("q2", "a2"));
+        entries.extend(completed_turn("q3", "a3"));
+        entries
+    }
+
+    #[test]
+    fn fork_prefix_default_cuts_at_last_completed_turn_and_drops_tail() {
+        let mut entries = forked_history();
+        // Trailing non-turn entries (Notice, BackgroundCompletion, another
+        // ForkedFrom) must be dropped by the default fork point.
+        entries.push(SessionEntry::Notice {
+            text: "[background task 1 completed]\nzzz".into(),
+        });
+        entries.push(SessionEntry::BackgroundCompletion {
+            id: 9,
+            output: "output".into(),
+            label: None,
+        });
+        entries.push(SessionEntry::ForkedFrom {
+            source: "other".into(),
+            at: 1,
+            event_time: None,
+            seq: None,
+        });
+
+        let prefix = fork_prefix(&entries, None).unwrap();
+        assert_eq!(prefix, forked_history());
+        // The boundary entry is the last assistant answer with no tool calls.
+        assert!(is_turn_boundary(prefix.last().unwrap()));
+    }
+
+    #[test]
+    fn fork_prefix_at_is_1_based_inclusive() {
+        let entries = forked_history();
+        let prefix = fork_prefix(&entries, Some(4)).unwrap();
+        assert_eq!(prefix.len(), 4);
+        assert_eq!(
+            prefix,
+            completed_turn("q1", "a1")
+                .into_iter()
+                .chain(completed_turn("q2", "a2"))
+                .collect::<Vec<_>>()
+        );
+        // Forking at the very last entry keeps everything.
+        assert_eq!(fork_prefix(&entries, Some(6)).unwrap(), entries);
+    }
+
+    #[test]
+    fn fork_prefix_rejects_mid_turn_at() {
+        let mut entries = forked_history();
+        // Insert an assistant message that still has a pending tool call
+        // (the turn is not complete at this entry).
+        entries.push(
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning: None,
+            })
+            .into(),
+        );
+        let error = fork_prefix(&entries, Some(7)).unwrap_err();
+        assert!(
+            error.contains("not a turn boundary"),
+            "mid-turn fork must be rejected, got {error:?}"
+        );
+        // Same entry is fine without an explicit at: the boundary search
+        // stops at the previous completed turn.
+        let prefix = fork_prefix(&entries, None).unwrap();
+        assert_eq!(prefix.len(), 6);
+    }
+
+    #[test]
+    fn fork_prefix_rejects_out_of_range_at() {
+        let entries = forked_history();
+        let error = fork_prefix(&entries, Some(7)).unwrap_err();
+        assert!(error.contains("out of range"), "{error}");
+        let error = fork_prefix(&entries, Some(0)).unwrap_err();
+        assert!(error.contains("out of range"), "0 is not 1-based: {error}");
+    }
+
+    #[test]
+    fn fork_prefix_rejects_empty_and_no_completed_turn() {
+        assert_eq!(
+            fork_prefix(&[], None).unwrap_err(),
+            "no completed turn in session"
+        );
+        assert_eq!(
+            fork_prefix(&[], Some(1)).unwrap_err(),
+            "no completed turn in session"
+        );
+        // Only user messages: no assistant boundary anywhere.
+        let no_turn = vec![
+            Message::User {
+                content: "q1".into(),
+            }
+            .into(),
+            Message::User {
+                content: "q2".into(),
+            }
+            .into(),
+        ];
+        assert_eq!(
+            fork_prefix(&no_turn, None).unwrap_err(),
+            "no completed turn in session"
+        );
+    }
+
+    #[test]
+    fn fork_prefix_accepts_compaction_as_boundary() {
+        let mut entries = forked_history();
+        entries.push(SessionEntry::Compaction {
+            summary: "summary".into(),
+            retained: vec![],
+        });
+        let prefix = fork_prefix(&entries, None).unwrap();
+        assert_eq!(prefix.len(), 7);
+        assert!(matches!(
+            prefix.last(),
+            Some(SessionEntry::Compaction { .. })
+        ));
+        // Explicit at on the compaction works too.
+        assert_eq!(fork_prefix(&entries, Some(7)).unwrap(), entries);
+    }
+
+    #[test]
+    fn forked_from_marker_serde_roundtrip_and_context_skip() {
+        // Serialization: provenance None fields are skipped, at/source kept.
+        let marker = SessionEntry::ForkedFrom {
+            source: "src-123".into(),
+            at: 4,
+            event_time: Some(1_700_000_000_000_000),
+            seq: Some(3),
+        };
+        let json = serde_json::to_string(&marker).unwrap();
+        assert!(json.contains(r#""type":"forked_from""#), "{json}");
+        assert!(json.contains(r#""source":"src-123""#), "{json}");
+        assert!(json.contains(r#""at":4"#), "{json}");
+        assert!(json.contains(r#""event_time":1700000000000000"#), "{json}");
+        assert!(json.contains(r#""seq":3"#), "{json}");
+        assert_eq!(serde_json::from_str::<SessionEntry>(&json).unwrap(), marker);
+        let marker_none = SessionEntry::ForkedFrom {
+            source: "src-123".into(),
+            at: 4,
+            event_time: None,
+            seq: None,
+        };
+        let json_none = serde_json::to_string(&marker_none).unwrap();
+        assert!(!json_none.contains("event_time"), "{json_none}");
+        assert!(!json_none.contains("seq"), "{json_none}");
+        assert_eq!(
+            serde_json::from_str::<SessionEntry>(&json_none).unwrap(),
+            marker_none
+        );
+
+        // context(): the marker must never reach the model wire.
+        let mut agent = Agent::new(
+            Box::new(ScriptedModel {
+                replies: vec![],
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delays: Default::default(),
+            }),
+            vec![],
+        );
+        agent.restore_history(vec![
+            marker_none.clone(),
+            Message::User {
+                content: "q1".into(),
+            }
+            .into(),
+            Message::Assistant(AssistantMessage {
+                content: Some("a1".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            })
+            .into(),
+        ]);
+        let msgs = agent.context();
+        assert_eq!(msgs.len(), 2, "forked_from must not appear in context");
+        assert!(matches!(
+            &msgs[0],
+            Message::User { content } if content == "q1"
+        ));
+        assert!(!format!("{msgs:?}").contains("src-123"));
     }
 }

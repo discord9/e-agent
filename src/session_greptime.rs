@@ -108,6 +108,7 @@ fn entry_kind(entry: &SessionEntry) -> &'static str {
         SessionEntry::Compaction { .. } => "compaction",
         SessionEntry::Notice { .. } => "notice",
         SessionEntry::BackgroundCompletion { .. } => "background_completion",
+        SessionEntry::ForkedFrom { .. } => "forked_from",
     }
 }
 

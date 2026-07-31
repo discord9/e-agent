@@ -432,6 +432,55 @@ mod tests {
     }
 
     #[test]
+    fn fork_roundtrip_writes_marker_plus_prefix_and_leaves_source_untouched() {
+        use crate::agent::fork_prefix;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = "source-session";
+        // Two completed turns plus a trailing notice (not a turn boundary).
+        let mut history = entries();
+        history.extend(entries());
+        history.push(SessionEntry::Notice {
+            text: "tail notice".into(),
+        });
+        Session::append(temp.path(), source, &history).unwrap();
+
+        let loaded = Session::load(temp.path(), source).unwrap();
+        let prefix = fork_prefix(&loaded.entries, None).unwrap();
+        assert_eq!(prefix.len(), 4, "trailing notice must be dropped");
+        let marker = SessionEntry::ForkedFrom {
+            source: source.into(),
+            at: prefix.len(),
+            event_time: None,
+            seq: Some(prefix.len() as i64 - 1),
+        };
+        let mut fork_entries = vec![marker];
+        fork_entries.extend(prefix);
+        let forked = "forked-session";
+        Session::rewrite(temp.path(), forked, &fork_entries).unwrap();
+
+        // Source session is byte-for-byte unchanged.
+        assert_eq!(Session::load(temp.path(), source).unwrap().entries, history);
+        // The new session file is exactly [ForkedFrom] + prefix, and loads
+        // back as the same entries (restore_history consumes this shape).
+        let raw =
+            std::fs::read_to_string(temp.path().join(".e-agent/sessions/forked-session.jsonl"))
+                .unwrap();
+        assert_eq!(raw.lines().count(), fork_entries.len());
+        assert!(
+            raw.lines()
+                .next()
+                .unwrap()
+                .contains(r#""type":"forked_from""#),
+            "first line must be the marker: {}",
+            raw.lines().next().unwrap()
+        );
+        let reloaded = Session::load(temp.path(), forked).unwrap();
+        assert!(!reloaded.legacy);
+        assert_eq!(reloaded.entries, fork_entries);
+    }
+
+    #[test]
     fn loads_legacy_v1_and_rewrites_as_jsonl() {
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path().join(".e-agent/sessions");

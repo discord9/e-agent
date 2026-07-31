@@ -122,6 +122,29 @@ impl SessionStore {
         }
     }
 
+    /// Load entries paired with their backend sequence number, in load
+    /// order. Used by `--fork` to record the source entry's seq as
+    /// provenance on the `ForkedFrom` marker.
+    ///
+    /// For JSONL there is no seq column; the 0-based ordinal (the JSONL line
+    /// index) is returned so the provenance is still meaningful. For
+    /// Greptime the real `seq` column values are returned.
+    pub async fn load_with_seq(&self, root: &Path, name: &str) -> Result<Vec<(i64, SessionEntry)>> {
+        match self {
+            SessionStore::Jsonl => {
+                let loaded = Session::load(root, name)?;
+                Ok(loaded
+                    .entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, entry)| (index as i64, entry))
+                    .collect())
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session.lock().await.load_with_seq().await,
+        }
+    }
+
     /// Append entries to the session log.
     ///
     /// For JSONL, `root` and `name` locate the file. For Greptime, the
