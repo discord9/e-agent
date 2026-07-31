@@ -47,7 +47,7 @@ without an explicit user request.
   (see README "Safety boundaries").
 - Errors: anyhow chains displayed with `{:#}`; model-facing tool errors
   stay plain strings.
-- `kimi-key` must never be committed (it is gitignored).
+- API key files must never be committed (they are gitignored).
 - Reasoning-model `reasoning_content` is persisted in the session for
   display/audit only and is never echoed back to the API
   (OpenAI/Kimi convention; Anthropic thinking blocks would be a wire-level
