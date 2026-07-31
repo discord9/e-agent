@@ -1,5 +1,6 @@
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::cursor::Show;
@@ -375,7 +376,8 @@ async fn run_inner(
             Some(first) = inbox.recv() => route_idle_events(&mut state, first, &mut inbox),
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
-                    if state.show_tasks { if let Some(id)=state.handle_tasks_panel_key(key) { attach_to_task(&mut state,id,&sessions,&sender); } else { let _=state.handle_panel_key(key); } continue; }
+                    if state.task_detail.is_some() { state.handle_task_detail_key(key); continue; }
+                    if state.show_tasks { match state.handle_tasks_panel_key(key) { TaskSelection::Attach(id) => attach_to_task(&mut state,id,&sessions,&sender), TaskSelection::OpenDetail(id) => state.open_task_detail(id), TaskSelection::None => { let _=state.handle_panel_key(key); } } continue; }
                     if state.attached.is_some() { if key.code==KeyCode::Esc { state.detach(); } else if is_scroll_key(key) { state.attached.as_mut().unwrap().state.handle_scroll(key); } else { let width=attached_input_width(terminal)?; state.handle_attached_key(key,width); } continue; }
                     let active = matches!(&*status.borrow(), SessionStatus::Busy | SessionStatus::Compacting);
                     if active && is_cancel(key) { handle.cancel(); continue; }
@@ -461,6 +463,17 @@ fn draw<'a, B: ratatui::backend::Backend>(
             .as_ref()
             .map(|background| background.running())
             .unwrap_or_default();
+        // Detail view: full-screen over the output/panel area. The spool Arc
+        // keeps the page alive after the task leaves the registry.
+        if let Some(detail) = &mut state.task_detail {
+            if !running.iter().any(|task| task.id == detail.id) {
+                detail.finished = true;
+            }
+            let area = frame.area();
+            render_task_detail(frame, detail, area);
+            force_wide_trailing_cell_updates(frame.buffer_mut(), area);
+            return;
+        }
         // Clamp cursor so it never points past the end (tasks may have
         // completed since the last render).
         state.task_cursor = state.task_cursor.min(running.len().saturating_sub(1));
@@ -1188,6 +1201,9 @@ struct TuiState {
     /// Attached session view; when set, draw renders this instead of the
     /// main scrollback and Esc detaches instead of cancelling the turn.
     attached: Option<Box<AttachedView>>,
+    /// Full-output detail view for a selected background bash task; when
+    /// set, draw renders it full-screen and keys route to it first.
+    task_detail: Option<TaskDetail>,
     /// Whether the terminal title has been set to a user-derived value.
     /// Once true, subsequent prompts never overwrite the title.
     session_title_set: bool,
@@ -1220,6 +1236,166 @@ impl Drop for AttachedView {
     fn drop(&mut self) {
         if let Some(bridge) = self.bridge.take() {
             bridge.abort();
+        }
+    }
+}
+
+/// Full-output viewer for a background bash task. The page holds one
+/// viewport of spool lines (plain Dim text, no markdown); `window` is the
+/// existing [`ScrollWindow`] machinery reused for page-internal scrolling.
+/// Scrolling past a page boundary loads the adjacent page from the spool.
+struct TaskDetail {
+    id: u64,
+    label: String,
+    /// Keeps the full output alive after the task completes (the registry
+    /// drops its reference when the task leaves `running()`).
+    spool: Arc<crate::tools::TaskSpool>,
+    finished: bool,
+    /// 0-based spool line number of `lines[0]`.
+    base_line: usize,
+    /// Current page of spool lines.
+    lines: Vec<DisplayLine>,
+    /// Page-internal window (source_* index into `lines`).
+    window: ScrollWindow,
+}
+
+impl TaskDetail {
+    fn new(id: u64, label: String, spool: Arc<crate::tools::TaskSpool>, finished: bool) -> Self {
+        Self {
+            id,
+            label,
+            spool,
+            finished,
+            base_line: 0,
+            lines: Vec::new(),
+            window: ScrollWindow::new(),
+        }
+    }
+
+    /// Fetch spool lines `[base, base+max_lines)` into the page.
+    /// `anchor_bottom` positions the viewport at the page's last rows
+    /// (used when paging up into the previous page). Does not touch
+    /// `follow_bottom`; callers set it (load_tail enables follow).
+    fn load_page(
+        &mut self,
+        base: usize,
+        max_lines: usize,
+        anchor_bottom: bool,
+        width: usize,
+        height: usize,
+    ) {
+        let window = self.spool.window(base, max_lines, MAX_RENDER_BYTES);
+        let Some(window) = window else {
+            // Empty spool (or base past the end): empty page.
+            self.base_line = base;
+            self.lines.clear();
+            self.window.source_start = 0;
+            self.window.source_end = 0;
+            self.window.local_offset = 0;
+            return;
+        };
+        self.base_line = window.first_line;
+        self.lines = window
+            .lines
+            .into_iter()
+            .map(|text| DisplayLine {
+                text,
+                kind: LineKind::Dim,
+            })
+            .collect();
+        self.window.source_start = 0;
+        self.window.source_end = self.lines.len();
+        self.window.local_offset = 0;
+        if anchor_bottom {
+            let total =
+                render_bounded_window(&local_window_lines(&self.lines, &self.window), width).len();
+            self.window.local_offset = total.saturating_sub(height);
+        }
+    }
+
+    /// Anchor the page at the spool tail and enable follow (draw reloads
+    /// the tail page every frame while `follow_bottom` stays true).
+    fn load_tail(&mut self, width: usize, height: usize) {
+        let capacity = height.max(1);
+        let total = self.spool.line_count();
+        self.load_page(
+            total.saturating_sub(capacity),
+            capacity,
+            false,
+            width,
+            height,
+        );
+        self.window.follow_bottom = true;
+        self.window.frozen_tail_cursor = None;
+        self.window.frozen_source_end = 0;
+    }
+
+    fn step_up(&mut self, width: usize, height: usize) {
+        self.window.follow_bottom = false;
+        if self.window.local_offset > 0 {
+            self.window.local_offset -= 1;
+        } else if self.base_line > 0 {
+            let step = self.lines.len().max(1);
+            self.load_page(
+                self.base_line.saturating_sub(step),
+                step,
+                true,
+                width,
+                height,
+            );
+        }
+    }
+
+    fn step_down(&mut self, width: usize, height: usize) {
+        if self.window.follow_bottom {
+            return;
+        }
+        let total =
+            render_bounded_window(&local_window_lines(&self.lines, &self.window), width).len();
+        if self.window.local_offset.saturating_add(height) < total {
+            self.window.local_offset += 1;
+        } else if self.base_line + self.lines.len() < self.spool.line_count() {
+            let step = self.lines.len().max(1);
+            self.load_page(self.base_line + step, step, false, width, height);
+        } else {
+            // Spool tail reached: resume follow (draw re-fetches the tail).
+            self.window.follow_bottom = true;
+        }
+    }
+
+    fn page_up(&mut self, width: usize, height: usize) {
+        self.window.follow_bottom = false;
+        if self.window.local_offset >= height {
+            self.window.local_offset -= height;
+        } else if self.base_line > 0 {
+            let into_prev = self.window.local_offset;
+            let step = self.lines.len().max(1);
+            self.load_page(
+                self.base_line.saturating_sub(step),
+                step,
+                true,
+                width,
+                height,
+            );
+            self.window.local_offset = self.window.local_offset.saturating_add(into_prev);
+        } else {
+            self.window.local_offset = 0;
+        }
+    }
+
+    fn page_down(&mut self, width: usize, height: usize) {
+        if self.window.follow_bottom {
+            return;
+        }
+        let total =
+            render_bounded_window(&local_window_lines(&self.lines, &self.window), width).len();
+        if self.window.local_offset.saturating_add(height) < total {
+            self.window.local_offset += height;
+        } else if self.base_line + self.lines.len() < self.spool.line_count() {
+            let step = self.lines.len().max(1);
+            self.load_page(self.base_line + step, step, false, width, height);
+        } else {
+            self.window.follow_bottom = true;
         }
     }
 }
@@ -1327,6 +1503,92 @@ fn render_bounded_window(lines: &[DisplayLine], width: usize) -> Vec<ratatui::te
         rows.drain(..rows.len() - MAX_RENDER_VISUAL_ROWS);
     }
     rows
+}
+
+/// Full-screen detail view for a background bash task: a bordered header
+/// (#id: label — status — N lines · X MiB (truncated) — key hints) plus the
+/// current spool page rendered as plain Dim text through the bounded window
+/// pipeline (no markdown). While `follow_bottom` the tail page is re-fetched
+/// every frame so a running task's output keeps streaming in.
+fn render_task_detail(
+    frame: &mut ratatui::Frame,
+    detail: &mut TaskDetail,
+    area: ratatui::layout::Rect,
+) {
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let height = usize::from(area.height.saturating_sub(2)).max(1);
+    if detail.window.follow_bottom {
+        detail.load_tail(width, height);
+    }
+    let (bytes, lines, truncated) = (
+        detail.spool.len(),
+        detail.spool.line_count(),
+        detail.spool.truncated(),
+    );
+    let status = if detail.finished {
+        "finished"
+    } else {
+        "running"
+    };
+    let header = format!(
+        "#{}: {} — {} — {} lines · {:.1} MiB{} — ↑↓ scroll  PgUp/PgDn  Home/End  Esc close  F2 close panel  Ctrl-C/x cancel",
+        detail.id,
+        crate::agent::preview(&detail.label, 40),
+        status,
+        lines,
+        bytes as f64 / (1024.0 * 1024.0),
+        if truncated { " (truncated)" } else { "" },
+    );
+    let block = SOLARIZED_LIGHT.block(header);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let local = local_window_lines(&detail.lines, &detail.window);
+    let visual = render_bounded_window(&local, width);
+    let total_rows = visual.len();
+    if detail.window.follow_bottom {
+        detail.window.local_offset = total_rows.saturating_sub(height);
+    }
+    detail.window.local_offset = detail
+        .window
+        .local_offset
+        .min(total_rows.saturating_sub(height).max(0));
+    {
+        let buf = frame.buffer_mut();
+        buf.set_style(inner, SOLARIZED_LIGHT.screen_style());
+        let scroll_offset = detail.window.local_offset;
+        // When following with fewer rows than the viewport, bottom-align
+        // like the main scrollback so the tail touches the border.
+        let render_top = if detail.window.follow_bottom && total_rows < height {
+            inner.bottom() - total_rows as u16
+        } else {
+            inner.y
+        };
+        for (row_idx, line) in visual.iter().enumerate().skip(scroll_offset) {
+            let y = render_top + (row_idx - scroll_offset) as u16;
+            if y >= inner.bottom() {
+                break;
+            }
+            buf.set_line(inner.x, y, line, inner.width);
+        }
+        // Restore glyph style on trailing cells set_stringn reset (same as
+        // the scrollback path, so wide glyphs keep their style).
+        for y in inner.y..inner.bottom() {
+            let mut x = inner.x;
+            while x < inner.right() {
+                let width = buf[(x, y)].cell_width();
+                if width > 1 {
+                    let glyph_style = buf[(x, y)].style();
+                    let last = (x + width).min(inner.right());
+                    for cx in x + 1..last {
+                        buf[(cx, y)].set_style(glyph_style);
+                    }
+                    x += width;
+                } else {
+                    x += 1;
+                }
+            }
+        }
+    }
 }
 
 /// Bounded local rendering window over a sub-range of the scrollback's
@@ -1598,6 +1860,18 @@ enum PanelAction {
     Passthrough,
 }
 
+/// Outcome of a selection key while the tasks panel is open.
+#[derive(Debug, PartialEq, Eq)]
+enum TaskSelection {
+    /// Attach to the selected task's session (delegate tasks, and cursor
+    /// moves to an attachable task).
+    Attach(u64),
+    /// Open the full-output detail view (Enter on a bash task).
+    OpenDetail(u64),
+    /// Key was not a selection; caller should fall through.
+    None,
+}
+
 impl TuiState {
     fn push_background_completion(&mut self, id: u64, output: &str, label: Option<&str>) {
         let header = match label.filter(|l| !l.trim().is_empty()) {
@@ -1828,9 +2102,10 @@ impl TuiState {
             .unwrap_or(0)
     }
 
-    /// Up/Down move the cursor and immediately attach to the selected task.
-    /// Returns the attach request `(task_id)` if one was made.
-    fn handle_tasks_panel_key(&mut self, key: KeyEvent) -> Option<u64> {
+    /// Up/Down move the cursor and immediately attach to the selected task;
+    /// Enter opens the full-output detail view for bash tasks and attaches
+    /// for delegate tasks. Returns the requested action, if any.
+    fn handle_tasks_panel_key(&mut self, key: KeyEvent) -> TaskSelection {
         let running = self
             .background
             .as_ref()
@@ -1839,6 +2114,12 @@ impl TuiState {
         // Clamp cursor before any navigation: tasks may have finished since
         // the last key press, leaving the cursor past the end.
         self.task_cursor = self.task_cursor.min(running.len().saturating_sub(1));
+        let attachable = |state: &TuiState, id: u64| -> bool {
+            state
+                .attachable
+                .as_ref()
+                .is_some_and(|attachable| attachable(id))
+        };
         match key.code {
             KeyCode::Up => {
                 self.task_cursor = self.task_cursor.saturating_sub(1);
@@ -1848,18 +2129,117 @@ impl TuiState {
                     self.task_cursor = (self.task_cursor + 1).min(running.len() - 1);
                 }
             }
-            KeyCode::Enter => {}
-            _ => return None,
+            KeyCode::Enter => {
+                let Some(task) = running.get(self.task_cursor) else {
+                    return TaskSelection::None;
+                };
+                return if task.kind == "bash" {
+                    TaskSelection::OpenDetail(task.id)
+                } else if attachable(self, task.id) {
+                    // Delegate: attach, exactly like a cursor move.
+                    TaskSelection::Attach(task.id)
+                } else {
+                    TaskSelection::None
+                };
+            }
+            _ => return TaskSelection::None,
         }
         // After any cursor move, attach to the newly selected task (if
         // attachable). Attaching is cheap — it replays an in-memory snapshot
         // and opens a broadcast channel, no I/O.
-        let task = running.get(self.task_cursor)?;
-        let attachable = self.attachable.as_ref()?;
-        if !attachable(task.id) {
-            return None;
+        let Some(task) = running.get(self.task_cursor) else {
+            return TaskSelection::None;
+        };
+        if attachable(self, task.id) {
+            TaskSelection::Attach(task.id)
+        } else {
+            TaskSelection::None
         }
-        Some(task.id)
+    }
+
+    /// Open the full-output detail view for a background bash task,
+    /// anchored at the spool tail (follow mode).
+    fn open_task_detail(&mut self, id: u64) {
+        let Some(background) = &self.background else {
+            return;
+        };
+        let Some(spool) = background.spool(id) else {
+            return;
+        };
+        let label = background
+            .running()
+            .into_iter()
+            .find(|task| task.id == id)
+            .map(|task| task.label)
+            .unwrap_or_default();
+        let mut detail = TaskDetail::new(id, label, spool, false);
+        detail.load_tail(self.inner_width.max(1), self.output_height.max(1));
+        self.task_detail = Some(detail);
+    }
+
+    /// Keys while the full-output detail view is open. Esc returns to the
+    /// tasks panel, F2 closes both, x/Ctrl-C cancels the task by id, scroll
+    /// keys page through the spool.
+    fn handle_task_detail_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.task_detail = None,
+            KeyCode::F(2) => {
+                self.task_detail = None;
+                self.show_tasks = false;
+            }
+            _ if key.code == KeyCode::Char('x') || is_cancel(key) => {
+                if let Some(id) = self.task_detail.as_ref().map(|detail| detail.id) {
+                    self.cancel_task(id);
+                }
+            }
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => self.handle_detail_scroll(key),
+            _ => {}
+        }
+    }
+
+    /// Page through the detail view: line keys move within the current
+    /// page, crossing a page boundary loads the adjacent page from the
+    /// spool (rebase of the page-internal window).
+    fn handle_detail_scroll(&mut self, key: KeyEvent) {
+        let Some(detail) = &mut self.task_detail else {
+            return;
+        };
+        let width = self.inner_width.max(1);
+        let height = self.output_height.max(1);
+        match key.code {
+            KeyCode::Up => detail.step_up(width, height),
+            KeyCode::Down => detail.step_down(width, height),
+            KeyCode::PageUp => detail.page_up(width, height),
+            KeyCode::PageDown => detail.page_down(width, height),
+            KeyCode::Home => {
+                detail.window.follow_bottom = false;
+                detail.load_page(0, height, false, width, height);
+            }
+            KeyCode::End => detail.load_tail(width, height),
+            _ => {}
+        }
+    }
+
+    /// Cancel a background task by id: registry cancel + session
+    /// bookkeeping + a dim line in the main scrollback.
+    fn cancel_task(&mut self, id: u64) {
+        if let Some(label) = self
+            .background
+            .as_ref()
+            .and_then(|background| background.cancel(id))
+        {
+            crate::session::Session::clear_background_task(
+                std::path::Path::new(&self.cwd),
+                &self.session_id,
+                id,
+            );
+            self.push_line(format!("cancelled task #{id}: {label}"), LineKind::Dim);
+        }
     }
 
     /// `x` / Ctrl-C in the tasks panel cancels the selected background task.
@@ -1873,17 +2253,7 @@ impl TuiState {
         let Some(task) = running.get(index) else {
             return;
         };
-        if let Some(label) = self.background.as_ref().and_then(|b| b.cancel(task.id)) {
-            crate::session::Session::clear_background_task(
-                std::path::Path::new(&self.cwd),
-                &self.session_id,
-                task.id,
-            );
-            self.push_line(
-                format!("cancelled task #{}: {}", task.id, label),
-                LineKind::Dim,
-            );
-        }
+        self.cancel_task(task.id);
         // Clamp cursor after removal so it never points past the end.
         let len = self
             .background
@@ -2841,12 +3211,260 @@ mod tests {
         };
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::empty());
-        assert_eq!(state.handle_tasks_panel_key(down), None);
+        assert_eq!(
+            state.handle_tasks_panel_key(down),
+            TaskSelection::None,
+            "no tasks: cursor stays at 0"
+        );
         assert_eq!(state.task_cursor, 0, "no tasks: cursor stays at 0");
-        assert_eq!(state.handle_tasks_panel_key(up), None);
+        assert_eq!(state.handle_tasks_panel_key(up), TaskSelection::None);
         assert_eq!(state.task_cursor, 0);
         let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
-        assert_eq!(state.handle_tasks_panel_key(a), None);
+        assert_eq!(state.handle_tasks_panel_key(a), TaskSelection::None);
+    }
+
+    #[tokio::test]
+    async fn tasks_panel_enter_routes_bash_to_detail_and_delegate_to_attach() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, mut background) =
+            crate::tools::builtins(crate::workspace::Workspace::new(temp.path()).unwrap(), None);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        background
+            .start(
+                crate::workspace::Workspace::new(temp.path()).unwrap(),
+                "echo hello; sleep 30".into(),
+                false,
+            )
+            .unwrap();
+        background
+            .spawn_with_id(
+                "delegate task".into(),
+                None,
+                None,
+                None,
+                |_| {},
+                || async { std::future::pending::<String>().await },
+            )
+            .unwrap();
+        let running = background.running();
+        assert_eq!(running.len(), 2);
+        assert_eq!(running[0].kind, "bash");
+        assert_eq!(running[1].kind, "delegate");
+
+        let mut state = TuiState {
+            background: Some(background.clone()),
+            show_tasks: true,
+            ..Default::default()
+        };
+        let delegate_id = running[1].id;
+        state.attachable = Some(Box::new(move |id| id == delegate_id));
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+        // Enter on the bash row opens the full-output detail view.
+        assert_eq!(
+            state.handle_tasks_panel_key(enter),
+            TaskSelection::OpenDetail(running[0].id)
+        );
+        // Enter on the delegate row attaches (original behavior).
+        state.task_cursor = 1;
+        assert_eq!(
+            state.handle_tasks_panel_key(enter),
+            TaskSelection::Attach(running[1].id)
+        );
+        // Cursor moves still attach to the attachable delegate task.
+        state.task_cursor = 0;
+        assert_eq!(
+            state.handle_tasks_panel_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())),
+            TaskSelection::Attach(running[1].id)
+        );
+        background.cancel(running[0].id);
+        background.cancel(running[1].id);
+        tokio::task::yield_now().await;
+    }
+
+    #[test]
+    fn task_detail_opens_anchored_at_tail_and_pages() {
+        let spool = Arc::new(crate::tools::TaskSpool::new());
+        let mut text = String::new();
+        for i in 0..300 {
+            text.push_str(&format!("line {i:03}\n"));
+        }
+        spool.append(text.as_bytes());
+        let mut state = TuiState {
+            inner_width: 80,
+            output_height: 10,
+            ..Default::default()
+        };
+        let scroll = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+        // Open anchors at the tail in follow mode (one viewport of lines).
+        let mut detail = TaskDetail::new(1, "demo".into(), spool, false);
+        detail.load_tail(80, 10);
+        assert!(detail.window.follow_bottom);
+        assert_eq!(detail.base_line, 290);
+        assert_eq!(detail.lines.first().unwrap().text, "line 290");
+        assert_eq!(detail.lines.last().unwrap().text, "line 299");
+        state.task_detail = Some(detail);
+
+        // PgUp freezes and pages up one viewport at a time.
+        state.handle_detail_scroll(scroll(KeyCode::PageUp));
+        let detail = state.task_detail.as_ref().unwrap();
+        assert!(!detail.window.follow_bottom);
+        assert_eq!(detail.base_line, 280);
+        assert_eq!(detail.lines.first().unwrap().text, "line 280");
+        state.handle_detail_scroll(scroll(KeyCode::PageUp));
+        assert_eq!(state.task_detail.as_ref().unwrap().base_line, 270);
+
+        // Home jumps to the first page.
+        state.handle_detail_scroll(scroll(KeyCode::Home));
+        let detail = state.task_detail.as_ref().unwrap();
+        assert_eq!(detail.base_line, 0);
+        assert_eq!(detail.lines.first().unwrap().text, "line 000");
+        assert_eq!(detail.window.local_offset, 0);
+        // Up at the very first page stays put.
+        state.handle_detail_scroll(scroll(KeyCode::Up));
+        assert_eq!(state.task_detail.as_ref().unwrap().base_line, 0);
+
+        // End restores follow at the tail.
+        state.handle_detail_scroll(scroll(KeyCode::End));
+        let detail = state.task_detail.as_ref().unwrap();
+        assert!(detail.window.follow_bottom);
+        assert_eq!(detail.base_line, 290);
+        // Down while following is a no-op.
+        state.handle_detail_scroll(scroll(KeyCode::Down));
+        assert!(state.task_detail.as_ref().unwrap().window.follow_bottom);
+
+        // Up freezes; Down pages forward to the tail page, then a second
+        // Down at the spool tail resumes follow.
+        state.handle_detail_scroll(scroll(KeyCode::Up));
+        let detail = state.task_detail.as_ref().unwrap();
+        assert!(!detail.window.follow_bottom);
+        assert_eq!(detail.base_line, 280);
+        state.handle_detail_scroll(scroll(KeyCode::Down));
+        let detail = state.task_detail.as_ref().unwrap();
+        assert_eq!(detail.base_line, 290);
+        assert!(!detail.window.follow_bottom);
+        state.handle_detail_scroll(scroll(KeyCode::Down));
+        assert!(state.task_detail.as_ref().unwrap().window.follow_bottom);
+    }
+
+    #[test]
+    fn task_detail_render_paints_header_and_finished() {
+        let spool = Arc::new(crate::tools::TaskSpool::new());
+        let mut text = String::new();
+        for i in 0..30 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        spool.append(text.as_bytes());
+        let mut state = TuiState {
+            task_detail: Some(TaskDetail::new(9, "demo".into(), spool, false)),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw(&mut terminal, &mut state).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Task 9 is not in the (empty) running snapshot → finished.
+        assert!(state.task_detail.as_ref().unwrap().finished);
+        // Header carries status, line count, and key hints.
+        let header: String = (0..120)
+            .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(header.contains("finished"), "{header}");
+        assert!(header.contains("30 lines"), "{header}");
+        assert!(header.contains("Esc close"), "{header}");
+        // Follow tail: lines 20..29 rendered as plain Dim text.
+        assert_eq!(buffer[(1, 1)].fg, SOLARIZED_LIGHT.muted);
+        assert!(buffer[(1, 1)].modifier.contains(Modifier::DIM));
+        let row: String = (1..119)
+            .map(|x| buffer[(x, 1)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert_eq!(row.trim_end(), "line 20");
+        let row: String = (1..119)
+            .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert_eq!(row.trim_end(), "line 29");
+    }
+
+    #[test]
+    fn task_detail_follow_bottom_aligns_short_output_and_esc_f2_close() {
+        let spool = Arc::new(crate::tools::TaskSpool::new());
+        spool.append(b"one\ntwo\nthree\n");
+        let mut state = TuiState {
+            show_tasks: true,
+            task_detail: Some(TaskDetail::new(9, "demo".into(), spool, false)),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw(&mut terminal, &mut state).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Fewer rows than the viewport: bottom-aligned like the scrollback.
+        let row: String = (1..39)
+            .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert_eq!(row.trim_end(), "three");
+
+        // Esc closes the detail and returns to the panel.
+        state.handle_task_detail_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(state.task_detail.is_none());
+        assert!(state.show_tasks, "Esc returns to the tasks panel");
+
+        // F2 closes the detail AND the panel.
+        let spool = Arc::new(crate::tools::TaskSpool::new());
+        spool.append(b"x\n");
+        state.task_detail = Some(TaskDetail::new(9, "demo".into(), spool, false));
+        state.handle_task_detail_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()));
+        assert!(state.task_detail.is_none());
+        assert!(!state.show_tasks, "F2 closes the detail and the panel");
+    }
+
+    #[tokio::test]
+    async fn task_detail_cancel_by_id_keeps_the_spool_paged() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, mut background) =
+            crate::tools::builtins(crate::workspace::Workspace::new(temp.path()).unwrap(), None);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(sender);
+        background
+            .start(
+                crate::workspace::Workspace::new(temp.path()).unwrap(),
+                "echo hello; sleep 30".into(),
+                false,
+            )
+            .unwrap();
+        let id = background.running()[0].id;
+        for _ in 0..50 {
+            if background
+                .spool(id)
+                .is_some_and(|spool| spool.line_count() >= 1)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut state = TuiState {
+            background: Some(background.clone()),
+            show_tasks: true,
+            cwd: temp.path().display().to_string(),
+            session_id: "detail-cancel".into(),
+            ..Default::default()
+        };
+        state.open_task_detail(id);
+        let detail = state.task_detail.as_ref().unwrap();
+        assert!(!detail.finished);
+        assert_eq!(detail.lines.first().unwrap().text, "hello");
+        // x cancels the task by the detail id (not the panel cursor).
+        state.handle_task_detail_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        tokio::task::yield_now().await;
+        assert!(background.running().is_empty());
+        // The detail stays open; its Arc keeps the spool paged.
+        assert!(state.task_detail.is_some());
+        assert_eq!(
+            state.task_detail.as_ref().unwrap().spool.line_count(),
+            1,
+            "cancelled task's spool is still readable"
+        );
     }
 
     #[tokio::test]

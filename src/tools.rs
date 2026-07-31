@@ -608,6 +608,7 @@ impl Tool for Bash {
             self.protect_git,
             None,
             None,
+            None,
             self.sandbox.as_ref(),
         )
         .await
@@ -655,6 +656,229 @@ fn slot_append(slot: &OutputSlot, chunk: &[u8]) {
     }
 }
 
+/// Full combined stdout+stderr of a background bash task, keep-first capped
+/// at [`FULL_SPOOL_LIMIT`]. The 16 KiB tail slot (panel preview, model-facing
+/// output) is untouched; the TUI detail view reads the full output
+/// exclusively through [`TaskSpool::window`]. The Arc in [`RunningTask`]
+/// keeps the data alive after the task leaves the registry, so a finished
+/// task's output stays paged in the detail view.
+pub struct TaskSpool {
+    state: std::sync::Mutex<SpoolState>,
+}
+
+const FULL_SPOOL_LIMIT: usize = 16 * 1024 * 1024; // 16 MiB keep-first
+const CHECKPOINT_INTERVAL: usize = 256; // one (line_no, byte_offset) per 256 lines
+const LINE_TRUNCATED_MARKER: &str = " [line truncated]";
+
+struct SpoolState {
+    /// Append-only bytes; stops growing (and sets `truncated`) at the cap.
+    bytes: Vec<u8>,
+    /// Completed lines (`\n` count), maintained incrementally on append.
+    line_count: usize,
+    /// Sparse index: line `line_no` (0-based) starts at `byte_offset`.
+    checkpoints: Vec<(usize, usize)>,
+    /// Whether the keep-first cap was hit (tail is missing).
+    truncated: bool,
+}
+
+impl Default for TaskSpool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TaskSpool {
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(SpoolState {
+                bytes: Vec::new(),
+                line_count: 0,
+                checkpoints: Vec::new(),
+                truncated: false,
+            }),
+        }
+    }
+
+    /// Append a chunk, maintaining the line count and sparse checkpoints.
+    /// Once the cap is reached further bytes are discarded.
+    pub fn append(&self, chunk: &[u8]) {
+        let mut state = self.state.lock().unwrap();
+        if state.truncated {
+            return;
+        }
+        let room = FULL_SPOOL_LIMIT.saturating_sub(state.bytes.len());
+        let take = chunk.len().min(room);
+        if take < chunk.len() {
+            state.truncated = true;
+        }
+        let base = state.bytes.len();
+        state.bytes.extend_from_slice(&chunk[..take]);
+        let mut line = state.line_count;
+        for (index, byte) in chunk[..take].iter().enumerate() {
+            if *byte == b'\n' {
+                line += 1;
+                if line.is_multiple_of(CHECKPOINT_INTERVAL) {
+                    state.checkpoints.push((line, base + index + 1));
+                }
+            }
+        }
+        state.line_count = line;
+    }
+
+    /// Total recorded bytes (never exceeds [`FULL_SPOOL_LIMIT`]).
+    pub fn len(&self) -> usize {
+        self.state.lock().unwrap().bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Total lines: completed lines plus a final unterminated line.
+    pub fn line_count(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        state.line_count + usize::from(has_partial_tail(&state))
+    }
+
+    /// Whether the keep-first cap was hit.
+    pub fn truncated(&self) -> bool {
+        self.state.lock().unwrap().truncated
+    }
+
+    /// A line-aligned window starting at 0-based spool line `start_line`,
+    /// at most `max_lines` lines and `max_bytes` bytes of content. Line
+    /// content is UTF-8-lossy decoded (matching the panel preview); a
+    /// partial trailing character on the final unterminated line is clamped
+    /// away until the character completes. A single line that exceeds the
+    /// byte budget keeps its tail plus a truncation marker. Returns `None`
+    /// when `start_line` is past the end of the spool.
+    pub fn window(
+        &self,
+        start_line: usize,
+        max_lines: usize,
+        max_bytes: usize,
+    ) -> Option<SpoolWindow> {
+        let state = self.state.lock().unwrap();
+        let total = state.line_count + usize::from(has_partial_tail(&state));
+        if start_line >= total {
+            return None;
+        }
+        let max_lines = max_lines.max(1);
+        let max_bytes = max_bytes.max(1);
+        let mut cursor = line_offset(&state, start_line);
+        let mut lines = Vec::new();
+        let mut used = 0usize;
+        while lines.len() < max_lines && cursor < state.bytes.len() && used < max_bytes {
+            let line_end = state.bytes[cursor..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(state.bytes.len(), |pos| cursor + pos);
+            // The final unterminated line clamps a partial trailing char;
+            // terminated lines decode lossy like the panel preview.
+            let content_end = if line_end < state.bytes.len() {
+                line_end
+            } else {
+                utf8_floor(&state.bytes, line_end)
+            };
+            let content_len = content_end - cursor;
+            if used + content_len > max_bytes {
+                // Single line exceeds the remaining budget: keep its tail.
+                // Skip it entirely when even the marker would not fit.
+                let budget = max_bytes - used;
+                if budget >= LINE_TRUNCATED_MARKER.len() {
+                    lines.push(truncated_tail_line(
+                        &state.bytes,
+                        cursor,
+                        content_end,
+                        budget,
+                    ));
+                }
+                break;
+            }
+            lines.push(String::from_utf8_lossy(&state.bytes[cursor..content_end]).into_owned());
+            used += content_len;
+            if line_end >= state.bytes.len() {
+                break;
+            }
+            cursor = line_end + 1;
+        }
+        Some(SpoolWindow {
+            lines,
+            first_line: start_line,
+            line_count: total,
+            truncated: state.truncated,
+        })
+    }
+}
+
+/// A line-aligned slice of a [`TaskSpool`], for the TUI detail view.
+pub struct SpoolWindow {
+    /// Line contents (no trailing newlines), lossy-decoded.
+    pub lines: Vec<String>,
+    /// 0-based spool line number of `lines[0]`.
+    pub first_line: usize,
+    /// Total lines in the spool (completed plus a final unterminated line).
+    pub line_count: usize,
+    /// Whether the spool hit its keep-first cap (tail is missing).
+    pub truncated: bool,
+}
+
+/// Whether the spool ends in a line without a trailing newline.
+fn has_partial_tail(state: &SpoolState) -> bool {
+    state.bytes.last().is_some_and(|byte| *byte != b'\n')
+}
+
+/// Byte offset where 0-based `line` starts: binary-search the sparse
+/// checkpoints, then scan forward at most [`CHECKPOINT_INTERVAL`] newlines.
+fn line_offset(state: &SpoolState, line: usize) -> usize {
+    let (mut cp_line, mut offset) = (0usize, 0usize);
+    match state.checkpoints.binary_search_by_key(&line, |&(l, _)| l) {
+        Ok(index) => {
+            cp_line = state.checkpoints[index].0;
+            offset = state.checkpoints[index].1;
+        }
+        Err(index) if index > 0 => {
+            cp_line = state.checkpoints[index - 1].0;
+            offset = state.checkpoints[index - 1].1;
+        }
+        Err(_) => {}
+    }
+    while cp_line < line && offset < state.bytes.len() {
+        if state.bytes[offset] == b'\n' {
+            cp_line += 1;
+        }
+        offset += 1;
+    }
+    offset
+}
+
+/// Round a byte offset down to a UTF-8 boundary: a partial trailing
+/// multi-byte character is dropped until it completes. (tui.rs has its own
+/// `&str`-based helpers; this one works on raw bytes.)
+fn utf8_floor(bytes: &[u8], end: usize) -> usize {
+    let end = end.min(bytes.len());
+    match std::str::from_utf8(&bytes[..end]) {
+        Ok(_) => end,
+        Err(error) => error.valid_up_to(),
+    }
+}
+
+/// Tail of a single over-long line within `budget` bytes, plus a marker.
+/// The cut never splits a multi-byte character.
+fn truncated_tail_line(bytes: &[u8], start: usize, end: usize, budget: usize) -> String {
+    let mut tail_start = end.saturating_sub(budget.saturating_sub(LINE_TRUNCATED_MARKER.len()));
+    if tail_start > start {
+        while tail_start < end && (bytes[tail_start] & 0xC0) == 0x80 {
+            tail_start += 1;
+        }
+    }
+    let mut text = String::from_utf8_lossy(&bytes[tail_start..end]).into_owned();
+    if tail_start > start {
+        text.push_str(LINE_TRUNCATED_MARKER);
+    }
+    text
+}
+
 #[derive(Clone)]
 struct RunningTask {
     id: u64,
@@ -663,6 +887,7 @@ struct RunningTask {
     process_group: Arc<AtomicI32>,
     handle: Arc<tokio::task::JoinHandle<()>>,
     output: Option<OutputSlot>,
+    spool: Option<Arc<TaskSpool>>,
     display_meta: Option<TaskDisplayMeta>,
     completion: Completion,
 }
@@ -747,6 +972,20 @@ impl BackgroundTasks {
             .collect()
     }
 
+    /// Full-output spool of a running bash task; `None` for delegate tasks
+    /// and tasks without an output spool. The returned Arc keeps the data
+    /// alive after the task finishes, so the TUI detail view can keep
+    /// paging through a completed task's output.
+    pub fn spool(&self, id: u64) -> Option<Arc<TaskSpool>> {
+        self.registry
+            .running
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|task| task.id == id)
+            .and_then(|task| task.spool.clone())
+    }
+
     /// Cancel a running background task. Aborting its future drops any
     /// in-flight `run_bash`, which kills the process group via its guard.
     /// Returns the cancelled task's label, or `None` if no such task.
@@ -785,8 +1024,10 @@ impl BackgroundTasks {
     ) -> Result<String, String> {
         let process_group = Arc::new(AtomicI32::new(0));
         let output: OutputSlot = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spool: Arc<TaskSpool> = Arc::new(TaskSpool::new());
         let pg = process_group.clone();
         let slot = output.clone();
+        let full = spool.clone();
         let timeout = self.timeout;
         let running = self.registry.clone();
         let sandbox = self.sandbox.clone();
@@ -800,6 +1041,7 @@ impl BackgroundTasks {
                 let mut running = running.running.lock().unwrap();
                 if let Some(task) = running.iter_mut().find(|task| task.id == id) {
                     task.output = Some(output);
+                    task.spool = Some(spool);
                 }
             },
             move || async move {
@@ -810,6 +1052,7 @@ impl BackgroundTasks {
                     protect_git,
                     Some(pg),
                     Some(slot),
+                    Some(full),
                     sandbox.as_ref(),
                 )
                 .await
@@ -982,6 +1225,7 @@ impl BackgroundTasks {
             process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),
             handle: Arc::new(handle),
             output: None,
+            spool: None,
             display_meta,
             completion,
         });
@@ -1037,6 +1281,7 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_bash(
     workspace: &Workspace,
     command: &str,
@@ -1044,6 +1289,7 @@ async fn run_bash(
     protect_git: bool,
     process_group_slot: Option<Arc<AtomicI32>>,
     output_slot: Option<OutputSlot>,
+    spool: Option<Arc<TaskSpool>>,
     sandbox: Option<&crate::config::Sandbox>,
 ) -> Result<String, String> {
     // Build the command: bare bash, or wrapped in bwrap when sandboxed.
@@ -1215,8 +1461,8 @@ async fn run_bash(
     let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
     let result = tokio::time::timeout(timeout, async {
         let (stdout, stderr, status) = tokio::join!(
-            capture(stdout, output_slot.clone()),
-            capture(stderr, output_slot),
+            capture(stdout, output_slot.clone(), spool.clone()),
+            capture(stderr, output_slot, spool),
             child.wait()
         );
         Ok::<_, std::io::Error>((stdout?, stderr?, status?))
@@ -1318,6 +1564,7 @@ struct Captured {
 async fn capture(
     mut reader: impl AsyncRead + Unpin,
     slot: Option<OutputSlot>,
+    spool: Option<Arc<TaskSpool>>,
 ) -> std::io::Result<Captured> {
     let mut bytes = Vec::new();
     let mut buffer = [0; 8192];
@@ -1329,6 +1576,9 @@ async fn capture(
         }
         if let Some(slot) = &slot {
             slot_append(slot, &buffer[..count]);
+        }
+        if let Some(spool) = &spool {
+            spool.append(&buffer[..count]);
         }
         let room = OUTPUT_LIMIT.saturating_sub(bytes.len());
         bytes.extend_from_slice(&buffer[..count.min(room)]);

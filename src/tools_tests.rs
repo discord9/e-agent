@@ -463,7 +463,7 @@ async fn capture_drains_and_marks_each_truncated_stream() {
     async fn captured(bytes: Vec<u8>) -> Captured {
         let (mut writer, reader) = tokio::io::duplex(1024);
         tokio::spawn(async move { writer.write_all(&bytes).await.unwrap() });
-        capture(reader, None).await.unwrap()
+        capture(reader, None, None).await.unwrap()
     }
     let stdout = captured(vec![b'o'; OUTPUT_LIMIT + 1]).await;
     let stderr = captured(vec![b'e'; OUTPUT_LIMIT + 1]).await;
@@ -1567,4 +1567,128 @@ async fn shared_bash_facades_keep_completions_at_their_origins() {
     );
     assert!(first_rx.try_recv().is_err());
     assert!(second_rx.try_recv().is_err());
+}
+
+// ── TaskSpool ────────────────────────────────────────────────────────────
+
+#[test]
+fn task_spool_windows_are_line_aligned_across_chunk_boundaries() {
+    let spool = TaskSpool::new();
+    spool.append(b"one\ntwo\n");
+    spool.append(b"three\nfour\nfive"); // unterminated final line
+    assert_eq!(spool.line_count(), 5);
+    assert_eq!(spool.len(), "one\ntwo\nthree\nfour\nfive".len());
+
+    let window = spool.window(0, 100, 1024).unwrap();
+    assert_eq!(window.first_line, 0);
+    assert_eq!(window.line_count, 5);
+    assert_eq!(window.lines, ["one", "two", "three", "four", "five"]);
+    assert!(!window.truncated);
+
+    // Mid-spool windows start at the requested line, not a chunk boundary.
+    let window = spool.window(2, 2, 1024).unwrap();
+    assert_eq!(window.first_line, 2);
+    assert_eq!(window.lines, ["three", "four"]);
+
+    // Past the end: None.
+    assert!(spool.window(5, 1, 1024).is_none());
+}
+
+#[test]
+fn task_spool_window_obeys_line_and_byte_budgets() {
+    let spool = TaskSpool::new();
+    spool.append(b"aaaa\nbbbb\ncccc\n");
+    assert_eq!(spool.window(0, 2, 1024).unwrap().lines, ["aaaa", "bbbb"]);
+    // Byte budget cuts mid-stream at a line boundary.
+    let window = spool.window(0, 100, 9).unwrap(); // "aaaa\n" = 5, "bbbb\n" = 5
+    assert_eq!(window.lines, ["aaaa", "bbbb"]); // 9 bytes used; "cccc" does not fit
+    // An over-long single line keeps its tail plus a marker.
+    let spool = TaskSpool::new();
+    spool.append(&vec![b'x'; 10_000]);
+    spool.append(b"\nshort\n");
+    let window = spool.window(0, 10, 128).unwrap();
+    assert_eq!(window.lines.len(), 1);
+    let line = &window.lines[0];
+    assert!(line.ends_with("[line truncated]"), "{line}");
+    assert!(line.starts_with(&"x".repeat(128 - "[line truncated]".len() - 1)));
+}
+
+#[test]
+fn task_spool_handles_multibyte_utf8_across_chunks() {
+    let spool = TaskSpool::new();
+    let name = "你";
+    let bytes = name.as_bytes();
+    // Partial character on the unterminated tail is clamped until complete.
+    spool.append(&bytes[..1]);
+    assert_eq!(spool.window(0, 10, 1024).unwrap().lines, [""]);
+    spool.append(&bytes[1..]);
+    assert_eq!(spool.window(0, 10, 1024).unwrap().lines, ["你"]);
+    spool.append(b"\nok\n");
+    assert_eq!(spool.window(0, 10, 1024).unwrap().lines, ["你", "ok"]);
+    // Invalid UTF-8 in a terminated line decodes lossy (panel behavior).
+    let spool = TaskSpool::new();
+    spool.append(b"\xff\xfe\n");
+    assert_eq!(
+        spool.window(0, 10, 1024).unwrap().lines,
+        ["\u{FFFD}\u{FFFD}"]
+    );
+}
+
+#[test]
+fn task_spool_caps_at_16_mib_and_flags_truncated() {
+    let spool = TaskSpool::new();
+    let chunk = vec![b'a'; 64 * 1024];
+    let mut capped = false;
+    for _ in 0..(FULL_SPOOL_LIMIT / chunk.len()) + 2 {
+        spool.append(&chunk);
+        if spool.truncated() {
+            capped = true;
+            break;
+        }
+    }
+    assert!(capped, "append past the cap must flag truncated");
+    assert!(spool.len() <= FULL_SPOOL_LIMIT);
+    assert!(spool.line_count() >= 1);
+    let window = spool.window(0, 1, 1024).unwrap();
+    assert!(window.truncated);
+    // The single giant line still windows (tail + marker).
+    assert!(window.lines[0].ends_with("[line truncated]"));
+}
+
+#[test]
+fn task_spool_checkpoints_jump_large_outputs() {
+    // > CHECKPOINT_INTERVAL lines: window() must locate any line via the
+    // sparse checkpoints (binary search + at most 256-line scan).
+    let spool = TaskSpool::new();
+    let mut expected = Vec::new();
+    for i in 0..1000 {
+        let line = format!("line-{i:04}");
+        spool.append(line.as_bytes());
+        spool.append(b"\n");
+        expected.push(line);
+    }
+    assert_eq!(spool.line_count(), 1000);
+    for (start, count) in [(0, 3), (255, 3), (256, 3), (511, 3), (998, 2)] {
+        let window = spool.window(start, count, 64 * 1024).unwrap();
+        assert_eq!(window.first_line, start);
+        assert_eq!(
+            window.lines,
+            expected[start..start + count],
+            "start={start}"
+        );
+    }
+    assert!(spool.window(1000, 1, 1024).is_none());
+}
+
+#[test]
+fn task_spool_tail_window_covers_the_last_lines() {
+    let spool = TaskSpool::new();
+    for i in 0..100 {
+        spool.append(format!("line {i}\n").as_bytes());
+    }
+    // A tail window larger than the remaining lines starts at 0.
+    let window = spool.window(0, 1000, 64 * 1024).unwrap();
+    assert_eq!(window.first_line, 0);
+    assert_eq!(window.lines.len(), 100);
+    assert_eq!(window.line_count, 100);
 }
