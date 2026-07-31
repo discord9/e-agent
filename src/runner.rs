@@ -378,11 +378,21 @@ impl SessionRunner {
             SessionEntry::Message {
                 message: Message::User { content },
             } => Some(AgentEvent::UserPrompt(content.clone())),
+            SessionEntry::BackgroundCompletion { id, output, label } => {
+                Some(AgentEvent::BackgroundCompletionNotice {
+                    id: *id,
+                    output: output.clone(),
+                    label: label.clone(),
+                })
+            }
             _ => None,
         };
         self.agent.apply_entry(entry);
         if let Some(event) = event {
-            self.shared.lock().unwrap().emit(event);
+            // Background notices become live only after their durable entry
+            // exists; using Agent's normal event path prevents a second UI-only
+            // injection and preserves session fanout semantics.
+            self.agent.emit_event(event);
         }
         Ok(())
     }
@@ -536,7 +546,7 @@ impl SessionRunner {
     }
 
     fn finish_cancelled_or_idle(&mut self) -> bool {
-        if self.policy == IdlePolicy::FinishWhenIdle {
+        if self.policy == IdlePolicy::FinishWhenIdle && !self.agent.has_running_background() {
             self.finalize_when_idle(SessionResult::Cancelled)
         } else {
             self.status(SessionStatus::Idle);
@@ -660,7 +670,9 @@ impl SessionRunner {
                     }
                 } else {
                     self.status(SessionStatus::Idle);
-                    if self.policy == IdlePolicy::FinishWhenIdle {
+                    if self.policy == IdlePolicy::FinishWhenIdle
+                        && !self.agent.has_running_background()
+                    {
                         let result = if self.cancelled {
                             SessionResult::Cancelled
                         } else {

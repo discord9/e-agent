@@ -44,8 +44,8 @@ pub fn builtins(
 
 /// Builtin tools bound to an existing background-task registry.
 ///
-/// Subagents use this path so their bash completions reach the parent while
-/// retaining the same optional web-search capability as the main agent.
+/// Subagents use this path to share global task visibility while their bash
+/// facade is independently bound to the subagent Agent's completion sink.
 pub fn builtins_with_background(
     workspace: Workspace,
     background: BackgroundTasks,
@@ -103,8 +103,8 @@ fn tools_with_background_and_exa_key(
 }
 
 /// File tools only; the bash tool is added by the caller so it can be
-/// bound to shared [`BackgroundTasks`] (subagents share the parent's
-/// registry so their background completions reach the parent agent).
+/// bound to shared [`BackgroundTasks`] (subagents share task visibility and
+/// cancellation, while their completions remain origin-session-local).
 pub fn file_tools(workspace: &Workspace) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(ReadFile {
@@ -132,6 +132,7 @@ pub fn bash_tool(
         workspace,
         timeout: Duration::from_secs(30),
         background,
+        sender: None,
         sandbox,
         protect_git,
     })
@@ -520,6 +521,9 @@ struct Bash {
     workspace: Workspace,
     timeout: Duration,
     background: BackgroundTasks,
+    /// Completion delivery belongs to this bash facade's Agent, not the
+    /// shared registry. Spawned tasks retain this origin sender.
+    sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
     sandbox: Option<crate::config::Sandbox>,
     /// When true and sandbox is enabled, bind `<workspace>/.git` read-only
     /// so subagents / fixers cannot corrupt the repository metadata.
@@ -590,10 +594,11 @@ impl Tool for Bash {
     async fn execute(&self, arguments: Value) -> Result<String, String> {
         let command = required_string(&arguments, "command")?;
         if optional_bool(&arguments, "background")? {
-            return self.background.start(
+            return self.background.start_with_sender(
                 self.workspace.clone(),
                 command.to_owned(),
                 self.protect_git,
+                self.sender.clone(),
             );
         }
         run_bash(
@@ -609,22 +614,30 @@ impl Tool for Bash {
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
-        self.background.sender = Some(sender);
+        self.sender = Some(sender);
     }
 
     fn has_event_sender(&self) -> bool {
-        self.background.sender.is_some()
+        self.sender.is_some()
     }
 }
 
 #[derive(Clone)]
 pub struct BackgroundTasks {
-    next_id: Arc<AtomicU64>,
-    running: Arc<std::sync::Mutex<Vec<RunningTask>>>,
+    registry: Arc<BackgroundRegistry>,
+    /// Compatibility sender for callers which schedule directly on a registry
+    /// (delegates do this). Bash deliberately does not use this field.
     sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
     timeout: Duration,
     sandbox: Option<crate::config::Sandbox>,
 }
+
+struct BackgroundRegistry {
+    next_id: AtomicU64,
+    running: std::sync::Mutex<Vec<RunningTask>>,
+}
+
+type Completion = Arc<std::sync::Mutex<Option<Box<dyn FnOnce(u64, String) + Send>>>>;
 
 /// A live, read-only snapshot of a background task's combined stdout+stderr
 /// tail (capped at 16KB), shared between the running `bash` capture and the
@@ -651,6 +664,7 @@ struct RunningTask {
     handle: Arc<tokio::task::JoinHandle<()>>,
     output: Option<OutputSlot>,
     display_meta: Option<TaskDisplayMeta>,
+    completion: Completion,
 }
 
 /// Structured metadata for delegate-task display in the F2 task panel.
@@ -681,8 +695,10 @@ pub struct BackgroundTaskInfo {
 impl BackgroundTasks {
     fn new(timeout: Duration, sandbox: Option<crate::config::Sandbox>) -> Self {
         Self {
-            next_id: Arc::new(AtomicU64::new(1)),
-            running: Arc::new(std::sync::Mutex::new(Vec::new())),
+            registry: Arc::new(BackgroundRegistry {
+                next_id: AtomicU64::new(1),
+                running: std::sync::Mutex::new(Vec::new()),
+            }),
             sender: None,
             timeout,
             sandbox,
@@ -707,7 +723,8 @@ impl BackgroundTasks {
 
     /// Snapshot of currently running background tasks, for the TUI panel.
     pub fn running(&self) -> Vec<BackgroundTaskInfo> {
-        self.running
+        self.registry
+            .running
             .lock()
             .unwrap()
             .iter()
@@ -735,11 +752,14 @@ impl BackgroundTasks {
     /// Returns the cancelled task's label, or `None` if no such task.
     pub fn cancel(&self, id: u64) -> Option<String> {
         let task = {
-            let mut running = self.running.lock().unwrap();
+            let mut running = self.registry.running.lock().unwrap();
             let index = running.iter().position(|task| task.id == id)?;
             running.remove(index)
         };
         task.handle.abort();
+        if let Some(done) = task.completion.lock().unwrap().take() {
+            done(id, "background task cancelled".into());
+        }
         Some(task.label)
     }
 
@@ -753,20 +773,31 @@ impl BackgroundTasks {
         command: String,
         protect_git: bool,
     ) -> Result<String, String> {
+        self.start_with_sender(workspace, command, protect_git, self.sender.clone())
+    }
+
+    pub fn start_with_sender(
+        &self,
+        workspace: Workspace,
+        command: String,
+        protect_git: bool,
+        sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<String, String> {
         let process_group = Arc::new(AtomicI32::new(0));
         let output: OutputSlot = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pg = process_group.clone();
         let slot = output.clone();
         let timeout = self.timeout;
-        let running = self.running.clone();
+        let running = self.registry.clone();
         let sandbox = self.sandbox.clone();
-        self.spawn_with_id(
+        self.spawn_with_id_to(
+            sender,
             preview(&command, 100),
             None,
             Some(process_group),
             None, // display_meta
             move |id| {
-                let mut running = running.lock().unwrap();
+                let mut running = running.running.lock().unwrap();
                 if let Some(task) = running.iter_mut().find(|task| task.id == id) {
                     task.output = Some(output);
                 }
@@ -822,9 +853,33 @@ impl BackgroundTasks {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
-        let sender = self
-            .sender
-            .clone()
+        self.spawn_with_id_to(
+            self.sender.clone(),
+            label,
+            role,
+            process_group,
+            display_meta,
+            on_id,
+            work,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_id_to<F, Fut>(
+        &self,
+        sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+        label: String,
+        role: Option<String>,
+        process_group: Option<Arc<AtomicI32>>,
+        display_meta: Option<TaskDisplayMeta>,
+        on_id: impl FnOnce(u64),
+        work: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = String> + Send + 'static,
+    {
+        let sender = sender
             .filter(|sender| !sender.is_closed())
             .ok_or("background task delivery is unavailable")?;
         let completion_label = label.clone();
@@ -888,30 +943,39 @@ impl BackgroundTasks {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.registry.next_id.fetch_add(1, Ordering::Relaxed);
         let started = format!("started background task {id}: {label}");
         let (work_tx, work_rx) = tokio::sync::oneshot::channel::<F>();
-        let running = self.running.clone();
+        // The task holds only a weak registry reference. Therefore dropping
+        // the final BackgroundTasks owner tears down the registry and kills
+        // its process groups, while dropping an ordinary shared clone does not.
+        let running = Arc::downgrade(&self.registry);
+        let completion: Completion = Arc::new(std::sync::Mutex::new(Some(Box::new(on_complete))));
+        let task_completion = completion.clone();
         let handle = tokio::spawn(async move {
             let Ok(work) = work_rx.await else {
-                running.lock().unwrap().retain(|task| task.id != id);
+                if let Some(running) = running.upgrade() {
+                    running.running.lock().unwrap().retain(|task| task.id != id);
+                }
                 return;
             };
             let output = work().await;
-            let completed = {
-                let mut running = running.lock().unwrap();
+            let completed = if let Some(running) = running.upgrade() {
+                let mut running = running.running.lock().unwrap();
                 if let Some(index) = running.iter().position(|task| task.id == id) {
                     running.remove(index);
                     true
                 } else {
                     false
                 }
+            } else {
+                false
             };
-            if completed {
-                on_complete(id, output);
+            if completed && let Some(done) = task_completion.lock().unwrap().take() {
+                done(id, output);
             }
         });
-        self.running.lock().unwrap().push(RunningTask {
+        self.registry.running.lock().unwrap().push(RunningTask {
             id,
             label,
             role,
@@ -919,6 +983,7 @@ impl BackgroundTasks {
             handle: Arc::new(handle),
             output: None,
             display_meta,
+            completion,
         });
         on_id(id);
         if let Err(work) = work_tx.send(work) {
@@ -928,7 +993,7 @@ impl BackgroundTasks {
     }
 }
 
-impl Drop for BackgroundTasks {
+impl Drop for BackgroundRegistry {
     fn drop(&mut self) {
         #[cfg(unix)]
         for task in self.running.lock().unwrap().iter() {

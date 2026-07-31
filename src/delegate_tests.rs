@@ -279,7 +279,10 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
     assert!(crate::session::Session::take_unfinished_background(&root, "parent").is_empty());
     assert_eq!(work_runs.load(Ordering::SeqCst), 0);
     assert_eq!(signals.side_effects.load(Ordering::SeqCst), 0);
-    assert!(completions.try_recv().is_err());
+    assert!(matches!(
+        completions.try_recv(),
+        Ok(AgentEvent::BackgroundCompleted { output, .. }) if output == "background task cancelled"
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -338,7 +341,10 @@ async fn background_cancel_before_first_yield_cleans_everything() {
     assert!(sessions.sessions.lock().unwrap().is_empty());
     assert!(crate::session::Session::take_unfinished_background(temp.path(), "parent").is_empty());
     assert_eq!(signals.side_effects.load(Ordering::SeqCst), 0);
-    assert!(completions.try_recv().is_err());
+    assert!(matches!(
+        completions.try_recv(),
+        Ok(AgentEvent::BackgroundCompleted { output, .. }) if output == "background task cancelled"
+    ));
 }
 
 #[tokio::test]
@@ -398,7 +404,10 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
     assert!(sessions.sessions.lock().unwrap().is_empty());
     assert!(crate::session::Session::take_unfinished_background(temp.path(), "parent").is_empty());
     assert_eq!(signals.side_effects.load(Ordering::SeqCst), 0);
-    assert!(completions.try_recv().is_err());
+    assert!(matches!(
+        completions.try_recv(),
+        Ok(AgentEvent::BackgroundCompleted { output, .. }) if output == "background task cancelled"
+    ));
 }
 
 #[tokio::test]
@@ -727,7 +736,7 @@ async fn role_requires_a_roles_root_and_a_known_role() {
 }
 
 #[tokio::test]
-async fn shared_background_bash_completion_reaches_the_parent_channel() {
+async fn shared_background_registry_completion_reaches_its_configured_channel() {
     // A bash tool bound to the parent's BackgroundTasks keeps that
     // sender when wrapped in an Agent (Agent::new must not retarget
     // it): a background command's completion arrives on the parent's

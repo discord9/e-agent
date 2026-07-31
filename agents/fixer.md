@@ -26,3 +26,7 @@ Brief summary of what was implemented.
 - No external research, no architectural decisions, no design/visual judgment.
 - No multi-step exploration; if the spec is ambiguous in a way that changes behavior, implement the most reasonable interpretation and note the assumption in `<summary>`.
 - If you hit a genuine blocker (missing input, conflicting requirements), stop and report the blocker plus the exact question the orchestrator must answer — do not ask the user directly.
+
+## Background tasks
+
+- Background completion automatically resumes the originating session; do not poll, sleep, or re-check task status. Continue independent work or end the turn and let the originating session consume its completion.
