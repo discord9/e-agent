@@ -905,6 +905,9 @@ async fn index() -> impl IntoResponse {
         Ok(html) => HttpResponse::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            // Never cache the dev UI: browsers would serve a stale HTML
+            // (missing the latest scroll/flex fixes) after a reload.
+            .header(header::CACHE_CONTROL, "no-store")
             .body(html)
             .unwrap(),
         Err(error) => HttpResponse::builder()
