@@ -720,6 +720,10 @@
 <script>
 "use strict";
 
+/* 历史分页：每页条数。长会话分块加载/渲染，避免一次渲染上千条 DOM
+   导致移动/桌面浏览器滚动卡死。 */
+const HISTORY_PAGE = 200;
+
 /* =====================================================================
  * 全局状态
  * ===================================================================*/
@@ -1091,7 +1095,11 @@ function scrollBottom(force) {
   if (suppressScroll) return;
   if (userScrolled) return;   // 用户主动离开底部在看历史：任何自动滚动都不打扰
   const near = m.scrollHeight - m.scrollTop - m.clientHeight < 80;
-  if (force || near) m.scrollTop = m.scrollHeight;
+  if (force || near) {
+    m.scrollTop = m.scrollHeight;
+    // 程序滚到底后同步按钮状态（scroll 事件被 isTrusted 拦截时不会触发）
+    if (els.jumpBottomBtn) els.jumpBottomBtn.hidden = true;
+  }
 }
 
 function appendUserMsg(text) {
@@ -1720,7 +1728,9 @@ function stopSSE() {
  * ===================================================================*/
 async function loadHistory(id) {
   try {
-    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/history");
+    // 只取尾部 HISTORY_PAGE 条：长会话不一次全量渲染（Firefox 等浏览器
+    // 对超大 DOM 滚动卡死）；滚动触顶时 loadOlder 增量加载更早。
+    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/history?limit=" + HISTORY_PAGE);
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return "auth"; }
     if (res.status === 404) { setBanner("⚠ 会话不存在或已被删除。"); return "gone"; }
     if (!res.ok) throw new Error("HTTP " + res.status);
@@ -1749,7 +1759,7 @@ async function loadOlder() {
   const prevHeight = els.messages.scrollHeight;   // 插入前高度
   try {
     const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId)
-      + "/history?before_seq=" + state.nextBeforeSeq);
+      + "/history?before_seq=" + state.nextBeforeSeq + "&limit=" + HISTORY_PAGE);
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
     if (!res.ok) return;                          // 静默失败，下次滚动重试
     const data = await res.json();
@@ -2063,19 +2073,17 @@ els.promptInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
 });
 els.promptInput.addEventListener("input", autosizeInput);
-els.messages.addEventListener("scroll", () => {
-  // 用户滚到接近底部时恢复自动跟随
+els.messages.addEventListener("scroll", (ev) => {
+  // 只有用户主动滚动才处理；程序滚动（scrollTop 赋值）不碰 userScrolled。
+  if (!ev.isTrusted) return;
   const m = els.messages;
-  const nearBottom = m.scrollHeight - m.scrollTop - m.clientHeight < 80;
-  if (nearBottom) {
-    userScrolled = false;
-    scrollBottom(true);
-  } else {
-    // 用户主动离开底部（上滑查看历史/输出）：暂停自动跟随
-    userScrolled = true;
-  }
+  // 精确到底（不是 80px 模糊带）：用户拖到最底部才解锁自动跟随。
+  // 只要没到底部，任何用户滚动都立即锁定——避免慢慢上滑时在底部
+  // 模糊带内被反复拉回（用户报告的「慢拖弹回、快拖能滚」）。
+  const atBottom = m.scrollHeight - m.scrollTop - m.clientHeight <= 4;
+  userScrolled = !atBottom;
   // 离开底部时显示「回到底部」按钮；在底部则隐藏
-  els.jumpBottomBtn.hidden = nearBottom;
+  els.jumpBottomBtn.hidden = atBottom;
   // 滚到接近顶部时加载更早历史（分页；防重入 / 已全部加载 / 未开会话时跳过）
   if (state.loadingOlder || state.olderDone || !state.sessionId) return;
   if (m.scrollTop < 30) loadOlder();
