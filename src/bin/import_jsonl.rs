@@ -445,6 +445,7 @@ mod tests {
     fn msg(content: &str) -> SessionEntry {
         Message::User {
             content: content.to_owned(),
+            images: vec![],
         }
         .into()
     }

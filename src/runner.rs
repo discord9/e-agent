@@ -2,7 +2,8 @@
 
 use crate::{
     agent::{
-        Agent, AgentEvent, CompactionOutput, Message, RoundOutput, SessionEntry, ToolCall, ToolSpec,
+        Agent, AgentEvent, CompactionOutput, ImagePart, Message, RoundOutput, SessionEntry,
+        ToolCall, ToolSpec,
     },
     session_store::SessionStore,
 };
@@ -83,6 +84,11 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionCommand {
     Prompt(String),
+    /// A prompt with an image attached (REPL `/image <path>` entrance).
+    PromptWithImage {
+        text: String,
+        image: ImagePart,
+    },
     Cancel,
     Compact,
 }
@@ -145,16 +151,28 @@ pub struct SessionHandle {
 }
 impl SessionHandle {
     pub fn prompt(&self, prompt: impl Into<String>) {
-        let prompt = prompt.into();
+        self.prompt_inner(prompt.into(), None);
+    }
+
+    /// Queue a prompt with an image attached; the image rides along as a
+    /// reference on the resulting `Message::User`.
+    pub fn prompt_with_image(&self, prompt: impl Into<String>, image: ImagePart) {
+        self.prompt_inner(prompt.into(), Some(image));
+    }
+
+    fn prompt_inner(&self, prompt: String, image: Option<ImagePart>) {
         let mut shared = self.shared.lock().unwrap();
         if !shared.commands_open || self.commands.is_closed() {
             return;
         }
-        if self
-            .commands
-            .send(SessionCommand::Prompt(prompt.clone()))
-            .is_ok()
-        {
+        let command = match image {
+            Some(image) => SessionCommand::PromptWithImage {
+                text: prompt.clone(),
+                image,
+            },
+            None => SessionCommand::Prompt(prompt.clone()),
+        };
+        if self.commands.send(command).is_ok() {
             if matches!(
                 *shared.status.borrow(),
                 SessionStatus::Busy | SessionStatus::Compacting
@@ -287,7 +305,13 @@ enum OperationFlow {
 }
 
 enum PendingCommand {
-    Prompt { text: String, queued: bool },
+    Prompt {
+        text: String,
+        queued: bool,
+        /// Image reference attached by the REPL `/image` entrance; becomes
+        /// `Message::User.images` on the committed prompt.
+        image: Option<ImagePart>,
+    },
     Compact,
 }
 
@@ -363,6 +387,7 @@ impl SessionRunner {
             self.pending.push_back(PendingCommand::Prompt {
                 text: prompt,
                 queued: false,
+                image: None,
             });
         }
         SessionTask {
@@ -376,7 +401,7 @@ impl SessionRunner {
             .await?;
         let event = match &entry {
             SessionEntry::Message {
-                message: Message::User { content },
+                message: Message::User { content, .. },
             } => Some(AgentEvent::UserPrompt(content.clone())),
             SessionEntry::BackgroundCompletion { id, output, label } => {
                 Some(AgentEvent::BackgroundCompletionNotice {
@@ -399,9 +424,14 @@ impl SessionRunner {
     async fn commit_user_batch(
         &mut self,
         content: String,
+        image: Option<ImagePart>,
         consumed: Vec<(bool, String)>,
     ) -> anyhow::Result<()> {
-        let entry: SessionEntry = Message::User { content }.into();
+        let entry: SessionEntry = Message::User {
+            content,
+            images: image.map_or_else(Vec::new, |image| vec![image]),
+        }
+        .into();
         self.store
             .append(&self.root, &self.session, std::slice::from_ref(&entry))
             .await?;
@@ -459,9 +489,10 @@ impl SessionRunner {
             while self.has_work() {
                 match self.pending.front() {
                     Some(PendingCommand::Prompt { .. }) => {
-                        let (prompt, consumed) = self.take_prompt_batch();
+                        let (prompt, image, consumed) = self.take_prompt_batch();
                         if !prompt.is_empty()
-                            && let Err(error) = self.commit_user_batch(prompt, consumed).await
+                            && let Err(error) =
+                                self.commit_user_batch(prompt, image, consumed).await
                         {
                             self.shared.lock().unwrap().emit(AgentEvent::Error(format!(
                                 "persisting accepted prompt while terminating: {error:#}"
@@ -486,6 +517,15 @@ impl SessionRunner {
                 self.pending.push_back(PendingCommand::Prompt {
                     text: prompt,
                     queued: true,
+                    image: None,
+                });
+                false
+            }
+            SessionCommand::PromptWithImage { text, image } => {
+                self.pending.push_back(PendingCommand::Prompt {
+                    text,
+                    queued: true,
+                    image: Some(image),
                 });
                 false
             }
@@ -530,19 +570,28 @@ impl SessionRunner {
         !self.pending.is_empty()
     }
 
-    fn take_prompt_batch(&mut self) -> (String, Vec<(bool, String)>) {
+    fn take_prompt_batch(&mut self) -> (String, Option<ImagePart>, Vec<(bool, String)>) {
         let mut prompts = Vec::new();
         let mut consumed = Vec::new();
+        let mut image = None;
         while matches!(self.pending.front(), Some(PendingCommand::Prompt { .. })) {
-            let Some(PendingCommand::Prompt { text, queued }) = self.pending.pop_front() else {
+            let Some(PendingCommand::Prompt {
+                text,
+                queued,
+                image: pending_image,
+            }) = self.pending.pop_front()
+            else {
                 unreachable!()
             };
+            if image.is_none() {
+                image = pending_image;
+            }
             if !text.is_empty() {
                 consumed.push((queued, text.clone()));
             }
             prompts.push(text);
         }
-        (prompts.join("\n\n"), consumed)
+        (prompts.join("\n\n"), image, consumed)
     }
 
     fn finish_cancelled_or_idle(&mut self) -> bool {
@@ -629,6 +678,7 @@ impl SessionRunner {
                     self.pending.push_back(PendingCommand::Prompt {
                         text: String::new(),
                         queued: false,
+                        image: None,
                     })
                 }
                 Ok(_) => {}
@@ -706,10 +756,10 @@ impl SessionRunner {
                     }
                 }
             }
-            let (prompt, consumed) = self.take_prompt_batch();
+            let (prompt, image, consumed) = self.take_prompt_batch();
             self.status(SessionStatus::Busy);
             if !prompt.is_empty()
-                && let Err(error) = self.commit_user_batch(prompt, consumed).await
+                && let Err(error) = self.commit_user_batch(prompt, image, consumed).await
             {
                 self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
                     .await;
@@ -823,7 +873,24 @@ impl SessionRunner {
                             return;
                         }
                     };
-                    let entry = tool_entry(&call, &result);
+                    // A read_image result carries a structured image marker;
+                    // strip it so the committed Tool entry and the ToolResult
+                    // event keep only the text summary (base64 never reaches
+                    // the scrollback), then attach the image as a synthetic
+                    // User message right after the tool result (images ride
+                    // only on user role).
+                    let (tool_text, image) = match &result {
+                        Ok(content) => crate::agent::split_image_marker(content),
+                        Err(error) => (error.clone(), None),
+                    };
+                    let entry = Message::Tool {
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        content: tool_text.clone(),
+                        is_error: result.is_err(),
+                        synthetic: false,
+                    }
+                    .into();
                     if let Err(error) = self.commit(entry).await {
                         self.terminate(SessionResult::Failed(format!("{error:#}")), waited.pending)
                             .await;
@@ -832,8 +899,25 @@ impl SessionRunner {
                     self.agent.after_tool_entry(&call, &result);
                     self.agent.emit_event(AgentEvent::ToolResult {
                         is_error: result.is_err(),
-                        content: result.unwrap_or_else(|error| error),
+                        content: tool_text,
                     });
+                    if let Some(image) = image {
+                        let path =
+                            crate::agent::tool_path_argument(&call.arguments).unwrap_or_default();
+                        let user_entry: SessionEntry = Message::User {
+                            content: format!("[image attached: {path}]"),
+                            images: vec![image],
+                        }
+                        .into();
+                        if let Err(error) = self.commit(user_entry).await {
+                            self.terminate(
+                                SessionResult::Failed(format!("{error:#}")),
+                                waited.pending,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
                     self.intake_after_operation(waited.pending);
                     if self.stop_turn_for_cancel() {
                         break 'turn;
@@ -849,7 +933,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             message: Message::System { .. },
         } => None,
         SessionEntry::Message {
-            message: Message::User { content },
+            message: Message::User { content, .. },
         } => Some(AgentEvent::UserPrompt(content.clone())),
         SessionEntry::Message {
             message: Message::Assistant(message),
@@ -877,17 +961,6 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             "forked from {source} at entry {at}"
         ))),
     }
-}
-
-fn tool_entry(call: &ToolCall, result: &Result<String, String>) -> SessionEntry {
-    Message::Tool {
-        call_id: call.id.clone(),
-        name: call.name.clone(),
-        content: result.as_ref().unwrap_or_else(|e| e).clone(),
-        is_error: result.is_err(),
-        synthetic: false,
-    }
-    .into()
 }
 
 #[cfg(test)]

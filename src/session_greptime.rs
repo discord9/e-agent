@@ -618,6 +618,7 @@ mod tests {
             .into(),
             Message::User {
                 content: "hello world".into(),
+                images: vec![],
             }
             .into(),
             Message::Assistant(AssistantMessage {
@@ -647,6 +648,7 @@ mod tests {
                 retained: vec![
                     Message::User {
                         content: "retained user".into(),
+                        images: vec![],
                     },
                     Message::Assistant(AssistantMessage {
                         content: Some("retained assistant".into()),
@@ -671,10 +673,12 @@ mod tests {
             },
             Message::User {
                 content: "你好世界👋\n多行".into(),
+                images: vec![],
             }
             .into(),
             Message::User {
                 content: "'); DROP TABLE session_entries; --".into(),
+                images: vec![],
             }
             .into(),
         ]
@@ -772,10 +776,12 @@ mod tests {
         // First write: seq 0 with "old_content"
         let old_entry: SessionEntry = Message::User {
             content: "old_content".into(),
+            images: vec![],
         }
         .into();
         let new_entry: SessionEntry = Message::User {
             content: "new_content".into(),
+            images: vec![],
         }
         .into();
 
@@ -901,6 +907,7 @@ mod tests {
 
         let user_msg = Message::User {
             content: "only in workspace A".into(),
+            images: vec![],
         };
         sa.append(&[user_msg.clone().into()]).await.unwrap();
 
@@ -928,6 +935,7 @@ mod tests {
     fn msg_entry(content: &str) -> String {
         serde_json::to_string(&SessionEntry::from(Message::User {
             content: content.to_owned(),
+            images: vec![],
         }))
         .unwrap()
     }

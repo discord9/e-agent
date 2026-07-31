@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -157,6 +158,7 @@ pub fn file_tools(workspace: &Workspace) -> Vec<Box<dyn Tool>> {
         Box::new(ReadFile {
             workspace: workspace.clone(),
         }),
+        Box::new(ReadImage::new(workspace.clone())),
         Box::new(WriteFile {
             workspace: workspace.clone(),
         }),
@@ -469,7 +471,15 @@ impl Tool for ReadFile {
         if limit == 0 {
             return Err("`limit` must be >= 1".into());
         }
-        let bytes = self.workspace.read(required_string(&arguments, "path")?)?;
+        let path = required_string(&arguments, "path")?;
+        // Image files are binary; point the model at read_image instead so
+        // the image actually reaches the provider as an attachment.
+        if crate::agent::image_mime_from_extension(path).is_some() {
+            return Err(format!(
+                "`{path}` looks like an image file; use `read_image` to attach it to the conversation"
+            ));
+        }
+        let bytes = self.workspace.read(path)?;
         let text = String::from_utf8_lossy(&bytes);
         let lines: Vec<&str> = text.lines().collect();
         let total = lines.len();
@@ -494,6 +504,72 @@ impl Tool for ReadFile {
             output = "[empty file]".into();
         }
         Ok(output)
+    }
+}
+
+/// Reads an image file (capability-path policy, same as read_file), stores
+/// its bytes in the global content-addressed image store, and returns a
+/// structured marker the runner turns into an attached image on the next
+/// user message.
+struct ReadImage {
+    workspace: Workspace,
+    store: Option<PathBuf>,
+}
+
+impl ReadImage {
+    fn new(workspace: Workspace) -> Self {
+        Self {
+            workspace,
+            store: crate::agent::image_store_dir(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_store(workspace: Workspace, store: PathBuf) -> Self {
+        Self {
+            workspace,
+            store: Some(store),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ReadImage {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "read_image",
+            "Read an image file (png, jpeg/jpg, webp, gif; up to 10 MiB) and attach it to the conversation so the model can see it. Relative paths use the workspace; authorized external absolute paths are accepted. The image bytes are stored once in a global content-addressed cache and sent to the provider on the next model call.",
+            json!({
+                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path to an image file"}
+            }),
+            &["path"],
+        )
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String, String> {
+        let path = required_string(&arguments, "path")?;
+        let mime = crate::agent::image_mime_from_extension(path).ok_or_else(|| {
+            format!("unsupported image type for {path}: expected .png, .jpeg/.jpg, .webp, or .gif")
+        })?;
+        let bytes = self.workspace.read(path)?;
+        if bytes.len() > crate::agent::IMAGE_MAX_BYTES {
+            return Err(format!(
+                "image {path} is {} bytes, exceeding the {} MiB limit",
+                bytes.len(),
+                crate::agent::IMAGE_MAX_BYTES / (1024 * 1024)
+            ));
+        }
+        let store = self
+            .store
+            .as_deref()
+            .ok_or("no image store: XDG_STATE_HOME or HOME is not set")?;
+        let hash = crate::agent::store_image_bytes(store, &bytes)?;
+        Ok(format!(
+            "{}{hash},{mime}{}[image read: {path}] (hash {hash}, {mime}, {} bytes)",
+            crate::agent::IMAGE_MARKER_START,
+            crate::agent::IMAGE_MARKER_END,
+            bytes.len()
+        ))
     }
 }
 

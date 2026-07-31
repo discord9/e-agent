@@ -1,11 +1,14 @@
 use anyhow::Context;
+use base64::Engine;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::agent::{
-    AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
+    AssistantMessage, ImagePart, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
 };
 use crate::codex::CodexModel;
 
@@ -84,6 +87,13 @@ pub struct OpenAiModel {
     api_key: String,
     model: String,
     reasoning_effort: Option<String>,
+    /// Whether the model accepts image input (chat wire builds image_url
+    /// parts only for vision-capable models; see `ensure_vision_supported`).
+    vision: bool,
+    /// Global content-addressed image store (see `agent::image_store_dir`).
+    /// None when no HOME/XDG_STATE_HOME: image refs then degrade to text
+    /// placeholders on the wire.
+    image_store: Option<PathBuf>,
 }
 
 impl OpenAiModel {
@@ -95,7 +105,14 @@ impl OpenAiModel {
         let model = model
             .or_else(|| std::env::var("OPENAI_MODEL").ok())
             .unwrap_or_else(|| "gpt-4o-mini".into());
-        Self::with_timeout(base_url, api_key, model, None, Duration::from_secs(600))
+        Self::with_timeout(
+            base_url,
+            api_key,
+            model,
+            None,
+            false,
+            Duration::from_secs(600),
+        )
     }
 
     pub fn new(
@@ -109,8 +126,22 @@ impl OpenAiModel {
             api_key,
             model,
             reasoning_effort,
+            false,
             Duration::from_secs(600),
         )
+    }
+
+    /// Mark the model as vision-capable so user messages with attached
+    /// images pass the vision gate.
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_image_store(mut self, store: PathBuf) -> Self {
+        self.image_store = Some(store);
+        self
     }
 
     fn with_timeout(
@@ -118,6 +149,7 @@ impl OpenAiModel {
         api_key: String,
         model: String,
         reasoning_effort: Option<String>,
+        vision: bool,
         timeout: Duration,
     ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
@@ -130,6 +162,8 @@ impl OpenAiModel {
             api_key,
             model,
             reasoning_effort,
+            vision,
+            image_store: crate::agent::image_store_dir(),
         })
     }
 
@@ -151,11 +185,13 @@ impl Model for OpenAiModel {
         tools: &[ToolSpec],
         mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
     ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        crate::agent::ensure_vision_supported(&self.model, self.vision, messages)?;
         let request = ChatRequest::from_internal(
             &self.model,
             self.reasoning_effort.as_deref(),
             messages,
             tools,
+            self.image_store.as_deref(),
         );
         let mut retried = false;
         let response = loop {
@@ -304,11 +340,15 @@ impl<'a> ChatRequest<'a> {
         reasoning_effort: Option<&str>,
         messages: &[Message],
         tools: &'a [ToolSpec],
+        image_store: Option<&Path>,
     ) -> Self {
         Self {
             model: model.into(),
             reasoning_effort: reasoning_effort.map(str::to_owned),
-            messages: messages.iter().map(WireMessage::from_internal).collect(),
+            messages: messages
+                .iter()
+                .map(|message| WireMessage::from_internal(message, image_store))
+                .collect(),
             tools: tools
                 .iter()
                 .map(|tool| WireTool {
@@ -325,11 +365,23 @@ impl<'a> ChatRequest<'a> {
     }
 }
 
+/// Chat-wire message content: a plain string for system/assistant/tool
+/// messages, or a part array for user messages with attached images
+/// (`text` + `image_url` parts; `image_url` is an OBJECT holding `url`).
+/// `#[serde(untagged)]` keeps the wire output byte-identical to the old
+/// string form whenever no images are attached.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum WireContent {
+    Text(String),
+    Parts(Vec<Value>),
+}
+
 #[derive(Debug, Serialize)]
 struct WireMessage {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<WireContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<WireToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -337,23 +389,23 @@ struct WireMessage {
 }
 
 impl WireMessage {
-    fn from_internal(message: &Message) -> Self {
+    fn from_internal(message: &Message, image_store: Option<&Path>) -> Self {
         match message {
             Message::System { content } => Self {
                 role: "system",
-                content: Some(content.clone()),
+                content: Some(WireContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: None,
             },
-            Message::User { content } => Self {
+            Message::User { content, images } => Self {
                 role: "user",
-                content: Some(content.clone()),
+                content: Some(WireContent::from_user(content, images, image_store)),
                 tool_calls: None,
                 tool_call_id: None,
             },
             Message::Assistant(message) => Self {
                 role: "assistant",
-                content: message.content.clone(),
+                content: message.content.clone().map(WireContent::Text),
                 tool_calls: (!message.tool_calls.is_empty()).then(|| {
                     message
                         .tool_calls
@@ -370,15 +422,47 @@ impl WireMessage {
                 ..
             } => Self {
                 role: "tool",
-                content: Some(if *is_error {
+                content: Some(WireContent::Text(if *is_error {
                     format!("ERROR: {content}")
                 } else {
                     content.clone()
-                }),
+                })),
                 tool_calls: None,
                 tool_call_id: Some(call_id.clone()),
             },
         }
+    }
+}
+
+impl WireContent {
+    /// User content: plain text when no images are attached; otherwise an
+    /// array of `text` + `image_url` parts. Image files are re-read from the
+    /// global store and base64-encoded at send time; a missing file degrades
+    /// to a `[image missing: <hash>]` text part instead of failing.
+    fn from_user(content: &str, images: &[ImagePart], image_store: Option<&Path>) -> Self {
+        if images.is_empty() {
+            return Self::Text(content.to_owned());
+        }
+        let mut parts = vec![json!({"type": "text", "text": content})];
+        for image in images {
+            match crate::agent::load_image_bytes(image_store, &image.hash) {
+                Some(bytes) => parts.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!(
+                            "data:{};base64,{}",
+                            image.mime,
+                            base64::engine::general_purpose::STANDARD.encode(bytes)
+                        )
+                    }
+                })),
+                None => parts.push(json!({
+                    "type": "text",
+                    "text": format!("[image missing: {}]", image.hash)
+                })),
+            }
+        }
+        Self::Parts(parts)
     }
 }
 
@@ -544,6 +628,7 @@ mod tests {
                 },
             ],
             &tools,
+            None,
         );
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["tools"][0]["type"], "function");
@@ -567,6 +652,7 @@ mod tests {
                 reasoning: None,
             })],
             &[],
+            None,
         );
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["messages"][0]["content"], "done");
@@ -575,14 +661,14 @@ mod tests {
 
     #[test]
     fn serializes_reasoning_effort_at_the_top_level() {
-        let request = ChatRequest::from_internal("test-model", Some("max"), &[], &[]);
+        let request = ChatRequest::from_internal("test-model", Some("max"), &[], &[], None);
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["reasoning_effort"], "max");
     }
 
     #[test]
     fn omits_reasoning_effort_when_unset() {
-        let request = ChatRequest::from_internal("test-model", None, &[], &[]);
+        let request = ChatRequest::from_internal("test-model", None, &[], &[], None);
         let value = serde_json::to_value(request).unwrap();
         assert!(value.get("reasoning_effort").is_none());
     }
@@ -661,6 +747,7 @@ mod tests {
             "test-key".into(),
             "test-model".into(),
             None,
+            false,
             Duration::from_secs(1),
         )
         .unwrap();
@@ -669,6 +756,7 @@ mod tests {
             .complete(
                 &[Message::User {
                     content: "hello".into(),
+                    images: vec![],
                 }],
                 &[],
                 Some(&mut |kind, delta| deltas.push((kind, delta.to_owned()))),
@@ -707,6 +795,7 @@ mod tests {
                 reasoning: Some("secret thinking".into()),
             })],
             &[],
+            None,
         );
         let value = serde_json::to_value(request).unwrap();
         let message = &value["messages"][0];
@@ -733,6 +822,7 @@ mod tests {
             "test-key".into(),
             "test-model".into(),
             None,
+            false,
             Duration::from_millis(50),
         )
         .unwrap();
@@ -740,6 +830,7 @@ mod tests {
             .complete(
                 &[Message::User {
                     content: "hello".into(),
+                    images: vec![],
                 }],
                 &[],
                 None,
@@ -772,6 +863,7 @@ mod tests {
             "test-key".into(),
             "test-model".into(),
             None,
+            false,
             Duration::from_millis(100),
         )
         .unwrap();
@@ -779,6 +871,7 @@ mod tests {
             .complete(
                 &[Message::User {
                     content: "hello".into(),
+                    images: vec![],
                 }],
                 &[],
                 None,
@@ -837,6 +930,7 @@ mod tests {
             "test-key".into(),
             "test-model".into(),
             None,
+            false,
             Duration::from_secs(1),
         )
         .unwrap();
@@ -854,5 +948,198 @@ mod tests {
                 .unwrap()
                 .contains("ERROR: intentional failure")
         );
+    }
+
+    #[test]
+    fn chat_wire_emits_image_url_object_parts_for_attached_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\nfake-png-bytes";
+        let hash = crate::agent::store_image_bytes(temp.path(), bytes).unwrap();
+        let request = ChatRequest::from_internal(
+            "vision-model",
+            None,
+            &[Message::User {
+                content: "what is this?".into(),
+                images: vec![ImagePart {
+                    hash: hash.clone(),
+                    mime: "image/png".into(),
+                }],
+            }],
+            &[],
+            Some(temp.path()),
+        );
+        let value = serde_json::to_value(request).unwrap();
+        // content switches from a plain string to a parts array.
+        let parts = value["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["type"], "image_url");
+        // Chat wire: image_url is an OBJECT with a data-URL `url`.
+        let url = parts[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+        let encoded = url.trim_start_matches("data:image/png;base64,");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            bytes
+        );
+        // Non-user messages stay plain strings even with images elsewhere.
+        let request = ChatRequest::from_internal(
+            "vision-model",
+            None,
+            &[Message::System {
+                content: "sys".into(),
+            }],
+            &[],
+            None,
+        );
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["messages"][0]["content"], "sys");
+    }
+
+    #[test]
+    fn chat_wire_degrades_missing_image_file_to_text_placeholder() {
+        let request = ChatRequest::from_internal(
+            "vision-model",
+            None,
+            &[Message::User {
+                content: "hi".into(),
+                images: vec![ImagePart {
+                    hash: "deadbeef".into(),
+                    mime: "image/png".into(),
+                }],
+            }],
+            &[],
+            None,
+        );
+        let value = serde_json::to_value(request).unwrap();
+        let parts = value["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[1]["type"], "text");
+        assert_eq!(parts[1]["text"], "[image missing: deadbeef]");
+    }
+
+    #[test]
+    fn vision_gate_rejects_images_on_non_vision_models() {
+        let error = crate::agent::ensure_vision_supported(
+            "deepseek-v3",
+            false,
+            &[Message::User {
+                content: "hi".into(),
+                images: vec![ImagePart {
+                    hash: "x".into(),
+                    mime: "image/png".into(),
+                }],
+            }],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("deepseek-v3 does not support image input"));
+
+        // No images: passes even without vision. Images: passes with vision.
+        crate::agent::ensure_vision_supported(
+            "deepseek-v3",
+            false,
+            &[Message::User {
+                content: "hi".into(),
+                images: vec![],
+            }],
+        )
+        .unwrap();
+        crate::agent::ensure_vision_supported(
+            "kimi-k3",
+            true,
+            &[Message::User {
+                content: "hi".into(),
+                images: vec![ImagePart {
+                    hash: "x".into(),
+                    mime: "image/png".into(),
+                }],
+            }],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_images_before_any_request_on_non_vision_models() {
+        // Nothing listens on this address; the vision gate must fire first.
+        let mut model = OpenAiModel::with_timeout(
+            "http://127.0.0.1:1".into(),
+            "test-key".into(),
+            "test-model".into(),
+            None,
+            false,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let error = model
+            .complete(
+                &[Message::User {
+                    content: "hi".into(),
+                    images: vec![ImagePart {
+                        hash: "x".into(),
+                        mime: "image/png".into(),
+                    }],
+                }],
+                &[],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("does not support image input"));
+    }
+
+    #[tokio::test]
+    async fn chat_wire_sends_image_url_parts_over_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\nfake-http";
+        let hash = crate::agent::store_image_bytes(temp.path(), bytes).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            let parts = request["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(parts[1]["type"], "image_url");
+            assert_eq!(
+                parts[1]["image_url"]["url"].as_str().unwrap(),
+                format!(
+                    "data:image/png;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                )
+            );
+            reply_sse(
+                &mut stream,
+                &[
+                    json!({"choices":[{"delta":{"content":"seen it"},"finish_reason":null}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+                ],
+            )
+            .await;
+        });
+        let mut model = OpenAiModel::with_timeout(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "test-model".into(),
+            None,
+            true,
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_image_store(temp.path().to_path_buf());
+        let (message, _) = model
+            .complete(
+                &[Message::User {
+                    content: "what is this?".into(),
+                    images: vec![ImagePart {
+                        hash,
+                        mime: "image/png".into(),
+                    }],
+                }],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(message.content.as_deref(), Some("seen it"));
     }
 }

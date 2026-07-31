@@ -5,7 +5,7 @@ use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
-use e_agent::agent::{Agent, AgentEvent, SessionEntry, preview};
+use e_agent::agent::{Agent, AgentEvent, ImagePart, SessionEntry, preview};
 use e_agent::codex::CodexModel;
 use e_agent::codex_auth::{CodexAuth, login, logout};
 use e_agent::config::{AuthMode, ResolvedModel};
@@ -599,6 +599,8 @@ async fn repl(handle: SessionHandle, task: e_agent::runner::SessionTask) -> anyh
     let (_, events, mut status) = handle.attach();
     let render = tokio::spawn(consume_stderr_events(events));
     let stdin = std::io::stdin();
+    // Image attached via `/image <path>`; rides along with the next prompt.
+    let mut pending_image: Option<(String, ImagePart)> = None;
     loop {
         // Wait for the runner to become idle again. Finished is a terminal
         // state: the watch channel gets no further values, so waiting for
@@ -627,15 +629,33 @@ async fn repl(handle: SessionHandle, task: e_agent::runner::SessionTask) -> anyh
             }
             Err(error) => return Err(error.into()),
         }
-        match line.trim() {
+        let trimmed = line.trim();
+        match trimmed {
             "" => {}
             "/exit" | "/quit" => break,
             "/compact" => {
                 handle.compact();
                 status.changed().await?;
             }
+            command if command.starts_with("/image ") => {
+                // Entrance A (human attaches an image): store it in the
+                // global content-addressed store and attach it to the next
+                // prompt. The placeholder line also reaches the model text.
+                let path = command.trim_start_matches("/image").trim();
+                match e_agent::agent::attach_image_from_path(path) {
+                    Ok(part) => {
+                        pending_image = Some((path.to_owned(), part));
+                        eprintln!("[image attached: {path}]");
+                    }
+                    Err(error) => eprintln!("e-agent: {error}"),
+                }
+            }
             prompt => {
-                handle.prompt(prompt);
+                if let Some((path, part)) = pending_image.take() {
+                    handle.prompt_with_image(format!("{prompt}\n[image attached: {path}]"), part);
+                } else {
+                    handle.prompt(prompt);
+                }
                 status.changed().await?;
             }
         }
@@ -1001,22 +1021,28 @@ fn configured_model(
     let display = Some(resolved.display);
     match resolved.auth {
         AuthMode::ApiKey => {
-            let mut cm = ConfiguredModel::chat(OpenAiModel::new(
-                base_url.unwrap_or(resolved.base_url),
-                resolved.api_key,
-                model.unwrap_or(resolved.model),
-                resolved.reasoning_effort,
-            )?);
+            let mut cm = ConfiguredModel::chat(
+                OpenAiModel::new(
+                    base_url.unwrap_or(resolved.base_url),
+                    resolved.api_key,
+                    model.unwrap_or(resolved.model),
+                    resolved.reasoning_effort,
+                )?
+                .with_vision(resolved.vision),
+            );
             cm.display = display;
             Ok(cm)
         }
         AuthMode::ChatGpt => {
-            let mut cm = ConfiguredModel::codex(CodexModel::new(
-                auth.cloned()
-                    .ok_or_else(|| anyhow!("ChatGPT auth was not initialized"))?,
-                model.unwrap_or(resolved.model),
-                resolved.reasoning_effort,
-            )?);
+            let mut cm = ConfiguredModel::codex(
+                CodexModel::new(
+                    auth.cloned()
+                        .ok_or_else(|| anyhow!("ChatGPT auth was not initialized"))?,
+                    model.unwrap_or(resolved.model),
+                    resolved.reasoning_effort,
+                )?
+                .with_vision(resolved.vision),
+            );
             cm.display = display;
             Ok(cm)
         }

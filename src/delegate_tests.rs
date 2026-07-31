@@ -716,6 +716,7 @@ fn resume_loads_the_previous_transcript_as_starting_context() {
     let prior = vec![
         crate::agent::SessionEntry::from(crate::agent::Message::User {
             content: "earlier task".into(),
+            images: vec![],
         }),
         crate::agent::SessionEntry::from(crate::agent::Message::Assistant(
             crate::agent::AssistantMessage {
@@ -1114,6 +1115,7 @@ async fn resume_replays_scrollback_into_session_sink() {
     let prior = vec![
         crate::agent::SessionEntry::from(crate::agent::Message::User {
             content: "earlier task".into(),
+            images: vec![],
         }),
         crate::agent::SessionEntry::from(crate::agent::Message::Assistant(
             crate::agent::AssistantMessage {

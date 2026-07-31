@@ -264,6 +264,7 @@ fn history_for_compaction(agent: &mut Agent) {
     agent.restore_history(vec![
         Message::User {
             content: "old question".into(),
+            images: vec![],
         }
         .into(),
         Message::Assistant(AssistantMessage {
@@ -274,6 +275,7 @@ fn history_for_compaction(agent: &mut Agent) {
         .into(),
         Message::User {
             content: "current question".into(),
+            images: vec![],
         }
         .into(),
     ]);
@@ -596,7 +598,7 @@ async fn prompt_racing_finalization_is_consumed_and_persisted() {
             .iter()
             .filter(|entry| matches!(
                 entry,
-                SessionEntry::Message { message: Message::User { content } }
+                SessionEntry::Message { message: Message::User { content, .. } }
                     if content == "at finalization"
             ))
             .count(),
@@ -632,7 +634,7 @@ async fn prompt_accepted_before_round_failure_is_persisted_before_failure() {
         .unwrap();
     assert!(loaded.entries.iter().any(|entry| matches!(
         entry,
-        SessionEntry::Message { message: Message::User { content } }
+        SessionEntry::Message { message: Message::User { content, .. } }
             if content == "accepted before failure"
     )));
     assert!(!loaded.entries.iter().any(|entry| matches!(
@@ -667,7 +669,7 @@ async fn prompt_after_round_failure_has_no_projection_or_persistence() {
         .unwrap();
     assert!(!loaded.entries.iter().any(|entry| matches!(
         entry,
-        SessionEntry::Message { message: Message::User { content } }
+        SessionEntry::Message { message: Message::User { content, .. } }
             if content == "too late"
     )));
     task.join().await.unwrap();
@@ -726,7 +728,7 @@ async fn model_call_failure_returns_to_idle_and_recovers() {
     assert!(matches!(
         &loaded.entries[0],
         SessionEntry::Message {
-            message: Message::User { content }
+            message: Message::User { content, .. }
         } if content == "initial"
     ));
 
@@ -829,7 +831,7 @@ async fn prompt_queued_during_failed_model_call_runs_next_turn() {
     assert!(loaded.entries.iter().any(|entry| matches!(
         entry,
         SessionEntry::Message {
-            message: Message::User { content }
+            message: Message::User { content, .. }
         } if content == "queued during failure"
     )));
     assert!(loaded.entries.iter().any(|entry| matches!(
@@ -875,7 +877,7 @@ async fn prompt_after_finished_has_no_projection_or_persistence() {
         .unwrap();
     assert!(!loaded.entries.iter().any(|entry| matches!(
         entry,
-        SessionEntry::Message { message: Message::User { content } }
+        SessionEntry::Message { message: Message::User { content, .. } }
             if content == "too late"
     )));
     task.join().await.unwrap();
@@ -928,7 +930,7 @@ async fn queued_handle_prompt_is_transient_until_consumed() {
         .unwrap();
     assert!(loaded.entries.iter().any(|entry| matches!(
         entry,
-        SessionEntry::Message { message: Message::User { content } }
+        SessionEntry::Message { message: Message::User { content, .. } }
             if content == "queued while busy"
     )));
     task.join().await.unwrap();
@@ -978,7 +980,7 @@ async fn prompt_and_compact_pending_order_is_fifo() {
             .position(|entry| {
                 matches!(
                     entry,
-                    SessionEntry::Message { message: Message::User { content } }
+                    SessionEntry::Message { message: Message::User { content, .. } }
                         if content == "queued prompt"
                 )
             })
@@ -1145,6 +1147,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
     agent.restore_history(vec![
         Message::User {
             content: "old question".into(),
+            images: vec![],
         }
         .into(),
         Message::Assistant(AssistantMessage {
@@ -1183,7 +1186,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
         let final_context = &calls[2];
         assert!(matches!(
             &final_context[0],
-            Message::User { content }
+            Message::User { content, .. }
                 if content == "[compacted summary of earlier conversation]\nsummary"
         ));
         // Placeholder skipped entirely: the only Tool message is the real
@@ -1402,4 +1405,171 @@ async fn cancel_without_queued_work_returns_cancelled() {
         )
     );
     task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn runner_strips_image_marker_and_attaches_synthetic_user() {
+    struct MarkerTool;
+    #[async_trait]
+    impl Tool for MarkerTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "read_image".into(),
+                description: "test".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _: Value) -> Result<String, String> {
+            Ok("__EA_IMAGE__hash123,image/png__EA_IMAGE_END__[image read: pic.png] (hash hash123, image/png, 3 bytes)".into())
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call-img".into(),
+                            name: "read_image".into(),
+                            arguments: r#"{"path":"pic.png"}"#.into(),
+                        }],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(MarkerTool)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "marker".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("look".into()));
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
+    );
+    task.join().await.unwrap();
+
+    // Persisted tool entry has the summary only; the synthetic user message
+    // carrying the image reference follows it.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "marker")
+        .await
+        .unwrap();
+    let tool = loaded
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Message {
+                message: Message::Tool { content, .. },
+            } => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(tool.starts_with("[image read: pic.png]"));
+    assert!(!tool.contains("__EA_IMAGE__"));
+    let synthetic = loaded
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Message {
+                message: Message::User { content, images },
+            } => Some((content.clone(), images.clone())),
+            _ => None,
+        })
+        .find(|(content, _)| content.starts_with("[image attached:"));
+    let (content, images) = synthetic.expect("synthetic image user message");
+    assert_eq!(content, "[image attached: pic.png]");
+    assert_eq!(
+        images,
+        vec![crate::agent::ImagePart {
+            hash: "hash123".into(),
+            mime: "image/png".into(),
+        }]
+    );
+    // The second model call saw the image on the user message.
+    let calls = calls.lock().unwrap();
+    assert!(calls[1].iter().any(|message| matches!(
+        message,
+        Message::User { images, .. } if !images.is_empty()
+    )));
+}
+
+#[tokio::test]
+async fn prompt_with_image_rides_on_the_committed_user_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("answered".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "attach".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(None);
+    handle.prompt_with_image(
+        "what is this?",
+        crate::agent::ImagePart {
+            hash: "abc".into(),
+            mime: "image/jpeg".into(),
+        },
+    );
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("answered".into())))
+    );
+    task.join().await.unwrap();
+    let calls = calls.lock().unwrap();
+    let user = calls[0]
+        .iter()
+        .find_map(|message| match message {
+            Message::User { content, images } => Some((content.clone(), images.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(user.0, "what is this?");
+    assert_eq!(
+        user.1,
+        vec![crate::agent::ImagePart {
+            hash: "abc".into(),
+            mime: "image/jpeg".into(),
+        }]
+    );
 }

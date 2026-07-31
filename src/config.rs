@@ -98,6 +98,12 @@ struct ModelProfile {
     /// auto-compacts when usage exceeds 80% of this value, and the TUI
     /// shows a percentage alongside the token count.
     context_window: Option<u64>,
+    /// Whether the model accepts image input. Defaults to false: user
+    /// messages with attached images fail the vision gate with a clear
+    /// error on non-vision models. kimi/k3 profiles should set
+    /// `vision = true`; deepseek defaults to false.
+    #[serde(default)]
+    vision: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -109,6 +115,7 @@ pub struct ResolvedModel {
     pub auth: AuthMode,
     pub display: String,
     pub context_window: Option<u64>,
+    pub vision: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,6 +253,7 @@ impl Config {
                 auth: AuthMode::ChatGpt,
                 display: profile.to_owned(),
                 context_window: model_profile.context_window,
+                vision: model_profile.vision.unwrap_or(false),
             });
         }
         let base_url = provider
@@ -280,6 +288,7 @@ impl Config {
             auth: AuthMode::ApiKey,
             display: profile.to_owned(),
             context_window: model_profile.context_window,
+            vision: model_profile.vision.unwrap_or(false),
         })
     }
 
@@ -647,6 +656,41 @@ context_window = 131072
         );
         let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
         assert_eq!(resolved.context_window, Some(131072));
+    }
+
+    #[test]
+    fn vision_defaults_to_false_and_reads_from_model_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("key"), "key").unwrap();
+        let path = write_config(
+            temp.path(),
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://api.kimi.com/coding/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+vision = true
+"#,
+        );
+        let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
+        assert!(resolved.vision);
+
+        // Absent `vision` means false (deepseek-style default).
+        let path = write_config(
+            temp.path(),
+            r#"
+default = "deepseek/v3"
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_file = "key"
+[models."deepseek/v3"]
+model = "deepseek-chat"
+"#,
+        );
+        let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
+        assert!(!resolved.vision);
     }
 
     #[test]
