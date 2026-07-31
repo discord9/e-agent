@@ -23,6 +23,12 @@ api_key_file = "kimi-key" # absolute or relative to this config file
 model = "k3"
 # Optional: Kimi Coding k3 accepts "low", "high", or "max".
 reasoning_effort = "high"
+# Optional: set true when the model accepts image input (attached via the
+# `read_image` tool or the REPL `/image <path>` command). Defaults to false;
+# a user message with images on a model without `vision = true` fails with
+# "model X does not support image input". kimi/k3 and ChatGPT/Codex vision
+# models should set it; deepseek-style models keep the default false.
+vision = true
 ```
 
 Provider names are inferred from the part of the profile before `/`. API-key
@@ -457,6 +463,33 @@ TOML config is optional. When present, it supplies the selected provider
 credential and profile values instead of `OPENAI_*`; see [Run](#run). A
 provider using `api_key_env` reads the variable named by that field (for
 example, `KIMI_API_KEY`).
+
+## Image input (multimodal)
+
+Two entrances attach images to the conversation, both stored in a global
+content-addressed cache (files named by SHA-256 hex, deduplicated across
+sessions) at `$XDG_STATE_HOME/e-agent/images/`, falling back to
+`~/.config/e-agent/images/` — the same base the crash directory uses:
+
+- **`read_image` tool** (agent entrance): the model reads an image file
+  (png/jpeg/webp/gif, up to 10 MiB; capability-path policy like `read_file`).
+  The bytes are stored once under their hash; the tool result carries a
+  structured marker that the runner strips into a text summary, then attaches
+  a synthetic user message carrying the image reference. Base64 never enters
+  the scrollback or the session file.
+- **REPL `/image <path>`** (human entrance, REPL mode only): attaches the
+  image to the next prompt; the placeholder line
+  `[image attached: <path>]` is included in the prompt text.
+
+Sessions persist only `ImageRef { hash, mime }` references — never base64.
+At send time the wire re-reads the file and builds the provider format:
+`image_url` parts (an object) for OpenAI-compatible chat, `input_image` parts
+(a bare-string `image_url`) for ChatGPT Responses. A missing cache file
+degrades to a `[image missing: <hash>]` text placeholder instead of failing.
+
+A model only receives images when its profile sets `vision = true` (see
+[Run](#run)). A user message with images on a non-vision model fails with a
+clear `model X does not support image input` error before any request is sent.
 
 Errors print their causal chain (for example `cannot decode provider
 response: error decoding response body: ...`), and provider HTTP failures

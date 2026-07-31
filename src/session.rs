@@ -391,6 +391,7 @@ mod tests {
         vec![
             Message::User {
                 content: "hello".into(),
+                images: vec![],
             }
             .into(),
             Message::Assistant(crate::agent::AssistantMessage {

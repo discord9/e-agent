@@ -1,8 +1,10 @@
 use anyhow::{Context, anyhow, bail};
+use base64::Engine;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 
 use crate::agent::{
     AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
@@ -18,6 +20,11 @@ pub struct CodexModel {
     model: String,
     reasoning_effort: Option<String>,
     endpoint: String,
+    /// Whether the model accepts image input (responses wire builds
+    /// `input_image` parts only for vision-capable models).
+    vision: bool,
+    /// Global content-addressed image store (see `agent::image_store_dir`).
+    image_store: Option<PathBuf>,
 }
 
 impl CodexModel {
@@ -34,7 +41,16 @@ impl CodexModel {
             model,
             reasoning_effort,
             endpoint: RESPONSES_URL.into(),
+            vision: false,
+            image_store: crate::agent::image_store_dir(),
         })
+    }
+
+    /// Mark the model as vision-capable so user messages with attached
+    /// images pass the vision gate.
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
+        self
     }
 
     #[cfg(test)]
@@ -48,6 +64,8 @@ impl CodexModel {
             model: "codex".into(),
             reasoning_effort: Some("high".into()),
             endpoint,
+            vision: false,
+            image_store: crate::agent::image_store_dir(),
         }
     }
 
@@ -89,11 +107,13 @@ impl Model for CodexModel {
         tools: &[ToolSpec],
         mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
     ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        crate::agent::ensure_vision_supported(&self.model, self.vision, messages)?;
         let request = ResponsesRequest::from_internal(
             &self.model,
             self.reasoning_effort.as_deref(),
             messages,
             tools,
+            self.image_store.as_deref(),
         );
         let (mut response, rejected_access_token) = self.send(&request, true).await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -235,6 +255,7 @@ impl<'a> ResponsesRequest<'a> {
         reasoning_effort: Option<&str>,
         messages: &[Message],
         tools: &[ToolSpec],
+        image_store: Option<&Path>,
     ) -> Self {
         let instructions = messages
             .iter()
@@ -246,7 +267,19 @@ impl<'a> ResponsesRequest<'a> {
             .join("\n\n");
         let input = messages.iter().filter_map(|message| match message {
             Message::System { .. } => None,
-            Message::User { content } => Some(json!({"type":"message","role":"user","content":[{"type":"input_text","text":content}]})),
+            // A user message with attached images appends `input_image` parts
+            // (image_url is a BARE STRING here, unlike the chat wire's object
+            // form). A missing store file degrades to a text placeholder part.
+            Message::User { content, images } => {
+                let mut parts = vec![json!({"type":"input_text","text":content})];
+                for image in images {
+                    match crate::agent::load_image_bytes(image_store, &image.hash) {
+                        Some(bytes) => parts.push(json!({"type":"input_image","image_url":format!("data:{};base64,{}", image.mime, base64::engine::general_purpose::STANDARD.encode(bytes))})),
+                        None => parts.push(json!({"type":"input_text","text":format!("[image missing: {}]", image.hash)})),
+                    }
+                }
+                Some(json!({"type":"message","role":"user","content":parts}))
+            }
             Message::Assistant(message) => {
                 let mut items = Vec::new();
                 if let Some(content) = &message.content { items.push(json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":content}]})); }
@@ -290,6 +323,7 @@ mod tests {
                 },
                 Message::User {
                     content: "hello".into(),
+                    images: vec![],
                 },
                 Message::Assistant(AssistantMessage {
                     content: Some("working".into()),
@@ -313,6 +347,7 @@ mod tests {
                 description: "run".into(),
                 parameters: json!({"type":"object"}),
             }],
+            None,
         );
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["instructions"], "first\n\nsecond");
@@ -323,6 +358,61 @@ mod tests {
         assert!(value["tools"][0].get("function").is_none());
         assert_eq!(value["reasoning"]["effort"], "high");
         assert_eq!(value["include"], json!([]));
+    }
+
+    #[test]
+    fn responses_wire_emits_input_image_parts_for_attached_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\nfake-png";
+        let hash = crate::agent::store_image_bytes(temp.path(), bytes).unwrap();
+        let request = ResponsesRequest::from_internal(
+            "codex",
+            None,
+            &[Message::User {
+                content: "what is this?".into(),
+                images: vec![crate::agent::ImagePart {
+                    hash: hash.clone(),
+                    mime: "image/png".into(),
+                }],
+            }],
+            &[],
+            Some(temp.path()),
+        );
+        let value = serde_json::to_value(request).unwrap();
+        let parts = value["input"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[0]["text"], "what is this?");
+        // Codex wire: image_url is a BARE STRING, not an object.
+        assert_eq!(parts[1]["type"], "input_image");
+        let url = parts[1]["image_url"].as_str().unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        );
+    }
+
+    #[test]
+    fn responses_wire_degrades_missing_image_to_text_placeholder() {
+        let request = ResponsesRequest::from_internal(
+            "codex",
+            None,
+            &[Message::User {
+                content: "hi".into(),
+                images: vec![crate::agent::ImagePart {
+                    hash: "missing-hash".into(),
+                    mime: "image/png".into(),
+                }],
+            }],
+            &[],
+            None,
+        );
+        let value = serde_json::to_value(request).unwrap();
+        let parts = value["input"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[1]["type"], "input_text");
+        assert_eq!(parts[1]["text"], "[image missing: missing-hash]");
     }
 
     #[test]
@@ -370,6 +460,7 @@ mod tests {
             .complete(
                 &[Message::User {
                     content: "hello".into(),
+                    images: vec![],
                 }],
                 &[],
                 Some(&mut |kind, text| deltas.push((kind, text.to_owned()))),
@@ -418,6 +509,7 @@ mod tests {
             .complete(
                 &[Message::User {
                     content: "hello".into(),
+                    images: vec![],
                 }],
                 &[],
                 None,
@@ -503,6 +595,7 @@ mod tests {
             .complete(
                 &[Message::User {
                     content: "hello".into(),
+                    images: vec![],
                 }],
                 &[],
                 None,

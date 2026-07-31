@@ -100,6 +100,7 @@ fn web_search_registration_requires_a_nonempty_key() {
     let workspace = Workspace::new(temp.path()).unwrap();
     let local_tools = vec![
         "read_file".to_string(),
+        "read_image".to_string(),
         "write_file".to_string(),
         "edit_file".to_string(),
         "get_background_tasks".to_string(),
@@ -117,6 +118,7 @@ fn web_search_registration_requires_a_nonempty_key() {
         names,
         [
             "read_file",
+            "read_image",
             "write_file",
             "edit_file",
             "get_background_tasks",
@@ -2224,4 +2226,103 @@ fn task_spool_tail_window_covers_the_last_lines() {
     assert_eq!(window.first_line, 0);
     assert_eq!(window.lines.len(), 100);
     assert_eq!(window.line_count, 100);
+}
+
+fn read_image_tool(temp: &tempfile::TempDir, store: &std::path::Path) -> ReadImage {
+    ReadImage::with_store(Workspace::new(temp.path()).unwrap(), store.to_path_buf())
+}
+
+#[tokio::test]
+async fn read_image_stores_hashes_and_returns_structured_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("images");
+    std::fs::write(temp.path().join("cat.png"), b"png-bytes").unwrap();
+    let tool = read_image_tool(&temp, &store);
+    let output = tool.execute(json!({"path": "cat.png"})).await.unwrap();
+    let (summary, image) = crate::agent::split_image_marker(&output);
+    assert!(summary.starts_with("[image read: cat.png] (hash "));
+    assert!(summary.ends_with(", image/png, 9 bytes)"));
+    let image = image.unwrap();
+    assert_eq!(image.mime, "image/png");
+    // The stored file is content-addressed by hash and readable back.
+    assert_eq!(
+        std::fs::read(store.join(&image.hash)).unwrap(),
+        b"png-bytes"
+    );
+
+    // Dedup: reading again (even a different path with same bytes) does not
+    // add a second file, and the returned hash is identical.
+    std::fs::write(temp.path().join("copy.png"), b"png-bytes").unwrap();
+    let output = tool.execute(json!({"path": "copy.png"})).await.unwrap();
+    let (_, second) = crate::agent::split_image_marker(&output);
+    assert_eq!(second.unwrap().hash, image.hash);
+    assert_eq!(std::fs::read_dir(&store).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn read_image_sniffs_mime_from_extension_whitelist() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("images");
+    for (name, mime) in [
+        ("a.png", "image/png"),
+        ("b.jpg", "image/jpeg"),
+        ("c.JPEG", "image/jpeg"),
+        ("d.webp", "image/webp"),
+        ("e.gif", "image/gif"),
+    ] {
+        std::fs::write(temp.path().join(name), b"bytes").unwrap();
+        let tool = read_image_tool(&temp, &store);
+        let output = tool.execute(json!({"path": name})).await.unwrap();
+        let (_, image) = crate::agent::split_image_marker(&output);
+        assert_eq!(image.unwrap().mime, mime, "for {name}");
+    }
+}
+
+#[tokio::test]
+async fn read_image_rejects_unlisted_extensions_and_oversize_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("images");
+    std::fs::write(temp.path().join("doc.txt"), b"text").unwrap();
+    let tool = read_image_tool(&temp, &store);
+    let error = tool.execute(json!({"path": "doc.txt"})).await.unwrap_err();
+    assert!(error.contains("unsupported image type for doc.txt"));
+    assert!(!std::fs::exists(&store).unwrap());
+
+    // Oversize: 10 MiB + 1 byte.
+    std::fs::write(
+        temp.path().join("huge.png"),
+        vec![0u8; crate::agent::IMAGE_MAX_BYTES + 1],
+    )
+    .unwrap();
+    let error = tool.execute(json!({"path": "huge.png"})).await.unwrap_err();
+    assert!(error.contains("exceeding the 10 MiB limit"));
+    assert!(!std::fs::exists(&store).unwrap());
+}
+
+#[tokio::test]
+async fn read_image_respects_workspace_capability_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("images");
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("x.png"), b"bytes").unwrap();
+    let tool = read_image_tool(&temp, &store);
+    let error = tool
+        .execute(json!({"path": outside.path().join("x.png").to_str().unwrap()}))
+        .await
+        .unwrap_err();
+    assert!(error.contains("absolute path is not within an authorized external root"));
+}
+
+#[tokio::test]
+async fn read_file_hints_read_image_for_image_extensions() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("photo.jpg"), b"\xff\xd8\xff").unwrap();
+    let error = read(&temp, json!({"path": "photo.jpg"})).await.unwrap_err();
+    assert!(error.contains("use `read_image` to attach it"));
+    // Non-image extensions still read normally.
+    std::fs::write(temp.path().join("notes.txt"), b"plain").unwrap();
+    assert_eq!(
+        read(&temp, json!({"path": "notes.txt"})).await.unwrap(),
+        "plain"
+    );
 }

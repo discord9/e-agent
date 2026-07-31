@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 /// Content of the synthetic error result inserted for every tool call left
@@ -76,6 +77,160 @@ pub(crate) fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
     out
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePart {
+    /// Content SHA-256 hex digest; the file lives at
+    /// `<image store>/<hash>` (see [`image_store_dir`]).
+    pub hash: String,
+    /// MIME type, e.g. `image/png` (sniffed from the extension whitelist).
+    pub mime: String,
+}
+
+/// Single-image size cap for `read_image` and the REPL `/image` command.
+pub const IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+/// Structured prefix a `read_image` tool result carries so the runner can
+/// split the image reference from the display summary:
+/// `__EA_IMAGE__<hash>,<mime>__EA_IMAGE_END__<summary>`.
+pub const IMAGE_MARKER_START: &str = "__EA_IMAGE__";
+pub const IMAGE_MARKER_END: &str = "__EA_IMAGE_END__";
+
+/// Split a tool result that may start with an image marker into the display
+/// summary (marker stripped) and the optional [`ImagePart`]. Results without
+/// the marker pass through untouched.
+pub fn split_image_marker(result: &str) -> (String, Option<ImagePart>) {
+    if let Some(rest) = result.strip_prefix(IMAGE_MARKER_START)
+        && let Some((hash_mime, summary)) = rest.split_once(IMAGE_MARKER_END)
+        && let Some((hash, mime)) = hash_mime.split_once(',')
+        && !hash.is_empty()
+        && !mime.is_empty()
+    {
+        (
+            summary.to_owned(),
+            Some(ImagePart {
+                hash: hash.to_owned(),
+                mime: mime.to_owned(),
+            }),
+        )
+    } else {
+        (result.to_owned(), None)
+    }
+}
+
+/// The `path` argument of a tool call, for synthetic image-attach messages.
+pub fn tool_path_argument(arguments: &str) -> Option<String> {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| value.get("path").and_then(Value::as_str).map(str::to_owned))
+}
+
+/// Global content-addressed image store: `$XDG_STATE_HOME/e-agent/images`,
+/// falling back to `~/.config/e-agent/images` — the same base the crash
+/// directory uses in main.rs. None when neither variable is set.
+pub fn image_store_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|x| !x.is_empty()) {
+        Some(PathBuf::from(xdg).join("e-agent/images"))
+    } else {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/e-agent/images"))
+    }
+}
+
+/// SHA-256 hex digest of `bytes` (the content address used as file name).
+pub fn image_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// MIME sniffing from a lowercase extension whitelist: png, jpeg/jpg,
+/// webp, gif. None for anything else.
+pub fn image_mime_from_extension(path: &str) -> Option<&'static str> {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("png") => Some("image/png"),
+        Some("jpeg" | "jpg") => Some("image/jpeg"),
+        Some("webp") => Some("image/webp"),
+        Some("gif") => Some("image/gif"),
+        _ => None,
+    }
+}
+
+/// Store image bytes under their SHA-256 hex hash, creating the store
+/// directory as needed. Already-present files are skipped (cross-session
+/// dedup). Returns the hash.
+pub fn store_image_bytes(store: &Path, bytes: &[u8]) -> Result<String, String> {
+    let hash = image_sha256(bytes);
+    std::fs::create_dir_all(store)
+        .map_err(|error| format!("create image store {}: {error}", store.display()))?;
+    let target = store.join(&hash);
+    match std::fs::write(&target, bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("write image {}: {error}", target.display())),
+    }
+    Ok(hash)
+}
+
+/// Load stored image bytes for `hash` (wire side). None when the store or
+/// the file is missing — the wire then degrades to a text placeholder
+/// instead of failing the whole request.
+pub fn load_image_bytes(store: Option<&Path>, hash: &str) -> Option<Vec<u8>> {
+    let store = store?;
+    std::fs::read(store.join(hash)).ok()
+}
+
+/// Validate (extension whitelist + size cap) and store an image read from
+/// the ambient filesystem. Used by the REPL `/image` command: a human
+/// explicitly attaching a file, not a model tool call, so ambient fs access
+/// is appropriate (mirrors the crash-directory handling in main.rs).
+pub fn attach_image_from_path(path: &str) -> Result<ImagePart, String> {
+    let mime = image_mime_from_extension(path).ok_or_else(|| {
+        format!("unsupported image type for {path}: expected .png, .jpeg/.jpg, .webp, or .gif")
+    })?;
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("cannot read image {path}: {error}"))?;
+    if bytes.len() > IMAGE_MAX_BYTES {
+        return Err(format!(
+            "image {path} is {} bytes, exceeding the {} MiB limit",
+            bytes.len(),
+            IMAGE_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+    let store = image_store_dir().ok_or("no image store: XDG_STATE_HOME or HOME is not set")?;
+    let hash = store_image_bytes(&store, &bytes)?;
+    Ok(ImagePart {
+        hash,
+        mime: mime.into(),
+    })
+}
+
+/// Vision gate shared by both wires: user messages with images require a
+/// vision-capable model. Non-vision models get a clear error instead of a
+/// malformed or silently degraded request.
+pub fn ensure_vision_supported(
+    model: &str,
+    vision: bool,
+    messages: &[Message],
+) -> anyhow::Result<()> {
+    let has_images = messages
+        .iter()
+        .any(|message| matches!(message, Message::User { images, .. } if !images.is_empty()));
+    if has_images && !vision {
+        anyhow::bail!("model {model} does not support image input");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     /// System-prompt-style context (e.g. AGENTS.md or MCP instructions). Sent
@@ -86,6 +241,13 @@ pub enum Message {
     },
     User {
         content: String,
+        /// Attached images as content-hash references into the global image
+        /// store (never inline base64 in the session). Only the reference is
+        /// persisted; the wire layer re-reads the file and encodes it.
+        /// `#[serde(default)]` keeps old session files (no `images` field)
+        /// loadable.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImagePart>,
     },
     Assistant(AssistantMessage),
     Tool {
@@ -522,6 +684,7 @@ impl Agent {
             };
             messages.push(Message::User {
                 content: format!("[compacted summary of earlier conversation]\n{summary}"),
+                images: vec![],
             });
             messages.extend(retained.iter().cloned());
             start = index + 1;
@@ -537,6 +700,7 @@ impl Agent {
                     // completions and task-death notices.
                     SessionEntry::Notice { text } => Some(Message::User {
                         content: text.clone(),
+                        images: vec![],
                     }),
                     // Structured background completions: same surface as
                     // before, but derived from the structured variant rather
@@ -549,6 +713,7 @@ impl Agent {
                             };
                         Some(Message::User {
                             content: format!("{header}\n{output}"),
+                            images: vec![],
                         })
                     }
                     // Fork provenance is audit/display only; never put it on
@@ -622,7 +787,13 @@ impl Agent {
         // a failed compaction doesn't permanently prevent future attempts.
         self.auto_compacted = false;
         if !prompt.is_empty() {
-            self.history.push(Message::User { content: prompt }.into());
+            self.history.push(
+                Message::User {
+                    content: prompt,
+                    images: vec![],
+                }
+                .into(),
+            );
         }
         let specs: Vec<_> = self.tools.iter().map(|tool| tool.spec()).collect();
 
@@ -673,6 +844,7 @@ impl Agent {
         let mut request = context[..split].to_vec();
         request.push(Message::User {
             content: "Summarize the earlier conversation. Preserve the user's goals, decisions made, files changed, and unfinished work. Be concise and use Chinese or English to match the conversation language.".into(),
+            images: vec![],
         });
         let response = {
             let model = &mut self.model;
@@ -864,21 +1036,33 @@ impl Agent {
                 });
                 let result = Self::execute_on(&self.tools, call).await;
                 self.after_tool_entry(call, &result);
+                // A read_image result carries a structured image marker;
+                // strip it so the Tool message/event keep only the text
+                // summary (base64 never enters the scrollback), then attach
+                // the image as a synthetic User message right after the tool
+                // result (images can only ride on user role messages).
+                let (summary, image) = match &result {
+                    Ok(content) => split_image_marker(content),
+                    Err(error) => (error.clone(), None),
+                };
                 self.emit(AgentEvent::ToolResult {
                     is_error: result.is_err(),
-                    content: match &result {
-                        Ok(content) | Err(content) => content.clone(),
-                    },
+                    content: summary.clone(),
                 });
                 self.push_message(Message::Tool {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
-                    content: match &result {
-                        Ok(content) | Err(content) => content.clone(),
-                    },
+                    content: summary,
                     is_error: result.is_err(),
                     synthetic: false,
                 });
+                if let Some(image) = image {
+                    let path = tool_path_argument(&call.arguments).unwrap_or_default();
+                    self.push_message(Message::User {
+                        content: format!("[image attached: {path}]"),
+                        images: vec![image],
+                    });
+                }
             }
         }
     }
@@ -1178,6 +1362,7 @@ mod tests {
         let messages = vec![
             Message::User {
                 content: "u".into(),
+                images: vec![],
             },
             Message::Assistant(AssistantMessage {
                 content: None,
@@ -1222,6 +1407,7 @@ mod tests {
         let messages = vec![
             Message::User {
                 content: "u".into(),
+                images: vec![],
             },
             Message::Assistant(AssistantMessage {
                 content: None,
@@ -1230,6 +1416,7 @@ mod tests {
             }),
             Message::User {
                 content: "next".into(),
+                images: vec![],
             },
         ];
         let repaired = repair_tool_pairs(messages);
@@ -1254,6 +1441,7 @@ mod tests {
         let messages = vec![
             Message::User {
                 content: "u".into(),
+                images: vec![],
             },
             Message::Assistant(AssistantMessage {
                 content: None,
@@ -1445,7 +1633,7 @@ mod tests {
         assert_eq!(context.len(), 4);
         assert!(matches!(
             &context[0],
-            Message::User { content }
+            Message::User { content, .. }
                 if content == "[compacted summary of earlier conversation]\nold summary"
         ));
         assert!(matches!(&context[1], Message::User { .. }));
@@ -1493,6 +1681,7 @@ mod tests {
                 retained: vec![
                     Message::User {
                         content: "current question".into(),
+                        images: vec![],
                     },
                     Message::Assistant(AssistantMessage {
                         content: None,
@@ -1521,7 +1710,7 @@ mod tests {
         assert_eq!(context.len(), 4);
         assert!(matches!(
             &context[0],
-            Message::User { content }
+            Message::User { content, .. }
                 if content == "[compacted summary of earlier conversation]\nsummary text"
         ));
         assert!(matches!(&context[1], Message::User { .. }));
@@ -1615,7 +1804,7 @@ mod tests {
         assert_eq!(requests[1].len(), 3);
         assert!(matches!(
             &requests[1][0],
-            Message::User { content } if content == "one"
+            Message::User { content, .. } if content == "one"
         ));
         assert!(matches!(
             &requests[1][1],
@@ -1623,7 +1812,7 @@ mod tests {
         ));
         assert!(matches!(
             &requests[1][2],
-            Message::User { content } if content == "two"
+            Message::User { content, .. } if content == "two"
         ));
     }
 
@@ -1784,11 +1973,11 @@ mod tests {
         // context() surfaces as a Message::User so the model sees it.
         assert!(matches!(
             &requests[2][4],
-            Message::User { content } if content.starts_with("[background task 1 completed]\n")
+            Message::User { content, .. } if content.starts_with("[background task 1 completed]\n")
         ));
         assert!(matches!(
             &requests[2][5],
-            Message::User { content } if content == "second"
+            Message::User { content, .. } if content == "second"
         ));
     }
 
@@ -1833,7 +2022,7 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert!(matches!(
             requests[2].last().unwrap(),
-            Message::User { content } if content.starts_with("[background task 1 completed]\n")
+            Message::User { content, .. } if content.starts_with("[background task 1 completed]\n")
         ));
     }
 
@@ -1853,6 +2042,7 @@ mod tests {
         let current_turn = vec![
             Message::User {
                 content: "recent request".into(),
+                images: vec![],
             },
             Message::Assistant(AssistantMessage {
                 content: None,
@@ -1885,6 +2075,7 @@ mod tests {
         let mut transcript = vec![
             Message::User {
                 content: "original goal".into(),
+                images: vec![],
             },
             Message::Assistant(AssistantMessage {
                 content: None,
@@ -1900,6 +2091,7 @@ mod tests {
             },
             Message::User {
                 content: "follow up".into(),
+                images: vec![],
             },
             Message::Assistant(AssistantMessage {
                 content: Some("noted".into()),
@@ -1924,14 +2116,14 @@ mod tests {
         assert_eq!(context.len(), current_turn.len() + 1);
         assert!(matches!(
             &context[0],
-            Message::User { content } if content == "[compacted summary of earlier conversation]\nsummary text"
+            Message::User { content, .. } if content == "[compacted summary of earlier conversation]\nsummary text"
         ));
         assert_eq!(&context[1..], current_turn.as_slice());
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0].len(), 6);
         assert!(matches!(
             requests[0].last().unwrap(),
-            Message::User { content } if content.contains("Summarize the earlier conversation")
+            Message::User { content, .. } if content.contains("Summarize the earlier conversation")
         ));
     }
 
@@ -1940,6 +2132,7 @@ mod tests {
         let interrupted = vec![
             Message::User {
                 content: "do things".into(),
+                images: vec![],
             },
             Message::Assistant(AssistantMessage {
                 content: None,
@@ -1987,6 +2180,7 @@ mod tests {
         agent.restore_history(vec![
             Message::User {
                 content: "short".into(),
+                images: vec![],
             }
             .into(),
         ]);
@@ -2239,10 +2433,10 @@ mod tests {
             assert_eq!(msgs.len(), 1);
             let expected = format!("{expected_header}\nfull output text\nwith multiple\nlines");
             assert!(
-                matches!(&msgs[0], Message::User { content } if content == &expected),
+                matches!(&msgs[0], Message::User { content, .. } if content == &expected),
                 "label={label_val:?}: expected {expected:?}, got {:?}",
                 match &msgs[0] {
-                    Message::User { content } => content,
+                    Message::User { content, .. } => content,
                     _ => "(wrong variant)",
                 }
             );
@@ -2274,11 +2468,11 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert!(matches!(
             &msgs[0],
-            Message::User { content } if content.contains("old style")
+            Message::User { content, .. } if content.contains("old style")
         ));
         assert!(matches!(
             &msgs[1],
-            Message::User { content } if content == "[background task 2 completed]\nnew style"
+            Message::User { content, .. } if content == "[background task 2 completed]\nnew style"
         ));
     }
 
@@ -2288,6 +2482,7 @@ mod tests {
         vec![
             Message::User {
                 content: question.into(),
+                images: vec![],
             }
             .into(),
             Message::Assistant(AssistantMessage {
@@ -2399,10 +2594,12 @@ mod tests {
         let no_turn = vec![
             Message::User {
                 content: "q1".into(),
+                images: vec![],
             }
             .into(),
             Message::User {
                 content: "q2".into(),
+                images: vec![],
             }
             .into(),
         ];
@@ -2472,6 +2669,7 @@ mod tests {
             marker_none.clone(),
             Message::User {
                 content: "q1".into(),
+                images: vec![],
             }
             .into(),
             Message::Assistant(AssistantMessage {
@@ -2485,8 +2683,242 @@ mod tests {
         assert_eq!(msgs.len(), 2, "forked_from must not appear in context");
         assert!(matches!(
             &msgs[0],
-            Message::User { content } if content == "q1"
+            Message::User { content, .. } if content == "q1"
         ));
         assert!(!format!("{msgs:?}").contains("src-123"));
+    }
+
+    #[test]
+    fn user_images_serde_round_trips_and_old_sessions_load_without_images() {
+        // New shape: images field round-trips.
+        let message = Message::User {
+            content: "look".into(),
+            images: vec![ImagePart {
+                hash: "abc123".into(),
+                mime: "image/png".into(),
+            }],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+
+        // Old sessions (no `images` key) deserialize with an empty list.
+        let legacy: Message = serde_json::from_str(r#"{"User":{"content":"old"}}"#).unwrap();
+        assert_eq!(
+            legacy,
+            Message::User {
+                content: "old".into(),
+                images: vec![],
+            }
+        );
+        // And serialize back without the images key when empty.
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        assert!(!legacy_json.contains("images"));
+    }
+
+    #[test]
+    fn split_image_marker_parses_hash_and_mime_and_strips_summary() {
+        let (summary, image) = split_image_marker(
+            "__EA_IMAGE__deadbeef,image/png__EA_IMAGE_END__[image read: a.png] (hash deadbeef, image/png, 4 bytes)",
+        );
+        assert_eq!(
+            summary,
+            "[image read: a.png] (hash deadbeef, image/png, 4 bytes)"
+        );
+        assert_eq!(
+            image,
+            Some(ImagePart {
+                hash: "deadbeef".into(),
+                mime: "image/png".into(),
+            })
+        );
+        // Non-marker results pass through untouched.
+        let (summary, image) = split_image_marker("plain result");
+        assert_eq!(summary, "plain result");
+        assert!(image.is_none());
+        // Malformed markers are not mistaken for attachments.
+        let (summary, image) = split_image_marker("__EA_IMAGE__nocomma__EA_IMAGE_END__rest");
+        assert_eq!(summary, "__EA_IMAGE__nocomma__EA_IMAGE_END__rest");
+        assert!(image.is_none());
+    }
+
+    struct ImageTool {
+        workspace: tempfile::TempDir,
+    }
+
+    #[async_trait]
+    impl Tool for ImageTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "read_image".into(),
+                description: "read an image".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(&self, _: Value) -> Result<String, String> {
+            let store = self.workspace.path().join("store");
+            let bytes = b"fake-png-bytes";
+            let hash = store_image_bytes(&store, bytes).unwrap();
+            Ok(format!(
+                "{IMAGE_MARKER_START}{hash},image/png{IMAGE_MARKER_END}\
+                 [image read: pics/cat.png] (hash {hash}, image/png, {} bytes)",
+                bytes.len()
+            ))
+        }
+    }
+
+    struct ImageRoundModel {
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        calls: usize,
+    }
+
+    #[async_trait]
+    impl Model for ImageRoundModel {
+        async fn complete(
+            &mut self,
+            messages: &[Message],
+            _: &[ToolSpec],
+            _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+        ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.calls += 1;
+            if self.calls == 1 {
+                return Ok((
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![call(
+                            "call-img",
+                            "read_image",
+                            r#"{"path":"pics/cat.png"}"#,
+                        )],
+                        reasoning: None,
+                    },
+                    None,
+                ));
+            }
+            Ok((
+                AssistantMessage {
+                    content: Some("final".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_loop_strips_marker_and_attaches_synthetic_user_with_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(
+            Box::new(ImageRoundModel {
+                requests: requests.clone(),
+                calls: 0,
+            }),
+            vec![Box::new(ImageTool { workspace: temp })],
+        );
+        let answer = agent.run("describe".into()).await.unwrap();
+        assert_eq!(answer, "final");
+        let history = agent.history();
+        // Tool result keeps only the text summary (no marker, no base64).
+        let tool = history
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Message {
+                    message: Message::Tool { content, .. },
+                } => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(tool.starts_with("[image read: pics/cat.png]"));
+        assert!(!tool.contains("__EA_IMAGE__"));
+        assert!(!tool.contains("fake-png"));
+        // The synthetic user message follows the tool result and carries the
+        // image reference.
+        let synthetic = history
+            .iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Message {
+                    message: Message::User { content, images },
+                } => Some((content.clone(), images.clone())),
+                _ => None,
+            })
+            .find(|(content, _)| content.starts_with("[image attached:"));
+        let (content, images) = synthetic.unwrap();
+        assert_eq!(content, "[image attached: pics/cat.png]");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime, "image/png");
+        // And the model saw the image in the second round's context.
+        let calls = requests.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let second = &calls[1];
+        assert!(second.iter().any(|message| matches!(
+            message,
+            Message::User { content, images } if content.starts_with("[image attached:")
+                && !images.is_empty()
+        )));
+    }
+
+    #[test]
+    fn context_includes_user_images() {
+        let mut agent = Agent::new(
+            Box::new(ScriptedModel {
+                replies: vec![],
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delays: Default::default(),
+            }),
+            vec![],
+        );
+        agent.restore_history(vec![
+            Message::User {
+                content: "look at this".into(),
+                images: vec![ImagePart {
+                    hash: "cafe".into(),
+                    mime: "image/webp".into(),
+                }],
+            }
+            .into(),
+        ]);
+        let context = agent.context();
+        assert_eq!(context.len(), 1);
+        match &context[0] {
+            Message::User { content, images } => {
+                assert_eq!(content, "look at this");
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].hash, "cafe");
+                assert_eq!(images[0].mime, "image/webp");
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_store_dedups_by_hash_and_mime_whitelist() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"same-content";
+        let first = store_image_bytes(temp.path(), bytes).unwrap();
+        let second = store_image_bytes(temp.path(), bytes).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read(temp.path().join(&first)).unwrap(), bytes);
+        // Directory contains exactly one file.
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+
+        assert_eq!(image_mime_from_extension("a.PNG"), Some("image/png"));
+        assert_eq!(image_mime_from_extension("a.jpg"), Some("image/jpeg"));
+        assert_eq!(image_mime_from_extension("a.jpeg"), Some("image/jpeg"));
+        assert_eq!(image_mime_from_extension("a.webp"), Some("image/webp"));
+        assert_eq!(image_mime_from_extension("a.gif"), Some("image/gif"));
+        assert_eq!(image_mime_from_extension("a.txt"), None);
+        assert_eq!(image_mime_from_extension("a.png.txt"), None);
+        assert_eq!(image_mime_from_extension("noextension"), None);
+
+        assert_eq!(
+            load_image_bytes(Some(temp.path()), &first),
+            Some(bytes.to_vec())
+        );
+        assert_eq!(load_image_bytes(Some(temp.path()), "missing"), None);
+        assert_eq!(load_image_bytes(None, &first), None);
     }
 }
