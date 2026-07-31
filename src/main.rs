@@ -30,7 +30,12 @@ async fn main() -> anyhow::Result<()> {
     install_panic_hook();
     notify_crash_if_exists();
     if let Err(error) = run(raw_arguments).await {
-        eprintln!("e-agent: {error:#}");
+        let text = format!("{error:#}");
+        if let Some(friendly) = friendly_failure(&text) {
+            eprintln!("{friendly}");
+        } else {
+            eprintln!("e-agent: {text}");
+        }
         std::process::exit(1);
     }
     Ok(())
@@ -58,6 +63,24 @@ fn version_requested(arguments: &[String]) -> anyhow::Result<bool> {
 /// a narrowed read-only bash sandbox (no bash at all without the sandbox).
 fn read_only_requested(arguments: &[String]) -> bool {
     arguments.iter().any(|argument| argument == "--read-only")
+}
+
+/// Recognize GreptimeDB concurrent-write conflicts (backend message carries
+/// the fixed `concurrent write conflict` substring) and render a friendly
+/// multi-line Chinese hint with the raw English detail kept below. Returns
+/// `None` for any other text so callers print it unchanged.
+fn friendly_failure(text: &str) -> Option<String> {
+    if !text.contains("concurrent write conflict") {
+        return None;
+    }
+    Some(
+        [
+            "会话被其他客户端占用，已停止写入以避免数据冲突。".to_owned(),
+            "请关闭另一个 TUI / Web 窗口 / 导入工具后再试，或新开会话继续。".to_owned(),
+            format!("详情: {text}"),
+        ]
+        .join("\n"),
+    )
 }
 
 async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
@@ -411,7 +434,10 @@ async fn repl(handle: SessionHandle, task: SessionTask) -> anyhow::Result<()> {
         while !matches!(*status.borrow(), SessionStatus::Idle) {
             if let SessionStatus::Finished(result) = &*status.borrow() {
                 if let SessionResult::Failed(text) = result {
-                    eprintln!("e-agent: session failed: {text}");
+                    match friendly_failure(text) {
+                        Some(friendly) => eprintln!("{friendly}"),
+                        None => eprintln!("e-agent: session failed: {text}"),
+                    }
                 }
                 drop(handle);
                 drop(task);

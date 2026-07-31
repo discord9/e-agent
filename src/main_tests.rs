@@ -160,6 +160,32 @@ fn test_format_crash_report_no_location() {
     assert!(r.contains("panic payload omitted"));
 }
 
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Concurrent-write conflict hint tests
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#[test]
+fn test_friendly_failure_with_conflict_marker() {
+    let raw = "session failed: concurrent write conflict on table foo (status 409)";
+    let friendly = friendly_failure(raw).expect("conflict marker must be recognized");
+    assert!(
+        friendly.contains("会话被其他客户端占用，已停止写入以避免数据冲突。"),
+        "{friendly}"
+    );
+    assert!(
+        friendly.contains("请关闭另一个 TUI / Web 窗口 / 导入工具后再试，或新开会话继续。"),
+        "{friendly}"
+    );
+    assert!(friendly.contains("详情: "), "{friendly}");
+    assert!(friendly.contains(raw), "{friendly}");
+}
+
+#[test]
+fn test_friendly_failure_without_conflict_marker() {
+    assert_eq!(friendly_failure("some other error"), None);
+    assert_eq!(friendly_failure(""), None);
+}
+
 #[test]
 fn test_crash_dir_inner() {
     // XDG takes precedence
