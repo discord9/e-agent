@@ -351,6 +351,10 @@ pub struct SessionMeta {
     pub model: String,
     pub role: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Last activity time (session start / last tool call / last message);
+    /// the session list sorts by this descending so the most recently
+    /// active session renders first.
+    pub last_active_at: chrono::DateTime<chrono::Utc>,
     /// CamelCase frontend status string (`"Idle" | "Busy" | "Compacting" |
     /// "Finished"`); the UI's `statusLabel`/`statusChipClass`/`applyStatus`
     /// compare against these exact values.
@@ -383,6 +387,9 @@ async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -
         model: session.model_name.clone(),
         role: session.role_name.clone(),
         created_at: session.created_at,
+        // Registry sessions are live right now, so "last active" is the
+        // present moment; the list sort puts them at the top.
+        last_active_at: chrono::Utc::now(),
         status: status_string(&status).to_owned(),
         entry_count,
         busy: matches!(status, SessionStatus::Busy | SessionStatus::Compacting),
@@ -476,6 +483,10 @@ fn merge_session_metas(
             model: meta.model.unwrap_or_default(),
             role: meta.role,
             created_at: chrono::DateTime::from_naive_utc_and_offset(meta.created_at, chrono::Utc),
+            last_active_at: chrono::DateTime::from_naive_utc_and_offset(
+                meta.last_active_at,
+                chrono::Utc,
+            ),
             // Historical sessions are not running; "Idle" renders as the
             // resumable chip and matches what a fresh resume shows.
             status: "Idle".to_owned(),
@@ -486,7 +497,9 @@ fn merge_session_metas(
         });
     }
     let mut metas: Vec<SessionMeta> = by_id.into_values().collect();
-    metas.sort_by_key(|meta| meta.created_at);
+    // Newest activity first so the frontend shows the most recently active
+    // session at the top.
+    metas.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
     metas
 }
 
@@ -1500,6 +1513,7 @@ mod tests {
             "model",
             "role",
             "created_at",
+            "last_active_at",
             "status",
             "entry_count",
             "busy",
@@ -1531,6 +1545,7 @@ mod tests {
             model: "web-model".into(),
             role: None,
             created_at: dt(created),
+            last_active_at: dt(created),
             status: "Idle".into(),
             entry_count: 1,
             busy: false,
@@ -1563,6 +1578,15 @@ mod tests {
         assert_eq!(tui1.entry_count, 7);
         assert_eq!(tui1.status, "Idle", "historical sessions are resumable");
         assert_eq!(tui1.model, "", "history without model renders empty");
+        // Newest activity first: the merged list is sorted by last_active_at
+        // descending (registry web-1 has last_active=200, history tui-1 has
+        // last_active=60), not by created_at.
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["web-1", "tui-1"],
+            "most recently active sorts first"
+        );
     }
 
     /// Delete is idempotent for unknown/historical ids: it removes the
