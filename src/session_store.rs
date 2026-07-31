@@ -122,6 +122,54 @@ impl SessionStore {
         }
     }
 
+    /// Load only the newest compaction segment (the last `Compaction` entry
+    /// and everything after it). The agent context on resume depends only
+    /// on that segment, so this keeps startup cheap on long sessions;
+    /// older history is pulled on demand via [`Self::load_older`].
+    ///
+    /// For JSONL this falls back to the full [`Self::load`] (no segmented
+    /// loading on the local backend — behavior unchanged). For Greptime it
+    /// delegates to `GreptimeSession::load_head`.
+    pub async fn load_head(&self, root: &Path, name: &str) -> Result<LoadedSession> {
+        match self {
+            SessionStore::Jsonl => Session::load(root, name),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                let entries = { session.lock().await.load_head().await? };
+                Ok(LoadedSession {
+                    entries,
+                    legacy: false,
+                })
+            }
+        }
+    }
+
+    /// Load the compaction segment immediately older than `before_seq`,
+    /// returning `(entries, cursor)` where `cursor` is the seq of the
+    /// compaction that opens the returned segment (`Some`) or `None` when
+    /// this was the oldest segment. The caller feeds `cursor` back as the
+    /// next `before_seq` to page further back; `None` means the end of
+    /// history.
+    ///
+    /// For JSONL the whole session was already loaded by [`Self::load`] /
+    /// [`Self::load_head`], so there is nothing older to fetch: returns
+    /// `(vec![], None)`. For Greptime it delegates to
+    /// `GreptimeSession::load_older`.
+    pub async fn load_older(
+        &self,
+        _root: &Path,
+        _name: &str,
+        before_seq: i64,
+    ) -> Result<(Vec<SessionEntry>, Option<i64>)> {
+        match self {
+            SessionStore::Jsonl => Ok((Vec::new(), None)),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session.lock().await.load_older(before_seq).await
+            }
+        }
+    }
+
     /// Load entries paired with their backend sequence number, in load
     /// order. Used by `--fork` to record the source entry's seq as
     /// provenance on the `ForkedFrom` marker.

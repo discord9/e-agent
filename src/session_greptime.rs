@@ -256,6 +256,148 @@ impl GreptimeSession {
         dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)
     }
 
+    /// Load only the newest compaction segment: the last `Compaction` entry
+    /// and everything after it. This is the segment the agent context
+    /// actually needs on resume (`Agent::context` sends only the last
+    /// compaction's summary + retained + everything after it), so loading
+    /// just this slice keeps startup cheap on very long sessions.
+    ///
+    /// Segment boundary semantics (shared with [`Self::load_older`]):
+    ///
+    /// - head = `[last_comp, ∞)` — the last compaction row rides with its
+    ///   following segment;
+    /// - `load_older(before)` = `[prev_comp, before)` — the compaction row
+    ///   that opens a segment rides with that segment;
+    /// - the oldest segment = `[0, before)` and `load_older` returns `None`
+    ///   as its cursor, meaning nothing older exists.
+    ///
+    /// Every row is loaded exactly once across the head + older chain.
+    ///
+    /// When the session has no compaction entries at all, the whole session
+    /// is a single head segment and the full [`Self::load`] result is
+    /// returned (behavior identical to the pre-segmentation load).
+    pub async fn load_head(&self) -> Result<Vec<SessionEntry>> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT MAX(seq) AS max_seq FROM session_entries \
+                 WHERE workspace_id = $1 AND session_id = $2 AND entry_kind = 'compaction'",
+                &[&self.workspace_id, &self.session_id],
+            )
+            .await
+            .context("cannot query last compaction seq")?;
+        let last_comp: Option<i64> = row.and_then(|r| r.get("max_seq"));
+        let Some(last_comp) = last_comp else {
+            return self.load().await;
+        };
+
+        let rows = self
+            .client
+            .query(
+                "SELECT seq, event_time, payload FROM session_entries \
+                 WHERE workspace_id = $1 AND session_id = $2 AND seq >= $3 \
+                 ORDER BY event_time ASC, seq ASC",
+                &[&self.workspace_id, &self.session_id, &last_comp],
+            )
+            .await
+            .context("cannot load head segment")?;
+        let raw: Vec<(i64, chrono::NaiveDateTime, String)> = rows
+            .iter()
+            .map(|r| {
+                let seq: i64 = r.get("seq");
+                let et: chrono::NaiveDateTime = r.get("event_time");
+                let p: String = r.get("payload");
+                (seq, et, p)
+            })
+            .collect();
+
+        dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)
+            .map(|v| v.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Load the compaction segment immediately older than `before_seq`:
+    /// seq ∈ `[prev_comp, before)` where `prev_comp` is the newest
+    /// compaction with `seq < before_seq`. The compaction row that opens
+    /// the segment rides with it.
+    ///
+    /// Returns `(entries, cursor)` where `cursor` is `Some(prev_comp)` when
+    /// an older segment exists (pass it as the next `before_seq`) and
+    /// `None` when this is the oldest segment (`[0, before)` — the full
+    /// remaining history was returned and nothing older exists).
+    ///
+    /// Segment boundary semantics (shared with [`Self::load_head`]):
+    ///
+    /// - head = `[last_comp, ∞)`;
+    /// - `load_older(before)` = `[prev_comp, before)`;
+    /// - the oldest segment = `[0, before)` and returns `None` as cursor.
+    ///
+    /// Every row is loaded exactly once across the head + older chain.
+    pub async fn load_older(&self, before_seq: i64) -> Result<(Vec<SessionEntry>, Option<i64>)> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT MAX(seq) AS max_seq FROM session_entries \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 AND entry_kind = 'compaction' AND seq < $3",
+                &[&self.workspace_id, &self.session_id, &before_seq],
+            )
+            .await
+            .context("cannot query previous compaction seq")?;
+        let prev_comp: Option<i64> = row.and_then(|r| r.get("max_seq"));
+
+        let raw: Vec<(i64, chrono::NaiveDateTime, String)> = match prev_comp {
+            // Middle segment: [prev_comp, before).
+            Some(prev) => {
+                let rows = self
+                    .client
+                    .query(
+                        "SELECT seq, event_time, payload FROM session_entries \
+                         WHERE workspace_id = $1 AND session_id = $2 \
+                         AND seq >= $3 AND seq < $4 \
+                         ORDER BY event_time ASC, seq ASC",
+                        &[&self.workspace_id, &self.session_id, &prev, &before_seq],
+                    )
+                    .await
+                    .context("cannot load middle segment")?;
+                rows.iter()
+                    .map(|r| {
+                        let seq: i64 = r.get("seq");
+                        let et: chrono::NaiveDateTime = r.get("event_time");
+                        let p: String = r.get("payload");
+                        (seq, et, p)
+                    })
+                    .collect()
+            }
+            // Oldest segment: [0, before). Nothing older follows.
+            None => {
+                let rows = self
+                    .client
+                    .query(
+                        "SELECT seq, event_time, payload FROM session_entries \
+                         WHERE workspace_id = $1 AND session_id = $2 AND seq < $3 \
+                         ORDER BY event_time ASC, seq ASC",
+                        &[&self.workspace_id, &self.session_id, &before_seq],
+                    )
+                    .await
+                    .context("cannot load oldest segment")?;
+                rows.iter()
+                    .map(|r| {
+                        let seq: i64 = r.get("seq");
+                        let et: chrono::NaiveDateTime = r.get("event_time");
+                        let p: String = r.get("payload");
+                        (seq, et, p)
+                    })
+                    .collect()
+            }
+        };
+
+        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)?
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect();
+        Ok((entries, prev_comp))
+    }
+
     /// Append new entries atomically per multi-row INSERT statement.
     ///
     /// GreptimeDB's pg-wire does not support transactions, so atomicity
@@ -920,6 +1062,129 @@ mod tests {
 
         let loaded_a = sa.load().await.unwrap();
         assert_eq!(loaded_a.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_head_and_load_older_segmented() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-seg-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        let early: Vec<SessionEntry> = vec![
+            Message::User {
+                content: "early 1".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::User {
+                content: "early 2".into(),
+                images: vec![],
+            }
+            .into(),
+        ];
+        let comp1 = SessionEntry::Compaction {
+            summary: "compaction 1".into(),
+            retained: vec![Message::User {
+                content: "retained 1".into(),
+                images: vec![],
+            }],
+        };
+        let middle: Vec<SessionEntry> = vec![
+            Message::User {
+                content: "middle 1".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::User {
+                content: "middle 2".into(),
+                images: vec![],
+            }
+            .into(),
+        ];
+        let comp2 = SessionEntry::Compaction {
+            summary: "compaction 2".into(),
+            retained: vec![Message::User {
+                content: "retained 2".into(),
+                images: vec![],
+            }],
+        };
+        let latest: Vec<SessionEntry> = vec![
+            Message::User {
+                content: "latest 1".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::User {
+                content: "latest 2".into(),
+                images: vec![],
+            }
+            .into(),
+        ];
+
+        let mut all = Vec::new();
+        all.extend(early.iter().cloned());
+        all.push(comp1.clone());
+        all.extend(middle.iter().cloned());
+        all.push(comp2.clone());
+        all.extend(latest.iter().cloned());
+        session.append(&all).await.unwrap();
+
+        // Append order = contiguous seqs: early=0,1, comp1=2, middle=3,4,
+        // comp2=5, latest=6,7.
+        let comp1_seq = 2i64;
+        let comp2_seq = 5i64;
+
+        // Head segment: [comp2, ∞) = comp2 + latest only.
+        let head = session.load_head().await.unwrap();
+        assert_eq!(
+            head.len(),
+            1 + latest.len(),
+            "head must contain comp2 + latest, got {} entries",
+            head.len(),
+        );
+        assert_eq!(head[0], comp2, "head opens with the last compaction");
+        for (got, want) in head.iter().skip(1).zip(latest.iter()) {
+            assert_eq!(got, want, "head tail mismatch");
+        }
+
+        // Middle segment: load_older(comp2_seq) = [comp1, comp2) = comp1 +
+        // middle, cursor = comp1_seq.
+        let (seg, cursor) = session.load_older(comp2_seq).await.unwrap();
+        assert_eq!(
+            cursor,
+            Some(comp1_seq),
+            "middle segment cursor must be comp1's seq"
+        );
+        assert_eq!(
+            seg.len(),
+            1 + middle.len(),
+            "middle segment must contain comp1 + middle, got {} entries",
+            seg.len(),
+        );
+        assert_eq!(seg[0], comp1, "middle segment opens with comp1");
+        for (got, want) in seg.iter().skip(1).zip(middle.iter()) {
+            assert_eq!(got, want, "middle segment tail mismatch");
+        }
+
+        // Oldest segment: load_older(comp1_seq) = [0, comp1) = early, and
+        // cursor None (nothing older).
+        let (oldest, cursor) = session.load_older(comp1_seq).await.unwrap();
+        assert_eq!(cursor, None, "oldest segment cursor must be None");
+        assert_eq!(
+            oldest, early,
+            "oldest segment must contain only early entries"
+        );
+
+        // Exactly-once coverage across the chain: head + middle + oldest
+        // accounts for every appended entry, with each compaction row in
+        // exactly one segment.
+        let total: usize = head.len() + seg.len() + oldest.len();
+        assert_eq!(total, all.len(), "segments must cover the whole session");
     }
 
     // ------------------------------------------------------------------
