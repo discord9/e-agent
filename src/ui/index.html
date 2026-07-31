@@ -362,7 +362,7 @@
     gap: 6px;
   }
 
-  /* 思考进行中的转圈动画点；思考停止后静止（由 JS 加/去 .active） */
+  /* 思考进行中的转圈动画点；思考结束后变勾号（.done） */
   .think-dot {
     width: 10px;
     height: 10px;
@@ -374,6 +374,28 @@
   }
   .think-dot.active { animation: think-spin 0.9s linear infinite; }
   @keyframes think-spin { to { transform: rotate(360deg); } }
+
+  /* 思考完成：圆点变勾号（绿色，表示该轮思考已结束） */
+  .think-dot.done {
+    border: none;
+    animation: none;
+    width: 12px;
+    height: 12px;
+    background: var(--green);
+    border-radius: 50%;
+    position: relative;
+  }
+  .think-dot.done::after {
+    content: "";
+    position: absolute;
+    left: 3px;
+    top: 1px;
+    width: 4px;
+    height: 7px;
+    border: solid var(--base3);
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+  }
 
   details.thinking .think-body { white-space: pre-wrap; overflow-wrap: break-word; margin-top: 2px; }
 
@@ -1080,10 +1102,13 @@ function freezeAssistant(acc) {
   if (acc && acc.assistantBody && acc.assistantText) {
     acc.assistantBody.innerHTML = renderMarkdown(acc.assistantText);
   }
-  // 思考结束：停止转圈动画
+  // 思考结束：转圈 → 勾号（表示该轮思考完成）
   if (acc && acc.thinkingEl) {
     const dot = acc.thinkingEl.querySelector(".think-dot");
-    if (dot) dot.classList.remove("active");
+    if (dot) {
+      dot.classList.remove("active");
+      dot.classList.add("done");
+    }
   }
   acc.assistantEl = null;
   acc.assistantBody = null;
@@ -1356,7 +1381,7 @@ function renderMessage(m, acc, pendingCards) {
       const det = el("details", "thinking");
       det.open = false;
       const sum = el("summary", "", "");
-      const dot = el("span", "think-dot");          // 与实时 thinking 一致的圆点
+      const dot = el("span", "think-dot done");  // 历史：已完成的思考，直接勾号
       const label = el("span", "think-label", "思考");
       sum.append(dot, label);
       det.append(sum);
@@ -1473,7 +1498,10 @@ function applyStatus(status) {
     }
     if (state.acc.thinkingEl) {
       const dot = state.acc.thinkingEl.querySelector(".think-dot");
-      if (dot) dot.classList.remove("active");
+      if (dot) {
+        dot.classList.remove("active");
+        dot.classList.add("done");
+      }
     }
   }
 }
