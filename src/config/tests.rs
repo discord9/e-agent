@@ -968,12 +968,20 @@ timeout_secs = 120
     assert_eq!(t, Some(Duration::from_secs(5)));
 
     // timeout_secs = 0 → None (no timeout).
-    std::fs::write(ws.join(".e-agent/config.toml"), "[background]\ntimeout_secs = 0\n").unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[background]\ntimeout_secs = 0\n",
+    )
+    .unwrap();
     let t = resolve_background_timeout(Some(&config), &ws).unwrap();
     assert_eq!(t, None);
 
     // Workspace without [background] falls back to global.
-    std::fs::write(ws.join(".e-agent/config.toml"), "[sandbox]\nenabled = true\n").unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[sandbox]\nenabled = true\n",
+    )
+    .unwrap();
     let t = resolve_background_timeout(Some(&config), &ws).unwrap();
     assert_eq!(t, Some(Duration::from_secs(120)));
 }
@@ -1015,18 +1023,27 @@ fn resolve_sandbox_adds_linked_worktree_main_repo_readonly() {
     std::fs::create_dir_all(&worktree).unwrap();
     std::fs::write(
         worktree.join(".git"),
-        format!("gitdir: {}\n", main_repo.join(".git/worktrees/feature").display()),
+        format!(
+            "gitdir: {}\n",
+            main_repo.join(".git/worktrees/feature").display()
+        ),
     )
     .unwrap();
 
     let sandbox = resolve_sandbox(None, &worktree).unwrap();
     assert!(
-        sandbox.readable_paths.iter().any(|p| Path::new(p) == main_repo),
+        sandbox
+            .readable_paths
+            .iter()
+            .any(|p| Path::new(p) == main_repo),
         "main repo must be in readable_paths, got: {:?}",
         sandbox.readable_paths
     );
     assert!(
-        sandbox.writable_paths.iter().all(|p| Path::new(p) != main_repo),
+        sandbox
+            .writable_paths
+            .iter()
+            .all(|p| Path::new(p) != main_repo),
         "main repo must NOT be writable, got: {:?}",
         sandbox.writable_paths
     );
@@ -1049,8 +1066,12 @@ fn linked_worktree_main_repo_rejects_malicious_pointers() {
     std::fs::create_dir_all(&worktree).unwrap();
 
     // gitdir: pointing at ~/.ssh (or any non-.git/worktrees shape) → None.
-    std::fs::write(worktree.join(".git"), "gitdir: /home/victim/.ssh
-").unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: /home/victim/.ssh
+",
+    )
+    .unwrap();
     assert_eq!(
         linked_worktree_main_repo(&worktree).unwrap(),
         None,
@@ -1058,8 +1079,12 @@ fn linked_worktree_main_repo_rejects_malicious_pointers() {
     );
 
     // Relative pointer → None.
-    std::fs::write(worktree.join(".git"), "gitdir: ../.git/worktrees/x
-").unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: ../.git/worktrees/x
+",
+    )
+    .unwrap();
     assert_eq!(linked_worktree_main_repo(&worktree).unwrap(), None);
 
     // Pointer with .. inside → None.
@@ -1072,8 +1097,12 @@ fn linked_worktree_main_repo_rejects_malicious_pointers() {
     assert_eq!(linked_worktree_main_repo(&worktree).unwrap(), None);
 
     // Pointer to the filesystem root → None.
-    std::fs::write(worktree.join(".git"), "gitdir: /.git/worktrees/x
-").unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: /.git/worktrees/x
+",
+    )
+    .unwrap();
     assert_eq!(linked_worktree_main_repo(&worktree).unwrap(), None);
 
     // Valid-shaped pointer but <main>/.git is not a directory → None.
@@ -1081,8 +1110,11 @@ fn linked_worktree_main_repo_rejects_malicious_pointers() {
     std::fs::create_dir_all(&main_repo).unwrap();
     std::fs::write(
         worktree.join(".git"),
-        format!("gitdir: {}/.git/worktrees/feature
-", main_repo.display()),
+        format!(
+            "gitdir: {}/.git/worktrees/feature
+",
+            main_repo.display()
+        ),
     )
     .unwrap();
     assert_eq!(

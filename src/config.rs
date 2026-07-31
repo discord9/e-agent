@@ -436,8 +436,7 @@ fn linked_worktree_main_repo(workspace: &Path) -> anyhow::Result<Option<PathBuf>
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("cannot inspect {}", git_path.display()))
+            return Err(error).with_context(|| format!("cannot inspect {}", git_path.display()));
         }
     };
     if metadata.is_dir() {
@@ -453,7 +452,11 @@ fn linked_worktree_main_repo(workspace: &Path) -> anyhow::Result<Option<PathBuf>
     // component-clean path of the shape <main>/.git/worktrees/<name>. A
     // malicious project archive could otherwise point gitdir: at ~/.ssh or
     // / and get that path auto-added as a read-only external root.
-    if !target.is_absolute() || target.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
+    if !target.is_absolute()
+        || target
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
         return Ok(None);
     }
     // <main>/.git/worktrees/<name>  →  main repo root = <main>
@@ -490,8 +493,7 @@ pub fn resolve_background_timeout(
     let global = config
         .and_then(|c| c.background.as_ref())
         .and_then(|b| b.timeout_secs);
-    let local = project_background(workspace)?
-        .and_then(|b| b.timeout_secs);
+    let local = project_background(workspace)?.and_then(|b| b.timeout_secs);
     match local.or(global) {
         Some(0) => Ok(None),
         Some(secs) => Ok(Some(Duration::from_secs(secs))),
