@@ -333,7 +333,8 @@ impl TaskDetail {
         self.window.local_offset = 0;
         if anchor_bottom {
             let total =
-                render_bounded_window(&local_window_lines(&self.lines, &self.window), width).len();
+                render_bounded_window(&local_window_lines(&self.lines, &self.window), width, false)
+                    .len();
             self.window.local_offset = total.saturating_sub(height);
         }
     }
@@ -388,7 +389,8 @@ impl TaskDetail {
             return;
         }
         let total =
-            render_bounded_window(&local_window_lines(&self.lines, &self.window), width).len();
+            render_bounded_window(&local_window_lines(&self.lines, &self.window), width, false)
+                .len();
         if self.window.local_offset.saturating_add(height) < total {
             self.window.local_offset += 1;
         } else if self.base_line + self.lines.len() < self.spool.line_count() {
@@ -425,7 +427,8 @@ impl TaskDetail {
             return;
         }
         let total =
-            render_bounded_window(&local_window_lines(&self.lines, &self.window), width).len();
+            render_bounded_window(&local_window_lines(&self.lines, &self.window), width, false)
+                .len();
         if self.window.local_offset.saturating_add(height) < total {
             self.window.local_offset += height;
         } else if self.base_line + self.lines.len() < self.spool.line_count() {
