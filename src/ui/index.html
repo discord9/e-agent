@@ -10,11 +10,11 @@
 <body>
 
 <header id="topbar">
+  <button id="sidebarBtn" title="会话侧边栏">☰</button>
   <div class="brand">e-agent<span class="dot">●</span></div>
   <div class="top-actions" id="topActions" hidden>
     <button id="backBtn">← 返回列表</button>
     <span id="connState" class="conn-state"></span>
-    <button id="tasksBtn" title="查看后台任务 / 子代理">任务</button>
   </div>
   <div class="token-box">
     <label for="tokenInput">Token</label>
@@ -24,16 +24,18 @@
 
 <div id="banner" class="banner" hidden></div>
 
-<!-- ============ 后台任务 / 子代理面板 ============ -->
-<div id="tasksOverlay" hidden>
-  <div id="tasksPanel">
-    <div class="tasks-head">
-      <h2>后台任务</h2>
-      <button id="tasksCloseBtn" title="关闭">关闭</button>
-    </div>
-    <div id="tasksList"></div>
+<!-- ============ 会话侧边栏（会话树 + 运行中任务） ============ -->
+<div id="sidebarOverlay" hidden></div>
+<aside id="sidebar" hidden>
+  <div class="sidebar-head">
+    <h2>会话</h2>
+    <button id="sidebarCloseBtn" title="关闭">×</button>
   </div>
-</div>
+  <div id="sidebarTree" class="sidebar-tree"></div>
+  <div class="sidebar-divider"></div>
+  <h3 class="sidebar-tasks-title" id="sidebarTasksTitle">运行中任务</h3>
+  <div id="sidebarTasks" class="sidebar-tasks"></div>
+</aside>
 
 <!-- ============ 会话列表视图 ============ -->
 <main id="listView" class="view">
@@ -71,9 +73,12 @@
   <div class="composer">
     <div id="queueBar" class="queue-bar" hidden></div>
     <textarea id="promptInput" rows="1" placeholder="输入消息：Enter 发送，Shift+Enter 换行…"></textarea>
-    <div class="composer-actions">
-      <button id="cancelBtn" disabled title="取消当前回合">取消</button>
-      <button id="sendBtn" class="primary">发送</button>
+    <div class="composer-foot">
+      <div id="composerMeta" class="composer-meta" hidden></div>
+      <div class="composer-actions">
+        <button id="cancelBtn" disabled title="取消当前回合">取消</button>
+        <button id="sendBtn" class="primary">发送</button>
+      </div>
     </div>
   </div>
 </main>
