@@ -28,6 +28,8 @@ const state = {
   sidebar: {                 // 会话侧边栏
     open: false,             // 是否打开
     expanded: new Set(),     // 已展开的主会话 id（会话树；重绘时保留）
+    filter: "",              // 筛选关键词（已小写化）；空 = 默认显示
+    showAll: false,          // 是否已展开全部主会话（超出 15 条限制时）
   },
   tasks: {                   // 运行中任务（渲染进侧边栏）
     badgeSeq: 0,             // 徽标轮询竞态序号：只应用最新一次响应
@@ -54,6 +56,7 @@ const els = {
   sendBtn: $("sendBtn"), cancelBtn: $("cancelBtn"), compactBtn: $("compactBtn"),
   sidebarBtn: $("sidebarBtn"), sidebarOverlay: $("sidebarOverlay"),
   sidebar: $("sidebar"), sidebarCloseBtn: $("sidebarCloseBtn"),
+  sidebarFilter: $("sidebarFilter"),
   sidebarTree: $("sidebarTree"), sidebarTasks: $("sidebarTasks"),
   sidebarTasksTitle: $("sidebarTasksTitle"),
 };
@@ -1411,25 +1414,31 @@ async function refreshSessionsForSidebar() {
  * 会话侧边栏：会话树
  * 主会话（parent_session_id 空）为根，默认折叠；subagent 挂父节点下
  * （缩进 + 「子」徽章），展开才渲染子节点；孤儿 subagent 归入「未关联」。
+ * 默认只渲染最近 15 个主会话（列表按 last_active_at 降序），超出显示
+ * 「+N 个更早的会话」按钮点击显示全部；子会话/孤儿组不计数。
+ * 筛选时（state.sidebar.filter 非空）：主会话按 title/id 匹配才显示，
+ * 匹配的显示其所有子会话；孤儿按自身 title/id 匹配。
  * 数据来自 state.lastList（pollSessions）。列表未变化时跳过重绘，
  * 保留展开状态与滚动位置。
  * ===================================================================*/
+const MAX_TREE_ROOTS = 15;
 let lastTreeSig = "";
 
 function sidebarTreeSig() {
   const list = state.lastList || [];
   // 签名含当前会话 id：打开/切换会话后重绘以更新 .current 高亮
   return state.sessionId + "|" + JSON.stringify(list.map((s) => [
-    s.id, s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
+    s.id, s.title || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
     s.entry_count ?? 0, s.parent_session_id || "",
   ]));
 }
 
-function renderSidebarTree() {
+/* force=true 时无视签名强制重绘（筛选输入、展开全部按钮） */
+function renderSidebarTree(force) {
   const tree = els.sidebarTree;
   if (!tree) return;
   const sig = sidebarTreeSig();
-  if (sig === lastTreeSig) return;   // 数据未变：保留展开/滚动状态
+  if (!force && sig === lastTreeSig) return;   // 数据未变：保留展开/滚动状态
   lastTreeSig = sig;
   const prevScroll = tree.scrollTop;
   tree.innerHTML = "";
@@ -1446,12 +1455,36 @@ function renderSidebarTree() {
   }
   const rootIds = new Set(list.filter((s) => !s.parent_session_id).map((s) => s.id));
   const orphans = list.filter((s) => s.parent_session_id && !rootIds.has(s.parent_session_id));
-  for (const s of list) {
-    if (s.parent_session_id) continue;
-    tree.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || []));
-  }
-  if (orphans.length) {
-    tree.appendChild(buildTreeGroup("未关联", orphans));
+  const filter = state.sidebar.filter;
+  const roots = list.filter((s) => !s.parent_session_id);
+  if (filter) {
+    // 筛选：主会话匹配 title（无 title 回退 id），大小写不敏感；子会话随父显示
+    const match = (s) => (s.title || s.id).toLowerCase().includes(filter);
+    const matchedRoots = roots.filter(match);
+    const matchedOrphans = orphans.filter(match);
+    if (!matchedRoots.length && !matchedOrphans.length) {
+      tree.appendChild(el("div", "tree-empty", "无匹配会话"));
+    } else {
+      for (const s of matchedRoots) tree.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || []));
+      if (matchedOrphans.length) tree.appendChild(buildTreeGroup("未关联", matchedOrphans));
+    }
+  } else {
+    let shown = roots;
+    let moreBtn = null;
+    if (!state.sidebar.showAll && roots.length > MAX_TREE_ROOTS) {
+      shown = roots.slice(0, MAX_TREE_ROOTS);
+      const more = roots.length - shown.length;
+      moreBtn = el("button", "tree-more", "+" + more + " 个更早的会话");
+      moreBtn.type = "button";
+      moreBtn.title = "显示全部主会话";
+      moreBtn.addEventListener("click", () => {
+        state.sidebar.showAll = true;
+        renderSidebarTree(true);
+      });
+    }
+    for (const s of shown) tree.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || []));
+    if (moreBtn) tree.appendChild(moreBtn);
+    if (orphans.length) tree.appendChild(buildTreeGroup("未关联", orphans));
   }
   tree.scrollTop = prevScroll;
 }
@@ -1460,7 +1493,9 @@ function buildTreeRoot(s, kids) {
   const node = el("div", "tree-node");
   const row = el("div", "tree-row" + (state.sessionId === s.id ? " current" : ""));
   const hasKids = kids.length > 0;
-  const toggle = el("span", "tree-toggle", hasKids ? "▸" : "");
+  const toggle = el("button", "tree-toggle", hasKids ? "▸" : "");
+  toggle.type = "button";
+  toggle.disabled = !hasKids;      // 无子会话时留位（占 24px，不响应）
   if (hasKids) {
     toggle.title = "展开 / 收起子会话";
     toggle.addEventListener("click", (ev) => {
@@ -1469,11 +1504,12 @@ function buildTreeRoot(s, kids) {
     });
   }
   const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
-  const idEl = el("span", "tree-id", shortId(s.id));
-  idEl.title = s.id;
+  const title = s.title || shortId(s.id);
+  const titleEl = el("span", "tree-id", title);
+  titleEl.title = s.title || s.id;        // 完整 title（无 title 时回退完整 id）
   const count = el("span", "tree-count", (s.entry_count ?? 0) + " 条");
-  row.append(toggle, dot, idEl, count);
-  row.title = s.id + (s.model ? " · " + s.model : "") + (s.busy ? "（处理中）" : "");
+  row.append(toggle, dot, titleEl, count);
+  row.title = (s.title || s.id) + (s.model ? " · " + s.model : "") + (s.busy ? "（处理中）" : "");
   row.addEventListener("click", () => {
     if (s.active === false) { resumeSession(s.id); return; }   // 与列表页一致：历史会话先恢复
     openSession(s.id);
@@ -1482,7 +1518,9 @@ function buildTreeRoot(s, kids) {
   if (hasKids) {
     const children = el("div", "tree-children");
     children.hidden = true;
-    if (state.sidebar.expanded.has(s.id)) {
+    // 筛选时匹配的父节点直接展开显示全部子会话；否则按展开状态
+    const showKids = !!state.sidebar.filter || state.sidebar.expanded.has(s.id);
+    if (showKids) {
       children.hidden = false;
       toggle.classList.add("open");
       toggle.textContent = "▾";
@@ -1515,10 +1553,11 @@ function renderTreeChildren(container, kids) {
   for (const k of kids) {
     const row = el("div", "tree-row tree-row-child" + (state.sessionId === k.id ? " current" : ""));
     const dot = el("span", "busy-dot" + (k.busy ? " busy" : ""));
-    const idEl = el("span", "tree-id", shortId(k.id));
-    idEl.title = k.id;
+    const title = k.title || shortId(k.id);
+    const titleEl = el("span", "tree-id", title);
+    titleEl.title = k.title || k.id;
     const badge = el("span", "child-badge", "子");
-    row.append(dot, idEl, badge);
+    row.append(dot, titleEl, badge);
     row.addEventListener("click", () => {
       if (k.active === false) { resumeSession(k.id); return; }
       openSession(k.id);
@@ -1531,7 +1570,9 @@ function renderTreeChildren(container, kids) {
 function buildTreeGroup(label, kids) {
   const node = el("div", "tree-node");
   const row = el("div", "tree-row");
-  const toggle = el("span", "tree-toggle", "▸");
+  const toggle = el("button", "tree-toggle", "▸");
+  toggle.type = "button";
+  toggle.title = "展开 / 收起";
   toggle.addEventListener("click", (ev) => {
     ev.stopPropagation();
     const children = toggle.closest(".tree-node").querySelector(".tree-children");
@@ -1586,6 +1627,11 @@ els.sidebarBtn.addEventListener("click", () => {
 });
 els.sidebarCloseBtn.addEventListener("click", closeSidebar);
 els.sidebarOverlay.addEventListener("click", closeSidebar);   // 点遮罩关闭
+els.sidebarFilter.addEventListener("input", () => {
+  state.sidebar.filter = els.sidebarFilter.value.trim().toLowerCase();
+  state.sidebar.showAll = false;   // 清空筛选后回到默认 15 条限制
+  renderSidebarTree(true);
+});
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && state.sidebar.open) closeSidebar();
 });
