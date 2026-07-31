@@ -1488,6 +1488,12 @@ impl TuiState {
             AgentEvent::BackgroundCompletionNotice {
                 id, output, label, ..
             } => {
+                // End the streaming lane BEFORE the aside lines: a
+                // completion notice interleaving with an in-flight
+                // assistant message must not become the append target for
+                // the next delta (the body would merge into the Dim line
+                // and lose its markdown rendering). Same as Notice/Error.
+                self.active_lane = None;
                 self.push_background_completion(id, &output, label.as_deref());
             }
             AgentEvent::Usage { context_input, .. } => {

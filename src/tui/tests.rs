@@ -2301,6 +2301,34 @@ fn user_prompt_resets_active_stream_lane() {
 }
 
 #[test]
+fn background_completion_ends_stream_lane_so_next_delta_starts_fresh_line() {
+    // A background-completion notice interleaving with a streaming
+    // assistant message must end the active lane: otherwise the next
+    // AssistantDelta appends to the Dim line and the body loses its
+    // markdown rendering (Dim lines are plain-text wrapped).
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::AssistantDelta("```rust\nlet x = 1;".into()));
+    state.push_agent_event(AgentEvent::BackgroundCompletionNotice {
+        id: 7,
+        output: "built ok".into(),
+        label: Some("build".into()),
+    });
+    state.push_agent_event(AgentEvent::AssistantDelta("\nlet y = 2;\n```".into()));
+
+    assert_eq!(state.lines.len(), 4, "body, header, body line, fresh body line");
+    assert_eq!(state.lines[0].kind, LineKind::Normal);
+    assert_eq!(state.lines[0].text, "```rust\nlet x = 1;");
+    assert_eq!(state.lines[1].kind, LineKind::Dim);
+    assert!(state.lines[1].text.starts_with("[background task 7 completed"));
+    assert_eq!(state.lines[2].kind, LineKind::Dim);
+    assert_eq!(state.lines[2].text, "built ok");
+    // The delta after the notice starts a NEW Normal line instead of
+    // appending to the Dim line.
+    assert_eq!(state.lines[3].kind, LineKind::Normal);
+    assert_eq!(state.lines[3].text, "\nlet y = 2;\n```");
+}
+
+#[test]
 fn input_title_distinguishes_compaction_from_model_thinking() {
     let backend = ratatui::backend::TestBackend::new(40, 10);
     let mut terminal = Terminal::new(backend).unwrap();
