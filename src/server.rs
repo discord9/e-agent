@@ -878,6 +878,7 @@ const PLACEHOLDER_HTML: &str = r#"<!doctype html>
 </html>
 "#;
 
+#[cfg(not(web_ui))]
 fn html_headers() -> [(header::HeaderName, header::HeaderValue); 1] {
     [(
         header::CONTENT_TYPE,
@@ -895,7 +896,28 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 #[cfg(web_ui)]
 async fn index() -> impl IntoResponse {
-    (html_headers(), include_str!("ui/index.html"))
+    use axum::http::Response as HttpResponse;
+    // Dev-friendly: read the single-file UI from disk on every request so
+    // frontend edits show up on refresh without recompiling. Located via
+    // CARGO_MANIFEST_DIR (stable regardless of the process cwd).
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/index.html");
+    match std::fs::read_to_string(&path) {
+        Ok(html) => HttpResponse::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(html)
+            .unwrap(),
+        Err(error) => HttpResponse::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(format!(
+                "<!doctype html><meta charset=\"utf-8\"><title>e-agent UI error</title>\
+                 <body style=\"font-family:system-ui,sans-serif;padding:2rem\">\
+                 <h1>Cannot read {}</h1><pre>{error}</pre></body>",
+                path.display()
+            ))
+            .unwrap(),
+    }
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
