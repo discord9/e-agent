@@ -1076,16 +1076,22 @@ function freezeAssistant(acc) {
 
 /* 历史前置插入期间抑制自动滚动：loadOlder 自己负责保持滚动位置 */
 let suppressScroll = false;
+// 用户主动上滑离开底部后，暂停自动跟随（流式/工具结果不再强扯回底部）；
+// 用户滚回底部或开始新回合（新 UserPrompt）时恢复跟随。
+let userScrolled = false;
 
 function scrollBottom(force) {
   const m = els.messages;
   if (suppressScroll) return;
+  if (userScrolled) return;   // 用户主动离开底部在看历史：任何自动滚动都不打扰
   const near = m.scrollHeight - m.scrollTop - m.clientHeight < 80;
   if (force || near) m.scrollTop = m.scrollHeight;
 }
 
 function appendUserMsg(text) {
   freezeAssistant(state.acc);
+  // 新回合开始：恢复自动跟随（用户发了新消息，理应看到后续输出）
+  userScrolled = false;
   const msg = el("div", "msg msg-user");
   const who = el("span", "who", "you>");
   const body = el("div", "msg-body");
@@ -1788,6 +1794,7 @@ function openSession(id) {
     els.messages.removeChild(els.messages.firstChild);
   }
   els.jumpBottomBtn.hidden = true;
+  userScrolled = false;   // 打开新会话：恢复自动跟随
   els.usageInfo.textContent = "";
   applyStatus("Idle");
   refreshBanner();
@@ -2054,7 +2061,13 @@ els.messages.addEventListener("scroll", () => {
   // 用户滚到接近底部时恢复自动跟随
   const m = els.messages;
   const nearBottom = m.scrollHeight - m.scrollTop - m.clientHeight < 80;
-  if (nearBottom) scrollBottom(true);
+  if (nearBottom) {
+    userScrolled = false;
+    scrollBottom(true);
+  } else {
+    // 用户主动离开底部（上滑查看历史/输出）：暂停自动跟随
+    userScrolled = true;
+  }
   // 离开底部时显示「回到底部」按钮；在底部则隐藏
   els.jumpBottomBtn.hidden = nearBottom;
   // 滚到接近顶部时加载更早历史（分页；防重入 / 已全部加载 / 未开会话时跳过）
