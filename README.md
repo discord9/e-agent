@@ -109,6 +109,15 @@ main bash sandbox narrowed the same way — no bash at all when the sandbox is
 disabled. Delegation stays available (spawning a subagent does not mutate the
 host session), and each subagent resolves its own role template.
 
+`--read-only` narrows **only the main session's own tools**; it is not
+inherited by delegated subagents. A `delegate` subagent with no role override
+resolves its default role, which carries the full toolset — including
+`write_file`/`edit_file` and a writable workspace — so a subagent spawned from
+a `--read-only` session **can still write to disk**. To keep subagents
+read-only too, give their role template a `read_only = true` frontmatter as
+described above; forced inheritance of the parent's read-only policy into
+subagents is a planned future option, not implemented today.
+
 The `bash` tool can be sandboxed with `bubblewrap` when it is installed. The
 sandbox is off unless explicitly enabled:
 
