@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use crossterm::event::{KeyEvent, KeyModifiers};
+
 use super::*;
 
 #[test]

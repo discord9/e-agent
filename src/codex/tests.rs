@@ -213,16 +213,14 @@ async fn sse_failure(body: String) -> anyhow::Error {
 #[tokio::test]
 async fn sse_reports_failed_incomplete_and_explicit_error_events() {
     let failed = sse_failure(
-        "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"failed reason\"}}\n\n"
-            .into(),
+        "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"failed reason\"}}\n\n".into(),
     )
     .await;
     assert!(format!("{failed:#}").contains("failed reason"));
     let incomplete = sse_failure("data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n".into()).await;
     assert!(format!("{incomplete:#}").contains("max_output_tokens"));
     let explicit =
-        sse_failure("data: {\"type\":\"error\",\"message\":\"explicit reason\"}\n\n".into())
-            .await;
+        sse_failure("data: {\"type\":\"error\",\"message\":\"explicit reason\"}\n\n".into()).await;
     assert!(format!("{explicit:#}").contains("explicit reason"));
     let response_error = sse_failure(
         "data: {\"type\":\"response.error\",\"error\":{\"message\":\"response reason\"}}\n\n"
@@ -280,8 +278,8 @@ async fn backend_401_refreshes_once_persists_rotation_and_retries_once() {
     });
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("auth.json");
-    let auth = crate::codex_auth::CodexAuth::test_auth(path.clone())
-        .with_token_endpoint(token_endpoint);
+    let auth =
+        crate::codex_auth::CodexAuth::test_auth(path.clone()).with_token_endpoint(token_endpoint);
     let mut model = CodexModel::with_endpoint(auth.clone(), endpoint);
     let (_, usage) = model
         .complete(

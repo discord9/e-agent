@@ -1,3 +1,8 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use crossterm::event::{KeyEvent, KeyModifiers};
+
 use super::*;
 use ratatui::buffer::CellDiffOption;
 
@@ -575,8 +580,7 @@ async fn reattaching_forwards_each_delta_once() {
     let (sender, mut inbox) = mpsc::unbounded_channel();
     let mut state = TuiState::default();
     attach_test(&mut state, 7, "demo", handle.clone());
-    state.attached.as_mut().unwrap().bridge =
-        Some(bridge(7, handle.attach().1, sender.clone()));
+    state.attached.as_mut().unwrap().bridge = Some(bridge(7, handle.attach().1, sender.clone()));
     state.detach();
     tokio::task::yield_now().await;
 
@@ -880,15 +884,14 @@ fn attached_title_reflects_injected_status() {
     attach_test(&mut state, 5, "job", handle);
     let (tx, rx) = tokio::sync::watch::channel(SessionStatus::Idle);
     state.attached.as_mut().unwrap().status = rx;
-    let title = |terminal: &mut Terminal<ratatui::backend::TestBackend>,
-                 state: &mut TuiState|
-     -> String {
-        draw(terminal, state).unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..60)
-            .map(|x| buffer[(x, 9)].symbol().chars().next().unwrap_or(' '))
-            .collect()
-    };
+    let title =
+        |terminal: &mut Terminal<ratatui::backend::TestBackend>, state: &mut TuiState| -> String {
+            draw(terminal, state).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..60)
+                .map(|x| buffer[(x, 9)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
     // Idle: mirror what run_inner's status refresh does (no spinner).
     state.attached.as_mut().unwrap().state.busy = None;
     let top = title(&mut terminal, &mut state);
@@ -1733,14 +1736,8 @@ async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
         )
         .unwrap();
     let id = background.running()[0].id;
-    crate::session::Session::record_background_start(
-        temp.path(),
-        "cancel-store",
-        id,
-        "task",
-        None,
-    )
-    .unwrap();
+    crate::session::Session::record_background_start(temp.path(), "cancel-store", id, "task", None)
+        .unwrap();
     let mut state = TuiState {
         background: Some(background),
         cwd: temp.path().display().to_string(),
@@ -1751,8 +1748,7 @@ async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
     state.cancel_selected_task();
 
     assert!(
-        crate::session::Session::take_unfinished_background(temp.path(), "cancel-store")
-            .is_empty()
+        crate::session::Session::take_unfinished_background(temp.path(), "cancel-store").is_empty()
     );
 }
 

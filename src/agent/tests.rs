@@ -1593,11 +1593,7 @@ impl Model for ImageRoundModel {
             return Ok((
                 AssistantMessage {
                     content: None,
-                    tool_calls: vec![call(
-                        "call-img",
-                        "read_image",
-                        r#"{"path":"pics/cat.png"}"#,
-                    )],
+                    tool_calls: vec![call("call-img", "read_image", r#"{"path":"pics/cat.png"}"#)],
                     reasoning: None,
                 },
                 None,
