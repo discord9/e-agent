@@ -978,6 +978,7 @@ function setConn(stateName, text) {
 }
 
 function connectSSE(id) {
+  if (id !== state.sessionId) return;   // 已切换会话：不动当前会话的流
   stopSSE();
   state.sse.stopped = false;
   state.sse.ctrl = new AbortController();
@@ -1202,6 +1203,7 @@ async function loadHistory(id) {
 function openWith(id, withHistory) {
   const step = withHistory ? loadHistory(id) : Promise.resolve("ok");
   step.then((r) => {
+    if (state.sessionId !== id) return;   // 已切换会话：丢弃过期回调
     if (r === "auth" || r === "gone") return;
     connectSSE(id);
   });

@@ -396,6 +396,41 @@ impl SessionFactory {
             role_name,
         })
     }
+
+    /// Test-only factory: the real constructor resolves config, model env
+    /// keys and sandbox policy, which the server tests must not depend on.
+    /// The server's test handlers only ever call `root()` (registry-miss
+    /// paths short-circuit before any store I/O), never `build()`.
+    #[cfg(test)]
+    pub(crate) fn test_factory(root: PathBuf) -> Self {
+        let workspace = Workspace::new(root.clone()).expect("temp workspace");
+        let main_model = ConfiguredModel::chat(
+            OpenAiModel::new(
+                "http://localhost".into(),
+                "test-key".into(),
+                "test-model".into(),
+                None,
+            )
+            .expect("test model"),
+        );
+        Self {
+            workspace,
+            root,
+            config: None,
+            backend: crate::config::SessionBackend::Jsonl,
+            main_model,
+            main_context_window: None,
+            subagent_model: None,
+            subagent_context_window: None,
+            role_models: HashMap::new(),
+            role_context_windows: HashMap::new(),
+            sandbox: None,
+            read_only: false,
+            agents_instructions: None,
+            skills_instructions: None,
+            announce: false,
+        }
+    }
 }
 
 fn read_agents(root: &Path) -> anyhow::Result<Option<String>> {

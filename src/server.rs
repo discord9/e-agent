@@ -49,6 +49,30 @@ use crate::tools::BackgroundTasks;
 /// Heartbeat interval for SSE connections (comment line `: ping`).
 const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Bounded per-connection SSE queue. A stalled TCP peer cannot grow an
+/// unbounded buffer (ToolResult payloads can be MB-sized): when the queue
+/// fills, `forward_events` drops the connection and the frontend's 3s
+/// reconnect logic re-establishes it.
+const SSE_CHANNEL_CAPACITY: usize = 256;
+
+/// Cap for the `snapshot` / `resync` event arrays. The in-memory event log
+/// grows without bound on a long session; the initial snapshot is only a
+/// fallback when the history route fails, and a resync only needs to cover
+/// the broadcast gap (256) with margin, so the newest `SNAPSHOT_MAX` events
+/// are enough to re-render a client.
+const SNAPSHOT_MAX: usize = 1000;
+
+/// Keep only the newest `SNAPSHOT_MAX` events of a log snapshot (drop the
+/// oldest). Bounds the per-connection snapshot/resync frame size on long
+/// sessions.
+fn tail_snapshot(mut events: Vec<AgentEvent>) -> Vec<AgentEvent> {
+    let len = events.len();
+    if len > SNAPSHOT_MAX {
+        events.drain(..len - SNAPSHOT_MAX);
+    }
+    events
+}
+
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // Startup
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -550,24 +574,28 @@ async fn session_history(
 // SSE
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-/// `GET /api/sessions/{id}/events` — one `event: snapshot` carrying the full
-/// event array, one initial `event: status`, then live frames named after
+/// `GET /api/sessions/{id}/events` — one `event: snapshot` carrying the
+/// recent event array (newest `SNAPSHOT_MAX`, a fallback when the history
+/// route fails), one initial `event: status`, then live frames named after
 /// the [`AgentEvent`] variant (CamelCase: `UserPrompt`, `AssistantDelta`,
 /// `ToolCall`, …) plus `event: status` on state changes and a `: ping`
-/// comment every 15s. If a client ever falls behind the broadcast buffer,
-/// a fresh `event: resync` with the full event array is re-sent (the
-/// frontend force-replaces its transcript) and the stream continues.
+/// comment every 15s. Events are forwarded over a bounded queue
+/// (`SSE_CHANNEL_CAPACITY`): a client that stalls long enough to fill it is
+/// disconnected (the frontend reconnects after 3s). If a client ever falls
+/// behind the broadcast buffer, a fresh `event: resync` with the recent
+/// event array is re-sent (the frontend force-replaces its transcript) and
+/// the stream continues.
 async fn session_events(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
     let session = live(&state, &id)?;
     let (snapshot, live, status) = session.handle.attach();
-    let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Error>>();
+    let (tx, rx) = mpsc::channel::<Result<Event, Error>>(SSE_CHANNEL_CAPACITY);
     tokio::spawn(forward_events(
         state.registry.clone(),
         id,
-        snapshot,
+        tail_snapshot(snapshot),
         live,
         status,
         tx,
@@ -580,9 +608,9 @@ async fn session_events(
     Ok(response)
 }
 
-/// tokio's `UnboundedReceiver` does not implement `Stream` on its own; this
-/// adapter (a few lines, no extra dependency) exposes `poll_recv`.
-struct SseReceiver(mpsc::UnboundedReceiver<Result<Event, Error>>);
+/// tokio's `Receiver` does not implement `Stream` on its own; this adapter
+/// (a few lines, no extra dependency) exposes `poll_recv`.
+struct SseReceiver(mpsc::Receiver<Result<Event, Error>>);
 
 impl Stream for SseReceiver {
     type Item = Result<Event, Error>;
@@ -597,9 +625,12 @@ async fn forward_events(
     snapshot: Vec<AgentEvent>,
     mut live: broadcast::Receiver<AgentEvent>,
     mut status: watch::Receiver<SessionStatus>,
-    tx: mpsc::UnboundedSender<Result<Event, Error>>,
+    tx: mpsc::Sender<Result<Event, Error>>,
 ) {
-    let send = |event: Result<Event, Error>| tx.send(event).is_ok();
+    // Bounded queue: a full queue means the client is too slow to keep up —
+    // drop the connection instead of buffering without bound (the frontend
+    // reconnects after 3s).
+    let send = |event: Result<Event, Error>| tx.try_send(event).is_ok();
     if !send(snapshot_event(&snapshot)) {
         return;
     }
@@ -628,11 +659,13 @@ async fn forward_events(
                 Err(RecvError::Lagged(_)) => {
                     // Client fell behind the broadcast buffer; resync with a
                     // fresh `event: resync` (unlike `snapshot`, the frontend
-                    // never skips it — it force-replaces the transcript). A
-                    // deleted session ends the stream.
+                    // never skips it — it force-replaces the transcript). The
+                    // resync carries the recent log tail (capped at
+                    // SNAPSHOT_MAX; it only needs to cover the broadcast gap
+                    // with margin). A deleted session ends the stream.
                     let Some(session) = registry.get(&id) else { return };
                     let (snapshot, new_live, new_status) = session.handle.attach();
-                    if !send(resync_event(&snapshot)) {
+                    if !send(resync_event(&tail_snapshot(snapshot))) {
                         return;
                     }
                     if !send(status_event(&new_status.borrow().clone())) {
@@ -657,9 +690,10 @@ fn snapshot_event(events: &[AgentEvent]) -> Result<Event, Error> {
     Event::default().event("snapshot").json_data(events)
 }
 
-/// Lag resync: the full event log re-sent when a client falls behind the
-/// broadcast buffer. The frontend's `resync` branch force-replaces the
-/// transcript (unlike `snapshot`, which it skips once history rendered).
+/// Lag resync: the recent event log tail re-sent when a client falls behind
+/// the broadcast buffer (capped at `SNAPSHOT_MAX`). The frontend's `resync`
+/// branch force-replaces the transcript (unlike `snapshot`, which it skips
+/// once history rendered).
 fn resync_event(events: &[AgentEvent]) -> Result<Event, Error> {
     Event::default().event("resync").json_data(events)
 }
@@ -1086,9 +1120,15 @@ mod tests {
 
     fn live_session(id: &str) -> (String, Arc<LiveSession>) {
         let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+        (id.to_owned(), live_session_with_handle(handle))
+    }
+
+    /// A `LiveSession` sharing the given test handle (the caller keeps the
+    /// emitter so it can push events into the broadcast channel).
+    fn live_session_with_handle(handle: crate::runner::SessionHandle) -> Arc<LiveSession> {
         let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
         let (_tools, background) = crate::tools::builtins(workspace, None, false);
-        let live = LiveSession {
+        Arc::new(LiveSession {
             handle,
             task: crate::runner::SessionTask::from_join_handle(tokio::spawn(async {})),
             store: SessionStore::Jsonl,
@@ -1097,8 +1137,32 @@ mod tests {
             model_name: "test-model".into(),
             role_name: None,
             created_at: chrono::Utc::now(),
-        };
-        (id.to_owned(), Arc::new(live))
+        })
+    }
+
+    /// An `AppState` for handler tests. `test_factory` skips config/model env
+    /// resolution; the tested paths (auth middleware, registry-miss 404)
+    /// never reach `factory.build()`.
+    fn test_app_state(token: &str) -> Arc<AppState> {
+        Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(std::env::temp_dir()),
+            registry: Arc::new(SessionRegistry::default()),
+            token: token.to_owned(),
+        })
+    }
+
+    /// Serialize one SSE `Event` to its wire text (via a one-event `Sse`
+    /// stream) so tests can assert the actual frame shape the frontend
+    /// parses (`event: NAME` + `data: ...`).
+    async fn event_to_text(event: Event) -> String {
+        let sse = Sse::new(futures_util::stream::once(async move {
+            Ok::<Event, Error>(event)
+        }));
+        let body = sse.into_response().into_body();
+        let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
+            .await
+            .expect("event frame fits");
+        String::from_utf8(bytes.to_vec()).expect("event frame is utf-8")
     }
 
     #[tokio::test]
@@ -1227,5 +1291,298 @@ mod tests {
         // No cap or an oversized cap: unchanged.
         assert_eq!(cap_entries(entries.clone(), None).len(), 4);
         assert_eq!(cap_entries(entries, Some(99)).len(), 4);
+    }
+
+    /// M3: snapshots are capped at the newest `SNAPSHOT_MAX` events so a
+    /// long session's unbounded in-memory log cannot blow up the per-client
+    /// snapshot/resync frame.
+    #[test]
+    fn snapshot_tail_keeps_newest_events() {
+        let events: Vec<AgentEvent> = (0..SNAPSHOT_MAX + 50)
+            .map(|i| AgentEvent::Notice(format!("n{i}")))
+            .collect();
+        let tail = tail_snapshot(events);
+        assert_eq!(tail.len(), SNAPSHOT_MAX);
+        assert_eq!(tail.first(), Some(&AgentEvent::Notice("n50".into())));
+        assert_eq!(tail.last(), Some(&AgentEvent::Notice("n1049".into())));
+        // Under the cap: unchanged.
+        let small = vec![AgentEvent::Notice("x".into())];
+        assert_eq!(tail_snapshot(small).len(), 1);
+    }
+
+    /// M5: `require_auth` rejects missing/wrong credentials with 401 and
+    /// lets the startup token through (Bearer header or `?token=`) on the
+    /// real router, so every `/api/*` route is covered by the middleware.
+    #[tokio::test]
+    async fn require_auth_rejects_missing_and_wrong_token() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let app = router(test_app_state("sekrit"));
+        let status =
+            |request: Request<Body>| async { app.clone().oneshot(request).await.unwrap().status() };
+        assert_eq!(
+            status(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "no token must be rejected"
+        );
+        assert_eq!(
+            status(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, "Bearer nope")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "wrong bearer token must be rejected"
+        );
+        assert_eq!(
+            status(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::OK,
+            "right bearer token must pass"
+        );
+        assert_eq!(
+            status(
+                Request::builder()
+                    .uri("/api/sessions?token=sekrit")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::OK,
+            "right query token must pass"
+        );
+    }
+
+    /// M5: `session_history` for an unknown session id returns 404 — the
+    /// registry-miss path short-circuits before any store I/O, so this is
+    /// testable without a real store.
+    #[tokio::test]
+    async fn session_history_404_for_unknown_session() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let app = router(test_app_state("sekrit"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/does-not-exist/history")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// M5: `HistoryParams` must deserialize from the query strings the
+    /// frontend sends — both fields optional, `before_seq` an i64 paging
+    /// cursor, `limit` a cap.
+    #[tokio::test]
+    async fn history_params_parse_from_query_string() {
+        use axum::extract::FromRequestParts;
+        use axum::http::Request;
+
+        let parse = |query: String| async move {
+            let request = Request::builder()
+                .uri(format!("/api/sessions/x/history?{query}"))
+                .body(())
+                .unwrap();
+            let (mut parts, _) = request.into_parts();
+            let Ok(Query(params)) =
+                Query::<HistoryParams>::from_request_parts(&mut parts, &()).await
+            else {
+                panic!("query {query} must parse");
+            };
+            params
+        };
+        let none = parse(String::new()).await;
+        assert_eq!(none.before_seq, None);
+        assert_eq!(none.limit, None);
+        let both = parse("before_seq=42&limit=10".to_owned()).await;
+        assert_eq!(both.before_seq, Some(42));
+        assert_eq!(both.limit, Some(10));
+    }
+
+    /// M5: a client that falls behind the broadcast buffer must receive a
+    /// fresh `event: resync` carrying the event log (so the frontend
+    /// force-replaces its transcript), followed by a fresh status — then the
+    /// stream keeps serving on the new receiver.
+    #[tokio::test]
+    async fn forward_events_resyncs_when_client_lags() {
+        let (handle, emitter, _commands) = crate::runner::session_test_channel();
+        let id = "web-lag".to_owned();
+        let session = live_session_with_handle(handle.clone());
+        let registry = Arc::new(SessionRegistry::default());
+        registry.insert(id.clone(), session.clone());
+
+        // Subscribe, then overflow the broadcast buffer (capacity 256) while
+        // the receiver idles so its next recv reports Lagged.
+        let (snapshot, live, status) = handle.attach();
+        for i in 0..300 {
+            emitter.emit(AgentEvent::Notice(format!("n{i}")));
+        }
+        drop(emitter);
+
+        let (tx, mut rx) = mpsc::channel::<Result<Event, Error>>(16);
+        let task = tokio::spawn(forward_events(
+            registry.clone(),
+            id.clone(),
+            tail_snapshot(snapshot),
+            live,
+            status,
+            tx,
+        ));
+
+        // Frame order: snapshot + status first, then the lag resync + a
+        // fresh status.
+        let first = event_to_text(rx.recv().await.unwrap().unwrap()).await;
+        assert!(first.contains("event: snapshot"), "{first}");
+        let second = event_to_text(rx.recv().await.unwrap().unwrap()).await;
+        assert!(second.contains("event: status"), "{second}");
+        let third = event_to_text(rx.recv().await.unwrap().unwrap()).await;
+        assert!(
+            third.contains("event: resync"),
+            "lag must emit resync:\n{third}"
+        );
+        // The resync replays the log tail: all 300 events (under SNAPSHOT_MAX).
+        let data = third
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("resync data line");
+        let events: Vec<serde_json::Value> = serde_json::from_str(data).unwrap();
+        assert_eq!(events.len(), 300);
+        let fourth = event_to_text(rx.recv().await.unwrap().unwrap()).await;
+        assert!(fourth.contains("event: status"), "{fourth}");
+
+        // Drop every sender: the loop sees the closed channels and exits.
+        drop(rx);
+        registry.remove(&id);
+        drop(session);
+        drop(handle);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("forward_events must exit once the session is gone")
+            .expect("forward_events task must not panic");
+    }
+
+    /// M5: the bounded queue disconnects a client that cannot keep up —
+    /// with the queue already full, `forward_events` ends immediately
+    /// instead of buffering without bound (the frontend then reconnects).
+    #[tokio::test]
+    async fn forward_events_disconnects_when_queue_is_full() {
+        let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+        let (id, session) = live_session("web-full");
+        let registry = Arc::new(SessionRegistry::default());
+        registry.insert(id.clone(), session.clone());
+        let (snapshot, live, status) = handle.attach();
+
+        // Capacity 1, already occupied: the very first try_send fails and
+        // the stream ends.
+        let (tx, _rx) = mpsc::channel::<Result<Event, Error>>(1);
+        let _ = tx.try_send(Ok(Event::default().comment("prefill")));
+        let task = tokio::spawn(forward_events(
+            registry,
+            id,
+            tail_snapshot(snapshot),
+            live,
+            status,
+            tx,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("forward_events must end when the queue is full")
+            .expect("forward_events task must not panic");
+    }
+
+    /// M5 contract (frontend): each live SSE frame must pair the CamelCase
+    /// event name (`applyLiveEvent` switch) with the flat payload keys
+    /// (`pickText` / per-event handlers) on the actual wire — a name/payload
+    /// mismatch would silently break rendering.
+    #[tokio::test]
+    async fn live_event_wire_frames_match_frontend_contract() {
+        use serde_json::json;
+        let cases: &[(AgentEvent, &str, serde_json::Value)] = &[
+            (
+                AgentEvent::UserPrompt("hi".into()),
+                "UserPrompt",
+                json!({"text": "hi"}),
+            ),
+            (
+                AgentEvent::AssistantText("done".into()),
+                "AssistantText",
+                json!({"text": "done"}),
+            ),
+            (
+                AgentEvent::AssistantDelta("正在".into()),
+                "AssistantDelta",
+                json!({"delta": "正在"}),
+            ),
+            (
+                AgentEvent::ReasoningDelta("推理".into()),
+                "ReasoningDelta",
+                json!({"delta": "推理"}),
+            ),
+            (
+                AgentEvent::Notice("note".into()),
+                "Notice",
+                json!({"text": "note"}),
+            ),
+            (
+                AgentEvent::Error("boom".into()),
+                "Error",
+                json!({"error": "boom"}),
+            ),
+            (
+                AgentEvent::ToolCall {
+                    name: "bash".into(),
+                    arguments: "ls".into(),
+                },
+                "ToolCall",
+                json!({"name": "bash", "arguments": "ls"}),
+            ),
+            (
+                AgentEvent::ToolResult {
+                    is_error: true,
+                    content: "no".into(),
+                },
+                "ToolResult",
+                json!({"is_error": true, "content": "no"}),
+            ),
+        ];
+        for (event, name, payload) in cases {
+            let text = event_to_text(live_event(event).unwrap()).await;
+            assert!(
+                text.contains(&format!("event: {name}")),
+                "frame for {name} must carry the CamelCase event name:\n{text}"
+            );
+            let payload_text = payload.to_string();
+            assert!(
+                text.contains(&payload_text),
+                "frame for {name} must carry the flat payload {payload_text}:\n{text}"
+            );
+        }
+        // Status frames: the frontend reads `JSON.parse(data).status`.
+        let text = event_to_text(status_event(&SessionStatus::Busy).unwrap()).await;
+        assert!(text.contains("event: status"), "{text}");
+        assert!(text.contains(r#"{"status":"Busy"}"#), "{text}");
     }
 }
