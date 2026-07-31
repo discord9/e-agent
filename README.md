@@ -85,12 +85,18 @@ home directory; relative paths resolve against the main workspace. Existing
 file/directory roots are canonicalized (including symlink aliases) and aliases
 are deduplicated; missing global roots are skipped.
 
-A project-local `<workspace>/.e-agent/config.toml` may select a subset of these
-global roots. An absent file/section or empty `[sandbox]` inherits all roots.
-If either path field appears, selection mode applies and the other field is
-empty; two explicit empty arrays clear external access. Readable selections may
-come from global readable or writable roots (downgrading authority), while
-writable selections must come from global writable roots. Malformed or
+A project-local `<workspace>/.e-agent/config.toml` merges with these global
+roots instead of replacing them. A project path that is a strict subpath of a
+global root replaces that global root (narrowing it — the global ancestor is
+dropped, so only the project subpath remains), while a project path with no
+ancestor relationship is accumulated alongside the global roots. A project
+path equal to a global root is a no-op, and multiple project subpaths of the
+same global root all survive as separate narrowing points. An absent
+file/section — or a `[sandbox]` with no paths — inherits all global roots
+unchanged. If either path field appears, selection mode applies and the other
+field is empty. Readable selections may come from global readable or writable
+roots (downgrading authority), while writable selections must come from global
+writable roots. Malformed or
 unreadable project config is a startup error. Project config cannot change
 `enabled`, `network`, or `workspace_writable`. A read-only child under a
 writable parent is rejected rather than silently restoring write authority;

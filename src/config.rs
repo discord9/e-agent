@@ -319,8 +319,11 @@ struct ProjectSandbox {
     readable_paths: Option<Vec<String>>,
 }
 
-/// Resolve global roots and the optional project selection. Missing global
-/// roots are ignored for compatibility; all returned paths are canonical.
+/// Resolve global roots and the optional project selection, merged with
+/// narrowing semantics: project roots that are strict subpaths of a global
+/// root replace that global root (least privilege), while unrelated project
+/// roots accumulate alongside the global ones. Missing global roots are
+/// ignored for compatibility; all returned paths are canonical.
 pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Result<Sandbox> {
     let mut result = config.and_then(|c| c.sandbox.clone()).unwrap_or_default();
     let global_writable = canonical_roots(&result.writable_paths, workspace, true)?;
@@ -332,17 +335,17 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
         .is_some_and(|s| s.writable_paths.is_some() || s.readable_paths.is_some());
     let (writable, readable) = if selecting {
         let local = local.expect("selection has a sandbox");
-        let writable = canonical_roots(
+        let local_writable = canonical_roots(
             local.writable_paths.as_deref().unwrap_or_default(),
             workspace,
             false,
         )?;
-        let readable = canonical_roots(
+        let local_readable = canonical_roots(
             local.readable_paths.as_deref().unwrap_or_default(),
             workspace,
             false,
         )?;
-        for path in &writable {
+        for path in &local_writable {
             if !global_writable.iter().any(|root| path.starts_with(root)) {
                 bail!(
                     "project writable path {} is not within a global writable root",
@@ -350,7 +353,7 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
                 );
             }
         }
-        for path in &readable {
+        for path in &local_readable {
             if !global_readable
                 .iter()
                 .chain(&global_writable)
@@ -362,7 +365,10 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
                 );
             }
         }
-        (writable, readable)
+        (
+            merge_roots(global_writable, local_writable),
+            merge_roots(global_readable, local_readable),
+        )
     } else {
         (global_writable, global_readable)
     };
@@ -419,6 +425,33 @@ fn canonical_roots(
         }
     }
     Ok(roots)
+}
+
+/// Merge project-selected roots into global roots with narrowing semantics:
+///
+/// - A project root that is a strict subpath of a global root (`W != G` and
+///   `W.starts_with(G)`) replaces that global root: the global ancestor is
+///   dropped and the narrower project roots are kept (least privilege).
+///   Multiple project subpaths of the same global root all survive as
+///   separate narrowing points.
+/// - A project root equal to a global root is a no-op: the global root stays
+///   and the duplicate is folded away by `normalize_roots`.
+/// - A project root with no ancestor relationship to any global root is
+///   simply accumulated alongside the global roots.
+///
+/// The subset validation in `resolve_sandbox` has already guaranteed every
+/// project root is inside some global root, so no widening is possible here.
+fn merge_roots(global: Vec<PathBuf>, local: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut merged: Vec<PathBuf> = global
+        .into_iter()
+        .filter(|root| {
+            !local
+                .iter()
+                .any(|candidate| *candidate != *root && candidate.starts_with(root))
+        })
+        .collect();
+    merged.extend(local);
+    merged
 }
 
 fn normalize_roots(
@@ -787,7 +820,7 @@ subagent = "kimi/nope"
     }
 
     #[test]
-    fn sandbox_project_selects_and_can_downgrade() {
+    fn sandbox_project_selects_and_narrows_global_writable() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("ws");
         let external = temp.path().join("external");
@@ -809,7 +842,7 @@ writable_paths = ["{}"]
             format!(
                 r#"
 [sandbox]
-readable_paths = ["{}"]
+writable_paths = ["{}"]
 "#,
                 external.join("child").display()
             ),
@@ -820,10 +853,279 @@ readable_paths = ["{}"]
             .sandbox(&workspace)
             .unwrap();
         assert!(!sandbox.enabled);
-        assert!(sandbox.writable_paths.is_empty());
+        assert_eq!(
+            sandbox.writable_paths,
+            vec![external.join("child").to_str().unwrap()],
+            "global writable root is narrowed to the project subpath"
+        );
+        assert!(sandbox.readable_paths.is_empty());
+    }
+
+    #[test]
+    fn sandbox_project_readable_child_of_global_writable_is_rejected() {
+        // Merging keeps the global writable root, so a project read-only
+        // child of it would be a read-only child under a writable root —
+        // rejected by normalize_roots instead of silently re-adding write
+        // authority.
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        std::fs::create_dir_all(external.join("child")).unwrap();
+        let path = write_config(
+            temp.path(),
+            &format!("[sandbox]\nwritable_paths = [\"{}\"]\n", external.display()),
+        );
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            format!(
+                "[sandbox]\nreadable_paths = [\"{}\"]\n",
+                external.join("child").display()
+            ),
+        )
+        .unwrap();
+        let error = Config::from_path(&path)
+            .unwrap()
+            .sandbox(&workspace)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("read-only child") && error.contains("unsupported"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn sandbox_project_accumulates_unrelated_roots_and_narrows() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let keep = temp.path().join("keep");
+        let parent = temp.path().join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        let path = write_config(
+            temp.path(),
+            &format!(
+                "[sandbox]\nwritable_paths = [\"{}\", \"{}\"]\n",
+                keep.display(),
+                parent.display()
+            ),
+        );
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            format!("[sandbox]\nwritable_paths = [\"{}\"]\n", child.display()),
+        )
+        .unwrap();
+        let sandbox = Config::from_path(&path)
+            .unwrap()
+            .sandbox(&workspace)
+            .unwrap();
+        assert_eq!(
+            sandbox.writable_paths,
+            vec![keep.to_str().unwrap(), child.to_str().unwrap()],
+            "unrelated global root accumulated, ancestor replaced by subpath"
+        );
+        assert!(sandbox.readable_paths.is_empty());
+    }
+
+    #[test]
+    fn sandbox_project_narrows_global_writable_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let external = temp.path().join("external");
+        let child = external.join("child");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        let path = write_config(
+            temp.path(),
+            &format!("[sandbox]\nwritable_paths = [\"{}\"]\n", external.display()),
+        );
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            format!("[sandbox]\nwritable_paths = [\"{}\"]\n", child.display()),
+        )
+        .unwrap();
+        let sandbox = Config::from_path(&path)
+            .unwrap()
+            .sandbox(&workspace)
+            .unwrap();
+        assert_eq!(
+            sandbox.writable_paths,
+            vec![child.to_str().unwrap()],
+            "global root replaced by the narrower project subpath"
+        );
+        assert!(
+            !sandbox
+                .writable_paths
+                .contains(&external.to_str().unwrap().to_owned())
+        );
+        assert!(sandbox.readable_paths.is_empty());
+    }
+
+    #[test]
+    fn sandbox_project_multiple_narrowing_subpaths_all_survive() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let external = temp.path().join("external");
+        let x = external.join("x");
+        let z = external.join("z");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        std::fs::create_dir_all(&x).unwrap();
+        std::fs::create_dir_all(&z).unwrap();
+        let path = write_config(
+            temp.path(),
+            &format!("[sandbox]\nwritable_paths = [\"{}\"]\n", external.display()),
+        );
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            format!(
+                "[sandbox]\nwritable_paths = [\"{}\", \"{}\"]\n",
+                x.display(),
+                z.display()
+            ),
+        )
+        .unwrap();
+        let sandbox = Config::from_path(&path)
+            .unwrap()
+            .sandbox(&workspace)
+            .unwrap();
+        assert_eq!(
+            sandbox.writable_paths,
+            vec![x.to_str().unwrap(), z.to_str().unwrap()],
+            "both narrowing subpaths kept, ancestor dropped"
+        );
+    }
+
+    #[test]
+    fn sandbox_project_equal_to_global_is_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let path = write_config(
+            temp.path(),
+            &format!("[sandbox]\nwritable_paths = [\"{}\"]\n", external.display()),
+        );
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            format!("[sandbox]\nwritable_paths = [\"{}\"]\n", external.display()),
+        )
+        .unwrap();
+        let sandbox = Config::from_path(&path)
+            .unwrap()
+            .sandbox(&workspace)
+            .unwrap();
+        assert_eq!(
+            sandbox.writable_paths,
+            vec![external.to_str().unwrap()],
+            "project root equal to the global root changes nothing"
+        );
+    }
+
+    #[test]
+    fn sandbox_without_project_config_is_pure_global() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let writable = temp.path().join("writable");
+        let readable = temp.path().join("readable");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        std::fs::create_dir_all(&writable).unwrap();
+        std::fs::create_dir_all(&readable).unwrap();
+        let path = write_config(
+            temp.path(),
+            &format!(
+                "[sandbox]\nwritable_paths = [\"{}\"]\nreadable_paths = [\"{}\"]\n",
+                writable.display(),
+                readable.display()
+            ),
+        );
+        let sandbox = Config::from_path(&path)
+            .unwrap()
+            .sandbox(&workspace)
+            .unwrap();
+        assert_eq!(sandbox.writable_paths, vec![writable.to_str().unwrap()]);
+        assert_eq!(sandbox.readable_paths, vec![readable.to_str().unwrap()]);
+    }
+
+    #[test]
+    fn sandbox_project_subset_validation_still_applies() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let external = temp.path().join("external");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let path = write_config(
+            temp.path(),
+            &format!("[sandbox]\nwritable_paths = [\"{}\"]\n", external.display()),
+        );
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            format!("[sandbox]\nwritable_paths = [\"{}\"]\n", outside.display()),
+        )
+        .unwrap();
+        let error = Config::from_path(&path)
+            .unwrap()
+            .sandbox(&workspace)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not within a global writable root"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn sandbox_normalize_does_not_undo_narrowing() {
+        // The narrowed child must survive normalize_roots (which folds
+        // children into parents): the global ancestor is gone, so nothing
+        // re-expands it.
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let keep = temp.path().join("keep");
+        let external = temp.path().join("external");
+        let child = external.join("child");
+        let readable = temp.path().join("readable");
+        let readable_child = readable.join("rc");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        for dir in [&keep, &child, &readable_child] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let path = write_config(
+            temp.path(),
+            &format!(
+                "[sandbox]\nwritable_paths = [\"{}\", \"{}\"]\nreadable_paths = [\"{}\"]\n",
+                keep.display(),
+                external.display(),
+                readable.display()
+            ),
+        );
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            format!(
+                "[sandbox]\nwritable_paths = [\"{}\"]\nreadable_paths = [\"{}\"]\n",
+                child.display(),
+                readable_child.display()
+            ),
+        )
+        .unwrap();
+        let sandbox = Config::from_path(&path)
+            .unwrap()
+            .sandbox(&workspace)
+            .unwrap();
+        assert_eq!(
+            sandbox.writable_paths,
+            vec![keep.to_str().unwrap(), child.to_str().unwrap()],
+            "writable narrowing survives normalize_roots; unrelated root kept"
+        );
         assert_eq!(
             sandbox.readable_paths,
-            vec![external.join("child").to_str().unwrap()]
+            vec![readable_child.to_str().unwrap()],
+            "readable narrowing survives normalize_roots"
         );
     }
 
@@ -910,7 +1212,7 @@ readable_paths = ["{}"]
     }
 
     #[test]
-    fn sandbox_project_clear_rejections_aliases_and_malformed() {
+    fn sandbox_project_empty_rejections_aliases_and_malformed() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("ws");
         let writable = temp.path().join("writable");
@@ -938,8 +1240,11 @@ readable_paths = ["{}"]
             "[sandbox]\nwritable_paths = []\nreadable_paths = []\n",
         )
         .unwrap();
-        let clear = config.sandbox(&workspace).unwrap();
-        assert!(clear.writable_paths.is_empty() && clear.readable_paths.is_empty());
+        // Empty project arrays no longer clear the global policy: with
+        // nothing to narrow or accumulate, the merged policy is pure global.
+        let empty = config.sandbox(&workspace).unwrap();
+        assert_eq!(empty.writable_paths, vec![writable.to_str().unwrap()]);
+        assert_eq!(empty.readable_paths, vec![readable.to_str().unwrap()]);
 
         std::fs::write(
             workspace.join(".e-agent/config.toml"),
