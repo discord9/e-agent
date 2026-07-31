@@ -263,6 +263,7 @@
     flex: 1 1 auto;
     min-height: 0;   /* 同上：保证内容多时自身收缩并启用内部滚动 */
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;   /* iOS Safari：启用惯性滚动（否则长内容拖不动） */
     padding: 6px 2px 6px 8px;
     display: flex;
     flex-direction: column;
@@ -290,7 +291,7 @@
   }
   .jump-bottom:hover { color: var(--blue); border-color: var(--blue); }
 
-  .msg { display: flex; gap: 8px; line-height: 1.6; }
+  .msg { display: flex; gap: 8px; line-height: 1.6; flex-shrink: 0; }
   .msg .who { flex: 0 0 auto; font-weight: bold; }
   .msg-body { min-width: 0; overflow-wrap: break-word; }
 
@@ -337,6 +338,7 @@
 
   /* 思考区：紫色斜体，可折叠 */
   details.thinking {
+    flex-shrink: 0;
     margin: 2px 0;
     border-left: 2px solid var(--violet);
     padding-left: 8px;
@@ -371,6 +373,7 @@
 
   /* 工具调用卡片：details 可折叠（summary=标题行） */
   .tool-card {
+    flex-shrink: 0;
     border: 1px solid var(--base1);
     border-left: 3px solid var(--blue);
     border-radius: 4px;
@@ -430,6 +433,7 @@
   }
 
   .notice {
+    flex-shrink: 0;
     color: var(--base01);
     font-size: 12px;
     border-left: 2px solid var(--base1);
@@ -445,6 +449,7 @@
     overflow-wrap: break-word;
   }
   .compaction {
+    flex-shrink: 0;
     text-align: center;
     color: var(--violet);
     font-size: 12px;
@@ -454,6 +459,7 @@
     margin: 4px 0;
   }
   .forked {
+    flex-shrink: 0;
     color: var(--base01);
     font-size: 12px;
     text-align: center;
