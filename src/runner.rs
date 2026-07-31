@@ -721,9 +721,22 @@ impl SessionRunner {
                 let round = match waited.outcome {
                     WaitOutcome::Completed(Ok(round)) => round,
                     WaitOutcome::Completed(Err(error)) => {
-                        self.terminate(SessionResult::Failed(format!("{error:#}")), waited.pending)
+                        if self.policy == IdlePolicy::FinishWhenIdle {
+                            // 子代理 / 一次性 CLI：无人能继续对话，保持终结失败语义
+                            // （delegate.rs 依赖 Finished(Failed) 把失败传回主 agent）。
+                            self.terminate(
+                                SessionResult::Failed(format!("{error:#}")),
+                                waited.pending,
+                            )
                             .await;
-                        return;
+                            return;
+                        }
+                        self.intake_after_operation(waited.pending); // 保留排队命令
+                        self.shared.lock().unwrap().emit(AgentEvent::Error(
+                            // 错误进 shared log + broadcast
+                            format!("model call failed: {error:#}"),
+                        ));
+                        break 'turn; // 外层循环自然回 Idle
                     }
                     WaitOutcome::Cancelled => {
                         self.cancelled = true;

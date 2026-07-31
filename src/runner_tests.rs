@@ -104,6 +104,62 @@ impl Model for ScriptedAssistantModel {
     }
 }
 
+/// Scripted model for the recoverable-failure tests: the first call can be
+/// blocked (so a test can queue commands mid-call) and fail, later calls
+/// succeed. Never streams deltas, so a successful turn projects a plain
+/// `AssistantText` event.
+struct RecoveringModel {
+    replies: VecDeque<anyhow::Result<AssistantMessage>>,
+    block_first: bool,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for RecoveringModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        let reply = self.replies.pop_front().expect("unexpected model call");
+        if self.block_first {
+            self.block_first = false;
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok((reply?, None))
+    }
+}
+
+fn recovering_agent(
+    replies: Vec<anyhow::Result<AssistantMessage>>,
+    block_first: bool,
+) -> (Agent, Arc<Notify>, Arc<Notify>) {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let model = RecoveringModel {
+        replies: replies.into(),
+        block_first,
+        entered: entered.clone(),
+        release: release.clone(),
+    };
+    (
+        // The keep-alive tool holds a clone of the agent's background
+        // completion sender, keeping that channel open. Without a tool the
+        // sender is dropped in Agent::new, so the runner's idle
+        // `wait_background_ready()` returns false immediately and the
+        // session terminates with Finished(Closed) instead of staying Idle.
+        Agent::new(
+            Box::new(model),
+            vec![Box::new(KeepAliveTool { sender: None })],
+        ),
+        entered,
+        release,
+    )
+}
+
 /// Scripted replies with per-call usage, capturing every context the model
 /// is called with, so a test can inspect the derived context of later calls.
 struct ScriptedContextCaptureModel {
@@ -591,6 +647,181 @@ async fn prompt_after_round_failure_has_no_projection_or_persistence() {
             if content == "too late"
     )));
     task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn model_call_failure_returns_to_idle_and_recovers() {
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, entered, release) = recovering_agent(
+        vec![
+            Err(anyhow::anyhow!("model boom")),
+            Ok(AssistantMessage {
+                content: Some("recovered".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+        ],
+        true,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "recoverable-failure".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+    entered.notified().await;
+    release.notify_one();
+
+    // The failed round surfaces as an Error event and the runner returns to
+    // Idle instead of terminating.
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::Error(text)
+                if text.contains("model call failed") && text.contains("model boom")
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+    assert!(handle.snapshot().iter().any(|event| matches!(
+        event,
+        AgentEvent::Error(text) if text.contains("model call failed")
+    )));
+
+    // The failed round committed nothing: only the initial user prompt is on disk.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "recoverable-failure")
+        .await
+        .unwrap();
+    assert_eq!(loaded.entries.len(), 1);
+    assert!(matches!(
+        &loaded.entries[0],
+        SessionEntry::Message {
+            message: Message::User { content }
+        } if content == "initial"
+    ));
+
+    // A fresh prompt opens a new turn that succeeds.
+    handle.prompt("retry prompt");
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "recovered" => break,
+            AgentEvent::Error(_) => panic!("second turn failed"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(handle.snapshot().iter().any(|event| matches!(
+        event,
+        AgentEvent::UserPrompt(text) if text == "retry prompt"
+    )));
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "recoverable-failure")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Assistant(message)
+        } if message.content.as_deref() == Some("recovered")
+    )));
+    assert!(!loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Tool { .. }
+        }
+    )));
+    drop(handle);
+    drop(task);
+}
+
+#[tokio::test]
+async fn prompt_queued_during_failed_model_call_runs_next_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, entered, release) = recovering_agent(
+        vec![
+            Err(anyhow::anyhow!("model boom")),
+            Ok(AssistantMessage {
+                content: Some("recovered".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+        ],
+        true,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "queued-during-failure".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+    entered.notified().await;
+    handle.prompt("queued during failure");
+    assert!(handle.snapshot().iter().any(|event| matches!(
+        event,
+        AgentEvent::PromptQueued(text) if text == "queued during failure"
+    )));
+    release.notify_one();
+
+    // Failure surfaces as an Error event, then the queued prompt automatically
+    // opens a new turn that succeeds.
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::Error(text) if text.contains("model call failed")
+        ) {
+            break;
+        }
+    }
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::UserPrompt(text) if text == "queued during failure" => break,
+            AgentEvent::Error(_) => panic!("second turn failed"),
+            _ => {}
+        }
+    }
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "recovered" => break,
+            AgentEvent::Error(_) => panic!("second turn failed"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "queued-during-failure")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::User { content }
+        } if content == "queued during failure"
+    )));
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Assistant(message)
+        } if message.content.as_deref() == Some("recovered")
+    )));
+    assert!(!loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Tool { .. }
+        }
+    )));
+    drop(handle);
+    drop(task);
 }
 
 #[tokio::test]
