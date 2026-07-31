@@ -144,10 +144,13 @@ impl Palette {
                 .fg(self.violet)
                 .bg(self.element)
                 .add_modifier(Modifier::BOLD),
+            // Bright violet + italic reads clearly as "the model is
+            // thinking" against the dark body text and the grey dim
+            // notices (a DIM violet previously collapsed toward grey).
             LineKind::Thinking => Style::default()
                 .fg(self.violet)
                 .bg(self.background)
-                .add_modifier(Modifier::DIM),
+                .add_modifier(Modifier::ITALIC),
         }
     }
 
