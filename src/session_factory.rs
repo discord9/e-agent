@@ -1,0 +1,541 @@
+//! `SessionFactory`: reusable per-session bootstrap pipeline.
+//!
+//! The single-session bootstrap that used to live in `main.rs::run()` is
+//! factored into a factory so a headless server can build many main sessions
+//! from one set of startup-resolved configuration. Construction
+//! ([`SessionFactory::new`]) resolves everything that is process-global
+//! (workspace, config, models, sandbox); [`SessionFactory::build`] runs the
+//! per-session pipeline (store connect, fork, tools, MCP, delegate, agent,
+//! runner). Behavior is identical to the old `main.rs` flow — build() is a
+//! mechanical move of the per-session block, in the same order.
+
+use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, anyhow};
+
+use crate::agent::{Agent, SessionEntry};
+use crate::codex::CodexModel;
+use crate::codex_auth::CodexAuth;
+use crate::config::{AuthMode, Config, ResolvedModel, Sandbox, resolve_sandbox};
+use crate::delegate::{Delegate, Sessions};
+use crate::mcp;
+use crate::model::{ConfiguredModel, OpenAiModel};
+use crate::runner::{IdlePolicy, SessionHandle, SessionRunner};
+use crate::session_store::SessionStore;
+use crate::tools::{BackgroundTasks, builtins};
+use crate::workspace::Workspace;
+
+/// Everything resolved once at startup and shared by every built session.
+pub struct SessionFactory {
+    workspace: Workspace,
+    root: PathBuf,
+    /// Unified TOML config. Kept so `build()` can read the MCP server
+    /// definitions; a fresh set of MCP servers is spawned per build exactly
+    /// like `main.rs` did (sharing the spawned connections is Phase 2).
+    config: Option<Config>,
+    backend: crate::config::SessionBackend,
+    main_model: ConfiguredModel,
+    main_context_window: Option<u64>,
+    subagent_model: Option<ConfiguredModel>,
+    subagent_context_window: Option<u64>,
+    role_models: HashMap<String, ConfiguredModel>,
+    role_context_windows: HashMap<String, Option<u64>>,
+    /// Already-resolved bwrap policy (`None` = sandbox disabled).
+    sandbox: Option<Sandbox>,
+    read_only: bool,
+    agents_instructions: Option<String>,
+    skills_instructions: Option<String>,
+    /// Print startup/session announcements to stderr (`false` for the TUI,
+    /// whose alternate screen must stay clean).
+    announce: bool,
+}
+
+/// One fully constructed session, ready for the caller to
+/// `runner.start(initial_prompt)` and dispatch to its frontend.
+pub struct SessionBuild {
+    pub runner: SessionRunner,
+    pub handle: SessionHandle,
+    pub store: SessionStore,
+    pub background: BackgroundTasks,
+    /// Live subagent session registry (background delegates).
+    pub sessions: Sessions,
+    /// The effective session id (the fresh `fork-…` id when forking).
+    pub session: String,
+    pub model_name: String,
+    pub role_name: Option<String>,
+}
+
+impl SessionFactory {
+    /// Resolve all process-global startup state: workspace + external roots,
+    /// config, models (main/subagent/roles), sandbox policy, workspace
+    /// instructions. `announce` gates the stderr startup messages the TUI
+    /// suppresses.
+    pub fn new(
+        workspace_root: PathBuf,
+        profile: Option<&str>,
+        base_url: Option<String>,
+        model: Option<String>,
+        read_only: bool,
+        announce: bool,
+    ) -> anyhow::Result<Self> {
+        let mut workspace = Workspace::new(workspace_root)
+            .map_err(anyhow::Error::msg)
+            .context("cannot open workspace")?;
+        let root = workspace.root().to_path_buf();
+        let agents_instructions = read_agents(&root)?;
+        let skills_instructions = read_skills_merged(&root)?;
+        let config = Config::load()?;
+        let backend = config
+            .as_ref()
+            .map(|c| c.session_backend())
+            .unwrap_or_default();
+        // Migrate pre-session-id files only when using the JSONL backend;
+        // GreptimeDB has its own session namespace and does not need file
+        // migration.
+        if matches!(backend, crate::config::SessionBackend::Jsonl) {
+            for (old, new) in crate::session::migrate_legacy(&root) {
+                eprintln!("e-agent: migrated session {old} -> {new}");
+            }
+        }
+        // Web search reads EXA_API_KEY from the process env (tools.rs and
+        // subagents pick it up there). When unset, fall back to the
+        // `[web_search]` config section by injecting it into the env once at
+        // startup — this keeps the key's single transport mechanism and
+        // avoids threading it through every tools constructor. Startup is
+        // single-threaded, so set_var is safe.
+        if std::env::var_os("EXA_API_KEY").is_none()
+            && let Some(config) = &config
+            && let Some(key) = config.web_search_key()?
+        {
+            unsafe { std::env::set_var("EXA_API_KEY", key) };
+        }
+        let (main_resolved, role_resolved, all_roles) = match &config {
+            Some(config) => (
+                Some(config.resolve(profile)?),
+                config
+                    .resolve_role("subagent")
+                    .context("cannot resolve [roles] subagent profile")?,
+                config
+                    .resolve_roles()
+                    .context("cannot resolve [roles] profiles")?,
+            ),
+            None => (None, None, HashMap::new()),
+        };
+        let mut main_context_window = main_resolved.as_ref().and_then(|r| r.context_window);
+        // When --model overrides the profile's wire model, the profile's
+        // context window is no longer valid for the unknown model.
+        let model_override = model.is_some();
+        if matches!(
+            main_resolved.as_ref().map(|value| value.auth),
+            Some(AuthMode::ChatGpt)
+        ) && base_url.is_some()
+        {
+            return Err(anyhow!(
+                "--base-url cannot be used with a provider using auth = `chatgpt`"
+            ));
+        }
+        let needs_chatgpt = main_resolved
+            .as_ref()
+            .is_some_and(|value| value.auth == AuthMode::ChatGpt)
+            || all_roles
+                .values()
+                .any(|value| value.auth == AuthMode::ChatGpt);
+        let auth = needs_chatgpt.then(CodexAuth::load).transpose()?;
+        let main_model = match main_resolved {
+            Some(configured) => configured_model(configured, auth.as_ref(), base_url, model)?,
+            None => {
+                if profile.is_some() {
+                    return Err(anyhow!(
+                        "--profile requires a config file at $XDG_CONFIG_HOME/e-agent/config.toml or $HOME/.config/e-agent/config.toml"
+                    ));
+                }
+                ConfiguredModel::chat(OpenAiModel::from_env(base_url, model)?)
+            }
+        };
+        if model_override {
+            main_context_window = None;
+        }
+        let subagent_context_window = role_resolved.as_ref().and_then(|r| r.context_window);
+        let subagent_model = role_resolved
+            .map(|resolved| configured_model(resolved, auth.as_ref(), None, None))
+            .transpose()?;
+        let mut role_models = HashMap::new();
+        let mut role_context_windows = HashMap::new();
+        for (role, resolved) in all_roles {
+            role_context_windows.insert(role.clone(), resolved.context_window);
+            role_models.insert(role, configured_model(resolved, auth.as_ref(), None, None)?);
+        }
+        // Resolve one shared canonical policy. `enabled` controls only bwrap;
+        // file capabilities remain active independently.
+        let resolved_policy = resolve_sandbox(config.as_ref(), &root)?;
+        workspace = workspace
+            .with_external_roots(&resolved_policy)
+            .map_err(anyhow::Error::msg)?;
+        let sandbox = resolved_policy.enabled.then_some(resolved_policy.clone());
+        if sandbox.is_some() {
+            if !crate::tools::bwrap_available() {
+                return Err(anyhow!(
+                    "[sandbox] enabled = true but bwrap is not available. \
+                     Install bubblewrap or disable the sandbox."
+                ));
+            }
+            if announce {
+                eprintln!("e-agent: bash sandboxed with bwrap");
+            }
+        }
+        Ok(Self {
+            workspace,
+            root,
+            config,
+            backend,
+            main_model,
+            main_context_window,
+            subagent_model,
+            subagent_context_window,
+            role_models,
+            role_context_windows,
+            sandbox,
+            read_only,
+            agents_instructions,
+            skills_instructions,
+            announce,
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The main model's context window (already cleared when `--model`
+    /// overrode the profile's wire model).
+    pub fn main_context_window(&self) -> Option<u64> {
+        self.main_context_window
+    }
+
+    /// Build one session end-to-end, in the exact order `main.rs::run()`
+    /// used: store connect → fork → tools → MCP → delegate → agent →
+    /// context prefix → history restore → unfinished-background notice →
+    /// context window → runner.
+    ///
+    /// `id` is the requested session id; `fork_from` is `(source session,
+    /// optional 1-based entry index)` and replaces `id` with a fresh
+    /// `fork-…` id. The caller still chooses when to `runner.start(...)`
+    /// with its initial prompt.
+    pub async fn build(
+        &self,
+        id: &str,
+        fork_from: Option<(String, Option<usize>)>,
+        max_rounds: Option<usize>,
+        policy: IdlePolicy,
+    ) -> anyhow::Result<SessionBuild> {
+        let mut session = id.to_owned();
+        let mut store = SessionStore::connect(&self.backend, &self.root, &session).await?;
+        if let Some((source, at)) = fork_from {
+            // Fork: copy the source session's history up to a completed-turn
+            // boundary into a brand-new session id. The source is only read;
+            // it never changes.
+            let source_store = SessionStore::connect(&self.backend, &self.root, &source).await?;
+            let with_seq = source_store
+                .load_with_seq(&self.root, &source)
+                .await
+                .with_context(|| format!("cannot load source session {source} for fork"))?;
+            let source_entries: Vec<SessionEntry> =
+                with_seq.iter().map(|(_, entry)| entry.clone()).collect();
+            let prefix = crate::agent::fork_prefix(&source_entries, at)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("cannot fork session {source}"))?;
+            // `at` (1-based, inclusive) is the index of the last kept entry.
+            let at = prefix.len();
+            let seq = with_seq.get(at - 1).map(|(seq, _)| *seq);
+            let marker = SessionEntry::ForkedFrom {
+                source: source.clone(),
+                at,
+                // JSONL has no event_time column and SessionStore does not
+                // expose one; kept as an optional provenance slot.
+                event_time: None,
+                seq,
+            };
+            // The marker sits at the fork point: source prefix first, then
+            // the marker, then the session's own new messages — so scrolling
+            // the forked session reads as "source history … forked from …
+            // new work".
+            let mut fork_entries = Vec::with_capacity(prefix.len() + 1);
+            fork_entries.extend(prefix);
+            fork_entries.push(marker);
+            let new_id = crate::session::new_id_prefixed("fork-");
+            store = SessionStore::connect(&self.backend, &self.root, &new_id).await?;
+            match self.backend {
+                // Atomic create-or-replace for a brand-new JSONL session file.
+                crate::config::SessionBackend::Jsonl => {
+                    store.rewrite(&self.root, &new_id, &fork_entries).await?
+                }
+                // Greptime: fresh session (no rows, next_seq = 0); append
+                // writes contiguous seqs with fresh timestamps. The marker's
+                // provenance fields are payload-only.
+                crate::config::SessionBackend::Greptime { .. } => {
+                    store.append(&self.root, &new_id, &fork_entries).await?
+                }
+            }
+            eprintln!("e-agent: forked session: {new_id}");
+            session = new_id;
+        }
+        let (mut tools, background) =
+            builtins(self.workspace.clone(), self.sandbox.clone(), self.read_only);
+        // Read-only sessions skip MCP entirely: MCP tools carry no read-only
+        // marker, so exposing them would defeat the policy. Delegation stays —
+        // spawning a subagent does not mutate this session's host state, and
+        // each subagent resolves its own role template (read-only or not).
+        let (mcp_tools, mcp_instructions) = if self.read_only {
+            (Vec::new(), Vec::new())
+        } else {
+            let mcp_servers = self
+                .config
+                .as_ref()
+                .map(|c| c.mcp.clone())
+                .unwrap_or_default();
+            mcp::connect_all(mcp_servers, &self.root).await
+        };
+        tools.extend(mcp_tools);
+        let mut delegate = Delegate::new(
+            self.main_model.clone(),
+            self.workspace.clone(),
+            background.clone(),
+        )
+        .persist_sessions(self.root.clone())
+        .with_role_models(self.role_models.clone())
+        .with_role_context_windows(self.role_context_windows.clone())
+        .with_subagent_context_window(self.subagent_context_window)
+        .with_roles_root(self.root.clone())
+        .with_sandbox(self.sandbox.clone())
+        .record_background_tasks_in(self.root.clone(), &session, store.clone())
+        .with_persist_store(self.backend.clone());
+        if let Some(subagent_model) = &self.subagent_model {
+            let name = subagent_model.display_name().to_owned();
+            delegate = delegate.with_subagent_model(subagent_model.clone());
+            if self.announce {
+                eprintln!("e-agent: subagent model {name}");
+            }
+        }
+        let subagent_sessions = delegate.sessions();
+        tools.push(Box::new(delegate));
+        let mut agent = Agent::new(Box::new(self.main_model.clone()), tools);
+        let mut context = Vec::new();
+        // The main agent's orchestrator template (.e-agent/agents/main.md)
+        // leads; it tells the model to decompose work and delegate to the
+        // named roles.
+        let role_name = match crate::roles::role_prompt(&self.root, crate::roles::MAIN_ROLE)? {
+            Some(orchestrator) => {
+                context.push(orchestrator);
+                Some(crate::roles::MAIN_ROLE.to_owned())
+            }
+            None => None,
+        };
+        if let Some(instructions) = &self.agents_instructions {
+            context.push(format!("## AGENTS.md\n\n{instructions}"));
+        }
+        if let Some(skills) = &self.skills_instructions {
+            context.push(skills.clone());
+        }
+        context.extend(mcp_instructions);
+        if !context.is_empty() {
+            agent.set_context_prefix(context.join("\n\n"));
+        }
+        if let Some(rounds) = max_rounds {
+            agent = agent.max_tool_rounds(rounds);
+        }
+        let loaded = store.load(&self.root, &session).await?;
+        let legacy = loaded.legacy;
+        agent.restore_history(loaded.entries);
+        agent.record_background_tasks_in(self.root.clone(), &session, store.clone());
+        let unfinished = store
+            .take_unfinished_background(&self.root, &session)
+            .await?;
+        if !unfinished.is_empty() {
+            let notice = format!(
+                "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
+                unfinished.len(),
+                unfinished.join("\n")
+            );
+            let entry = crate::agent::SessionEntry::Notice {
+                text: notice.clone(),
+            };
+            // Persist immediately so a crash-before-first-turn cannot inject
+            // the same notice again on the next launch.
+            store
+                .append(&self.root, &session, std::slice::from_ref(&entry))
+                .await?;
+            // Append (NOT restore_history, which would wipe the resumed history).
+            agent.push_entry(entry);
+        }
+        if legacy {
+            store.rewrite(&self.root, &session, agent.history()).await?;
+        }
+
+        if let Some(window) = self.main_context_window {
+            agent.set_context_window(window);
+        }
+
+        let model_name = self.main_model.display_name().to_owned();
+        let (runner, handle) = SessionRunner::new(
+            agent,
+            store.clone(),
+            self.root.clone(),
+            session.clone(),
+            policy,
+        );
+        Ok(SessionBuild {
+            runner,
+            handle,
+            store,
+            background,
+            sessions: subagent_sessions,
+            session,
+            model_name,
+            role_name,
+        })
+    }
+}
+
+fn read_agents(root: &Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(root.join("AGENTS.md")) {
+        Ok(content) if content.trim().is_empty() => Ok(None),
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("cannot read workspace AGENTS.md"),
+    }
+}
+
+/// Read all workspace skills from `.e-agent/skills/<name>/SKILL.md`.
+///
+/// Returns `None` (silently) when the directory is missing, empty, or contains
+/// only non-directories / missing / empty SKILL.md files. Actual I/O or UTF-8
+/// errors on a SKILL.md that should be readable are returned with a path
+/// context.
+///
+/// Skills are sorted by `<name>` (dictionary order, stable) and joined as a
+/// single block prefixed with `## Skill: <name>` per skill.
+/// Scan a single skill directory and return (name, content) pairs.
+///
+/// Missing dir, non-directory entries, missing/empty SKILL.md are silently
+/// skipped. I/O/UTF-8 errors on a readable SKILL.md bubble up with path
+/// context.
+pub fn read_skills_from(dir: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let dir_entries = match std::fs::read_dir(dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).context(format!("cannot read {}", dir.display())),
+    };
+
+    let mut skills: Vec<(String, String)> = Vec::new();
+
+    for entry in dir_entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => return Err(e).context(format!("cannot read {} entry", dir.display())),
+        };
+
+        // Only directories are candidate skill folders
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+
+        let skill_name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+
+        let skill_path = entry.path().join("SKILL.md");
+
+        match std::fs::read_to_string(&skill_path) {
+            Ok(content) => {
+                if !content.trim().is_empty() {
+                    skills.push((skill_name, content));
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).context(format!("cannot read {}", skill_path.display()));
+            }
+        }
+    }
+
+    Ok(skills)
+}
+
+/// Merge skills from `global_dir` (e.g. `Config::config_dir()/skills/`) and
+/// `workspace_dir` (`.e-agent/skills/`).  Workspace entries override same-name
+/// globals.  Returns `None` silently when both are missing/empty.
+pub fn read_skills_merge(
+    global_dir: Option<&Path>,
+    workspace_dir: &Path,
+) -> anyhow::Result<Option<String>> {
+    let mut merged: HashMap<String, String> = HashMap::new();
+    if let Some(global) = global_dir {
+        for (name, content) in read_skills_from(global)? {
+            merged.insert(name, content);
+        }
+    }
+    for (name, content) in read_skills_from(workspace_dir)? {
+        merged.insert(name, content);
+    }
+    if merged.is_empty() {
+        return Ok(None);
+    }
+    let mut skills: Vec<_> = merged.into_iter().collect();
+    skills.sort_by(|a, b| a.0.cmp(&b.0));
+    let combined = skills
+        .into_iter()
+        .map(|(name, content)| format!("## Skill: {name}\n\n{content}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok(Some(combined))
+}
+
+/// Production entry: global from `Config::config_dir()/skills/`, workspace
+/// from `<root>/.e-agent/skills/`.
+fn read_skills_merged(root: &Path) -> anyhow::Result<Option<String>> {
+    let global = crate::config::config_dir().map(|d| d.join("skills"));
+    let workspace = root.join(".e-agent").join("skills");
+    read_skills_merge(global.as_deref(), &workspace)
+}
+
+/// Turn a resolved profile into a wire model, honoring `--base-url`/`--model`
+/// overrides for the main model.
+fn configured_model(
+    resolved: ResolvedModel,
+    auth: Option<&CodexAuth>,
+    base_url: Option<String>,
+    model: Option<String>,
+) -> anyhow::Result<ConfiguredModel> {
+    let display = Some(resolved.display);
+    match resolved.auth {
+        AuthMode::ApiKey => {
+            let mut cm = ConfiguredModel::chat(
+                OpenAiModel::new(
+                    base_url.unwrap_or(resolved.base_url),
+                    resolved.api_key,
+                    model.unwrap_or(resolved.model),
+                    resolved.reasoning_effort,
+                )?
+                .with_vision(resolved.vision),
+            );
+            cm.display = display;
+            Ok(cm)
+        }
+        AuthMode::ChatGpt => {
+            let mut cm = ConfiguredModel::codex(
+                CodexModel::new(
+                    auth.cloned()
+                        .ok_or_else(|| anyhow!("ChatGPT auth was not initialized"))?,
+                    model.unwrap_or(resolved.model),
+                    resolved.reasoning_effort,
+                )?
+                .with_vision(resolved.vision),
+            );
+            cm.display = display;
+            Ok(cm)
+        }
+    }
+}

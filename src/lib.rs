@@ -9,6 +9,7 @@ pub mod model;
 pub mod roles;
 pub mod runner;
 pub mod session;
+pub mod session_factory;
 #[cfg(feature = "greptime")]
 pub mod session_greptime;
 pub mod session_store;
