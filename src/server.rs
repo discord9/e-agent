@@ -14,6 +14,8 @@
 //! | POST   | `/api/sessions/{id}/cancel`       | cancel the in-flight turn          |
 //! | POST   | `/api/sessions/{id}/compact`      | request compaction                 |
 //! | DELETE | `/api/sessions/{id}`              | cancel + remove from the registry  |
+//! | GET    | `/api/tasks`                        | running background tasks, all sessions |
+//! | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task          |
 //!
 //! Authentication: a random token generated at startup (written to
 //! `$XDG_STATE_HOME/e-agent/server.token` or `~/.local/state/e-agent/server.token`,
@@ -44,7 +46,7 @@ use crate::delegate::Sessions;
 use crate::runner::{IdlePolicy, SessionHandle, SessionStatus, SessionTask};
 use crate::session_factory::{SessionBuild, SessionFactory};
 use crate::session_store::SessionStore;
-use crate::tools::BackgroundTasks;
+use crate::tools::{BackgroundTaskInfo, BackgroundTasks};
 
 /// Heartbeat interval for SSE connections (comment line `: ping`).
 const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -140,6 +142,8 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/compact", post(session_compact))
         .route("/api/sessions/{id}", delete(delete_session))
+        .route("/api/tasks", get(list_tasks))
+        .route("/api/sessions/{id}/tasks/{task_id}", delete(cancel_task))
         .route_layer(from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/", get(index))
@@ -378,6 +382,61 @@ fn error(status: StatusCode, message: impl Into<String>) -> (StatusCode, String)
     (status, message.into())
 }
 
+/// One running background task, flattened for the wire. Task ids are only
+/// unique per session (`BackgroundTasks` ids increment per registry), so
+/// every entry carries its `session_id` and clients address a task as
+/// `/api/sessions/{session_id}/tasks/{id}`.
+#[derive(Serialize)]
+pub struct TaskMeta {
+    pub session_id: String,
+    pub id: u64,
+    pub label: String,
+    pub full_command: Option<String>,
+    pub role: Option<String>,
+    /// `"bash"` for background shell commands, `"delegate"` for subagents.
+    pub kind: String,
+    /// Lossy UTF-8 of the captured output tail, truncated to
+    /// `TASK_OUTPUT_LIMIT` characters so a batch of running tasks cannot
+    /// produce an unbounded payload.
+    pub output: String,
+    /// `display_meta.background` (delegate tasks); `false` otherwise.
+    pub background: bool,
+    /// `display_meta.workspace` (delegate tasks); `None` otherwise.
+    pub workspace: Option<String>,
+}
+
+/// Cap for `TaskMeta.output`. The per-task output tail is already capped at
+/// 16 KiB in the spool; the wire DTO truncates further to this many
+/// characters so a batch of running tasks stays a bounded `/api/tasks`
+/// payload.
+const TASK_OUTPUT_LIMIT: usize = 2000;
+
+/// Map one [`BackgroundTaskInfo`] snapshot to its wire DTO. Pure function so
+/// the field mapping (lossy UTF-8, truncation, display-meta flattening) is
+/// unit-testable without a live task.
+fn task_meta(session_id: &str, info: BackgroundTaskInfo) -> TaskMeta {
+    let output = String::from_utf8_lossy(&info.output);
+    let mut output = output.into_owned();
+    if output.chars().count() > TASK_OUTPUT_LIMIT {
+        output = output.chars().take(TASK_OUTPUT_LIMIT).collect();
+    }
+    TaskMeta {
+        session_id: session_id.to_owned(),
+        id: info.id,
+        label: info.label,
+        full_command: info.full_command,
+        role: info.role,
+        kind: info.kind,
+        output,
+        background: info
+            .display_meta
+            .as_ref()
+            .map(|meta| meta.background)
+            .unwrap_or(false),
+        workspace: info.display_meta.and_then(|meta| meta.workspace),
+    }
+}
+
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // Handlers
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -572,6 +631,43 @@ async fn delete_session(
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Background tasks
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// `GET /api/tasks` — one flat snapshot of every running background task
+/// across all live sessions (bash and delegate). Task ids are only unique
+/// per session, so each entry carries its `session_id`; the list is sorted
+/// by `(session_id, id)` for a stable render across registry iteration
+/// order (the registry is a HashMap).
+async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<TaskMeta>> {
+    let mut tasks: Vec<TaskMeta> = Vec::new();
+    for (session_id, session) in state.registry.list() {
+        for info in session.background.running() {
+            tasks.push(task_meta(&session_id, info));
+        }
+    }
+    tasks.sort_by(|a, b| (&a.session_id, a.id).cmp(&(&b.session_id, b.id)));
+    Json(tasks)
+}
+
+/// `DELETE /api/sessions/{id}/tasks/{task_id}` — cancel one running
+/// background task. 204 when cancelled; 404 for an unknown session or an
+/// unknown task id in that session.
+async fn cancel_task(
+    State(state): State<Arc<AppState>>,
+    Path((id, task_id)): Path<(String, u64)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let session = live(&state, &id)?;
+    match session.background.cancel(task_id) {
+        Some(_) => Ok(StatusCode::NO_CONTENT),
+        None => Err(error(
+            StatusCode::NOT_FOUND,
+            format!("task {task_id} not found in session {id}"),
+        )),
+    }
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -930,6 +1026,7 @@ async fn index() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::TaskDisplayMeta;
 
     fn test_state_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("e-agent-server-tests-{}", std::process::id()));
@@ -1264,6 +1361,40 @@ mod tests {
             role_name: None,
             created_at: chrono::Utc::now(),
         })
+    }
+
+    /// A `LiveSession` whose `BackgroundTasks` has a live completion sender.
+    /// `builtins` alone yields a sender-less registry whose `start` rejects
+    /// with "background task delivery is unavailable"; this helper wires an
+    /// unbounded channel so tests can spawn real background tasks. The
+    /// returned receiver keeps the channel open for the caller's scope
+    /// (dropping every receiver would make `sender.is_closed()` true).
+    fn live_session_with_background_sender(
+        id: &str,
+    ) -> (
+        String,
+        Arc<LiveSession>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::agent::AgentEvent>,
+    ) {
+        let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+        let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
+        let (_tools, mut background) = crate::tools::builtins(workspace, None, false, None);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        background.set_event_sender(tx);
+        (
+            id.to_owned(),
+            Arc::new(LiveSession {
+                handle,
+                task: crate::runner::SessionTask::from_join_handle(tokio::spawn(async {})),
+                store: SessionStore::Jsonl,
+                background,
+                sessions: Sessions::default(),
+                model_name: "test-model".into(),
+                role_name: None,
+                created_at: chrono::Utc::now(),
+            }),
+            rx,
+        )
     }
 
     /// An `AppState` for handler tests. `test_factory` skips config/model env
@@ -1813,5 +1944,264 @@ mod tests {
         let text = event_to_text(status_event(&SessionStatus::Busy).unwrap()).await;
         assert!(text.contains("event: status"), "{text}");
         assert!(text.contains(r#"{"status":"Busy"}"#), "{text}");
+    }
+
+    /// The `task_meta` field mapping: bash output becomes lossy UTF-8
+    /// truncated at `TASK_OUTPUT_LIMIT` chars, and delegate display metadata
+    /// is flattened into `background` + `workspace` (both empty for
+    /// non-delegate tasks).
+    #[test]
+    fn task_meta_maps_fields_and_truncates_output() {
+        let long = task_meta(
+            "web-x",
+            BackgroundTaskInfo {
+                id: 7,
+                label: "big".into(),
+                full_command: Some("yes".into()),
+                role: Some("coder".into()),
+                kind: "bash".into(),
+                output: vec![b'a'; 5000],
+                display_meta: None,
+            },
+        );
+        assert_eq!(long.session_id, "web-x");
+        assert_eq!(long.id, 7);
+        assert_eq!(long.label, "big");
+        assert_eq!(long.full_command.as_deref(), Some("yes"));
+        assert_eq!(long.role.as_deref(), Some("coder"));
+        assert_eq!(long.kind, "bash");
+        assert_eq!(long.output.chars().count(), TASK_OUTPUT_LIMIT);
+        assert!(!long.background, "non-delegate tasks have no display meta");
+        assert_eq!(long.workspace, None);
+        // Invalid UTF-8 becomes the lossy replacement character; short
+        // output passes through untruncated.
+        let lossy = task_meta(
+            "web-x",
+            BackgroundTaskInfo {
+                id: 8,
+                label: "bytes".into(),
+                full_command: None,
+                role: None,
+                kind: "bash".into(),
+                output: vec![0xff, 0xfe],
+                display_meta: None,
+            },
+        );
+        assert_eq!(lossy.output, "\u{FFFD}\u{FFFD}");
+        // Delegate display metadata is flattened into background + workspace.
+        let delegate = task_meta(
+            "web-y",
+            BackgroundTaskInfo {
+                id: 9,
+                label: "d".into(),
+                full_command: None,
+                role: None,
+                kind: "delegate".into(),
+                output: Vec::new(),
+                display_meta: Some(TaskDisplayMeta {
+                    background: true,
+                    workspace: Some("/tmp/w".into()),
+                }),
+            },
+        );
+        assert_eq!(delegate.kind, "delegate");
+        assert!(delegate.background);
+        assert_eq!(delegate.workspace.as_deref(), Some("/tmp/w"));
+    }
+
+    /// `GET /api/tasks` on an empty registry (and on sessions with no
+    /// running tasks) returns an empty list.
+    #[tokio::test]
+    async fn list_tasks_empty_registry_returns_empty_list() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let state = test_app_state("sekrit");
+        // One live session, no running tasks.
+        let (id, session) = live_session("web-idle");
+        state.registry.insert(id, session);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    /// `DELETE /api/sessions/{id}/tasks/{task_id}` returns 404 for an
+    /// unknown session and for a known session with no such task.
+    #[tokio::test]
+    async fn cancel_task_404_for_unknown_session_and_unknown_task() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let state = test_app_state("sekrit");
+        let (id, session) = live_session("web-cancel");
+        state.registry.insert(id.clone(), session);
+        let app = router(state);
+        let status = |uri: String| async {
+            let app = app.clone();
+            app.oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .method("DELETE")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+        assert_eq!(
+            status("/api/sessions/ghost/tasks/1".to_owned()).await,
+            StatusCode::NOT_FOUND,
+            "unknown session must 404"
+        );
+        assert_eq!(
+            status(format!("/api/sessions/{id}/tasks/42")).await,
+            StatusCode::NOT_FOUND,
+            "unknown task id must 404"
+        );
+    }
+
+    /// `GET /api/tasks` lists running bash and delegate tasks across
+    /// sessions with the wire fields (sorted by `(session_id, id)`), and
+    /// `DELETE /api/sessions/{id}/tasks/{task_id}` cancels one (204, then
+    /// the task is gone; a second cancel 404s).
+    #[tokio::test]
+    async fn list_tasks_and_cancel_running_tasks() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::time::Duration;
+        use tower::util::ServiceExt;
+
+        let state = test_app_state("sekrit");
+        let (id_a, session_a, _rx_a) = live_session_with_background_sender("web-a");
+        let (id_b, session_b, _rx_b) = live_session_with_background_sender("web-b");
+        state.registry.insert(id_a.clone(), session_a.clone());
+        state.registry.insert(id_b.clone(), session_b.clone());
+
+        // A real background bash task. The test registry is sender-equipped
+        // and sandbox-less; the command outlives the assertions (30s) so
+        // `running()` stays stable, and the test cancels it before exiting.
+        let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
+        session_a
+            .background
+            .start(workspace, "sleep 30".to_string(), false)
+            .expect("bash background task starts");
+        // A delegate task with display metadata (background + workspace).
+        session_b
+            .background
+            .spawn_with_id(
+                "delegate task".into(),
+                Some("coder".into()),
+                None,
+                Some(TaskDisplayMeta {
+                    background: true,
+                    workspace: Some("/tmp/dw".into()),
+                }),
+                |_| {},
+                || async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    "done".into()
+                },
+            )
+            .expect("delegate background task starts");
+
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let tasks: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            tasks.len(),
+            2,
+            "one bash + one delegate task across two sessions: {tasks:?}"
+        );
+        // Sorted by (session_id, id): web-a before web-b.
+        assert_eq!(tasks[0]["session_id"], "web-a");
+        assert_eq!(tasks[1]["session_id"], "web-b");
+        let bash = &tasks[0];
+        assert_eq!(bash["id"], 1);
+        assert_eq!(bash["kind"], "bash");
+        assert_eq!(bash["label"], "sleep 30");
+        assert_eq!(bash["full_command"], "sleep 30");
+        assert_eq!(bash["output"], "");
+        assert_eq!(bash["background"], false);
+        assert_eq!(bash["workspace"], serde_json::Value::Null);
+        let delegate = &tasks[1];
+        assert_eq!(delegate["id"], 1);
+        assert_eq!(delegate["kind"], "delegate");
+        assert_eq!(delegate["label"], "delegate task");
+        assert_eq!(delegate["full_command"], serde_json::Value::Null);
+        assert_eq!(delegate["role"], "coder");
+        assert_eq!(delegate["background"], true);
+        assert_eq!(delegate["workspace"], "/tmp/dw");
+
+        // Cancel the bash task via the endpoint: 204, task gone, and a
+        // second cancel 404s.
+        let cancel = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id_a}/tasks/1"))
+                    .method("DELETE")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
+        assert!(
+            session_a.background.running().is_empty(),
+            "bash task must be cancelled"
+        );
+        let cancel_twice = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id_a}/tasks/1"))
+                    .method("DELETE")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel_twice.status(), StatusCode::NOT_FOUND);
+
+        // Clean up the delegate task too (it is still registered).
+        assert!(
+            session_b.background.cancel(1).is_some(),
+            "delegate task is cancelled"
+        );
     }
 }
