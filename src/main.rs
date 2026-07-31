@@ -8,7 +8,7 @@ use anyhow::{Context, anyhow};
 use e_agent::agent::{AgentEvent, ImagePart, preview};
 use e_agent::codex_auth::{login, logout};
 use e_agent::runner::{IdlePolicy, SessionHandle, SessionResult, SessionStatus, SessionTask};
-use e_agent::session_factory::SessionFactory;
+use e_agent::session_factory::{SessionFactory, UnfinishedPolicy};
 use e_agent::tui;
 
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -258,7 +258,13 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
         IdlePolicy::FinishWhenIdle
     };
     let built = factory
-        .build(&session, fork_from, max_rounds, policy)
+        .build(
+            &session,
+            fork_from,
+            max_rounds,
+            policy,
+            UnfinishedPolicy::Consume,
+        )
         .await?;
     if tui_mode {
         // The fork (if any) happened inside build; report the effective id.

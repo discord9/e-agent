@@ -27,6 +27,30 @@ use crate::session_store::SessionStore;
 use crate::tools::{BackgroundTasks, builtins_with_bash_timeout};
 use crate::workspace::Workspace;
 
+/// What to do with background-task records left behind by a previous run
+/// when building a session.
+///
+/// The store cannot tell whether the process that owned those tasks is
+/// still alive, so the *caller* decides:
+///
+/// - [`UnfinishedPolicy::Consume`]: process-level startup (CLI/TUI/REPL).
+///   The old process is known dead, so its tasks really were killed with
+///   it: take the running-task records and inject a "tasks were killed"
+///   notice into the resumed history.
+/// - [`UnfinishedPolicy::Preserve`]: a server lazily attaching to a session
+///   that may still be alive in another process. Do not read the records
+///   and do not inject any notice; the owning process clears them itself
+///   via `ack_background_entry` → `clear_background_task` when it finishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnfinishedPolicy {
+    /// Process-level startup: the previous owner is dead; consume the
+    /// records and announce that its tasks were killed.
+    Consume,
+    /// Server-side lazy attach to a possibly-live session: leave the
+    /// records untouched for the owning process to acknowledge.
+    Preserve,
+}
+
 /// Everything resolved once at startup and shared by every built session.
 pub struct SessionFactory {
     workspace: Workspace,
@@ -221,19 +245,24 @@ impl SessionFactory {
 
     /// Build one session end-to-end, in the exact order `main.rs::run()`
     /// used: store connect → fork → tools → MCP → delegate → agent →
-    /// context prefix → history restore → unfinished-background notice →
+    /// context prefix → history restore → unfinished-background handling →
     /// context window → runner.
     ///
     /// `id` is the requested session id; `fork_from` is `(source session,
     /// optional 1-based entry index)` and replaces `id` with a fresh
-    /// `fork-…` id. The caller still chooses when to `runner.start(...)`
-    /// with its initial prompt.
+    /// `fork-…` id. `unfinished` selects how leftover background-task
+    /// records are handled: `Consume` (process-level startup; see
+    /// [`UnfinishedPolicy`]) takes them and injects a "killed with the
+    /// process" notice, `Preserve` (server lazy attach) leaves them for
+    /// the owning process. The caller still chooses when to
+    /// `runner.start(...)` with its initial prompt.
     pub async fn build(
         &self,
         id: &str,
         fork_from: Option<(String, Option<usize>)>,
         max_rounds: Option<usize>,
         policy: IdlePolicy,
+        unfinished: UnfinishedPolicy,
     ) -> anyhow::Result<SessionBuild> {
         let mut session = id.to_owned();
         let mut store = SessionStore::connect(&self.backend, &self.root, &session).await?;
@@ -364,25 +393,32 @@ impl SessionFactory {
         let legacy = loaded.legacy;
         agent.restore_history(loaded.entries);
         agent.record_background_tasks_in(self.root.clone(), &session, store.clone());
-        let unfinished = store
-            .take_unfinished_background(&self.root, &session)
-            .await?;
-        if !unfinished.is_empty() {
-            let notice = format!(
-                "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
-                unfinished.len(),
-                unfinished.join("\n")
-            );
-            let entry = crate::agent::SessionEntry::Notice {
-                text: notice.clone(),
-            };
-            // Persist immediately so a crash-before-first-turn cannot inject
-            // the same notice again on the next launch.
-            store
-                .append(&self.root, &session, std::slice::from_ref(&entry))
+        if matches!(unfinished, UnfinishedPolicy::Consume) {
+            // Process-level startup only: the previous owner is dead, so its
+            // tasks really were killed with the process. Preserve skips this
+            // entirely — the server may be attaching to a session that is
+            // still live in another process, and that owner clears its own
+            // records via ack_background_entry → clear_background_task.
+            let unfinished = store
+                .take_unfinished_background(&self.root, &session)
                 .await?;
-            // Append (NOT restore_history, which would wipe the resumed history).
-            agent.push_entry(entry);
+            if !unfinished.is_empty() {
+                let notice = format!(
+                    "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
+                    unfinished.len(),
+                    unfinished.join("\n")
+                );
+                let entry = crate::agent::SessionEntry::Notice {
+                    text: notice.clone(),
+                };
+                // Persist immediately so a crash-before-first-turn cannot inject
+                // the same notice again on the next launch.
+                store
+                    .append(&self.root, &session, std::slice::from_ref(&entry))
+                    .await?;
+                // Append (NOT restore_history, which would wipe the resumed history).
+                agent.push_entry(entry);
+            }
         }
         if legacy {
             store.rewrite(&self.root, &session, agent.history()).await?;

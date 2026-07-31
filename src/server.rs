@@ -44,7 +44,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::agent::{AgentEvent, SessionEntry};
 use crate::delegate::Sessions;
 use crate::runner::{IdlePolicy, SessionHandle, SessionStatus, SessionTask};
-use crate::session_factory::{SessionBuild, SessionFactory};
+use crate::session_factory::{SessionBuild, SessionFactory, UnfinishedPolicy};
 use crate::session_store::SessionStore;
 use crate::tools::{BackgroundTaskInfo, BackgroundTasks};
 
@@ -576,8 +576,18 @@ async fn build_session(
     factory: &SessionFactory,
     id: &str,
 ) -> Result<SessionBuild, (StatusCode, String)> {
+    // Lazy server attach: the session may still be live in another process,
+    // so do NOT consume its unfinished-background records or inject a
+    // "killed with the process" notice — the owning process clears them
+    // itself via ack_background_entry → clear_background_task.
     factory
-        .build(id, None, None, IdlePolicy::WaitForInput)
+        .build(
+            id,
+            None,
+            None,
+            IdlePolicy::WaitForInput,
+            UnfinishedPolicy::Preserve,
+        )
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
 }
