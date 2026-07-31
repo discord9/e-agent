@@ -614,11 +614,25 @@ function pickText(payload, keys) {
 }
 
 /* =====================================================================
- * 极简 Markdown 渲染（无外部库）：
- * 转义 HTML + 围栏代码块 + 行内代码 + 粗体 + 斜体
+ * Markdown 渲染：marked + KaTeX（内嵌，单 HTML 自包含）。
+ * marked 配置在启动时注册一次；renderMarkdown 只做摘公式 → 解析 →
+ * 还原，避免每条消息重复 setOptions/use（开销虽小但纯属浪费）。
  * ===================================================================*/
+marked.setOptions({ gfm: true, breaks: true });
+marked.use({
+  renderer: {
+    link(href, title, text) {
+      // 只允许 http/https/mailto/# 链接；javascript: 等协议拒绝
+      if (!/^(https?:|mailto:|#|\/)/i.test(href || "")) {
+        return text;
+      }
+      return '<a href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' + text + "</a>";
+    },
+  },
+});
+
 function renderMarkdown(text) {
-  // marked + KaTeX：GFM 全开，单换行 <br>（breaks）。LaTeX 用 $...$ / $$...$$
+  // GFM 全开，单换行 <br>（breaks）。LaTeX 用 $...$ / $$...$$
   // 先摘出，避免被 marked 的转义/斜体干扰；渲染完再还原为 KaTeX HTML。
   const math = [];
   let s = String(text == null ? "" : text).replace(/\r\n?/g, "\n");
@@ -631,19 +645,6 @@ function renderMarkdown(text) {
       math.push({ display: false, body });
       return "\u0000M" + (math.length - 1) + "\u0000";
     });
-  // marked 配置：GFM 全开 + breaks（单换行 <br>）+ 禁用原始 HTML（防 XSS）
-  marked.setOptions({ gfm: true, breaks: true });
-  marked.use({
-    renderer: {
-      link(href, title, text) {
-        // 只允许 http/https/mailto/# 链接；javascript: 等协议拒绝
-        if (!/^(https?:|mailto:|#|\/)/i.test(href || "")) {
-          return text;
-        }
-        return '<a href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' + text + "</a>";
-      },
-    },
-  });
   // 不允许内嵌原始 HTML：把 < > 先转义再喂给 marked（表格/代码块不受影响）
   s = s.replace(/<(\/?)([a-zA-Z][a-zA-Z0-9-]*)([^>]*)>/g, (m, slash, tag, rest) => {
     // 白名单：保留代码块围栏和占位符（它们不含 <tag> 形态）
@@ -1162,11 +1163,16 @@ function renderEntries(entries, prepend) {
   const list = Array.isArray(entries) ? entries : [];
   const prevAcc = state.acc;
   let sentinel = null;
+  // 无论 prepend 与否，渲染期间都禁止自动滚动：每条消息的 scrollBottom
+  // 都会触发一次强制布局读（forced reflow），N 条近似 O(N²) 累计开销，
+  // 是长会话初始渲染阻塞主线程（触摸拖不动）的主要放大器。渲染结束后
+  // 由调用方（renderHistory 末尾 scrollBottom(true) / loadOlder 自己
+  // 保持位置）负责最终滚动。
+  suppressScroll = true;
   if (prepend) {
     // 末尾放一个哨兵注释节点标记「旧内容结束」；渲染后把哨兵之后的节点按序移到开头
     sentinel = document.createComment("older-boundary");
     els.messages.appendChild(sentinel);
-    suppressScroll = true;   // 渲染期间禁止自动滚动，避免跳动
     // history 条目（compaction / user 消息等）会 freezeAssistant(state.acc)；
     // 前置插入不能动底部当前流的累积器。整批渲染是同步的，事件不会穿插，可安全临时切换。
     state.acc = acc;
