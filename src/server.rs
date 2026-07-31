@@ -108,12 +108,25 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .with_context(|| format!("cannot bind {host}:{port}"))?;
+    // Graceful shutdown on Ctrl-C, but bound: long-lived SSE connections
+    // (a phone keeping the chat open) would otherwise hold the process
+    // forever — the first Ctrl-C looks like it "does nothing". After
+    // SHUTDOWN_DRAIN_TIMEOUT the server exits anyway (a second Ctrl-C
+    // still kills outright via the default handler).
+    let shutdown = async {
+        shutdown_signal().await;
+        tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT).await;
+    };
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await
         .context("server error")?;
     Ok(())
 }
+
+/// How long graceful shutdown waits for in-flight connections to close
+/// after Ctrl-C before exiting regardless.
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn shutdown_signal() {
     // Ctrl-C only. A second Ctrl-C kills the process outright (default
