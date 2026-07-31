@@ -144,17 +144,43 @@ pub(crate) struct TuiState {
     pub(crate) store: Option<crate::session_store::SessionStore>,
     /// Older-history paging state, driven by `handle_scroll` + the run loop:
     ///
-    /// - `older_pending`: an Up/PageUp at the scrollback top asked for the
-    ///   next older segment; the run loop performs the async load.
+    /// - `older_pending`: an Up/PageUp at the scrollback top (or Home,
+    ///   which also sets `older_is_jump`) asked for older history; the run
+    ///   loop performs the async load.
     /// - `older_loading`: a load is in flight (re-entrancy guard).
     /// - `older_done`: the store reported no more history (or JSONL, whose
     ///   full session was already loaded at startup).
     /// - `older_cursor`: next `before_seq` for `load_older`; `None` until
     ///   the first load seeds it from `head_seq`.
+    /// - `older_is_jump`: Home queues the *oldest* segment in one load
+    ///   (`load_oldest`) instead of the stepwise PageUp path (`load_older`
+    ///   per segment); `load_older_history` consumes the flag once.
     pub(crate) older_pending: bool,
     pub(crate) older_loading: bool,
     pub(crate) older_done: bool,
     pub(crate) older_cursor: Option<i64>,
+    pub(crate) older_is_jump: bool,
+    /// Newer-history paging state — the mirror of the older_* fields,
+    /// driven by reaching the end of the loaded lines while scrolling down
+    /// (see `extend_window_down`):
+    ///
+    /// - `newer_pending`: the run loop should load the next middle segment.
+    /// - `newer_loading`: a load is in flight (re-entrancy guard).
+    /// - `newer_done`: the store reported no more middle segments (the
+    ///   head segment was reached; it is already loaded).
+    /// - `newer_cursor`: next `after_seq` for `load_newer`; `None` until
+    ///   `load_oldest` seeds it (or the session has no compaction at all).
+    pub(crate) newer_pending: bool,
+    pub(crate) newer_loading: bool,
+    pub(crate) newer_done: bool,
+    pub(crate) newer_cursor: Option<i64>,
+    /// Index of the head segment's first line in `lines`. The head
+    /// segment (loaded at startup) always occupies `lines[head_start..]`;
+    /// older segments are prepended in front of it and middle segments
+    /// are spliced in just before it, each insertion shifting `head_start`
+    /// forward by the inserted line count. Initial 0: startup replay of
+    /// the head segment begins at `lines[0]`.
+    pub(crate) head_start: usize,
     /// Probe for whether a background task has an attachable session
     /// (wired to the session registry by the runner).
     pub(crate) attachable: Option<Box<dyn Fn(u64) -> bool + Send>>,
@@ -1153,10 +1179,19 @@ impl TuiState {
                 self.window.source_start = 0;
                 self.window.local_offset = 0;
                 self.window.frozen_tail_cursor = None;
-                // If the loaded scrollback still has older history behind
-                // it, queue a segment load (same as PageUp at the top).
-                if self.at_scrollback_top() {
-                    self.request_older();
+                // If older history is still unloaded, queue a
+                // jump-to-oldest load (`load_oldest` in one step) rather
+                // than the stepwise PageUp path: with N compaction
+                // segments the user must not press Home N times to reach
+                // the true beginning. `older_done` (or no store) leaves
+                // Home as a pure jump to the loaded start.
+                if self.store.is_some()
+                    && !self.older_done
+                    && !self.older_pending
+                    && !self.older_loading
+                {
+                    self.older_pending = true;
+                    self.older_is_jump = true;
                 }
             }
             KeyCode::End => {
@@ -1177,21 +1212,27 @@ impl TuiState {
         self.window.source_start == 0 && self.window.local_offset == 0
     }
 
-    /// Queue an asynchronous load of the next older compaction segment. The
-    /// run loop performs the actual load (`load_older_history`) when this
-    /// flag is set; repeated scroll keys at the top collapse into a single
-    /// request. No-op without a store, once history is exhausted, or while
-    /// a load is pending/in flight.
+    /// Queue an asynchronous load of the next older compaction segment (the
+    /// stepwise PageUp path). The run loop performs the actual load
+    /// (`load_older_history`) when this flag is set; repeated scroll keys
+    /// at the top collapse into a single request. No-op without a store,
+    /// once history is exhausted, or while a load is pending/in flight.
+    /// Resets `older_is_jump` so a Home-queued jump flag can never leak
+    /// into a stepwise load.
     pub(crate) fn request_older(&mut self) {
         if self.store.is_some() && !self.older_done && !self.older_loading && !self.older_pending {
             self.older_pending = true;
+            self.older_is_jump = false;
         }
     }
 
     /// Load the next older compaction segment from the store and splice it
     /// in front of the scrollback. Called by the run loop after
-    /// `handle_scroll` set `older_pending`. The first call seeds
-    /// `older_cursor` from the store's head-start seq; later calls page
+    /// `handle_scroll` set `older_pending`. When `older_is_jump` is set
+    /// (Home), loads the *oldest* segment in one step via `load_oldest`
+    /// and positions the viewport at the true beginning; otherwise pages
+    /// backward one segment at a time (Up/PageUp): the first call seeds
+    /// `older_cursor` from the store's head-start seq, later calls page
     /// with the cursor returned by `load_older` until it reports `None`.
     /// Errors surface as a dim line and never abort the loop; a JSONL
     /// store (already fully loaded) reports "done" immediately.
@@ -1203,6 +1244,40 @@ impl TuiState {
         let root = self.root.clone();
         let session_id = self.session_id.clone();
         self.older_loading = true;
+        if std::mem::take(&mut self.older_is_jump) {
+            // Home: fetch the whole oldest segment in one load.
+            match store.load_oldest(&root, &session_id).await {
+                Ok((entries, cursor)) => {
+                    let lines: Vec<DisplayLine> =
+                        entries.iter().flat_map(session_entry_to_lines).collect();
+                    if !lines.is_empty() {
+                        self.prepend_lines(lines);
+                    }
+                    // If the user paged up stepwise before pressing Home,
+                    // the middle segments between `older_cursor` and the
+                    // head are already in `lines`; there is nothing left
+                    // for load_newer to fetch.
+                    self.newer_cursor = if self.older_cursor.is_some() {
+                        None
+                    } else {
+                        cursor
+                    };
+                    self.older_done = true;
+                    // Show the true beginning: prepend_lines shifted
+                    // source_start forward by the loaded lines.
+                    self.window.source_start = 0;
+                    self.window.local_offset = 0;
+                }
+                Err(error) => {
+                    self.push_line(
+                        format!("failed to load older history: {error:#}"),
+                        LineKind::Dim,
+                    );
+                }
+            }
+            self.older_loading = false;
+            return;
+        }
         let before = match self.older_cursor {
             Some(cursor) => cursor,
             None => match store.head_seq(&root, &session_id).await {
@@ -1246,12 +1321,104 @@ impl TuiState {
         self.older_loading = false;
     }
 
+    /// Queue an asynchronous load of the next newer middle compaction
+    /// segment. The run loop performs the actual load
+    /// (`load_newer_history`) when this flag is set; repeated requests
+    /// collapse into a single one. No-op without a store, once the middle
+    /// segments are exhausted, without a seeded cursor, or while a load is
+    /// pending/in flight.
+    pub(crate) fn request_newer(&mut self) {
+        if self.store.is_some()
+            && self.newer_cursor.is_some()
+            && !self.newer_done
+            && !self.newer_loading
+            && !self.newer_pending
+        {
+            self.newer_pending = true;
+        }
+    }
+
+    /// Load the next newer middle compaction segment from the store and
+    /// splice it in just before the head segment. Called by the run loop
+    /// after `extend_window_down` set `newer_pending` (the user scrolled
+    /// to the end of the loaded lines). `newer_cursor` holds the
+    /// `after_seq`; `load_newer` returns the segment and the next cursor,
+    /// and `None` marks `newer_done` (the head segment was reached — it
+    /// is already loaded, so nothing is duplicated). Errors surface as a
+    /// dim line and never abort the loop; a JSONL store (already fully
+    /// loaded) reports "done" immediately.
+    pub(crate) async fn load_newer_history(&mut self) {
+        self.newer_pending = false;
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let root = self.root.clone();
+        let session_id = self.session_id.clone();
+        self.newer_loading = true;
+        let after = match self.newer_cursor {
+            Some(cursor) => cursor,
+            None => {
+                // No middle segments to fetch (never seeded).
+                self.newer_loading = false;
+                return;
+            }
+        };
+        match store.load_newer(&root, &session_id, after).await {
+            Ok((entries, cursor)) => {
+                let lines: Vec<DisplayLine> =
+                    entries.iter().flat_map(session_entry_to_lines).collect();
+                if !lines.is_empty() {
+                    self.splice_newer_lines(lines);
+                }
+                self.newer_cursor = cursor;
+                if cursor.is_none() {
+                    self.newer_done = true;
+                }
+            }
+            Err(error) => {
+                self.push_line(
+                    format!("failed to load newer history: {error:#}"),
+                    LineKind::Dim,
+                );
+            }
+        }
+        self.newer_loading = false;
+    }
+
+    /// Splice newly loaded middle-segment lines in just before the head
+    /// segment and shift every window index at or after the insertion
+    /// point forward by the inserted count, so the viewport keeps showing
+    /// the same content. `local_offset` (a visual-row offset inside the
+    /// window) is untouched. Only reached while scrolled away from the
+    /// bottom; follow mode is already off. The head segment always ends
+    /// at `lines.len()`, so an insertion before it never invalidates the
+    /// "loaded end" the down-scroll trigger watches.
+    pub(crate) fn splice_newer_lines(&mut self, newer: Vec<DisplayLine>) {
+        let n = newer.len();
+        if n == 0 {
+            return;
+        }
+        let insert_at = self.head_start;
+        self.lines.splice(insert_at..insert_at, newer);
+        // Indices at or after the insertion point (including exactly at
+        // it: the head segment's first line) all move by n.
+        if self.window.source_start >= insert_at {
+            self.window.source_start += n;
+        }
+        if self.window.source_end >= insert_at {
+            self.window.source_end += n;
+        }
+        self.head_start = insert_at + n;
+    }
+
     /// Splice `older` in front of the scrollback, keeping the visible
     /// window anchored on the same content: both window indices shift by
     /// the number of prepended lines while `local_offset` (a visual-row
-    /// offset inside the window) is untouched. Only reached while scrolled
-    /// away from the bottom (Up/PageUp at the local top), so follow mode
-    /// is already off; frozen-tail state is unchanged.
+    /// offset inside the window) is untouched. The head segment moves
+    /// with the insertion, so `head_start` shifts by the same count.
+    /// Only reached while scrolled away from the bottom (Up/PageUp at the
+    /// local top), so follow mode is already off; frozen-tail state is
+    /// unchanged.
     pub(crate) fn prepend_lines(&mut self, older: Vec<DisplayLine>) {
         let n = older.len();
         if n == 0 {
@@ -1260,6 +1427,7 @@ impl TuiState {
         self.lines.splice(0..0, older);
         self.window.source_start += n;
         self.window.source_end += n;
+        self.head_start += n;
     }
 
     pub(crate) fn push_agent_event_inner(&mut self, event: AgentEvent) {

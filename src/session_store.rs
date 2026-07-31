@@ -170,6 +170,56 @@ impl SessionStore {
         }
     }
 
+    /// Load the oldest compaction segment: everything before the first
+    /// `Compaction` entry, returning `(entries, cursor)` where `cursor`
+    /// is `Some(first_comp_seq)` when middle segments exist — feed it to
+    /// [`Self::load_newer`] as the first `after_seq` — and `None` when
+    /// the session has no compaction (the whole session is one head
+    /// segment, already loaded by [`Self::load_head`]).
+    ///
+    /// For JSONL the whole session was already loaded by [`Self::load`] /
+    /// [`Self::load_head`], so there is nothing older to fetch: returns
+    /// `(vec![], None)`. For Greptime it delegates to
+    /// `GreptimeSession::load_oldest`.
+    pub async fn load_oldest(
+        &self,
+        _root: &Path,
+        _name: &str,
+    ) -> Result<(Vec<SessionEntry>, Option<i64>)> {
+        match self {
+            SessionStore::Jsonl => Ok((Vec::new(), None)),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session.lock().await.load_oldest().await,
+        }
+    }
+
+    /// Load the compaction segment immediately newer than `after_seq`,
+    /// returning `(entries, cursor)` where `cursor` is the seq of the
+    /// next compaction after the returned segment (`Some`) or `None` when
+    /// the head segment has been reached — the caller already holds it,
+    /// so nothing new is returned. The caller feeds `cursor` back as the
+    /// next `after_seq` to page further forward; `None` means the end of
+    /// the middle segments.
+    ///
+    /// For JSONL the whole session was already loaded by [`Self::load`] /
+    /// [`Self::load_head`], so there is nothing newer to fetch: returns
+    /// `(vec![], None)`. For Greptime it delegates to
+    /// `GreptimeSession::load_newer`.
+    pub async fn load_newer(
+        &self,
+        _root: &Path,
+        _name: &str,
+        after_seq: i64,
+    ) -> Result<(Vec<SessionEntry>, Option<i64>)> {
+        match self {
+            SessionStore::Jsonl => Ok((Vec::new(), None)),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session.lock().await.load_newer(after_seq).await
+            }
+        }
+    }
+
     /// The backend seq of the newest compaction entry — the first seq of
     /// the head segment loaded by [`Self::load_head`]. `None` means the
     /// session has no compaction (the head covers the whole session, so

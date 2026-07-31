@@ -2861,3 +2861,307 @@ async fn jsonl_store_load_older_marks_history_done_without_lines() {
     assert_eq!(state.lines.len(), 1, "nothing older to splice in");
     assert_eq!(state.older_cursor, None);
 }
+
+// ── newer-history paging (downward middle-segment load) ─────────────────
+
+#[test]
+fn home_requests_oldest_jump_and_pageup_stays_stepwise() {
+    let scroll = |code| KeyEvent::new(code, KeyModifiers::empty());
+    let mut state = TuiState {
+        store: Some(crate::session_store::SessionStore::Jsonl),
+        session_id: "s1".into(),
+        root: std::path::PathBuf::from("/tmp"),
+        lines: vec![DisplayLine {
+            text: "only line".into(),
+            kind: LineKind::Normal,
+        }],
+        window: ScrollWindow {
+            source_start: 0,
+            source_end: 1,
+            local_offset: 0,
+            follow_bottom: false,
+            ..Default::default()
+        },
+        inner_width: 80,
+        ..Default::default()
+    };
+    // Home queues the oldest-segment jump…
+    state.handle_scroll(scroll(KeyCode::Home));
+    assert!(state.older_pending);
+    assert!(state.older_is_jump, "Home must flag a load_oldest jump");
+    // …and repeated Home keys collapse into the same single request.
+    state.handle_scroll(scroll(KeyCode::Home));
+    assert!(state.older_pending);
+    assert!(state.older_is_jump);
+
+    // PageUp at the top instead queues the stepwise path.
+    state.older_pending = false;
+    state.older_is_jump = false;
+    state.handle_scroll(scroll(KeyCode::PageUp));
+    assert!(state.older_pending);
+    assert!(
+        !state.older_is_jump,
+        "PageUp must not flag a jump (stepwise load_older)"
+    );
+
+    // Once exhausted, Home no longer queues (pure jump to the start).
+    state.older_pending = false;
+    state.older_done = true;
+    state.handle_scroll(scroll(KeyCode::Home));
+    assert!(!state.older_pending, "older_done suppresses the request");
+}
+
+#[tokio::test]
+async fn home_jump_loads_oldest_and_positions_at_beginning() {
+    let mut state = TuiState {
+        store: Some(crate::session_store::SessionStore::Jsonl),
+        session_id: "s1".into(),
+        root: std::path::PathBuf::from("/tmp"),
+        older_pending: true,
+        older_is_jump: true,
+        lines: vec![DisplayLine {
+            text: "head".into(),
+            kind: LineKind::Normal,
+        }],
+        window: ScrollWindow {
+            source_start: 1,
+            source_end: 1,
+            local_offset: 3,
+            follow_bottom: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    state.load_older_history().await;
+    assert!(!state.older_pending);
+    assert!(!state.older_loading);
+    assert!(
+        !state.older_is_jump,
+        "the jump flag is one-shot and consumed by the load"
+    );
+    assert!(state.older_done, "the oldest segment is the end of history");
+    assert_eq!(state.newer_cursor, None, "JSONL has no middle segments");
+    assert_eq!(
+        state.window.source_start, 0,
+        "jump must position the viewport at the true beginning"
+    );
+    assert_eq!(state.window.local_offset, 0);
+}
+
+#[test]
+fn prepend_lines_shifts_head_start_with_window() {
+    let mut state = TuiState {
+        lines: vec![DisplayLine {
+            text: "head-1".into(),
+            kind: LineKind::Normal,
+        }],
+        window: ScrollWindow {
+            source_start: 0,
+            source_end: 1,
+            ..Default::default()
+        },
+        head_start: 0,
+        ..Default::default()
+    };
+    state.prepend_lines(vec![
+        DisplayLine {
+            text: "old-1".into(),
+            kind: LineKind::Dim,
+        },
+        DisplayLine {
+            text: "old-2".into(),
+            kind: LineKind::Dim,
+        },
+    ]);
+    assert_eq!(state.lines.len(), 3);
+    assert_eq!(
+        state.head_start, 2,
+        "head_start must follow the prepended lines"
+    );
+    // An empty prepend is a no-op for head_start too.
+    state.prepend_lines(Vec::new());
+    assert_eq!(state.head_start, 2);
+}
+
+#[test]
+fn splice_newer_lines_shifts_indices_and_keeps_viewport() {
+    // lines = [old-1, old-2, head-1, head-2, head-3], head starts at 2.
+    let mut state = TuiState {
+        lines: vec![
+            DisplayLine {
+                text: "old-1".into(),
+                kind: LineKind::Dim,
+            },
+            DisplayLine {
+                text: "old-2".into(),
+                kind: LineKind::Dim,
+            },
+            DisplayLine {
+                text: "head-1".into(),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "head-2".into(),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "head-3".into(),
+                kind: LineKind::Normal,
+            },
+        ],
+        window: ScrollWindow {
+            // Viewport inside the head segment (head-2..head-3).
+            source_start: 3,
+            source_end: 5,
+            local_offset: 2,
+            follow_bottom: false,
+            frozen_source_end: 5,
+            ..Default::default()
+        },
+        head_start: 2,
+        inner_width: 80,
+        ..Default::default()
+    };
+    state.splice_newer_lines(vec![
+        DisplayLine {
+            text: "mid-1".into(),
+            kind: LineKind::Dim,
+        },
+        DisplayLine {
+            text: "mid-2".into(),
+            kind: LineKind::Dim,
+        },
+    ]);
+    assert_eq!(state.lines.len(), 7);
+    assert_eq!(state.lines[0].text, "old-1");
+    assert_eq!(state.lines[2].text, "mid-1");
+    assert_eq!(state.lines[4].text, "head-1");
+    // The head segment moved with the insertion; the window indices at or
+    // after the insertion point shifted by 2, so the viewport still shows
+    // the same head lines (content stable). local_offset and frozen state
+    // are untouched.
+    assert_eq!(state.head_start, 4, "head_start follows the insertion");
+    assert_eq!(state.window.source_start, 5);
+    assert_eq!(state.window.source_end, 7);
+    assert_eq!(state.window.local_offset, 2);
+    assert_eq!(state.window.frozen_source_end, 5);
+
+    // Boundary case: a window exactly at the insertion point (head-1 at
+    // index 2) shifts to the head's new start; a window ending exactly at
+    // the boundary shifts past the inserted middle segment.
+    let mut boundary = TuiState {
+        lines: vec![
+            DisplayLine {
+                text: "old-1".into(),
+                kind: LineKind::Dim,
+            },
+            DisplayLine {
+                text: "head-1".into(),
+                kind: LineKind::Normal,
+            },
+        ],
+        window: ScrollWindow {
+            source_start: 1,
+            source_end: 2,
+            local_offset: 0,
+            follow_bottom: false,
+            ..Default::default()
+        },
+        head_start: 1,
+        inner_width: 80,
+        ..Default::default()
+    };
+    boundary.splice_newer_lines(vec![DisplayLine {
+        text: "mid-1".into(),
+        kind: LineKind::Dim,
+    }]);
+    assert_eq!(boundary.lines.len(), 3);
+    assert_eq!(boundary.head_start, 2);
+    assert_eq!(
+        boundary.window.source_start, 2,
+        "source_start at the insertion point shifts to the head start"
+    );
+    assert_eq!(
+        boundary.window.source_end, 3,
+        "source_end at the insertion point shifts past the middle segment"
+    );
+
+    // An empty splice is a no-op.
+    let before = (
+        state.lines.len(),
+        state.head_start,
+        state.window.source_start,
+        state.window.source_end,
+    );
+    state.splice_newer_lines(Vec::new());
+    assert_eq!(
+        (
+            state.lines.len(),
+            state.head_start,
+            state.window.source_start,
+            state.window.source_end
+        ),
+        before
+    );
+}
+
+#[test]
+fn request_newer_is_guarded_and_stops_when_done() {
+    let mut state = TuiState {
+        store: Some(crate::session_store::SessionStore::Jsonl),
+        newer_cursor: Some(5),
+        ..Default::default()
+    };
+    state.request_newer();
+    assert!(state.newer_pending);
+    // Pending: repeated requests collapse into the same single one.
+    state.request_newer();
+    assert!(state.newer_pending);
+    // Loading (in flight): no second request while the load runs.
+    state.newer_pending = false;
+    state.newer_loading = true;
+    state.request_newer();
+    assert!(!state.newer_pending);
+    state.newer_loading = false;
+    // Done: the head segment was reached, nothing more to fetch.
+    state.newer_done = true;
+    state.request_newer();
+    assert!(!state.newer_pending);
+    // No seeded cursor: nothing to fetch.
+    state.newer_done = false;
+    state.newer_cursor = None;
+    state.request_newer();
+    assert!(!state.newer_pending);
+    // No store: never requests.
+    state.newer_cursor = Some(5);
+    state.store = None;
+    state.request_newer();
+    assert!(!state.newer_pending);
+}
+
+#[tokio::test]
+async fn jsonl_store_load_newer_marks_done_without_lines() {
+    let mut state = TuiState {
+        store: Some(crate::session_store::SessionStore::Jsonl),
+        session_id: "s1".into(),
+        root: std::path::PathBuf::from("/tmp"),
+        newer_pending: true,
+        newer_cursor: Some(5),
+        lines: vec![DisplayLine {
+            text: "head".into(),
+            kind: LineKind::Normal,
+        }],
+        head_start: 0,
+        ..Default::default()
+    };
+    state.load_newer_history().await;
+    assert!(!state.newer_pending);
+    assert!(!state.newer_loading);
+    assert!(
+        state.newer_done,
+        "JSONL holds the full session: no middle segments"
+    );
+    assert_eq!(state.lines.len(), 1, "nothing newer to splice in");
+    assert_eq!(state.head_start, 0);
+    assert_eq!(state.newer_cursor, None);
+}

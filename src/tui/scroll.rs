@@ -421,4 +421,13 @@ pub(crate) fn extend_window_down(
         state.window.follow_bottom = true;
         state.window.frozen_tail_cursor = None;
     }
+    // Reached the end of the loaded lines while scrolling down: queue the
+    // next newer middle segment (request_newer is self-guarding, so
+    // repeated keys collapse and done/loading states suppress it). The
+    // loaded lines always end with the head segment, so this fires once
+    // per middle segment as the user pages down, until load_newer reports
+    // None (the head segment is already loaded — nothing to fetch).
+    if state.window.source_end >= state.lines.len() && state.newer_cursor.is_some() {
+        state.request_newer();
+    }
 }

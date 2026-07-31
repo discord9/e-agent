@@ -428,6 +428,9 @@ async fn run_inner(
                         if state.older_pending {
                             state.load_older_history().await;
                         }
+                        if state.newer_pending {
+                            state.load_newer_history().await;
+                        }
                     }
                     else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
