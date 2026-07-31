@@ -8,12 +8,13 @@ use tokio::sync::mpsc;
 /// interrupted turn (cancel, provider error, crash), so the derived context
 /// always satisfies the provider's tool_call/tool-result pairing rule.
 fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
+    const INTERRUPTED: &str = "[turn interrupted before a tool result was produced]";
     fn flush(pending: &mut Vec<ToolCall>, out: &mut Vec<Message>) {
         for call in pending.drain(..) {
             out.push(Message::Tool {
                 call_id: call.id,
                 name: call.name,
-                content: "[turn interrupted before a tool result was produced]".into(),
+                content: INTERRUPTED.into(),
                 is_error: true,
             });
         }
@@ -23,9 +24,28 @@ fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
     let mut pending: Vec<ToolCall> = Vec::new();
     for message in messages {
         match &message {
+            Message::Tool {
+                call_id,
+                content,
+                is_error: true,
+                ..
+            } if content == INTERRUPTED => {
+                // Synthetic placeholder from an interrupted-turn snapshot
+                // (e.g. captured in a compaction `retained` window). Skip it
+                // without consuming the pending call: the real result may
+                // land later (compaction race), and if it never does the
+                // final flush re-synthesizes an equivalent placeholder.
+            }
             Message::Tool { call_id, .. } => {
-                pending.retain(|call| &call.id != call_id);
-                out.push(message);
+                if pending.iter().any(|call| call.id == *call_id) {
+                    pending.retain(|call| &call.id != call_id);
+                    out.push(message);
+                }
+                // Orphan tool result: no pending tool_call matches this
+                // call_id (e.g. the same result was already answered by a
+                // synthetic entry captured in a compaction snapshot, or the
+                // call itself was compacted away). Dropping it keeps the
+                // provider's tool_call/tool-result pairing rule intact.
             }
             Message::Assistant(assistant) => {
                 flush(&mut pending, &mut out);
@@ -993,6 +1013,79 @@ mod tests {
             id: id.into(),
             name: name.into(),
             arguments: arguments.into(),
+        }
+    }
+
+    #[test]
+    fn repair_tool_pairs_drops_orphan_results_after_a_synthetic_answer() {
+        // Compaction captures a synthetic interrupted-result for call-1,
+        // then the real result lands later (duplicate call_id). The second
+        // Tool message has no pending tool_call and must be dropped.
+        let messages = vec![
+            Message::User { content: "u".into() },
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![call("call-1", "bash", r#"{"cmd":"x"}"#)],
+                reasoning: None,
+            }),
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "bash".into(),
+                content: "[turn interrupted before a tool result was produced]".into(),
+                is_error: true,
+            },
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "bash".into(),
+                content: "real result".into(),
+                is_error: false,
+            },
+        ];
+        let repaired = repair_tool_pairs(messages);
+        assert_eq!(repaired.len(), 3);
+        // The synthetic placeholder is skipped so the real result can claim
+        // the pending call: output = [User, Assistant(call-1), Tool(real)].
+        assert!(matches!(
+            &repaired[2],
+            Message::Tool { call_id, content, is_error: false, .. }
+                if call_id == "call-1" && content == "real result"
+        ));
+        assert!(!repaired.iter().any(|m| matches!(
+            m,
+            Message::Tool { content, is_error: true, .. }
+                if content == "[turn interrupted before a tool result was produced]"
+        )));
+    }
+
+    #[test]
+    fn repair_tool_pairs_synthesizes_missing_results_in_order() {
+        let messages = vec![
+            Message::User { content: "u".into() },
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![call("call-1", "bash", r#"{}"#)],
+                reasoning: None,
+            }),
+            Message::User { content: "next".into() },
+        ];
+        let repaired = repair_tool_pairs(messages);
+        assert!(repaired.iter().any(|message| matches!(
+            message,
+            Message::Tool { call_id, is_error: true, .. }
+                if call_id == "call-1" && message_tool_content(message) == "[turn interrupted before a tool result was produced]"
+        )));
+        // The synthetic result must precede the following user message.
+        let index = repaired
+            .iter()
+            .position(|m| matches!(m, Message::Tool { call_id, .. } if call_id == "call-1"))
+            .unwrap();
+        assert!(matches!(&repaired[index + 1], Message::User { .. }));
+    }
+
+    fn message_tool_content(message: &Message) -> &str {
+        match message {
+            Message::Tool { content, .. } => content,
+            _ => "",
         }
     }
 

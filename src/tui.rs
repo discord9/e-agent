@@ -24,7 +24,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::{AgentEvent, preview};
 use crate::delegate::Sessions;
-use crate::runner::{SessionHandle as RunnerHandle, SessionStatus, SessionTask};
+use crate::runner::{SessionHandle as RunnerHandle, SessionResult, SessionStatus, SessionTask};
 
 /// Events on the shared UI channel are tagged by session id: `0` is the
 /// main agent, anything else is an attached background session. The TUI
@@ -349,9 +349,15 @@ async fn run_inner(
         draw(terminal, &mut state)?;
         tokio::select! {
             changed = status.changed() => {
-                if changed.is_err()
-                    || matches!(&*status.borrow(), SessionStatus::Finished(_))
-                {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                if let SessionStatus::Finished(result) = &*status.borrow() {
+                    // A terminal state with a failure must be visible: the
+                    // TUI exits silently otherwise and looks like a crash.
+                    if let SessionResult::Failed(text) = result {
+                        eprintln!("e-agent: session failed: {text}");
+                    }
                     return Ok(());
                 }
             }
