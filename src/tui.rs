@@ -149,9 +149,7 @@ impl Palette {
             // violet previously collapsed toward grey). No ITALIC: some
             // terminals (e.g. Termux's Android fonts) render synthetic
             // italics with clipped glyphs.
-            LineKind::Thinking => Style::default()
-                .fg(self.violet)
-                .bg(self.background),
+            LineKind::Thinking => Style::default().fg(self.violet).bg(self.background),
         }
     }
 
@@ -433,7 +431,7 @@ async fn run_inner(
                             state.load_newer_history().await;
                         }
                     }
-                    else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
+                    else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else if let Some(command)=parse_rename(&prompt) { handle_rename(command, &mut state).await; } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
                 Some(Ok(Event::Paste(text))) => state.handle_paste(&text),
                 // Resize needs no explicit handling: the next draw()
@@ -455,5 +453,95 @@ fn route_idle_events(
     state.push_event(first);
     while let Ok(event) = inbox.try_recv() {
         state.push_event(event);
+    }
+}
+
+/// A parsed `/rename` command from the input line.
+#[derive(Debug, PartialEq, Eq)]
+enum RenameCommand {
+    /// Bare `/rename` — show usage.
+    Usage,
+    /// `/rename ` with empty arguments — clear the title.
+    Clear,
+    /// `/rename <title>` — set the title.
+    Set(String),
+}
+
+/// Parse a `/rename` command. Returns `None` for any other input so the
+/// caller falls through to the normal prompt path. Command matching is
+/// strict (`/rename` plus a space separator): `/renamexxx` stays a prompt.
+fn parse_rename(prompt: &str) -> Option<RenameCommand> {
+    if prompt == "/rename" {
+        return Some(RenameCommand::Usage);
+    }
+    let rest = prompt.strip_prefix("/rename ")?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        Some(RenameCommand::Clear)
+    } else {
+        Some(RenameCommand::Set(rest.to_string()))
+    }
+}
+
+/// Run a `/rename` command: persist the title via the store (Greptime
+/// appends a snapshot row with the new title; JSONL is a no-op Ok) and
+/// mirror the result into the terminal title. Success and failure are both
+/// surfaced as a Notice (pushed into the TUI scrollback — the session
+/// handle exposes no event-injection path, so the notice is display-only)
+/// so the rename never fails silently.
+async fn handle_rename(command: RenameCommand, state: &mut TuiState) {
+    let Some(store) = state.store.clone() else {
+        return; // No store wired (tests): nothing to persist.
+    };
+    let root = state.root.clone();
+    let session_name = state.session_id.clone();
+    match command {
+        RenameCommand::Usage => state.push_agent_event(AgentEvent::Notice(
+            "用法：/rename <标题>（留空标题可清除）".to_string(),
+        )),
+        RenameCommand::Clear => match store.set_title(&root, &session_name, None).await {
+            Ok(()) => {
+                set_terminal_title(&sanitize_title(&session_name));
+                state.push_agent_event(AgentEvent::Notice("已清除标题".to_string()));
+            }
+            Err(error) => {
+                state.push_agent_event(AgentEvent::Notice(format!("重命名失败：{error:#}")))
+            }
+        },
+        RenameCommand::Set(title) => {
+            match store.set_title(&root, &session_name, Some(&title)).await {
+                Ok(()) => {
+                    set_terminal_title(&sanitize_title(&title));
+                    state.push_agent_event(AgentEvent::Notice(format!("已重命名：{title}")));
+                }
+                Err(error) => {
+                    state.push_agent_event(AgentEvent::Notice(format!("重命名失败：{error:#}")))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::{RenameCommand, parse_rename};
+
+    #[test]
+    fn parse_rename_commands() {
+        assert_eq!(parse_rename("/rename"), Some(RenameCommand::Usage));
+        assert_eq!(parse_rename("/rename "), Some(RenameCommand::Clear));
+        assert_eq!(parse_rename("/rename   "), Some(RenameCommand::Clear));
+        assert_eq!(
+            parse_rename("/rename 新标题"),
+            Some(RenameCommand::Set("新标题".to_string()))
+        );
+        assert_eq!(
+            parse_rename("/rename   padded title  "),
+            Some(RenameCommand::Set("padded title".to_string()))
+        );
+        // Non-rename input falls through to the normal prompt path.
+        assert_eq!(parse_rename("/renamexxx"), None);
+        assert_eq!(parse_rename("/compact"), None);
+        assert_eq!(parse_rename("hello"), None);
     }
 }
