@@ -278,6 +278,15 @@ impl SessionTask {
     }
 }
 
+#[cfg(test)]
+impl SessionTask {
+    /// Test-only constructor: wrap a bare join handle so server tests can
+    /// build a `LiveSession` without running a real runner.
+    pub(crate) fn from_join_handle(task: JoinHandle<()>) -> Self {
+        Self { task: Some(task) }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum CompactionSource {
     Manual,

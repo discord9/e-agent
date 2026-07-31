@@ -86,6 +86,9 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     let mut at: Option<usize> = None;
     let mut max_rounds = None;
     let mut repl_mode = false;
+    let mut serve_mode = false;
+    let mut host = None;
+    let mut port = None;
     let mut prompt = Vec::new();
     let read_only = read_only_requested(&raw_arguments);
     let mut arguments = raw_arguments.into_iter();
@@ -112,10 +115,19 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
                 )
             }
             "--repl" => repl_mode = true,
+            "--serve" => serve_mode = true,
+            "--host" => host = Some(next_value(&mut arguments, "--host")?),
+            "--port" => {
+                port = Some(
+                    next_value(&mut arguments, "--port")?
+                        .parse::<u16>()
+                        .context("--port must be a number between 0 and 65535")?,
+                )
+            }
             "--read-only" => {} // consumed via read_only_requested above
             "--help" | "-h" => {
                 println!(
-                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--fork SESSION] [--at N] [--max-rounds N] [--read-only] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup);\npass --fork <id> to start a new session from a completed turn of an existing one\n(--at N forks at the N-th entry, 1-based and inclusive, and must be a turn boundary);\n--read-only applies the read-only role policy to the main session only (no write/edit tools, no MCP tools, narrowed bash sandbox); delegated subagents keep their full default toolset and can write — give their role template read_only = true to make them read-only too)"
+                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent --serve [--host ADDR] [--port PORT] [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--read-only]\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--fork SESSION] [--at N] [--max-rounds N] [--read-only] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup);\npass --fork <id> to start a new session from a completed turn of an existing one\n(--at N forks at the N-th entry, 1-based and inclusive, and must be a turn boundary);\n--read-only applies the read-only role policy to the main session only (no write/edit tools, no MCP tools, narrowed bash sandbox); delegated subagents keep their full default toolset and can write — give their role template read_only = true to make them read-only too;\n--serve runs a headless HTTP server (default http://127.0.0.1:8766) with a token-authenticated /api and a web UI"
                 );
                 return Ok(());
             }
@@ -129,6 +141,28 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
         return Err(anyhow!(
             "--fork cannot be combined with --session (the forked session gets a new id)"
         ));
+    }
+    // Headless mode: build the process-global factory once and hand it to
+    // the HTTP server, which builds sessions on demand. Everything below
+    // (TUI/REPL/stdin prompt handling) is skipped.
+    if serve_mode {
+        let factory = SessionFactory::new(
+            match workspace {
+                Some(path) => path.into(),
+                None => std::env::current_dir()?,
+            },
+            profile.as_deref(),
+            base_url,
+            model,
+            read_only,
+            true,
+        )?;
+        return e_agent::server::run(
+            factory,
+            host.as_deref().unwrap_or("127.0.0.1"),
+            port.unwrap_or(8766),
+        )
+        .await;
     }
     let tui_mode = prompt.is_empty() && std::io::stdout().is_terminal() && !repl_mode;
     let prompt = if prompt.is_empty() && !tui_mode && !repl_mode {
