@@ -148,7 +148,7 @@ fn tasks_panel_nav_clamps_cursor_and_ignores_non_nav_keys() {
 }
 
 #[tokio::test]
-async fn tasks_panel_enter_routes_bash_to_detail_and_delegate_to_attach() {
+async fn tasks_panel_selection_routes_bash_to_detail_and_delegate_to_attach() {
     let temp = tempfile::tempdir().unwrap();
     let (_, mut background) = crate::tools::builtins(
         crate::workspace::Workspace::new(temp.path()).unwrap(),
@@ -198,14 +198,144 @@ async fn tasks_panel_enter_routes_bash_to_detail_and_delegate_to_attach() {
         state.handle_tasks_panel_key(enter),
         TaskSelection::Attach(running[1].id)
     );
-    // Cursor moves still attach to the attachable delegate task.
+    // Cursor moves open the selected task's view immediately, like Enter:
+    // down onto the delegate row attaches…
     state.task_cursor = 0;
+    assert_eq!(
+        state.handle_tasks_panel_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())),
+        TaskSelection::Attach(running[1].id)
+    );
+    // …and up back onto the bash row opens its full-output detail.
+    assert_eq!(
+        state.handle_tasks_panel_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty())),
+        TaskSelection::OpenDetail(running[0].id)
+    );
+    // Down again re-attaches to the delegate row.
     assert_eq!(
         state.handle_tasks_panel_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())),
         TaskSelection::Attach(running[1].id)
     );
     background.cancel(running[0].id);
     background.cancel(running[1].id);
+    tokio::task::yield_now().await;
+}
+
+#[tokio::test]
+async fn open_task_detail_clears_attached_and_remembers_panel_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, mut background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(temp.path()).unwrap(),
+        None,
+        false,
+    );
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    background.set_event_sender(sender);
+    background
+        .start(
+            crate::workspace::Workspace::new(temp.path()).unwrap(),
+            "echo hello; sleep 30".into(),
+            false,
+        )
+        .unwrap();
+    let id = background.running()[0].id;
+    for _ in 0..50 {
+        if background
+            .spool(id)
+            .is_some_and(|spool| spool.line_count() >= 1)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState {
+        background: Some(background.clone()),
+        show_tasks: true,
+        cwd: temp.path().display().to_string(),
+        session_id: "detail-attach-clear".into(),
+        ..Default::default()
+    };
+    attach_test(&mut state, id, "bash task", handle);
+    assert!(state.attached.is_some());
+
+    // Opening the detail view drops the attached session — the detail is
+    // an independent full-screen view and must never stack on attach —
+    // and hides the panel, remembering it for Esc.
+    state.open_task_detail(id);
+    assert!(state.task_detail.is_some());
+    assert!(
+        state.attached.is_none(),
+        "detail must clear the attached view"
+    );
+    assert!(!state.show_tasks, "detail is full-screen: panel hidden");
+    assert!(
+        state.detail_return_panel,
+        "opened from the panel: Esc must return there"
+    );
+
+    // Esc restores the tasks panel (the state before the detail opened).
+    state.handle_task_detail_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(state.task_detail.is_none());
+    assert!(state.show_tasks, "Esc returns to the tasks panel");
+
+    // F2 closes the detail AND the panel, back to the main view.
+    state.open_task_detail(id);
+    assert!(state.task_detail.is_some());
+    state.handle_task_detail_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()));
+    assert!(state.task_detail.is_none());
+    assert!(!state.show_tasks, "F2 closes the detail and the panel");
+
+    background.cancel(id);
+    tokio::task::yield_now().await;
+}
+
+#[tokio::test]
+async fn open_task_detail_from_main_view_esc_returns_to_main_view() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, mut background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(temp.path()).unwrap(),
+        None,
+        false,
+    );
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    background.set_event_sender(sender);
+    background
+        .start(
+            crate::workspace::Workspace::new(temp.path()).unwrap(),
+            "echo hello; sleep 30".into(),
+            false,
+        )
+        .unwrap();
+    let id = background.running()[0].id;
+    for _ in 0..50 {
+        if background
+            .spool(id)
+            .is_some_and(|spool| spool.line_count() >= 1)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Detail opened with no panel showing: Esc returns to the main view.
+    let mut state = TuiState {
+        background: Some(background.clone()),
+        show_tasks: false,
+        ..Default::default()
+    };
+    state.open_task_detail(id);
+    assert!(state.task_detail.is_some());
+    assert!(!state.show_tasks);
+    assert!(
+        !state.detail_return_panel,
+        "opened from the main view: Esc returns to the main view"
+    );
+    state.handle_task_detail_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(state.task_detail.is_none());
+    assert!(!state.show_tasks, "Esc returns to the main view");
+
+    background.cancel(id);
     tokio::task::yield_now().await;
 }
 
@@ -470,8 +600,11 @@ fn task_detail_render_shows_full_command_banner_below_header() {
 fn task_detail_top_aligns_short_output_and_esc_f2_close() {
     let spool = Arc::new(crate::tools::TaskSpool::new());
     spool.append(b"one\ntwo\nthree\n");
+    // State as open_task_detail leaves it when opened from the panel:
+    // panel hidden, Esc-return target remembered.
     let mut state = TuiState {
-        show_tasks: true,
+        show_tasks: false,
+        detail_return_panel: true,
         task_detail: Some(TaskDetail::new(9, "demo".into(), spool, false)),
         ..Default::default()
     };
