@@ -1,0 +1,2334 @@
+use super::*;
+use ratatui::buffer::CellDiffOption;
+
+/// Test helper: attach with default metadata, mirroring the old 3-arg
+/// signature for minimal test churn.
+fn attach_test(state: &mut TuiState, id: u64, label: &str, handle: RunnerHandle) {
+    let snapshot = handle.snapshot();
+    let status = handle.status();
+    state.attach(
+        id,
+        label.into(),
+        handle,
+        String::new(),
+        None,
+        String::new(),
+        String::new(),
+        None,
+        snapshot,
+        status,
+    );
+}
+
+/// Verify that the lookbehind used by render_window is bounded even
+/// when the full scrollback contains 10k preceding lines.
+#[test]
+fn lookbehind_is_bounded_with_10k_prefix() {
+    // 10,000 preceding lines followed by one Normal line.
+    let mut lines: Vec<DisplayLine> = (0..10_000)
+        .map(|i| DisplayLine {
+            text: format!("line {i}"),
+            kind: LineKind::Dim,
+        })
+        .collect();
+    lines.push(DisplayLine {
+        text: "the actual rendered line".into(),
+        kind: LineKind::Normal,
+    });
+    let source_start = 10_000;
+    let lb = lookbehind_start(&lines, source_start);
+    // The look-behind must be bounded to at most FENCE_LOOKBEHIND
+    // preceding segments; with 10k identical-line entries each is 1
+    // segment, so the start is at most FENCE_LOOKBEHIND away.
+    assert!(
+        source_start - lb <= FENCE_LOOKBEHIND + 1,
+        "lookbehind_start gap was {} (max {})",
+        source_start - lb,
+        FENCE_LOOKBEHIND + 1
+    );
+    // Render the single line with the bounded prefix to prove it
+    // completes without iterating the full 10k prefix.
+    let rendered = render_window(&lines, source_start, source_start + 1, 80);
+    assert_eq!(rendered.len(), 1);
+    assert_eq!(rendered[0].spans.len(), 1);
+    assert_eq!(rendered[0].spans[0].content, "the actual rendered line");
+}
+
+#[test]
+fn is_exit_matches_esc_or_ctrl_c_idle() {
+    // Idle: Esc exits.
+    assert!(is_exit(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    // Idle: Ctrl+C exits (idle has no active turn to cancel).
+    assert!(is_exit(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    )));
+    // A plain character is not an exit.
+    assert!(!is_exit(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE
+    )));
+    assert!(!is_exit(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::empty(),
+    )));
+}
+
+#[test]
+fn paste_routes_to_active_input_and_normalizes_line_endings() {
+    let pasted = "one\r\ntwo\rthree";
+    let mut state = TuiState::default();
+
+    state.handle_paste(pasted);
+    assert_eq!(state.input.text, "one\ntwo\nthree", "main paste");
+
+    state.input.insert(" main");
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    attach_test(&mut state, 7, "demo", handle);
+    state.handle_paste(pasted);
+
+    assert_eq!(
+        state.attached.as_ref().unwrap().input.text,
+        "one\ntwo\nthree",
+        "attached paste uses the same CRLF/CR normalization"
+    );
+    assert_eq!(state.input.text, "one\ntwo\nthree main");
+}
+
+#[test]
+fn f2_toggles_tasks_panel() {
+    let mut state = TuiState::default();
+    assert!(!state.show_tasks);
+    let key = || KeyEvent::new(KeyCode::F(2), KeyModifiers::empty());
+    assert_eq!(state.handle_key(key()), None);
+    assert!(state.show_tasks);
+    assert_eq!(state.handle_key(key()), None);
+    assert!(!state.show_tasks);
+}
+
+#[test]
+fn f2_toggles_the_panel_while_attached() {
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    attach_test(&mut state, 7, "demo", handle);
+    assert!(!state.show_tasks);
+    state.handle_attached_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()), 80);
+    assert!(state.show_tasks, "F2 opens the panel while attached");
+    assert!(state.attached.is_some(), "attach view is kept");
+    state.handle_attached_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()), 80);
+    assert!(!state.show_tasks);
+}
+
+#[test]
+fn tasks_panel_nav_clamps_cursor_and_ignores_non_nav_keys() {
+    // Panel nav does not need real running tasks to test cursor
+    // movement: with no background set the cursor just stays put and
+    // plain characters fall through.
+    let mut state = TuiState {
+        show_tasks: true,
+        ..Default::default()
+    };
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::empty());
+    assert_eq!(
+        state.handle_tasks_panel_key(down),
+        TaskSelection::None,
+        "no tasks: cursor stays at 0"
+    );
+    assert_eq!(state.task_cursor, 0, "no tasks: cursor stays at 0");
+    assert_eq!(state.handle_tasks_panel_key(up), TaskSelection::None);
+    assert_eq!(state.task_cursor, 0);
+    let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
+    assert_eq!(state.handle_tasks_panel_key(a), TaskSelection::None);
+}
+
+#[tokio::test]
+async fn tasks_panel_enter_routes_bash_to_detail_and_delegate_to_attach() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, mut background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(temp.path()).unwrap(),
+        None,
+        false,
+    );
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    background.set_event_sender(sender);
+    background
+        .start(
+            crate::workspace::Workspace::new(temp.path()).unwrap(),
+            "echo hello; sleep 30".into(),
+            false,
+        )
+        .unwrap();
+    background
+        .spawn_with_id(
+            "delegate task".into(),
+            None,
+            None,
+            None,
+            |_| {},
+            || async { std::future::pending::<String>().await },
+        )
+        .unwrap();
+    let running = background.running();
+    assert_eq!(running.len(), 2);
+    assert_eq!(running[0].kind, "bash");
+    assert_eq!(running[1].kind, "delegate");
+
+    let mut state = TuiState {
+        background: Some(background.clone()),
+        show_tasks: true,
+        ..Default::default()
+    };
+    let delegate_id = running[1].id;
+    state.attachable = Some(Box::new(move |id| id == delegate_id));
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+    // Enter on the bash row opens the full-output detail view.
+    assert_eq!(
+        state.handle_tasks_panel_key(enter),
+        TaskSelection::OpenDetail(running[0].id)
+    );
+    // Enter on the delegate row attaches (original behavior).
+    state.task_cursor = 1;
+    assert_eq!(
+        state.handle_tasks_panel_key(enter),
+        TaskSelection::Attach(running[1].id)
+    );
+    // Cursor moves still attach to the attachable delegate task.
+    state.task_cursor = 0;
+    assert_eq!(
+        state.handle_tasks_panel_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())),
+        TaskSelection::Attach(running[1].id)
+    );
+    background.cancel(running[0].id);
+    background.cancel(running[1].id);
+    tokio::task::yield_now().await;
+}
+
+#[test]
+fn task_detail_opens_at_head_and_pages() {
+    let spool = Arc::new(crate::tools::TaskSpool::new());
+    let mut text = String::new();
+    for i in 0..300 {
+        text.push_str(&format!("line {i:03}\n"));
+    }
+    spool.append(text.as_bytes());
+    let mut state = TuiState {
+        inner_width: 80,
+        output_height: 10,
+        ..Default::default()
+    };
+    let scroll = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    // Open shows the head page (first viewport of lines) in follow
+    // mode; the view only slides to the tail once output grows.
+    let mut detail = TaskDetail::new(1, "demo".into(), spool, false);
+    detail.load_head(80, 10);
+    detail.last_seen_lines = detail.spool.line_count();
+    assert!(detail.window.follow_bottom);
+    assert_eq!(detail.base_line, 0);
+    assert_eq!(detail.lines.first().unwrap().text, "line 000");
+    assert_eq!(detail.lines.last().unwrap().text, "line 009");
+    state.task_detail = Some(detail);
+
+    // PgUp freezes and pages up one viewport at a time.
+    state.handle_detail_scroll(scroll(KeyCode::PageUp));
+    let detail = state.task_detail.as_ref().unwrap();
+    assert!(!detail.window.follow_bottom);
+    assert_eq!(detail.base_line, 0);
+    assert_eq!(detail.lines.first().unwrap().text, "line 000");
+    state.handle_detail_scroll(scroll(KeyCode::PageUp));
+    assert_eq!(state.task_detail.as_ref().unwrap().base_line, 0);
+
+    // Home jumps to the first page.
+    state.handle_detail_scroll(scroll(KeyCode::Home));
+    let detail = state.task_detail.as_ref().unwrap();
+    assert_eq!(detail.base_line, 0);
+    assert_eq!(detail.lines.first().unwrap().text, "line 000");
+    assert_eq!(detail.window.local_offset, 0);
+    // Up at the very first page stays put.
+    state.handle_detail_scroll(scroll(KeyCode::Up));
+    assert_eq!(state.task_detail.as_ref().unwrap().base_line, 0);
+
+    // End restores follow at the tail and syncs last_seen_lines so
+    // the next draw does not re-jump the anchored tail page.
+    state.handle_detail_scroll(scroll(KeyCode::End));
+    let detail = state.task_detail.as_ref().unwrap();
+    assert!(detail.window.follow_bottom);
+    assert_eq!(detail.base_line, 290);
+    assert_eq!(detail.last_seen_lines, 300);
+    // Down while following is a no-op.
+    state.handle_detail_scroll(scroll(KeyCode::Down));
+    assert!(state.task_detail.as_ref().unwrap().window.follow_bottom);
+
+    // Up freezes; Down pages forward to the tail page, then a second
+    // Down at the spool tail resumes follow.
+    state.handle_detail_scroll(scroll(KeyCode::Up));
+    let detail = state.task_detail.as_ref().unwrap();
+    assert!(!detail.window.follow_bottom);
+    assert_eq!(detail.base_line, 280);
+    state.handle_detail_scroll(scroll(KeyCode::Down));
+    let detail = state.task_detail.as_ref().unwrap();
+    assert_eq!(detail.base_line, 290);
+    assert!(!detail.window.follow_bottom);
+    state.handle_detail_scroll(scroll(KeyCode::Down));
+    assert!(state.task_detail.as_ref().unwrap().window.follow_bottom);
+}
+
+#[test]
+fn task_detail_growth_follows_tail_from_head() {
+    let spool = Arc::new(crate::tools::TaskSpool::new());
+    let mut text = String::new();
+    for i in 0..300 {
+        text.push_str(&format!("line {i:03}\n"));
+    }
+    spool.append(text.as_bytes());
+    let mut state = TuiState {
+        inner_width: 80,
+        output_height: 10,
+        ..Default::default()
+    };
+    let scroll = |code| KeyEvent::new(code, KeyModifiers::empty());
+    // Same open path as open_task_detail: head page + follow armed
+    // with last_seen_lines at the current spool count.
+    let mut detail = TaskDetail::new(1, "demo".into(), spool.clone(), false);
+    detail.load_head(80, 10);
+    detail.last_seen_lines = detail.spool.line_count();
+    state.task_detail = Some(detail);
+
+    let backend = ratatui::backend::TestBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    // First draw with no growth: the head page stays on screen.
+    draw(&mut terminal, &mut state).unwrap();
+    let buffer = terminal.backend().buffer();
+    let row: String = (1..79)
+        .map(|x| buffer[(x, 1)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "line 000");
+    assert!(state.task_detail.as_ref().unwrap().window.follow_bottom);
+
+    // Output grows -> the next draw slides to the live tail.
+    let mut more = String::new();
+    for i in 300..320 {
+        more.push_str(&format!("line {i:03}\n"));
+    }
+    spool.append(more.as_bytes());
+    draw(&mut terminal, &mut state).unwrap();
+    let detail = state.task_detail.as_ref().unwrap();
+    assert!(detail.window.follow_bottom);
+    assert_eq!(detail.base_line, 310);
+    assert_eq!(detail.lines.last().unwrap().text, "line 319");
+    let buffer = terminal.backend().buffer();
+    let row: String = (1..79)
+        .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "line 319");
+
+    // No growth -> a draw leaves the page untouched.
+    draw(&mut terminal, &mut state).unwrap();
+    let detail = state.task_detail.as_ref().unwrap();
+    assert_eq!(detail.base_line, 310);
+    assert_eq!(detail.last_seen_lines, 320);
+
+    // PgUp freezes; growth while frozen does not move the view.
+    state.handle_detail_scroll(scroll(KeyCode::PageUp));
+    let detail = state.task_detail.as_ref().unwrap();
+    assert!(!detail.window.follow_bottom);
+    assert_eq!(detail.base_line, 300);
+    let mut more = String::new();
+    for i in 320..325 {
+        more.push_str(&format!("line {i:03}\n"));
+    }
+    spool.append(more.as_bytes());
+    draw(&mut terminal, &mut state).unwrap();
+    let detail = state.task_detail.as_ref().unwrap();
+    assert!(!detail.window.follow_bottom);
+    assert_eq!(detail.base_line, 300);
+
+    // End resumes follow at the new tail and syncs last_seen_lines,
+    // so the following draw does not re-jump.
+    state.handle_detail_scroll(scroll(KeyCode::End));
+    let detail = state.task_detail.as_ref().unwrap();
+    assert!(detail.window.follow_bottom);
+    assert_eq!(detail.base_line, 315);
+    assert_eq!(detail.last_seen_lines, 325);
+    draw(&mut terminal, &mut state).unwrap();
+    let detail = state.task_detail.as_ref().unwrap();
+    assert_eq!(detail.base_line, 315);
+}
+
+#[test]
+fn task_detail_render_paints_header_and_finished() {
+    let spool = Arc::new(crate::tools::TaskSpool::new());
+    let mut text = String::new();
+    for i in 0..30 {
+        text.push_str(&format!("line {i}\n"));
+    }
+    spool.append(text.as_bytes());
+    let mut state = TuiState {
+        task_detail: Some(TaskDetail::new(9, "demo".into(), spool, false)),
+        ..Default::default()
+    };
+    let backend = ratatui::backend::TestBackend::new(120, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    draw(&mut terminal, &mut state).unwrap();
+    let buffer = terminal.backend().buffer();
+    // Task 9 is not in the (empty) running snapshot → finished.
+    assert!(state.task_detail.as_ref().unwrap().finished);
+    // Header carries status, line count, and key hints.
+    let header: String = (0..120)
+        .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert!(header.contains("finished"), "{header}");
+    assert!(header.contains("30 lines"), "{header}");
+    assert!(header.contains("Esc close"), "{header}");
+    // Follow tail: lines 20..29 rendered as plain Dim text.
+    assert_eq!(buffer[(1, 1)].fg, SOLARIZED_LIGHT.muted);
+    assert!(buffer[(1, 1)].modifier.contains(Modifier::DIM));
+    let row: String = (1..119)
+        .map(|x| buffer[(x, 1)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "line 20");
+    let row: String = (1..119)
+        .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "line 29");
+}
+
+#[test]
+fn task_detail_render_shows_full_command_banner_below_header() {
+    let spool = Arc::new(crate::tools::TaskSpool::new());
+    spool.append(b"line 0\nline 1\n");
+    // Longer than the 100-char panel label preview: the middle would be
+    // elided with "…" in the header, but the banner must show it whole.
+    let command = format!(
+        "echo {} && echo tail",
+        "abcdefghijklmnopqrstuvwxyz0123456789".repeat(4)
+    );
+    assert!(command.len() > 100);
+    let mut state = TuiState {
+        task_detail: Some(TaskDetail::new(9, "demo".into(), spool, false)),
+        ..Default::default()
+    };
+    state.task_detail.as_mut().unwrap().command = Some(command.clone());
+    let backend = ratatui::backend::TestBackend::new(120, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    draw(&mut terminal, &mut state).unwrap();
+    let buffer = terminal.backend().buffer();
+    // The header keeps the short label (no alphabet block, no ellipsis
+    // over the long command): the full command lives in the banner.
+    let header: String = (0..120)
+        .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert!(
+        !header.contains("abcdefghijklmnopqrstuvwxyz0123456789"),
+        "header should keep the short label: {header}"
+    );
+    // Banner rows directly under the header: the wrapped full command,
+    // not the truncated label.
+    let banner: String = (1..3)
+        .map(|y| {
+            (1..119)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let joined: String = banner.lines().map(str::trim_end).collect();
+    assert_eq!(
+        joined, command,
+        "full command must be visible in the detail banner"
+    );
+    // Banner is Dim like the spool output text.
+    assert!(buffer[(1, 1)].modifier.contains(Modifier::DIM));
+    // Output still renders below the fixed banner (bottom-aligned tail).
+    let row: String = (1..119)
+        .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "line 1");
+}
+
+#[test]
+fn task_detail_follow_bottom_aligns_short_output_and_esc_f2_close() {
+    let spool = Arc::new(crate::tools::TaskSpool::new());
+    spool.append(b"one\ntwo\nthree\n");
+    let mut state = TuiState {
+        show_tasks: true,
+        task_detail: Some(TaskDetail::new(9, "demo".into(), spool, false)),
+        ..Default::default()
+    };
+    let backend = ratatui::backend::TestBackend::new(40, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    draw(&mut terminal, &mut state).unwrap();
+    let buffer = terminal.backend().buffer();
+    // Fewer rows than the viewport: bottom-aligned like the scrollback.
+    let row: String = (1..39)
+        .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(row.trim_end(), "three");
+
+    // Esc closes the detail and returns to the panel.
+    state.handle_task_detail_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(state.task_detail.is_none());
+    assert!(state.show_tasks, "Esc returns to the tasks panel");
+
+    // F2 closes the detail AND the panel.
+    let spool = Arc::new(crate::tools::TaskSpool::new());
+    spool.append(b"x\n");
+    state.task_detail = Some(TaskDetail::new(9, "demo".into(), spool, false));
+    state.handle_task_detail_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()));
+    assert!(state.task_detail.is_none());
+    assert!(!state.show_tasks, "F2 closes the detail and the panel");
+}
+
+#[tokio::test]
+async fn task_detail_cancel_by_id_keeps_the_spool_paged() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, mut background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(temp.path()).unwrap(),
+        None,
+        false,
+    );
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    background.set_event_sender(sender);
+    background
+        .start(
+            crate::workspace::Workspace::new(temp.path()).unwrap(),
+            "echo hello; sleep 30".into(),
+            false,
+        )
+        .unwrap();
+    let id = background.running()[0].id;
+    for _ in 0..50 {
+        if background
+            .spool(id)
+            .is_some_and(|spool| spool.line_count() >= 1)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut state = TuiState {
+        background: Some(background.clone()),
+        show_tasks: true,
+        cwd: temp.path().display().to_string(),
+        session_id: "detail-cancel".into(),
+        ..Default::default()
+    };
+    state.open_task_detail(id);
+    let detail = state.task_detail.as_ref().unwrap();
+    assert!(!detail.finished);
+    assert_eq!(detail.lines.first().unwrap().text, "hello");
+    // x cancels the task by the detail id (not the panel cursor).
+    state.handle_task_detail_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+    tokio::task::yield_now().await;
+    assert!(background.running().is_empty());
+    // The detail stays open; its Arc keeps the spool paged.
+    assert!(state.task_detail.is_some());
+    assert_eq!(
+        state.task_detail.as_ref().unwrap().spool.line_count(),
+        1,
+        "cancelled task's spool is still readable"
+    );
+}
+
+#[tokio::test]
+async fn atomic_attach_snapshot_and_live_receiver_have_no_gap() {
+    let (handle, sink, _source) = crate::runner::session_test_channel();
+    sink.emit(AgentEvent::AssistantText("snapshot".into()));
+    let (snapshot, mut live, _) = handle.attach();
+    sink.emit(AgentEvent::AssistantDelta("live".into()));
+
+    assert_eq!(snapshot, vec![AgentEvent::AssistantText("snapshot".into())]);
+    assert_eq!(
+        live.recv().await.unwrap(),
+        AgentEvent::AssistantDelta("live".into())
+    );
+}
+
+#[tokio::test]
+async fn idle_attached_view_routes_ready_deltas_without_reattach() {
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    attach_test(&mut state, 7, "demo", handle);
+    let (sender, mut inbox) = mpsc::unbounded_channel();
+    for text in ["live ", "while ", "idle"] {
+        sender
+            .send(UiEvent {
+                session: 7,
+                event: AgentEvent::AssistantDelta(text.into()),
+            })
+            .unwrap();
+    }
+    let first = inbox.recv().await.unwrap();
+    route_idle_events(&mut state, first, &mut inbox);
+    assert!(inbox.try_recv().is_err());
+    assert_eq!(
+        state.attached.as_ref().unwrap().state.lines[0].text,
+        "live while idle"
+    );
+}
+
+#[tokio::test]
+async fn reattaching_forwards_each_delta_once() {
+    let (handle, sink, _source) = crate::runner::session_test_channel();
+    let (sender, mut inbox) = mpsc::unbounded_channel();
+    let mut state = TuiState::default();
+    attach_test(&mut state, 7, "demo", handle.clone());
+    state.attached.as_mut().unwrap().bridge =
+        Some(bridge(7, handle.attach().1, sender.clone()));
+    state.detach();
+    tokio::task::yield_now().await;
+
+    attach_test(&mut state, 7, "demo", handle.clone());
+    state.attached.as_mut().unwrap().bridge = Some(bridge(7, handle.attach().1, sender));
+    sink.emit(AgentEvent::AssistantDelta("你".into()));
+    let first = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.session, 7);
+    assert!(matches!(first.event, AgentEvent::AssistantDelta(text) if text == "你"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), inbox.recv())
+            .await
+            .is_err(),
+        "both the old and new bridges forwarded the same delta"
+    );
+}
+
+#[test]
+fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
+    let (handle, sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    sink.emit(AgentEvent::AssistantDelta("partial".into()));
+    sink.emit(AgentEvent::ToolCall {
+        name: "bash".into(),
+        arguments: r#"{"command":"ls"}"#.into(),
+    });
+    sink.emit(AgentEvent::ToolResult {
+        is_error: false,
+        content: "files".into(),
+    });
+    attach_test(&mut state, 7, "demo task", handle);
+    let lines: Vec<_> = state
+        .attached
+        .as_ref()
+        .unwrap()
+        .state
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect();
+    assert_eq!(lines, ["partial", "bash: ls", "  ok: files",]);
+    // The transient BackgroundCompleted flips the attached view to
+    // finished but renders nothing (the persistent "finished" line
+    // comes from the UserPrompt at the turn boundary).
+    assert!(!state.attached.as_ref().unwrap().finished);
+    state.push_event(UiEvent {
+        session: 0,
+        event: AgentEvent::BackgroundCompleted {
+            id: 7,
+            output: "done".into(),
+            label: None,
+        },
+    });
+    assert!(state.attached.as_ref().unwrap().finished);
+    assert_eq!(
+        state
+            .attached
+            .as_ref()
+            .unwrap()
+            .state
+            .lines
+            .last()
+            .unwrap()
+            .text,
+        "  ok: files",
+        "transient completion renders no line"
+    );
+    state.detach();
+    assert!(state.attached.is_none());
+}
+
+#[test]
+fn attached_view_clears_spinner_on_background_completed_from_bridge() {
+    // BackgroundCompleted arriving via the bridge (session id != 0)
+    // must clear the spinner and mark the view finished, same as the
+    // main-session path.
+    let (handle, sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    // Attach with an unfinished session (no BackgroundCompleted in log).
+    sink.emit(AgentEvent::AssistantDelta("working...".into()));
+    attach_test(&mut state, 7, "demo task", handle);
+    let attached = state.attached.as_ref().unwrap();
+    assert!(!attached.finished);
+    assert!(attached.state.busy.is_some(), "spinner should be active");
+    // Simulate a BackgroundCompleted arriving from the bridge.
+    state.push_event(UiEvent {
+        session: 7,
+        event: AgentEvent::BackgroundCompleted {
+            id: 7,
+            output: "done".into(),
+            label: None,
+        },
+    });
+    let attached = state.attached.as_ref().unwrap();
+    assert!(attached.finished);
+    assert!(attached.state.busy.is_none(), "spinner should be cleared");
+}
+
+#[test]
+fn attach_after_completion_marks_finished_from_the_snapshot() {
+    // Regression: a completion that raced into the session log before
+    // the attach left the view stuck in "running" forever.
+    let (handle, sink, _source) = crate::runner::session_test_channel();
+    sink.emit(AgentEvent::AssistantText("work".into()));
+    sink.emit(AgentEvent::BackgroundCompleted {
+        id: 3,
+        output: "done".into(),
+        label: None,
+    });
+    let mut state = TuiState::default();
+    attach_test(&mut state, 3, "demo task", handle);
+    assert!(state.attached.as_ref().unwrap().finished);
+}
+
+#[test]
+fn background_completion_notice_renders_as_dim_line() {
+    // The turn-boundary completion is a structured Notice event (not a
+    // UserPrompt with a magic prefix); the main view renders it dim.
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::Notice(
+        "[background task 2 completed]\nall good".into(),
+    ));
+    assert_eq!(
+        state.lines.last().unwrap().text,
+        "[background task 2 completed]\nall good"
+    );
+    assert_eq!(state.lines.last().unwrap().kind, LineKind::Dim);
+    // A regular user prompt still renders as user input.
+    state.push_agent_event(AgentEvent::UserPrompt("hello".into()));
+    assert_eq!(state.lines.last().unwrap().text, "you> hello");
+}
+
+#[test]
+fn attached_enter_steers_and_ctrl_c_cancels_through_the_handle() {
+    let (handle, _sink, mut source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    attach_test(&mut state, 7, "demo task", handle);
+    {
+        let attached = state.attached.as_mut().unwrap();
+        attached.input.insert("please also check tests");
+    }
+    state.handle_attached_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), 80);
+    assert_eq!(
+        source.try_recv().ok(),
+        Some(crate::runner::SessionCommand::Prompt(
+            "please also check tests".into()
+        ))
+    );
+    state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
+    assert_eq!(
+        source.try_recv().ok(),
+        Some(crate::runner::SessionCommand::Cancel)
+    );
+    // Finished sessions no longer accept steering.
+    state.push_event(UiEvent {
+        session: 0,
+        event: AgentEvent::BackgroundCompleted {
+            id: 7,
+            output: "done".into(),
+            label: None,
+        },
+    });
+    state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
+    assert_eq!(source.try_recv().ok(), None);
+}
+
+#[test]
+fn attached_enter_on_finished_keeps_input_and_sends_nothing() {
+    // S1: Enter on a finished session must not silently swallow the
+    // buffer — the input stays editable, no command goes out, and a dim
+    // hint explains why.
+    let (handle, _sink, mut source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    attach_test(&mut state, 9, "done task", handle);
+    state.push_event(UiEvent {
+        session: 0,
+        event: AgentEvent::BackgroundCompleted {
+            id: 9,
+            output: "done".into(),
+            label: None,
+        },
+    });
+    {
+        let attached = state.attached.as_mut().unwrap();
+        attached.input.insert("still typing");
+    }
+    state.handle_attached_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), 80);
+    assert_eq!(source.try_recv().ok(), None, "no command may be sent");
+    let attached = state.attached.as_mut().unwrap();
+    assert_eq!(
+        attached.input.text, "still typing",
+        "input must be preserved"
+    );
+    assert_eq!(
+        attached.state.lines.last().unwrap().text,
+        "subagent finished — prompt not sent, press Esc to detach"
+    );
+    assert_eq!(attached.state.lines.last().unwrap().kind, LineKind::Dim);
+}
+
+#[test]
+fn finish_with_queued_prompts_notes_them_as_unanswered() {
+    // S2: prompts queued while the turn was in flight may be persisted
+    // by the runner but never answered; the view must surface that
+    // instead of leaving "queued" dangling forever.
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    attach_test(&mut state, 11, "task", handle);
+    state.push_event(UiEvent {
+        session: 11,
+        event: AgentEvent::PromptQueued("first".into()),
+    });
+    state.push_event(UiEvent {
+        session: 11,
+        event: AgentEvent::PromptQueued("second".into()),
+    });
+    assert_eq!(state.attached.as_ref().unwrap().state.queued.len(), 2);
+    state.push_event(UiEvent {
+        session: 0,
+        event: AgentEvent::BackgroundCompleted {
+            id: 11,
+            output: "done".into(),
+            label: None,
+        },
+    });
+    let attached = state.attached.as_ref().unwrap();
+    assert!(attached.finished);
+    assert_eq!(
+        attached.state.lines.last().unwrap().text,
+        "2 queued prompt(s) not answered (session finished)"
+    );
+    assert_eq!(attached.state.lines.last().unwrap().kind, LineKind::Dim);
+}
+
+#[test]
+fn attached_ctrl_c_clears_input_when_nonempty() {
+    // S5: with a non-empty buffer Ctrl-C clears the line instead of
+    // cancelling the in-flight turn; an empty buffer still cancels.
+    let (handle, _sink, mut source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    attach_test(&mut state, 7, "demo task", handle);
+    {
+        let attached = state.attached.as_mut().unwrap();
+        attached.input.insert("half-typed");
+    }
+    state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
+    assert_eq!(
+        source.try_recv().ok(),
+        None,
+        "no cancel while the input is non-empty"
+    );
+    assert_eq!(state.attached.as_ref().unwrap().input.text, "");
+    state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
+    assert_eq!(
+        source.try_recv().ok(),
+        Some(crate::runner::SessionCommand::Cancel)
+    );
+}
+
+#[test]
+fn attached_input_survives_detach_and_reattach() {
+    // S6: detaching (Esc) and re-attaching must restore a half-typed
+    // steering prompt instead of discarding it.
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    attach_test(&mut state, 21, "task", handle.clone());
+    state.handle_attached_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()), 80);
+    state.handle_attached_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()), 80);
+    assert_eq!(state.attached.as_ref().unwrap().input.text, "hi");
+    state.detach();
+    assert!(state.attached.is_none());
+    attach_test(&mut state, 21, "task", handle.clone());
+    assert_eq!(
+        state.attached.as_ref().unwrap().input.text,
+        "hi",
+        "detach/reattach must restore the steering input"
+    );
+    // A sent prompt must not resurrect on the next re-attach.
+    state.handle_attached_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), 80);
+    assert_eq!(state.attached.as_ref().unwrap().input.text, "");
+    state.detach();
+    attach_test(&mut state, 21, "task", handle);
+    assert_eq!(
+        state.attached.as_ref().unwrap().input.text,
+        "",
+        "a sent prompt must not be stashed"
+    );
+}
+
+#[test]
+fn attached_title_reflects_injected_status() {
+    // S3: the title text is driven by the attached session's live
+    // status receiver (injected here; run_inner keeps it in sync).
+    let backend = ratatui::backend::TestBackend::new(60, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    attach_test(&mut state, 5, "job", handle);
+    let (tx, rx) = tokio::sync::watch::channel(SessionStatus::Idle);
+    state.attached.as_mut().unwrap().status = rx;
+    let title = |terminal: &mut Terminal<ratatui::backend::TestBackend>,
+                 state: &mut TuiState|
+     -> String {
+        draw(terminal, state).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..60)
+            .map(|x| buffer[(x, 9)].symbol().chars().next().unwrap_or(' '))
+            .collect()
+    };
+    // Idle: mirror what run_inner's status refresh does (no spinner).
+    state.attached.as_mut().unwrap().state.busy = None;
+    let top = title(&mut terminal, &mut state);
+    assert!(top.contains("idle — subagent #5"), "got: {top:?}");
+    // Busy and Compacting carry the spinner labels.
+    tx.send_replace(SessionStatus::Busy);
+    state.attached.as_mut().unwrap().state.busy = Some(BusyState::thinking());
+    let top = title(&mut terminal, &mut state);
+    assert!(top.contains("thinking… — subagent #5"), "got: {top:?}");
+    tx.send_replace(SessionStatus::Compacting);
+    state.attached.as_mut().unwrap().state.busy = Some(BusyState::compacting());
+    let top = title(&mut terminal, &mut state);
+    assert!(top.contains("compaction… — subagent #5"), "got: {top:?}");
+    // Finished distinguishes the terminal result variants.
+    tx.send_replace(SessionStatus::Finished(SessionResult::Completed(None)));
+    let top = title(&mut terminal, &mut state);
+    assert!(top.contains("finished — subagent #5"), "got: {top:?}");
+    tx.send_replace(SessionStatus::Finished(SessionResult::Failed(
+        "boom".into(),
+    )));
+    let top = title(&mut terminal, &mut state);
+    assert!(top.contains("failed — subagent #5"), "got: {top:?}");
+    tx.send_replace(SessionStatus::Finished(SessionResult::Cancelled));
+    let top = title(&mut terminal, &mut state);
+    assert!(top.contains("cancelled — subagent #5"), "got: {top:?}");
+    // The dead "Enter steer  Ctrl-C interrupt" hint disappears once the
+    // session is finished.
+    assert!(
+        !top.contains("Enter steer"),
+        "finished view must not advertise steering, got: {top:?}"
+    );
+    assert!(
+        top.contains("Esc detach"),
+        "finished view must still offer detach, got: {top:?}"
+    );
+}
+
+#[test]
+fn attached_view_scrolls_independently() {
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState {
+        window: ScrollWindow {
+            local_offset: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    attach_test(&mut state, 1, "task", handle);
+    {
+        let attached = state.attached.as_mut().unwrap();
+        attached.state.lines.push(DisplayLine {
+            text: "a".into(),
+            kind: LineKind::Normal,
+        });
+        attached.state.lines.push(DisplayLine {
+            text: "b".into(),
+            kind: LineKind::Normal,
+        });
+        attached.state.window.source_start = 0;
+        attached.state.window.source_end = 2;
+        attached.state.window.local_offset = 1;
+        attached.state.inner_width = 80;
+    }
+    // Scrolling while attached moves the subagent view only.
+    state.handle_attached_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()), 80);
+    assert_eq!(state.window.local_offset, 2, "main scroll untouched");
+    assert_eq!(
+        state.attached.as_ref().unwrap().state.window.local_offset,
+        0
+    );
+    state.handle_attached_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), 80);
+    assert_eq!(
+        state.attached.as_ref().unwrap().state.window.local_offset,
+        1
+    );
+}
+
+#[test]
+fn input_autoheight_and_wrapped_cursor_track_visual_rows() {
+    let mut input = InputBuffer::default();
+    input.insert("ab\ncdef");
+    assert_eq!(input.visual_rows(10), 2);
+    // "ab" (1 row) + newline + "cdef" wraps to 2 rows at width 3.
+    assert_eq!(input.visual_rows(3), 3);
+    input.end();
+    assert_eq!(input.wrapped_cursor(3), (2, 1));
+    input.home();
+    assert_eq!(input.wrapped_cursor(3), (0, 0));
+    // Exactly full row: reserve one more row so the cursor stays visible.
+    let mut input = InputBuffer::default();
+    input.insert("ab");
+    assert_eq!(input.visual_rows(2), 2);
+}
+
+#[tokio::test]
+async fn ready_scroll_keys_are_coalesced_without_consuming_following_input() {
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    let page_down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+    let typing = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+    let mut events = futures_util::stream::iter(vec![
+        Ok::<_, io::Error>(Event::Key(down)),
+        Ok(Event::Key(page_down)),
+        Ok(Event::Key(typing)),
+    ])
+    .peekable();
+    // Start with follow_bottom = false so Down/PageDown are not no-ops.
+    let mut state = TuiState {
+        window: ScrollWindow {
+            follow_bottom: false,
+            local_offset: 0,
+            source_start: 0,
+            source_end: 1,
+            ..Default::default()
+        },
+        lines: vec![DisplayLine {
+            text: "hello".into(),
+            kind: LineKind::Normal,
+        }],
+        inner_width: 80,
+        ..Default::default()
+    };
+
+    state.handle_scroll(down);
+    drain_ready_scroll_keys(&mut events, &mut state).await;
+    assert_eq!(
+        state.window.local_offset, 12,
+        "the ready scroll run is applied in order"
+    );
+    assert!(matches!(
+        events.next().await,
+        Some(Ok(Event::Key(key))) if key == typing
+    ));
+
+    let mut step = 0;
+    let delayed_scroll = futures_util::stream::poll_fn(move |cx| match step {
+        0 => {
+            step = 1;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+        1 => {
+            step = 2;
+            std::task::Poll::Ready(Some(Ok::<_, io::Error>(Event::Key(down))))
+        }
+        _ => std::task::Poll::Ready(None),
+    });
+    let mut events = delayed_scroll
+        .chain(futures_util::stream::iter(vec![Ok(Event::Key(typing))]))
+        .peekable();
+    let mut state = TuiState {
+        window: ScrollWindow {
+            follow_bottom: false,
+            local_offset: 0,
+            source_start: 0,
+            source_end: 1,
+            ..Default::default()
+        },
+        lines: vec![DisplayLine {
+            text: "hello".into(),
+            kind: LineKind::Normal,
+        }],
+        inner_width: 80,
+        ..Default::default()
+    };
+    state.handle_scroll(down);
+    drain_ready_scroll_keys(&mut events, &mut state).await;
+    assert_eq!(
+        state.window.local_offset, 2,
+        "a woken scroll key joins the quiet window"
+    );
+    assert!(matches!(
+        events.next().await,
+        Some(Ok(Event::Key(key))) if key == typing
+    ));
+
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut parent = TuiState {
+        window: ScrollWindow {
+            local_offset: 7,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    attach_test(&mut parent, 1, "task", handle);
+    let mut events = futures_util::stream::iter(vec![
+        Ok::<_, io::Error>(Event::Key(down)),
+        Ok(Event::Key(typing)),
+    ])
+    .peekable();
+    {
+        let attached = parent.attached.as_mut().unwrap();
+        attached.state.lines.push(DisplayLine {
+            text: "hello".into(),
+            kind: LineKind::Normal,
+        });
+        attached.state.window.source_start = 0;
+        attached.state.window.source_end = 1;
+        attached.state.window.follow_bottom = false;
+        attached.state.inner_width = 80;
+        attached.state.handle_scroll(down);
+        drain_ready_scroll_keys(&mut events, &mut attached.state).await;
+        assert_eq!(attached.state.window.local_offset, 2);
+    }
+    assert_eq!(
+        parent.window.local_offset, 7,
+        "attached coalescing leaves main scroll alone"
+    );
+    assert!(matches!(
+        events.next().await,
+        Some(Ok(Event::Key(key))) if key == typing
+    ));
+
+    let release = KeyEvent::new_with_kind(
+        KeyCode::Down,
+        KeyModifiers::NONE,
+        crossterm::event::KeyEventKind::Release,
+    );
+    let mut events =
+        futures_util::stream::iter(vec![Ok::<_, io::Error>(Event::Key(release))]).peekable();
+    drain_ready_scroll_keys(&mut events, &mut state).await;
+    assert!(matches!(
+        events.next().await,
+        Some(Ok(Event::Key(key))) if key == release
+    ));
+}
+
+#[test]
+fn wide_char_backspace_leaves_no_stale_trailing_cell_in_input() {
+    // Regression: typing then deleting a wide char in the input area.
+    // Frame 1: type "好" (wide, covering inner.x and x+1), draw.
+    // Frame 2: backspace (input empty), draw.  The trailing cell that
+    // was covered by 好 in frame 1 must carry the panel background.
+    //
+    // NOTE: this assertion also passes on the old Paragraph-based code
+    // because the input Block repaints the entire frame area every draw
+    // (set_style all-area paint already fixes bg).  The real regression
+    // is in the scrollback area (Scenario B below) where no Block exists.
+    let backend = ratatui::backend::TestBackend::new(12, 8);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+
+    state.input.insert("好");
+    draw(&mut terminal, &mut state).unwrap();
+    state.input.backspace();
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    // inner content row = y=6 (input.y=5 + 1 border)
+    // 好 was at inner.x=1 → trailing cell at x=2
+    let trailing = &buffer[(2, 6)];
+    assert_eq!(
+        trailing.bg, SOLARIZED_LIGHT.panel,
+        "trailing cell of deleted wide char in input must get panel bg"
+    );
+    let sym = trailing.symbol();
+    assert!(
+        sym.is_empty() || sym == " ",
+        "trailing cell must be blank, got {sym:?}"
+    );
+}
+
+#[test]
+fn wide_scroll_lines_leave_no_stale_trailing_cells() {
+    // Regression: in the scrollback area (no Block repaint), trailing
+    // cells of wide glyphs must carry the line's background style so
+    // the completed buffer has the correct background.
+    //
+    // set_stringn resets covered cells; the fixup loop re-styles them
+    // with the glyph's own style.  ratatui's BufferDiff force-emits
+    // trailing cells when a previous wide glyph is replaced by narrower
+    // content (the previous_width > cell_width path in
+    // diff_cell_state), provided the previous background is non-Reset.
+    //
+    // We test this by verifying that trailing cells in the completed
+    // (backend) buffer have the line's Solarized bg after a single
+    // draw.
+    let backend = ratatui::backend::TestBackend::new(12, 8);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    state.push_line("你好数据".into(), LineKind::Normal);
+    state.window.follow_bottom = false;
+
+    // Capture the CompletedFrame to check the rendered buffer.
+    // The CompletedFrame.buffer is the non-current buffer after
+    // swap_buffers — it holds exactly what the frame rendered.
+    let completed = draw(&mut terminal, &mut state).unwrap();
+    let frame_buf = completed.buffer;
+
+    // The trailing cells (odd x positions) must carry the Normal
+    // line's background style.  This is the condition that allows
+    // BufferDiff to force-emit them when a wide glyph is later
+    // replaced by narrower content (previous bg non-Reset).
+    let line_bg = SOLARIZED_LIGHT.background;
+    for trailing_x in [1, 3, 5, 7] {
+        assert_eq!(
+            frame_buf[(trailing_x, 0)].bg,
+            line_bg,
+            "trailing cell ({trailing_x}, 0) in frame buffer must have line bg, not Reset"
+        );
+    }
+
+    // The glyph cells themselves must still be visible.
+    assert_eq!(frame_buf[(0, 0)].symbol(), "你");
+    assert_eq!(frame_buf[(2, 0)].symbol(), "好");
+    assert_eq!(frame_buf[(4, 0)].symbol(), "数");
+    assert_eq!(frame_buf[(6, 0)].symbol(), "据");
+}
+
+#[test]
+fn wide_glyph_scroll_emits_trailing_cell_after_glyph() {
+    // Regression: when a wide CJK glyph moves between frames (e.g. " 好"
+    // → "好 " after scrolling), Ratatui's diff skips the cell immediately
+    // after the wide glyph (x + width) because the logical content appears
+    // unchanged (both frames carry a Solarized background).  The terminal
+    // physically painted the old wide glyph across its trailing column,
+    // so that column must be force-emitted to clear the stale glyph half.
+    //
+    // The post-render pass in force_wide_trailing_cell_updates marks
+    // every cell at x + width with CellDiffOption::AlwaysUpdate so the
+    // diff always emits it regardless of logical equality.
+    let backend = ratatui::backend::TestBackend::new(6, 4);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState {
+        lines: vec![
+            DisplayLine {
+                text: " 好".into(),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "好 ".into(),
+                kind: LineKind::Normal,
+            },
+        ],
+        ..Default::default()
+    };
+
+    // Frame 1: display " 好" (scroll to first line).
+    // The wide glyph 好 sits at column 1, width=2, so its trailing
+    // cell occupies column 2.  After the draw, the post-render pass
+    // marks column 1+2=3 (x + width) with AlwaysUpdate.
+    state.window.source_start = 0;
+    state.window.source_end = 1;
+    state.window.local_offset = 0;
+    state.window.follow_bottom = false;
+    state.inner_width = 6;
+    let completed = draw(&mut terminal, &mut state).unwrap();
+    let frame_buf = completed.buffer;
+
+    // 好 at (1), covers (1,2).  Column 3 (x+width=1+2) gets AlwaysUpdate.
+    assert_eq!(frame_buf[(1, 0)].symbol(), "好");
+    assert_eq!(
+        frame_buf[(3, 0)].diff_option,
+        CellDiffOption::AlwaysUpdate,
+        "cell after a wide glyph must be marked AlwaysUpdate"
+    );
+
+    // Frame 2: scroll to show "好 " (second line).
+    // Now 好 sits at column 0, width=2, covering columns 0-1.
+    // Column 2 becomes a plain space.  The post-render pass marks
+    // column 0+2=2 with AlwaysUpdate so the diff emits it even though
+    // it logically compares equal to column 2 of of the previous frame
+    // (both had Solarized background, both have empty/space symbol).
+    state.window.source_start = 1;
+    state.window.source_end = 2;
+    state.window.local_offset = 0;
+    let completed = draw(&mut terminal, &mut state).unwrap();
+    let frame_buf = completed.buffer;
+
+    assert_eq!(frame_buf[(0, 0)].symbol(), "好");
+    assert_eq!(
+        frame_buf[(2, 0)].diff_option,
+        CellDiffOption::AlwaysUpdate,
+        "cell exposed after wide-glyph scroll must be AlwaysUpdate"
+    );
+    assert_eq!(frame_buf[(2, 0)].symbol(), " ");
+}
+#[test]
+fn cursor_sits_at_the_insertion_point() {
+    let backend = ratatui::backend::TestBackend::new(20, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    state.input.insert("abc");
+    state.input.left();
+    state.input.left();
+    draw(&mut terminal, &mut state).unwrap();
+    let position = terminal.backend().cursor_position();
+    // border at column 0, content starts at column 1, cursor between a/b -> on 'b'
+    assert_eq!((position.x, position.y), (2, 8));
+
+    state.input.end();
+    draw(&mut terminal, &mut state).unwrap();
+    let position = terminal.backend().cursor_position();
+    // end of text: one cell past 'c', which is where the next char lands
+    assert_eq!((position.x, position.y), (4, 8));
+}
+
+#[test]
+fn draw_paints_the_entire_terminal_with_theme_backgrounds() {
+    let backend = ratatui::backend::TestBackend::new(32, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    state.push_line("assistant text".into(), LineKind::Normal);
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert!(
+        buffer.content().iter().all(|cell| cell.bg != Color::Reset),
+        "every cell should have an explicit Solarized surface"
+    );
+    assert_eq!(buffer[(0, 0)].bg, SOLARIZED_LIGHT.background);
+    assert_eq!(buffer[(0, 9)].bg, SOLARIZED_LIGHT.panel);
+}
+
+#[test]
+fn scrolling_redraw_keeps_blank_scrollback_cells_on_solarized_surfaces() {
+    let backend = ratatui::backend::TestBackend::new(12, 8);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState {
+        lines: vec![
+            DisplayLine {
+                text: "  leading and trailing  ".into(),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "   ".into(),
+                kind: LineKind::ToolCall,
+            },
+            DisplayLine {
+                text: "+    7 wrapped diff text  ".into(),
+                kind: LineKind::Added,
+            },
+            DisplayLine {
+                text: "-    8 trailing   ".into(),
+                kind: LineKind::Removed,
+            },
+        ],
+        ..Default::default()
+    };
+
+    state.follow();
+    draw(&mut terminal, &mut state).unwrap();
+    state.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    draw(&mut terminal, &mut state).unwrap();
+    assert_eq!(state.window.local_offset, 0);
+    assert_eq!(state.window.source_start, 0);
+    assert!(!state.window.follow_bottom);
+    assert_eq!(
+        terminal.backend().buffer()[(0, 0)].bg,
+        SOLARIZED_LIGHT.background,
+        "the leading blank cell on a normal line is repainted"
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(0, 2)].bg,
+        SOLARIZED_LIGHT.element,
+        "all-space tool line has its semantic surface"
+    );
+
+    state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    draw(&mut terminal, &mut state).unwrap();
+    state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    draw(&mut terminal, &mut state).unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(0, 0)].bg,
+        SOLARIZED_LIGHT.element,
+        "scrolling reuses the terminal and repaints the all-space row"
+    );
+
+    state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    draw(&mut terminal, &mut state).unwrap();
+    state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    draw(&mut terminal, &mut state).unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(0, 0)].bg,
+        SOLARIZED_LIGHT.background,
+        "scrolling back up clears the tool surface from the leading blank cell"
+    );
+    state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    draw(&mut terminal, &mut state).unwrap();
+
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(12)
+            .take(5)
+            .flatten()
+            .all(|cell| cell.bg != Color::Reset),
+        "every output scrollback cell stays on an explicit Solarized surface after scrolling"
+    );
+}
+
+#[test]
+fn attached_view_paints_input_corners_like_the_main_view() {
+    let backend = ratatui::backend::TestBackend::new(60, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let (handle, sink, _source) = crate::runner::session_test_channel();
+    sink.emit(AgentEvent::Usage {
+        context_input: 1_500,
+        session: crate::agent::Usage {
+            input_tokens: 1_500,
+            output_tokens: 0,
+        },
+    });
+    let mut state = TuiState::default();
+    let snapshot = handle.snapshot();
+    let status = handle.status();
+    state.attach(
+        7,
+        "demo task".into(),
+        handle,
+        "deepseek-v4-flash".into(),
+        Some("fixer".into()),
+        "/repo".into(),
+        "sub-abc123".into(),
+        None,
+        snapshot,
+        status,
+    );
+
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let row_text = |y: u16| -> String {
+        (0..60)
+            .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect()
+    };
+    let bottom = row_text(11);
+    assert!(
+        bottom.contains("deepseek-v4-flash fixer"),
+        "bottom-left shows model role, got: {bottom:?}"
+    );
+    assert!(
+        bottom.contains("/repo 1.5k"),
+        "bottom-right shows cwd usage, got: {bottom:?}"
+    );
+    let top = row_text(9);
+    assert!(
+        top.contains("sub-abc123"),
+        "top-right shows the session id, got: {top:?}"
+    );
+    // The title (top-row of the input block) starts with the status
+    // followed by the subagent label. After attach with no
+    // BackgroundCompleted, the subagent is in thinking state.
+    assert!(
+        top.contains("thinking… — subagent #7"),
+        "title must show status before subagent label, got: {top:?}"
+    );
+    // The first display character after the block drawing is the spinner.
+    let first_chars: String = top.chars().take(2).collect();
+    assert!(
+        first_chars.starts_with('┌'),
+        "title row must start with the top-left corner, got: {first_chars:?}"
+    );
+    assert!(
+        first_chars.chars().nth(1) == Some('⠋'),
+        "spinner must be the second character (after the corner), got: {first_chars:?}"
+    );
+}
+
+#[test]
+fn attached_title_shows_finished_before_subagent_label() {
+    let backend = ratatui::backend::TestBackend::new(60, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let (_handle, sink, _source) = crate::runner::session_test_channel();
+    // Emit a completion so the attach marks the view as finished.
+    sink.emit(AgentEvent::BackgroundCompleted {
+        id: 3,
+        output: "done".into(),
+        label: None,
+    });
+    let mut state = TuiState::default();
+    let snapshot = _handle.snapshot();
+    let status = _handle.status();
+    state.attach(
+        3,
+        "quick job".into(),
+        _handle,
+        String::new(),
+        None,
+        String::new(),
+        String::new(),
+        None,
+        snapshot,
+        status,
+    );
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let top: String = (0..60)
+        .map(|x| buffer[(x, 9)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert!(
+        top.contains("finished — subagent #3"),
+        "finished view must have status before subagent label, got: {top:?}"
+    );
+    assert!(
+        !top.contains("(finished)"),
+        "must not use old parenthesized format, got: {top:?}"
+    );
+}
+
+#[test]
+fn attached_title_shows_idle_status_before_subagent_label() {
+    let backend = ratatui::backend::TestBackend::new(60, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let (_handle, sink, _source) = crate::runner::session_test_channel();
+    // Emit a user prompt so the session has content but is not busy:
+    // with the status receiver the title reflects the runner's real
+    // state, and an idle (waiting-for-input) subagent shows "idle" —
+    // the old synthetic "running" state is gone.
+    sink.emit(AgentEvent::UserPrompt("do work".into()));
+    sink.emit(AgentEvent::AssistantText("working...".into()));
+    let (handle2, _sink2, _source2) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    let snapshot = handle2.snapshot();
+    let status = handle2.status();
+    state.attach(
+        5,
+        "long job".into(),
+        handle2,
+        String::new(),
+        None,
+        String::new(),
+        String::new(),
+        None,
+        snapshot,
+        status,
+    );
+    // The attach with no messages sets busy=thinking; override to
+    // simulate an idle subagent (status Idle, no spinner), which is
+    // what run_inner's per-iteration status refresh would do.
+    let attached = state.attached.as_mut().unwrap();
+    attached.state.busy = None;
+    attached.finished = false;
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let top: String = (0..60)
+        .map(|x| buffer[(x, 9)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert!(
+        top.contains("idle — subagent #5"),
+        "idle view must have status before subagent label, got: {top:?}"
+    );
+    assert!(
+        !top.contains("(idle)"),
+        "must not use old parenthesized format, got: {top:?}"
+    );
+}
+
+#[test]
+fn cwd_usage_text_shortens_home_to_tilde() {
+    let home = std::env::var_os("HOME").expect("tests run with HOME set");
+    let home = home.to_string_lossy().into_owned();
+    let (text, fg) = cwd_usage_text(&format!("{home}/work"), 0, None);
+    assert_eq!(text, "~/work", "paths under $HOME collapse to ~");
+    assert_eq!(fg, SOLARIZED_LIGHT.orange, "zero tokens uses orange");
+    let (text, _fg) = cwd_usage_text(&home, 0, None);
+    assert_eq!(text, "~", "$HOME itself collapses to ~");
+    let (text, _fg) = cwd_usage_text("/elsewhere", 0, None);
+    assert_eq!(text, "/elsewhere", "paths outside $HOME stay absolute");
+    let (text, _fg) = cwd_usage_text(&format!("{home}x"), 0, None);
+    assert_eq!(
+        text,
+        format!("{home}x"),
+        "a sibling sharing the prefix is not shortened"
+    );
+    let (text, _fg) = cwd_usage_text(&format!("{home}/work"), 1_500, None);
+    assert_eq!(
+        text, "~/work 1.5k",
+        "token count still appended after shortening"
+    );
+}
+
+#[test]
+fn cwd_usage_text_shows_percentage_with_context_window() {
+    let (text, fg) = cwd_usage_text("/repo", 45_000, Some(131_072));
+    assert_eq!(text, "/repo 45.0k 34%");
+    assert_eq!(fg, SOLARIZED_LIGHT.orange, "34% < 80% uses orange");
+}
+
+#[test]
+fn cwd_usage_text_uses_red_at_80_percent_or_higher() {
+    let (text, fg) = cwd_usage_text("/repo", 104_858, Some(131_072));
+    // 104858 / 131072 ≈ 80.0% — at the boundary
+    assert!(text.contains("80%"), "text = {text:?}");
+    assert_eq!(fg, SOLARIZED_LIGHT.red, ">= 80% uses red");
+
+    let (text, fg) = cwd_usage_text("/repo", 131_072, Some(131_072));
+    assert!(text.contains("100%"), "text = {text:?}");
+    assert_eq!(fg, SOLARIZED_LIGHT.red);
+
+    let (_text, fg) = cwd_usage_text("/repo", 1_500, Some(131_072));
+    assert_eq!(fg, SOLARIZED_LIGHT.orange, "1% uses orange");
+}
+
+#[test]
+fn cwd_usage_text_behaves_normally_without_window() {
+    let (text, fg) = cwd_usage_text("/repo", 1_500, None);
+    assert_eq!(text, "/repo 1.5k");
+    assert_eq!(fg, SOLARIZED_LIGHT.orange);
+}
+
+#[tokio::test]
+async fn tasks_panel_tags_rows_with_the_agent_role() {
+    let backend = ratatui::backend::TestBackend::new(50, 14);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let (_, mut background) =
+        crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None, false);
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    background.set_event_sender(sender);
+    background
+        .spawn_with_id(
+            "find the render site".into(),
+            Some("explorer".into()),
+            None,
+            None, // display_meta
+            |_| {},
+            || async { "done".into() },
+        )
+        .unwrap();
+    background
+        .spawn_with_id(
+            "sleep 5".into(),
+            None,
+            None,
+            None, // display_meta
+            |_| {},
+            || async { "done".into() },
+        )
+        .unwrap();
+    let mut state = TuiState {
+        background: Some(background),
+        show_tasks: true,
+        ..Default::default()
+    };
+
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let text: String = buffer
+        .content()
+        .iter()
+        .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert!(
+        text.contains("[explorer] find the render site"),
+        "role-tagged row, got: {text:?}"
+    );
+    assert!(
+        text.contains("sleep 5"),
+        "untagged bash row still shows its label"
+    );
+    assert!(
+        !text.contains("[] sleep 5"),
+        "bash row has no empty role tag"
+    );
+}
+
+#[tokio::test]
+async fn tasks_panel_selection_highlight_shows_on_non_attachable_task() {
+    // Every selected task row uses SOLARIZED_LIGHT.selection as the
+    // background, regardless of attachability (the old guard only
+    // highlighted attachable tasks).
+    let (_, mut background) =
+        crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None, false);
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    background.set_event_sender(sender);
+    for label in ["task-alpha", "task-beta"] {
+        background
+            .spawn_with_id(
+                label.into(),
+                None,
+                None,
+                None,
+                |_| {},
+                || async { std::future::pending::<String>().await },
+            )
+            .unwrap();
+    }
+    let mut state = TuiState {
+        background: Some(background),
+        show_tasks: true,
+        task_cursor: 0,
+        ..Default::default()
+    };
+
+    let backend = ratatui::backend::TestBackend::new(50, 14);
+    let mut terminal = Terminal::new(backend).unwrap();
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buf = terminal.backend().buffer();
+    // tasks_bar starts at y=6 (height 5); block inner starts at (1, 7).
+    // Header is at y=7, task rows at y=8 (cursor=0) and y=9.
+    assert_eq!(
+        buf[(1, 8)].bg,
+        SOLARIZED_LIGHT.selection,
+        "selected task row has selection background"
+    );
+    assert_eq!(
+        buf[(1, 9)].bg,
+        SOLARIZED_LIGHT.panel,
+        "non-selected task row keeps panel background"
+    );
+
+    // Same selection for cursor=1 (second task).
+    state.task_cursor = 1;
+    draw(&mut terminal, &mut state).unwrap();
+    let buf = terminal.backend().buffer();
+    assert_eq!(
+        buf[(1, 9)].bg,
+        SOLARIZED_LIGHT.selection,
+        "cursor=1 highlights the second task"
+    );
+    assert_eq!(
+        buf[(1, 8)].bg,
+        SOLARIZED_LIGHT.panel,
+        "non-selected first task keeps panel background"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, mut background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(temp.path()).unwrap(),
+        None,
+        false,
+    );
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    background.set_event_sender(sender);
+    background
+        .spawn_with_id(
+            "task".into(),
+            None,
+            None,
+            None,
+            |_| {},
+            || async { std::future::pending::<String>().await },
+        )
+        .unwrap();
+    let id = background.running()[0].id;
+    crate::session::Session::record_background_start(
+        temp.path(),
+        "cancel-store",
+        id,
+        "task",
+        None,
+    )
+    .unwrap();
+    let mut state = TuiState {
+        background: Some(background),
+        cwd: temp.path().display().to_string(),
+        session_id: "cancel-store".into(),
+        ..Default::default()
+    };
+
+    state.cancel_selected_task();
+
+    assert!(
+        crate::session::Session::take_unfinished_background(temp.path(), "cancel-store")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn cancel_selected_task_cancels_any_task_and_clamps_cursor() {
+    // cancel_selected_task must remove the task at cursor even when the
+    // attachable probe returns true for that id, then clamp cursor.
+    let (_, mut background) =
+        crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None, false);
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    background.set_event_sender(sender);
+
+    // Three never-finishing tasks (ids 1, 2, 3).
+    for _ in 0..3 {
+        background
+            .spawn_with_id(
+                "task".into(),
+                None,
+                None,
+                None,
+                |_| {},
+                || async { std::future::pending::<String>().await },
+            )
+            .unwrap();
+    }
+    let running = background.running();
+    assert_eq!(running.len(), 3);
+    let task2_id = running[1].id; // middle task
+
+    // Attachable probe returns true for task2_id specifically.
+    let mut state = TuiState {
+        background: Some(background),
+        task_cursor: 1,
+        ..Default::default()
+    };
+    state.attachable = Some(Box::new(move |id| id == task2_id));
+
+    // Cancel the attachable task — should succeed despite the probe.
+    state.cancel_selected_task();
+    tokio::task::yield_now().await; // let spawned task abort settle
+
+    let updated = state
+        .background
+        .as_ref()
+        .map(|b| b.running())
+        .unwrap_or_default();
+    assert_eq!(
+        updated.len(),
+        2,
+        "cancelled attachable task was removed from registry"
+    );
+    assert!(
+        !updated.iter().any(|t| t.id == task2_id),
+        "task {task2_id} was cancelled"
+    );
+    // Cursor clamped to min(1, 2-1) = 1 (still valid).
+    assert_eq!(state.task_cursor, 1);
+
+    // Cancel the last task: cursor should clamp downward.
+    state.task_cursor = 1;
+    let last_id = state
+        .background
+        .as_ref()
+        .map(|b| b.running())
+        .unwrap_or_default()[1]
+        .id;
+    state.cancel_selected_task();
+    tokio::task::yield_now().await;
+
+    let remaining = state
+        .background
+        .as_ref()
+        .map(|b| b.running())
+        .unwrap_or_default();
+    assert_eq!(remaining.len(), 1);
+    assert!(!remaining.iter().any(|t| t.id == last_id));
+    // Cursor clamped from 1 to min(1, 1-1) = 0.
+    assert_eq!(state.task_cursor, 0);
+
+    // Cancel the last remaining task: cursor stays at 0 (empty list).
+    state.cancel_selected_task();
+    tokio::task::yield_now().await;
+    let empty = state
+        .background
+        .as_ref()
+        .map(|b| b.running())
+        .unwrap_or_default();
+    assert!(empty.is_empty());
+    assert_eq!(state.task_cursor, 0, "cursor at 0 when list is empty");
+}
+
+#[test]
+fn handle_panel_key_routes_x_ctrl_c_esc_f2() {
+    let mut state = TuiState {
+        show_tasks: true,
+        ..Default::default()
+    };
+
+    // Ctrl-C → CancelTask (does not close panel).
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert_eq!(state.handle_panel_key(ctrl_c), PanelAction::CancelTask);
+    assert!(state.show_tasks, "CancelTask does not close panel");
+
+    // x → CancelTask.
+    let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty());
+    assert_eq!(state.handle_panel_key(x), PanelAction::CancelTask);
+    assert!(state.show_tasks);
+
+    // Esc → ClosePanel.
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
+    assert_eq!(state.handle_panel_key(esc), PanelAction::ClosePanel);
+    assert!(!state.show_tasks, "ClosePanel hides the panel");
+
+    // F2 → ClosePanel.
+    state.show_tasks = true;
+    let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::empty());
+    assert_eq!(state.handle_panel_key(f2), PanelAction::ClosePanel);
+    assert!(!state.show_tasks);
+
+    // Plain character → Passthrough (panel stays open).
+    state.show_tasks = true;
+    let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
+    assert_eq!(state.handle_panel_key(a), PanelAction::Passthrough);
+    assert!(state.show_tasks, "Passthrough leaves the panel open");
+}
+
+#[test]
+fn draw_renders_normal_lines_as_markdown() {
+    // A heading, an inline-code line, and a fenced code block all get
+    // their markdown styles, and every painted cell keeps an explicit
+    // Solarized background (no Reset leaking through the markdown path).
+    let backend = ratatui::backend::TestBackend::new(30, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    state.push_line("## Summary".into(), LineKind::Normal);
+    state.push_line("run `cargo test` now".into(), LineKind::Normal);
+    state.push_line("```".into(), LineKind::Normal);
+    state.push_line("let x = 1;".into(), LineKind::Normal);
+    state.push_line("```".into(), LineKind::Normal);
+    state.window.follow_bottom = false;
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert!(
+        buffer.content().iter().all(|cell| cell.bg != Color::Reset),
+        "markdown path must keep explicit Solarized backgrounds"
+    );
+    // The code-block line sits on the element (panel) background.
+    let code_row_y = 3; // "## Summary", inline line, fence, then code
+    assert_eq!(buffer[(0, code_row_y)].bg, SOLARIZED_LIGHT.element);
+}
+
+#[test]
+fn markdown_preserves_embedded_newlines_across_a_code_block() {
+    // A Normal line embedding newlines must render one visual row per
+    // segment (no collapsed newlines), and the code fence opened on one
+    // segment still applies to the next.
+    let backend = ratatui::backend::TestBackend::new(40, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    state.push_line(
+        "before\n```\ncode line\n```\nafter".into(),
+        LineKind::Normal,
+    );
+    state.window.follow_bottom = false;
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let row_text = |y: u16| -> String {
+        (0..40)
+            .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    };
+    assert_eq!(row_text(0), "before");
+    assert_eq!(row_text(1), "```");
+    assert_eq!(row_text(2), "code line");
+    assert_eq!(row_text(3), "```");
+    assert_eq!(row_text(4), "after");
+    // The code line keeps the panel background from the still-open fence.
+    assert_eq!(buffer[(0, 2)].bg, SOLARIZED_LIGHT.element);
+    // Lines after the fence close are back on the body background.
+    assert_eq!(buffer[(0, 4)].bg, SOLARIZED_LIGHT.background);
+}
+
+#[test]
+fn draw_uses_semantic_solarized_message_styles() {
+    let backend = ratatui::backend::TestBackend::new(50, 14);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState {
+        window: ScrollWindow {
+            follow_bottom: false,
+            source_end: 8, // matches lines.len()
+            ..Default::default()
+        },
+        lines: vec![
+            DisplayLine {
+                text: "normal".into(),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "dim".into(),
+                kind: LineKind::Dim,
+            },
+            DisplayLine {
+                text: "user".into(),
+                kind: LineKind::User,
+            },
+            DisplayLine {
+                text: "tool".into(),
+                kind: LineKind::ToolCall,
+            },
+            DisplayLine {
+                text: "ok".into(),
+                kind: LineKind::ToolResult,
+            },
+            DisplayLine {
+                text: "error".into(),
+                kind: LineKind::ToolError,
+            },
+            DisplayLine {
+                text: "+    7 added".into(),
+                kind: LineKind::Added,
+            },
+            DisplayLine {
+                text: "-    7 removed".into(),
+                kind: LineKind::Removed,
+            },
+        ],
+        ..Default::default()
+    };
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(0, 0)].fg, SOLARIZED_LIGHT.text);
+    assert_eq!(buffer[(0, 1)].fg, SOLARIZED_LIGHT.muted);
+    assert!(buffer[(0, 1)].modifier.contains(Modifier::DIM));
+    assert_eq!(buffer[(0, 2)].fg, SOLARIZED_LIGHT.cyan);
+    assert_eq!(buffer[(0, 3)].bg, SOLARIZED_LIGHT.element);
+    assert_eq!(buffer[(0, 3)].fg, SOLARIZED_LIGHT.violet);
+    assert_eq!(buffer[(0, 4)].fg, SOLARIZED_LIGHT.green);
+    assert_eq!(buffer[(0, 5)].fg, SOLARIZED_LIGHT.red);
+    assert_eq!(buffer[(7, 6)].bg, SOLARIZED_LIGHT.diff_added_background);
+    assert_eq!(
+        buffer[(0, 6)].bg,
+        SOLARIZED_LIGHT.diff_added_line_number_background
+    );
+    assert_eq!(buffer[(7, 7)].bg, SOLARIZED_LIGHT.diff_removed_background);
+    assert_eq!(
+        buffer[(0, 7)].bg,
+        SOLARIZED_LIGHT.diff_removed_line_number_background
+    );
+}
+
+#[test]
+fn busy_enqueue_renders_queue_bar() {
+    let backend = ratatui::backend::TestBackend::new(50, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState {
+        busy: Some(BusyState::thinking()),
+        ..TuiState::default()
+    };
+    state.push_agent_event(AgentEvent::PromptQueued("follow up".into()));
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    // input is three rows high; with one queue row, the banner sits at y=6.
+    let row: String = buffer.content()[6 * 50..7 * 50]
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(row.contains("queued 1: follow up"));
+    let first = &buffer[(0, 6)];
+    assert_eq!(first.fg, SOLARIZED_LIGHT.ink);
+    assert_eq!(first.bg, SOLARIZED_LIGHT.blue);
+    assert!(first.modifier.contains(Modifier::BOLD));
+    assert_eq!(buffer[(49, 6)].bg, SOLARIZED_LIGHT.blue);
+    assert!(state.lines.is_empty(), "queued prompt entered scrollback");
+}
+
+#[test]
+fn prompt_consumption_drains_duplicate_prompts_fifo() {
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::PromptQueued("same".into()));
+    state.push_agent_event(AgentEvent::PromptQueued("same".into()));
+    state.push_agent_event(AgentEvent::PromptQueued("last".into()));
+
+    state.push_agent_event(AgentEvent::PromptConsumed);
+    assert_eq!(
+        state.queued.iter().cloned().collect::<Vec<_>>(),
+        ["same", "last"]
+    );
+    state.push_agent_event(AgentEvent::UserPrompt("same".into()));
+    assert_eq!(state.lines.last().unwrap().text, "you> same");
+}
+
+#[test]
+fn user_prompt_resets_active_stream_lane() {
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::AssistantDelta("answer".into()));
+    state.push_agent_event(AgentEvent::UserPrompt("next".into()));
+    state.push_agent_event(AgentEvent::AssistantDelta("new answer".into()));
+
+    assert_eq!(state.lines.len(), 3);
+    assert_eq!(state.lines[1].text, "you> next");
+    assert_eq!(state.lines[2].text, "new answer");
+}
+
+#[test]
+fn input_title_distinguishes_compaction_from_model_thinking() {
+    let backend = ratatui::backend::TestBackend::new(40, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState {
+        busy: Some(BusyState::thinking()),
+        ..Default::default()
+    };
+    draw(&mut terminal, &mut state).unwrap();
+    let thinking_title: String = terminal.backend().buffer().content()[7 * 40..8 * 40]
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(thinking_title.contains("thinking…"));
+    assert!(thinking_title.contains(BusyState::SPINNER[0].to_string().as_str()));
+    assert!(!thinking_title.contains("compaction…"));
+
+    state.busy = Some(BusyState::compacting());
+    draw(&mut terminal, &mut state).unwrap();
+    let compaction_title: String = terminal.backend().buffer().content()[7 * 40..8 * 40]
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(compaction_title.contains("compaction…"));
+    assert!(!compaction_title.contains("thinking…"));
+}
+
+#[test]
+fn input_edits_unicode_at_character_boundaries() {
+    let mut input = InputBuffer::default();
+    input.insert("你好a");
+    input.left();
+    input.backspace();
+    input.insert("世");
+    input.end();
+    input.delete();
+    assert_eq!(input.text, "你世a");
+    assert_eq!(input.cursor, 3);
+}
+
+#[test]
+fn unicode_cursor_uses_terminal_display_width() {
+    let mut input = InputBuffer::default();
+    input.insert("你好a");
+    assert_eq!(input.wrapped_cursor(80), (0, 5));
+}
+
+#[test]
+fn empty_content_delta_does_not_split_the_reasoning_line() {
+    // kimi interleaves empty `content: ""` chunks into the reasoning
+    // stream. Each one must NOT flip the active lane, or the reasoning
+    // text scatters across many `thinking: ` lines.
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::AssistantDelta("".into()));
+    state.push_agent_event(AgentEvent::ReasoningDelta("plan".into()));
+    state.push_agent_event(AgentEvent::AssistantDelta("".into()));
+    state.push_agent_event(AgentEvent::ReasoningDelta(" more".into()));
+    let thinking: Vec<_> = state
+        .lines
+        .iter()
+        .filter(|line| line.kind == LineKind::Thinking)
+        .collect();
+    assert_eq!(thinking.len(), 1, "reasoning must stay on one line");
+    assert_eq!(thinking[0].text, "thinking: plan more");
+}
+
+#[test]
+fn reply_after_plain_text_turn_does_not_append_to_the_user_line() {
+    // A turn ending on a plain text answer leaves active_lane = Content
+    // (no ToolCall/ToolResult reset it). run_request clears it per turn;
+    // simulate that reset, then the next turn's first delta must start a
+    // fresh Normal line instead of appending onto the `you> …` line.
+    let mut state = TuiState::default();
+    // turn 1: plain text answer, lane left as Content.
+    state.push_agent_event(AgentEvent::AssistantDelta("first answer".into()));
+    assert_eq!(state.active_lane, Some(ActiveStreamLane::Content));
+    // user submits the next prompt; run_request then resets the lane.
+    state.push_line("you> next question".into(), LineKind::User);
+    state.streamed = false;
+    state.active_lane = None; // the per-turn reset in run_request
+    // turn 2's first delta must open its own line.
+    state.push_agent_event(AgentEvent::AssistantDelta("second answer".into()));
+    assert_eq!(state.lines[1].text, "you> next question");
+    assert_eq!(state.lines[1].kind, LineKind::User);
+    assert_eq!(state.lines[2].text, "second answer");
+    assert_eq!(state.lines[2].kind, LineKind::Normal);
+}
+
+#[test]
+fn without_a_lane_reset_the_reply_would_append_to_the_user_line() {
+    // Pin the failure mode the run_request reset prevents: a stale
+    // Content lane makes the next delta append onto the `you> …` line,
+    // keeping its User kind (the "reply dyed as user input" bug).
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::AssistantDelta("first answer".into()));
+    state.push_line("you> next question".into(), LineKind::User);
+    // NO lane reset (the bug): the stale Content lane appends.
+    state.push_agent_event(AgentEvent::AssistantDelta("second".into()));
+    assert_eq!(state.lines[1].text, "you> next questionsecond");
+    assert_eq!(state.lines[1].kind, LineKind::User);
+}
+
+#[test]
+fn new_events_do_not_yank_a_scrolled_up_view() {
+    let mut state = TuiState {
+        lines: vec![
+            DisplayLine {
+                text: "one".into(),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "two".into(),
+                kind: LineKind::Normal,
+            },
+        ],
+        ..Default::default()
+    };
+    state.window.source_start = 0;
+    state.window.source_end = 2;
+    state.window.follow_bottom = false;
+    state.window.local_offset = 0;
+    state.inner_width = 80;
+    state.push_agent_event(AgentEvent::AssistantText("three".into()));
+    assert!(!state.window.follow_bottom);
+    assert_eq!(state.window.local_offset, 0);
+    state.window.follow_bottom = true;
+    state.push_agent_event(AgentEvent::AssistantText("four".into()));
+    assert!(state.window.follow_bottom);
+}
+
+#[test]
+fn home_and_end_jump_to_session_edges() {
+    let mut state = TuiState {
+        lines: vec![
+            DisplayLine {
+                text: "one".into(),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "two".into(),
+                kind: LineKind::Normal,
+            },
+        ],
+        ..Default::default()
+    };
+    state.window.local_offset = 10;
+    state.window.source_start = 0;
+    state.window.source_end = 2;
+    state.inner_width = 80;
+    state.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    assert_eq!(state.window.local_offset, 0);
+    assert_eq!(state.window.source_start, 0);
+    state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    assert!(state.window.follow_bottom);
+    state.input.insert("xy");
+    state.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(state.input.cursor, 0);
+    state.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    assert_eq!(state.input.cursor, 2);
+}
+
+#[test]
+fn scrolling_is_bounded_and_events_append_echo_lines() {
+    let mut state = TuiState {
+        lines: vec![
+            DisplayLine {
+                text: "one".into(),
+                kind: LineKind::Normal,
+            },
+            DisplayLine {
+                text: "two".into(),
+                kind: LineKind::Normal,
+            },
+        ],
+        ..Default::default()
+    };
+    state.window.source_start = 0;
+    state.window.source_end = 2;
+    state.window.local_offset = 0;
+    state.inner_width = 80;
+    // Up disengages follow mode; then PageDown advances.
+    state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert!(!state.window.follow_bottom);
+    state.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+    assert!(!state.window.follow_bottom);
+    assert_eq!(state.window.local_offset, 10);
+    // ToolResult ends a delta; at_bottom is false so follow is NOT called.
+    state.push_agent_event(AgentEvent::ToolResult {
+        is_error: false,
+        content: "done".into(),
+    });
+    assert_eq!(state.lines.last().unwrap().text, "  ok: done");
+    assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolResult);
+    assert!(!state.window.follow_bottom);
+
+    // When following, a ToolResult keeps follow_bottom = true.
+    state.window.follow_bottom = true;
+    state.push_agent_event(AgentEvent::ToolResult {
+        is_error: true,
+        content: "failed".into(),
+    });
+    assert_eq!(state.lines.last().unwrap().text, "  error: failed");
+    assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolError);
+}
+
+#[test]
+fn wrapped_rows_counts_embedded_newlines_and_wrapping() {
+    let lines = vec![
+        DisplayLine {
+            text: "short".into(),
+            kind: LineKind::Normal,
+        },
+        DisplayLine {
+            text: "one\ntwo\nthree".into(),
+            kind: LineKind::Normal,
+        },
+        DisplayLine {
+            text: "x".repeat(25),
+            kind: LineKind::Normal,
+        },
+    ];
+    // 1 + 3 + exact hard wrap of 25 cells at width 10
+    assert_eq!(wrapped_rows(&lines, 10), 1 + 3 + 3);
+    let cjk = vec![DisplayLine {
+        text: "你好世界".into(),
+        kind: LineKind::Normal,
+    }];
+    // Each CJK char is 2 cells: "你好" then "世界" at width 5.
+    assert_eq!(wrapped_rows(&cjk, 5), 2);
+}
+
+#[test]
+fn edit_file_tool_calls_render_as_a_numbered_diff_on_result() {
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::ToolCall {
+        name: "edit_file".into(),
+        arguments: r#"{"path":"src/a.rs","old":"fn a() {}\nfn b() {}","new":"fn a() { 1 }"}"#
+            .into(),
+    });
+    assert_eq!(state.lines.len(), 1);
+    assert_eq!(state.lines[0].text, "tool: edit_file src/a.rs");
+    assert_eq!(state.lines[0].kind, LineKind::ToolCall);
+    state.push_agent_event(AgentEvent::ToolResult {
+        is_error: false,
+        content: "file edited (line 7)".into(),
+    });
+    let lines: Vec<_> = state
+        .lines
+        .iter()
+        .map(|line| (line.text.as_str(), line.kind))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ("tool: edit_file src/a.rs", LineKind::ToolCall),
+            ("-    7 fn a() {}", LineKind::Removed),
+            ("-    8 fn b() {}", LineKind::Removed),
+            ("+    7 fn a() { 1 }", LineKind::Added),
+        ]
+    );
+
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::ToolCall {
+        name: "edit_file".into(),
+        arguments: "not json".into(),
+    });
+    assert_eq!(state.lines.len(), 1);
+    assert!(state.lines[0].text.starts_with("tool: edit_file not json"));
+    assert_eq!(state.lines[0].kind, LineKind::ToolCall);
+}
