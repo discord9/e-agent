@@ -108,11 +108,11 @@ fn web_search_registration_requires_a_nonempty_key() {
         "bash".to_string(),
     ];
     for key in [None, Some("   ".into())] {
-        let (tools, _) = builtins_with_exa_key(workspace.clone(), key, None, false);
+        let (tools, _) = builtins_with_exa_key(workspace.clone(), key, None, false, None);
         let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
         assert_eq!(names, local_tools);
     }
-    let (tools, _) = builtins_with_exa_key(workspace, Some(" key ".into()), None, false);
+    let (tools, _) = builtins_with_exa_key(workspace, Some(" key ".into()), None, false, None);
     let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
     assert_eq!(
         names,
@@ -640,7 +640,7 @@ async fn bash_timeout_kills_its_background_process_group() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_millis(100),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30 * 60), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30 * 60)), None),
         sandbox: None,
         protect_git: false,
     };
@@ -664,7 +664,7 @@ async fn bash_timeout_kills_its_background_process_group() {
 fn bash_description_explains_the_sandbox_only_when_enabled() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let background = BackgroundTasks::new(Duration::from_secs(30), None);
+    let background = BackgroundTasks::new(Some(Duration::from_secs(30)), None);
 
     // No sandbox: plain description, no sandbox caveats.
     let plain = Bash {
@@ -755,7 +755,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
 fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (tools, _) = builtins_with_exa_key(workspace, None, None, true);
+    let (tools, _) = builtins_with_exa_key(workspace, None, None, true, None);
     let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
     assert_eq!(
         names,
@@ -783,6 +783,7 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             readable_paths: vec!["~/.rustup".into()],
         }),
         true,
+        None,
     );
     let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
     assert_eq!(
@@ -861,7 +862,10 @@ async fn background_bash_uses_the_facade_sandbox_not_the_registry_one() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(30),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30 * 60), Some(registry_sandbox)),
+        background: BackgroundTasks::new(
+            Some(Duration::from_secs(30 * 60)),
+            Some(registry_sandbox),
+        ),
         sandbox: Some(narrowed),
         protect_git: false,
     };
@@ -896,7 +900,7 @@ fn background_bash(
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(30),
         sender: None,
-        background: BackgroundTasks::new(timeout, None),
+        background: BackgroundTasks::new(Some(timeout), None),
         sandbox: None,
         protect_git: false,
     };
@@ -929,7 +933,7 @@ async fn sandbox_allows_workspace_writes_but_not_outside() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -962,7 +966,7 @@ async fn sandbox_can_disable_network() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -995,7 +999,7 @@ async fn sandbox_read_only_workspace_rejects_bash_but_not_file_tool_writes() {
         workspace,
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -1023,7 +1027,7 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
         workspace: Workspace::new(&workspace_dir).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox.clone()),
         protect_git: false,
     };
@@ -1042,7 +1046,7 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
         workspace: Workspace::new(&workspace_dir).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -1068,7 +1072,7 @@ async fn sandbox_read_only_workspace_allows_explicit_writable_child() {
         workspace: Workspace::new(workspace_dir.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -1108,7 +1112,7 @@ async fn sandbox_reroot_keeps_startup_policy_anchor_read_only() {
         workspace,
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -1135,7 +1139,7 @@ async fn sandbox_missing_policy_cannot_be_created_through_writable_e_agent_child
         workspace: Workspace::new(workspace.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -1163,7 +1167,7 @@ async fn sandbox_ro_parent_allows_rw_child_override() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -1198,7 +1202,7 @@ async fn sandbox_extra_writable_and_readable_paths() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -1239,7 +1243,7 @@ async fn sandbox_protects_workspace_git_directory() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: true,
     };
@@ -1279,7 +1283,7 @@ async fn sandbox_protects_workspace_git_file_linked_worktree() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: true,
     };
@@ -1314,7 +1318,7 @@ async fn sandbox_mounts_systemd_resolve_when_present() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -1360,7 +1364,7 @@ async fn sandbox_cat_etc_resolv_conf_works() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -1395,7 +1399,7 @@ async fn sandbox_dns_resolution_live_smoke() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(15),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -1498,6 +1502,36 @@ async fn background_timeout_is_delivered_as_completion() {
             .unwrap()
             .success()
     );
+}
+
+#[tokio::test]
+async fn background_without_timeout_runs_to_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut bash = Bash {
+        workspace: Workspace::new(temp.path()).unwrap(),
+        timeout: Duration::from_secs(30),
+        sender: None,
+        // None = no timeout: a command sleeping past any small budget must
+        // still complete normally instead of being killed.
+        background: BackgroundTasks::new(None, None),
+        sandbox: None,
+        protect_git: false,
+    };
+    bash.set_event_sender(sender.clone());
+    bash.background.set_event_sender(sender);
+    bash.execute(json!({"command": "sleep 2; echo done", "background": true}))
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+        .await
+        .expect("background task without timeout never completed")
+        .unwrap();
+    assert!(matches!(
+        event,
+        AgentEvent::BackgroundCompleted { output, .. }
+            if output.contains("done") && !output.contains("timed out")
+    ));
 }
 
 #[tokio::test]
@@ -1721,7 +1755,7 @@ async fn get_background_tasks_shows_roled_delegate_with_role_name() {
 
 #[tokio::test]
 async fn completion_delivery_available_requires_an_open_receiver() {
-    let mut background = BackgroundTasks::new(Duration::from_secs(30), None);
+    let mut background = BackgroundTasks::new(Some(Duration::from_secs(30)), None);
     assert!(!background.completion_delivery_available());
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1770,7 +1804,7 @@ async fn completion_delivery_available_requires_an_open_receiver() {
 
 #[tokio::test]
 async fn panicking_on_id_removes_registration_without_work_or_completion() {
-    let mut background = BackgroundTasks::new(Duration::from_secs(30), None);
+    let mut background = BackgroundTasks::new(Some(Duration::from_secs(30)), None);
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let work_runs = Arc::new(AtomicU64::new(0));
@@ -1810,7 +1844,7 @@ async fn panicking_on_id_removes_registration_without_work_or_completion() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_during_on_id_suppresses_work_and_completion() {
-    let mut background = BackgroundTasks::new(Duration::from_secs(30), None);
+    let mut background = BackgroundTasks::new(Some(Duration::from_secs(30)), None);
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let entered = Arc::new(Barrier::new(2));
@@ -1933,7 +1967,7 @@ async fn sandbox_does_not_protect_git_when_protect_git_is_false() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -1974,7 +2008,7 @@ async fn sandbox_does_not_protect_git_file_when_protect_git_is_false() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
     };
@@ -2010,7 +2044,7 @@ async fn background_bash_inherits_protect_git_from_parent_bash() {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
         sender: None,
-        background: BackgroundTasks::new(Duration::from_secs(30 * 60), Some(sandbox.clone())),
+        background: BackgroundTasks::new(Some(Duration::from_secs(30 * 60)), Some(sandbox.clone())),
         sandbox: Some(sandbox),
         protect_git: true,
     };
@@ -2039,7 +2073,7 @@ async fn background_bash_inherits_protect_git_from_parent_bash() {
 async fn shared_registry_clone_drop_does_not_kill_another_bash_origin() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let registry = BackgroundTasks::new(Duration::from_secs(30), None);
+    let registry = BackgroundTasks::new(Some(Duration::from_secs(30)), None);
     let (origin_tx, mut origin_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut bash = Bash {
         workspace: workspace.clone(),
@@ -2065,7 +2099,7 @@ async fn shared_registry_clone_drop_does_not_kill_another_bash_origin() {
 async fn shared_bash_facades_keep_completions_at_their_origins() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let registry = BackgroundTasks::new(Duration::from_secs(30), None);
+    let registry = BackgroundTasks::new(Some(Duration::from_secs(30)), None);
     let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
     let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut first = Bash {

@@ -146,7 +146,9 @@ fn home_budgets_from_start_when_head_segment_exceeds_byte_cap() {
         local.first().map(|l| l.text.as_str()),
         Some("FIRST_LINE_START"),
         "local window must start at the true first line, got: {:?}",
-        local.first().map(|l| l.text.chars().take(30).collect::<String>())
+        local
+            .first()
+            .map(|l| l.text.chars().take(30).collect::<String>())
     );
     draw(&mut terminal, &mut state).unwrap();
     let top: String = terminal.backend().buffer().content()[0..60]

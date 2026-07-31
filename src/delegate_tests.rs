@@ -100,7 +100,7 @@ fn delegate_with_url(workspace: &std::path::Path, base_url: String) -> Delegate 
         crate::model::OpenAiModel::new(base_url, "test-key".into(), "test-model".into(), None)
             .unwrap(),
     );
-    let (_, background) = builtins(workspace.clone(), None, false);
+    let (_, background) = builtins(workspace.clone(), None, false, None);
     Delegate::new(model, workspace, background)
 }
 
@@ -221,7 +221,7 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     let workspace = Workspace::new(&root).unwrap();
-    let (_, mut background) = builtins(workspace, None, false);
+    let (_, mut background) = builtins(workspace, None, false, None);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(&root, false);
@@ -299,7 +299,7 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
 async fn background_cancel_before_first_yield_cleans_everything() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None, false);
+    let (_, mut background) = builtins(workspace, None, false, None);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(temp.path(), false);
@@ -361,7 +361,7 @@ async fn background_cancel_before_first_yield_cleans_everything() {
 async fn background_cancel_while_joining_aborts_inner_without_completion() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None, false);
+    let (_, mut background) = builtins(workspace, None, false, None);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(temp.path(), false);
@@ -424,7 +424,7 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
 async fn sync_cancel_cleans_session_and_closes_result_channel() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None, false);
+    let (_, mut background) = builtins(workspace, None, false, None);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(temp.path(), false);
@@ -474,7 +474,7 @@ async fn sync_cancel_cleans_session_and_closes_result_channel() {
 async fn panicking_inner_model_cleans_up_and_sends_one_failure_completion() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None, false);
+    let (_, mut background) = builtins(workspace, None, false, None);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(temp.path(), true);
@@ -740,7 +740,7 @@ fn resume_loads_the_previous_transcript_as_starting_context() {
 async fn spec_disallows_nested_delegation_by_design() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (tools, _) = builtins(workspace, None, false);
+    let (tools, _) = builtins(workspace, None, false, None);
     let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
     assert!(!names.contains(&"delegate".to_owned()));
     assert!(names.contains(&"bash".to_owned()));
@@ -934,7 +934,7 @@ async fn shared_background_registry_completion_reaches_its_configured_channel() 
     // pin the runner wiring.
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut parent_background) = builtins(workspace.clone(), None, false);
+    let (_, mut parent_background) = builtins(workspace.clone(), None, false, None);
     let (parent_sender, mut parent_receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     parent_background.set_event_sender(parent_sender);
 

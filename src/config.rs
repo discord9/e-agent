@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
@@ -28,9 +29,25 @@ pub struct Config {
     /// Optional `[session]` backend configuration.
     #[serde(default)]
     session: Option<SessionConfig>,
+    /// Optional `[background]` policy (background-task timeout).
+    #[serde(default)]
+    background: Option<BackgroundConfig>,
     #[serde(skip)]
     path: PathBuf,
 }
+
+/// Background-task policy, from `[background]`.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct BackgroundConfig {
+    /// Background bash timeout in seconds. `0` disables the timeout
+    /// (runs until the task finishes or is cancelled). Absent defaults
+    /// to [`DEFAULT_BACKGROUND_TIMEOUT_SECS`].
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Default background-task timeout: 30 minutes.
+pub const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Runtime sandbox configuration for the bash tool, from `[sandbox]`.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -381,10 +398,95 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
     } else {
         (global_writable, global_readable)
     };
-    let (writable, readable) = normalize_roots(writable, readable)?;
+    let (writable, mut readable) = normalize_roots(writable, readable)?;
+
+    // Linked-worktree support: when the workspace is a `git worktree`, its
+    // `.git` is a pointer file (`gitdir: <main-repo>/.git/worktrees/<name>`).
+    // The main repository (with its full object store and other branches)
+    // lives OUTSIDE the workspace, so a subagent (oracle / fixer) running in
+    // the worktree cannot read it — its reads and bash mounts only cover the
+    // workspace. Bind the main repo read-only into the readable roots so
+    // review/comparison against the main branch keeps working.
+    if let Some(main_repo) = linked_worktree_main_repo(workspace)?
+        && !writable.iter().any(|root| root == &main_repo)
+        && !readable.iter().any(|root| root == &main_repo)
+    {
+        readable.push(main_repo);
+    }
+
     result.writable_paths = utf8_roots(writable)?;
     result.readable_paths = utf8_roots(readable)?;
     Ok(result)
+}
+
+/// Resolve the main repository of a linked worktree. When `workspace/.git`
+/// is a regular file starting with `gitdir: `, it points at the main repo's
+/// gitdir (e.g. `<main>/.git/worktrees/<name>`); the main repository root is
+/// that path's grandparent's parent (strip `.git/worktrees/<name>`). Returns
+/// `Ok(None)` for a normal repository (`.git` is a directory or absent).
+fn linked_worktree_main_repo(workspace: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let git_path = workspace.join(".git");
+    let metadata = match std::fs::metadata(&git_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect {}", git_path.display()))
+        }
+    };
+    if metadata.is_dir() {
+        return Ok(None);
+    }
+    let pointer = std::fs::read_to_string(&git_path)
+        .with_context(|| format!("cannot read {}", git_path.display()))?;
+    let Some(target) = pointer.trim().strip_prefix("gitdir:") else {
+        return Ok(None);
+    };
+    let target = PathBuf::from(target.trim());
+    // <main>/.git/worktrees/<name>  →  main repo root = <main>
+    let main_repo = target
+        .parent() // .../worktrees/<name> → .../worktrees
+        .and_then(|p| p.parent()) // .../worktrees → .../.git
+        .and_then(|p| p.parent()); // .../.git → <main>
+    Ok(main_repo.map(PathBuf::from))
+}
+
+/// Resolve the background-task timeout policy for a workspace: workspace
+/// `<workspace>/.e-agent/config.toml` `[background]` overrides the global
+/// config; `timeout_secs = 0` means no timeout (`None`); absent everywhere
+/// returns the default 1800s. Mirrors `resolve_sandbox`/`project_sandbox`.
+pub fn resolve_background_timeout(
+    config: Option<&Config>,
+    workspace: &Path,
+) -> anyhow::Result<Option<Duration>> {
+    let global = config
+        .and_then(|c| c.background.as_ref())
+        .and_then(|b| b.timeout_secs);
+    let local = project_background(workspace)?
+        .and_then(|b| b.timeout_secs);
+    match local.or(global) {
+        Some(0) => Ok(None),
+        Some(secs) => Ok(Some(Duration::from_secs(secs))),
+        None => Ok(Some(Duration::from_secs(DEFAULT_BACKGROUND_TIMEOUT_SECS))),
+    }
+}
+
+/// Read `[background]` from `<workspace>/.e-agent/config.toml` (same
+/// pattern as `project_sandbox`); `None` when absent or unparseable-free.
+fn project_background(workspace: &Path) -> anyhow::Result<Option<BackgroundConfig>> {
+    #[derive(Deserialize)]
+    struct ProjectConfig {
+        background: Option<BackgroundConfig>,
+    }
+    let path = workspace.join(".e-agent/config.toml");
+    let source = match std::fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let parsed: ProjectConfig = toml::from_str(&source)
+        .with_context(|| format!("cannot parse project config {}", path.display()))?;
+    Ok(parsed.background)
 }
 
 fn project_sandbox(workspace: &Path) -> anyhow::Result<Option<ProjectSandbox>> {

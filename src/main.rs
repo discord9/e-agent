@@ -337,7 +337,13 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             eprintln!("e-agent: bash sandboxed with bwrap");
         }
     }
-    let (mut tools, background) = builtins(workspace.clone(), sandbox.clone(), read_only);
+    let background_timeout = e_agent::config::resolve_background_timeout(config.as_ref(), &root)?;
+    let (mut tools, background) = builtins(
+        workspace.clone(),
+        sandbox.clone(),
+        read_only,
+        background_timeout,
+    );
     // Read-only sessions skip MCP entirely: MCP tools carry no read-only
     // marker, so exposing them would defeat the policy. Delegation stays —
     // spawning a subagent does not mutate this session's host state, and each

@@ -154,6 +154,7 @@ async fn tasks_panel_selection_routes_bash_to_detail_and_delegate_to_attach() {
         crate::workspace::Workspace::new(temp.path()).unwrap(),
         None,
         false,
+        None,
     );
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
@@ -227,6 +228,7 @@ async fn open_task_detail_clears_attached_and_remembers_panel_state() {
         crate::workspace::Workspace::new(temp.path()).unwrap(),
         None,
         false,
+        None,
     );
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
@@ -297,6 +299,7 @@ async fn open_task_detail_from_main_view_esc_returns_to_main_view() {
         crate::workspace::Workspace::new(temp.path()).unwrap(),
         None,
         false,
+        None,
     );
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
@@ -699,6 +702,7 @@ async fn task_detail_cancel_by_id_keeps_the_spool_paged() {
         crate::workspace::Workspace::new(temp.path()).unwrap(),
         None,
         false,
+        None,
     );
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
@@ -1807,8 +1811,12 @@ fn cwd_usage_text_behaves_normally_without_window() {
 async fn tasks_panel_tags_rows_with_the_agent_role() {
     let backend = ratatui::backend::TestBackend::new(50, 14);
     let mut terminal = Terminal::new(backend).unwrap();
-    let (_, mut background) =
-        crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None, false);
+    let (_, mut background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(".").unwrap(),
+        None,
+        false,
+        None,
+    );
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     background.set_event_sender(sender);
     background
@@ -1864,8 +1872,12 @@ async fn tasks_panel_selection_highlight_shows_on_non_attachable_task() {
     // Every selected task row uses SOLARIZED_LIGHT.selection as the
     // background, regardless of attachability (the old guard only
     // highlighted attachable tasks).
-    let (_, mut background) =
-        crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None, false);
+    let (_, mut background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(".").unwrap(),
+        None,
+        false,
+        None,
+    );
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     background.set_event_sender(sender);
     for label in ["task-alpha", "task-beta"] {
@@ -1928,6 +1940,7 @@ async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
         crate::workspace::Workspace::new(temp.path()).unwrap(),
         None,
         false,
+        None,
     );
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
@@ -1962,8 +1975,12 @@ async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
 async fn cancel_selected_task_cancels_any_task_and_clamps_cursor() {
     // cancel_selected_task must remove the task at cursor even when the
     // attachable probe returns true for that id, then clamp cursor.
-    let (_, mut background) =
-        crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None, false);
+    let (_, mut background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(".").unwrap(),
+        None,
+        false,
+        None,
+    );
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     background.set_event_sender(sender);
 
@@ -2315,11 +2332,19 @@ fn background_completion_ends_stream_lane_so_next_delta_starts_fresh_line() {
     });
     state.push_agent_event(AgentEvent::AssistantDelta("\nlet y = 2;\n```".into()));
 
-    assert_eq!(state.lines.len(), 4, "body, header, body line, fresh body line");
+    assert_eq!(
+        state.lines.len(),
+        4,
+        "body, header, body line, fresh body line"
+    );
     assert_eq!(state.lines[0].kind, LineKind::Normal);
     assert_eq!(state.lines[0].text, "```rust\nlet x = 1;");
     assert_eq!(state.lines[1].kind, LineKind::Dim);
-    assert!(state.lines[1].text.starts_with("[background task 7 completed"));
+    assert!(
+        state.lines[1]
+            .text
+            .starts_with("[background task 7 completed")
+    );
     assert_eq!(state.lines[2].kind, LineKind::Dim);
     assert_eq!(state.lines[2].text, "built ok");
     // The delta after the notice starts a NEW Normal line instead of

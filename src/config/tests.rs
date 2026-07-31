@@ -911,3 +911,133 @@ model = "codex"
         );
     }
 }
+
+#[test]
+fn resolve_background_timeout_defaults_and_global() {
+    let temp = tempfile::tempdir().unwrap();
+    // No config at all → default 1800s.
+    let t = resolve_background_timeout(None, temp.path()).unwrap();
+    assert_eq!(t, Some(Duration::from_secs(1800)));
+
+    // Global config sets a value.
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[background]
+timeout_secs = 120
+"#,
+    );
+    let config = Config::from_path(&path).unwrap();
+    let t = resolve_background_timeout(Some(&config), temp.path()).unwrap();
+    assert_eq!(t, Some(Duration::from_secs(120)));
+}
+
+#[test]
+fn resolve_background_timeout_workspace_override_and_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[background]
+timeout_secs = 120
+"#,
+    );
+    let config = Config::from_path(&path).unwrap();
+
+    // Workspace .e-agent/config.toml overrides global.
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[background]\ntimeout_secs = 5\n",
+    )
+    .unwrap();
+    let t = resolve_background_timeout(Some(&config), &ws).unwrap();
+    assert_eq!(t, Some(Duration::from_secs(5)));
+
+    // timeout_secs = 0 → None (no timeout).
+    std::fs::write(ws.join(".e-agent/config.toml"), "[background]\ntimeout_secs = 0\n").unwrap();
+    let t = resolve_background_timeout(Some(&config), &ws).unwrap();
+    assert_eq!(t, None);
+
+    // Workspace without [background] falls back to global.
+    std::fs::write(ws.join(".e-agent/config.toml"), "[sandbox]\nenabled = true\n").unwrap();
+    let t = resolve_background_timeout(Some(&config), &ws).unwrap();
+    assert_eq!(t, Some(Duration::from_secs(120)));
+}
+
+#[test]
+fn linked_worktree_main_repo_resolves_gitdir_pointer() {
+    let temp = tempfile::tempdir().unwrap();
+    let main_repo = temp.path().join("main-repo");
+    let git_dir = main_repo.join(".git");
+    std::fs::create_dir_all(git_dir.join("worktrees/feature")).unwrap();
+    let worktree = temp.path().join("worktrees/feature");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", git_dir.join("worktrees/feature").display()),
+    )
+    .unwrap();
+
+    let resolved = linked_worktree_main_repo(&worktree).unwrap();
+    assert_eq!(resolved, Some(main_repo), "must resolve the main repo root");
+
+    // A normal repo (.git is a directory) → None.
+    let normal = temp.path().join("normal");
+    std::fs::create_dir_all(normal.join(".git")).unwrap();
+    assert_eq!(linked_worktree_main_repo(&normal).unwrap(), None);
+
+    // No .git at all → None.
+    let bare = temp.path().join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    assert_eq!(linked_worktree_main_repo(&bare).unwrap(), None);
+}
+
+#[test]
+fn resolve_sandbox_adds_linked_worktree_main_repo_readonly() {
+    let temp = tempfile::tempdir().unwrap();
+    let main_repo = temp.path().join("main-repo");
+    std::fs::create_dir_all(main_repo.join(".git/worktrees/feature")).unwrap();
+    let worktree = temp.path().join("worktrees/feature");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", main_repo.join(".git/worktrees/feature").display()),
+    )
+    .unwrap();
+
+    let sandbox = resolve_sandbox(None, &worktree).unwrap();
+    assert!(
+        sandbox.readable_paths.iter().any(|p| Path::new(p) == main_repo),
+        "main repo must be in readable_paths, got: {:?}",
+        sandbox.readable_paths
+    );
+    assert!(
+        sandbox.writable_paths.iter().all(|p| Path::new(p) != main_repo),
+        "main repo must NOT be writable, got: {:?}",
+        sandbox.writable_paths
+    );
+
+    // A normal workspace gets no extra readable root.
+    let normal = temp.path().join("normal");
+    std::fs::create_dir_all(normal.join(".git")).unwrap();
+    let sandbox = resolve_sandbox(None, &normal).unwrap();
+    assert!(
+        sandbox.readable_paths.is_empty(),
+        "normal repo must have no extra roots, got: {:?}",
+        sandbox.readable_paths
+    );
+}

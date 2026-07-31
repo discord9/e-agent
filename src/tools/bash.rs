@@ -119,7 +119,7 @@ impl Tool for Bash {
         run_bash(
             &self.workspace,
             command,
-            self.timeout,
+            Some(self.timeout),
             self.protect_git,
             None,
             None,
@@ -170,7 +170,7 @@ impl Drop for ProcessGroupGuard {
 pub(super) async fn run_bash(
     workspace: &Workspace,
     command: &str,
-    timeout: Duration,
+    timeout: Option<Duration>,
     protect_git: bool,
     process_group_slot: Option<Arc<AtomicI32>>,
     output_slot: Option<OutputSlot>,
@@ -359,45 +359,48 @@ pub(super) async fn run_bash(
     let mut cancel_guard = ProcessGroupGuard::armed(process_group);
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
-    let result = tokio::time::timeout(timeout, async {
+    let run = async {
         let (stdout, stderr, status) = tokio::join!(
             capture(stdout, output_slot.clone(), spool.clone()),
             capture(stderr, output_slot, spool),
             child.wait()
         );
         Ok::<_, std::io::Error>((stdout?, stderr?, status?))
-    })
-    .await;
-    let (stdout, stderr, status) = match result {
-        Ok(result) => result.map_err(|error| format!("shell I/O failed: {error}"))?,
-        Err(_) => {
-            #[cfg(unix)]
-            let kill_error = match rustix::process::kill_process_group(
-                process_group,
-                rustix::process::Signal::KILL,
-            ) {
-                Ok(()) | Err(rustix::io::Errno::SRCH) => None,
-                Err(error) => Some(error),
-            };
-            #[cfg(unix)]
-            let _ = child.wait().await;
-            #[cfg(not(unix))]
-            let _ = child.kill().await;
-            #[cfg(not(unix))]
-            let _ = child.wait().await;
-            if let Some(slot) = &process_group_slot {
-                slot.store(0, Ordering::Release);
-            }
-            #[cfg(unix)]
-            if let Some(error) = kill_error {
-                return Err(format!("failed to kill bash process group: {error}"));
-            }
-            return Err(format!(
-                "exit code: signal\nstdout:\n\nstderr:\n\n[command timed out after {} seconds]",
-                timeout.as_secs_f64()
-            ));
-        }
     };
+    let result = match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, run).await {
+            Ok(result) => result,
+            Err(_) => {
+                #[cfg(unix)]
+                let kill_error = match rustix::process::kill_process_group(
+                    process_group,
+                    rustix::process::Signal::KILL,
+                ) {
+                    Ok(()) | Err(rustix::io::Errno::SRCH) => None,
+                    Err(error) => Some(error),
+                };
+                #[cfg(unix)]
+                let _ = child.wait().await;
+                #[cfg(not(unix))]
+                let _ = child.kill().await;
+                #[cfg(not(unix))]
+                let _ = child.wait().await;
+                if let Some(slot) = &process_group_slot {
+                    slot.store(0, Ordering::Release);
+                }
+                #[cfg(unix)]
+                if let Some(error) = kill_error {
+                    return Err(format!("failed to kill bash process group: {error}"));
+                }
+                return Err(format!(
+                    "exit code: signal\nstdout:\n\nstderr:\n\n[command timed out after {} seconds]",
+                    timeout.as_secs_f64()
+                ));
+            }
+        },
+        None => run.await,
+    };
+    let (stdout, stderr, status) = result.map_err(|error| format!("shell I/O failed: {error}"))?;
     #[cfg(unix)]
     cancel_guard.disarm();
     if let Some(slot) = &process_group_slot {

@@ -14,7 +14,8 @@ pub struct BackgroundTasks {
     /// Compatibility sender for callers which schedule directly on a registry
     /// (delegates do this). Bash deliberately does not use this field.
     sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
-    timeout: Duration,
+    /// Background bash timeout; `None` = no timeout (run forever).
+    timeout: Option<Duration>,
     sandbox: Option<crate::config::Sandbox>,
 }
 
@@ -310,7 +311,7 @@ pub struct BackgroundTaskInfo {
 }
 
 impl BackgroundTasks {
-    pub(super) fn new(timeout: Duration, sandbox: Option<crate::config::Sandbox>) -> Self {
+    pub(super) fn new(timeout: Option<Duration>, sandbox: Option<crate::config::Sandbox>) -> Self {
         Self {
             registry: Arc::new(BackgroundRegistry {
                 next_id: AtomicU64::new(1),

@@ -55,16 +55,21 @@ pub fn bwrap_available() -> bool {
 /// to `read_file`, bash runs in a narrowed read-only sandbox with network
 /// disabled, and — fail closed — there is no bash at all when the sandbox is
 /// not enabled.
+///
+/// `background_timeout` is the background bash timeout
+/// (`Some(Duration)` = timeout, `None` = no timeout / run forever).
 pub fn builtins(
     workspace: Workspace,
     sandbox: Option<crate::config::Sandbox>,
     read_only: bool,
+    background_timeout: Option<Duration>,
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
     builtins_with_exa_key(
         workspace,
         std::env::var("EXA_API_KEY").ok(),
         sandbox,
         read_only,
+        background_timeout,
     )
 }
 
@@ -95,8 +100,9 @@ fn builtins_with_exa_key(
     exa_api_key: Option<String>,
     sandbox: Option<crate::config::Sandbox>,
     read_only: bool,
+    background_timeout: Option<Duration>,
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
-    let background = BackgroundTasks::new(Duration::from_secs(30 * 60), sandbox.clone());
+    let background = BackgroundTasks::new(background_timeout, sandbox.clone());
     // Main agent: protect_git = false so git worktree/add/commit work.
     let tools = tools_with_background_and_exa_key(
         workspace,
