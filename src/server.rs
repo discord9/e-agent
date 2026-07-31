@@ -1127,7 +1127,7 @@ mod tests {
     /// emitter so it can push events into the broadcast channel).
     fn live_session_with_handle(handle: crate::runner::SessionHandle) -> Arc<LiveSession> {
         let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
-        let (_tools, background) = crate::tools::builtins(workspace, None, false);
+        let (_tools, background) = crate::tools::builtins(workspace, None, false, None);
         Arc::new(LiveSession {
             handle,
             task: crate::runner::SessionTask::from_join_handle(tokio::spawn(async {})),
