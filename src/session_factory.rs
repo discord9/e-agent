@@ -281,17 +281,8 @@ impl SessionFactory {
             eprintln!("e-agent: forked session: {new_id}");
             session = new_id;
         }
-        let background_timeout = crate::config::resolve_background_timeout(
-            self.config.as_ref(),
-            &self.root,
-        )
-        .unwrap_or(None);
-        let (mut tools, background) = builtins(
-            self.workspace.clone(),
-            self.sandbox.clone(),
-            self.read_only,
-            background_timeout,
-        );
+        let (mut tools, background) =
+            builtins(self.workspace.clone(), self.sandbox.clone(), self.read_only);
         // Read-only sessions skip MCP entirely: MCP tools carry no read-only
         // marker, so exposing them would defeat the policy. Delegation stays —
         // spawning a subagent does not mutate this session's host state, and
@@ -354,11 +345,7 @@ impl SessionFactory {
         if let Some(rounds) = max_rounds {
             agent = agent.max_tool_rounds(rounds);
         }
-        // Initial load: only the last compaction segment (the last
-        // Compaction entry + everything after it) — the agent context
-        // depends only on it. Older history is read on demand via
-        // store.load_older (TUI scrollback / Web history pagination).
-        let loaded = store.load_head(&self.root, &session).await?;
+        let loaded = store.load(&self.root, &session).await?;
         let legacy = loaded.legacy;
         agent.restore_history(loaded.entries);
         agent.record_background_tasks_in(self.root.clone(), &session, store.clone());
