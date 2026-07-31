@@ -125,7 +125,8 @@ pub struct Delegate {
     subagent_context_window: Option<u64>,
     workspace: Workspace,
     /// Shared running-task registry: background delegates and bash commands
-    /// stay visible together and deliver completions through the parent.
+    /// stay visible and cancellable together. Delegate wrappers complete to
+    /// the parent; each child Bash facade completes to its child Agent.
     background: BackgroundTasks,
     /// Live handles of background subagents, for the TUI attach view.
     sessions: Sessions,

@@ -32,3 +32,7 @@ What was designed, implemented, or reviewed.
 - Respect an established design system unless the task explicitly asks to replace it.
 - Avoid generic template aesthetics, gratuitous animation, and visual effects that reduce readability or performance.
 - Keep recommendations practical and production-oriented.
+
+## Background tasks
+
+- Background completion automatically resumes the originating session; do not poll, sleep, or re-check task status. Continue independent work or end the turn and let the originating session consume its completion.

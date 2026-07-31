@@ -287,9 +287,8 @@ impl Agent {
     pub fn new(model: Box<dyn Model>, mut tools: Vec<Box<dyn Tool>>) -> Self {
         let (background_sender, background_receiver) = mpsc::unbounded_channel();
         for tool in &mut tools {
-            // Tools already wired to a shared completion channel (e.g. a
-            // subagent's bash bound to the parent's BackgroundTasks) keep
-            // their sender: their completions belong to the parent agent.
+            // A tool may own an explicit sink (notably a Bash facade). Such
+            // completions retain the session that spawned them.
             if !tool.has_event_sender() {
                 tool.set_event_sender(background_sender.clone());
             }
@@ -421,6 +420,9 @@ impl Agent {
 
     pub fn background_task_ids(&self) -> &HashSet<u64> {
         &self.running_background
+    }
+    pub(crate) fn has_running_background(&self) -> bool {
+        !self.running_background.is_empty()
     }
 
     /// Names of the registered tools (for tests and diagnostics).
@@ -1535,10 +1537,8 @@ mod tests {
 
     #[tokio::test]
     async fn new_keeps_an_already_wired_event_sender() {
-        // Subagents bind their bash tool to the PARENT's BackgroundTasks
-        // (already wired to the parent's channel). Agent::new must not
-        // retarget such a tool to the subagent's own channel, or the
-        // completion would die with the subagent.
+        // Tools with an explicit event sender retain it when Agent::new
+        // attaches its default session sink.
         struct PreWired;
         #[async_trait]
         impl Tool for PreWired {

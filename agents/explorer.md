@@ -24,3 +24,7 @@ Concise answer to the question, referencing path:line.
 - READ-ONLY: never modify files or run mutating commands.
 - Be exhaustive but concise; include line numbers.
 - Return compressed findings (paths + snippets), not whole-file dumps.
+
+## Background tasks
+
+- Background completion automatically resumes the originating session; do not poll, sleep, or re-check task status. Continue independent work or end the turn and let the originating session consume its completion.

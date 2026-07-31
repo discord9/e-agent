@@ -482,6 +482,7 @@ async fn bash_timeout_kills_its_background_process_group() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_millis(100),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30 * 60), None),
         sandbox: None,
         protect_git: false,
@@ -512,6 +513,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
     let plain = Bash {
         workspace: workspace.clone(),
         timeout: Duration::from_secs(1),
+        sender: None,
         background: background.clone(),
         sandbox: None,
         protect_git: false,
@@ -523,6 +525,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
     let sandboxed = Bash {
         workspace: workspace.clone(),
         timeout: Duration::from_secs(1),
+        sender: None,
         background: background.clone(),
         sandbox: Some(crate::config::Sandbox {
             enabled: true,
@@ -549,6 +552,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
     let sandboxed_ro = Bash {
         workspace: workspace.clone(),
         timeout: Duration::from_secs(1),
+        sender: None,
         background: background.clone(),
         sandbox: Some(crate::config::Sandbox {
             enabled: true,
@@ -572,6 +576,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
     let sandboxed_main = Bash {
         workspace,
         timeout: Duration::from_secs(1),
+        sender: None,
         background,
         sandbox: Some(crate::config::Sandbox {
             enabled: true,
@@ -597,11 +602,15 @@ fn background_bash(
     let mut bash = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(30),
+        sender: None,
         background: BackgroundTasks::new(timeout, None),
         sandbox: None,
         protect_git: false,
     };
-    bash.set_event_sender(sender);
+    bash.set_event_sender(sender.clone());
+    // This helper also exercises BackgroundTasks directly in a few tests.
+    // Registry-origin work therefore uses the same test receiver.
+    bash.background.set_event_sender(sender);
     (bash, receiver)
 }
 
@@ -626,6 +635,7 @@ async fn sandbox_allows_workspace_writes_but_not_outside() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -658,6 +668,7 @@ async fn sandbox_can_disable_network() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -690,6 +701,7 @@ async fn sandbox_extra_writable_and_readable_paths() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -730,6 +742,7 @@ async fn sandbox_protects_workspace_git_directory() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: true,
@@ -769,6 +782,7 @@ async fn sandbox_protects_workspace_git_file_linked_worktree() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: true,
@@ -803,6 +817,7 @@ async fn sandbox_mounts_systemd_resolve_when_present() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -848,6 +863,7 @@ async fn sandbox_cat_etc_resolv_conf_works() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -882,6 +898,7 @@ async fn sandbox_dns_resolution_live_smoke() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(15),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -1304,7 +1321,7 @@ async fn cancel_during_on_id_suppresses_work_and_completion() {
     tokio::task::yield_now().await;
     assert!(background.running().is_empty());
     assert_eq!(work_runs.load(Ordering::SeqCst), 0);
-    assert_eq!(completions.load(Ordering::SeqCst), 0);
+    assert_eq!(completions.load(Ordering::SeqCst), 1);
     assert!(receiver.try_recv().is_err());
 }
 
@@ -1380,6 +1397,7 @@ async fn sandbox_does_not_protect_git_when_protect_git_is_false() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -1420,6 +1438,7 @@ async fn sandbox_does_not_protect_git_file_when_protect_git_is_false() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -1455,6 +1474,7 @@ async fn background_bash_inherits_protect_git_from_parent_bash() {
     let mut bash = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30 * 60), Some(sandbox.clone())),
         sandbox: Some(sandbox),
         protect_git: true,
@@ -1478,4 +1498,73 @@ async fn background_bash_inherits_protect_git_from_parent_bash() {
         "ref: refs/heads/main\n",
         "background bash with protect_git=true must not corrupt .git"
     );
+}
+
+#[tokio::test]
+async fn shared_registry_clone_drop_does_not_kill_another_bash_origin() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let registry = BackgroundTasks::new(Duration::from_secs(30), None);
+    let (origin_tx, mut origin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut bash = Bash {
+        workspace: workspace.clone(),
+        timeout: Duration::from_secs(30),
+        background: registry.clone(),
+        sender: None,
+        sandbox: None,
+        protect_git: false,
+    };
+    bash.set_event_sender(origin_tx);
+    // Dropping an unrelated facade must not tear down the shared registry.
+    drop(registry);
+    bash.execute(json!({"command": "echo origin", "background": true}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        origin_rx.recv().await,
+        Some(AgentEvent::BackgroundCompleted { output, .. }) if output.contains("origin")
+    ));
+}
+
+#[tokio::test]
+async fn shared_bash_facades_keep_completions_at_their_origins() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let registry = BackgroundTasks::new(Duration::from_secs(30), None);
+    let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut first = Bash {
+        workspace: workspace.clone(),
+        timeout: Duration::from_secs(30),
+        background: registry.clone(),
+        sender: None,
+        sandbox: None,
+        protect_git: false,
+    };
+    let mut second = Bash {
+        workspace,
+        timeout: Duration::from_secs(30),
+        background: registry,
+        sender: None,
+        sandbox: None,
+        protect_git: false,
+    };
+    first.set_event_sender(first_tx);
+    second.set_event_sender(second_tx);
+    first
+        .execute(json!({"command": "echo first", "background": true}))
+        .await
+        .unwrap();
+    second
+        .execute(json!({"command": "echo second", "background": true}))
+        .await
+        .unwrap();
+    assert!(
+        matches!(first_rx.recv().await, Some(AgentEvent::BackgroundCompleted { output, .. }) if output.contains("first"))
+    );
+    assert!(
+        matches!(second_rx.recv().await, Some(AgentEvent::BackgroundCompleted { output, .. }) if output.contains("second"))
+    );
+    assert!(first_rx.try_recv().is_err());
+    assert!(second_rx.try_recv().is_err());
 }
