@@ -166,7 +166,7 @@
   .session-row.inactive { opacity: 0.55; }
   .session-row.inactive .sid { color: var(--base01); }
   .session-row.inactive:hover { opacity: 0.8; }
-  .session-row .sid { color: var(--blue); font-size: 12px; min-width: 110px; }
+  .session-row .sid { color: var(--blue); font-size: 12px; min-width: 110px; word-break: break-all; }
   .session-row .smodel { color: var(--base00); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .session-row .smeta { color: var(--base01); font-size: 12px; text-align: right; }
   .session-row .del {
@@ -631,7 +631,7 @@ function renderSessionList(list) {
       (s.parent_session_id ? " · 子会话 ← " + s.parent_session_id : "");
 
     const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
-    const sid = el("span", "sid", shortId(s.id));
+    const sid = el("span", "sid", s.id);   // 完整 ID：用户需要知道是哪个会话
     const chip = el("span", "status-chip " + statusChipClass(s.status), statusLabel(s.status));
     const model = el("span", "smodel", s.model || "");
     const meta = el("span", "smeta",
