@@ -286,9 +286,10 @@ pub struct Agent {
     /// turns and receive every emitted event. Sinks are dropped once their
     /// session handle is gone.
     running_background: HashSet<u64>,
-    /// Workspace root + session name used to record in-flight background
-    /// tasks, so resuming the same session can report what died. None in tests.
-    background_record: Option<(std::path::PathBuf, String)>,
+    /// Where in-flight background tasks are recorded (workspace root +
+    /// session + the store that owns the record), so resuming the same
+    /// session can report what died. None in tests.
+    background_record: Option<crate::session_store::BackgroundRecord>,
     session_input_tokens: u64,
     session_output_tokens: u64,
     last_context_input: u64,
@@ -339,10 +340,20 @@ impl Agent {
         self.context_prefix = Some(prefix);
     }
 
-    /// Record in-flight background tasks under this workspace root + session,
-    /// so resuming the same session later can report what died with this process.
-    pub fn record_background_tasks_in(&mut self, root: std::path::PathBuf, session: &str) {
-        self.background_record = Some((root, session.to_owned()));
+    /// Record in-flight background tasks under this workspace root + session
+    /// through the given store, so resuming the same session later can
+    /// report what died with this process.
+    pub fn record_background_tasks_in(
+        &mut self,
+        root: std::path::PathBuf,
+        session: &str,
+        store: crate::session_store::SessionStore,
+    ) {
+        self.background_record = Some(crate::session_store::BackgroundRecord {
+            root,
+            session: session.to_owned(),
+            store,
+        });
     }
 
     /// Cap the number of tool-call rounds per turn. None (the default) means
@@ -651,14 +662,18 @@ impl Agent {
             && let Some(id) = started_task_id(result.as_deref().unwrap_or_default())
         {
             self.running_background.insert(id);
-            if let Some((root, session)) = &self.background_record {
+            if let Some(record) = &self.background_record {
                 let command = serde_json::from_str::<Value>(&call.arguments)
                     .ok()
                     .and_then(|args| args["command"].as_str().map(str::to_owned))
                     .unwrap_or_else(|| call.arguments.clone());
                 let label = preview(&command, 100);
-                let _ = crate::session::Session::record_background_start(
-                    root, session, id, &label, None,
+                record.store.record_background_start(
+                    &record.root,
+                    &record.session,
+                    id,
+                    &label,
+                    None,
                 );
             }
         }
@@ -852,8 +867,10 @@ impl Agent {
     pub(crate) fn ack_background_entry(&mut self) {
         if let Some((id, _output, _label)) = self.pending_background.pop_front() {
             self.running_background.remove(&id);
-            if let Some((root, session)) = &self.background_record {
-                crate::session::Session::clear_background_task(root, session, id);
+            if let Some(record) = &self.background_record {
+                record
+                    .store
+                    .clear_background_task(&record.root, &record.session, id);
             }
         }
     }
@@ -1984,7 +2001,11 @@ mod tests {
             Box::new(model),
             vec![Box::new(ScriptedBackgroundTool { sender: None })],
         );
-        agent.record_background_tasks_in(temp.path().to_path_buf(), "test");
+        agent.record_background_tasks_in(
+            temp.path().to_path_buf(),
+            "test",
+            crate::session_store::SessionStore::Jsonl,
+        );
         assert_eq!(agent.run("go".into()).await.unwrap(), "started");
         // Task recorded while in flight (its completion arrives 10ms after
         // start; the first run finished before that).

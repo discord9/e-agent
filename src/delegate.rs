@@ -69,14 +69,14 @@ impl Sessions {
 struct DelegateCleanup {
     id: Arc<Mutex<Option<u64>>>,
     sessions: Sessions,
-    recovery: Option<(std::path::PathBuf, String)>,
+    recovery: Option<crate::session_store::BackgroundRecord>,
 }
 
 impl DelegateCleanup {
     fn new(
         id: Arc<Mutex<Option<u64>>>,
         sessions: Sessions,
-        recovery: Option<(std::path::PathBuf, String)>,
+        recovery: Option<crate::session_store::BackgroundRecord>,
     ) -> Self {
         Self {
             id,
@@ -105,8 +105,10 @@ impl DelegateCleanup {
                 poisoned.into_inner().remove(&id);
             }
         }
-        if let Some((root, session)) = &self.recovery {
-            crate::session::Session::clear_background_task(root, session, id);
+        if let Some(record) = &self.recovery {
+            record
+                .store
+                .clear_background_task(&record.root, &record.session, id);
         }
     }
 }
@@ -145,10 +147,11 @@ pub struct Delegate {
     roles_root: Option<std::path::PathBuf>,
     /// Optional bwrap sandbox inherited by every subagent's bash tool.
     sandbox: Option<crate::config::Sandbox>,
-    /// Parent session's background-task record (root + session name), so
-    /// subagent delegates are recorded alongside bash background tasks and
-    /// trigger the "killed on exit" notice on restart.
-    record_in: Option<(std::path::PathBuf, String)>,
+    /// Parent session's background-task record (workspace root + session
+    /// name + the store that owns the record), so subagent delegates are
+    /// recorded alongside bash background tasks and trigger the "killed on
+    /// exit" notice on restart.
+    record_in: Option<crate::session_store::BackgroundRecord>,
     /// Session backend configuration for subagent persistence (not a
     /// connected store — each subagent connects its own).
     persist_backend: SessionBackend,
@@ -251,8 +254,17 @@ impl Delegate {
 
     /// Record subagent background tasks in the parent session's record so a
     /// restart can warn about killed subagents alongside killed bash tasks.
-    pub fn record_background_tasks_in(mut self, root: std::path::PathBuf, session: &str) -> Self {
-        self.record_in = Some((root, session.to_owned()));
+    pub fn record_background_tasks_in(
+        mut self,
+        root: std::path::PathBuf,
+        session: &str,
+        store: SessionStore,
+    ) -> Self {
+        self.record_in = Some(crate::session_store::BackgroundRecord {
+            root,
+            session: session.to_owned(),
+            store,
+        });
         self
     }
 
@@ -511,14 +523,50 @@ impl Tool for Delegate {
                 let temp_store = SessionStore::connect(&self.persist_backend, &root, &id)
                     .await
                     .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
-                let loaded = temp_store
+                let mut entries = temp_store
                     .load(&root, &id)
                     .await
-                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
-                if loaded.entries.is_empty() {
+                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?
+                    .entries;
+                if entries.is_empty() {
                     return Err(format!("no such subagent session: `{id}`"));
                 }
-                Some((id, loaded.entries))
+                // Consume any background-task records left by a process that
+                // died while this subagent's background delegates were
+                // running, so the resumed subagent knows what died with it.
+                // Greptime: the running_tasks table is global, so the lookup
+                // works across parent sessions. JSONL: records live only in
+                // the parent session's file (never a per-subagent file), so
+                // there is nothing to consume.
+                let unfinished = temp_store
+                    .take_unfinished_background_for_subagent(&root, &id)
+                    .await
+                    .map_err(|error| {
+                        format!("cannot load unfinished tasks for session `{id}`: {error:#}")
+                    })?;
+                if !unfinished.is_empty() {
+                    let notice = format!(
+                        "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
+                        unfinished.len(),
+                        unfinished.join("\n")
+                    );
+                    let entry = crate::agent::SessionEntry::Notice {
+                        text: notice.clone(),
+                    };
+                    // Persist immediately (mirrors the main-agent resume
+                    // path) so a crash-before-first-turn cannot inject the
+                    // same notice again on the next resume.
+                    temp_store
+                        .append(&root, &id, std::slice::from_ref(&entry))
+                        .await
+                        .map_err(|error| {
+                            format!("cannot persist resume notice for session `{id}`: {error:#}")
+                        })?;
+                    // Append (NOT restore_history, which would wipe the
+                    // resumed history).
+                    entries.push(entry);
+                }
+                Some((id, entries))
             }
             None => None,
         };
@@ -610,10 +658,10 @@ impl Tool for Delegate {
                         Err(poisoned) => *poisoned.into_inner() = Some(id),
                     }
                     sessions.insert(id, entry_for_hook);
-                    if let Some((root, session)) = &record {
-                        let _ = crate::session::Session::record_background_start(
-                            root,
-                            session,
+                    if let Some(record) = &record {
+                        record.store.record_background_start(
+                            &record.root,
+                            &record.session,
                             id,
                             &record_label,
                             Some(&record_session_id),
