@@ -856,6 +856,7 @@ async fn sandbox_read_only_workspace_rejects_bash_but_not_file_tool_writes() {
     let tool = Bash {
         workspace,
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -883,6 +884,7 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
     let read_only = Bash {
         workspace: Workspace::new(&workspace_dir).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox.clone()),
         protect_git: false,
@@ -901,6 +903,7 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
     let writable = Bash {
         workspace: Workspace::new(&workspace_dir).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -926,6 +929,7 @@ async fn sandbox_read_only_workspace_allows_explicit_writable_child() {
     let tool = Bash {
         workspace: Workspace::new(workspace_dir.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -965,6 +969,7 @@ async fn sandbox_reroot_keeps_startup_policy_anchor_read_only() {
     let tool = Bash {
         workspace,
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -991,6 +996,7 @@ async fn sandbox_missing_policy_cannot_be_created_through_writable_e_agent_child
     let tool = Bash {
         workspace: Workspace::new(workspace.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
@@ -1018,6 +1024,7 @@ async fn sandbox_ro_parent_allows_rw_child_override() {
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Duration::from_secs(10),
+        sender: None,
         background: BackgroundTasks::new(Duration::from_secs(30), None),
         sandbox: Some(sandbox),
         protect_git: false,
