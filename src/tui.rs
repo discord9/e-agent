@@ -540,16 +540,6 @@ fn draw<'a, B: ratatui::backend::Backend>(
             );
         }
         if tasks_height > 0 && state.show_tasks {
-            let attachable = |id: u64| {
-                state
-                    .attached
-                    .as_ref()
-                    .is_some_and(|attached| attached.id == id)
-                    || state
-                        .attachable
-                        .as_ref()
-                        .is_some_and(|attachable| attachable(id))
-            };
             let mut lines = vec![Line::styled(
                 if running.is_empty() {
                     "no background tasks running".to_owned()
@@ -3268,8 +3258,11 @@ mod tests {
     #[tokio::test]
     async fn tasks_panel_enter_routes_bash_to_detail_and_delegate_to_attach() {
         let temp = tempfile::tempdir().unwrap();
-        let (_, mut background) =
-            crate::tools::builtins(crate::workspace::Workspace::new(temp.path()).unwrap(), None);
+        let (_, mut background) = crate::tools::builtins(
+            crate::workspace::Workspace::new(temp.path()).unwrap(),
+            None,
+            false,
+        );
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         background.set_event_sender(sender);
         background
@@ -3551,8 +3544,11 @@ mod tests {
     #[tokio::test]
     async fn task_detail_cancel_by_id_keeps_the_spool_paged() {
         let temp = tempfile::tempdir().unwrap();
-        let (_, mut background) =
-            crate::tools::builtins(crate::workspace::Workspace::new(temp.path()).unwrap(), None);
+        let (_, mut background) = crate::tools::builtins(
+            crate::workspace::Workspace::new(temp.path()).unwrap(),
+            None,
+            false,
+        );
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         background.set_event_sender(sender);
         background
@@ -4481,7 +4477,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(50, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         let (_, mut background) =
-            crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None);
+            crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None, false);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         background.set_event_sender(sender);
         background
@@ -4538,7 +4534,7 @@ mod tests {
         // background, regardless of attachability (the old guard only
         // highlighted attachable tasks).
         let (_, mut background) =
-            crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None);
+            crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None, false);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         background.set_event_sender(sender);
         for label in ["task-alpha", "task-beta"] {
@@ -4597,8 +4593,11 @@ mod tests {
     #[tokio::test]
     async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
         let temp = tempfile::tempdir().unwrap();
-        let (_, mut background) =
-            crate::tools::builtins(crate::workspace::Workspace::new(temp.path()).unwrap(), None);
+        let (_, mut background) = crate::tools::builtins(
+            crate::workspace::Workspace::new(temp.path()).unwrap(),
+            None,
+            false,
+        );
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         background.set_event_sender(sender);
         background
@@ -4640,7 +4639,7 @@ mod tests {
         // cancel_selected_task must remove the task at cursor even when the
         // attachable probe returns true for that id, then clamp cursor.
         let (_, mut background) =
-            crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None);
+            crate::tools::builtins(crate::workspace::Workspace::new(".").unwrap(), None, false);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         background.set_event_sender(sender);
 

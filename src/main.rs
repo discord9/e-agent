@@ -61,6 +61,13 @@ fn version_requested(arguments: &[String]) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Whether the invocation requests a read-only session (`--read-only`): the
+/// same policy as a read-only role — no write/edit tools, no MCP tools, and
+/// a narrowed read-only bash sandbox (no bash at all without the sandbox).
+fn read_only_requested(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| argument == "--read-only")
+}
+
 async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     if let Some(command) = raw_arguments
         .first()
@@ -88,6 +95,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     let mut max_rounds = None;
     let mut repl_mode = false;
     let mut prompt = Vec::new();
+    let read_only = read_only_requested(&raw_arguments);
     let mut arguments = raw_arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -112,9 +120,10 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
                 )
             }
             "--repl" => repl_mode = true,
+            "--read-only" => {} // consumed via read_only_requested above
             "--help" | "-h" => {
                 println!(
-                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--fork SESSION] [--at N] [--max-rounds N] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup);\npass --fork <id> to start a new session from a completed turn of an existing one\n(--at N forks at the N-th entry, 1-based and inclusive, and must be a turn boundary)"
+                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--fork SESSION] [--at N] [--max-rounds N] [--read-only] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup);\npass --fork <id> to start a new session from a completed turn of an existing one\n(--at N forks at the N-th entry, 1-based and inclusive, and must be a turn boundary);\n--read-only applies the read-only role policy to the main session (no write/edit tools, no MCP tools, narrowed bash sandbox)"
                 );
                 return Ok(());
             }
@@ -328,12 +337,20 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             eprintln!("e-agent: bash sandboxed with bwrap");
         }
     }
-    let (mut tools, background) = builtins(workspace.clone(), sandbox.clone());
-    let mcp_servers = config
-        .as_ref()
-        .map(|config| config.mcp.clone())
-        .unwrap_or_default();
-    let (mcp_tools, mcp_instructions) = mcp::connect_all(mcp_servers, &root).await;
+    let (mut tools, background) = builtins(workspace.clone(), sandbox.clone(), read_only);
+    // Read-only sessions skip MCP entirely: MCP tools carry no read-only
+    // marker, so exposing them would defeat the policy. Delegation stays —
+    // spawning a subagent does not mutate this session's host state, and each
+    // subagent resolves its own role template (read-only or not).
+    let (mcp_tools, mcp_instructions) = if read_only {
+        (Vec::new(), Vec::new())
+    } else {
+        let mcp_servers = config
+            .as_ref()
+            .map(|config| config.mcp.clone())
+            .unwrap_or_default();
+        mcp::connect_all(mcp_servers, &root).await
+    };
     tools.extend(mcp_tools);
     let mut delegate = Delegate::new(model.clone(), workspace, background.clone())
         .persist_sessions(root.clone())

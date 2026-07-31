@@ -35,21 +35,34 @@ pub fn bwrap_available() -> bool {
 
 /// Built-in tools plus the shared background-task registry, exposed so that
 /// other tools (e.g. delegate) can schedule background work too.
+///
+/// `read_only` (the main session's `--read-only` policy): file tools shrink
+/// to `read_file`, bash runs in a narrowed read-only sandbox with network
+/// disabled, and — fail closed — there is no bash at all when the sandbox is
+/// not enabled.
 pub fn builtins(
     workspace: Workspace,
     sandbox: Option<crate::config::Sandbox>,
+    read_only: bool,
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
-    builtins_with_exa_key(workspace, std::env::var("EXA_API_KEY").ok(), sandbox)
+    builtins_with_exa_key(
+        workspace,
+        std::env::var("EXA_API_KEY").ok(),
+        sandbox,
+        read_only,
+    )
 }
 
 /// Builtin tools bound to an existing background-task registry.
 ///
 /// Subagents use this path to share global task visibility while their bash
 /// facade is independently bound to the subagent Agent's completion sink.
+/// `read_only` applies the read-only role policy (see [`builtins`]).
 pub fn builtins_with_background(
     workspace: Workspace,
     background: BackgroundTasks,
     sandbox: Option<crate::config::Sandbox>,
+    read_only: bool,
 ) -> Vec<Box<dyn Tool>> {
     // Subagent / fixer: protect_git = true so .git is read-only.
     tools_with_background_and_exa_key(
@@ -58,6 +71,7 @@ pub fn builtins_with_background(
         std::env::var("EXA_API_KEY").ok(),
         sandbox,
         true,
+        read_only,
     )
 }
 
@@ -65,6 +79,7 @@ fn builtins_with_exa_key(
     workspace: Workspace,
     exa_api_key: Option<String>,
     sandbox: Option<crate::config::Sandbox>,
+    read_only: bool,
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
     let background = BackgroundTasks::new(Duration::from_secs(30 * 60), sandbox.clone());
     // Main agent: protect_git = false so git worktree/add/commit work.
@@ -74,8 +89,22 @@ fn builtins_with_exa_key(
         exa_api_key,
         sandbox,
         false,
+        read_only,
     );
     (tools, background)
+}
+
+/// Narrow a resolved sandbox policy for read-only roles: the workspace is
+/// mounted read-only, extra writable roots are dropped, and the network is
+/// disabled. Readable roots are kept — reads stay possible.
+pub(crate) fn read_only_sandbox(sandbox: &crate::config::Sandbox) -> crate::config::Sandbox {
+    crate::config::Sandbox {
+        enabled: true,
+        network: false,
+        workspace_writable: false,
+        writable_paths: Vec::new(),
+        readable_paths: sandbox.readable_paths.clone(),
+    }
 }
 
 fn tools_with_background_and_exa_key(
@@ -84,15 +113,33 @@ fn tools_with_background_and_exa_key(
     exa_api_key: Option<String>,
     sandbox: Option<crate::config::Sandbox>,
     protect_git: bool,
+    read_only: bool,
 ) -> Vec<Box<dyn Tool>> {
-    let mut tools = file_tools(&workspace);
+    let mut tools = if read_only {
+        // Read-only roles get no write/edit tools at all.
+        vec![Box::new(ReadFile {
+            workspace: workspace.clone(),
+        }) as Box<dyn Tool>]
+    } else {
+        file_tools(&workspace)
+    };
     tools.push(Box::new(GetBackgroundTasks {
         background: background.clone(),
     }));
     tools.push(Box::new(CancelBackgroundTask {
         background: background.clone(),
     }));
-    tools.push(bash_tool(workspace, background, sandbox, protect_git));
+    // Bash for read-only roles only exists inside a narrowed bwrap policy;
+    // without one (sandbox disabled / bwrap unavailable) there is no bash —
+    // fail closed rather than an unsandboxed shell.
+    let bash_sandbox = if read_only {
+        sandbox.as_ref().map(read_only_sandbox)
+    } else {
+        sandbox
+    };
+    if !read_only || bash_sandbox.is_some() {
+        tools.push(bash_tool(workspace, background, bash_sandbox, protect_git));
+    }
     if let Some(key) = exa_api_key
         .map(|key| key.trim().to_owned())
         .filter(|key| !key.is_empty())
@@ -590,11 +637,15 @@ impl Tool for Bash {
     async fn execute(&self, arguments: Value) -> Result<String, String> {
         let command = required_string(&arguments, "command")?;
         if optional_bool(&arguments, "background")? {
+            // Background commands run under THIS facade's sandbox (possibly a
+            // read-only role's narrowed policy), never the shared registry's
+            // wider one.
             return self.background.start_with_sender(
                 self.workspace.clone(),
                 command.to_owned(),
                 self.protect_git,
                 self.sender.clone(),
+                self.sandbox.clone(),
             );
         }
         run_bash(
@@ -1008,15 +1059,29 @@ impl BackgroundTasks {
         command: String,
         protect_git: bool,
     ) -> Result<String, String> {
-        self.start_with_sender(workspace, command, protect_git, self.sender.clone())
+        self.start_with_sender(
+            workspace,
+            command,
+            protect_git,
+            self.sender.clone(),
+            self.sandbox.clone(),
+        )
     }
 
+    /// Start a background bash command with an explicit completion sender and
+    /// sandbox policy.
+    ///
+    /// `sandbox` is the POLICY OF THE CALLING BASH FACADE, not the shared
+    /// registry's: a subagent's Bash tool passes its own (possibly read-only
+    /// narrowed) sandbox so background commands cannot escape into the
+    /// parent's wider policy. `start()` passes the registry's default.
     pub fn start_with_sender(
         &self,
         workspace: Workspace,
         command: String,
         protect_git: bool,
         sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+        sandbox: Option<crate::config::Sandbox>,
     ) -> Result<String, String> {
         let process_group = Arc::new(AtomicI32::new(0));
         let output: OutputSlot = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1026,7 +1091,6 @@ impl BackgroundTasks {
         let full = spool.clone();
         let timeout = self.timeout;
         let running = self.registry.clone();
-        let sandbox = self.sandbox.clone();
         self.spawn_with_id_to(
             sender,
             preview(&command, 100),

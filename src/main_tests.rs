@@ -21,6 +21,20 @@ fn test_version_rejects_additional_arguments() {
 }
 
 #[test]
+fn test_read_only_requested() {
+    assert!(read_only_requested(&["--read-only".into()]));
+    assert!(read_only_requested(&[
+        "--workspace".into(),
+        "/tmp".into(),
+        "--read-only".into(),
+        "audit".into()
+    ]));
+    assert!(!read_only_requested(&[]));
+    assert!(!read_only_requested(&["--repl".into(), "prompt".into()]));
+    assert!(!read_only_requested(&["--read".into(), "-only".into()]));
+}
+
+#[test]
 fn test_build_version_is_package_version() {
     assert_eq!(BUILD_VERSION, env!("CARGO_PKG_VERSION"));
     assert_eq!(
