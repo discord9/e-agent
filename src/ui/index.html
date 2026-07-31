@@ -503,6 +503,116 @@
     flex: 0 0 auto;
   }
 
+  /* ---------- 后台任务 / 子代理面板 ---------- */
+  #tasksBtn {
+    padding: 3px 10px;
+    font-size: 12px;
+    color: var(--base01);
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+  #tasksBtn.has-tasks { color: var(--base02); border-color: var(--blue); }
+  #tasksBtn .badge-count { color: var(--blue); font-weight: bold; margin-left: 3px; }
+  #tasksBtn.has-tasks .badge-count { color: var(--blue); }
+
+  /* 半透明遮罩 + 固定定位，z-index 高于顶栏（10） */
+  #tasksOverlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 43, 54, 0.45);
+    z-index: 100;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 48px 16px 16px;
+  }
+  #tasksPanel {
+    background: var(--base2);
+    border: 1px solid var(--base1);
+    border-radius: 8px;
+    width: 560px;
+    max-width: 100%;
+    max-height: 75vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 6px 24px rgba(0, 43, 54, 0.25);
+  }
+  .tasks-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--base1);
+    flex: 0 0 auto;
+  }
+  .tasks-head h2 { margin: 0; font-size: 14px; flex: 1; color: var(--base02); }
+  #tasksCloseBtn { padding: 2px 10px; font-size: 12px; }
+  #tasksList {
+    overflow-y: auto;               /* 面板内滚动，不随消息滚动 */
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 56px;
+    scrollbar-width: thin;
+  }
+  .tasks-empty { color: var(--base01); font-size: 13px; padding: 14px 2px; text-align: center; }
+
+  .task-row {
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    background: var(--base3);
+    padding: 6px 10px;
+    cursor: pointer;
+  }
+  .task-row:hover { border-color: var(--blue); }
+  .task-row .task-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .kind-badge {
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 3px;
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+  .kind-badge.bash     { background: #dceaf7; color: var(--blue);   border: 1px solid var(--blue); }
+  .kind-badge.delegate { background: #e5e2f5; color: var(--violet); border: 1px solid var(--violet); }
+  .task-label {
+    flex: 1 1 140px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--base02);
+    font-size: 13px;
+  }
+  .task-meta { color: var(--base01); font-size: 11px; display: flex; gap: 6px 10px; align-items: center; flex-wrap: wrap; }
+  .task-meta .trole { color: var(--base00); }
+  .task-meta .tsid { color: var(--cyan); }
+  .task-cancel {
+    padding: 1px 10px;
+    font-size: 12px;
+    color: var(--red);
+    border-color: var(--red);
+    flex: 0 0 auto;
+    margin-left: auto;
+  }
+  .task-cancel:hover:not(:disabled) { background: var(--red); color: var(--base3); border-color: var(--red); }
+  .task-cancel:disabled { opacity: 0.4; cursor: not-allowed; }
+  .task-output {
+    margin: 6px 0 0;
+    padding: 6px 8px;
+    background: var(--base2);
+    border: 1px solid var(--base1);
+    border-radius: 3px;
+    font-size: 12px;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    max-height: 12em;
+    overflow-y: auto;
+    color: var(--base02);
+  }
+  .task-output.empty { color: var(--base01); font-style: italic; }
+
   /* 小屏适配 */
   @media (max-width: 640px) {
     .token-box label { display: none; }
@@ -510,6 +620,13 @@
     #searchInput { max-width: 100%; }   /* 小屏换行后占满整行，不溢出 */
     .session-row .smodel { display: none; }
     .session-row .smeta { display: none; }
+  }
+  /* 手机宽度（390px）：面板占满宽度、遮罩贴边，不横向溢出 */
+  @media (max-width: 480px) {
+    #tasksOverlay { padding: 8px; align-items: stretch; }
+    #tasksPanel { width: 100%; max-height: 92vh; }
+    .top-actions { gap: 6px; }
+    #tasksBtn { padding: 3px 8px; }
   }
 </style>
 </head>
@@ -520,6 +637,7 @@
   <div class="top-actions" id="topActions" hidden>
     <button id="backBtn">← 返回列表</button>
     <span id="connState" class="conn-state"></span>
+    <button id="tasksBtn" title="查看后台任务 / 子代理">任务</button>
   </div>
   <div class="token-box">
     <label for="tokenInput">Token</label>
@@ -528,6 +646,17 @@
 </header>
 
 <div id="banner" class="banner" hidden></div>
+
+<!-- ============ 后台任务 / 子代理面板 ============ -->
+<div id="tasksOverlay" hidden>
+  <div id="tasksPanel">
+    <div class="tasks-head">
+      <h2>后台任务</h2>
+      <button id="tasksCloseBtn" title="关闭">关闭</button>
+    </div>
+    <div id="tasksList"></div>
+  </div>
+</div>
 
 <!-- ============ 会话列表视图 ============ -->
 <main id="listView" class="view">
@@ -603,6 +732,14 @@ const state = {
   lastList: [],              // 最近一次轮询拿到的完整列表，供搜索框重绘
   queue: [],                 // 排队提示（FIFO；最多显示 3 条 + "+N"）
   deepLink: { pending: null, handled: false },  // URL ?session= 深链：待打开 id + 一次性标志
+  tasks: {                   // 后台任务面板
+    open: false,             // 面板是否打开
+    badgeSeq: 0,             // 徽标轮询竞态序号：只应用最新一次响应
+    panelSeq: 0,             // 面板轮询竞态序号
+    badgeTimer: null,        // 徽标轮询（独立 3s，面板关闭时也跑）
+    panelTimer: null,        // 面板打开时的列表刷新（2s）
+    cancelling: new Set(),   // 正在取消的任务 id（防重复点击）
+  },
 };
 
 /* 常用 DOM 引用 */
@@ -618,6 +755,8 @@ const els = {
   messages: $("messages"), promptInput: $("promptInput"), queueBar: $("queueBar"),
   jumpBottomBtn: $("jumpBottomBtn"),
   sendBtn: $("sendBtn"), cancelBtn: $("cancelBtn"), compactBtn: $("compactBtn"),
+  tasksBtn: $("tasksBtn"), tasksOverlay: $("tasksOverlay"),
+  tasksCloseBtn: $("tasksCloseBtn"), tasksList: $("tasksList"),
 };
 
 /* =====================================================================
@@ -1732,6 +1871,143 @@ function stopPolling() {
 }
 
 /* =====================================================================
+ * 后台任务 / 子代理面板
+ * ===================================================================*/
+/* GET /api/tasks → 任务数组；失败/无 token 返回 null（调用方决定如何处理） */
+async function fetchTasks() {
+  if (!state.token) return null;
+  try {
+    const res = await api("/api/tasks");
+    if (res.status === 401 || res.status === 403) {
+      setBanner("⚠ 认证失败：请检查 Token。");
+      return null;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const list = await res.json();
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    return null;   // 网络/404：静默，保持徽标现状，不刷屏
+  }
+}
+
+function updateTasksBtn(count) {
+  const n = Number(count) || 0;
+  els.tasksBtn.textContent = "";
+  els.tasksBtn.appendChild(document.createTextNode("任务" + (n > 0 ? " " : "")));
+  if (n > 0) {
+    els.tasksBtn.appendChild(el("span", "badge-count", String(n)));
+    els.tasksBtn.classList.add("has-tasks");
+  } else {
+    els.tasksBtn.classList.remove("has-tasks");
+  }
+}
+
+/* 徽标轮询（独立 3s，面板关闭时也运行）；序号防竞态 */
+async function pollTasksBadge() {
+  const seq = ++state.tasks.badgeSeq;
+  const tasks = await fetchTasks();
+  if (tasks === null || seq !== state.tasks.badgeSeq) return;  // 过期响应丢弃
+  updateTasksBtn(tasks.length);
+}
+
+/* 面板列表刷新（面板打开时 2s 一次） */
+async function refreshTasksPanel() {
+  const seq = ++state.tasks.panelSeq;
+  const tasks = await fetchTasks();
+  if (tasks === null || seq !== state.tasks.panelSeq || !state.tasks.open) return;
+  renderTaskList(tasks);
+}
+
+function shortTaskLabel(t) {
+  // delegate 显示 label；bash 显示截断的 full_command（label 兜底）
+  if (t.kind === "delegate") return t.label || "子代理任务";
+  return truncate(t.full_command || t.label || "", 80);
+}
+
+function renderTaskList(tasks) {
+  const list = els.tasksList;
+  list.innerHTML = "";
+  if (!tasks.length) {
+    list.appendChild(el("div", "tasks-empty", "暂无运行中的任务"));
+    return;
+  }
+  for (const t of tasks) {
+    const row = el("div", "task-row");
+    row.title = "点击展开 / 收起输出";
+    const line = el("div", "task-line");
+    const badge = el("span", "kind-badge " + (t.kind === "delegate" ? "delegate" : "bash"),
+      t.kind === "delegate" ? "子代理" : "bash");
+    line.appendChild(badge);
+    line.appendChild(el("span", "task-label", shortTaskLabel(t)));
+    if (t.role) line.appendChild(el("span", "task-meta trole", t.role));
+    if (t.session_id) line.appendChild(el("span", "task-meta tsid", "会话 " + shortId(t.session_id)));
+    const cancel = el("button", "task-cancel", "取消");
+    cancel.title = "取消任务 " + (t.id != null ? t.id : "");
+    cancel.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      await cancelTask(t);
+    });
+    line.appendChild(cancel);
+    row.appendChild(line);
+
+    const out = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
+    const pre = el("pre", "task-output" + (out ? "" : " empty"), out || "(无输出)");
+    pre.hidden = true;
+    row.appendChild(pre);
+    row.addEventListener("click", () => { pre.hidden = !pre.hidden; });
+    list.appendChild(row);
+  }
+}
+
+async function cancelTask(t) {
+  if (!t || t.id == null) return;
+  if (!state.token) { setBanner("⚠ 请先输入 Token。", true); return; }
+  if (state.tasks.cancelling.has(t.id)) return;   // 防重复点击
+  state.tasks.cancelling.add(t.id);
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(t.session_id || "")
+      + "/tasks/" + encodeURIComponent(t.id), { method: "DELETE" });
+    if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
+    if (res.status === 404) { setBanner("⚠ 任务不存在（可能已完成）。"); return; }
+    if (res.status !== 204) throw new Error("HTTP " + res.status);
+    // 成功：立即刷新列表 + 徽标
+    await refreshTasksPanel();
+    await pollTasksBadge();
+  } catch (e) {
+    setBanner("⚠ 取消失败：" + e.message);
+  } finally {
+    state.tasks.cancelling.delete(t.id);
+  }
+}
+
+function openTasksPanel() {
+  if (state.tasks.open) return;
+  state.tasks.open = true;
+  els.tasksOverlay.hidden = false;
+  refreshTasksPanel();
+  stopTasksPanelPolling();
+  state.tasks.panelTimer = setInterval(refreshTasksPanel, 2000);
+}
+
+function closeTasksPanel() {
+  state.tasks.open = false;
+  els.tasksOverlay.hidden = true;
+  stopTasksPanelPolling();
+}
+
+function stopTasksPanelPolling() {
+  if (state.tasks.panelTimer) { clearInterval(state.tasks.panelTimer); state.tasks.panelTimer = null; }
+}
+
+function startTasksBadgePolling() {
+  stopTasksBadgePolling();
+  state.tasks.badgeTimer = setInterval(pollTasksBadge, 3000);
+}
+function stopTasksBadgePolling() {
+  if (state.tasks.badgeTimer) { clearInterval(state.tasks.badgeTimer); state.tasks.badgeTimer = null; }
+}
+
+/* =====================================================================
  * 事件绑定与启动
  * ===================================================================*/
 els.newSessionBtn.addEventListener("click", createSession);
@@ -1743,6 +2019,18 @@ els.searchInput.addEventListener("input", () => {
   renderSessionList(state.lastList);   // 轮询仍会全量重绘，但搜索词留在 state 里，过滤持续生效
 });
 els.backBtn.addEventListener("click", backToList);
+els.backBtn.addEventListener("click", closeTasksPanel);   // 返回列表时收起任务面板
+els.tasksBtn.addEventListener("click", () => {
+  if (state.tasks.open) closeTasksPanel();
+  else openTasksPanel();
+});
+els.tasksCloseBtn.addEventListener("click", closeTasksPanel);
+els.tasksOverlay.addEventListener("click", (e) => {
+  if (e.target === els.tasksOverlay) closeTasksPanel();   // 点遮罩关闭
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && state.tasks.open) closeTasksPanel();
+});
 els.sendBtn.addEventListener("click", sendPrompt);
 els.cancelBtn.addEventListener("click", cancelTurn);
 els.compactBtn.addEventListener("click", compactSession);
@@ -1776,6 +2064,10 @@ function init() {
   if (dl) state.deepLink.pending = dl;
   startPolling();
   pollSessions();
+  // 后台任务徽标：独立轻量轮询，面板关闭时也保持更新（无 token 时静默跳过）
+  updateTasksBtn(0);
+  startTasksBadgePolling();
+  pollTasksBadge();
 }
 
 init();
