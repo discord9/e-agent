@@ -352,12 +352,96 @@ fn frozen_render_stable_then_end_shows_latest() {
     state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
     assert!(state.window.frozen_tail_cursor.is_none());
     draw(&mut term, &mut state).unwrap();
-    assert_eq!(row_text(term.backend().buffer(), 6), "hello world");
-    // Short content (3 lines < 7 output height) is bottom-aligned:
-    // rows 0-3 are empty (background paint), rows 4-6 show content.
-    assert_eq!(row_text(term.backend().buffer(), 0), "");
+    assert_eq!(row_text(term.backend().buffer(), 2), "hello world");
+    // Short content (3 lines < 7 output height) is head-anchored:
+    // output starts at the top of the scrollback (terminal-style), not
+    // bottom-aligned against the input boundary.
+    assert_eq!(row_text(term.backend().buffer(), 0), "earlier");
+    assert_eq!(row_text(term.backend().buffer(), 1), "context");
     assert_eq!(row_text(term.backend().buffer(), 3), "");
-    assert_ne!(row_text(term.backend().buffer(), 4), "");
+    assert_eq!(row_text(term.backend().buffer(), 6), "");
+}
+
+// ── Terminal-style head/tail anchoring ─────────────────────────────
+
+#[test]
+fn follow_short_content_anchors_head_not_tail() {
+    let backend = ratatui::backend::TestBackend::new(40, 10);
+    let mut term = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    state.push_line("first".into(), LineKind::Normal);
+    state.push_line("second".into(), LineKind::Normal);
+    state.push_line("third".into(), LineKind::Normal);
+    assert!(state.window.follow_bottom);
+    draw(&mut term, &mut state).unwrap();
+
+    // Content (3 rows) fits the 7-row output area: the window is
+    // head-anchored and the first line renders at the top of the
+    // scrollback, not bottom-aligned against the input boundary.
+    assert!(state.window.follow_bottom);
+    assert_eq!(state.window.source_start, 0);
+    assert_eq!(state.window.source_end, 3);
+    assert_eq!(state.window.local_offset, 0);
+    assert_eq!(row_text(term.backend().buffer(), 0), "first");
+    assert_eq!(row_text(term.backend().buffer(), 1), "second");
+    assert_eq!(row_text(term.backend().buffer(), 2), "third");
+    assert_eq!(row_text(term.backend().buffer(), 3), "");
+    assert_eq!(row_text(term.backend().buffer(), 6), "");
+}
+
+#[test]
+fn follow_overflow_anchors_tail() {
+    let backend = ratatui::backend::TestBackend::new(40, 10);
+    let mut term = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    // 12 one-row lines > the 7-row output area.
+    for i in 0..12 {
+        state.push_line(format!("line {i:02}"), LineKind::Normal);
+    }
+    assert!(state.window.follow_bottom);
+    draw(&mut term, &mut state).unwrap();
+
+    // Overflow: follow anchors at the tail, last visible row = tail line.
+    assert!(state.window.follow_bottom);
+    assert_eq!(state.window.source_end, state.lines.len());
+    assert_eq!(state.window.source_start, 5);
+    assert_eq!(row_text(term.backend().buffer(), 6), "line 11");
+    assert_eq!(row_text(term.backend().buffer(), 0), "line 05");
+}
+
+#[test]
+fn scroll_up_freezes_then_end_resumes_follow() {
+    let backend = ratatui::backend::TestBackend::new(40, 10);
+    let mut term = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    for i in 0..12 {
+        state.push_line(format!("line {i:02}"), LineKind::Normal);
+    }
+    draw(&mut term, &mut state).unwrap();
+    assert!(state.window.follow_bottom);
+
+    // Up freezes the view (non-follow): the tail line leaves the viewport.
+    state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert!(!state.window.follow_bottom);
+    draw(&mut term, &mut state).unwrap();
+    assert!(!state.window.follow_bottom);
+    let frozen_top = row_text(term.backend().buffer(), 0);
+    let frozen_last = row_text(term.backend().buffer(), 6);
+    assert_ne!(frozen_last, "line 11", "tail line must scroll off");
+
+    // New content while frozen does not yank the view.
+    state.push_line("new tail".into(), LineKind::Normal);
+    draw(&mut term, &mut state).unwrap();
+    assert!(!state.window.follow_bottom);
+    assert_eq!(row_text(term.backend().buffer(), 0), frozen_top);
+
+    // End resumes follow at the live tail.
+    state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    assert!(state.window.follow_bottom);
+    draw(&mut term, &mut state).unwrap();
+    assert!(state.window.follow_bottom);
+    assert_eq!(state.window.source_end, state.lines.len());
+    assert_eq!(row_text(term.backend().buffer(), 6), "new tail");
 }
 
 #[test]

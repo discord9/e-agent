@@ -211,13 +211,21 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
                 usize::from(output.height),
             );
         }
-        // When following, anchor the window at the tail.
+        // When following, anchor the window. Terminal-style output: content
+        // that fits the viewport is anchored at the head (starts at the top
+        // of the scrollback instead of emerging from the bottom); once it
+        // overflows, follow anchors at the tail (follows the latest output).
+        // A user scroll (Up/PageUp) freezes by clearing follow_bottom and End
+        // restores following — the anchor decision only runs while following.
         if scroll_state.window.follow_bottom {
-            scroll_state.window.anchor_tail(
-                &scroll_state.lines,
-                inner_width,
-                usize::from(output.height),
-            );
+            let height = usize::from(output.height);
+            if scrollback_fits_viewport(&scroll_state.lines, inner_width, height) {
+                scroll_state.window.anchor_head(&scroll_state.lines);
+            } else {
+                scroll_state
+                    .window
+                    .anchor_tail(&scroll_state.lines, inner_width, height);
+            }
         }
         // Render a bounded local tail. The cursor captured when scrolling
         // away from a streaming tail keeps later deltas out of this view.
@@ -233,9 +241,15 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
             .window
             .local_offset
             .min(total_rows.saturating_sub(height).max(0));
-        // When following with fewer rows than the viewport, bottom-align
-        // so the last visual row touches the input boundary.
-        let render_top = if scroll_state.window.follow_bottom && total_rows < height {
+        // Terminal-style placement for a following window that renders fewer
+        // rows than the viewport: a head-anchored (fits) window starts at the
+        // top; only a tail-anchored window whose bounded source budget is
+        // shorter than a very tall viewport bottom-aligns, keeping the live
+        // tail against the input boundary.
+        let render_top = if scroll_state.window.follow_bottom
+            && total_rows < height
+            && scroll_state.window.source_start > 0
+        {
             output.bottom() - total_rows as u16
         } else {
             output.y

@@ -152,6 +152,21 @@ impl ScrollWindow {
         }
     }
 
+    /// Populate the window from the head of `lines` (terminal-style anchor
+    /// for content that fits the viewport): `source_start = 0`, `source_end`
+    /// clamped to the source-line rendering budget, `local_offset = 0` so the
+    /// first visual row sits at the viewport top. Follow stays armed, so the
+    /// next draw switches to `anchor_tail` once the content overflows the
+    /// viewport. Clears any frozen cursor so follow shows the live view.
+    pub(crate) fn anchor_head(&mut self, lines: &[DisplayLine]) {
+        self.follow_bottom = true;
+        self.frozen_tail_cursor = None;
+        self.frozen_source_end = 0;
+        self.source_start = 0;
+        self.source_end = lines.len().min(MAX_RENDER_SOURCE_LINES);
+        self.local_offset = 0;
+    }
+
     /// Populate the window from a tail-anchored range of `lines`, choosing
     /// `source_start` by walking backward far enough to fill `height` visual
     /// rows at `width`, without considering more than the bounded history
@@ -251,6 +266,35 @@ pub(crate) fn reanchor_window_on_resize(
             rows_above.saturating_add(line_visual_rows(&lines[window.source_start], new_width));
     }
     window.local_offset = rows_above;
+}
+
+/// Terminal-style head-anchoring decision for the main scrollback: while
+/// following, content that fits the viewport is anchored at the head (output
+/// starts at the top of the scrollback), and content that overflows is
+/// anchored at the tail (follows the latest output). Exact for the "fits"
+/// case and cheap for the overflow case: more source lines than viewport rows
+/// can never fit (every line renders at least one visual row), and a line
+/// longer than the viewport's whole cell budget can never fit either.
+pub(crate) fn scrollback_fits_viewport(lines: &[DisplayLine], width: usize, height: usize) -> bool {
+    if lines.len() > height {
+        return false;
+    }
+    let width = width.max(1);
+    let cell_budget = height * width;
+    let mut total = 0usize;
+    for line in lines {
+        // A line whose char count alone exceeds the viewport's cell budget
+        // cannot wrap into `height` rows (each char is at least one cell),
+        // so skip the expensive markdown wrap entirely.
+        if line.text.chars().count() > cell_budget {
+            return false;
+        }
+        total = total.saturating_add(line_visual_rows(line, width));
+        if total > height {
+            return false;
+        }
+    }
+    true
 }
 
 /// Count the visual rows a single DisplayLine would produce at `width`.
