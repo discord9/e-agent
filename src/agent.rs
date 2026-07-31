@@ -288,7 +288,8 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// A prompt accepted while the runner is busy. Transient UI projection;
     /// kept in the in-memory event log for attach replay, but never persisted
@@ -347,7 +348,7 @@ pub enum ModelDeltaKind {
     Reasoning,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,

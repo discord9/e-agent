@@ -5,19 +5,11 @@ use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
-use e_agent::agent::{Agent, AgentEvent, ImagePart, SessionEntry, preview};
-use e_agent::codex::CodexModel;
-use e_agent::codex_auth::{CodexAuth, login, logout};
-use e_agent::config::{AuthMode, ResolvedModel};
-use e_agent::config::{Config, resolve_sandbox};
-use e_agent::delegate::Delegate;
-use e_agent::mcp;
-use e_agent::model::{ConfiguredModel, OpenAiModel};
-use e_agent::runner::{IdlePolicy, SessionHandle, SessionResult, SessionRunner, SessionStatus};
-use e_agent::session_store::SessionStore;
-use e_agent::tools::builtins;
+use e_agent::agent::{AgentEvent, ImagePart, preview};
+use e_agent::codex_auth::{login, logout};
+use e_agent::runner::{IdlePolicy, SessionHandle, SessionResult, SessionStatus, SessionTask};
+use e_agent::session_factory::SessionFactory;
 use e_agent::tui;
-use e_agent::workspace::Workspace;
 
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -94,6 +86,9 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     let mut at: Option<usize> = None;
     let mut max_rounds = None;
     let mut repl_mode = false;
+    let mut serve_mode = false;
+    let mut host = None;
+    let mut port = None;
     let mut prompt = Vec::new();
     let read_only = read_only_requested(&raw_arguments);
     let mut arguments = raw_arguments.into_iter();
@@ -120,10 +115,19 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
                 )
             }
             "--repl" => repl_mode = true,
+            "--serve" => serve_mode = true,
+            "--host" => host = Some(next_value(&mut arguments, "--host")?),
+            "--port" => {
+                port = Some(
+                    next_value(&mut arguments, "--port")?
+                        .parse::<u16>()
+                        .context("--port must be a number between 0 and 65535")?,
+                )
+            }
             "--read-only" => {} // consumed via read_only_requested above
             "--help" | "-h" => {
                 println!(
-                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--fork SESSION] [--at N] [--max-rounds N] [--read-only] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup);\npass --fork <id> to start a new session from a completed turn of an existing one\n(--at N forks at the N-th entry, 1-based and inclusive, and must be a turn boundary);\n--read-only applies the read-only role policy to the main session only (no write/edit tools, no MCP tools, narrowed bash sandbox); delegated subagents keep their full default toolset and can write — give their role template read_only = true to make them read-only too)"
+                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent --serve [--host ADDR] [--port PORT] [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--read-only]\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--fork SESSION] [--at N] [--max-rounds N] [--read-only] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup);\npass --fork <id> to start a new session from a completed turn of an existing one\n(--at N forks at the N-th entry, 1-based and inclusive, and must be a turn boundary);\n--read-only applies the read-only role policy to the main session only (no write/edit tools, no MCP tools, narrowed bash sandbox); delegated subagents keep their full default toolset and can write — give their role template read_only = true to make them read-only too;\n--serve runs a headless HTTP server (default http://127.0.0.1:8766) with a token-authenticated /api and a web UI"
                 );
                 return Ok(());
             }
@@ -138,6 +142,28 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             "--fork cannot be combined with --session (the forked session gets a new id)"
         ));
     }
+    // Headless mode: build the process-global factory once and hand it to
+    // the HTTP server, which builds sessions on demand. Everything below
+    // (TUI/REPL/stdin prompt handling) is skipped.
+    if serve_mode {
+        let factory = SessionFactory::new(
+            match workspace {
+                Some(path) => path.into(),
+                None => std::env::current_dir()?,
+            },
+            profile.as_deref(),
+            base_url,
+            model,
+            read_only,
+            true,
+        )?;
+        return e_agent::server::run(
+            factory,
+            host.as_deref().unwrap_or("127.0.0.1"),
+            port.unwrap_or(8766),
+        )
+        .await;
+    }
     let tui_mode = prompt.is_empty() && std::io::stdout().is_terminal() && !repl_mode;
     let prompt = if prompt.is_empty() && !tui_mode && !repl_mode {
         let mut input = String::new();
@@ -149,29 +175,21 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     if !tui_mode && !repl_mode && prompt.trim().is_empty() {
         return Err(anyhow!("a prompt argument or stdin content is required"));
     }
-    let mut workspace = Workspace::new(match workspace {
-        Some(path) => path.into(),
-        None => std::env::current_dir()?,
-    })
-    .map_err(anyhow::Error::msg)
-    .context("cannot open workspace")?;
-    let root = workspace.root().to_path_buf();
-    let agents_instructions = read_agents(&root)?;
-    let skills_instructions = read_skills_merged(&root)?;
-    let config = Config::load()?;
-    let backend = config
-        .as_ref()
-        .map(|c| c.session_backend())
-        .unwrap_or_default();
-    // Migrate pre-session-id files only when using the JSONL backend;
-    // GreptimeDB has its own session namespace and does not need file
-    // migration.
-    if matches!(backend, e_agent::config::SessionBackend::Jsonl) {
-        for (old, new) in e_agent::session::migrate_legacy(&root) {
-            eprintln!("e-agent: migrated session {old} -> {new}");
-        }
-    }
-    let mut session = match session {
+    // Resolve all process-global startup state once: workspace, config,
+    // models, sandbox. Per-session construction happens in
+    // SessionFactory::build.
+    let factory = SessionFactory::new(
+        match workspace {
+            Some(path) => path.into(),
+            None => std::env::current_dir()?,
+        },
+        profile.as_deref(),
+        base_url,
+        model,
+        read_only,
+        !tui_mode,
+    )?;
+    let session = match session {
         Some(name) => {
             e_agent::session::validate_session_name(&name)?;
             name
@@ -199,281 +217,44 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
         },
         success: false,
     };
-    // Web search reads EXA_API_KEY from the process env (tools.rs and
-    // subagents pick it up there). When unset, fall back to the `[web_search]`
-    // config section by injecting it into the env once at startup — this keeps
-    // the key's single transport mechanism and avoids threading it through
-    // every tools constructor. Startup is single-threaded, so set_var is safe.
-    if std::env::var_os("EXA_API_KEY").is_none()
-        && let Some(config) = &config
-        && let Some(key) = config.web_search_key()?
-    {
-        unsafe { std::env::set_var("EXA_API_KEY", key) };
-    }
-    let mut store = SessionStore::connect(&backend, &root, &session).await?;
-    if let Some(source) = fork {
-        // Fork: copy the source session's history up to a completed-turn
-        // boundary into a brand-new session id. The source is only read;
-        // it never changes.
-        let source_store = SessionStore::connect(&backend, &root, &source).await?;
-        let with_seq = source_store
-            .load_with_seq(&root, &source)
-            .await
-            .with_context(|| format!("cannot load source session {source} for fork"))?;
-        let source_entries: Vec<SessionEntry> =
-            with_seq.iter().map(|(_, entry)| entry.clone()).collect();
-        let prefix = e_agent::agent::fork_prefix(&source_entries, at)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("cannot fork session {source}"))?;
-        // `at` (1-based, inclusive) is the index of the last kept entry.
-        let at = prefix.len();
-        let seq = with_seq.get(at - 1).map(|(seq, _)| *seq);
-        let marker = SessionEntry::ForkedFrom {
-            source: source.clone(),
-            at,
-            // JSONL has no event_time column and SessionStore does not
-            // expose one; kept as an optional provenance slot.
-            event_time: None,
-            seq,
-        };
-        // The marker sits at the fork point: source prefix first, then the
-        // marker, then the session's own new messages — so scrolling the
-        // forked session reads as "source history … forked from … new work".
-        let mut fork_entries = Vec::with_capacity(prefix.len() + 1);
-        fork_entries.extend(prefix);
-        fork_entries.push(marker);
-        let new_id = e_agent::session::new_id_prefixed("fork-");
-        store = SessionStore::connect(&backend, &root, &new_id).await?;
-        match backend {
-            // Atomic create-or-replace for a brand-new JSONL session file.
-            e_agent::config::SessionBackend::Jsonl => {
-                store.rewrite(&root, &new_id, &fork_entries).await?
-            }
-            // Greptime: fresh session (no rows, next_seq = 0); append writes
-            // contiguous seqs with fresh timestamps. The marker's provenance
-            // fields are payload-only.
-            e_agent::config::SessionBackend::Greptime { .. } => {
-                store.append(&root, &new_id, &fork_entries).await?
-            }
-        }
-        if tui_mode {
-            _tui_report.session = Some(new_id.clone());
-        }
-        eprintln!("e-agent: forked session: {new_id}");
-        session = new_id;
-    }
-    let (main_resolved, role_resolved, all_roles) = match &config {
-        Some(config) => (
-            Some(config.resolve(profile.as_deref())?),
-            config
-                .resolve_role("subagent")
-                .context("cannot resolve [roles] subagent profile")?,
-            config
-                .resolve_roles()
-                .context("cannot resolve [roles] profiles")?,
-        ),
-        None => (None, None, std::collections::HashMap::new()),
-    };
-    let mut main_context_window = main_resolved.as_ref().and_then(|r| r.context_window);
-    // When --model overrides the profile's wire model, the profile's
-    // context window is no longer valid for the unknown model.
-    let model_override = model.is_some();
-    if matches!(
-        main_resolved.as_ref().map(|value| value.auth),
-        Some(AuthMode::ChatGpt)
-    ) && base_url.is_some()
-    {
-        return Err(anyhow!(
-            "--base-url cannot be used with a provider using auth = `chatgpt`"
-        ));
-    }
-    let needs_chatgpt = main_resolved
-        .as_ref()
-        .is_some_and(|value| value.auth == AuthMode::ChatGpt)
-        || all_roles
-            .values()
-            .any(|value| value.auth == AuthMode::ChatGpt);
-    let auth = needs_chatgpt.then(CodexAuth::load).transpose()?;
-    let model = match main_resolved {
-        Some(configured) => configured_model(configured, auth.as_ref(), base_url, model)?,
-        None => {
-            if profile.is_some() {
-                return Err(anyhow!(
-                    "--profile requires a config file at $XDG_CONFIG_HOME/e-agent/config.toml or $HOME/.config/e-agent/config.toml"
-                ));
-            }
-            ConfiguredModel::chat(OpenAiModel::from_env(base_url, model)?)
-        }
-    };
-    if model_override {
-        main_context_window = None;
-    }
-    let model_name = model.display_name().to_owned();
-    let subagent_context_window = role_resolved.as_ref().and_then(|r| r.context_window);
-    let subagent_model = role_resolved
-        .map(|resolved| configured_model(resolved, auth.as_ref(), None, None))
-        .transpose()?;
-    let mut role_models = std::collections::HashMap::new();
-    let mut role_context_windows = std::collections::HashMap::new();
-    for (role, resolved) in all_roles {
-        role_context_windows.insert(role.clone(), resolved.context_window);
-        role_models.insert(role, configured_model(resolved, auth.as_ref(), None, None)?);
-    }
-    // Resolve one shared canonical policy. `enabled` controls only bwrap;
-    // file capabilities remain active independently.
-    let resolved_policy = resolve_sandbox(config.as_ref(), &root)?;
-    workspace = workspace
-        .with_external_roots(&resolved_policy)
-        .map_err(anyhow::Error::msg)?;
-    let sandbox = resolved_policy.enabled.then_some(resolved_policy.clone());
-    if sandbox.is_some() {
-        if !e_agent::tools::bwrap_available() {
-            return Err(anyhow!(
-                "[sandbox] enabled = true but bwrap is not available. \
-                 Install bubblewrap or disable the sandbox."
-            ));
-        }
-        if !tui_mode {
-            eprintln!("e-agent: bash sandboxed with bwrap");
-        }
-    }
-    let background_timeout = e_agent::config::resolve_background_timeout(config.as_ref(), &root)?;
-    let (mut tools, background) = builtins(
-        workspace.clone(),
-        sandbox.clone(),
-        read_only,
-        background_timeout,
-    );
-    // Read-only sessions skip MCP entirely: MCP tools carry no read-only
-    // marker, so exposing them would defeat the policy. Delegation stays —
-    // spawning a subagent does not mutate this session's host state, and each
-    // subagent resolves its own role template (read-only or not).
-    let (mcp_tools, mcp_instructions) = if read_only {
-        (Vec::new(), Vec::new())
+    let fork_from = fork.map(|source| (source, at));
+    let policy = if tui_mode || repl_mode {
+        IdlePolicy::WaitForInput
     } else {
-        let mcp_servers = config
-            .as_ref()
-            .map(|config| config.mcp.clone())
-            .unwrap_or_default();
-        mcp::connect_all(mcp_servers, &root).await
+        IdlePolicy::FinishWhenIdle
     };
-    tools.extend(mcp_tools);
-    let mut delegate = Delegate::new(model.clone(), workspace, background.clone())
-        .persist_sessions(root.clone())
-        .with_role_models(role_models)
-        .with_role_context_windows(role_context_windows)
-        .with_subagent_context_window(subagent_context_window)
-        .with_roles_root(root.clone())
-        .with_sandbox(sandbox)
-        .record_background_tasks_in(root.clone(), &session, store.clone())
-        .with_persist_store(backend);
-    if let Some(subagent_model) = subagent_model {
-        let name = subagent_model.display_name().to_owned();
-        delegate = delegate.with_subagent_model(subagent_model);
-        if !tui_mode {
-            eprintln!("e-agent: subagent model {name}");
-        }
-    }
-    let subagent_sessions = delegate.sessions();
-    tools.push(Box::new(delegate));
-    let mut agent = Agent::new(Box::new(model), tools);
-    let mut context = Vec::new();
-    // The main agent's orchestrator template (.e-agent/agents/main.md) leads;
-    // it tells the model to decompose work and delegate to the named roles.
-    let role_name = match e_agent::roles::role_prompt(&root, e_agent::roles::MAIN_ROLE)? {
-        Some(orchestrator) => {
-            context.push(orchestrator);
-            Some(e_agent::roles::MAIN_ROLE.to_owned())
-        }
-        None => None,
-    };
-    if let Some(instructions) = agents_instructions {
-        context.push(format!("## AGENTS.md\n\n{instructions}"));
-    }
-    if let Some(skills) = skills_instructions {
-        context.push(skills);
-    }
-    context.extend(mcp_instructions);
-    if !context.is_empty() {
-        agent.set_context_prefix(context.join("\n\n"));
-    }
-    if let Some(rounds) = max_rounds {
-        agent = agent.max_tool_rounds(rounds);
-    }
-    // Initial load: only the last compaction segment (the last Compaction
-    // entry + everything after it) — the agent context depends only on it.
-    // Older history is read on demand via store.load_older (TUI scrollback /
-    // Web pagination will consume it later).
-    let loaded = store.load_head(&root, &session).await?;
-    let legacy = loaded.legacy;
-    agent.restore_history(loaded.entries);
-    agent.record_background_tasks_in(root.clone(), &session, store.clone());
-    let unfinished = store.take_unfinished_background(&root, &session).await?;
-    if !unfinished.is_empty() {
-        let notice = format!(
-            "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
-            unfinished.len(),
-            unfinished.join("\n")
-        );
-        let entry = e_agent::agent::SessionEntry::Notice {
-            text: notice.clone(),
-        };
-        // Persist immediately so a crash-before-first-turn cannot inject
-        // the same notice again on the next launch.
-        store
-            .append(&root, &session, std::slice::from_ref(&entry))
-            .await?;
-        // Append (NOT restore_history, which would wipe the resumed history).
-        agent.push_entry(entry);
-    }
-    if legacy {
-        store.rewrite(&root, &session, agent.history()).await?;
-    }
-
-    if let Some(window) = main_context_window {
-        agent.set_context_window(window);
-    }
-
+    let built = factory
+        .build(&session, fork_from, max_rounds, policy)
+        .await?;
     if tui_mode {
-        let (runner, handle) = SessionRunner::new(
-            agent,
-            store.clone(),
-            root.clone(),
-            session.clone(),
-            IdlePolicy::WaitForInput,
-        );
-        let task = runner.start(None);
+        // The fork (if any) happened inside build; report the effective id.
+        _tui_report.session = Some(built.session.clone());
+        let task = built.runner.start(None);
         let result = tui::run(
-            handle,
+            built.handle,
             task,
-            root,
-            session,
-            background,
-            subagent_sessions,
-            model_name,
-            role_name,
-            main_context_window,
-            store,
+            factory.root().to_path_buf(),
+            built.session,
+            built.background,
+            built.sessions,
+            built.model_name,
+            built.role_name,
+            factory.main_context_window(),
+            built.store,
         )
         .await;
         _tui_report.success = result.is_ok();
         return result;
     }
-    let policy = if repl_mode {
-        IdlePolicy::WaitForInput
-    } else {
-        IdlePolicy::FinishWhenIdle
-    };
-    let (runner, handle) = SessionRunner::new(agent, store, root, session, policy);
-    let task = runner.start((!repl_mode).then_some(prompt));
+    let task = built.runner.start((!repl_mode).then_some(prompt));
     if repl_mode {
-        repl(handle, task).await
+        repl(built.handle, task).await
     } else {
-        let (_, events, status) = handle.attach();
+        let (_, events, status) = built.handle.attach();
         let render = tokio::spawn(consume_stderr_events(events));
         task.join().await?;
         let result = status.borrow().clone();
-        drop(handle);
+        drop(built.handle);
         let _ = render.await;
         if let SessionStatus::Finished(SessionResult::Completed(Some(answer))) = result {
             println!("{answer}");
@@ -605,7 +386,7 @@ async fn consume_stderr_events(mut events: tokio::sync::broadcast::Receiver<Agen
     }
 }
 
-async fn repl(handle: SessionHandle, task: e_agent::runner::SessionTask) -> anyhow::Result<()> {
+async fn repl(handle: SessionHandle, task: SessionTask) -> anyhow::Result<()> {
     let (_, events, mut status) = handle.attach();
     let render = tokio::spawn(consume_stderr_events(events));
     let stdin = std::io::stdin();
@@ -674,109 +455,6 @@ async fn repl(handle: SessionHandle, task: e_agent::runner::SessionTask) -> anyh
     drop(task);
     render.abort();
     Ok(())
-}
-
-fn read_agents(root: &Path) -> anyhow::Result<Option<String>> {
-    match std::fs::read_to_string(root.join("AGENTS.md")) {
-        Ok(content) if content.trim().is_empty() => Ok(None),
-        Ok(content) => Ok(Some(content)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).context("cannot read workspace AGENTS.md"),
-    }
-}
-
-/// Read all workspace skills from `.e-agent/skills/<name>/SKILL.md`.
-///
-/// Returns `None` (silently) when the directory is missing, empty, or contains
-/// only non-directories / missing / empty SKILL.md files. Actual I/O or UTF-8
-/// errors on a SKILL.md that should be readable are returned with a path
-/// context.
-///
-/// Skills are sorted by `<name>` (dictionary order, stable) and joined as a
-/// single block prefixed with `## Skill: <name>` per skill.
-/// Scan a single skill directory and return (name, content) pairs.
-///
-/// Missing dir, non-directory entries, missing/empty SKILL.md are silently
-/// skipped. I/O/UTF-8 errors on a readable SKILL.md bubble up with path
-/// context.
-fn read_skills_from(dir: &Path) -> anyhow::Result<Vec<(String, String)>> {
-    let dir_entries = match std::fs::read_dir(dir) {
-        Ok(d) => d,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).context(format!("cannot read {}", dir.display())),
-    };
-
-    let mut skills: Vec<(String, String)> = Vec::new();
-
-    for entry in dir_entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => return Err(e).context(format!("cannot read {} entry", dir.display())),
-        };
-
-        // Only directories are candidate skill folders
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-
-        let skill_name = match entry.file_name().into_string() {
-            Ok(name) => name,
-            Err(_) => continue,
-        };
-
-        let skill_path = entry.path().join("SKILL.md");
-
-        match std::fs::read_to_string(&skill_path) {
-            Ok(content) => {
-                if !content.trim().is_empty() {
-                    skills.push((skill_name, content));
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(e).context(format!("cannot read {}", skill_path.display()));
-            }
-        }
-    }
-
-    Ok(skills)
-}
-
-/// Merge skills from `global_dir` (e.g. `Config::config_dir()/skills/`) and
-/// `workspace_dir` (`.e-agent/skills/`).  Workspace entries override same-name
-/// globals.  Returns `None` silently when both are missing/empty.
-fn read_skills_merge(
-    global_dir: Option<&Path>,
-    workspace_dir: &Path,
-) -> anyhow::Result<Option<String>> {
-    let mut merged: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    if let Some(global) = global_dir {
-        for (name, content) in read_skills_from(global)? {
-            merged.insert(name, content);
-        }
-    }
-    for (name, content) in read_skills_from(workspace_dir)? {
-        merged.insert(name, content);
-    }
-    if merged.is_empty() {
-        return Ok(None);
-    }
-    let mut skills: Vec<_> = merged.into_iter().collect();
-    skills.sort_by(|a, b| a.0.cmp(&b.0));
-    let combined = skills
-        .into_iter()
-        .map(|(name, content)| format!("## Skill: {name}\n\n{content}"))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    Ok(Some(combined))
-}
-
-/// Production entry: global from `Config::config_dir()/skills/`, workspace
-/// from `<root>/.e-agent/skills/`.
-fn read_skills_merged(root: &Path) -> anyhow::Result<Option<String>> {
-    let global = e_agent::config::config_dir().map(|d| d.join("skills"));
-    let workspace = root.join(".e-agent").join("skills");
-    read_skills_merge(global.as_deref(), &workspace)
 }
 
 fn next_value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<String> {
@@ -1022,42 +700,11 @@ fn notify_crash_if_exists() {
     acknowledge_crash(&dir.join("latest.log"), &dir.join("previous.log"));
 }
 
-fn configured_model(
-    resolved: ResolvedModel,
-    auth: Option<&CodexAuth>,
-    base_url: Option<String>,
-    model: Option<String>,
-) -> anyhow::Result<ConfiguredModel> {
-    let display = Some(resolved.display);
-    match resolved.auth {
-        AuthMode::ApiKey => {
-            let mut cm = ConfiguredModel::chat(
-                OpenAiModel::new(
-                    base_url.unwrap_or(resolved.base_url),
-                    resolved.api_key,
-                    model.unwrap_or(resolved.model),
-                    resolved.reasoning_effort,
-                )?
-                .with_vision(resolved.vision),
-            );
-            cm.display = display;
-            Ok(cm)
-        }
-        AuthMode::ChatGpt => {
-            let mut cm = ConfiguredModel::codex(
-                CodexModel::new(
-                    auth.cloned()
-                        .ok_or_else(|| anyhow!("ChatGPT auth was not initialized"))?,
-                    model.unwrap_or(resolved.model),
-                    resolved.reasoning_effort,
-                )?
-                .with_vision(resolved.vision),
-            );
-            cm.display = display;
-            Ok(cm)
-        }
-    }
-}
+// The skill-scanning helpers moved into session_factory.rs (the factory's
+// constructor owns workspace-content reading); re-exported here so the
+// existing main_tests.rs tests keep exercising them unchanged.
+#[cfg(test)]
+pub use e_agent::session_factory::{read_skills_from, read_skills_merge};
 
 #[cfg(test)]
 #[path = "main_tests.rs"]
