@@ -588,21 +588,10 @@ fn draw<'a, B: ratatui::backend::Backend>(
                 usize::from(output.height),
             );
         }
-        // Render the window range into visual rows. If the viewport is
-        // frozen with a tail-text snapshot, build a temporary line copy so
-        // streaming deltas cannot mutate the rendered output.
-        let visual = if let Some(frozen_lines) =
-            frozen_window_lines(&scroll_state.lines, &scroll_state.window)
-        {
-            render_window(&frozen_lines, 0, frozen_lines.len(), inner_width)
-        } else {
-            render_window(
-                &scroll_state.lines,
-                scroll_state.window.source_start,
-                scroll_state.window.source_end,
-                inner_width,
-            )
-        };
+        // Render a bounded local tail. The cursor captured when scrolling
+        // away from a streaming tail keeps later deltas out of this view.
+        let local_lines = local_window_lines(&scroll_state.lines, &scroll_state.window);
+        let visual = render_bounded_window(&local_lines, inner_width);
         let total_rows = visual.len();
         let height = usize::from(output.height);
         // Clamp local_offset in follow mode.
@@ -1252,16 +1241,81 @@ struct DisplayLine {
     kind: LineKind,
 }
 
-/// Copy the current window with its frozen streaming tail substituted.
-/// Keeping this shared by rendering and scroll accounting ensures both see
-/// the same visual height while live deltas continue growing the source line.
-fn frozen_window_lines(lines: &[DisplayLine], window: &ScrollWindow) -> Option<Vec<DisplayLine>> {
-    let frozen_text = window.frozen_tail_text.as_ref()?;
-    let mut frozen_lines = lines[window.source_start..window.source_end].to_vec();
-    if let Some(last) = frozen_lines.last_mut() {
-        last.text = frozen_text.clone();
+/// Rendering never materializes more than this much scrollback. Limits are
+/// deliberately independent: a very long source line cannot evade the byte
+/// cap, and many short lines cannot evade either the line or row cap.
+const MAX_RENDER_VISUAL_ROWS: usize = 512;
+const MAX_RENDER_SOURCE_LINES: usize = 256;
+const MAX_RENDER_BYTES: usize = 64 * 1024;
+
+/// Round a byte offset down to a UTF-8 boundary. `limit` is normally already
+/// a boundary (it comes from `String::len()`), but this also makes truncation
+/// of a frozen cursor safe if the source was replaced while detached.
+fn utf8_floor_boundary(text: &str, limit: usize) -> usize {
+    let mut index = limit.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
     }
-    Some(frozen_lines)
+    index
+}
+
+/// Round a byte offset up to a UTF-8 boundary. This prevents a tail slice
+/// from exceeding its byte budget when the budget lands in a multibyte char.
+fn utf8_ceil_boundary(text: &str, limit: usize) -> usize {
+    let mut index = limit.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// Return at most `bytes` of the tail ending at `end`, never splitting a
+/// Unicode scalar value. Keeping the tail is what makes a followed giant
+/// streaming line useful without allocating or wrapping the whole line.
+fn utf8_tail(text: &str, end: usize, bytes: usize) -> &str {
+    let end = utf8_floor_boundary(text, end);
+    let start = utf8_ceil_boundary(text, end.saturating_sub(bytes));
+    &text[start..end]
+}
+
+/// Copy only the bounded part of the current source window. A frozen cursor
+/// is an offset into the final source line, rather than a cloned tail string:
+/// this is both bounded and stable while that line receives streaming deltas.
+fn local_window_lines(lines: &[DisplayLine], window: &ScrollWindow) -> Vec<DisplayLine> {
+    let end = window.source_end.min(lines.len());
+    let start = window.source_start.min(end);
+    let mut remaining = MAX_RENDER_BYTES;
+    let mut local = Vec::new();
+    for index in (start..end).rev().take(MAX_RENDER_SOURCE_LINES) {
+        if remaining == 0 {
+            break;
+        }
+        let line = &lines[index];
+        let cursor = if index + 1 == end {
+            window.frozen_tail_cursor.unwrap_or(line.text.len())
+        } else {
+            line.text.len()
+        };
+        let text = utf8_tail(&line.text, cursor, remaining);
+        remaining = remaining.saturating_sub(text.len());
+        local.push(DisplayLine {
+            text: text.to_owned(),
+            kind: line.kind,
+        });
+    }
+    local.reverse();
+    local
+}
+
+/// Render the local copy and retain its most recent visual rows. The local
+/// copy is byte-bounded before markdown parsing; trimming after wrapping also
+/// bounds the actual ratatui history passed to the frame.
+fn render_bounded_window(lines: &[DisplayLine], width: usize) -> Vec<ratatui::text::Line<'static>> {
+    let mut rows = render_window(lines, 0, lines.len(), width);
+    if rows.len() > MAX_RENDER_VISUAL_ROWS {
+        rows.drain(..rows.len() - MAX_RENDER_VISUAL_ROWS);
+    }
+    rows
 }
 
 /// Bounded local rendering window over a sub-range of the scrollback's
@@ -1286,11 +1340,10 @@ struct ScrollWindow {
     local_offset: usize,
     /// Whether the viewport auto-follows the tail.
     follow_bottom: bool,
-    /// Snapshot of the last line's text taken when freezing the viewport
-    /// during active streaming. While set, the drawn visual replaces the
-    /// last DisplayLine's text with this snapshot so subsequent streaming
-    /// deltas cannot mutate the frozen viewport.
-    frozen_tail_text: Option<String>,
+    /// Byte cursor in the last line captured when freezing during active
+    /// streaming. Rendering stops at this UTF-8-safe cursor, so appended
+    /// deltas cannot mutate the frozen viewport without cloning that line.
+    frozen_tail_cursor: Option<usize>,
     /// The source_end value at the moment the snapshot was taken; used to
     /// detect when the user has scrolled past the frozen range.
     frozen_source_end: usize,
@@ -1309,20 +1362,21 @@ impl ScrollWindow {
             source_end: 0,
             local_offset: 0,
             follow_bottom: true,
-            frozen_tail_text: None,
+            frozen_tail_cursor: None,
             frozen_source_end: 0,
         }
     }
 
     /// Populate the window from a tail-anchored range of `lines`, choosing
     /// `source_start` by walking backward far enough to fill `height` visual
-    /// rows at `width`. After this call the window is ready for rendering
-    /// and `local_offset` points to the bottom (follow mode).
-    /// Clears any frozen snapshot so follow shows the live tail.
+    /// rows at `width`, without considering more than the bounded history
+    /// limits. After this call the window is ready for rendering and
+    /// `local_offset` points to the bottom (follow mode).
+    /// Clears any frozen cursor so follow shows the live tail.
     fn anchor_tail(&mut self, lines: &[DisplayLine], width: usize, height: usize) {
         let total = lines.len();
         self.follow_bottom = true;
-        self.frozen_tail_text = None;
+        self.frozen_tail_cursor = None;
         self.frozen_source_end = 0;
         self.source_end = total;
         // Walk backward counting visual rows until we have enough.
@@ -1331,7 +1385,10 @@ impl ScrollWindow {
         // excluded entirely when followed by a short user line.
         self.source_start = total;
         let mut accumulated = 0usize;
-        while self.source_start > 0 && accumulated < height {
+        while self.source_start > 0
+            && accumulated < height.min(MAX_RENDER_VISUAL_ROWS)
+            && total - self.source_start < MAX_RENDER_SOURCE_LINES
+        {
             self.source_start -= 1;
             accumulated =
                 accumulated.saturating_add(line_visual_rows(&lines[self.source_start], width));
@@ -1855,7 +1912,8 @@ impl TuiState {
                     self.window.source_end = self.lines.len();
                     self.window.frozen_source_end = self.window.source_end;
                     if self.active_lane.is_some() {
-                        self.window.frozen_tail_text = self.lines.last().map(|l| l.text.clone());
+                        self.window.frozen_tail_cursor =
+                            self.lines.last().map(|line| line.text.len());
                     }
                 }
                 let w = self.inner_width.max(1);
@@ -1875,10 +1933,10 @@ impl TuiState {
                 self.window.local_offset += 1;
                 // When frozen and at the local bottom, extend forward.
                 extend_window_down(self, 1, |state| {
-                    if state.window.frozen_tail_text.is_some()
+                    if state.window.frozen_tail_cursor.is_some()
                         && state.window.source_end > state.window.frozen_source_end
                     {
-                        state.window.frozen_tail_text = None;
+                        state.window.frozen_tail_cursor = None;
                     }
                 });
             }
@@ -1889,7 +1947,8 @@ impl TuiState {
                     self.window.source_end = self.lines.len();
                     self.window.frozen_source_end = self.window.source_end;
                     if self.active_lane.is_some() {
-                        self.window.frozen_tail_text = self.lines.last().map(|l| l.text.clone());
+                        self.window.frozen_tail_cursor =
+                            self.lines.last().map(|line| line.text.len());
                     }
                 }
                 let step = 10usize;
@@ -1925,23 +1984,28 @@ impl TuiState {
                 // When frozen and at the local bottom, extend forward by
                 // enough to show 10 more visual rows.
                 extend_window_down(self, 10, |state| {
-                    if state.window.frozen_tail_text.is_some()
+                    if state.window.frozen_tail_cursor.is_some()
                         && state.window.source_end > state.window.frozen_source_end
                     {
-                        state.window.frozen_tail_text = None;
+                        state.window.frozen_tail_cursor = None;
                     }
                 });
             }
             KeyCode::Home => {
                 self.window.follow_bottom = false;
-                self.window.source_start = 0;
-                self.window.local_offset = 0;
+                // Home is bounded too: exposing the beginning of an
+                // unbounded transcript would force a full-history render.
                 self.window.source_end = self.lines.len();
-                self.window.frozen_tail_text = None;
+                self.window.source_start = self
+                    .window
+                    .source_end
+                    .saturating_sub(MAX_RENDER_SOURCE_LINES);
+                self.window.local_offset = 0;
+                self.window.frozen_tail_cursor = None;
             }
             KeyCode::End => {
                 self.window.follow_bottom = true;
-                self.window.frozen_tail_text = None;
+                self.window.frozen_tail_cursor = None;
             }
             _ => {}
         }
@@ -2026,7 +2090,7 @@ impl TuiState {
 
     fn follow(&mut self) {
         self.window.follow_bottom = true;
-        self.window.frozen_tail_text = None;
+        self.window.frozen_tail_cursor = None;
         self.window.frozen_source_end = 0;
         // source_start/source_end will be anchored at the tail on next draw.
     }
@@ -2101,24 +2165,14 @@ impl TuiState {
 /// more source lines exist). Adds enough `DisplayLine` entries to cover
 /// `step` visual rows. When the true end is reached, resumes follow mode.
 /// `on_extension` is called after any source_end growth (used to clear the
-/// frozen-tail snapshot once the user scrolls past the freeze point).
+/// frozen-tail cursor once the user scrolls past the freeze point).
 fn extend_window_down(state: &mut TuiState, step: usize, on_extension: impl FnOnce(&mut TuiState)) {
     let w = state.inner_width.max(1);
     let height = state.output_height.max(1);
-    // Compute the same frozen visual snapshot that draw uses. Live deltas may
-    // have made the source tail taller without changing the frozen viewport.
+    // Count the same bounded local copy that draw renders. Live deltas may
+    // have made the source tail taller without changing the frozen cursor.
     let mut total_visual =
-        if let Some(frozen_lines) = frozen_window_lines(&state.lines, &state.window) {
-            frozen_lines
-                .iter()
-                .map(|line| line_visual_rows(line, w))
-                .sum()
-        } else {
-            state.lines[state.window.source_start..state.window.source_end]
-                .iter()
-                .map(|line| line_visual_rows(line, w))
-                .sum()
-        };
+        render_bounded_window(&local_window_lines(&state.lines, &state.window), w).len();
     // The viewport-bottom check: the last visible row is
     // local_offset + height - 1.  Scrolling can advance until
     // local_offset + height >= total_visual.
@@ -2141,14 +2195,14 @@ fn extend_window_down(state: &mut TuiState, step: usize, on_extension: impl FnOn
             .min(total_visual.saturating_sub(1).max(0));
         on_extension(state);
     } else if !state.window.follow_bottom
-        && state.window.frozen_tail_text.is_some()
+        && state.window.frozen_tail_cursor.is_some()
         && state.window.source_end >= state.lines.len()
         && at_visual_bottom
     {
         // Already at the true end — only deltas accumulated on the last
-        // line.  Switch to follow and clear the frozen snapshot.
+        // line. Switch to follow and clear the frozen cursor.
         state.window.follow_bottom = true;
-        state.window.frozen_tail_text = None;
+        state.window.frozen_tail_cursor = None;
     }
 }
 
@@ -4694,7 +4748,7 @@ mod ux_tests {
 
     // ── Frozen-viewport regression tests ────────────────────────────────
 
-    /// Set up 3 lines with an active streaming lane, frozen snapshot at `hel`.
+    /// Set up 3 lines with an active streaming lane, frozen cursor at `hel`.
     fn frozen_state() -> TuiState {
         let mut s = TuiState::default();
         s.push_line("earlier".into(), LineKind::Normal);
@@ -4707,7 +4761,7 @@ mod ux_tests {
         s.window.follow_bottom = false;
         s.window.source_end = s.lines.len();
         s.window.frozen_source_end = s.window.source_end;
-        s.window.frozen_tail_text = s.lines.last().map(|l| l.text.clone());
+        s.window.frozen_tail_cursor = s.lines.last().map(|line| line.text.len());
         s.window.local_offset = 0;
         s
     }
@@ -4737,19 +4791,19 @@ mod ux_tests {
         draw(&mut term, &mut state).unwrap();
         assert_eq!(row_text(term.backend().buffer(), 2), "hel");
         assert_eq!(state.lines.last().unwrap().text, "hel");
-        // A frozen draw keeps the captured tail snapshot intact.
-        assert_eq!(state.window.frozen_tail_text.as_deref(), Some("hel"));
+        // A frozen draw keeps the captured tail cursor intact.
+        assert_eq!(state.window.frozen_tail_cursor, Some(3));
 
         append_deltas(&mut state);
         assert_eq!(state.lines.last().unwrap().text, "hello world");
-        // Rendered viewport still shows frozen text (draw uses snapshot).
+        // Rendered viewport still shows frozen text (draw stops at cursor).
         draw(&mut term, &mut state).unwrap();
         assert_eq!(row_text(term.backend().buffer(), 2), "hel");
-        assert_eq!(state.window.frozen_tail_text.as_deref(), Some("hel"));
+        assert_eq!(state.window.frozen_tail_cursor, Some(3));
 
         // End clears snapshot via follow(); next draw shows accumulated.
         state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        assert!(state.window.frozen_tail_text.is_none());
+        assert!(state.window.frozen_tail_cursor.is_none());
         draw(&mut term, &mut state).unwrap();
         assert_eq!(row_text(term.backend().buffer(), 6), "hello world");
         // Short content (3 lines < 7 output height) is bottom-aligned:
@@ -4768,7 +4822,8 @@ mod ux_tests {
         draw(&mut term, &mut state).unwrap();
 
         state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        let frozen = state.window.frozen_tail_text.clone().unwrap();
+        let frozen =
+            state.lines.last().unwrap().text[..state.window.frozen_tail_cursor.unwrap()].to_owned();
         state.push_agent_event(AgentEvent::AssistantDelta("growth ".repeat(60)));
         assert!(state.lines.last().unwrap().text.len() > frozen.len());
         assert!(
@@ -4790,7 +4845,7 @@ mod ux_tests {
             presses += 1;
         }
         assert!(state.window.follow_bottom, "Down must resume follow");
-        assert!(state.window.frozen_tail_text.is_none());
+        assert!(state.window.frozen_tail_cursor.is_none());
 
         state.push_agent_event(AgentEvent::AssistantDelta("\nLIVE_ASSISTANT_TAIL".into()));
         draw(&mut term, &mut state).unwrap();
@@ -4810,7 +4865,8 @@ mod ux_tests {
         draw(&mut term, &mut state).unwrap();
 
         state.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-        let frozen = state.window.frozen_tail_text.clone().unwrap();
+        let frozen =
+            state.lines.last().unwrap().text[..state.window.frozen_tail_cursor.unwrap()].to_owned();
         state.push_agent_event(AgentEvent::ReasoningDelta("growth ".repeat(60)));
         assert!(state.lines.last().unwrap().text.len() > frozen.len());
         assert!(
@@ -4832,7 +4888,7 @@ mod ux_tests {
             presses += 1;
         }
         assert!(state.window.follow_bottom, "PageDown must resume follow");
-        assert!(state.window.frozen_tail_text.is_none());
+        assert!(state.window.frozen_tail_cursor.is_none());
 
         state.push_agent_event(AgentEvent::ReasoningDelta("\nLIVE_REASONING_TAIL".into()));
         draw(&mut term, &mut state).unwrap();
@@ -4841,6 +4897,45 @@ mod ux_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("LIVE_REASONING_TAIL"));
+    }
+
+    #[test]
+    fn local_window_obeys_all_limits_without_splitting_utf8() {
+        let mut lines: Vec<_> = (0..300)
+            .map(|index| DisplayLine {
+                text: format!("line {index}"),
+                kind: LineKind::Normal,
+            })
+            .collect();
+        lines.push(DisplayLine {
+            text: format!("prefix{}尾", "好".repeat(MAX_RENDER_BYTES)),
+            kind: LineKind::Normal,
+        });
+        let window = ScrollWindow {
+            source_start: 0,
+            source_end: lines.len(),
+            ..ScrollWindow::new()
+        };
+        let local = local_window_lines(&lines, &window);
+        assert!(local.len() <= MAX_RENDER_SOURCE_LINES);
+        assert!(local.iter().map(|line| line.text.len()).sum::<usize>() <= MAX_RENDER_BYTES);
+        assert!(local.last().unwrap().text.is_char_boundary(0));
+        assert!(local.last().unwrap().text.ends_with('尾'));
+        assert!(render_bounded_window(&local, 80).len() <= MAX_RENDER_VISUAL_ROWS);
+    }
+
+    #[test]
+    fn home_starts_at_bounded_history_tail() {
+        let mut state = TuiState::default();
+        for index in 0..(MAX_RENDER_SOURCE_LINES + 10) {
+            state.push_line(index.to_string(), LineKind::Normal);
+        }
+        state.handle_scroll(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(
+            state.window.source_start,
+            state.lines.len() - MAX_RENDER_SOURCE_LINES
+        );
+        assert_eq!(state.window.local_offset, 0);
     }
 
     #[test]
