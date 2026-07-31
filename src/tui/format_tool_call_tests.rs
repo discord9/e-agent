@@ -97,13 +97,11 @@ fn delegate_workspace_variants() {
             "task".into(),
             json!(match workspace {
                 Some(_)
-                    if workspace.unwrap().trim().is_empty()
-                        && !workspace.unwrap().is_empty() =>
+                    if workspace.unwrap().trim().is_empty() && !workspace.unwrap().is_empty() =>
                     "ws blank",
                 Some(_) if workspace.unwrap().is_empty() => "no ws",
                 Some(_)
-                    if workspace.unwrap().contains('/')
-                        && workspace.unwrap().contains("trim") =>
+                    if workspace.unwrap().contains('/') && workspace.unwrap().contains("trim") =>
                     "trim ws",
                 Some(_) => "with ws",
                 None => "no ws key",
