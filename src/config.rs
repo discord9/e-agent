@@ -22,7 +22,7 @@ pub struct Config {
     /// Optional `[web_search]` credentials for the Exa `web_search` tool.
     #[serde(default)]
     web_search: Option<WebSearch>,
-    /// Optional `[sandbox]` bwrap wrapper for the bash tool.
+    /// Optional `[sandbox]` policy shared by bash mounts and file tools.
     #[serde(default)]
     sandbox: Option<Sandbox>,
     /// Optional `[session]` backend configuration.
@@ -44,13 +44,10 @@ pub struct Sandbox {
     /// Mount the workspace read-write inside the sandbox (default true).
     #[serde(default = "default_true")]
     pub workspace_writable: bool,
-    /// Extra paths mounted read-write inside the sandbox, beyond the
-    /// workspace. Global and project configs merge (union). `~` expands to
-    /// the home directory; relative paths resolve against the workspace root.
+    /// Extra writable roots shared by bash mounts and file tools.
     #[serde(default)]
     pub writable_paths: Vec<String>,
-    /// Extra paths mounted read-only inside the sandbox. Same merge and
-    /// resolution rules as `writable_paths`.
+    /// Extra readable roots shared by bash mounts and file tools.
     #[serde(default)]
     pub readable_paths: Vec<String>,
 }
@@ -196,35 +193,17 @@ impl Config {
         Ok(Some(key))
     }
 
-    /// The bash sandbox, only when `[sandbox] enabled = true`. Otherwise None.
-    ///
-    /// Merges the project-local `<workspace>/.e-agent/config.toml` on top of
-    /// this (global) config: `writable_paths` / `readable_paths` are unioned,
-    /// while `enabled` / `network` / `workspace_writable` come from the global
-    /// config only (a project file can add paths but never weaken the policy).
-    /// Paths are expanded: `~` -> home, relative -> the workspace root.
+    /// Resolve the shared bash/file path policy for a workspace.
+    pub fn sandbox(&self, workspace: &Path) -> anyhow::Result<Sandbox> {
+        resolve_sandbox(Some(self), workspace)
+    }
+
     /// The session backend from `[session] backend`, defaulting to Jsonl.
     pub fn session_backend(&self) -> SessionBackend {
         match &self.session {
             Some(session) => session.backend.clone(),
             None => SessionBackend::default(),
         }
-    }
-
-    pub fn sandbox(&self, workspace: &Path) -> Option<Sandbox> {
-        let mut sandbox = self.sandbox.clone().filter(|sandbox| sandbox.enabled)?;
-        if let Some(project) = project_sandbox(workspace) {
-            sandbox.writable_paths.extend(project.writable_paths);
-            sandbox.readable_paths.extend(project.readable_paths);
-        }
-        for paths in [&mut sandbox.writable_paths, &mut sandbox.readable_paths] {
-            for path in paths.iter_mut() {
-                *path = expand_sandbox_path(path, workspace);
-            }
-            paths.sort();
-            paths.dedup();
-        }
-        Some(sandbox)
     }
 
     fn resolve_profile(&self, profile: &str) -> anyhow::Result<ResolvedModel> {
@@ -333,37 +312,178 @@ pub fn config_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/e-agent"))
 }
 
-/// The `[sandbox]` section of the project-local config at
-/// `<workspace>/.e-agent/config.toml`, if present and parseable. Only the
-/// sandbox is read; a malformed file is ignored (the sandbox must not fail
-/// closed/open because of a typo in an optional local file).
-fn project_sandbox(workspace: &Path) -> Option<Sandbox> {
-    #[derive(Deserialize)]
-    struct ProjectConfig {
-        sandbox: Option<Sandbox>,
-    }
-    let path = workspace.join(".e-agent/config.toml");
-    let source = std::fs::read_to_string(path).ok()?;
-    toml::from_str::<ProjectConfig>(&source).ok()?.sandbox
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectSandbox {
+    writable_paths: Option<Vec<String>>,
+    readable_paths: Option<Vec<String>>,
 }
 
-/// Expand a sandbox path: a leading `~` becomes the home directory, and a
-/// relative path is resolved against the workspace root (then normalized
-/// lexically, not symlink-resolved — the sandbox binds the literal path).
-fn expand_sandbox_path(path: &str, workspace: &Path) -> String {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(rest))
-            .unwrap_or_else(|| PathBuf::from(path))
-    } else {
-        let candidate = PathBuf::from(path);
-        if candidate.is_absolute() {
-            candidate
-        } else {
-            workspace.join(candidate)
+/// Resolve global roots and the optional project selection. Missing global
+/// roots are ignored for compatibility; all returned paths are canonical.
+pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Result<Sandbox> {
+    let mut result = config.and_then(|c| c.sandbox.clone()).unwrap_or_default();
+    let global_writable = canonical_roots(&result.writable_paths, workspace, true)?;
+    let global_readable = canonical_roots(&result.readable_paths, workspace, true)?;
+
+    let local = project_sandbox(workspace)?;
+    let selecting = local
+        .as_ref()
+        .is_some_and(|s| s.writable_paths.is_some() || s.readable_paths.is_some());
+    let (writable, readable) = if selecting {
+        let local = local.expect("selection has a sandbox");
+        let writable = canonical_roots(
+            local.writable_paths.as_deref().unwrap_or_default(),
+            workspace,
+            false,
+        )?;
+        let readable = canonical_roots(
+            local.readable_paths.as_deref().unwrap_or_default(),
+            workspace,
+            false,
+        )?;
+        for path in &writable {
+            if !global_writable.iter().any(|root| path.starts_with(root)) {
+                bail!(
+                    "project writable path {} is not within a global writable root",
+                    path.display()
+                );
+            }
         }
+        for path in &readable {
+            if !global_readable
+                .iter()
+                .chain(&global_writable)
+                .any(|root| path.starts_with(root))
+            {
+                bail!(
+                    "project readable path {} is not within a global readable or writable root",
+                    path.display()
+                );
+            }
+        }
+        (writable, readable)
+    } else {
+        (global_writable, global_readable)
     };
-    expanded.to_string_lossy().into_owned()
+    let (writable, readable) = normalize_roots(writable, readable)?;
+    result.writable_paths = utf8_roots(writable)?;
+    result.readable_paths = utf8_roots(readable)?;
+    Ok(result)
+}
+
+fn project_sandbox(workspace: &Path) -> anyhow::Result<Option<ProjectSandbox>> {
+    #[derive(Deserialize)]
+    struct ProjectConfig {
+        sandbox: Option<ProjectSandbox>,
+    }
+    let path = workspace.join(".e-agent/config.toml");
+    let source = match std::fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let parsed: ProjectConfig = toml::from_str(&source)
+        .with_context(|| format!("cannot parse project config {}", path.display()))?;
+    Ok(parsed.sandbox)
+}
+
+fn canonical_roots(
+    paths: &[String],
+    workspace: &Path,
+    skip_missing: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for configured in paths {
+        let expanded = expand_sandbox_path(configured, workspace)?;
+        let path = match std::fs::canonicalize(&expanded) {
+            Ok(path) => path,
+            Err(error) if skip_missing && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot canonicalize external path {}", expanded.display())
+                });
+            }
+        };
+        let kind = std::fs::metadata(&path)
+            .with_context(|| format!("cannot inspect external path {}", path.display()))?
+            .file_type();
+        if !kind.is_dir() && !kind.is_file() {
+            bail!(
+                "external path {} is not a regular file or directory",
+                path.display()
+            );
+        }
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    }
+    Ok(roots)
+}
+
+fn normalize_roots(
+    mut writable: Vec<PathBuf>,
+    mut readable: Vec<PathBuf>,
+) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    for read in &readable {
+        if let Some(write) = writable
+            .iter()
+            .find(|write| read != *write && read.starts_with(write))
+        {
+            bail!(
+                "read-only child {} under writable root {} is unsupported; select a narrower writable root or downgrade the whole selected root",
+                read.display(),
+                write.display()
+            );
+        }
+    }
+    writable.sort_by_key(|p| p.components().count());
+    let mut compact_writable: Vec<PathBuf> = Vec::new();
+    for path in writable {
+        if !compact_writable.iter().any(|root| path.starts_with(root)) {
+            compact_writable.push(path);
+        }
+    }
+    writable = compact_writable;
+    readable.sort_by_key(|p| p.components().count());
+    let mut compact_readable: Vec<PathBuf> = Vec::new();
+    for path in readable {
+        if !compact_readable.iter().any(|root| path.starts_with(root))
+            && !writable.iter().any(|root| path.starts_with(root))
+        {
+            compact_readable.push(path);
+        }
+    }
+    readable = compact_readable;
+    Ok((writable, readable))
+}
+
+fn utf8_roots(roots: Vec<PathBuf>) -> anyhow::Result<Vec<String>> {
+    roots
+        .into_iter()
+        .map(|path| {
+            path.into_os_string().into_string().map_err(|path| {
+                anyhow!(
+                    "canonical external path {} is not valid UTF-8",
+                    PathBuf::from(path).display()
+                )
+            })
+        })
+        .collect()
+}
+
+fn expand_sandbox_path(path: &str, workspace: &Path) -> anyhow::Result<PathBuf> {
+    if path == "~" || path.starts_with("~/") {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| anyhow!("cannot expand `{path}`: HOME is not set"))?;
+        return Ok(PathBuf::from(home).join(path.strip_prefix("~/").unwrap_or("")));
+    }
+    let candidate = PathBuf::from(path);
+    Ok(if candidate.is_absolute() {
+        candidate
+    } else {
+        workspace.join(candidate)
+    })
 }
 
 fn config_paths() -> Vec<PathBuf> {
@@ -667,100 +787,217 @@ subagent = "kimi/nope"
     }
 
     #[test]
-    fn sandbox_merges_project_paths_and_expands_them() {
+    fn sandbox_project_selects_and_can_downgrade() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("ws");
+        let external = temp.path().join("external");
         std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
-        // Global config: enabled, one writable path with ~, one absolute.
+        std::fs::create_dir_all(external.join("child")).unwrap();
         let path = write_config(
             temp.path(),
-            r#"
-default = "kimi/k3"
-[providers.kimi]
-base_url = "https://x"
-api_key_file = "key"
-[models."kimi/k3"]
-model = "k3"
-[sandbox]
-enabled = true
-network = false
-writable_paths = ["~/.cargo/registry", "/mnt/nvme_rust/sccache"]
-readable_paths = ["~/.gitconfig"]
-"#,
-        );
-        std::fs::write(temp.path().join("key"), "key").unwrap();
-        // Project-local: adds paths (cannot flip `network` back on).
-        std::fs::write(
-            workspace.join(".e-agent/config.toml"),
-            r#"
+            &format!(
+                r#"
 [sandbox]
 enabled = false
-network = true
-writable_paths = ["target", "~/.cargo/registry"]
-readable_paths = ["/opt/shared"]
+writable_paths = ["{}"]
 "#,
+                external.display()
+            ),
+        );
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            format!(
+                r#"
+[sandbox]
+readable_paths = ["{}"]
+"#,
+                external.join("child").display()
+            ),
         )
         .unwrap();
-
-        let home = std::env::var("HOME").unwrap();
         let sandbox = Config::from_path(&path)
             .unwrap()
             .sandbox(&workspace)
-            .expect("sandbox enabled globally");
-
-        // Policy switches come from the global config only.
-        assert!(!sandbox.network, "project file must not weaken policy");
-        // Paths merged (union) and expanded; project duplicate deduped.
-        let cargo = format!("{home}/.cargo/registry");
-        assert!(sandbox.writable_paths.contains(&cargo));
-        assert!(
-            sandbox
-                .writable_paths
-                .contains(&"/mnt/nvme_rust/sccache".to_owned())
-        );
-        assert!(
-            sandbox
-                .writable_paths
-                .contains(&workspace.join("target").to_string_lossy().into_owned())
-        );
+            .unwrap();
+        assert!(!sandbox.enabled);
+        assert!(sandbox.writable_paths.is_empty());
         assert_eq!(
-            sandbox
-                .writable_paths
-                .iter()
-                .filter(|p| **p == cargo)
-                .count(),
-            1,
-            "global + project duplicate must be deduped"
+            sandbox.readable_paths,
+            vec![external.join("child").to_str().unwrap()]
         );
-        assert!(
-            sandbox
-                .readable_paths
-                .contains(&format!("{home}/.gitconfig"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_rejects_read_only_child_under_writable_parent_after_canonicalization() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let writable = temp.path().join("writable");
+        let child = writable.join("child");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        symlink(&child, &alias).unwrap();
+        let path = write_config(
+            temp.path(),
+            &format!("[sandbox]\nwritable_paths = [\"{}\"]\n", writable.display()),
         );
-        assert!(sandbox.readable_paths.contains(&"/opt/shared".to_owned()));
+        let config = Config::from_path(&path).unwrap();
+        for selected in [&child, &alias] {
+            std::fs::write(
+                workspace.join(".e-agent/config.toml"),
+                format!(
+                    "[sandbox]\nwritable_paths = [\"{}\"]\nreadable_paths = [\"{}\"]\n",
+                    writable.display(),
+                    selected.display()
+                ),
+            )
+            .unwrap();
+            let error = config.sandbox(&workspace).unwrap_err().to_string();
+            assert!(
+                error.contains("read-only child") && error.contains("unsupported"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
-    fn sandbox_absent_or_disabled_is_none() {
+    fn sandbox_allows_read_only_parent_with_writable_child() {
         let temp = tempfile::tempdir().unwrap();
-        let bare = write_config(
+        let workspace = temp.path().join("ws");
+        let parent = temp.path().join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        let path = write_config(
             temp.path(),
-            r#"
-default = "kimi/k3"
-[providers.kimi]
-base_url = "https://x"
-api_key_file = "key"
-[models."kimi/k3"]
-model = "k3"
+            &format!(
+                "[sandbox]\nreadable_paths = [\"{}\"]\nwritable_paths = [\"{}\"]\n",
+                parent.display(),
+                child.display()
+            ),
+        );
+        let policy = Config::from_path(&path)
+            .unwrap()
+            .sandbox(&workspace)
+            .unwrap();
+        assert_eq!(policy.readable_paths, vec![parent.to_str().unwrap()]);
+        assert_eq!(policy.writable_paths, vec![child.to_str().unwrap()]);
+    }
+
+    #[test]
+    fn project_sandbox_rejects_unknown_and_policy_switch_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        let path = write_config(temp.path(), "");
+        let config = Config::from_path(&path).unwrap();
+        for field in [
+            "readible_paths = []",
+            "enabled = true",
+            "network = false",
+            "workspace_writable = false",
+        ] {
+            std::fs::write(
+                workspace.join(".e-agent/config.toml"),
+                format!("[other]\nfuture = true\n[sandbox]\n{field}\n"),
+            )
+            .unwrap();
+            let error = config.sandbox(&workspace).unwrap_err().to_string();
+            assert!(error.contains("cannot parse project config"), "{error}");
+        }
+    }
+
+    #[test]
+    fn sandbox_project_clear_rejections_aliases_and_malformed() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let writable = temp.path().join("writable");
+        let readable = temp.path().join("readable");
+        std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+        std::fs::create_dir_all(writable.join("child")).unwrap();
+        std::fs::create_dir_all(&readable).unwrap();
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+[sandbox]
+writable_paths = ["{}", "{}"]
+readable_paths = ["{}"]
 "#,
+                writable.display(),
+                writable.join(".").display(),
+                readable.display()
+            ),
         );
-        std::fs::write(temp.path().join("key"), "key").unwrap();
+        let config = Config::from_path(&path).unwrap();
+
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            "[sandbox]\nwritable_paths = []\nreadable_paths = []\n",
+        )
+        .unwrap();
+        let clear = config.sandbox(&workspace).unwrap();
+        assert!(clear.writable_paths.is_empty() && clear.readable_paths.is_empty());
+
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            format!("[sandbox]\nwritable_paths = [\"{}\"]\n", readable.display()),
+        )
+        .unwrap();
         assert!(
-            Config::from_path(&bare)
-                .unwrap()
-                .sandbox(temp.path())
-                .is_none()
+            config
+                .sandbox(&workspace)
+                .unwrap_err()
+                .to_string()
+                .contains("global writable")
         );
+
+        std::fs::write(
+            workspace.join(".e-agent/config.toml"),
+            format!(
+                "[sandbox]\nreadable_paths = [\"{}\"]\n",
+                temp.path().display()
+            ),
+        )
+        .unwrap();
+        assert!(
+            config
+                .sandbox(&workspace)
+                .unwrap_err()
+                .to_string()
+                .contains("global readable or writable")
+        );
+
+        std::fs::write(workspace.join(".e-agent/config.toml"), "[sandbox\n").unwrap();
+        assert!(
+            config
+                .sandbox(&workspace)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot parse project config")
+        );
+
+        std::fs::remove_file(workspace.join(".e-agent/config.toml")).unwrap();
+        let inherited = config.sandbox(&workspace).unwrap();
+        assert_eq!(
+            inherited.writable_paths.len(),
+            1,
+            "canonical aliases deduplicate"
+        );
+    }
+
+    #[test]
+    fn sandbox_absent_is_empty_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_config(temp.path(), "");
+        let sandbox = Config::from_path(&path)
+            .unwrap()
+            .sandbox(temp.path())
+            .unwrap();
+        assert!(!sandbox.enabled);
+        assert!(sandbox.writable_paths.is_empty());
     }
 
     #[test]

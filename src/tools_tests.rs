@@ -367,6 +367,161 @@ async fn read(temp: &tempfile::TempDir, arguments: Value) -> Result<String, Stri
 }
 
 #[tokio::test]
+async fn external_absolute_file_tools_enforce_policy_and_reuse_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_dir = temp.path().join("workspace");
+    let readable = temp.path().join("readable");
+    let writable = temp.path().join("writable");
+    std::fs::create_dir(&workspace_dir).unwrap();
+    std::fs::create_dir(&readable).unwrap();
+    std::fs::create_dir(&writable).unwrap();
+    std::fs::write(readable.join("file"), "r1\nr2\nr3\n").unwrap();
+    std::fs::write(writable.join("file"), "one two one").unwrap();
+    let policy = crate::config::Sandbox {
+        enabled: false,
+        workspace_writable: false,
+        readable_paths: vec![readable.to_str().unwrap().to_owned()],
+        writable_paths: vec![writable.to_str().unwrap().to_owned()],
+        ..Default::default()
+    };
+    let workspace = Workspace::new(&workspace_dir)
+        .unwrap()
+        .with_external_roots(&policy)
+        .unwrap();
+    let read_tool = ReadFile {
+        workspace: workspace.clone(),
+    };
+    assert!(
+        read_tool
+            .execute(json!({"path": readable.join("file"), "limit": 2}))
+            .await
+            .unwrap()
+            .contains("use offset 3")
+    );
+    let write_tool = WriteFile {
+        workspace: workspace.clone(),
+    };
+    assert!(
+        write_tool
+            .execute(json!({"path": readable.join("file"), "content": "no"}))
+            .await
+            .is_err()
+    );
+    write_tool
+        .execute(json!({"path": writable.join("new"), "content": "created"}))
+        .await
+        .unwrap();
+    write_tool
+        .execute(json!({"path": "relative", "content": "allowed"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(workspace_dir.join("relative")).unwrap(),
+        "allowed"
+    );
+    let edit_tool = EditFile { workspace };
+    assert!(
+        edit_tool
+            .execute(json!({"path": readable.join("file"), "old": "r1", "new": "x"}))
+            .await
+            .is_err()
+    );
+    assert!(
+        edit_tool
+            .execute(json!({"path": writable.join("file"), "old": "one", "new": "x"}))
+            .await
+            .unwrap_err()
+            .contains("found 2")
+    );
+    edit_tool
+        .execute(json!({"path": writable.join("file"), "old": "two", "new": "x"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(writable.join("file")).unwrap(),
+        "one x one"
+    );
+}
+
+#[tokio::test]
+async fn policy_file_tools_allow_read_but_reject_relative_and_external_absolute_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join(".e-agent")).unwrap();
+    let policy_path = temp.path().join(".e-agent/config.toml");
+    std::fs::write(&policy_path, "[sandbox]\n").unwrap();
+    let policy = crate::config::Sandbox {
+        writable_paths: vec![temp.path().to_str().unwrap().to_owned()],
+        ..Default::default()
+    };
+    let workspace = Workspace::new(temp.path())
+        .unwrap()
+        .with_external_roots(&policy)
+        .unwrap();
+    let read = ReadFile {
+        workspace: workspace.clone(),
+    };
+    assert!(
+        read.execute(json!({"path": ".e-agent/config.toml"}))
+            .await
+            .unwrap()
+            .contains("[sandbox]")
+    );
+    assert!(
+        read.execute(json!({"path": policy_path}))
+            .await
+            .unwrap()
+            .contains("[sandbox]")
+    );
+    for path in [
+        ".e-agent/config.toml".to_owned(),
+        policy_path.to_str().unwrap().to_owned(),
+    ] {
+        let error = WriteFile {
+            workspace: workspace.clone(),
+        }
+        .execute(json!({"path": path, "content": ""}))
+        .await
+        .unwrap_err();
+        assert!(error.contains("outside the agent"));
+    }
+    let error = EditFile { workspace }
+        .execute(json!({
+            "path": policy_path,
+            "old": "sandbox",
+            "new": "x"
+        }))
+        .await
+        .unwrap_err();
+    assert!(error.contains("outside the agent"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn policy_file_tools_reject_workspace_symlink_alias_writes() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join(".e-agent")).unwrap();
+    std::fs::write(temp.path().join(".e-agent/config.toml"), "[sandbox]\n").unwrap();
+    symlink(".e-agent/config.toml", temp.path().join("policy-alias")).unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    assert!(
+        ReadFile {
+            workspace: workspace.clone(),
+        }
+        .execute(json!({"path": "policy-alias"}))
+        .await
+        .unwrap()
+        .contains("[sandbox]")
+    );
+    let error = WriteFile { workspace }
+        .execute(json!({"path": "policy-alias", "content": "no"}))
+        .await
+        .unwrap_err();
+    assert!(error.contains("outside the agent"));
+}
+
+#[tokio::test]
 async fn read_pages_lines_with_a_continuation_hint() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("file.txt"), "a\nb\nc\nd\ne\n").unwrap();
@@ -681,6 +836,202 @@ async fn sandbox_can_disable_network() {
         .await
         .unwrap();
     assert!(result.contains("NET_BLOCKED"), "{result}");
+}
+
+#[tokio::test]
+async fn sandbox_read_only_workspace_rejects_bash_but_not_file_tool_writes() {
+    let Some(mut sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    sandbox.workspace_writable = false;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    WriteFile {
+        workspace: workspace.clone(),
+    }
+    .execute(json!({"path": "file-tool", "content": "yes"}))
+    .await
+    .unwrap();
+    let tool = Bash {
+        workspace,
+        timeout: Duration::from_secs(10),
+        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        sandbox: Some(sandbox),
+        protect_git: false,
+    };
+    assert!(
+        tool.execute(json!({"command": "touch bash-file"}))
+            .await
+            .is_err()
+    );
+    assert!(!temp.path().join("bash-file").exists());
+}
+
+#[tokio::test]
+async fn sandbox_workspace_mount_wins_over_external_ancestor() {
+    let Some(mut sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    let parent = tempfile::tempdir().unwrap();
+    let workspace_dir = parent.path().join("workspace");
+    std::fs::create_dir(&workspace_dir).unwrap();
+
+    sandbox.workspace_writable = false;
+    sandbox.writable_paths = vec![parent.path().to_str().unwrap().to_owned()];
+    let read_only = Bash {
+        workspace: Workspace::new(&workspace_dir).unwrap(),
+        timeout: Duration::from_secs(10),
+        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        sandbox: Some(sandbox.clone()),
+        protect_git: false,
+    };
+    assert!(
+        read_only
+            .execute(json!({"command": "touch must-not-write"}))
+            .await
+            .is_err()
+    );
+    assert!(!workspace_dir.join("must-not-write").exists());
+
+    sandbox.workspace_writable = true;
+    sandbox.writable_paths.clear();
+    sandbox.readable_paths = vec![parent.path().to_str().unwrap().to_owned()];
+    let writable = Bash {
+        workspace: Workspace::new(&workspace_dir).unwrap(),
+        timeout: Duration::from_secs(10),
+        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        sandbox: Some(sandbox),
+        protect_git: false,
+    };
+    writable
+        .execute(json!({"command": "touch workspace-wins"}))
+        .await
+        .unwrap();
+    assert!(workspace_dir.join("workspace-wins").exists());
+}
+
+#[tokio::test]
+async fn sandbox_read_only_workspace_allows_explicit_writable_child() {
+    let Some(mut sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let child = workspace_dir.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    sandbox.workspace_writable = false;
+    sandbox.writable_paths = vec![child.to_str().unwrap().to_owned()];
+    let tool = Bash {
+        workspace: Workspace::new(workspace_dir.path()).unwrap(),
+        timeout: Duration::from_secs(10),
+        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        sandbox: Some(sandbox),
+        protect_git: false,
+    };
+    tool.execute(json!({"command": "touch child/allowed"}))
+        .await
+        .unwrap();
+    assert!(
+        tool.execute(json!({"command": "touch denied"}))
+            .await
+            .is_err()
+    );
+    assert!(child.join("allowed").exists());
+    assert!(!workspace_dir.path().join("denied").exists());
+}
+
+#[tokio::test]
+async fn sandbox_reroot_keeps_startup_policy_anchor_read_only() {
+    let Some(mut sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    let parent = tempfile::tempdir().unwrap();
+    let child = parent.path().join("child");
+    let policy_dir = parent.path().join(".e-agent");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::create_dir(&policy_dir).unwrap();
+    let policy_path = policy_dir.join("config.toml");
+    std::fs::write(&policy_path, "[sandbox]\n").unwrap();
+    sandbox.writable_paths = vec![parent.path().to_str().unwrap().to_owned()];
+    let workspace = Workspace::new(parent.path())
+        .unwrap()
+        .with_external_roots(&sandbox)
+        .unwrap()
+        .reroot(&child)
+        .unwrap();
+    let tool = Bash {
+        workspace,
+        timeout: Duration::from_secs(10),
+        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        sandbox: Some(sandbox),
+        protect_git: false,
+    };
+    assert!(
+        tool.execute(json!({"command": "echo no > ../.e-agent/config.toml"}))
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read_to_string(policy_path).unwrap(), "[sandbox]\n");
+}
+
+#[tokio::test]
+async fn sandbox_missing_policy_cannot_be_created_through_writable_e_agent_child() {
+    let Some(mut sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    let workspace = tempfile::tempdir().unwrap();
+    let policy_dir = workspace.path().join(".e-agent");
+    std::fs::create_dir(&policy_dir).unwrap();
+    sandbox.workspace_writable = false;
+    sandbox.writable_paths = vec![policy_dir.to_str().unwrap().to_owned()];
+    let tool = Bash {
+        workspace: Workspace::new(workspace.path()).unwrap(),
+        timeout: Duration::from_secs(10),
+        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        sandbox: Some(sandbox),
+        protect_git: false,
+    };
+    assert!(
+        tool.execute(json!({"command": "touch .e-agent/config.toml"}))
+            .await
+            .is_err()
+    );
+    assert!(!policy_dir.join("config.toml").exists());
+}
+
+#[tokio::test]
+async fn sandbox_ro_parent_allows_rw_child_override() {
+    let Some(mut sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    let parent = tempfile::tempdir().unwrap();
+    let child = parent.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    sandbox.readable_paths = vec![parent.path().to_str().unwrap().to_owned()];
+    sandbox.writable_paths = vec![child.to_str().unwrap().to_owned()];
+    let temp = tempfile::tempdir().unwrap();
+    let tool = Bash {
+        workspace: Workspace::new(temp.path()).unwrap(),
+        timeout: Duration::from_secs(10),
+        background: BackgroundTasks::new(Duration::from_secs(30), None),
+        sandbox: Some(sandbox),
+        protect_git: false,
+    };
+    tool.execute(json!({"command": format!("touch '{}/yes'", child.display())}))
+        .await
+        .unwrap();
+    assert!(
+        tool.execute(json!({"command": format!("touch '{}/no'", parent.path().display())}))
+            .await
+            .is_err()
+    );
+    assert!(child.join("yes").exists());
+    assert!(!parent.path().join("no").exists());
 }
 
 #[tokio::test]
