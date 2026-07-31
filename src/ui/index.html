@@ -1355,7 +1355,11 @@ function renderMessage(m, acc, pendingCards) {
     if (a.reasoning) {
       const det = el("details", "thinking");
       det.open = false;
-      det.append(el("summary", "", "思考"));
+      const sum = el("summary", "", "");
+      const dot = el("span", "think-dot");          // 与实时 thinking 一致的圆点
+      const label = el("span", "think-label", "思考");
+      sum.append(dot, label);
+      det.append(sum);
       det.append(el("div", "think-body", a.reasoning));
       els.messages.appendChild(det);
     }
