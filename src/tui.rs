@@ -1290,6 +1290,11 @@ impl Drop for AttachedView {
 struct TaskDetail {
     id: u64,
     label: String,
+    /// Full untruncated command for bash tasks (`None` for delegate/open
+    /// without a snapshot). Rendered as a fixed banner under the header so
+    /// the complete command is visible even though the panel label and the
+    /// header stay preview-truncated.
+    command: Option<String>,
     /// Keeps the full output alive after the task completes (the registry
     /// drops its reference when the task leaves `running()`).
     spool: Arc<crate::tools::TaskSpool>,
@@ -1316,6 +1321,7 @@ impl TaskDetail {
         Self {
             id,
             label,
+            command: None,
             spool,
             finished,
             base_line: 0,
@@ -1600,7 +1606,8 @@ fn render_bounded_window(lines: &[DisplayLine], width: usize) -> Vec<ratatui::te
 }
 
 /// Full-screen detail view for a background bash task: a bordered header
-/// (#id: label — status — N lines · X MiB (truncated) — key hints) plus the
+/// (#id: label — status — N lines · X MiB (truncated) — key hints), a fixed
+/// banner with the FULL untruncated command (hard-wrapped, Dim), then the
 /// current spool page rendered as plain Dim text through the bounded window
 /// pipeline (no markdown). While `follow_bottom` the tail page is re-fetched
 /// only when the spool has grown since the last reload, so a running task's
@@ -1617,6 +1624,28 @@ fn render_task_detail(
         detail.spool.line_count(),
         detail.spool.truncated(),
     );
+    // Fixed banner under the header: the full untruncated command wrapped
+    // to the inner width. Reserves rows so the spool output never covers
+    // it; a pathological command may fill the whole viewport, in which
+    // case there is simply no room left for output.
+    let banner: Vec<ratatui::text::Line<'static>> = detail
+        .command
+        .as_deref()
+        .filter(|command| !command.is_empty())
+        .map(|command| {
+            hard_wrap(command, width)
+                .into_iter()
+                .map(|row| {
+                    ratatui::text::Line::styled(
+                        row.to_owned(),
+                        SOLARIZED_LIGHT.line_style(LineKind::Dim),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let banner_rows = banner.len().min(height);
+    let content_height = height.saturating_sub(banner_rows);
     // Follow slides to the tail only when the spool has grown since the
     // last reload: opening shows the head page, a paused task keeps the
     // current page, and new output pulls the view to the live tail.
@@ -1641,7 +1670,7 @@ fn render_task_detail(
     let header = format!(
         "#{}: {} — {} — {} lines · {:.1} MiB{} — ↑↓ scroll  PgUp/PgDn  Home/End  Esc close  F2 close panel  Ctrl-C/x cancel",
         detail.id,
-        crate::agent::preview(&detail.label, 40),
+        crate::agent::preview(&detail.label, 60),
         status,
         lines,
         bytes as f64 / (1024.0 * 1024.0),
@@ -1654,22 +1683,35 @@ fn render_task_detail(
     let visual = render_bounded_window(&local, width);
     let total_rows = visual.len();
     if detail.window.follow_bottom {
-        detail.window.local_offset = total_rows.saturating_sub(height);
+        detail.window.local_offset = total_rows.saturating_sub(content_height);
     }
     detail.window.local_offset = detail
         .window
         .local_offset
-        .min(total_rows.saturating_sub(height).max(0));
+        .min(total_rows.saturating_sub(content_height).max(0));
     {
         let buf = frame.buffer_mut();
         buf.set_style(inner, SOLARIZED_LIGHT.screen_style());
+        // Full-command banner first; it is fixed (not scrollable).
+        for (row_idx, line) in banner.iter().enumerate() {
+            let y = inner.y + row_idx as u16;
+            if y >= inner.bottom() {
+                break;
+            }
+            buf.set_line(inner.x, y, line, inner.width);
+        }
         let scroll_offset = detail.window.local_offset;
-        // When following with fewer rows than the viewport, bottom-align
-        // like the main scrollback so the tail touches the border.
-        let render_top = if detail.window.follow_bottom && total_rows < height {
-            inner.bottom() - total_rows as u16
+        let content_top = inner.y + banner_rows as u16;
+        // When following with fewer rows than the content viewport,
+        // bottom-align like the main scrollback so the tail touches the
+        // bottom border (below the fixed command banner).
+        let render_top = if detail.window.follow_bottom && total_rows < content_height {
+            inner
+                .bottom()
+                .saturating_sub(total_rows as u16)
+                .max(content_top)
         } else {
-            inner.y
+            content_top
         };
         for (row_idx, line) in visual.iter().enumerate().skip(scroll_offset) {
             let y = render_top + (row_idx - scroll_offset) as u16;
@@ -2409,13 +2451,14 @@ impl TuiState {
         let Some(spool) = background.spool(id) else {
             return;
         };
-        let label = background
-            .running()
-            .into_iter()
-            .find(|task| task.id == id)
-            .map(|task| task.label)
+        let task = background.running().into_iter().find(|task| task.id == id);
+        let label = task
+            .as_ref()
+            .map(|task| task.label.clone())
             .unwrap_or_default();
+        let command = task.and_then(|task| task.full_command);
         let mut detail = TaskDetail::new(id, label, spool, false);
+        detail.command = command;
         detail.load_head(self.inner_width.max(1), self.output_height.max(1));
         detail.last_seen_lines = detail.spool.line_count();
         self.task_detail = Some(detail);
@@ -3180,6 +3223,7 @@ mod format_task_label_tests {
         BackgroundTaskInfo {
             id,
             label: label.into(),
+            full_command: None,
             role: role.map(String::from),
             kind: "delegate".into(),
             output: vec![],
@@ -3248,6 +3292,7 @@ mod format_task_label_tests {
         let task = BackgroundTaskInfo {
             id: 10,
             label: "echo hi".into(),
+            full_command: None,
             role: None,
             kind: "bash".into(),
             output: vec![],
@@ -3733,6 +3778,59 @@ mod tests {
             .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
             .collect();
         assert_eq!(row.trim_end(), "line 29");
+    }
+
+    #[test]
+    fn task_detail_render_shows_full_command_banner_below_header() {
+        let spool = Arc::new(crate::tools::TaskSpool::new());
+        spool.append(b"line 0\nline 1\n");
+        // Longer than the 100-char panel label preview: the middle would be
+        // elided with "…" in the header, but the banner must show it whole.
+        let command = format!(
+            "echo {} && echo tail",
+            "abcdefghijklmnopqrstuvwxyz0123456789".repeat(4)
+        );
+        assert!(command.len() > 100);
+        let mut state = TuiState {
+            task_detail: Some(TaskDetail::new(9, "demo".into(), spool, false)),
+            ..Default::default()
+        };
+        state.task_detail.as_mut().unwrap().command = Some(command.clone());
+        let backend = ratatui::backend::TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw(&mut terminal, &mut state).unwrap();
+        let buffer = terminal.backend().buffer();
+        // The header keeps the short label (no alphabet block, no ellipsis
+        // over the long command): the full command lives in the banner.
+        let header: String = (0..120)
+            .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            !header.contains("abcdefghijklmnopqrstuvwxyz0123456789"),
+            "header should keep the short label: {header}"
+        );
+        // Banner rows directly under the header: the wrapped full command,
+        // not the truncated label.
+        let banner: String = (1..3)
+            .map(|y| {
+                (1..119)
+                    .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let joined: String = banner.lines().map(str::trim_end).collect();
+        assert_eq!(
+            joined, command,
+            "full command must be visible in the detail banner"
+        );
+        // Banner is Dim like the spool output text.
+        assert!(buffer[(1, 1)].modifier.contains(Modifier::DIM));
+        // Output still renders below the fixed banner (bottom-aligned tail).
+        let row: String = (1..119)
+            .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert_eq!(row.trim_end(), "line 1");
     }
 
     #[test]

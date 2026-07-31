@@ -930,6 +930,10 @@ fn truncated_tail_line(bytes: &[u8], start: usize, end: usize, budget: usize) ->
 struct RunningTask {
     id: u64,
     label: String,
+    /// Full untruncated command for bash tasks (`None` for delegate tasks).
+    /// The label is preview-truncated at spawn time, so the detail view
+    /// reads this field to show the complete command.
+    full_command: Option<String>,
     role: Option<String>,
     process_group: Arc<AtomicI32>,
     handle: Arc<tokio::task::JoinHandle<()>>,
@@ -955,6 +959,9 @@ pub struct TaskDisplayMeta {
 pub struct BackgroundTaskInfo {
     pub id: u64,
     pub label: String,
+    /// Full untruncated command for bash tasks; `None` for delegate tasks.
+    /// The detail view renders this instead of the truncated label.
+    pub full_command: Option<String>,
     pub role: Option<String>,
     /// "bash" for background shell commands, "delegate" for subagent tasks.
     pub kind: String,
@@ -1003,6 +1010,7 @@ impl BackgroundTasks {
             .map(|task| BackgroundTaskInfo {
                 id: task.id,
                 label: task.label.clone(),
+                full_command: task.full_command.clone(),
                 role: task.role.clone(),
                 kind: if task.output.is_some() {
                     "bash".into()
@@ -1089,6 +1097,7 @@ impl BackgroundTasks {
         let pg = process_group.clone();
         let slot = output.clone();
         let full = spool.clone();
+        let command_for_detail = command.clone();
         let timeout = self.timeout;
         let running = self.registry.clone();
         self.spawn_with_id_to(
@@ -1102,6 +1111,7 @@ impl BackgroundTasks {
                 if let Some(task) = running.iter_mut().find(|task| task.id == id) {
                     task.output = Some(output);
                     task.spool = Some(spool);
+                    task.full_command = Some(command_for_detail);
                 }
             },
             move || async move {
@@ -1281,6 +1291,7 @@ impl BackgroundTasks {
         self.registry.running.lock().unwrap().push(RunningTask {
             id,
             label,
+            full_command: None,
             role,
             process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),
             handle: Arc::new(handle),
