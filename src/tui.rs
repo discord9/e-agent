@@ -217,7 +217,7 @@ fn attach_to_task(
         })
         .map(|task| task.label)
         .unwrap_or_default();
-    let (snapshot, live, _) = entry.handle.attach();
+    let (snapshot, live, status) = entry.handle.attach();
     state.attach(
         task_id,
         label,
@@ -228,6 +228,7 @@ fn attach_to_task(
         entry.session_id.clone(),
         entry.context_window,
         snapshot,
+        status,
     );
     let bridge = bridge(task_id, live, sender.clone());
     state.attached.as_mut().unwrap().bridge = Some(bridge);
@@ -360,6 +361,21 @@ async fn run_inner(
             SessionStatus::Compacting => Some(BusyState::compacting()),
             _ => None,
         };
+        // Keep the attached view in step with its runner's real status, the
+        // same way the main view refreshes above. This closes the window
+        // where a finished delegate still shows "thinking" until the parent
+        // agent's next commit_backgrounds round trips a BackgroundCompleted.
+        if let Some(attached) = &mut state.attached {
+            match attached.status.borrow().clone() {
+                SessionStatus::Busy => attached.state.busy = Some(BusyState::thinking()),
+                SessionStatus::Compacting => attached.state.busy = Some(BusyState::compacting()),
+                SessionStatus::Idle => attached.state.busy = None,
+                SessionStatus::Finished(_) => {
+                    attached.finished = true;
+                    attached.state.busy = None;
+                }
+            }
+        }
         draw(terminal, &mut state)?;
         tokio::select! {
             changed = status.changed() => {
@@ -676,19 +692,23 @@ fn draw<'a, B: ratatui::backend::Backend>(
             }
         }
         if let Some(attached) = &mut state.attached {
-            let status: String = attached.state.busy.map_or_else(
-                || {
+            let status: String = attached.title_status();
+            let hint = match &*attached.status.borrow() {
+                SessionStatus::Busy | SessionStatus::Compacting => {
+                    "Esc detach  Enter steer  Ctrl-C interrupt"
+                }
+                SessionStatus::Idle => {
                     if attached.finished {
-                        "finished".into()
+                        "Esc detach"
                     } else {
-                        "running".into()
+                        "Esc detach  Enter steer"
                     }
-                },
-                BusyState::title,
-            );
+                }
+                SessionStatus::Finished(_) => "Esc detach",
+            };
             let block = SOLARIZED_LIGHT
                 .block(format!(
-                    "{} — subagent #{}: {} — Esc detach  Enter steer  Ctrl-C interrupt",
+                    "{} — subagent #{}: {} — {hint}",
                     status,
                     attached.id,
                     preview(&attached.label, 40),
@@ -1221,6 +1241,10 @@ struct TuiState {
     /// Whether the terminal title has been set to a user-derived value.
     /// Once true, subsequent prompts never overwrite the title.
     session_title_set: bool,
+    /// Steering input preserved per background-task id across detach /
+    /// re-attach and panel-driven task switches, so browsing the tasks
+    /// panel never discards a half-typed prompt.
+    stashed_input: std::collections::HashMap<u64, String>,
 }
 
 /// A live view into a running background session: its own scrollback
@@ -1241,6 +1265,11 @@ struct AttachedView {
     input: InputBuffer,
     /// Vertical scroll of the steering input (multi-line).
     input_scroll: usize,
+    /// Live status of the attached session, kept in sync with the runner:
+    /// drives the title text and the finished flag so the view reflects the
+    /// runner's real state (Busy/Compacting/Idle/Finished) instead of
+    /// lagging behind until the parent's BackgroundCompleted arrives.
+    status: tokio::sync::watch::Receiver<SessionStatus>,
     /// Set once the session's completion event has arrived (view becomes a
     /// static record; further events are impossible).
     finished: bool,
@@ -1438,6 +1467,34 @@ impl TaskDetail {
 }
 
 impl AttachedView {
+    /// Status text for the input-border title. Prefers the live runner
+    /// status; falls back to the view's own busy/finished flags when the
+    /// receiver is stale (attach raced ahead of the runner, or the test
+    /// channel never moves status).
+    fn title_status(&self) -> String {
+        match &*self.status.borrow() {
+            SessionStatus::Busy | SessionStatus::Compacting => self
+                .state
+                .busy
+                .map_or_else(|| BusyState::thinking().title(), BusyState::title),
+            SessionStatus::Idle => {
+                if self.finished {
+                    "finished".into()
+                } else if let Some(busy) = &self.state.busy {
+                    (*busy).title()
+                } else {
+                    "idle".into()
+                }
+            }
+            SessionStatus::Finished(result) => match result {
+                SessionResult::Completed(_) => "finished".into(),
+                SessionResult::Failed(_) => "failed".into(),
+                SessionResult::Cancelled => "cancelled".into(),
+                SessionResult::Closed => "closed".into(),
+            },
+        }
+    }
+
     /// Input editing on the attached steering buffer. Vertical arrow keys
     /// stay scroll keys (see handle_attached_key), so a multi-line buffer
     /// edits at the cursor without vertical movement.
@@ -2023,6 +2080,7 @@ impl TuiState {
     /// during the follow-up turn become a separate batch on the next call.
     /// Attach to a background session: snapshot its event log into a fresh
     /// scrollback and follow its live stream from now on (see `bridge`).
+    /// `status` is the live runner-status receiver from `RunnerHandle::attach`.
     #[allow(clippy::too_many_arguments)]
     fn attach(
         &mut self,
@@ -2035,7 +2093,11 @@ impl TuiState {
         session_id: String,
         context_window: Option<u64>,
         snapshot: Vec<AgentEvent>,
+        status: tokio::sync::watch::Receiver<SessionStatus>,
     ) {
+        // Switching straight from one attached task to another (F2 panel →
+        // attach) replaces the view without a detach; keep its input too.
+        self.stash_attached_input();
         let mut state = TuiState {
             model_name,
             role_name,
@@ -2057,19 +2119,39 @@ impl TuiState {
         if !finished {
             state.busy = Some(BusyState::thinking());
         }
+        let mut input = InputBuffer::default();
+        if let Some(stashed) = self.stashed_input.remove(&id) {
+            input.insert(&stashed);
+        }
         self.attached = Some(Box::new(AttachedView {
             id,
             label,
             state,
             bridge: None,
             handle,
-            input: InputBuffer::default(),
+            input,
             input_scroll: 0,
+            status,
             finished,
         }));
     }
 
+    /// Preserve the attached steering input keyed by task id so a detach /
+    /// re-attach or a panel-driven switch to another task cannot lose a
+    /// half-typed prompt. A previously stashed value for the same id is
+    /// replaced (an already-sent prompt must not resurrect itself).
+    fn stash_attached_input(&mut self) {
+        if let Some(attached) = &mut self.attached {
+            self.stashed_input.remove(&attached.id);
+            if !attached.input.text.is_empty() {
+                self.stashed_input
+                    .insert(attached.id, attached.input.text.clone());
+            }
+        }
+    }
+
     fn detach(&mut self) {
+        self.stash_attached_input();
         self.attached = None;
     }
 
@@ -2097,14 +2179,53 @@ impl TuiState {
                 attached.input.insert_char('\n');
             }
             KeyCode::Enter => {
-                let prompt = std::mem::take(&mut attached.input.text);
-                attached.input.cursor = 0;
-                if !prompt.trim().is_empty() && !attached.finished {
-                    attached.handle.prompt(prompt);
+                // Finished sessions must not silently swallow the input:
+                // keep the buffer intact, send nothing, and say why.
+                if attached.finished
+                    || matches!(&*attached.status.borrow(), SessionStatus::Finished(_))
+                {
+                    if !attached.input.text.trim().is_empty() {
+                        attached.state.push_line(
+                            "subagent finished — prompt not sent, press Esc to detach".into(),
+                            LineKind::Dim,
+                        );
+                    }
+                } else {
+                    let prompt = std::mem::take(&mut attached.input.text);
+                    attached.input.cursor = 0;
+                    if !prompt.trim().is_empty() {
+                        attached.handle.prompt(prompt);
+                    }
                 }
             }
-            _ if is_cancel(key) && !attached.finished => attached.handle.cancel(),
+            _ if is_cancel(key) && !attached.finished => {
+                // Non-empty input: Ctrl-C clears the line so the in-flight
+                // turn keeps running; only an empty buffer cancels it.
+                if attached.input.text.trim().is_empty() {
+                    attached.handle.cancel();
+                } else {
+                    attached.input.text.clear();
+                    attached.input.cursor = 0;
+                }
+            }
             _ => AttachedView::edit_input(&mut attached.input, key, input_width),
+        }
+    }
+
+    /// Mark an attached view finished and surface queued-but-unanswered
+    /// prompts. Prompts the user queued while the turn was in flight may
+    /// have been accepted by the runner and persisted, yet never answered
+    /// because the session ended before its next turn; the view must make
+    /// that distinguishable from a still-pending prompt.
+    fn mark_attached_finished(attached: &mut AttachedView) {
+        attached.finished = true;
+        attached.state.busy = None;
+        let queued = attached.state.queued.len();
+        if queued > 0 {
+            attached.state.push_line(
+                format!("{queued} queued prompt(s) not answered (session finished)"),
+                LineKind::Dim,
+            );
         }
     }
 
@@ -2121,8 +2242,7 @@ impl TuiState {
                     && let Some(attached) = &mut self.attached
                     && attached.id == *id
                 {
-                    attached.finished = true;
-                    attached.state.busy = None;
+                    Self::mark_attached_finished(attached);
                     attached.state.push_agent_event(ui.event.clone());
                 }
                 self.push_agent_event(ui.event);
@@ -2135,8 +2255,7 @@ impl TuiState {
                     && attached.id == session
                 {
                     if matches!(ui.event, AgentEvent::BackgroundCompleted { .. }) {
-                        attached.finished = true;
-                        attached.state.busy = None;
+                        Self::mark_attached_finished(attached);
                     }
                     attached.state.push_agent_event(ui.event);
                 }
@@ -3226,6 +3345,7 @@ mod tests {
     /// signature for minimal test churn.
     fn attach_test(state: &mut TuiState, id: u64, label: &str, handle: RunnerHandle) {
         let snapshot = handle.snapshot();
+        let status = handle.status();
         state.attach(
             id,
             label.into(),
@@ -3236,6 +3356,7 @@ mod tests {
             String::new(),
             None,
             snapshot,
+            status,
         );
     }
 
@@ -3913,6 +4034,186 @@ mod tests {
     }
 
     #[test]
+    fn attached_enter_on_finished_keeps_input_and_sends_nothing() {
+        // S1: Enter on a finished session must not silently swallow the
+        // buffer — the input stays editable, no command goes out, and a dim
+        // hint explains why.
+        let (handle, _sink, mut source) = crate::runner::session_test_channel();
+        let mut state = TuiState::default();
+        attach_test(&mut state, 9, "done task", handle);
+        state.push_event(UiEvent {
+            session: 0,
+            event: AgentEvent::BackgroundCompleted {
+                id: 9,
+                output: "done".into(),
+                label: None,
+            },
+        });
+        {
+            let attached = state.attached.as_mut().unwrap();
+            attached.input.insert("still typing");
+        }
+        state.handle_attached_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), 80);
+        assert_eq!(source.try_recv().ok(), None, "no command may be sent");
+        let attached = state.attached.as_mut().unwrap();
+        assert_eq!(
+            attached.input.text, "still typing",
+            "input must be preserved"
+        );
+        assert_eq!(
+            attached.state.lines.last().unwrap().text,
+            "subagent finished — prompt not sent, press Esc to detach"
+        );
+        assert_eq!(attached.state.lines.last().unwrap().kind, LineKind::Dim);
+    }
+
+    #[test]
+    fn finish_with_queued_prompts_notes_them_as_unanswered() {
+        // S2: prompts queued while the turn was in flight may be persisted
+        // by the runner but never answered; the view must surface that
+        // instead of leaving "queued" dangling forever.
+        let (handle, _sink, _source) = crate::runner::session_test_channel();
+        let mut state = TuiState::default();
+        attach_test(&mut state, 11, "task", handle);
+        state.push_event(UiEvent {
+            session: 11,
+            event: AgentEvent::PromptQueued("first".into()),
+        });
+        state.push_event(UiEvent {
+            session: 11,
+            event: AgentEvent::PromptQueued("second".into()),
+        });
+        assert_eq!(state.attached.as_ref().unwrap().state.queued.len(), 2);
+        state.push_event(UiEvent {
+            session: 0,
+            event: AgentEvent::BackgroundCompleted {
+                id: 11,
+                output: "done".into(),
+                label: None,
+            },
+        });
+        let attached = state.attached.as_ref().unwrap();
+        assert!(attached.finished);
+        assert_eq!(
+            attached.state.lines.last().unwrap().text,
+            "2 queued prompt(s) not answered (session finished)"
+        );
+        assert_eq!(attached.state.lines.last().unwrap().kind, LineKind::Dim);
+    }
+
+    #[test]
+    fn attached_ctrl_c_clears_input_when_nonempty() {
+        // S5: with a non-empty buffer Ctrl-C clears the line instead of
+        // cancelling the in-flight turn; an empty buffer still cancels.
+        let (handle, _sink, mut source) = crate::runner::session_test_channel();
+        let mut state = TuiState::default();
+        attach_test(&mut state, 7, "demo task", handle);
+        {
+            let attached = state.attached.as_mut().unwrap();
+            attached.input.insert("half-typed");
+        }
+        state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
+        assert_eq!(
+            source.try_recv().ok(),
+            None,
+            "no cancel while the input is non-empty"
+        );
+        assert_eq!(state.attached.as_ref().unwrap().input.text, "");
+        state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
+        assert_eq!(
+            source.try_recv().ok(),
+            Some(crate::runner::SessionCommand::Cancel)
+        );
+    }
+
+    #[test]
+    fn attached_input_survives_detach_and_reattach() {
+        // S6: detaching (Esc) and re-attaching must restore a half-typed
+        // steering prompt instead of discarding it.
+        let (handle, _sink, _source) = crate::runner::session_test_channel();
+        let mut state = TuiState::default();
+        attach_test(&mut state, 21, "task", handle.clone());
+        state.handle_attached_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()), 80);
+        state.handle_attached_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()), 80);
+        assert_eq!(state.attached.as_ref().unwrap().input.text, "hi");
+        state.detach();
+        assert!(state.attached.is_none());
+        attach_test(&mut state, 21, "task", handle.clone());
+        assert_eq!(
+            state.attached.as_ref().unwrap().input.text,
+            "hi",
+            "detach/reattach must restore the steering input"
+        );
+        // A sent prompt must not resurrect on the next re-attach.
+        state.handle_attached_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), 80);
+        assert_eq!(state.attached.as_ref().unwrap().input.text, "");
+        state.detach();
+        attach_test(&mut state, 21, "task", handle);
+        assert_eq!(
+            state.attached.as_ref().unwrap().input.text,
+            "",
+            "a sent prompt must not be stashed"
+        );
+    }
+
+    #[test]
+    fn attached_title_reflects_injected_status() {
+        // S3: the title text is driven by the attached session's live
+        // status receiver (injected here; run_inner keeps it in sync).
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (handle, _sink, _source) = crate::runner::session_test_channel();
+        let mut state = TuiState::default();
+        attach_test(&mut state, 5, "job", handle);
+        let (tx, rx) = tokio::sync::watch::channel(SessionStatus::Idle);
+        state.attached.as_mut().unwrap().status = rx;
+        let title = |terminal: &mut Terminal<ratatui::backend::TestBackend>,
+                     state: &mut TuiState|
+         -> String {
+            draw(terminal, state).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..60)
+                .map(|x| buffer[(x, 9)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
+        // Idle: mirror what run_inner's status refresh does (no spinner).
+        state.attached.as_mut().unwrap().state.busy = None;
+        let top = title(&mut terminal, &mut state);
+        assert!(top.contains("idle — subagent #5"), "got: {top:?}");
+        // Busy and Compacting carry the spinner labels.
+        tx.send_replace(SessionStatus::Busy);
+        state.attached.as_mut().unwrap().state.busy = Some(BusyState::thinking());
+        let top = title(&mut terminal, &mut state);
+        assert!(top.contains("thinking… — subagent #5"), "got: {top:?}");
+        tx.send_replace(SessionStatus::Compacting);
+        state.attached.as_mut().unwrap().state.busy = Some(BusyState::compacting());
+        let top = title(&mut terminal, &mut state);
+        assert!(top.contains("compaction… — subagent #5"), "got: {top:?}");
+        // Finished distinguishes the terminal result variants.
+        tx.send_replace(SessionStatus::Finished(SessionResult::Completed(None)));
+        let top = title(&mut terminal, &mut state);
+        assert!(top.contains("finished — subagent #5"), "got: {top:?}");
+        tx.send_replace(SessionStatus::Finished(SessionResult::Failed(
+            "boom".into(),
+        )));
+        let top = title(&mut terminal, &mut state);
+        assert!(top.contains("failed — subagent #5"), "got: {top:?}");
+        tx.send_replace(SessionStatus::Finished(SessionResult::Cancelled));
+        let top = title(&mut terminal, &mut state);
+        assert!(top.contains("cancelled — subagent #5"), "got: {top:?}");
+        // The dead "Enter steer  Ctrl-C interrupt" hint disappears once the
+        // session is finished.
+        assert!(
+            !top.contains("Enter steer"),
+            "finished view must not advertise steering, got: {top:?}"
+        );
+        assert!(
+            top.contains("Esc detach"),
+            "finished view must still offer detach, got: {top:?}"
+        );
+    }
+
+    #[test]
     fn attached_view_scrolls_independently() {
         let (handle, _sink, _source) = crate::runner::session_test_channel();
         let mut state = TuiState {
@@ -4381,6 +4682,7 @@ mod tests {
         });
         let mut state = TuiState::default();
         let snapshot = handle.snapshot();
+        let status = handle.status();
         state.attach(
             7,
             "demo task".into(),
@@ -4391,6 +4693,7 @@ mod tests {
             "sub-abc123".into(),
             None,
             snapshot,
+            status,
         );
 
         draw(&mut terminal, &mut state).unwrap();
@@ -4447,6 +4750,7 @@ mod tests {
         });
         let mut state = TuiState::default();
         let snapshot = _handle.snapshot();
+        let status = _handle.status();
         state.attach(
             3,
             "quick job".into(),
@@ -4457,6 +4761,7 @@ mod tests {
             String::new(),
             None,
             snapshot,
+            status,
         );
         draw(&mut terminal, &mut state).unwrap();
 
@@ -4475,24 +4780,20 @@ mod tests {
     }
 
     #[test]
-    fn attached_title_shows_running_status_before_subagent_label() {
+    fn attached_title_shows_idle_status_before_subagent_label() {
         let backend = ratatui::backend::TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let (_handle, sink, _source) = crate::runner::session_test_channel();
-        // Emit a user prompt so the session has content but is still
-        // running (no BackgroundCompleted). After attach with no
-        // completion, the busy state is set to thinking; the "running"
-        // state only appears when busy is None AND finished is false.
-        // Create that by sending a BackgroundCompleted then attaching
-        // without one — not possible through the normal path.
-        // Instead, manually set the attached view state.
-        //
-        // We use a snapshot that has content but no completion.
+        // Emit a user prompt so the session has content but is not busy:
+        // with the status receiver the title reflects the runner's real
+        // state, and an idle (waiting-for-input) subagent shows "idle" —
+        // the old synthetic "running" state is gone.
         sink.emit(AgentEvent::UserPrompt("do work".into()));
         sink.emit(AgentEvent::AssistantText("working...".into()));
         let (handle2, _sink2, _source2) = crate::runner::session_test_channel();
         let mut state = TuiState::default();
         let snapshot = handle2.snapshot();
+        let status = handle2.status();
         state.attach(
             5,
             "long job".into(),
@@ -4503,9 +4804,11 @@ mod tests {
             String::new(),
             None,
             snapshot,
+            status,
         );
         // The attach with no messages sets busy=thinking; override to
-        // simulate a running (not thinking) state.
+        // simulate an idle subagent (status Idle, no spinner), which is
+        // what run_inner's per-iteration status refresh would do.
         let attached = state.attached.as_mut().unwrap();
         attached.state.busy = None;
         attached.finished = false;
@@ -4516,11 +4819,11 @@ mod tests {
             .map(|x| buffer[(x, 9)].symbol().chars().next().unwrap_or(' '))
             .collect();
         assert!(
-            top.contains("running — subagent #5"),
-            "running view must have status before subagent label, got: {top:?}"
+            top.contains("idle — subagent #5"),
+            "idle view must have status before subagent label, got: {top:?}"
         );
         assert!(
-            !top.contains("(running)"),
+            !top.contains("(idle)"),
             "must not use old parenthesized format, got: {top:?}"
         );
     }
@@ -5359,6 +5662,7 @@ mod ux_tests {
             ..Default::default()
         };
         let snapshot = handle.snapshot();
+        let status = handle.status();
         parent.attach(
             1,
             "task".into(),
@@ -5369,6 +5673,7 @@ mod ux_tests {
             String::new(),
             None,
             snapshot,
+            status,
         );
         let attached = parent.attached.as_mut().unwrap();
         attached.state.busy = Some(BusyState::thinking());
