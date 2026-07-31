@@ -479,7 +479,7 @@ fn draw<'a, B: ratatui::backend::Backend>(
         state.task_cursor = state.task_cursor.min(running.len().saturating_sub(1));
         // Panel open: full list. Panel closed but tasks running: a one-line
         // hint so background work never goes completely unnoticed.
-        const OUTPUT_LINES: usize = 8;
+        const OUTPUT_LINES: usize = 1;
         let selected_output = if state.show_tasks {
             running
                 .get(state.task_cursor)
