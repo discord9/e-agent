@@ -24,12 +24,16 @@ const state = {
   lastList: [],              // 最近一次轮询拿到的完整列表，供搜索框重绘
   queue: [],                 // 排队提示（FIFO；最多显示 3 条 + "+N"）
   deepLink: { pending: null, handled: false },  // URL ?session= 深链：待打开 id + 一次性标志
-  tasks: {                   // 后台任务面板
-    open: false,             // 面板是否打开
+  sessionStates: {},         // sessionId -> {html, scrollTop, nextBeforeSeq, olderDone, draft}：切走时保存，切回时恢复（不重新加载历史）
+  sidebar: {                 // 会话侧边栏
+    open: false,             // 是否打开
+    expanded: new Set(),     // 已展开的主会话 id（会话树；重绘时保留）
+  },
+  tasks: {                   // 运行中任务（渲染进侧边栏）
     badgeSeq: 0,             // 徽标轮询竞态序号：只应用最新一次响应
     panelSeq: 0,             // 面板轮询竞态序号
-    badgeTimer: null,        // 徽标轮询（独立 3s，面板关闭时也跑）
-    panelTimer: null,        // 面板打开时的列表刷新（2s）
+    badgeTimer: null,        // 徽标轮询（独立 3s，侧边栏关闭时也跑）
+    panelTimer: null,        // 侧边栏打开时的任务列表刷新（2s）
     cancelling: new Set(),   // 正在取消的任务 id（防重复点击）
   },
 };
@@ -45,10 +49,13 @@ const els = {
   searchInput: $("searchInput"),
   chatSessionId: $("chatSessionId"), chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
   messages: $("messages"), promptInput: $("promptInput"), queueBar: $("queueBar"),
+  composerMeta: $("composerMeta"),
   jumpBottomBtn: $("jumpBottomBtn"),
   sendBtn: $("sendBtn"), cancelBtn: $("cancelBtn"), compactBtn: $("compactBtn"),
-  tasksBtn: $("tasksBtn"), tasksOverlay: $("tasksOverlay"),
-  tasksCloseBtn: $("tasksCloseBtn"), tasksList: $("tasksList"),
+  sidebarBtn: $("sidebarBtn"), sidebarOverlay: $("sidebarOverlay"),
+  sidebar: $("sidebar"), sidebarCloseBtn: $("sidebarCloseBtn"),
+  sidebarTree: $("sidebarTree"), sidebarTasks: $("sidebarTasks"),
+  sidebarTasksTitle: $("sidebarTasksTitle"),
 };
 
 /* =====================================================================
@@ -215,6 +222,8 @@ async function pollSessions() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const list = await res.json();
     renderSessionList(Array.isArray(list) ? list : []);
+    renderSidebarTree();                 // 侧边栏会话树随轮询刷新
+    if (state.view === "chat") updateComposerMeta();   // model/role 可能随轮询更新（幂等）
     maybeHandleDeepLink(Array.isArray(list) ? list : []);
   } catch (e) {
     if (!navigator.onLine || e instanceof TypeError) {
@@ -283,6 +292,7 @@ function renderSessionList(list) {
         const res = await api("/api/sessions/" + encodeURIComponent(s.id), { method: "DELETE" });
         if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
         if (!res.ok && res.status !== 204) throw new Error("HTTP " + res.status);
+        delete state.sessionStates[s.id];   // 删除会话：同步清掉视图缓存（切回不再恢复）
       } catch (e) {
         setBanner("⚠ 删除失败：" + e.message);
       }
@@ -322,6 +332,10 @@ async function createSession() {
     if (res.status !== 201) throw new Error("HTTP " + res.status);
     const s = await res.json();
     els.newPrompt.value = "";
+    // 新会话不在 lastList 里（聊天视图轮询已停）：先把返回的 meta 塞进列表，
+    // openSession 的 updateComposerMeta 才能显示 model/role
+    state.lastList = state.lastList.filter((x) => x.id !== s.id);
+    state.lastList.push(s);
     openSession(s.id);
   } catch (e) {
     setBanner("⚠ 创建会话失败：" + e.message);
@@ -852,8 +866,10 @@ function handleSSEBlock(block, id) {
   const data = dataLines.join("\n");
 
   if (eventName === "snapshot") {
-    // 已用 history 渲染过则跳过（避免重复）；history 失败时作为兜底
-    if (state.initSource !== "history") {
+    // 已用 history 渲染过则跳过（避免重复）；恢复的会话（initSource="restored"，
+    // 视图来自缓存）也跳过——缓存内容与 snapshot 等价，重放会造成重复；
+    // history 加载失败时仍作为兜底
+    if (state.initSource !== "history" && state.initSource !== "restored") {
       try {
         const parsed = JSON.parse(data);
         const entries = Array.isArray(parsed) ? parsed : (parsed.entries || []);
@@ -1066,16 +1082,49 @@ function openWith(id, withHistory) {
   });
 }
 
+/* 输入框左下角元信息：当前会话的 model · role（对齐 TUI 输入框左下角）。
+   数据来自 state.lastList（/api/sessions 已含 model/role 字段）；幂等：
+   内容没变就不动 DOM。两者都空 → hidden。 */
+function updateComposerMeta() {
+  const meta = els.composerMeta;
+  if (!meta) return;
+  const s = (state.lastList || []).find((x) => x.id === state.sessionId);
+  const model = s && s.model ? String(s.model) : "";
+  const role = s && s.role ? String(s.role) : "";
+  if (!model && !role) {
+    if (!meta.hidden || meta.textContent !== "") {   // 幂等：仅在变化时触碰 DOM
+      meta.hidden = true;
+      meta.textContent = "";
+      meta.title = "";
+    }
+    return;
+  }
+  const text = role ? model + " · " + role : model;
+  if (meta.hidden || meta.textContent !== text) {
+    meta.hidden = false;
+    meta.textContent = text;
+    meta.title = s.model || "";   // 完整 model 名（可能被省略号截断）
+  }
+}
+
+/* 切走前保存当前会话视图状态（消息 DOM、滚动位置、分页游标、输入草稿），
+   切回时原样恢复、不重新加载历史。 */
+function saveSessionState() {
+  if (!state.sessionId || state.view !== "chat") return;
+  state.sessionStates[state.sessionId] = {
+    html: els.messages.innerHTML,
+    scrollTop: els.messages.scrollTop,
+    nextBeforeSeq: state.nextBeforeSeq,
+    olderDone: state.olderDone,
+    draft: els.promptInput.value,
+  };
+}
+
 function openSession(id) {
+  saveSessionState();          // 切走：保存当前会话（消息/滚动/分页/草稿）
   stopSSE();
   state.sessionId = id;
   state.view = "chat";
-  state.initSource = null;
-  state.nextBeforeSeq = null;
-  state.loadingOlder = false;
-  state.olderDone = false;
-  state.status = "Idle";
-  state.acc = newAccumulator();
   // 任何手动打开都会取代/完成 URL 深链，避免返回列表后深链再次触发
   state.deepLink.handled = true;
   state.deepLink.pending = null;
@@ -1083,18 +1132,48 @@ function openSession(id) {
   els.chatView.classList.remove("hidden");
   els.topActions.hidden = false;
   els.chatSessionId.textContent = "会话 " + id;
-  // 清空消息区（jumpBottomBtn 在 messages 外，不受影响）
-  els.messages.innerHTML = "";
-  els.jumpBottomBtn.hidden = true;
-  userScrolled = false;   // 打开新会话：恢复自动跟随
+  updateComposerMeta();          // 显示当前会话 model · role（缓存/首开/恢复共用）
   els.usageInfo.textContent = "";
   applyStatus("Idle");
   refreshBanner();
   history.replaceState(null, "", "/?session=" + encodeURIComponent(id));
-  openWith(id, true);
+  const cached = state.sessionStates[id];
+  if (cached) {
+    // 切回缓存过的会话：恢复视图，不重新加载历史；SSE 重连但跳过 snapshot
+    state.initSource = "restored";
+    state.nextBeforeSeq = cached.nextBeforeSeq;
+    state.loadingOlder = false;
+    state.olderDone = cached.olderDone;
+    state.acc = newAccumulator();
+    els.messages.innerHTML = cached.html;
+    els.messages.scrollTop = cached.scrollTop;
+    els.promptInput.value = cached.draft || "";
+    autosizeInput();
+    const m = els.messages;
+    const atBottom = m.scrollHeight - m.scrollTop - m.clientHeight <= 4;
+    userScrolled = !atBottom;      // 恢复到非底部位置：不自动跟随滚动
+    els.jumpBottomBtn.hidden = atBottom;
+    openWith(id, false);           // 只重连 SSE，跳过历史加载与 snapshot
+  } else {
+    // 首次打开：走既有流程（加载历史 + SSE）
+    state.initSource = null;
+    state.nextBeforeSeq = null;
+    state.loadingOlder = false;
+    state.olderDone = false;
+    state.acc = newAccumulator();
+    // 清空消息区（jumpBottomBtn 在 messages 外，不受影响）
+    els.messages.innerHTML = "";
+    els.jumpBottomBtn.hidden = true;
+    els.promptInput.value = "";    // 输入框草稿跟随会话：新会话从空开始
+    autosizeInput();
+    userScrolled = false;          // 打开新会话：恢复自动跟随
+    openWith(id, true);
+  }
+  renderSidebarTree();             // 更新 .current 高亮
 }
 
 function backToList() {
+  saveSessionState();          // 返回列表也保存视图状态：再次打开该会话时恢复
   stopSSE();
   state.sessionId = null;
   state.view = "list";
@@ -1182,7 +1261,7 @@ function stopPolling() {
 }
 
 /* =====================================================================
- * 后台任务 / 子代理面板
+ * 会话侧边栏：运行中任务（复用原任务面板逻辑，渲染进 #sidebarTasks）
  * ===================================================================*/
 /* GET /api/tasks → 任务数组；失败/无 token 返回 null（调用方决定如何处理） */
 async function fetchTasks() {
@@ -1201,32 +1280,28 @@ async function fetchTasks() {
   }
 }
 
-function updateTasksBtn(count) {
+/* 任务数显示在侧边栏「运行中任务 (N)」标题上（原顶栏任务按钮徽标） */
+function updateTasksTitle(count) {
   const n = Number(count) || 0;
-  els.tasksBtn.textContent = "";
-  els.tasksBtn.appendChild(document.createTextNode("任务" + (n > 0 ? " " : "")));
-  if (n > 0) {
-    els.tasksBtn.appendChild(el("span", "badge-count", String(n)));
-    els.tasksBtn.classList.add("has-tasks");
-  } else {
-    els.tasksBtn.classList.remove("has-tasks");
+  if (els.sidebarTasksTitle) {
+    els.sidebarTasksTitle.textContent = "运行中任务" + (n > 0 ? " (" + n + ")" : "");
   }
 }
 
-/* 徽标轮询（独立 3s，面板关闭时也运行）；序号防竞态 */
+/* 徽标轮询（独立 3s，侧边栏关闭时也运行）；序号防竞态 */
 async function pollTasksBadge() {
   const seq = ++state.tasks.badgeSeq;
   const tasks = await fetchTasks();
   if (tasks === null || seq !== state.tasks.badgeSeq) return;  // 过期响应丢弃
-  updateTasksBtn(tasks.length);
+  updateTasksTitle(tasks.length);
 }
 
-/* 面板列表刷新（面板打开时 2s 一次） */
-async function refreshTasksPanel() {
+/* 侧边栏打开时的任务列表刷新（2s 一次） */
+async function refreshSidebarTasks() {
   const seq = ++state.tasks.panelSeq;
   const tasks = await fetchTasks();
-  if (tasks === null || seq !== state.tasks.panelSeq || !state.tasks.open) return;
-  renderTaskList(tasks);
+  if (tasks === null || seq !== state.tasks.panelSeq || !state.sidebar.open) return;
+  renderTaskList(tasks, els.sidebarTasks);
 }
 
 function shortTaskLabel(t) {
@@ -1235,8 +1310,8 @@ function shortTaskLabel(t) {
   return truncate(t.full_command || t.label || "", 80);
 }
 
-function renderTaskList(tasks) {
-  const list = els.tasksList;
+function renderTaskList(tasks, container) {
+  const list = container || els.sidebarTasks;
   list.innerHTML = "";
   if (!tasks.length) {
     list.appendChild(el("div", "tasks-empty", "暂无运行中的任务"));
@@ -1282,7 +1357,7 @@ async function cancelTask(t) {
     if (res.status === 404) { setBanner("⚠ 任务不存在（可能已完成）。"); return; }
     if (res.status !== 204) throw new Error("HTTP " + res.status);
     // 成功：立即刷新列表 + 徽标
-    await refreshTasksPanel();
+    await refreshSidebarTasks();
     await pollTasksBadge();
   } catch (e) {
     setBanner("⚠ 取消失败：" + e.message);
@@ -1291,19 +1366,192 @@ async function cancelTask(t) {
   }
 }
 
-function openTasksPanel() {
-  if (state.tasks.open) return;
-  state.tasks.open = true;
-  els.tasksOverlay.hidden = false;
-  refreshTasksPanel();
+function openSidebar() {
+  if (state.sidebar.open) return;
+  state.sidebar.open = true;
+  renderSidebarTree();                 // 树可能已随轮询刷新；打开时确保渲染
+  els.sidebarOverlay.hidden = false;
+  els.sidebar.hidden = false;
+  // 双 rAF：先让浏览器以 -100% 位姿渲染一帧，再加 .open 触发左滑过渡
+  requestAnimationFrame(() => requestAnimationFrame(() => els.sidebar.classList.add("open")));
+  refreshSidebarTasks();
   stopTasksPanelPolling();
-  state.tasks.panelTimer = setInterval(refreshTasksPanel, 2000);
+  state.tasks.panelTimer = setInterval(refreshSidebarTasks, 2000);
+  // 聊天视图下会话轮询已停：补拉一次列表，树与 busy/current 状态保持新鲜
+  if (state.view === "chat") refreshSessionsForSidebar();
 }
 
-function closeTasksPanel() {
-  state.tasks.open = false;
-  els.tasksOverlay.hidden = true;
+function closeSidebar() {
+  if (!state.sidebar.open) return;
+  state.sidebar.open = false;
+  els.sidebarOverlay.hidden = true;
+  els.sidebar.classList.remove("open");
   stopTasksPanelPolling();
+  window.setTimeout(() => {
+    if (!state.sidebar.open) els.sidebar.hidden = true;
+  }, 220);
+}
+
+/* 聊天视图下补拉会话列表（pollSessions 只在列表视图跑）；失败静默保留旧数据 */
+async function refreshSessionsForSidebar() {
+  if (!state.token) return;
+  try {
+    const res = await api("/api/sessions");
+    if (!res.ok) return;
+    const list = await res.json();
+    if (!Array.isArray(list)) return;
+    state.lastList = list;
+    renderSidebarTree();
+    updateComposerMeta();          // 聊天视图下列表刷新：同步 model/role（幂等）
+  } catch (e) { /* 静默：保留旧列表 */ }
+}
+
+/* =====================================================================
+ * 会话侧边栏：会话树
+ * 主会话（parent_session_id 空）为根，默认折叠；subagent 挂父节点下
+ * （缩进 + 「子」徽章），展开才渲染子节点；孤儿 subagent 归入「未关联」。
+ * 数据来自 state.lastList（pollSessions）。列表未变化时跳过重绘，
+ * 保留展开状态与滚动位置。
+ * ===================================================================*/
+let lastTreeSig = "";
+
+function sidebarTreeSig() {
+  const list = state.lastList || [];
+  // 签名含当前会话 id：打开/切换会话后重绘以更新 .current 高亮
+  return state.sessionId + "|" + JSON.stringify(list.map((s) => [
+    s.id, s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
+    s.entry_count ?? 0, s.parent_session_id || "",
+  ]));
+}
+
+function renderSidebarTree() {
+  const tree = els.sidebarTree;
+  if (!tree) return;
+  const sig = sidebarTreeSig();
+  if (sig === lastTreeSig) return;   // 数据未变：保留展开/滚动状态
+  lastTreeSig = sig;
+  const prevScroll = tree.scrollTop;
+  tree.innerHTML = "";
+  const list = state.lastList || [];
+  if (!list.length) {
+    tree.appendChild(el("div", "tree-empty", "暂无会话"));
+    return;
+  }
+  const childrenByParent = new Map();
+  for (const s of list) {
+    if (!s.parent_session_id) continue;
+    if (!childrenByParent.has(s.parent_session_id)) childrenByParent.set(s.parent_session_id, []);
+    childrenByParent.get(s.parent_session_id).push(s);
+  }
+  const rootIds = new Set(list.filter((s) => !s.parent_session_id).map((s) => s.id));
+  const orphans = list.filter((s) => s.parent_session_id && !rootIds.has(s.parent_session_id));
+  for (const s of list) {
+    if (s.parent_session_id) continue;
+    tree.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || []));
+  }
+  if (orphans.length) {
+    tree.appendChild(buildTreeGroup("未关联", orphans));
+  }
+  tree.scrollTop = prevScroll;
+}
+
+function buildTreeRoot(s, kids) {
+  const node = el("div", "tree-node");
+  const row = el("div", "tree-row" + (state.sessionId === s.id ? " current" : ""));
+  const hasKids = kids.length > 0;
+  const toggle = el("span", "tree-toggle", hasKids ? "▸" : "");
+  if (hasKids) {
+    toggle.title = "展开 / 收起子会话";
+    toggle.addEventListener("click", (ev) => {
+      ev.stopPropagation();          // 点击 ▸ 只展开/收起，不切换会话
+      toggleSidebarNode(s.id, toggle, kids);
+    });
+  }
+  const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
+  const idEl = el("span", "tree-id", shortId(s.id));
+  idEl.title = s.id;
+  const count = el("span", "tree-count", (s.entry_count ?? 0) + " 条");
+  row.append(toggle, dot, idEl, count);
+  row.title = s.id + (s.model ? " · " + s.model : "") + (s.busy ? "（处理中）" : "");
+  row.addEventListener("click", () => {
+    if (s.active === false) { resumeSession(s.id); return; }   // 与列表页一致：历史会话先恢复
+    openSession(s.id);
+  });
+  node.appendChild(row);
+  if (hasKids) {
+    const children = el("div", "tree-children");
+    children.hidden = true;
+    if (state.sidebar.expanded.has(s.id)) {
+      children.hidden = false;
+      toggle.classList.add("open");
+      toggle.textContent = "▾";
+      renderTreeChildren(children, kids);
+    }
+    node.appendChild(children);
+  }
+  return node;
+}
+
+function toggleSidebarNode(id, toggle, kids) {
+  const children = toggle.closest(".tree-node").querySelector(".tree-children");
+  if (!children) return;
+  if (children.hidden) {
+    children.hidden = false;
+    toggle.classList.add("open");
+    toggle.textContent = "▾";
+    renderTreeChildren(children, kids);   // 展开时才渲染子节点（400+ 会话不拖慢树）
+    state.sidebar.expanded.add(id);
+  } else {
+    children.hidden = true;
+    toggle.classList.remove("open");
+    toggle.textContent = "▸";
+    state.sidebar.expanded.delete(id);
+  }
+}
+
+function renderTreeChildren(container, kids) {
+  container.innerHTML = "";
+  for (const k of kids) {
+    const row = el("div", "tree-row tree-row-child" + (state.sessionId === k.id ? " current" : ""));
+    const dot = el("span", "busy-dot" + (k.busy ? " busy" : ""));
+    const idEl = el("span", "tree-id", shortId(k.id));
+    idEl.title = k.id;
+    const badge = el("span", "child-badge", "子");
+    row.append(dot, idEl, badge);
+    row.addEventListener("click", () => {
+      if (k.active === false) { resumeSession(k.id); return; }
+      openSession(k.id);
+    });
+    container.appendChild(row);
+  }
+}
+
+/* 「未关联」分组：孤儿 subagent 的根节点，默认折叠 */
+function buildTreeGroup(label, kids) {
+  const node = el("div", "tree-node");
+  const row = el("div", "tree-row");
+  const toggle = el("span", "tree-toggle", "▸");
+  toggle.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const children = toggle.closest(".tree-node").querySelector(".tree-children");
+    if (children.hidden) {
+      children.hidden = false;
+      toggle.classList.add("open");
+      toggle.textContent = "▾";
+    } else {
+      children.hidden = true;
+      toggle.classList.remove("open");
+      toggle.textContent = "▸";
+    }
+  });
+  const idEl = el("span", "tree-id tree-group", label);
+  row.append(toggle, idEl);
+  node.appendChild(row);
+  const children = el("div", "tree-children");
+  children.hidden = true;
+  renderTreeChildren(children, kids);
+  node.appendChild(children);
+  return node;
 }
 
 function stopTasksPanelPolling() {
@@ -1330,17 +1578,15 @@ els.searchInput.addEventListener("input", () => {
   renderSessionList(state.lastList);   // 轮询仍会全量重绘，但搜索词留在 state 里，过滤持续生效
 });
 els.backBtn.addEventListener("click", backToList);
-els.backBtn.addEventListener("click", closeTasksPanel);   // 返回列表时收起任务面板
-els.tasksBtn.addEventListener("click", () => {
-  if (state.tasks.open) closeTasksPanel();
-  else openTasksPanel();
+els.backBtn.addEventListener("click", closeSidebar);   // 返回列表时收起侧边栏
+els.sidebarBtn.addEventListener("click", () => {
+  if (state.sidebar.open) closeSidebar();
+  else openSidebar();
 });
-els.tasksCloseBtn.addEventListener("click", closeTasksPanel);
-els.tasksOverlay.addEventListener("click", (e) => {
-  if (e.target === els.tasksOverlay) closeTasksPanel();   // 点遮罩关闭
-});
+els.sidebarCloseBtn.addEventListener("click", closeSidebar);
+els.sidebarOverlay.addEventListener("click", closeSidebar);   // 点遮罩关闭
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && state.tasks.open) closeTasksPanel();
+  if (e.key === "Escape" && state.sidebar.open) closeSidebar();
 });
 els.sendBtn.addEventListener("click", sendPrompt);
 els.cancelBtn.addEventListener("click", cancelTurn);
@@ -1380,8 +1626,8 @@ function init() {
   if (dl) state.deepLink.pending = dl;
   startPolling();
   pollSessions();
-  // 后台任务徽标：独立轻量轮询，面板关闭时也保持更新（无 token 时静默跳过）
-  updateTasksBtn(0);
+  // 任务数（侧边栏标题）：独立轻量轮询，侧边栏关闭时也保持更新（无 token 时静默跳过）
+  updateTasksTitle(0);
   startTasksBadgePolling();
   pollTasksBadge();
 }
