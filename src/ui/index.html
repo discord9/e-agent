@@ -1058,6 +1058,33 @@ function handleSSEBlock(block, id) {
     return;
   }
   if (id !== state.sessionId || state.view !== "chat") return;  // 已切换会话
+  if (eventName === "resync") {
+    // Lag 追平：后端重发完整事件日志（AgentEvent 数组，{type,data} 形状）。
+    // 与 snapshot 不同，无论初始渲染来源都强制整体替换 transcript。
+    try {
+      const parsed = JSON.parse(data);
+      const events = Array.isArray(parsed) ? parsed : (parsed.events || []);
+      state.acc = newAccumulator();
+      els.messages.innerHTML = "";
+      const NAME = {
+        prompt_queued: "PromptQueued", prompt_consumed: "PromptConsumed",
+        user_prompt: "UserPrompt", assistant_text: "AssistantText",
+        assistant_delta: "AssistantDelta", reasoning_delta: "ReasoningDelta",
+        tool_call: "ToolCall", tool_result: "ToolResult",
+        notice: "Notice", error: "Error",
+        background_completed: "BackgroundCompleted",
+        background_completion_notice: "BackgroundCompletionNotice",
+        usage: "Usage",
+      };
+      for (const ev of events) {
+        const name = (ev && NAME[ev.type]) || "Notice";
+        const payload = (ev && ev.data !== undefined) ? ev.data : (ev || {});
+        applyLiveEvent(name, payload);
+      }
+      state.initSource = "snapshot";
+    } catch (e) { /* 忽略坏数据 */ }
+    return;
+  }
   if (state.initSource === null) return;   // 初始渲染未完成前的 live 事件丢弃
 
   let payload = null;

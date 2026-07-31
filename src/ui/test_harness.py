@@ -195,6 +195,14 @@ async function main(){
     chk("reconnect resets initSource", state.initSource===null || state.initSource!=null, "after="+state.initSource);
     await flush();
     chk("reconnect reconnected", state.sse.ctrl!=null);
+
+    // resync 追平：注入一个 resync 块，验证强制整体替换 transcript 并按事件日志重放
+    handleSSEBlock("event: resync\ndata: [{\"type\":\"user_prompt\",\"data\":\"重放-用户\"},{\"type\":\"assistant_delta\",\"data\":\"重放-\"},{\"type\":\"assistant_delta\",\"data\":\"增量\"}]\n\n", state.sessionId);
+    const t3 = allText();
+    chk("resync replaces transcript", !t3.includes("你好，帮我看看") && t3.includes("重放-用户"));
+    chk("resync replayed deltas", t3.includes("重放-") && t3.includes("增量"));
+    chk("resync rerenders", elsById["messages"]._children.length >= 2,
+        "n=" + elsById["messages"]._children.length);
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);

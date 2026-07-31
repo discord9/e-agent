@@ -260,44 +260,25 @@ impl SessionRegistry {
 // Wire DTOs
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-/// Busy-state JSON carried by `event: status` SSE frames and by the session
-/// metadata endpoints. Kept as a server-side DTO so the wire shape is
-/// independent of the runner's internal enum.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum StatusDto {
-    Idle,
-    Busy,
-    Compacting,
-    Finished { result: SessionResultDto },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SessionResultDto {
-    Completed { answer: Option<String> },
-    Failed { error: String },
-    Cancelled,
-    Closed,
-}
-
-impl From<SessionStatus> for StatusDto {
-    fn from(status: SessionStatus) -> Self {
-        use crate::runner::SessionResult;
-        match status {
-            SessionStatus::Idle => StatusDto::Idle,
-            SessionStatus::Busy => StatusDto::Busy,
-            SessionStatus::Compacting => StatusDto::Compacting,
-            SessionStatus::Finished(result) => StatusDto::Finished {
-                result: match result {
-                    SessionResult::Completed(answer) => SessionResultDto::Completed { answer },
-                    SessionResult::Failed(error) => SessionResultDto::Failed { error },
-                    SessionResult::Cancelled => SessionResultDto::Cancelled,
-                    SessionResult::Closed => SessionResultDto::Closed,
-                },
-            },
-        }
+/// Frontend status string: CamelCase, exactly the values the UI compares
+/// against (`statusLabel` / `statusChipClass` / `applyStatus` compare
+/// `=== "Busy"` etc.). Finished details are intentionally omitted: the
+/// frontend renders the Finished chip from the bare string and never reads
+/// the result payload.
+fn status_string(status: &SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Idle => "Idle",
+        SessionStatus::Busy => "Busy",
+        SessionStatus::Compacting => "Compacting",
+        SessionStatus::Finished(_) => "Finished",
     }
+}
+
+/// Wire payload of `event: status` SSE frames. The frontend does
+/// `applyStatus(JSON.parse(data).status)`, so the frame must be an object
+/// with a `status` key carrying the CamelCase string (not a bare string).
+fn status_json(status: &SessionStatus) -> serde_json::Value {
+    serde_json::json!({ "status": status_string(status) })
 }
 
 /// Session metadata for `GET /api/sessions` and `POST /api/sessions`.
@@ -307,17 +288,34 @@ pub struct SessionMeta {
     pub model: String,
     pub role: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    pub status: StatusDto,
+    /// CamelCase frontend status string (`"Idle" | "Busy" | "Compacting" |
+    /// "Finished"`); the UI's `statusLabel`/`statusChipClass`/`applyStatus`
+    /// compare against these exact values.
+    pub status: String,
+    /// Number of persisted `SessionEntry` values (the list renders "N 条").
+    pub entry_count: usize,
+    /// True while a turn is in flight (Busy or Compacting); the list renders
+    /// the busy dot from this.
+    pub busy: bool,
 }
 
-fn session_meta(id: &str, session: &LiveSession) -> SessionMeta {
+async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -> SessionMeta {
     let status = session.handle.status();
+    let status = status.borrow().clone();
+    let entry_count = session
+        .store
+        .load(root, id)
+        .await
+        .map(|loaded| loaded.entries.len())
+        .unwrap_or(0);
     SessionMeta {
         id: id.to_owned(),
         model: session.model_name.clone(),
         role: session.role_name.clone(),
         created_at: session.created_at,
-        status: StatusDto::from(status.borrow().clone()),
+        status: status_string(&status).to_owned(),
+        entry_count,
+        busy: matches!(status, SessionStatus::Busy | SessionStatus::Compacting),
     }
 }
 
@@ -330,12 +328,11 @@ fn error(status: StatusCode, message: impl Into<String>) -> (StatusCode, String)
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMeta>> {
-    let mut metas: Vec<SessionMeta> = state
-        .registry
-        .list()
-        .iter()
-        .map(|(id, session)| session_meta(id, session))
-        .collect();
+    let root = state.factory.root();
+    let mut metas: Vec<SessionMeta> = Vec::with_capacity(state.registry.list().len());
+    for (id, session) in state.registry.list() {
+        metas.push(session_meta(&id, &session, root).await);
+    }
     metas.sort_by_key(|meta| meta.created_at);
     Json(metas)
 }
@@ -345,6 +342,10 @@ struct CreateSessionBody {
     /// Optional caller-chosen id; defaults to a fresh `web-…` id.
     #[serde(default)]
     id: Option<String>,
+    /// Optional first prompt; queued on the runner before it starts so the
+    /// session begins a turn immediately (empty/whitespace = no prompt).
+    #[serde(default)]
+    initial_prompt: Option<String>,
 }
 
 async fn create_session(
@@ -366,9 +367,10 @@ async fn create_session(
         ));
     }
     let built = build_session(&state.factory, &id).await?;
+    let initial_prompt = body.initial_prompt.filter(|p| !p.trim().is_empty());
     let session = Arc::new(LiveSession {
         handle: built.handle,
-        task: built.runner.start(None),
+        task: built.runner.start(initial_prompt),
         store: built.store,
         background: built.background,
         sessions: built.sessions,
@@ -377,7 +379,11 @@ async fn create_session(
         created_at: chrono::Utc::now(),
     });
     state.registry.insert(id.clone(), session.clone());
-    Ok((StatusCode::CREATED, Json(session_meta(&id, &session))))
+    let root = state.factory.root();
+    Ok((
+        StatusCode::CREATED,
+        Json(session_meta(&id, &session, root).await),
+    ))
 }
 
 /// One session build from the shared factory. Web sessions are interactive:
@@ -401,6 +407,9 @@ fn live(state: &AppState, id: &str) -> Result<Arc<LiveSession>, (StatusCode, Str
 
 #[derive(Deserialize)]
 struct PromptBody {
+    /// The frontend sends `JSON.stringify({ text })`; accept both `text`
+    /// and `prompt` so the endpoint is agnostic to the client's field name.
+    #[serde(alias = "text")]
     prompt: String,
 }
 
@@ -542,11 +551,12 @@ async fn session_history(
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 /// `GET /api/sessions/{id}/events` — one `event: snapshot` carrying the full
-/// event array, one initial `event: status`, then live `event: message`
-/// frames plus `event: status` on state changes and a `: ping` comment every
-/// 15s. If a client ever falls behind the broadcast buffer, a fresh
-/// `event: snapshot` is re-sent (the frontend replaces its view) and the
-/// stream continues from there.
+/// event array, one initial `event: status`, then live frames named after
+/// the [`AgentEvent`] variant (CamelCase: `UserPrompt`, `AssistantDelta`,
+/// `ToolCall`, …) plus `event: status` on state changes and a `: ping`
+/// comment every 15s. If a client ever falls behind the broadcast buffer,
+/// a fresh `event: resync` with the full event array is re-sent (the
+/// frontend force-replaces its transcript) and the stream continues.
 async fn session_events(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -611,16 +621,18 @@ async fn forward_events(
             },
             event = live.recv() => match event {
                 Ok(event) => {
-                    if !send(message_event(&event)) {
+                    if !send(live_event(&event)) {
                         return;
                     }
                 }
                 Err(RecvError::Lagged(_)) => {
                     // Client fell behind the broadcast buffer; resync with a
-                    // fresh snapshot. A deleted session ends the stream.
+                    // fresh `event: resync` (unlike `snapshot`, the frontend
+                    // never skips it — it force-replaces the transcript). A
+                    // deleted session ends the stream.
                     let Some(session) = registry.get(&id) else { return };
                     let (snapshot, new_live, new_status) = session.handle.attach();
-                    if !send(snapshot_event(&snapshot)) {
+                    if !send(resync_event(&snapshot)) {
                         return;
                     }
                     if !send(status_event(&new_status.borrow().clone())) {
@@ -645,14 +657,82 @@ fn snapshot_event(events: &[AgentEvent]) -> Result<Event, Error> {
     Event::default().event("snapshot").json_data(events)
 }
 
-fn message_event(event: &AgentEvent) -> Result<Event, Error> {
-    Event::default().event("message").json_data(event)
+/// Lag resync: the full event log re-sent when a client falls behind the
+/// broadcast buffer. The frontend's `resync` branch force-replaces the
+/// transcript (unlike `snapshot`, which it skips once history rendered).
+fn resync_event(events: &[AgentEvent]) -> Result<Event, Error> {
+    Event::default().event("resync").json_data(events)
+}
+
+fn live_event(event: &AgentEvent) -> Result<Event, Error> {
+    Event::default()
+        .event(event_name(event))
+        .json_data(event_payload(event))
 }
 
 fn status_event(status: &SessionStatus) -> Result<Event, Error> {
     Event::default()
         .event("status")
-        .json_data(StatusDto::from(status.clone()))
+        .json_data(status_json(status))
+}
+
+/// SSE event name for a live [`AgentEvent`]: the Rust variant name in
+/// CamelCase, matching the frontend's `applyLiveEvent` switch
+/// (`UserPrompt`, `AssistantDelta`, `ToolCall`, …). This deliberately
+/// differs from the serde `type` tag (`user_prompt` vs `UserPrompt`).
+fn event_name(event: &AgentEvent) -> &'static str {
+    match event {
+        AgentEvent::PromptQueued(_) => "PromptQueued",
+        AgentEvent::PromptConsumed => "PromptConsumed",
+        AgentEvent::UserPrompt(_) => "UserPrompt",
+        AgentEvent::AssistantText(_) => "AssistantText",
+        AgentEvent::AssistantDelta(_) => "AssistantDelta",
+        AgentEvent::ReasoningDelta(_) => "ReasoningDelta",
+        AgentEvent::ToolCall { .. } => "ToolCall",
+        AgentEvent::ToolResult { .. } => "ToolResult",
+        AgentEvent::Notice(_) => "Notice",
+        AgentEvent::Error(_) => "Error",
+        AgentEvent::BackgroundCompleted { .. } => "BackgroundCompleted",
+        AgentEvent::BackgroundCompletionNotice { .. } => "BackgroundCompletionNotice",
+        AgentEvent::Usage { .. } => "Usage",
+    }
+}
+
+/// Live-event payload for the web frontend: a flat object (or bare string)
+/// whose fields match the keys `pickText` / the per-event handlers read.
+/// The `{type,data}` serde shape would leak the snake_case `type` tag into
+/// `pickText`'s first-string fallback (Object.values would return
+/// `"user_prompt"` before the real text), so the wire payload is derived
+/// per-variant instead.
+fn event_payload(event: &AgentEvent) -> serde_json::Value {
+    use serde_json::json;
+    match event {
+        AgentEvent::PromptQueued(text)
+        | AgentEvent::UserPrompt(text)
+        | AgentEvent::AssistantText(text)
+        | AgentEvent::Notice(text) => json!({ "text": text }),
+        AgentEvent::AssistantDelta(text) | AgentEvent::ReasoningDelta(text) => {
+            json!({ "delta": text })
+        }
+        AgentEvent::PromptConsumed => json!({}),
+        AgentEvent::Error(text) => json!({ "error": text }),
+        AgentEvent::ToolCall { name, arguments } => {
+            json!({ "name": name, "arguments": arguments })
+        }
+        AgentEvent::ToolResult { is_error, content } => {
+            json!({ "is_error": is_error, "content": content })
+        }
+        AgentEvent::BackgroundCompleted { id, output, label }
+        | AgentEvent::BackgroundCompletionNotice { id, output, label } => {
+            json!({ "id": id, "output": output, "label": label })
+        }
+        AgentEvent::Usage {
+            context_input,
+            session,
+        } => {
+            json!({ "context_input": context_input, "session": session })
+        }
+    }
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -780,25 +860,43 @@ mod tests {
     }
 
     #[test]
-    fn status_dto_wire_shape() {
+    fn status_string_is_camel_case_frontend_values() {
         use crate::runner::SessionResult;
+        assert_eq!(status_string(&SessionStatus::Idle), "Idle");
+        assert_eq!(status_string(&SessionStatus::Busy), "Busy");
+        assert_eq!(status_string(&SessionStatus::Compacting), "Compacting");
+        // Finished detail is intentionally dropped: the frontend renders the
+        // chip from the bare string and never reads the result payload.
         assert_eq!(
-            serde_json::to_value(StatusDto::from(SessionStatus::Idle)).unwrap(),
-            serde_json::json!({"status": "idle"})
+            status_string(&SessionStatus::Finished(SessionResult::Completed(Some(
+                "hi".into()
+            )))),
+            "Finished"
         );
         assert_eq!(
-            serde_json::to_value(StatusDto::from(SessionStatus::Finished(
-                SessionResult::Completed(Some("hi".into()))
-            )))
-            .unwrap(),
-            serde_json::json!({"status": "finished", "result": {"type": "completed", "answer": "hi"}})
+            status_string(&SessionStatus::Finished(SessionResult::Failed(
+                "boom".into()
+            ))),
+            "Finished"
+        );
+    }
+
+    #[test]
+    fn status_json_is_object_with_camel_case_status() {
+        use serde_json::json;
+        // The frontend does `applyStatus(JSON.parse(data).status)`: the frame
+        // must be an object carrying the CamelCase string.
+        assert_eq!(status_json(&SessionStatus::Idle), json!({"status": "Idle"}));
+        assert_eq!(status_json(&SessionStatus::Busy), json!({"status": "Busy"}));
+        assert_eq!(
+            status_json(&SessionStatus::Compacting),
+            json!({"status": "Compacting"})
         );
         assert_eq!(
-            serde_json::to_value(StatusDto::from(SessionStatus::Finished(
-                SessionResult::Failed("boom".into())
-            )))
-            .unwrap(),
-            serde_json::json!({"status": "finished", "result": {"type": "failed", "error": "boom"}})
+            status_json(&SessionStatus::Finished(
+                crate::runner::SessionResult::Cancelled
+            )),
+            json!({"status": "Finished"})
         );
     }
 
@@ -817,6 +915,165 @@ mod tests {
             serde_json::to_value(AgentEvent::Notice("hi".into())).unwrap(),
             serde_json::json!({"type": "notice", "data": "hi"})
         );
+    }
+
+    /// Frontend contract: live SSE frames are named after the Rust variant
+    /// (CamelCase) — `applyLiveEvent` switches on these exact strings.
+    #[test]
+    fn event_name_is_camel_case_variant() {
+        let name = |event: &AgentEvent| event_name(event);
+        assert_eq!(name(&AgentEvent::PromptQueued("x".into())), "PromptQueued");
+        assert_eq!(name(&AgentEvent::PromptConsumed), "PromptConsumed");
+        assert_eq!(name(&AgentEvent::UserPrompt("x".into())), "UserPrompt");
+        assert_eq!(
+            name(&AgentEvent::AssistantText("x".into())),
+            "AssistantText"
+        );
+        assert_eq!(
+            name(&AgentEvent::AssistantDelta("x".into())),
+            "AssistantDelta"
+        );
+        assert_eq!(
+            name(&AgentEvent::ReasoningDelta("x".into())),
+            "ReasoningDelta"
+        );
+        assert_eq!(
+            name(&AgentEvent::ToolCall {
+                name: "bash".into(),
+                arguments: "ls".into()
+            }),
+            "ToolCall"
+        );
+        assert_eq!(
+            name(&AgentEvent::ToolResult {
+                is_error: false,
+                content: "o".into()
+            }),
+            "ToolResult"
+        );
+        assert_eq!(name(&AgentEvent::Notice("x".into())), "Notice");
+        assert_eq!(name(&AgentEvent::Error("x".into())), "Error");
+        assert_eq!(
+            name(&AgentEvent::BackgroundCompleted {
+                id: 1,
+                output: "o".into(),
+                label: None
+            }),
+            "BackgroundCompleted"
+        );
+        assert_eq!(
+            name(&AgentEvent::BackgroundCompletionNotice {
+                id: 1,
+                output: "o".into(),
+                label: None,
+            }),
+            "BackgroundCompletionNotice"
+        );
+        assert_eq!(
+            name(&AgentEvent::Usage {
+                context_input: 1,
+                session: crate::agent::Usage {
+                    input_tokens: 1,
+                    output_tokens: 2
+                },
+            }),
+            "Usage"
+        );
+    }
+
+    /// Frontend contract: live payloads are flat — fields at the top level,
+    /// matching the keys `pickText` and the per-event handlers read. The
+    /// `{type,data}` serde shape would make `pickText`'s Object.values
+    /// fallback return the snake_case `type` tag instead of the real text.
+    #[test]
+    fn event_payload_is_flat_for_frontend() {
+        use serde_json::json;
+        assert_eq!(
+            event_payload(&AgentEvent::UserPrompt("hello".into())),
+            json!({"text": "hello"})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::AssistantText("done".into())),
+            json!({"text": "done"})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::AssistantDelta("正在".into())),
+            json!({"delta": "正在"})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::ReasoningDelta("推理".into())),
+            json!({"delta": "推理"})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::ToolCall {
+                name: "bash".into(),
+                arguments: "ls".into()
+            }),
+            json!({"name": "bash", "arguments": "ls"})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::ToolResult {
+                is_error: true,
+                content: "boom".into()
+            }),
+            json!({"is_error": true, "content": "boom"})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::Notice("hi".into())),
+            json!({"text": "hi"})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::Error("bad".into())),
+            json!({"error": "bad"})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::BackgroundCompleted {
+                id: 7,
+                output: "ok".into(),
+                label: Some("cargo".into()),
+            }),
+            json!({"id": 7, "output": "ok", "label": "cargo"})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::BackgroundCompletionNotice {
+                id: 7,
+                output: "ok".into(),
+                label: None,
+            }),
+            json!({"id": 7, "output": "ok", "label": null})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::Usage {
+                context_input: 1234,
+                session: crate::agent::Usage {
+                    input_tokens: 100,
+                    output_tokens: 50
+                },
+            }),
+            json!({"context_input": 1234, "session": {"input_tokens": 100, "output_tokens": 50}})
+        );
+    }
+
+    #[test]
+    fn prompt_body_accepts_text_and_prompt() {
+        // The frontend sends `JSON.stringify({ text })`.
+        let via_text: PromptBody = serde_json::from_str(r#"{"text": "hi"}"#).unwrap();
+        assert_eq!(via_text.prompt, "hi");
+        let via_prompt: PromptBody = serde_json::from_str(r#"{"prompt": "hi"}"#).unwrap();
+        assert_eq!(via_prompt.prompt, "hi");
+    }
+
+    #[test]
+    fn create_session_body_parses_initial_prompt() {
+        let with_prompt: CreateSessionBody =
+            serde_json::from_str(r#"{"initial_prompt": "hi"}"#).unwrap();
+        assert_eq!(with_prompt.initial_prompt.as_deref(), Some("hi"));
+        let empty: CreateSessionBody = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(empty.initial_prompt, None);
+        let with_id: CreateSessionBody =
+            serde_json::from_str(r#"{"id": "web-x", "initial_prompt": "go"}"#).unwrap();
+        assert_eq!(with_id.id.as_deref(), Some("web-x"));
+        assert_eq!(with_id.initial_prompt.as_deref(), Some("go"));
     }
 
     #[test]
@@ -862,11 +1119,46 @@ mod tests {
     #[test]
     fn sse_dto_helpers_build_frames() {
         // Frame construction must succeed; the wire JSON shapes are covered
-        // by `status_dto_wire_shape` and `agent_events_serialize_tagged`
-        // (axum 0.8's `Event` exposes no getters to assert the buffer on).
+        // by `status_json_is_object_with_camel_case_status`,
+        // `event_name_is_camel_case_variant` and
+        // `event_payload_is_flat_for_frontend` (axum 0.8's `Event` exposes
+        // no getters to assert the buffer on).
         assert!(snapshot_event(&[AgentEvent::Notice("hi".into())]).is_ok());
-        assert!(message_event(&AgentEvent::AssistantText("x".into())).is_ok());
+        assert!(resync_event(&[AgentEvent::Notice("hi".into())]).is_ok());
+        assert!(live_event(&AgentEvent::AssistantText("x".into())).is_ok());
+        assert!(
+            live_event(&AgentEvent::ToolCall {
+                name: "bash".into(),
+                arguments: "ls".into()
+            })
+            .is_ok()
+        );
         assert!(status_event(&SessionStatus::Busy).is_ok());
+    }
+
+    /// Frontend contract: `GET /api/sessions` items carry `status` as a
+    /// CamelCase string plus `entry_count` and `busy` (index.html reads
+    /// `s.id`, `s.status`, `s.model`, `s.created_at`, `s.entry_count`,
+    /// `s.busy`).
+    #[tokio::test]
+    async fn session_meta_has_frontend_fields() {
+        let (id, session) = live_session("web-abc");
+        let meta = session_meta(&id, &session, &std::env::temp_dir()).await;
+        let value = serde_json::to_value(&meta).unwrap();
+        for key in [
+            "id",
+            "model",
+            "role",
+            "created_at",
+            "status",
+            "entry_count",
+            "busy",
+        ] {
+            assert!(value.get(key).is_some(), "missing field {key}");
+        }
+        assert_eq!(value["status"], "Idle");
+        assert_eq!(value["busy"], false);
+        assert_eq!(value["entry_count"], 0);
     }
 
     /// The frontend contract (contract item 5): `SessionEntry` is internally
