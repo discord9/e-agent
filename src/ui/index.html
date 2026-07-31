@@ -116,6 +116,7 @@
     flex-direction: column;
     padding: 14px;
     gap: 14px;
+    position: relative;   /* 回到底部按钮的定位锚点（chatView） */
   }
   .view.hidden { display: none; }
 
@@ -272,11 +273,11 @@
     position: relative;   /* 回到底部按钮的定位锚点 */
   }
 
-  /* 回到底部按钮：右下角悬浮，离开底部时出现 */
+  /* 回到底部按钮：absolute 钉在聊天区右下（messages 区域底部、composer 上方） */
   .jump-bottom {
-    position: sticky;
-    bottom: 8px;
-    align-self: flex-end;
+    position: absolute;
+    right: 18px;
+    bottom: 110px;   /* composer 约 100px 高：按钮浮在 messages 区域右下角 */
     width: 34px;
     height: 34px;
     border-radius: 50%;
@@ -287,7 +288,6 @@
     cursor: pointer;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
     z-index: 5;
-    margin-top: -34px;   /* 悬浮在最后一条消息上方，不占文档流高度 */
   }
   .jump-bottom:hover { color: var(--blue); border-color: var(--blue); }
 
@@ -694,8 +694,10 @@
     <button id="compactBtn" class="compact-head" title="压缩上下文（释放 token）">压缩</button>
   </div>
   <div id="messages" class="messages">
-    <button id="jumpBottomBtn" class="jump-bottom" title="回到底部" hidden>↓</button>
   </div>
+  <!-- 回到底部按钮：chatView 的直接子节点（absolute 钉在聊天区右下，
+       不随 messages 滚动；在 messages 内会被滚动带走） -->
+  <button id="jumpBottomBtn" class="jump-bottom" title="回到底部" hidden>↓</button>
   <div class="composer">
     <div id="queueBar" class="queue-bar" hidden></div>
     <textarea id="promptInput" rows="1" placeholder="输入消息：Enter 发送，Shift+Enter 换行…"></textarea>
@@ -1415,10 +1417,8 @@ function renderEntries(entries, prepend) {
     state.acc = acc;
   } else {
     state.acc = acc;
-    // 清空消息区但保留 jumpBottomBtn（悬浮按钮在 messages 容器内）
-    while (els.messages.firstChild && els.messages.firstChild !== els.jumpBottomBtn) {
-      els.messages.removeChild(els.messages.firstChild);
-    }
+    // 清空消息区（jumpBottomBtn 在 messages 外，不受影响）
+    els.messages.innerHTML = "";
     els.jumpBottomBtn.hidden = true;
   }
   try {
@@ -1588,15 +1588,6 @@ function handleSSEBlock(block, id) {
     const backup = real.innerHTML;
     const temp = real.cloneNode(false);   // 同 class/id，无子节点
     temp.innerHTML = "";
-    // 保留 jumpBottomBtn：渲染后它仍在 real 里，但 temp 替换会覆盖——
-    // 在 temp 里也放一个同 id 的按钮占位，避免替换后按钮丢失。
-    const btn = document.createElement("button");
-    btn.id = "jumpBottomBtn";
-    btn.className = "jump-bottom";
-    btn.title = "回到底部";
-    btn.hidden = true;
-    btn.textContent = "↓";
-    temp.appendChild(btn);
     els.messages = temp;
     state.acc = newAccumulator();
     // 排队提示是「当下」状态，重放的是过去事件：清空 queueBar 并跳过重放
@@ -1624,8 +1615,6 @@ function handleSSEBlock(block, id) {
       }
       real.innerHTML = temp.innerHTML;
       els.messages = real;
-      // temp 里的按钮是新建节点：重新绑定 els（旧节点已被 innerHTML 替换销毁）
-      els.jumpBottomBtn = document.getElementById("jumpBottomBtn");
       state.initSource = "snapshot";
     } catch (e) {
       els.messages = real;
@@ -1805,10 +1794,8 @@ function openSession(id) {
   els.chatView.classList.remove("hidden");
   els.topActions.hidden = false;
   els.chatSessionId.textContent = "会话 " + id;
-  // 清空消息区但保留 jumpBottomBtn（悬浮按钮在 messages 容器内）
-  while (els.messages.firstChild && els.messages.firstChild !== els.jumpBottomBtn) {
-    els.messages.removeChild(els.messages.firstChild);
-  }
+  // 清空消息区（jumpBottomBtn 在 messages 外，不受影响）
+  els.messages.innerHTML = "";
   els.jumpBottomBtn.hidden = true;
   userScrolled = false;   // 打开新会话：恢复自动跟随
   els.usageInfo.textContent = "";
@@ -2089,6 +2076,7 @@ els.messages.addEventListener("scroll", (ev) => {
   if (m.scrollTop < 30) loadOlder();
 });
 els.jumpBottomBtn.addEventListener("click", () => {
+  userScrolled = false;   // 显式回底：覆盖「用户在看历史」的锁定
   scrollBottom(true);
   els.jumpBottomBtn.hidden = true;
 });
