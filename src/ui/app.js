@@ -196,6 +196,7 @@ const STATUS_LABEL = {
   Idle: "空闲", Busy: "处理中", Compacting: "压缩中", Finished: "已完成",
 };
 function statusLabel(s) {
+  if (s && s.startsWith("Failed")) return "失败";
   return STATUS_LABEL[s] || (s || "未知");
 }
 function statusChipClass(s) {
