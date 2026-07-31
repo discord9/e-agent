@@ -81,6 +81,9 @@ impl Tool for Bash {
             description.push_str(
                 " Bash mounts and read_file/write_file/edit_file capabilities are independent boundaries sharing this resolved path policy.",
             );
+            description.push_str(
+                " In a linked git worktree the main repository is mounted read-only (absolute path); bash can also reach it via relative traversal, but the file tools cannot — use the absolute path with them.",
+            );
             if self.protect_git {
                 description.push_str(
                     " The workspace `.git` metadata (directory or linked-worktree pointer) \

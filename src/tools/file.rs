@@ -31,7 +31,7 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         spec(
             "read_file",
-            "Read a UTF-8-ish file. Relative paths use the workspace; authorized external absolute paths are accepted. Lines are 1-indexed; long files are paged, use `offset` to continue reading.",
+            "Read a UTF-8-ish file. Relative paths are resolved inside the workspace and NEVER escape it (a capability boundary); external read-only roots — e.g. the main repository of a linked git worktree — are reachable ONLY via their absolute path. Lines are 1-indexed; long files are paged, use `offset` to continue reading.",
             json!({
                 "path": {"type": "string", "description": "workspace-relative or authorized external absolute path"},
                 "offset": {"type": "integer", "description": "first line to read, 1-indexed (default 1)"},
