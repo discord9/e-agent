@@ -345,7 +345,11 @@ impl SessionFactory {
         if let Some(rounds) = max_rounds {
             agent = agent.max_tool_rounds(rounds);
         }
-        let loaded = store.load(&self.root, &session).await?;
+        // Initial load: only the last compaction segment (the last
+        // Compaction entry + everything after it) — the agent context
+        // depends only on it. Older history is read on demand via
+        // store.load_older (TUI scrollback / Web history pagination).
+        let loaded = store.load_head(&self.root, &session).await?;
         let legacy = loaded.legacy;
         agent.restore_history(loaded.entries);
         agent.record_background_tasks_in(self.root.clone(), &session, store.clone());
