@@ -747,7 +747,11 @@ pub(crate) fn render_window(
             for segment in line.text.split('\n') {
                 markdown.render_line(segment);
             }
-        } else {
+        } else if line.kind != LineKind::Dim {
+            // Dim lines are asides (background completions, notices,
+            // cancelled-task hints) that interleave with a streaming
+            // assistant message; they must not reset the markdown state
+            // mid-message or the rest of the body loses its formatting.
             markdown = crate::markdown::MarkdownLines::new();
         }
     }

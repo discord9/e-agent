@@ -2108,6 +2108,42 @@ fn draw_renders_normal_lines_as_markdown() {
 }
 
 #[test]
+fn dim_line_does_not_reset_markdown_code_fence() {
+    // A background-completion aside (Dim) interleaving with a streaming
+    // assistant message must not reset the code-fence state: the fenced
+    // lines after the aside keep the panel background.
+    let backend = ratatui::backend::TestBackend::new(40, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    state.push_line("before\n```\ncode one".into(), LineKind::Normal);
+    state.push_line("[background task 3 completed]".to_string(), LineKind::Dim);
+    state.push_line("code two\n```\nafter".into(), LineKind::Normal);
+    state.window.follow_bottom = false;
+    draw(&mut terminal, &mut state).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let row_text = |y: u16| -> String {
+        (0..40)
+            .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    };
+    assert_eq!(row_text(0), "before");
+    assert_eq!(row_text(1), "```");
+    assert_eq!(row_text(2), "code one");
+    assert_eq!(row_text(3), "[background task 3 completed]");
+    assert_eq!(row_text(4), "code two");
+    assert_eq!(row_text(5), "```");
+    assert_eq!(row_text(6), "after");
+    // Both fenced lines keep the panel background across the Dim aside.
+    assert_eq!(buffer[(0, 2)].bg, SOLARIZED_LIGHT.element);
+    assert_eq!(buffer[(0, 4)].bg, SOLARIZED_LIGHT.element);
+    // Lines after the fence close are back on the body background.
+    assert_eq!(buffer[(0, 6)].bg, SOLARIZED_LIGHT.background);
+}
+
+#[test]
 fn markdown_preserves_embedded_newlines_across_a_code_block() {
     // A Normal line embedding newlines must render one visual row per
     // segment (no collapsed newlines), and the code fence opened on one
