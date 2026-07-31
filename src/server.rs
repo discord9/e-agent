@@ -13,6 +13,7 @@
 //! | POST   | `/api/sessions/{id}/prompt`       | queue a prompt                     |
 //! | POST   | `/api/sessions/{id}/cancel`       | cancel the in-flight turn          |
 //! | POST   | `/api/sessions/{id}/compact`      | request compaction                 |
+//! | PUT    | `/api/sessions/{id}/title`        | rename a session (Greptime only)   |
 //! | DELETE | `/api/sessions/{id}`              | cancel + remove from the registry  |
 //! | GET    | `/api/tasks`                        | running background tasks, all sessions |
 //! | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task          |
@@ -34,7 +35,7 @@ use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Error, Json, Router};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
@@ -154,6 +155,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/prompt", post(session_prompt))
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/compact", post(session_compact))
+        .route("/api/sessions/{id}/title", put(session_title))
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/tasks", get(list_tasks))
         .route("/api/sessions/{id}/tasks/{task_id}", delete(cancel_task))
@@ -371,6 +373,12 @@ pub struct SessionMeta {
     /// Parent subagent link (sessions spawned by the `delegate` tool); the
     /// frontend shows it as provenance when present.
     pub parent_session_id: Option<String>,
+    /// User-assigned session name (manual, never auto-generated). `None` =
+    /// unnamed — the frontend shows the session id. Registry sessions are
+    /// built from the metadata table via [`merge_session_metas`] (the
+    /// registry DTO itself carries no title), so live renames show up on
+    /// the next list.
+    pub title: Option<String>,
 }
 
 async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -> SessionMeta {
@@ -395,6 +403,10 @@ async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -
         busy: matches!(status, SessionStatus::Busy | SessionStatus::Compacting),
         active: true,
         parent_session_id: None,
+        // The registry DTO has no title; the merge fills it from the
+        // session's metadata-table snapshot (a built session always has
+        // one — `build` → `create_meta`).
+        title: None,
     }
 }
 
@@ -478,23 +490,39 @@ fn merge_session_metas(
     }
     for meta in historical {
         let id = meta.session_id.clone();
-        by_id.entry(id).or_insert_with(|| SessionMeta {
-            id: meta.session_id,
-            model: meta.model.unwrap_or_default(),
-            role: meta.role,
-            created_at: chrono::DateTime::from_naive_utc_and_offset(meta.created_at, chrono::Utc),
-            last_active_at: chrono::DateTime::from_naive_utc_and_offset(
-                meta.last_active_at,
-                chrono::Utc,
-            ),
-            // Historical sessions are not running; "Idle" renders as the
-            // resumable chip and matches what a fresh resume shows.
-            status: "Idle".to_owned(),
-            entry_count: meta.entry_count.max(0) as usize,
-            busy: false,
-            active: false,
-            parent_session_id: meta.parent_session_id,
-        });
+        match by_id.entry(id) {
+            // A live session wins the list entry, but its title lives in
+            // the metadata table (the registry DTO has no title), so
+            // backfill it from the historical snapshot.
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                if occupied.get().title.is_none() {
+                    occupied.get_mut().title = meta.title.clone();
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(SessionMeta {
+                    id: meta.session_id,
+                    model: meta.model.unwrap_or_default(),
+                    role: meta.role,
+                    created_at: chrono::DateTime::from_naive_utc_and_offset(
+                        meta.created_at,
+                        chrono::Utc,
+                    ),
+                    last_active_at: chrono::DateTime::from_naive_utc_and_offset(
+                        meta.last_active_at,
+                        chrono::Utc,
+                    ),
+                    // Historical sessions are not running; "Idle" renders as the
+                    // resumable chip and matches what a fresh resume shows.
+                    status: "Idle".to_owned(),
+                    entry_count: meta.entry_count.max(0) as usize,
+                    busy: false,
+                    active: false,
+                    parent_session_id: meta.parent_session_id,
+                    title: meta.title,
+                });
+            }
+        }
     }
     let mut metas: Vec<SessionMeta> = by_id.into_values().collect();
     // Newest activity first so the frontend shows the most recently active
@@ -643,6 +671,62 @@ async fn session_compact(
     let session = live(&state, &id)?;
     session.handle.compact();
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Cap for user-assigned session titles: longer titles are truncated
+/// (chars, so multi-byte text is preserved), never rejected with 400 —
+/// the simplest contract, per the manual-naming design.
+const TITLE_MAX_CHARS: usize = 200;
+
+#[derive(Deserialize)]
+struct TitleBody {
+    /// The frontend sends `JSON.stringify({ title })`.
+    title: String,
+}
+
+/// `PUT /api/sessions/{id}/title` — rename a session. Body
+/// `{"title": "..."}`; empty/whitespace clears the title (stored NULL),
+/// longer titles are truncated to [`TITLE_MAX_CHARS`]. Works for both
+/// live sessions (via their session-bound store — a built session always
+/// has a metadata row, `build` → `create_meta`) and historical sessions
+/// (via the workspace-scoped `meta_store`, so a rename survives the
+/// session leaving the registry). 404 when the id is neither live nor
+/// present in the metadata table. The JSONL backend has no meta table:
+/// renaming a live session is a silent no-op (title is Greptime-only).
+async fn session_title(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<TitleBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let trimmed = body.title.trim();
+    let title = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(TITLE_MAX_CHARS).collect::<String>())
+    };
+    let root = state.factory.root();
+    let store = match state.registry.get(&id) {
+        Some(session) => session.store.clone(),
+        None => {
+            let historical = state
+                .meta_store
+                .list_meta(root)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            if !historical.iter().any(|m| m.session_id == id) {
+                return Err(error(
+                    StatusCode::NOT_FOUND,
+                    format!("session {id} not found"),
+                ));
+            }
+            state.meta_store.clone()
+        }
+    };
+    store
+        .set_title(root, &id, title.as_deref())
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_session(
@@ -1050,18 +1134,17 @@ async fn index() -> impl IntoResponse {
         std::fs::read_to_string(ui.join(name))
             .map_err(|e| format!("cannot read {}: {e}", ui.join(name).display()))
     };
-    let assembled = read("index.html")
-        .and_then(|skeleton| {
-            let katex_css = read("vendor/katex.min.css")?;
-            let css = read("style.css")?;
-            let vendor_js = read("vendor/marked.min.js")?;
-            let app_js = read("app.js")?;
-            Ok(skeleton
-                .replace("/*__KATEX_CSS__*/", &katex_css)
-                .replace("/*__CSS__*/", &css)
-                .replace("/*__JS_VENDOR__*/", &vendor_js)
-                .replace("/*__JS_APP__*/", &app_js))
-        });
+    let assembled = read("index.html").and_then(|skeleton| {
+        let katex_css = read("vendor/katex.min.css")?;
+        let css = read("style.css")?;
+        let vendor_js = read("vendor/marked.min.js")?;
+        let app_js = read("app.js")?;
+        Ok(skeleton
+            .replace("/*__KATEX_CSS__*/", &katex_css)
+            .replace("/*__CSS__*/", &css)
+            .replace("/*__JS_VENDOR__*/", &vendor_js)
+            .replace("/*__JS_APP__*/", &app_js))
+    });
     match assembled {
         Ok(html) => HttpResponse::builder()
             .status(StatusCode::OK)
@@ -1136,14 +1219,17 @@ mod tests {
     fn token_is_reused_across_calls() {
         // Own unique dir: test_state_dir() is shared per-process and other
         // tests remove it at the end, which would race this one in parallel.
-        let dir = std::env::temp_dir()
-            .join(format!("e-agent-server-test-reuse-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("e-agent-server-test-reuse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("server.token");
         let first = load_or_create_token_at(path.clone()).unwrap();
         let second = load_or_create_token_at(path.clone()).unwrap();
-        assert_eq!(first, second, "existing token must be reused, not regenerated");
+        assert_eq!(
+            first, second,
+            "existing token must be reused, not regenerated"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1546,6 +1632,7 @@ mod tests {
             "busy",
             "active",
             "parent_session_id",
+            "title",
         ] {
             assert!(value.get(key).is_some(), "missing field {key}");
         }
@@ -1578,8 +1665,9 @@ mod tests {
             busy: false,
             active: false,
             parent_session_id: None,
+            title: None,
         };
-        let history = |id: &str, created: i64, count: i64| HistoryMeta {
+        let history = |id: &str, created: i64, count: i64, title: Option<&str>| HistoryMeta {
             session_id: id.to_owned(),
             created_at: naive(created),
             last_active_at: naive(created + 10),
@@ -1588,23 +1676,35 @@ mod tests {
             entry_count: count,
             parent_session_id: None,
             parent_task_id: None,
+            title: title.map(str::to_owned),
         };
         // One registry session plus two historical sessions, one of which
-        // overlaps a registry id (the registry entry wins).
+        // overlaps a registry id (the registry entry wins; the renamed
+        // history row backfills the live entry's title — the registry DTO
+        // has none).
         let merged = merge_session_metas(
             vec![wire("web-1", 200)],
-            vec![history("tui-1", 50, 7), history("web-1", 100, 3)],
+            vec![
+                history("tui-1", 50, 7, None),
+                history("web-1", 100, 3, Some("renamed")),
+            ],
         );
         assert_eq!(merged.len(), 2);
         let web1 = merged.iter().find(|m| m.id == "web-1").unwrap();
         assert!(web1.active, "registry session stays active");
         assert_eq!(web1.entry_count, 1, "registry data wins over history");
         assert_eq!(web1.created_at, dt(200));
+        assert_eq!(
+            web1.title.as_deref(),
+            Some("renamed"),
+            "live session title backfilled from the metadata table"
+        );
         let tui1 = merged.iter().find(|m| m.id == "tui-1").unwrap();
         assert!(!tui1.active, "historical session is inactive");
         assert_eq!(tui1.entry_count, 7);
         assert_eq!(tui1.status, "Idle", "historical sessions are resumable");
         assert_eq!(tui1.model, "", "history without model renders empty");
+        assert_eq!(tui1.title, None, "history without title renders unnamed");
         // Newest activity first: the merged list is sorted by last_active_at
         // descending (registry web-1 has last_active=200, history tui-1 has
         // last_active=60), not by created_at.
