@@ -19,19 +19,49 @@ use e_agent::tools::builtins;
 use e_agent::tui;
 use e_agent::workspace::Workspace;
 
+const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let raw_arguments: Vec<String> = std::env::args().skip(1).collect();
+    match version_requested(&raw_arguments) {
+        Ok(true) => {
+            println!("{}", version_line());
+            return Ok(());
+        }
+        Err(error) => {
+            eprintln!("e-agent: {error:#}");
+            std::process::exit(1);
+        }
+        Ok(false) => {}
+    }
     install_panic_hook();
     notify_crash_if_exists();
-    if let Err(error) = run().await {
+    if let Err(error) = run(raw_arguments).await {
         eprintln!("e-agent: {error:#}");
         std::process::exit(1);
     }
     Ok(())
 }
 
-async fn run() -> anyhow::Result<()> {
-    let raw_arguments: Vec<String> = std::env::args().skip(1).collect();
+fn version_line() -> String {
+    format!("e-agent {BUILD_VERSION}")
+}
+
+fn version_requested(arguments: &[String]) -> anyhow::Result<bool> {
+    let Some(flag) = arguments
+        .iter()
+        .find(|argument| matches!(argument.as_str(), "--version" | "-V"))
+    else {
+        return Ok(false);
+    };
+    if arguments.len() != 1 {
+        return Err(anyhow!("e-agent {flag} does not accept arguments"));
+    }
+    Ok(true)
+}
+
+async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     if let Some(command) = raw_arguments
         .first()
         .filter(|value| *value == "login" || *value == "logout")
@@ -74,7 +104,7 @@ async fn run() -> anyhow::Result<()> {
             "--repl" => repl_mode = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: e-agent login|logout\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--max-rounds N] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup)"
+                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--max-rounds N] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup)"
                 );
                 return Ok(());
             }

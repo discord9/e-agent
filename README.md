@@ -119,9 +119,10 @@ message and compaction entries. Without `--session`, each launch creates a
 fresh unique session ID. History is restored for
 model context on startup, while display projections are replayed in the TUI;
 the model only sees the latest compaction summary and everything after it.
-Legacy `.json` sessions are migrated on first load. Optional CLI overrides are `--base-url URL`,
-`--model MODEL`, `--profile PROFILE`, `--workspace PATH`, `--session NAME`, and `--max-rounds N`
-(tool-call rounds are unlimited by default; the flag sets an explicit cap).
+Legacy `.json` sessions are migrated on first load. `--version` (or `-V`) prints the exact
+package build version without loading the workspace or configuration. Optional CLI overrides
+are `--base-url URL`, `--model MODEL`, `--profile PROFILE`, `--workspace PATH`, `--session NAME`,
+and `--max-rounds N` (tool-call rounds are unlimited by default; the flag sets an explicit cap).
 `--profile` selects a TOML profile and requires a TOML config. When config is
 used, `--base-url` and `--model` are raw API wire-value overrides and take
 precedence over the selected profile values.

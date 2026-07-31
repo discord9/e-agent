@@ -1,6 +1,34 @@
 use super::*;
 use std::fs;
 
+#[test]
+fn test_version_requested() {
+    assert!(version_requested(&["--version".into()]).unwrap());
+    assert!(version_requested(&["-V".into()]).unwrap());
+    assert!(!version_requested(&[]).unwrap());
+    assert!(!version_requested(&["--help".into()]).unwrap());
+}
+
+#[test]
+fn test_version_rejects_additional_arguments() {
+    for arguments in [
+        vec!["--version".into(), "extra".into()],
+        vec!["extra".into(), "-V".into()],
+    ] {
+        let error = version_requested(&arguments).unwrap_err().to_string();
+        assert!(error.contains("does not accept arguments"), "{error}");
+    }
+}
+
+#[test]
+fn test_build_version_is_package_version() {
+    assert_eq!(BUILD_VERSION, env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        version_line(),
+        format!("e-agent {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
 fn write_skill(base: &std::path::Path, name: &str, content: &str) {
     let d = base.join(name);
     fs::create_dir_all(&d).unwrap();
