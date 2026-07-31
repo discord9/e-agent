@@ -1,0 +1,1316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>e-agent · Web UI</title>
+<style>
+  /* ============ Solarized Light 主题（对齐 TUI） ============ */
+  :root {
+    --base3:  #fdf6e3;  /* 背景 */
+    --base2:  #eee8d5;  /* 次级背景 */
+    --base1:  #93a1a1;  /* 弱边框 */
+    --base01: #586e75;  /* 次要文字 */
+    --base00: #657b83;  /* 正文灰 */
+    --base0:  #839496;
+    --base03: #002b36;
+    --base02: #073642;  /* 主文字 */
+    --yellow: #b58900;
+    --orange: #cb4b16;
+    --red:    #dc322f;
+    --violet: #6c71c4;
+    --blue:   #268bd2;
+    --cyan:   #2aa198;
+    --green:  #859900;
+  }
+
+  * { box-sizing: border-box; }
+
+  /* hidden 属性必须压过 .view/.top-actions 等 display 规则 */
+  [hidden] { display: none !important; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background: var(--base3);
+    color: var(--base02);
+    font-family: "SF Mono", "Cascadia Mono", Consolas, "Noto Sans Mono CJK SC",
+                 "PingFang SC", "Microsoft YaHei", monospace;
+    font-size: 14px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ---------- 顶栏 ---------- */
+  #topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px;
+    background: var(--base2);
+    border-bottom: 1px solid var(--base1);
+    flex: 0 0 auto;
+  }
+  .brand { font-weight: bold; color: var(--base02); }
+  .brand .dot { color: var(--green); }
+
+  .top-actions { display: flex; align-items: center; gap: 8px; flex: 1; }
+  .conn-state { font-size: 12px; color: var(--base01); }
+  .conn-state.ok  { color: var(--green); }
+  .conn-state.retrying { color: var(--yellow); }
+  .conn-state.err { color: var(--red); }
+
+  .token-box { display: flex; align-items: center; gap: 6px; }
+  .token-box label { font-size: 12px; color: var(--base01); }
+  #tokenInput {
+    width: 240px;
+    padding: 4px 8px;
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    color: var(--base02);
+    font-family: inherit;
+    font-size: 13px;
+  }
+  #tokenInput:focus { outline: 1px solid var(--blue); }
+
+  /* ---------- 提示横幅 ---------- */
+  .banner {
+    padding: 6px 14px;
+    background: #fbe3e4;      /* 浅红底 */
+    color: var(--red);
+    border-bottom: 1px solid var(--red);
+    font-size: 13px;
+    flex: 0 0 auto;
+  }
+  .banner.warn {
+    background: #fdf3d7;      /* 浅黄底 */
+    color: var(--yellow);
+    border-bottom-color: var(--yellow);
+  }
+
+  /* ---------- 视图容器 ---------- */
+  .view {
+    flex: 1 1 auto;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    padding: 14px;
+    gap: 14px;
+  }
+  .view.hidden { display: none; }
+
+  /* ---------- 卡片 / 表单 ---------- */
+  .card {
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 6px;
+    padding: 12px 14px;
+  }
+  .card h2 {
+    margin: 0 0 10px;
+    font-size: 14px;
+    color: var(--base02);
+    border-bottom: 1px dotted var(--base1);
+    padding-bottom: 6px;
+  }
+  .dim { color: var(--base01); font-size: 12px; }
+
+  .new-session { display: flex; gap: 8px; align-items: stretch; }
+  .new-session textarea {
+    flex: 1;
+    resize: vertical;
+    min-height: 40px;
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    padding: 6px 8px;
+    color: var(--base02);
+    font-family: inherit;
+    font-size: 13px;
+  }
+  textarea:focus { outline: 1px solid var(--blue); }
+
+  button {
+    background: var(--base2);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    color: var(--base02);
+    font-family: inherit;
+    font-size: 13px;
+    padding: 6px 14px;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--blue); color: var(--blue); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: var(--blue); border-color: var(--blue); color: var(--base3); }
+  button.primary:hover:not(:disabled) { background: var(--cyan); border-color: var(--cyan); color: var(--base3); }
+  button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+
+  /* ---------- 会话列表 ---------- */
+  .session-list { display: flex; flex-direction: column; gap: 6px; }
+  .session-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    cursor: pointer;
+    background: var(--base3);
+  }
+  .session-row:hover { border-color: var(--blue); background: var(--base2); }
+  .session-row .sid { color: var(--blue); font-size: 12px; min-width: 110px; }
+  .session-row .smodel { color: var(--base00); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .session-row .smeta { color: var(--base01); font-size: 12px; text-align: right; }
+  .session-row .del {
+    padding: 2px 8px;
+    font-size: 12px;
+    color: var(--base01);
+  }
+  .busy-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    flex: 0 0 auto;
+  }
+  .busy-dot.busy { background: var(--orange); animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: 0.3; } }
+
+  .status-chip {
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid var(--base1);
+    color: var(--base01);
+    white-space: nowrap;
+  }
+  .status-chip.idle       { color: var(--green);  border-color: var(--green); }
+  .status-chip.busy       { color: var(--orange); border-color: var(--orange); }
+  .status-chip.compacting { color: var(--yellow); border-color: var(--yellow); }
+  .status-chip.finished   { color: var(--blue);   border-color: var(--blue); }
+  .status-chip.error      { color: var(--red);    border-color: var(--red); }
+
+  .hint { color: var(--base01); font-size: 13px; padding: 10px 2px; }
+
+  /* ---------- 对话视图 ---------- */
+  .chat-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
+  }
+  .chat-head .dim { font-size: 13px; }
+  #usageInfo { margin-left: auto; }
+
+  .messages {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 6px 2px 6px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    scrollbar-width: thin;
+  }
+
+  .msg { display: flex; gap: 8px; line-height: 1.6; }
+  .msg .who { flex: 0 0 auto; font-weight: bold; }
+  .msg-body { min-width: 0; overflow-wrap: break-word; }
+  .msg-body pre {
+    background: var(--base2);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    padding: 8px 10px;
+    overflow-x: auto;
+    line-height: 1.5;
+  }
+  .msg-body code {
+    background: var(--base2);
+    border-radius: 3px;
+    padding: 1px 4px;
+    font-size: 13px;
+  }
+  .msg-body pre code { background: none; padding: 0; }
+
+  .msg-user { color: var(--cyan); }
+  .msg-user .who { color: var(--cyan); }
+  .msg-user .msg-body { color: var(--base02); }
+
+  .msg-assistant .who { color: var(--green); }
+
+  .msg-system { color: var(--base01); font-size: 12px; }
+  .msg-system .msg-body { color: var(--base01); }
+
+  /* 思考区：紫色斜体，可折叠 */
+  details.thinking {
+    margin: 2px 0;
+    border-left: 2px solid var(--violet);
+    padding-left: 8px;
+    color: var(--violet);
+    font-style: italic;
+    font-size: 13px;
+  }
+  details.thinking summary {
+    cursor: pointer;
+    color: var(--violet);
+    user-select: none;
+    font-style: italic;
+  }
+  details.thinking .think-body { white-space: pre-wrap; overflow-wrap: break-word; margin-top: 2px; }
+
+  /* 工具调用卡片 */
+  .tool-card {
+    border: 1px solid var(--base1);
+    border-left: 3px solid var(--blue);
+    border-radius: 4px;
+    margin: 2px 0 2px 18px;
+    padding: 6px 10px;
+    background: var(--base3);
+    max-width: 92%;
+  }
+  .tool-card .tool-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .tool-card .tool-name { font-weight: bold; color: var(--blue); }
+  .tool-card .tool-state { font-size: 12px; color: var(--base01); }
+  .tool-card .tool-args {
+    margin: 0 0 4px;
+    font-size: 12px;
+    color: var(--base00);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    max-height: 10em;
+    overflow-y: auto;
+    background: var(--base2);
+    border-radius: 3px;
+    padding: 4px 6px;
+  }
+  .tool-card .tool-result {
+    margin: 0;
+    font-size: 12px;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    max-height: 14em;
+    overflow-y: auto;
+    border-radius: 3px;
+    padding: 4px 6px;
+    background: #eef5e3;  /* 浅绿底 */
+    color: var(--base02);
+  }
+  .tool-card .tool-result.err {
+    background: #fbe3e4;  /* 浅红底 */
+    color: var(--red);
+  }
+  .tool-card .tool-result.pending {
+    background: var(--base2);
+    color: var(--base01);
+  }
+
+  .notice {
+    color: var(--base01);
+    font-size: 12px;
+    border-left: 2px solid var(--base1);
+    padding-left: 8px;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+  .msg-error {
+    color: var(--red);
+    border-left: 2px solid var(--red);
+    padding-left: 8px;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+  .compaction {
+    text-align: center;
+    color: var(--violet);
+    font-size: 12px;
+    border-top: 1px dashed var(--violet);
+    border-bottom: 1px dashed var(--violet);
+    padding: 2px 0;
+    margin: 4px 0;
+  }
+  .forked {
+    color: var(--base01);
+    font-size: 12px;
+    text-align: center;
+    border: 1px dashed var(--base1);
+    border-radius: 4px;
+    padding: 4px;
+  }
+
+  /* ---------- 输入区 ---------- */
+  .composer {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border-top: 1px solid var(--base1);
+    padding-top: 8px;
+    background: var(--base3);
+  }
+  #promptInput {
+    width: 100%;
+    resize: none;
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    padding: 8px 10px;
+    color: var(--base02);
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.5;
+    min-height: 40px;
+    max-height: 160px;
+    overflow-y: auto;
+  }
+  .composer-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+  /* 小屏适配 */
+  @media (max-width: 640px) {
+    .token-box label { display: none; }
+    #tokenInput { width: 150px; }
+    .session-row .smodel { display: none; }
+    .session-row .smeta { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<header id="topbar">
+  <div class="brand">e-agent<span class="dot">●</span></div>
+  <div class="top-actions" id="topActions" hidden>
+    <button id="backBtn">← 返回列表</button>
+    <span id="connState" class="conn-state"></span>
+  </div>
+  <div class="token-box">
+    <label for="tokenInput">Token</label>
+    <input id="tokenInput" type="password" placeholder="访问令牌（Bearer）" autocomplete="off" spellcheck="false">
+  </div>
+</header>
+
+<div id="banner" class="banner" hidden></div>
+
+<!-- ============ 会话列表视图 ============ -->
+<main id="listView" class="view">
+  <section class="card">
+    <h2>新建会话</h2>
+    <div class="new-session">
+      <textarea id="newPrompt" rows="2" placeholder="初始提示词（可选），Ctrl+Enter 提交…"></textarea>
+      <button id="newSessionBtn" class="primary">新建会话</button>
+    </div>
+  </section>
+
+  <section class="card" style="flex:1; overflow-y:auto;">
+    <h2>会话列表 <span id="listMeta" class="dim"></span></h2>
+    <div id="sessionList" class="session-list"></div>
+    <div id="listHint" class="hint"></div>
+  </section>
+</main>
+
+<!-- ============ 对话视图 ============ -->
+<main id="chatView" class="view" hidden>
+  <div class="chat-head">
+    <span id="chatSessionId" class="dim"></span>
+    <span id="chatStatus" class="status-chip idle">空闲</span>
+    <span id="usageInfo" class="dim"></span>
+  </div>
+  <div id="messages" class="messages"></div>
+  <div class="composer">
+    <textarea id="promptInput" rows="1" placeholder="输入消息：Enter 发送，Shift+Enter 换行…"></textarea>
+    <div class="composer-actions">
+      <button id="compactBtn" title="压缩上下文">压缩</button>
+      <button id="cancelBtn" disabled title="取消当前回合">取消</button>
+      <button id="sendBtn" class="primary">发送</button>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+/* =====================================================================
+ * 全局状态
+ * ===================================================================*/
+const state = {
+  token: localStorage.getItem("eagent_token") || "",
+  view: "list",              // "list" | "chat"
+  sessionId: null,           // 当前打开的会话
+  status: "Idle",
+  initSource: null,          // "history" | "snapshot" | null —— 初始渲染来源
+  pollTimer: null,
+  sse: { ctrl: null, retryTimer: null, stopped: false },
+  acc: null,                 // 增量渲染累积器（见 newAccumulator）
+};
+
+/* 常用 DOM 引用 */
+const $ = (id) => document.getElementById(id);
+const els = {
+  topActions: $("topActions"), backBtn: $("backBtn"), connState: $("connState"),
+  banner: $("banner"), tokenInput: $("tokenInput"),
+  listView: $("listView"), chatView: $("chatView"),
+  newPrompt: $("newPrompt"), newSessionBtn: $("newSessionBtn"),
+  sessionList: $("sessionList"), listMeta: $("listMeta"), listHint: $("listHint"),
+  chatSessionId: $("chatSessionId"), chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
+  messages: $("messages"), promptInput: $("promptInput"),
+  sendBtn: $("sendBtn"), cancelBtn: $("cancelBtn"), compactBtn: $("compactBtn"),
+};
+
+/* =====================================================================
+ * 小工具
+ * ===================================================================*/
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function truncate(s, n) {
+  s = String(s);
+  return s.length > n ? s.slice(0, n) + "\n… (省略 " + (s.length - n) + " 字符)" : s;
+}
+
+function fmtTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  return d.toLocaleString("zh-CN", { hour12: false });
+}
+
+function setBanner(msg, isWarn) {
+  els.banner.textContent = msg;
+  els.banner.className = "banner" + (isWarn ? " warn" : "");
+  els.banner.hidden = !msg;
+}
+
+/* 从事件载荷中提取字符串正文：后端字段名可能不同，做防御性兼容 */
+function pickText(payload, keys) {
+  if (typeof payload === "string") return payload;
+  if (!payload || typeof payload !== "object") return "";
+  for (const k of keys) {
+    if (typeof payload[k] === "string") return payload[k];
+  }
+  for (const v of Object.values(payload)) {
+    if (typeof v === "string") return v;
+  }
+  return "";
+}
+
+/* =====================================================================
+ * 极简 Markdown 渲染（无外部库）：
+ * 转义 HTML + 围栏代码块 + 行内代码 + 粗体 + 斜体
+ * ===================================================================*/
+function renderMarkdown(text) {
+  const fences = [];
+  // 1) 先摘出围栏代码块（语言标识与内容分离，内容原样保留，最后转义还原）
+  let s = String(text).replace(/```([\w+-]*)\n?([\s\S]*?)```/g, (m, lang, code) => {
+    fences.push({ lang: lang, code: code });
+    return "\u0000F" + (fences.length - 1) + "\u0000";
+  });
+  // 2) 转义 HTML
+  s = escapeHtml(s);
+  // 3) 摘出行内代码（内容此时已转义，避免被粗体/斜体规则误伤）
+  const codes = [];
+  s = s.replace(/`([^`\n]+)`/g, (m, c) => {
+    codes.push(c);
+    return "\u0000C" + (codes.length - 1) + "\u0000";
+  });
+  // 4) 粗体 / 斜体
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  // 5) 外层换行转 <br>（占位符不含换行，不受影响）
+  s = s.replace(/\n/g, "<br>");
+  // 6) 还原行内代码（已转义，直接包裹）
+  s = s.replace(/\u0000C(\d+)\u0000/g, (m, i) => "<code>" + codes[+i] + "</code>");
+  // 7) 还原代码块（原始内容此时才转义）
+  s = s.replace(/\u0000F(\d+)\u0000/g, (m, i) => {
+    const f = fences[+i];
+    return "<pre><code>"
+      + (f.lang ? '<span class="dim">' + escapeHtml(f.lang) + "</span>\n" : "")
+      + escapeHtml(f.code) + "</code></pre>";
+  });
+  return s;
+}
+
+/* =====================================================================
+ * Token 与认证
+ * ===================================================================*/
+els.tokenInput.value = state.token;
+els.tokenInput.addEventListener("input", () => {
+  state.token = els.tokenInput.value.trim();
+  if (state.token) localStorage.setItem("eagent_token", state.token);
+  else localStorage.removeItem("eagent_token");
+  refreshBanner();
+  restartTransport();   // token 变化 → 重启轮询 / SSE
+});
+
+function refreshBanner() {
+  if (!state.token) {
+    setBanner("⚠ 未配置访问令牌：请在右上角输入 Token，所有请求需要 Authorization: Bearer <token>。", true);
+  } else {
+    setBanner("");
+  }
+}
+
+/* 统一请求入口：自动附带 Authorization header */
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  if (opts.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+  return fetch(path, Object.assign({}, opts, { headers }));
+}
+
+/* =====================================================================
+ * 会话列表视图
+ * ===================================================================*/
+const STATUS_LABEL = {
+  Idle: "空闲", Busy: "处理中", Compacting: "压缩中", Finished: "已完成",
+};
+function statusLabel(s) {
+  return STATUS_LABEL[s] || (s || "未知");
+}
+function statusChipClass(s) {
+  if (s === "Busy") return "busy";
+  if (s === "Compacting") return "compacting";
+  if (s === "Finished") return "finished";
+  if (s && s.startsWith("Finished")) return "finished";
+  if (s && s.startsWith("Failed")) return "error";
+  return "idle";
+}
+
+function shortId(id) {
+  return id && id.length > 8 ? id.slice(0, 8) + "…" : (id || "");
+}
+
+async function pollSessions() {
+  if (state.view !== "list" || !state.token) return;
+  try {
+    const res = await api("/api/sessions");
+    if (res.status === 401 || res.status === 403) {
+      setBanner("⚠ 认证失败：请检查 Token 是否正确。");
+      return;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const list = await res.json();
+    renderSessionList(Array.isArray(list) ? list : []);
+  } catch (e) {
+    if (!navigator.onLine || e instanceof TypeError) {
+      setBanner("⚠ 无法连接服务器（网络错误）。", true);
+    }
+  }
+}
+
+function renderSessionList(list) {
+  els.listMeta.textContent = "共 " + list.length + " 个";
+  els.sessionList.innerHTML = "";
+  if (!list.length) {
+    els.listHint.textContent = "暂无会话，在上方输入初始提示词创建一个。";
+    return;
+  }
+  els.listHint.textContent = "";
+  for (const s of list) {
+    const row = el("div", "session-row");
+    row.title = s.id + (s.model ? " · " + s.model : "");
+
+    const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
+    const sid = el("span", "sid", shortId(s.id));
+    const chip = el("span", "status-chip " + statusChipClass(s.status), statusLabel(s.status));
+    const model = el("span", "smodel", s.model || "");
+    const meta = el("span", "smeta",
+      fmtTime(s.created_at) + " · " + (s.entry_count ?? "-") + " 条");
+    const del = el("button", "del danger", "删除");
+    del.title = "删除会话 " + s.id;
+    del.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      if (!confirm("确认删除会话 " + s.id + " ？")) return;
+      try {
+        const res = await api("/api/sessions/" + encodeURIComponent(s.id), { method: "DELETE" });
+        if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
+        if (!res.ok && res.status !== 204) throw new Error("HTTP " + res.status);
+      } catch (e) {
+        setBanner("⚠ 删除失败：" + e.message);
+      }
+    });
+    row.addEventListener("click", () => openSession(s.id));
+    row.append(dot, sid, chip, model, meta, del);
+    els.sessionList.appendChild(row);
+  }
+}
+
+async function createSession() {
+  if (!state.token) { setBanner("⚠ 请先输入 Token。", true); return; }
+  const text = els.newPrompt.value.trim();
+  const body = {};
+  if (text) body.initial_prompt = text;
+  els.newSessionBtn.disabled = true;
+  try {
+    const res = await api("/api/sessions", { method: "POST", body: JSON.stringify(body) });
+    if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
+    if (res.status !== 201) throw new Error("HTTP " + res.status);
+    const s = await res.json();
+    els.newPrompt.value = "";
+    openSession(s.id);
+  } catch (e) {
+    setBanner("⚠ 创建会话失败：" + e.message);
+  } finally {
+    els.newSessionBtn.disabled = false;
+  }
+}
+
+/* =====================================================================
+ * 消息渲染
+ * ===================================================================*/
+function newAccumulator() {
+  return {
+    assistantEl: null,   // 当前助手消息容器（流式累积）
+    assistantBody: null,
+    assistantText: "",   // 已累积的文本（用于替换/查重）
+    thinkingEl: null,    // 当前 thinking 折叠块
+    thinkBody: null,
+    toolStack: [],       // 未配对结果的工具卡片（live 事件按顺序配对）
+    pendingByCall: new Map(), // call_id -> 卡片元素（history 渲染按 id 配对）
+  };
+}
+
+function freezeAssistant(acc) {
+  // 工具调用 / 新用户回合开始时，结束当前助手消息与思考区的累积，
+  // 使下一回合的 delta 从新的消息块开始
+  acc.assistantEl = null;
+  acc.assistantBody = null;
+  acc.assistantText = "";
+  acc.thinkingEl = null;
+  acc.thinkBody = null;
+}
+
+function scrollBottom(force) {
+  const m = els.messages;
+  const near = m.scrollHeight - m.scrollTop - m.clientHeight < 80;
+  if (force || near) m.scrollTop = m.scrollHeight;
+}
+
+function appendUserMsg(text) {
+  freezeAssistant(state.acc);
+  const msg = el("div", "msg msg-user");
+  const who = el("span", "who", "you>");
+  const body = el("div", "msg-body");
+  body.innerHTML = renderMarkdown(text);
+  msg.append(who, body);
+  els.messages.appendChild(msg);
+  scrollBottom(false);
+}
+
+function appendSystemMsg(text) {
+  freezeAssistant(state.acc);
+  const msg = el("div", "msg msg-system");
+  const who = el("span", "who", "system>");
+  const body = el("div", "msg-body");
+  body.textContent = text;
+  msg.append(who, body);
+  els.messages.appendChild(msg);
+}
+
+/* 助手消息：有则累积，无则新建 */
+function assistantBubble(acc, reason) {
+  if (!acc.assistantEl) {
+    const msg = el("div", "msg msg-assistant");
+    const who = el("span", "who", "ai>");
+    const body = el("div", "msg-body");
+    msg.append(who, body);
+    els.messages.appendChild(msg);
+    acc.assistantEl = msg;
+    acc.assistantBody = body;
+    if (reason) scrollBottom(false);
+  }
+  return acc.assistantBody;
+}
+
+function appendAssistantDelta(text, acc) {
+  const body = assistantBubble(acc, true);
+  acc.assistantText += text;
+  // 流式渲染：直接追加（markdown 不重算，保持简单、快）
+  body.insertAdjacentText("beforeend", text);
+  scrollBottom(false);
+}
+
+/* 非流式回合结束时整段落文本 */
+function setAssistantText(text, acc) {
+  const body = assistantBubble(acc, true);
+  if (acc.assistantText) {
+    // 已累积过 delta：整段覆盖（TUI 语义：同回合的最终完整文本）
+    body.textContent = "";
+    acc.assistantText = "";
+  }
+  body.innerHTML = renderMarkdown(text);
+  acc.assistantText = text;
+  scrollBottom(false);
+}
+
+/* thinking 折叠块 */
+function thinkingBlock(acc) {
+  if (!acc.thinkingEl) {
+    const det = el("details", "thinking");
+    det.open = true;
+    const sum = el("summary", "", "思考中…");
+    const body = el("div", "think-body");
+    det.append(sum, body);
+    els.messages.appendChild(det);
+    acc.thinkingEl = det;
+    acc.thinkBody = body;
+  }
+  return acc.thinkBody;
+}
+
+function appendReasoningDelta(text, acc) {
+  const body = thinkingBlock(acc);
+  body.insertAdjacentText("beforeend", text);
+  scrollBottom(false);
+}
+
+/* 工具调用卡片（live 事件，无 call_id，按顺序配对结果） */
+function appendToolCall(name, args, acc, callId) {
+  freezeAssistant(acc);
+  const card = buildToolCard(name, args, "执行中…", "pending", null);
+  acc.toolStack.push({ el: card, filled: false });
+  if (callId) acc.pendingByCall.set(callId, card);
+  els.messages.appendChild(card);
+  scrollBottom(false);
+}
+
+function appendToolResult(isError, content, acc, callId) {
+  let card = null;
+  if (callId && acc.pendingByCall.has(callId)) {
+    card = acc.pendingByCall.get(callId);
+  }
+  if (!card) {
+    // 从后往前找最近一个未填充的卡片
+    for (let i = acc.toolStack.length - 1; i >= 0; i--) {
+      if (!acc.toolStack[i].filled) { card = acc.toolStack[i].el; acc.toolStack[i].filled = true; break; }
+    }
+  } else {
+    for (const t of acc.toolStack) if (t.el === card) t.filled = true;
+  }
+  if (card) {
+    card.querySelector(".tool-state").textContent = isError ? "失败" : "完成";
+    const resEl = card.querySelector(".tool-result");
+    resEl.className = "tool-result" + (isError ? " err" : "");
+    resEl.textContent = content || (isError ? "(无错误信息)" : "(无输出)");
+  } else {
+    // 没有可配对的卡片：独立展示结果行
+    const card2 = buildToolCard("工具结果", "", isError ? "失败" : "完成",
+      isError ? "err" : "", content || "");
+    els.messages.appendChild(card2);
+  }
+  scrollBottom(false);
+}
+
+function buildToolCard(name, args, stateText, stateCls, resultText) {
+  const card = el("div", "tool-card");
+  const head = el("div", "tool-head");
+  const nm = el("span", "tool-name", name || "tool");
+  const st = el("span", "tool-state", stateText);
+  head.append(nm, st);
+
+  let argsText = args != null ? String(args) : "";
+  let pretty = argsText;
+  try { pretty = JSON.stringify(JSON.parse(argsText), null, 2); } catch (e) { /* 保持原文 */ }
+  const argsEl = el("pre", "tool-args", truncate(pretty, 600));
+
+  const resEl = el("pre", "tool-result " + stateCls,
+    resultText != null ? resultText : (stateCls === "pending" ? "等待结果…" : ""));
+  card.append(head, argsEl, resEl);
+  return card;
+}
+
+/* 提示行（Notice / 排队等） */
+function appendNotice(text) {
+  const n = el("div", "notice", text);
+  els.messages.appendChild(n);
+  scrollBottom(false);
+}
+
+/* 错误行 */
+function appendError(text) {
+  const e = el("div", "msg-error", "错误: " + text);
+  els.messages.appendChild(e);
+  scrollBottom(false);
+}
+
+/* 压缩分界线 */
+function appendCompaction(summary) {
+  freezeAssistant(state.acc);
+  els.messages.appendChild(el("div", "compaction", "—— 上下文已压缩 ——"));
+  if (summary) {
+    const n = el("div", "notice", "摘要: " + summary);
+    els.messages.appendChild(n);
+  }
+  scrollBottom(false);
+}
+
+/* =====================================================================
+ * History 全量渲染（SessionEntry 数组）
+ * ===================================================================*/
+function renderEntry(entry, acc, pendingCards) {
+  switch (entry.type) {
+    case "message": return renderMessage(entry.message, acc, pendingCards);
+    case "compaction": return appendCompaction(entry.summary);
+    case "notice": return appendNotice(entry.text);
+    case "background_completion":
+      return appendNotice("⌛ 后台任务 #" + (entry.id ?? "?") + " 完成"
+        + (entry.label ? "（" + entry.label + "）" : "")
+        + "\n" + truncate(entry.output || "", 300));
+    case "forked_from":
+      els.messages.appendChild(el("div", "forked",
+        "分叉自会话 " + shortId(entry.source) + " @ 条目 #" + (entry.at ?? "?")));
+      return scrollBottom(false);
+    default:
+      // 未知条目类型：尽力显示原始 JSON（后端演进兼容）
+      return appendNotice("未知条目: " + truncate(JSON.stringify(entry), 300));
+  }
+}
+
+function renderMessage(m, acc, pendingCards) {
+  if (!m) return;
+  if (m.User) {
+    appendUserMsg(m.User.content || "");
+    const nImg = (m.User.images || []).length;
+    if (nImg > 0) appendNotice("📷 附带 " + nImg + " 张图片");
+    return;
+  }
+  if (m.System) { appendSystemMsg(m.System.content || ""); return; }
+  if (m.Assistant) {
+    const a = m.Assistant;
+    if (a.reasoning) {
+      const det = el("details", "thinking");
+      det.open = false;
+      det.append(el("summary", "", "思考"));
+      det.append(el("div", "think-body", a.reasoning));
+      els.messages.appendChild(det);
+    }
+    // 每个 history 条目是完整消息：结束上一个助手消息的累积，另起一块
+    freezeAssistant(acc);
+    if (a.content) {
+      const body = assistantBubble(acc, true);
+      body.innerHTML = renderMarkdown(a.content);
+      acc.assistantText = a.content;
+    } else if (!a.tool_calls || !a.tool_calls.length) {
+      // 空内容助手消息：占位，避免空白
+      const body = assistantBubble(acc, true);
+      body.innerHTML = "<span class=\"dim\">（空回复）</span>";
+    }
+    for (const tc of a.tool_calls || []) {
+      const card = buildToolCard(tc.name, tc.arguments, "等待结果…", "pending", null);
+      els.messages.appendChild(card);
+      pendingCards.set(tc.id, card);
+    }
+    scrollBottom(false);
+    return;
+  }
+  if (m.Tool) {
+    const t = m.Tool;
+    let card = pendingCards.get(t.call_id);
+    if (card) {
+      pendingCards.delete(t.call_id);
+      card.querySelector(".tool-state").textContent = t.is_error ? "失败" : "完成";
+      const resEl = card.querySelector(".tool-result");
+      resEl.className = "tool-result" + (t.is_error ? " err" : "");
+      resEl.textContent = t.content || (t.is_error ? "(无错误信息)" : "(无输出)");
+    } else {
+      // 无对应 ToolCall（如历史截断后）：独立卡片
+      const card2 = buildToolCard(t.name, "", t.is_error ? "失败" : "完成",
+        t.is_error ? "err" : "", t.content || "");
+      els.messages.appendChild(card2);
+    }
+    scrollBottom(false);
+    return;
+  }
+  // 其他 message 形状
+  appendNotice("消息: " + truncate(JSON.stringify(m), 300));
+}
+
+function renderHistory(entries) {
+  const acc = newAccumulator();
+  state.acc = acc;
+  els.messages.innerHTML = "";
+  const pendingCards = new Map();
+  for (const e of (Array.isArray(entries) ? entries : [])) {
+    renderEntry(e, acc, pendingCards);
+  }
+  scrollBottom(true);
+}
+
+/* =====================================================================
+ * 会话状态（status 事件 / 列表 busy 字段）
+ * ===================================================================*/
+function applyStatus(status) {
+  state.status = status || "Idle";
+  els.chatStatus.textContent = statusLabel(state.status);
+  els.chatStatus.className = "status-chip " + statusChipClass(state.status);
+  const busy = state.status === "Busy" || state.status === "Compacting";
+  els.cancelBtn.disabled = !busy;         // Busy/Compacting 时可取消
+  els.compactBtn.disabled = busy;         // 空闲时才压缩
+  els.sendBtn.disabled = false;           // 允许排队输入
+}
+
+function applyUsage(usage) {
+  if (!usage || typeof usage !== "object") return;
+  const s = usage.session || {};
+  const parts = [];
+  if (usage.context_input != null) parts.push("上下文 " + usage.context_input + " tok");
+  if (s.input_tokens != null) parts.push("输入 " + s.input_tokens);
+  if (s.output_tokens != null) parts.push("输出 " + s.output_tokens);
+  if (parts.length) els.usageInfo.textContent = "用量: " + parts.join(" · ");
+}
+
+/* =====================================================================
+ * SSE：fetch + ReadableStream（EventSource 无法带 header）
+ * ===================================================================*/
+function setConn(stateName, text) {
+  els.connState.className = "conn-state " + stateName;
+  els.connState.textContent = text;
+}
+
+function connectSSE(id) {
+  stopSSE();
+  state.sse.stopped = false;
+  state.sse.ctrl = new AbortController();
+  const ctrl = state.sse.ctrl;
+
+  fetch("/api/sessions/" + encodeURIComponent(id) + "/events", {
+    headers: {
+      "Authorization": "Bearer " + state.token,
+      "Accept": "text/event-stream",
+    },
+    signal: ctrl.signal,
+  }).then((res) => {
+    if (res.status === 401 || res.status === 403) {
+      setBanner("⚠ 认证失败：请检查 Token。");
+      throw new Error("auth");
+    }
+    if (res.status === 404) {
+      setBanner("⚠ 会话不存在或已被删除。");
+      throw new Error("gone");
+    }
+    if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
+    setConn("ok", "● 已连接");
+    return readSSEStream(res.body.getReader(), id);
+  }).then(() => {
+    // 正常结束（后端关闭流）→ 按断线处理
+    throw new Error("stream end");
+  }).catch((err) => {
+    if (err && err.name === "AbortError") return;   // 主动停止
+    if (state.sse.stopped) return;
+    if (err && err.message === "auth") { state.sse.stopped = true; return; }
+    scheduleReconnect(id);
+  });
+}
+
+/* 逐块读取 SSE：按空行切分事件块（兼容 \r\n 行尾） */
+async function readSSEStream(reader, id) {
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const block = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      handleSSEBlock(block, id);
+    }
+  }
+}
+
+/* 解析单个 SSE 事件块 */
+function handleSSEBlock(block, id) {
+  let eventName = "message";
+  const dataLines = [];
+  for (const line of block.split("\n")) {
+    if (line.startsWith(":")) continue;               // 心跳/注释行
+    if (line.startsWith("event:")) eventName = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+  }
+  if (!dataLines.length) return;
+  const data = dataLines.join("\n");
+
+  if (eventName === "snapshot") {
+    // 已用 history 渲染过则跳过（避免重复）；history 失败时作为兜底
+    if (state.initSource !== "history") {
+      try {
+        const parsed = JSON.parse(data);
+        const entries = Array.isArray(parsed) ? parsed : (parsed.entries || []);
+        renderHistory(entries);
+        state.initSource = "snapshot";
+      } catch (e) { /* 忽略坏数据 */ }
+    }
+    return;
+  }
+  if (eventName === "status") {
+    try { applyStatus(JSON.parse(data).status); } catch (e) { /* 忽略 */ }
+    return;
+  }
+  if (id !== state.sessionId || state.view !== "chat") return;  // 已切换会话
+  if (state.initSource === null) return;   // 初始渲染未完成前的 live 事件丢弃
+
+  let payload = null;
+  try { payload = JSON.parse(data); } catch (e) { payload = data; }
+  applyLiveEvent(eventName, payload);
+}
+
+/* live AgentEvent → 增量渲染 */
+function applyLiveEvent(name, payload) {
+  const acc = state.acc;
+  switch (name) {
+    case "UserPrompt":
+      appendUserMsg(pickText(payload, ["text", "prompt", "content"]));
+      break;
+    case "AssistantText":
+      setAssistantText(pickText(payload, ["text", "content"]), acc);
+      break;
+    case "AssistantDelta":
+      appendAssistantDelta(pickText(payload, ["delta", "text", "content"]), acc);
+      break;
+    case "ReasoningDelta":
+      appendReasoningDelta(pickText(payload, ["delta", "text", "reasoning"]), acc);
+      break;
+    case "ToolCall": {
+      const p = (payload && typeof payload === "object") ? payload : {};
+      let args = p.arguments;
+      if (args && typeof args === "object") args = JSON.stringify(args);
+      else args = pickText(p, ["arguments", "args", "params"]);
+      appendToolCall(pickText(p, ["name"]), args, acc, p.call_id);
+      break;
+    }
+    case "ToolResult": {
+      const p = (payload && typeof payload === "object") ? payload : {};
+      const isErr = p.is_error === true || p.error === true;
+      let content = p.content;
+      if (content && typeof content === "object") content = JSON.stringify(content);
+      else content = pickText(p, ["content", "text", "result", "error"]);
+      appendToolResult(isErr, content, acc, p.call_id);
+      break;
+    }
+    case "Notice":
+      appendNotice(pickText(payload, ["text", "message"]));
+      break;
+    case "Error":
+      appendError(pickText(payload, ["error", "message", "text"]));
+      break;
+    case "BackgroundCompleted":
+    case "BackgroundCompletionNotice": {
+      const p = (payload && typeof payload === "object") ? payload : {};
+      const label = p.label ? "（" + p.label + "）" : "";
+      appendNotice("⌛ 后台任务 #" + (p.id ?? "?") + " 完成" + label + "\n"
+        + truncate(pickText(p, ["output", "text", "content"]) || "", 300));
+      break;
+    }
+    case "Usage":
+      applyUsage(payload);
+      break;
+    case "PromptQueued":
+      appendNotice("⏳ 提示已排队: " + pickText(payload, ["text", "prompt", "content"]));
+      break;
+    case "PromptConsumed":
+      appendNotice("▶ 开始处理排队的提示");
+      break;
+    default:
+      // 后端新事件：未知则尽量显示，避免静默丢失
+      appendNotice("事件 " + name + ": " + truncate(JSON.stringify(payload), 200));
+  }
+}
+
+/* 断线重连：3 秒后重新加载 history + SSE */
+function scheduleReconnect(id) {
+  if (state.sse.stopped || id !== state.sessionId) return;
+  setConn("retrying", "↻ 连接断开，3 秒后重连…");
+  state.sse.retryTimer = setTimeout(() => {
+    if (state.sse.stopped || state.view !== "chat" || id !== state.sessionId) return;
+    state.initSource = null;             // 允许 snapshot 兜底
+    openWith(id, true);
+  }, 3000);
+}
+
+function stopSSE() {
+  state.sse.stopped = true;
+  if (state.sse.ctrl) { try { state.sse.ctrl.abort(); } catch (e) { /* 忽略 */ } }
+  if (state.sse.retryTimer) { clearTimeout(state.sse.retryTimer); state.sse.retryTimer = null; }
+  state.sse.ctrl = null;
+  setConn("", "");
+}
+
+/* =====================================================================
+ * 对话视图流程
+ * ===================================================================*/
+async function loadHistory(id) {
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/history");
+    if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return "auth"; }
+    if (res.status === 404) { setBanner("⚠ 会话不存在或已被删除。"); return "gone"; }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const entries = Array.isArray(data) ? data : (data.entries || []);
+    if (state.initSource !== "snapshot") {
+      renderHistory(entries);
+      state.initSource = "history";
+    }
+    return "ok";
+  } catch (e) {
+    // 网络问题：交给 SSE snapshot 兜底；两者都失败则提示
+    if (!state.acc || !els.messages.children.length) {
+      setBanner("⚠ 加载历史失败：" + e.message + "（等待 SSE 快照…）", true);
+    }
+    return "fail";
+  }
+}
+
+/* history 加载（可选）+ 连接 SSE；auth/gone 时不再重试连接 */
+function openWith(id, withHistory) {
+  const step = withHistory ? loadHistory(id) : Promise.resolve("ok");
+  step.then((r) => {
+    if (r === "auth" || r === "gone") return;
+    connectSSE(id);
+  });
+}
+
+function openSession(id) {
+  stopSSE();
+  state.sessionId = id;
+  state.view = "chat";
+  state.initSource = null;
+  state.status = "Idle";
+  state.acc = newAccumulator();
+  els.listView.classList.add("hidden");
+  els.chatView.classList.remove("hidden");
+  els.topActions.hidden = false;
+  els.chatSessionId.textContent = "会话 " + id;
+  els.messages.innerHTML = "";
+  els.usageInfo.textContent = "";
+  applyStatus("Idle");
+  refreshBanner();
+  openWith(id, true);
+}
+
+function backToList() {
+  stopSSE();
+  state.sessionId = null;
+  state.view = "list";
+  state.acc = null;
+  els.chatView.classList.add("hidden");
+  els.listView.classList.remove("hidden");
+  els.topActions.hidden = true;
+  refreshBanner();
+  pollSessions();
+}
+
+/* 发送 / 取消 / 压缩 */
+async function sendPrompt() {
+  const text = els.promptInput.value.trim();
+  if (!text || !state.sessionId) return;
+  if (!state.token) { setBanner("⚠ 请先输入 Token。", true); return; }
+  els.promptInput.value = "";
+  autosizeInput();
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId) + "/prompt",
+      { method: "POST", body: JSON.stringify({ text }) });
+    if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
+    if (res.status !== 202) throw new Error("HTTP " + res.status);
+  } catch (e) {
+    setBanner("⚠ 发送失败：" + e.message);
+  }
+}
+
+async function cancelTurn() {
+  if (!state.sessionId) return;
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId) + "/cancel",
+      { method: "POST" });
+    if (!res.ok && res.status !== 202) throw new Error("HTTP " + res.status);
+  } catch (e) {
+    setBanner("⚠ 取消失败：" + e.message);
+  }
+}
+
+async function compactSession() {
+  if (!state.sessionId) return;
+  if (!confirm("确认压缩该会话的上下文？")) return;
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId) + "/compact",
+      { method: "POST" });
+    if (!res.ok && res.status !== 202) throw new Error("HTTP " + res.status);
+    appendNotice("⏳ 压缩请求已提交…");
+  } catch (e) {
+    setBanner("⚠ 压缩失败：" + e.message);
+  }
+}
+
+/* 输入框自动增高 */
+function autosizeInput() {
+  const t = els.promptInput;
+  t.style.height = "auto";
+  t.style.height = Math.min(t.scrollHeight, 160) + "px";
+}
+
+/* token 变化后重启传输（轮询 / SSE） */
+function restartTransport() {
+  if (state.view === "list") {
+    stopPolling();
+    startPolling();
+    pollSessions();
+  } else if (state.view === "chat" && state.sessionId) {
+    // 重新走一遍打开流程（重新认证）
+    const id = state.sessionId;
+    stopSSE();
+    state.initSource = null;
+    openWith(id, true);
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  state.pollTimer = setInterval(pollSessions, 1000);
+}
+function stopPolling() {
+  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+}
+
+/* =====================================================================
+ * 事件绑定与启动
+ * ===================================================================*/
+els.newSessionBtn.addEventListener("click", createSession);
+els.newPrompt.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); createSession(); }
+});
+els.backBtn.addEventListener("click", backToList);
+els.sendBtn.addEventListener("click", sendPrompt);
+els.cancelBtn.addEventListener("click", cancelTurn);
+els.compactBtn.addEventListener("click", compactSession);
+els.promptInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+});
+els.promptInput.addEventListener("input", autosizeInput);
+els.messages.addEventListener("scroll", () => {
+  // 用户滚到接近底部时恢复自动跟随
+  const m = els.messages;
+  if (m.scrollHeight - m.scrollTop - m.clientHeight < 80) scrollBottom(true);
+});
+
+function init() {
+  refreshBanner();
+  els.chatView.classList.add("hidden");
+  els.topActions.hidden = true;
+  startPolling();
+  pollSessions();
+}
+
+init();
+</script>
+</body>
+</html>
