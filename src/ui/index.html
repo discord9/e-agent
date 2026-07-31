@@ -863,6 +863,11 @@ function newAccumulator() {
 function freezeAssistant(acc) {
   // 工具调用 / 新用户回合开始时，结束当前助手消息与思考区的累积，
   // 使下一回合的 delta 从新的消息块开始
+  // 流式期间是纯文本（快）；冻结时用完整文本重算一次 markdown，
+  // 让表格/代码块/公式在回合结束时正确渲染。
+  if (acc && acc.assistantBody && acc.assistantText) {
+    acc.assistantBody.innerHTML = renderMarkdown(acc.assistantText);
+  }
   acc.assistantEl = null;
   acc.assistantBody = null;
   acc.assistantText = "";
@@ -1214,6 +1219,11 @@ function applyStatus(status) {
   els.cancelBtn.disabled = !busy;         // Busy/Compacting 时可取消
   els.compactBtn.disabled = busy;         // 空闲时才压缩
   els.sendBtn.disabled = false;           // 允许排队输入
+  // 回合结束（回到 Idle）：流式 delta 期间是纯文本（快），此刻用完整
+  // 文本重算一次 markdown，让表格/代码块/公式正确渲染。
+  if (!busy && state.acc && state.acc.assistantBody && state.acc.assistantText) {
+    state.acc.assistantBody.innerHTML = renderMarkdown(state.acc.assistantText);
+  }
 }
 
 function applyUsage(usage) {
