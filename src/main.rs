@@ -8,8 +8,8 @@ use anyhow::{Context, anyhow};
 use e_agent::agent::{Agent, AgentEvent, preview};
 use e_agent::codex::CodexModel;
 use e_agent::codex_auth::{CodexAuth, login, logout};
-use e_agent::config::Config;
 use e_agent::config::{AuthMode, ResolvedModel};
+use e_agent::config::{Config, resolve_sandbox};
 use e_agent::delegate::Delegate;
 use e_agent::mcp;
 use e_agent::model::{ConfiguredModel, OpenAiModel};
@@ -123,7 +123,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     if !tui_mode && !repl_mode && prompt.trim().is_empty() {
         return Err(anyhow!("a prompt argument or stdin content is required"));
     }
-    let workspace = Workspace::new(match workspace {
+    let mut workspace = Workspace::new(match workspace {
         Some(path) => path.into(),
         None => std::env::current_dir()?,
     })
@@ -240,9 +240,13 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
         role_context_windows.insert(role.clone(), resolved.context_window);
         role_models.insert(role, configured_model(resolved, auth.as_ref(), None, None)?);
     }
-    // The bash sandbox ([sandbox] in config) wraps every bash call — main
-    // agent and subagents alike — in bwrap when enabled.
-    let sandbox = config.as_ref().and_then(|config| config.sandbox(&root));
+    // Resolve one shared canonical policy. `enabled` controls only bwrap;
+    // file capabilities remain active independently.
+    let resolved_policy = resolve_sandbox(config.as_ref(), &root)?;
+    workspace = workspace
+        .with_external_roots(&resolved_policy)
+        .map_err(anyhow::Error::msg)?;
+    let sandbox = resolved_policy.enabled.then_some(resolved_policy.clone());
     if sandbox.is_some() {
         if !e_agent::tools::bwrap_available() {
             return Err(anyhow!(

@@ -539,7 +539,9 @@ impl Tool for Delegate {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
         let workspace = match &explicit_workspace_arg {
-            Some(path) => Workspace::new(path)
+            Some(path) => self
+                .workspace
+                .reroot(path)
                 .map_err(|error| format!("invalid `workspace` path `{path}`: {error}"))?,
             None => self.workspace.clone(),
         };

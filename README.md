@@ -79,12 +79,27 @@ enabled = true
 # readable_paths = ["~/.rustup", "~/.local"]
 ```
 
-`writable_paths` / `readable_paths` are unioned with the project-local
-`<workspace>/.e-agent/config.toml` `[sandbox]` section (which can add paths but
-never change `enabled` / `network` / `workspace_writable`). A leading `~`
-expands to the home directory; relative paths resolve against the workspace
-root. Paths that do not exist on the host are skipped, so a missing cache
-directory never breaks a run.
+`writable_paths` / `readable_paths` define one resolved policy shared by Bash
+mounts and the file tools' external capabilities. A leading `~` expands to the
+home directory; relative paths resolve against the main workspace. Existing
+file/directory roots are canonicalized (including symlink aliases) and aliases
+are deduplicated; missing global roots are skipped.
+
+A project-local `<workspace>/.e-agent/config.toml` may select a subset of these
+global roots. An absent file/section or empty `[sandbox]` inherits all roots.
+If either path field appears, selection mode applies and the other field is
+empty; two explicit empty arrays clear external access. Readable selections may
+come from global readable or writable roots (downgrading authority), while
+writable selections must come from global writable roots. Malformed or
+unreadable project config is a startup error. Project config cannot change
+`enabled`, `network`, or `workspace_writable`. A read-only child under a
+writable parent is rejected rather than silently restoring write authority;
+select a narrower writable root or downgrade the whole selected root instead.
+The exact workspace-relative `.e-agent/config.toml` policy file is readable by
+file tools but write/edit protected and must be changed by the user outside the
+agent. Bash binds an existing policy over `/dev/null`; if only `.e-agent/`
+exists, that directory is mounted read-only so a writable child cannot create
+the policy. If neither exists, no mountpoint is needed or created.
 
 Note that the sandbox hides all of `$HOME` behind a fresh tmpfs and then
 binds in only the workspace and these extra paths — so personal files such as
@@ -184,10 +199,21 @@ ends the turn.
 
 ## Safety boundaries
 
-The workspace capability constrains only the agent's file tools. It permits
-symlinks that remain inside the workspace and rejects symlink escapes. It does
-not constrain hardlink inode origins, does not make a read-then-write sequence
-atomic, and is not a sandbox for the whole process.
+The workspace and configured external capabilities constrain only the agent's
+file tools. Relative paths use the workspace; absolute paths require an
+authorized canonical external root. Readable roots permit reads, while
+writable roots permit read/write/edit. Exact-file roots do not grant authority
+to siblings. Directory capabilities permit symlinks that remain inside their
+root and reject symlink escapes. Exact-file capabilities use a durable handle
+opened at startup: if the trusted host renames or replaces that pathname, file
+tools still address the original inode, while Bash resolves and mounts the
+pathname on each invocation. The trusted host should keep configured roots
+stable for the run. Delegated custom workspaces must be canonical directories
+inside the startup workspace or an authorized writable external directory;
+read-only and exact-file capabilities cannot be rerooted. Capabilities do not
+constrain hardlink inode origins or hardlink aliases to the protected project
+policy file, do not make read/edit sequences atomic, and are not a process
+sandbox.
 
 `bash` runs `/bin/bash -lc` with the workspace as its current directory. By
 default it is not sandboxed: commands can access files outside the workspace,
@@ -197,7 +223,11 @@ stdout and stderr are each captured up to 64 KiB, then drained and marked as
 truncated.
 
 Optional sandboxing is available when `bubblewrap` (`bwrap`) is installed and
-`[sandbox] enabled = true` is set in the config. Every `bash` call — main agent
+`[sandbox] enabled = true` is set in the config. Bash mounts and file-tool
+capabilities are independent boundaries that share the resolved path policy:
+with bwrap disabled Bash retains ambient host access, while configured file
+capabilities still apply; `workspace_writable` controls only the Bash mount.
+Every `bash` call — main agent
 and subagents alike — is then wrapped in `bwrap`: system directories are
 mounted read-only, the workspace is mounted read-write (`workspace_writable =
 false` makes it read-only), `/tmp` and `/home` are fresh tmpfs, PID/IPC/UTS

@@ -403,10 +403,9 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         spec(
             "read_file",
-            "Read a UTF-8-ish file from the workspace. Lines are 1-indexed; long files are paged, \
-             use `offset` to continue reading.",
+            "Read a UTF-8-ish file. Relative paths use the workspace; authorized external absolute paths are accepted. Lines are 1-indexed; long files are paged, use `offset` to continue reading.",
             json!({
-                "path": {"type": "string", "description": "relative file path"},
+                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path"},
                 "offset": {"type": "integer", "description": "first line to read, 1-indexed (default 1)"},
                 "limit": {"type": "integer", "description": format!("maximum lines to read (default {DEFAULT_READ_LINES})")}
             }),
@@ -460,9 +459,9 @@ impl Tool for WriteFile {
     fn spec(&self) -> ToolSpec {
         spec(
             "write_file",
-            "Write a file in the workspace, creating parent directories.",
+            "Write a workspace-relative file or an authorized writable external absolute path, creating parent directories.",
             json!({
-                "path": {"type": "string", "description": "relative file path"},
+                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path"},
                 "content": {"type": "string", "description": "file contents"}
             }),
             &["path", "content"],
@@ -486,9 +485,9 @@ impl Tool for EditFile {
     fn spec(&self) -> ToolSpec {
         spec(
             "edit_file",
-            "Replace exactly one literal occurrence in a workspace file.",
+            "Replace exactly one literal occurrence in a workspace-relative file or authorized writable external absolute path.",
             json!({
-                "path": {"type": "string", "description": "relative file path"},
+                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path"},
                 "old": {"type": "string", "description": "exact existing text"},
                 "new": {"type": "string", "description": "replacement text"}
             }),
@@ -533,8 +532,7 @@ struct Bash {
 #[async_trait]
 impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
-        let mut description =
-            "Run a shell command with the workspace as its current directory.".to_owned();
+        let mut description = "Run a shell command with the workspace as its current directory. Without bubblewrap, the command retains ambient host filesystem access; file-tool capabilities are an independent boundary.".to_owned();
         if let Some(sandbox) = &self.sandbox {
             let ws_mode = if sandbox.workspace_writable {
                 "writable"
@@ -566,9 +564,7 @@ impl Tool for Bash {
                 ));
             }
             description.push_str(
-                " The read_file/write_file/edit_file tools are restricted to the workspace \
-                 (capability-relative, not the sandbox); to read a file outside the workspace \
-                 that is mounted in the sandbox, use bash (e.g. cat).",
+                " Bash mounts and read_file/write_file/edit_file capabilities are independent boundaries sharing this resolved path policy.",
             );
             if self.protect_git {
                 description.push_str(
@@ -1344,35 +1340,50 @@ async fn run_bash(
                 "/tmp".into(),
                 "--tmpfs".into(),
                 "/home".into(),
-                // Workspace bind: must come before extra mounts so that an
-                // extra path *under* the workspace takes priority (bind-try
-                // will mount over the earlier workspace bind).
-                workspace_bind.into(),
-                root_str.clone(),
-                root_str.clone(),
             ]);
-            // Extra user-configured mounts (cargo caches, shared target
-            // disks, ...). These come after the workspace bind so they are
-            // not shadowed by it. --bind-try / --ro-bind-try skip paths that
-            // do not exist on the host so a missing cache dir cannot break.
-            for path in &sandbox.writable_paths {
-                args.push("--bind-try".into());
-                args.push(path.clone());
-                args.push(path.clone());
-            }
+            // Bind ancestors before descendants so the most specific policy
+            // wins. In particular, an external ancestor cannot override the
+            // workspace mode, while an explicit external child still can.
+            // Put the workspace last among equal paths so workspace_writable
+            // remains authoritative for the workspace root itself.
+            let mut mounts = Vec::new();
             for path in &sandbox.readable_paths {
-                args.push("--ro-bind-try".into());
-                args.push(path.clone());
-                args.push(path.clone());
+                mounts.push((path.as_str(), "--ro-bind-try", false));
             }
-            // Protect the project-local sandbox config from the agent:
-            // bind /dev/null over it so writes are silently discarded.
-            // This must come after all other binds (including extra paths)
-            // to ensure it is not shadowed.
-            let project_config = format!("{}/.e-agent/config.toml", root_str);
-            args.push("--ro-bind".into());
-            args.push("/dev/null".into());
-            args.push(project_config);
+            for path in &sandbox.writable_paths {
+                mounts.push((path.as_str(), "--bind-try", false));
+            }
+            mounts.push((root_str.as_str(), workspace_bind, true));
+            mounts.sort_by_key(|(path, _, workspace)| {
+                (std::path::Path::new(path).components().count(), *workspace)
+            });
+            for (path, bind, _) in mounts {
+                args.push(bind.into());
+                args.push(path.into());
+                args.push(path.into());
+            }
+            // Protect the startup policy anchor, not a custom delegated
+            // workspace's unrelated config. It must come after every bind.
+            if workspace.policy_anchor_is_visible() {
+                let policy = workspace.policy_anchor().to_string_lossy().into_owned();
+                let policy_dir = workspace
+                    .policy_anchor()
+                    .parent()
+                    .expect("policy anchor has a parent")
+                    .to_string_lossy()
+                    .into_owned();
+                if std::path::Path::new(&policy).exists() {
+                    args.push("--ro-bind".into());
+                    args.push("/dev/null".into());
+                    args.push(policy);
+                } else if std::path::Path::new(&policy_dir).is_dir() {
+                    // No file mountpoint exists. Freeze the existing parent
+                    // so a writable child cannot create this run's policy.
+                    args.push("--ro-bind".into());
+                    args.push(policy_dir.clone());
+                    args.push(policy_dir);
+                }
+            }
 
             // Protect the workspace .git metadata (directory or
             // linked-worktree pointer file) by binding it read-only over

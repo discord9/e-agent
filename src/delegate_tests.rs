@@ -767,10 +767,11 @@ async fn shared_background_registry_completion_reaches_its_configured_channel() 
 #[tokio::test]
 async fn delegate_uses_custom_workspace() {
     let parent = tempfile::tempdir().unwrap();
-    // Create a separate tempdir as the custom workspace.
-    let custom = tempfile::tempdir().unwrap();
+    // A custom workspace must be a directory within existing authority.
+    let custom_path = parent.path().join("custom");
+    std::fs::create_dir(&custom_path).unwrap();
     // Put a marker file in each workspace.
-    std::fs::write(custom.path().join("sentinel.txt"), "custom").unwrap();
+    std::fs::write(custom_path.join("sentinel.txt"), "custom").unwrap();
     std::fs::write(parent.path().join("sentinel.txt"), "parent").unwrap();
 
     // 1) An invalid (non-existent) workspace path is rejected at
@@ -796,7 +797,7 @@ async fn delegate_uses_custom_workspace() {
     let answer = tool
         .execute(json!({
             "task": "read sentinel.txt and report its content",
-            "workspace": custom.path().to_str().unwrap(),
+            "workspace": custom_path.to_str().unwrap(),
             "background": false
         }))
         .await
