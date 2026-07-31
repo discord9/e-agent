@@ -456,6 +456,14 @@ impl SessionRunner {
     }
 
     fn status(&self, status: SessionStatus) {
+        // Turn-boundary metadata touch (R4): the sessions audit table is
+        // appended once per return to Idle — not per event (double-write
+        // amplification). Fire-and-forget: the write is spawned and never
+        // awaited, so losing the final touch at process exit is acceptable
+        // (the audit table keeps the last committed snapshot).
+        if matches!(status, SessionStatus::Idle) {
+            self.store.touch_meta();
+        }
         self.shared.lock().unwrap().status.send_replace(status);
     }
     fn publish_finished(shared: &mut Shared, result: SessionResult) {

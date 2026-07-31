@@ -163,6 +163,9 @@
     background: var(--base3);
   }
   .session-row:hover { border-color: var(--blue); background: var(--base2); }
+  .session-row.inactive { opacity: 0.55; }
+  .session-row.inactive .sid { color: var(--base01); }
+  .session-row.inactive:hover { opacity: 0.8; }
   .session-row .sid { color: var(--blue); font-size: 12px; min-width: 110px; }
   .session-row .smodel { color: var(--base00); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .session-row .smeta { color: var(--base01); font-size: 12px; text-align: right; }
@@ -620,15 +623,20 @@ function renderSessionList(list) {
   }
   els.listHint.textContent = "";
   for (const s of list) {
-    const row = el("div", "session-row");
-    row.title = s.id + (s.model ? " · " + s.model : "");
+    // Historical (inactive) sessions come from the metadata table: grey
+    // row, clicking resumes them instead of opening directly.
+    const inactive = s.active === false;
+    const row = el("div", "session-row" + (inactive ? " inactive" : ""));
+    row.title = s.id + (s.model ? " · " + s.model : "") +
+      (s.parent_session_id ? " · 子会话 ← " + s.parent_session_id : "");
 
     const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
     const sid = el("span", "sid", shortId(s.id));
     const chip = el("span", "status-chip " + statusChipClass(s.status), statusLabel(s.status));
     const model = el("span", "smodel", s.model || "");
     const meta = el("span", "smeta",
-      fmtTime(s.created_at) + " · " + (s.entry_count ?? "-") + " 条");
+      fmtTime(s.created_at) + " · " + (s.entry_count ?? "-") + " 条" +
+      (s.parent_session_id ? " · ↳" + shortId(s.parent_session_id) : ""));
     const del = el("button", "del danger", "删除");
     del.title = "删除会话 " + s.id;
     del.addEventListener("click", async (ev) => {
@@ -642,9 +650,26 @@ function renderSessionList(list) {
         setBanner("⚠ 删除失败：" + e.message);
       }
     });
-    row.addEventListener("click", () => openSession(s.id));
+    row.addEventListener("click", () => {
+      if (inactive) { resumeSession(s.id); return; }
+      openSession(s.id);
+    });
     row.append(dot, sid, chip, model, meta, del);
     els.sessionList.appendChild(row);
+  }
+}
+
+/* 恢复（resume）一个历史会话：POST /api/sessions {id} 建回活跃会话后打开 */
+async function resumeSession(id) {
+  if (!state.token) { setBanner("⚠ 请先输入 Token。", true); return; }
+  try {
+    const res = await api("/api/sessions", { method: "POST", body: JSON.stringify({ id }) });
+    if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
+    if (res.status !== 201) throw new Error("HTTP " + res.status);
+    const s = await res.json();
+    openSession(s.id);
+  } catch (e) {
+    setBanner("⚠ 恢复会话失败：" + e.message);
   }
 }
 

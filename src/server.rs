@@ -81,10 +81,20 @@ fn tail_snapshot(mut events: Vec<AgentEvent>) -> Vec<AgentEvent> {
 /// here and reused by every session `build()`.
 pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Result<()> {
     let token = load_or_create_token()?;
+    // Sessions-metadata store, connected once at bootstrap. Greptime:
+    // create the audit table and run the one-time backfill of sessions
+    // that predate it (L3: never inside connect). Jsonl: registry-only
+    // listing marker (list_meta is empty).
+    let meta_store = SessionStore::connect_meta(factory.backend(), factory.root()).await?;
+    meta_store
+        .backfill_sessions(factory.root())
+        .await
+        .context("cannot backfill session metadata")?;
     let state = Arc::new(AppState {
         factory,
         registry: Arc::new(SessionRegistry::default()),
         token,
+        meta_store,
     });
     eprintln!(
         "e-agent: serving on http://{host}:{port} (token: {}; also at {})",
@@ -115,6 +125,10 @@ pub struct AppState {
     pub factory: SessionFactory,
     pub registry: Arc<SessionRegistry>,
     pub token: String,
+    /// Workspace-scoped sessions-metadata store: historical sessions for
+    /// `GET /api/sessions` (Greptime) and `delete_meta` hiding. The Jsonl
+    /// variant is the registry-only marker (list is always empty).
+    pub meta_store: SessionStore,
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -321,6 +335,13 @@ pub struct SessionMeta {
     /// True while a turn is in flight (Busy or Compacting); the list renders
     /// the busy dot from this.
     pub busy: bool,
+    /// True while the session is live in the registry. Historical sessions
+    /// from the metadata table are `false` and rendered grey by the
+    /// frontend; clicking one resumes it (`POST /api/sessions {id}`).
+    pub active: bool,
+    /// Parent subagent link (sessions spawned by the `delegate` tool); the
+    /// frontend shows it as provenance when present.
+    pub parent_session_id: Option<String>,
 }
 
 async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -> SessionMeta {
@@ -340,6 +361,8 @@ async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -
         status: status_string(&status).to_owned(),
         entry_count,
         busy: matches!(status, SessionStatus::Busy | SessionStatus::Compacting),
+        active: true,
+        parent_session_id: None,
     }
 }
 
@@ -351,14 +374,58 @@ fn error(status: StatusCode, message: impl Into<String>) -> (StatusCode, String)
 // Handlers
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+/// Merge active registry sessions with historical metadata-table sessions
+/// into one list. Registry entries win for ids present in both (they carry
+/// live status); historical entries are marked `active: false` and
+/// resumable. Pure function so the merge is unit-testable without a
+/// backend.
+fn merge_session_metas(
+    active: Vec<SessionMeta>,
+    historical: Vec<crate::session_store::SessionMeta>,
+) -> Vec<SessionMeta> {
+    let mut by_id: std::collections::HashMap<String, SessionMeta> =
+        std::collections::HashMap::with_capacity(active.len() + historical.len());
+    for mut meta in active {
+        meta.active = true;
+        by_id.insert(meta.id.clone(), meta);
+    }
+    for meta in historical {
+        let id = meta.session_id.clone();
+        by_id.entry(id).or_insert_with(|| SessionMeta {
+            id: meta.session_id,
+            model: meta.model.unwrap_or_default(),
+            role: meta.role,
+            created_at: chrono::DateTime::from_naive_utc_and_offset(meta.created_at, chrono::Utc),
+            // Historical sessions are not running; "Idle" renders as the
+            // resumable chip and matches what a fresh resume shows.
+            status: "Idle".to_owned(),
+            entry_count: meta.entry_count.max(0) as usize,
+            busy: false,
+            active: false,
+            parent_session_id: meta.parent_session_id,
+        });
+    }
+    let mut metas: Vec<SessionMeta> = by_id.into_values().collect();
+    metas.sort_by_key(|meta| meta.created_at);
+    metas
+}
+
 async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMeta>> {
     let root = state.factory.root();
-    let mut metas: Vec<SessionMeta> = Vec::with_capacity(state.registry.list().len());
+    let mut active: Vec<SessionMeta> = Vec::with_capacity(state.registry.list().len());
     for (id, session) in state.registry.list() {
-        metas.push(session_meta(&id, &session, root).await);
+        active.push(session_meta(&id, &session, root).await);
     }
-    metas.sort_by_key(|meta| meta.created_at);
-    Json(metas)
+    // Historical sessions from the metadata table (Greptime). The Jsonl
+    // backend lists nothing — the registry is the whole list (M4).
+    let historical = match state.meta_store.list_meta(root).await {
+        Ok(list) => list,
+        Err(error) => {
+            eprintln!("e-agent: cannot list session metadata: {error:#}");
+            Vec::new()
+        }
+    };
+    Json(merge_session_metas(active, historical))
 }
 
 #[derive(Deserialize)]
@@ -479,12 +546,23 @@ async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let session = live(&state, &id)?;
-    session.handle.cancel();
-    // Dropping the registry entry (and with it the SessionTask) aborts the
-    // runner; in-flight SSE streams notice the closed event/status channels
-    // and end themselves.
-    state.registry.remove(&id);
+    // Live session: cancel + remove from the registry. Dropping the
+    // registry entry (and with it the SessionTask) aborts the runner;
+    // in-flight SSE streams notice the closed event/status channels and
+    // end themselves. Unknown/historical ids simply skip this step.
+    if let Some(session) = state.registry.get(&id) {
+        session.handle.cancel();
+        state.registry.remove(&id);
+    }
+    // Hide from the sessions list: delete the session's metadata rows
+    // (Greptime audit table; JSONL no-op). The transcript stays, so a
+    // later resume still works.
+    let root = state.factory.root();
+    state
+        .meta_store
+        .delete_meta(root, &id)
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1142,12 +1220,14 @@ mod tests {
 
     /// An `AppState` for handler tests. `test_factory` skips config/model env
     /// resolution; the tested paths (auth middleware, registry-miss 404)
-    /// never reach `factory.build()`.
+    /// never reach `factory.build()`. The meta store is the Jsonl marker
+    /// (registry-only listing).
     fn test_app_state(token: &str) -> Arc<AppState> {
         Arc::new(AppState {
             factory: crate::session_factory::SessionFactory::test_factory(std::env::temp_dir()),
             registry: Arc::new(SessionRegistry::default()),
             token: token.to_owned(),
+            meta_store: SessionStore::Jsonl,
         })
     }
 
@@ -1201,9 +1281,10 @@ mod tests {
     }
 
     /// Frontend contract: `GET /api/sessions` items carry `status` as a
-    /// CamelCase string plus `entry_count` and `busy` (index.html reads
-    /// `s.id`, `s.status`, `s.model`, `s.created_at`, `s.entry_count`,
-    /// `s.busy`).
+    /// CamelCase string plus `entry_count`, `busy`, `active` and
+    /// `parent_session_id` (index.html reads `s.id`, `s.status`, `s.model`,
+    /// `s.created_at`, `s.entry_count`, `s.busy`, `s.active`,
+    /// `s.parent_session_id`).
     #[tokio::test]
     async fn session_meta_has_frontend_fields() {
         let (id, session) = live_session("web-abc");
@@ -1217,12 +1298,112 @@ mod tests {
             "status",
             "entry_count",
             "busy",
+            "active",
+            "parent_session_id",
         ] {
             assert!(value.get(key).is_some(), "missing field {key}");
         }
         assert_eq!(value["status"], "Idle");
         assert_eq!(value["busy"], false);
+        assert_eq!(value["active"], true, "registry sessions are active");
         assert_eq!(value["entry_count"], 0);
+    }
+
+    /// The list merge: registry sessions stay active (and win over an
+    /// overlapping history row), historical metadata-table sessions come in
+    /// inactive and resumable ("Idle").
+    #[test]
+    fn merge_session_metas_marks_registry_active_and_keeps_history() {
+        use crate::session_store::SessionMeta as HistoryMeta;
+        let dt = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let naive = |secs: i64| {
+            chrono::DateTime::from_timestamp(secs, 0)
+                .unwrap()
+                .naive_utc()
+        };
+        let wire = |id: &str, created: i64| SessionMeta {
+            id: id.to_owned(),
+            model: "web-model".into(),
+            role: None,
+            created_at: dt(created),
+            status: "Idle".into(),
+            entry_count: 1,
+            busy: false,
+            active: false,
+            parent_session_id: None,
+        };
+        let history = |id: &str, created: i64, count: i64| HistoryMeta {
+            session_id: id.to_owned(),
+            created_at: naive(created),
+            last_active_at: naive(created + 10),
+            model: None,
+            role: None,
+            entry_count: count,
+            parent_session_id: None,
+            parent_task_id: None,
+        };
+        // One registry session plus two historical sessions, one of which
+        // overlaps a registry id (the registry entry wins).
+        let merged = merge_session_metas(
+            vec![wire("web-1", 200)],
+            vec![history("tui-1", 50, 7), history("web-1", 100, 3)],
+        );
+        assert_eq!(merged.len(), 2);
+        let web1 = merged.iter().find(|m| m.id == "web-1").unwrap();
+        assert!(web1.active, "registry session stays active");
+        assert_eq!(web1.entry_count, 1, "registry data wins over history");
+        assert_eq!(web1.created_at, dt(200));
+        let tui1 = merged.iter().find(|m| m.id == "tui-1").unwrap();
+        assert!(!tui1.active, "historical session is inactive");
+        assert_eq!(tui1.entry_count, 7);
+        assert_eq!(tui1.status, "Idle", "historical sessions are resumable");
+        assert_eq!(tui1.model, "", "history without model renders empty");
+    }
+
+    /// Delete is idempotent for unknown/historical ids: it removes the
+    /// registry entry when present and hides the metadata rows (no-op on
+    /// the Jsonl test store), returning 204 either way.
+    #[tokio::test]
+    async fn delete_session_hides_unknown_and_known() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let state = test_app_state("sekrit");
+        let app = router(state.clone());
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/some-historical-id")
+                    .method("DELETE")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown.status(),
+            StatusCode::NO_CONTENT,
+            "deleting an unknown session hides it idempotently"
+        );
+        // A live registry session also deletes cleanly.
+        let (id, session) = live_session("web-del");
+        state.registry.insert(id.clone(), session);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}"))
+                    .method("DELETE")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(state.registry.get(&id).is_none(), "registry entry removed");
     }
 
     /// The frontend contract (contract item 5): `SessionEntry` is internally

@@ -383,6 +383,46 @@ fn result_output(result: SessionResult) -> (bool, String) {
     }
 }
 
+/// Spawn the fire-and-forget creation of a subagent's sessions-metadata
+/// row (R3: written by the parent process at spawn time). The parent task
+/// id is only known inside the background spawn's synchronous `on_id`
+/// hook, so the (async) create is spawned onto the current runtime from
+/// there. Best-effort: a failure only logs and never fails the delegate.
+fn spawn_subagent_meta_create(
+    store: SessionStore,
+    root: std::path::PathBuf,
+    session_id: String,
+    model: String,
+    role: Option<&str>,
+    parent_session_id: Option<&str>,
+    parent_task_id: u64,
+) {
+    let role = role.map(str::to_owned);
+    let parent_session_id = parent_session_id.map(str::to_owned);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                if let Err(error) = store
+                    .create_meta(
+                        &root,
+                        &session_id,
+                        Some(&model),
+                        role.as_deref(),
+                        parent_session_id.as_deref(),
+                        Some(parent_task_id as i64),
+                    )
+                    .await
+                {
+                    eprintln!("e-agent: cannot record subagent session metadata: {error:#}");
+                }
+            });
+        }
+        Err(_) => {
+            eprintln!("e-agent: cannot record subagent session metadata: no tokio runtime");
+        }
+    }
+}
+
 fn sync_result(session_id: &str, result: SessionResult) -> Result<String, String> {
     let (completed, output) = result_output(result);
     let output = format!("subagent session: {session_id}\n{output}");
@@ -640,6 +680,19 @@ impl Tool for Delegate {
             backend: self.persist_backend.clone(),
         };
         let session_id = persist.session_id.clone();
+        // Sessions metadata (audit table): the subagent's row is written
+        // by the PARENT at spawn time — model/role/parent links are all
+        // known here (R3) — never by the subagent's own touch path (which
+        // read-on-miss caches and rewrites, but never self-creates). The
+        // parent task id is allocated by BackgroundTasks only inside the
+        // spawn's on_id hook, so the (async) create is spawned from there.
+        let meta_store = SessionStore::connect(&persist.backend, &persist.root, &session_id)
+            .await
+            .map_err(|error| format!("subagent failed: {error:#}"))?;
+        let meta_model = model_name.clone();
+        let meta_role = role.clone();
+        let parent_session_id = self.record_in.as_ref().map(|record| record.session.clone());
+        let persist_root = persist.root.clone();
         // Read-only roles run under a narrowed bwrap policy: the workspace is
         // read-only, extra writable roots are dropped, network is disabled.
         let task_sandbox = if read_only {
@@ -674,6 +727,9 @@ impl Tool for Delegate {
             context_window,
         });
         let entry_for_hook = entry.clone();
+        // Owned clone for the move closures; the outer `session_id` stays
+        // usable for the return messages after the spawn.
+        let hook_session_id = session_id.clone();
         if background {
             let record = self.record_in.clone();
             let cleanup = DelegateCleanup::new(slot, self.sessions.clone(), record.clone());
@@ -700,6 +756,15 @@ impl Tool for Delegate {
                             Some(&record_session_id),
                         );
                     }
+                    spawn_subagent_meta_create(
+                        meta_store.clone(),
+                        persist_root.clone(),
+                        hook_session_id.clone(),
+                        meta_model.clone(),
+                        meta_role.as_deref(),
+                        parent_session_id.as_deref(),
+                        id,
+                    );
                 },
                 move || {
                     let cleanup = cleanup;
@@ -726,6 +791,15 @@ impl Tool for Delegate {
                     Err(poisoned) => *poisoned.into_inner() = Some(id),
                 }
                 sessions.insert(id, entry_for_hook);
+                spawn_subagent_meta_create(
+                    meta_store.clone(),
+                    persist_root.clone(),
+                    hook_session_id.clone(),
+                    meta_model.clone(),
+                    meta_role.as_deref(),
+                    parent_session_id.as_deref(),
+                    id,
+                );
             },
             move || {
                 let cleanup = cleanup;

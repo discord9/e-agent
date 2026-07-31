@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use tokio_postgres::NoTls;
 
 use crate::agent::{Message, SessionEntry};
+use crate::session_store::SessionMeta;
 
 /// DDL for the session table. Idempotent.
 const CREATE_TABLE: &str = r#"
@@ -56,6 +57,33 @@ CREATE TABLE IF NOT EXISTS running_tasks (
     PRIMARY KEY (workspace_id, session_id, task_id)
 ) WITH (
     sst_format = 'flat',
+)
+"#;
+
+/// DDL for the sessions metadata table. Idempotent. NOT `append_mode`
+/// (unlike `session_entries`) so `delete_meta` can DELETE rows.
+///
+/// Semantics: an append-only lifecycle AUDIT log, not a one-row-per-session
+/// upsert table. Every create/touch appends a COMPLETE snapshot row
+/// (created_at/model/role/parent/entry_count all carried on every row) at a
+/// fresh `last_active_at`; the TIME INDEX keeps the rows ordered, and the
+/// list view deduplicates per primary key taking the latest `last_active_at`
+/// (explicitly in SQL — the query is correct whether or not the engine
+/// auto-dedups same-PK rows). Because each row is a full snapshot, a touch
+/// can never wipe immutable columns: there is no partial-row rewrite at all.
+const CREATE_TABLE_SESSIONS: &str = r#"
+CREATE TABLE IF NOT EXISTS sessions (
+    workspace_id STRING NOT NULL,
+    session_id STRING NOT NULL,
+    created_at TIMESTAMP(9) NOT NULL,
+    last_active_at TIMESTAMP(9) NOT NULL,
+    model STRING NULL,
+    "role" STRING NULL,
+    entry_count BIGINT NOT NULL DEFAULT 0,
+    parent_session_id STRING NULL,
+    parent_task_id BIGINT NULL,
+    TIME INDEX (last_active_at),
+    PRIMARY KEY (workspace_id, session_id)
 )
 "#;
 
@@ -128,6 +156,13 @@ pub struct GreptimeSession {
     next_seq: i64,
     workspace_id: String,
     session_id: String,
+    /// The session's latest metadata snapshot, cached at connect time so
+    /// every touch carries the immutable columns (created_at/model/role/
+    /// parent) without re-reading them. `None` = no row yet (brand-new
+    /// session, or a subagent whose parent has not written its row yet).
+    /// Interior mutability because every touch path takes `&self` while
+    /// the store hands the session out behind a tokio Mutex.
+    cached_meta: std::sync::Mutex<Option<SessionMeta>>,
 }
 
 impl GreptimeSession {
@@ -152,6 +187,36 @@ impl GreptimeSession {
             .execute(CREATE_TABLE_RUNNING_TASKS, &[])
             .await
             .context("cannot create running_tasks table")?;
+        client
+            .execute(CREATE_TABLE_SESSIONS, &[])
+            .await
+            .context("cannot create sessions table")?;
+
+        // Cache the session's latest metadata snapshot (if any) so later
+        // touches rewrite complete rows without re-reading immutable
+        // columns. The table is append-only; the newest row per session
+        // wins (ORDER BY last_active_at DESC LIMIT 1).
+        let meta_row = client
+            .query_opt(
+                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                        parent_session_id, parent_task_id \
+                 FROM sessions \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 ORDER BY last_active_at DESC LIMIT 1",
+                &[&workspace_id, &session_id],
+            )
+            .await
+            .context("cannot query session metadata")?;
+        let cached_meta = meta_row.map(|row| SessionMeta {
+            session_id: session_id.to_string(),
+            created_at: row.get("created_at"),
+            last_active_at: row.get("last_active_at"),
+            model: row.get("model"),
+            role: row.get("role"),
+            entry_count: row.get("entry_count"),
+            parent_session_id: row.get("parent_session_id"),
+            parent_task_id: row.get("parent_task_id"),
+        });
 
         // Find the current max seq via COALESCE(MAX(seq), -1).
         // Returns -1 for an empty session (no rows for the workspace/session).
@@ -177,6 +242,7 @@ impl GreptimeSession {
             next_seq,
             workspace_id: workspace_id.to_string(),
             session_id: session_id.to_string(),
+            cached_meta: std::sync::Mutex::new(cached_meta),
         })
     }
 
@@ -627,6 +693,286 @@ impl GreptimeSession {
         // failure does not shift sequence numbers on retry.
         self.next_seq = final_cursor;
 
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // sessions — metadata audit table
+    // ------------------------------------------------------------------
+    //
+    // Greptime has no UPDATE: "upsert" is a same-PK INSERT and
+    // last-write-wins by the TIME INDEX. The sessions table is an
+    // append-only lifecycle audit log: every create/touch appends a
+    // COMPLETE snapshot row (created_at/model/role/parent/entry_count all
+    // carried on every row), and the list view deduplicates per session
+    // taking the latest last_active_at. There is no partial-row rewrite,
+    // so a touch can never wipe immutable columns.
+
+    /// Latest metadata snapshot for one session, or `None` when the
+    /// session has no row yet (brand-new session, or a subagent whose
+    /// parent has not written its row yet).
+    async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                        parent_session_id, parent_task_id \
+                 FROM sessions \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 ORDER BY last_active_at DESC LIMIT 1",
+                &[&self.workspace_id, &session_id],
+            )
+            .await
+            .context("cannot query session metadata")?;
+        Ok(row.map(|row| SessionMeta {
+            session_id: session_id.to_owned(),
+            created_at: row.get("created_at"),
+            last_active_at: row.get("last_active_at"),
+            model: row.get("model"),
+            role: row.get("role"),
+            entry_count: row.get("entry_count"),
+            parent_session_id: row.get("parent_session_id"),
+            parent_task_id: row.get("parent_task_id"),
+        }))
+    }
+
+    async fn insert_meta(&self, meta: &SessionMeta) -> Result<()> {
+        self.client
+            .execute(
+                "INSERT INTO sessions \
+                 (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                  entry_count, parent_session_id, parent_task_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &self.workspace_id,
+                    &meta.session_id,
+                    &meta.created_at,
+                    &meta.last_active_at,
+                    &meta.model,
+                    &meta.role,
+                    &meta.entry_count,
+                    &meta.parent_session_id,
+                    &meta.parent_task_id,
+                ],
+            )
+            .await
+            .context("cannot insert session metadata")?;
+        Ok(())
+    }
+
+    /// The full snapshot the next touch must carry: the cached row when
+    /// present, otherwise a read-on-miss of the table (a subagent's first
+    /// touch reads back the row its parent wrote at spawn time — R3).
+    /// Absence is never cached: a parent may create the row between
+    /// touches, and the next touch must see it.
+    async fn effective_meta(&self) -> Result<Option<SessionMeta>> {
+        if let Some(cached) = self.cached_meta.lock().unwrap().clone() {
+            return Ok(Some(cached));
+        }
+        match self.load_meta_row(&self.session_id).await? {
+            Some(meta) => {
+                *self.cached_meta.lock().unwrap() = Some(meta.clone());
+                Ok(Some(meta))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Create the session's first metadata snapshot row. Synchronous
+    /// (awaited by the caller) so the list sees the session immediately.
+    ///
+    /// Idempotent per session: when a row already exists this is a resume,
+    /// not a creation, so nothing is appended (a second creation snapshot
+    /// would rewrite `created_at` and pollute the audit log). `model` /
+    /// `role` / parent links are supplied by the caller — the parent
+    /// process writes subagent rows at spawn time; the main session's row
+    /// is written by `SessionFactory::build`.
+    pub async fn create_meta(
+        &self,
+        session_id: &str,
+        model: Option<&str>,
+        role: Option<&str>,
+        parent_session_id: Option<&str>,
+        parent_task_id: Option<i64>,
+    ) -> Result<()> {
+        if self.load_meta_row(session_id).await?.is_some() {
+            return Ok(());
+        }
+        let now = us_to_datetime(next_event_time_us());
+        let meta = SessionMeta {
+            session_id: session_id.to_owned(),
+            created_at: now,
+            last_active_at: now,
+            model: model.map(str::to_owned),
+            role: role.map(str::to_owned),
+            entry_count: self.next_seq,
+            parent_session_id: parent_session_id.map(str::to_owned),
+            parent_task_id,
+        };
+        self.insert_meta(&meta).await?;
+        *self.cached_meta.lock().unwrap() = Some(meta);
+        Ok(())
+    }
+
+    /// Append one activity snapshot for the bound session: a full row with
+    /// a fresh `last_active_at` and `entry_count = next_seq` — the next
+    /// sequence number from connect/append (R2), never a physical row
+    /// count, which same-seq retries would overcount.
+    ///
+    /// Never self-creates (R3): when no row exists yet (no cache and no
+    /// row in the table — e.g. a subagent whose parent has not written its
+    /// row), the touch is skipped so a subagent can never fabricate its
+    /// own row. Callers run this fire-and-forget at turn boundaries (R4);
+    /// losing the final touch at process exit is acceptable.
+    pub async fn touch_meta(&self) -> Result<()> {
+        let Some(meta) = self.effective_meta().await? else {
+            return Ok(());
+        };
+        let mut meta = meta;
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        meta.entry_count = self.next_seq;
+        self.insert_meta(&meta).await
+    }
+
+    /// Latest metadata snapshot per session, newest activity first.
+    ///
+    /// The table is append-only, so one session has many rows; the list
+    /// deduplicates by primary key keeping the row with the maximum
+    /// `last_active_at` per session (explicit GROUP BY + JOIN — correct
+    /// whether or not the engine auto-dedups same-PK rows at read time).
+    pub async fn list_meta(&self) -> Result<Vec<SessionMeta>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
+                        s.entry_count, s.parent_session_id, s.parent_task_id \
+                 FROM sessions s \
+                 INNER JOIN ( \
+                     SELECT session_id, MAX(last_active_at) AS max_ts \
+                     FROM sessions WHERE workspace_id = $1 GROUP BY session_id \
+                 ) latest \
+                   ON latest.session_id = s.session_id AND latest.max_ts = s.last_active_at \
+                 WHERE s.workspace_id = $1 \
+                 ORDER BY s.last_active_at DESC",
+                &[&self.workspace_id],
+            )
+            .await
+            .context("cannot list session metadata")?;
+        Ok(rows
+            .iter()
+            .map(|row| SessionMeta {
+                session_id: row.get("session_id"),
+                created_at: row.get("created_at"),
+                last_active_at: row.get("last_active_at"),
+                model: row.get("model"),
+                role: row.get("role"),
+                entry_count: row.get("entry_count"),
+                parent_session_id: row.get("parent_session_id"),
+                parent_task_id: row.get("parent_task_id"),
+            })
+            .collect())
+    }
+
+    /// The full lifecycle trace of one session: every snapshot row, oldest
+    /// activity first. This is the audit view — [`Self::list_meta`] shows
+    /// only the latest snapshot per session.
+    pub async fn audit_meta(&self, session_id: &str) -> Result<Vec<SessionMeta>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                        parent_session_id, parent_task_id \
+                 FROM sessions \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 ORDER BY last_active_at ASC",
+                &[&self.workspace_id, &session_id],
+            )
+            .await
+            .context("cannot load session metadata audit trail")?;
+        Ok(rows
+            .iter()
+            .map(|row| SessionMeta {
+                session_id: session_id.to_owned(),
+                created_at: row.get("created_at"),
+                last_active_at: row.get("last_active_at"),
+                model: row.get("model"),
+                role: row.get("role"),
+                entry_count: row.get("entry_count"),
+                parent_session_id: row.get("parent_session_id"),
+                parent_task_id: row.get("parent_task_id"),
+            })
+            .collect())
+    }
+
+    /// Hide a session from the sessions list: delete ALL of its metadata
+    /// rows (the complete audit trail). Resume still works because
+    /// `session_entries` is untouched. Known limitation (documented, per
+    /// the audit-log design without tombstones): a later
+    /// [`Self::backfill_sessions`] bootstrap run re-creates the row from
+    /// the transcript, so hiding is scoped to the current server lifetime.
+    pub async fn delete_meta(&self, session_id: &str) -> Result<()> {
+        self.client
+            .execute(
+                "DELETE FROM sessions WHERE workspace_id = $1 AND session_id = $2",
+                &[&self.workspace_id, &session_id],
+            )
+            .await
+            .context("cannot delete session metadata")?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = None;
+        }
+        Ok(())
+    }
+
+    /// One-time bootstrap migration: aggregate `session_entries` per
+    /// session — `MAX(seq)+1` as entry_count (never COUNT, same-seq
+    /// retries would overcount) and MIN/MAX(event_time) as the lifecycle
+    /// bounds — and insert a snapshot row only for sessions that have NO
+    /// metadata row yet. Idempotent: a second run finds every session
+    /// already has a row and inserts nothing, so results are identical.
+    /// Called once by the server bootstrap; never from `connect` (L3) and
+    /// never gated on table emptiness (M1).
+    pub async fn backfill_sessions(&self) -> Result<()> {
+        let existing: Vec<String> = self
+            .client
+            .query(
+                "SELECT DISTINCT session_id FROM sessions WHERE workspace_id = $1",
+                &[&self.workspace_id],
+            )
+            .await
+            .context("cannot query existing session metadata")?
+            .iter()
+            .map(|row| row.get("session_id"))
+            .collect();
+        let aggregates = self
+            .client
+            .query(
+                "SELECT session_id, MAX(seq) + 1 AS entry_count, \
+                        MIN(event_time) AS created_at, MAX(event_time) AS last_active_at \
+                 FROM session_entries \
+                 WHERE workspace_id = $1 \
+                 GROUP BY session_id",
+                &[&self.workspace_id],
+            )
+            .await
+            .context("cannot aggregate session_entries for metadata backfill")?;
+        for row in aggregates {
+            let session_id: String = row.get("session_id");
+            if existing.iter().any(|id| id == &session_id) {
+                continue;
+            }
+            self.insert_meta(&SessionMeta {
+                session_id,
+                created_at: row.get("created_at"),
+                last_active_at: row.get("last_active_at"),
+                model: None,
+                role: None,
+                entry_count: row.get("entry_count"),
+                parent_session_id: None,
+                parent_task_id: None,
+            })
+            .await?;
+        }
         Ok(())
     }
 
@@ -1865,6 +2211,210 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // sessions — metadata audit table (integration)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sessions_meta_create_list_touch_audit_delete() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-meta-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // create → the list sees it immediately (synchronous create).
+        session
+            .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+            .await
+            .unwrap();
+        let list = session.list_meta().await.unwrap();
+        let created = list
+            .iter()
+            .find(|m| m.session_id == sid)
+            .expect("created session must be listed");
+        assert_eq!(created.model.as_deref(), Some("model-x"));
+        assert_eq!(created.role.as_deref(), Some("main"));
+        assert_eq!(created.entry_count, 0);
+
+        // create is idempotent: a second create appends nothing.
+        session
+            .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            session.audit_meta(&sid).await.unwrap().len(),
+            1,
+            "re-create must not append a second creation snapshot"
+        );
+
+        // touch twice → audit trail has 3 rows (create + 2 touches), the
+        // list still returns one latest snapshot, created_at survives.
+        session.touch_meta().await.unwrap();
+        session.touch_meta().await.unwrap();
+        let trail = session.audit_meta(&sid).await.unwrap();
+        assert_eq!(trail.len(), 3, "create + 2 touches = 3 audit rows");
+        let list = session.list_meta().await.unwrap();
+        let latest = list
+            .iter()
+            .find(|m| m.session_id == sid)
+            .expect("session still listed after touches");
+        assert_eq!(
+            latest.created_at, created.created_at,
+            "touch must preserve created_at"
+        );
+        assert!(
+            latest.last_active_at > created.last_active_at,
+            "touch must advance last_active_at"
+        );
+
+        // delete hides the session entirely (all audit rows gone).
+        session.delete_meta(&sid).await.unwrap();
+        assert!(
+            session.audit_meta(&sid).await.unwrap().is_empty(),
+            "delete removes the full audit trail"
+        );
+        assert!(
+            !session
+                .list_meta()
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.session_id == sid),
+            "deleted session must not be listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_meta_entry_count_is_next_seq() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-meta-seq-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let entries = test_entries();
+
+        // entry_count = next_seq (MAX(seq)+1 at connect, advanced by
+        // append) — not a physical row count.
+        session.append(&entries[..3]).await.unwrap();
+        assert_eq!(session.next_seq, 3);
+        session
+            .create_meta(&sid, Some("m"), None, None, None)
+            .await
+            .unwrap();
+        let list = session.list_meta().await.unwrap();
+        let meta = list
+            .iter()
+            .find(|m| m.session_id == sid)
+            .expect("created session must be listed");
+        assert_eq!(meta.entry_count, 3, "create carries next_seq");
+
+        // A touch after more appends carries the advanced next_seq.
+        session.append(&entries[3..5]).await.unwrap();
+        assert_eq!(session.next_seq, 5);
+        session.touch_meta().await.unwrap();
+        let list = session.list_meta().await.unwrap();
+        let latest = list
+            .iter()
+            .find(|m| m.session_id == sid)
+            .expect("session still listed after touch");
+        assert_eq!(latest.entry_count, 5, "touch carries next_seq");
+    }
+
+    #[tokio::test]
+    async fn sessions_meta_touch_never_self_creates() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-meta-nocreate-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // No row exists (fresh subagent whose parent has not written yet):
+        // a touch must skip, never fabricate its own row (R3).
+        session.touch_meta().await.unwrap();
+        assert!(
+            session.audit_meta(&sid).await.unwrap().is_empty(),
+            "touch must not self-create a row"
+        );
+
+        // Once the parent's row lands, the next touch reads it back
+        // (read-on-miss) and appends a complete snapshot carrying the
+        // immutable columns.
+        session
+            .create_meta(
+                &sid,
+                Some("sub-model"),
+                Some("fixer"),
+                Some("parent-x"),
+                Some(7),
+            )
+            .await
+            .unwrap();
+        session.touch_meta().await.unwrap();
+        let trail = session.audit_meta(&sid).await.unwrap();
+        assert_eq!(trail.len(), 2, "parent create + subagent touch");
+        let latest = session
+            .list_meta()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.session_id == sid)
+            .expect("session listed");
+        assert_eq!(latest.model.as_deref(), Some("sub-model"));
+        assert_eq!(latest.role.as_deref(), Some("fixer"));
+        assert_eq!(latest.parent_session_id.as_deref(), Some("parent-x"));
+        assert_eq!(latest.parent_task_id, Some(7));
+    }
+
+    #[tokio::test]
+    async fn sessions_meta_backfill_is_idempotent() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        // Isolated workspace: backfill aggregates per workspace and the
+        // other tests share the default workspace id.
+        let wid = derive_workspace_id(Path::new("/tmp/e-agent-backfill-test"));
+        let sid = format!("test-gt-bf-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let entries = test_entries();
+
+        // Pre-table session: transcript rows, no metadata rows.
+        session.append(&entries[..3]).await.unwrap();
+        assert!(session.audit_meta(&sid).await.unwrap().is_empty());
+
+        session.backfill_sessions().await.unwrap();
+        let list = session.list_meta().await.unwrap();
+        assert_eq!(list.len(), 1, "only this session in the isolated workspace");
+        let meta = &list[0];
+        assert_eq!(meta.session_id, sid);
+        assert_eq!(meta.entry_count, 3, "MAX(seq)+1, not COUNT");
+        assert_eq!(meta.model, None, "pre-table sessions have no model");
+
+        // Idempotent: a second run inserts nothing; the list is identical.
+        session.backfill_sessions().await.unwrap();
+        let list = session.list_meta().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].entry_count, 3);
+        assert_eq!(list[0].created_at, meta.created_at);
+        assert_eq!(list[0].last_active_at, meta.last_active_at);
+        assert_eq!(
+            session.audit_meta(&sid).await.unwrap().len(),
+            1,
+            "second backfill appends nothing"
         );
     }
 }

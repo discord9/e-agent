@@ -27,6 +27,32 @@ use crate::agent::SessionEntry;
 use crate::config::SessionBackend;
 use crate::session::{LoadedSession, Session};
 
+/// Sentinel session id for a workspace-scoped metadata store: only the
+/// `workspace_id` bound at connect time is used by `list_meta` /
+/// `backfill_sessions`; `delete_meta` takes its target explicitly, so the
+/// sentinel is never matched. Only meaningful on the Greptime backend.
+#[allow(dead_code)]
+const META_STORE_SENTINEL: &str = "_meta";
+
+/// One session's metadata snapshot from the `sessions` audit table
+/// (Greptime backend only). Every row is a COMPLETE snapshot — Greptime
+/// has no UPDATE, so the table is append-only and the latest row per
+/// session wins by the TIME INDEX (`last_active_at`); `list_meta`
+/// deduplicates per session accordingly. The `workspace_id` is implied by
+/// the store/connection and never carried here. The JSONL backend has no
+/// meta table and never produces these values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionMeta {
+    pub session_id: String,
+    pub created_at: chrono::NaiveDateTime,
+    pub last_active_at: chrono::NaiveDateTime,
+    pub model: Option<String>,
+    pub role: Option<String>,
+    pub entry_count: i64,
+    pub parent_session_id: Option<String>,
+    pub parent_task_id: Option<i64>,
+}
+
 #[derive(Clone)]
 pub enum SessionStore {
     /// Default file-based JSONL backend. Stateless — delegates to
@@ -78,6 +104,35 @@ impl SessionStore {
                     conn,
                     &workspace_id,
                     session_id,
+                )
+                .await?;
+                Ok(SessionStore::Greptime {
+                    session: Arc::new(Mutex::new(session)),
+                    conn: conn.clone(),
+                })
+            }
+            #[cfg(not(feature = "greptime"))]
+            SessionBackend::Greptime { .. } => {
+                anyhow::bail!("greptime session backend requires the `greptime` cargo feature");
+            }
+        }
+    }
+
+    /// Connect a workspace-scoped store for sessions-metadata operations
+    /// (`list_meta` / `backfill_sessions` / `delete_meta`). The session id
+    /// is a sentinel: Greptime operations are keyed by the `workspace_id`
+    /// bound at connect time. JSONL: the registry-only marker store.
+    #[allow(unused_variables)]
+    pub async fn connect_meta(backend: &SessionBackend, root: &Path) -> Result<Self> {
+        match backend {
+            SessionBackend::Jsonl => Ok(SessionStore::Jsonl),
+            #[cfg(feature = "greptime")]
+            SessionBackend::Greptime { conn } => {
+                let workspace_id = crate::session_greptime::derive_workspace_id(root);
+                let session = crate::session_greptime::GreptimeSession::connect(
+                    conn,
+                    &workspace_id,
+                    META_STORE_SENTINEL,
                 )
                 .await?;
                 Ok(SessionStore::Greptime {
@@ -283,6 +338,119 @@ impl SessionStore {
             SessionStore::Jsonl => Session::rewrite(root, name, entries),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { .. } => Ok(()), // Append-only; rewriting is a no-op.
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Sessions metadata — the `sessions` audit table (Greptime only)
+    // ------------------------------------------------------------------
+    //
+    // The JSONL backend has no meta table: create/touch/delete are no-ops
+    // and `list_meta` is always empty (registry-only listing, M4).
+
+    /// Fire-and-forget activity touch on the sessions metadata table
+    /// (Greptime only): appends one full snapshot row with a fresh
+    /// `last_active_at` and `entry_count = next_seq`. The write is spawned
+    /// onto the current tokio runtime and never awaited — turn-boundary
+    /// activity is best-effort and losing the final touch at process exit
+    /// is acceptable (the audit table keeps the last committed snapshot).
+    /// JSONL: no-op.
+    pub fn touch_meta(&self) {
+        match self {
+            SessionStore::Jsonl => {}
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                let greptime = greptime_session.clone();
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        handle.spawn(async move {
+                            if let Err(error) = greptime.lock().await.touch_meta().await {
+                                eprintln!("e-agent: cannot touch session metadata: {error:#}");
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        eprintln!("e-agent: cannot touch session metadata: no tokio runtime");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Create the first `sessions` metadata snapshot for a session
+    /// (Greptime only). Idempotent per session: a session that already has
+    /// a row is a resume, not a creation, so no second creation snapshot
+    /// is appended (that would rewrite `created_at`). `model`/`role` come
+    /// from the caller's configuration; `parent_session_id`/
+    /// `parent_task_id` link subagent rows to their spawning delegate
+    /// (main sessions pass `None`). JSONL: no-op.
+    #[allow(unused_variables)]
+    pub async fn create_meta(
+        &self,
+        _root: &Path,
+        session: &str,
+        model: Option<&str>,
+        role: Option<&str>,
+        parent_session_id: Option<&str>,
+        parent_task_id: Option<i64>,
+    ) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => Ok(()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                greptime_session
+                    .lock()
+                    .await
+                    .create_meta(session, model, role, parent_session_id, parent_task_id)
+                    .await
+            }
+        }
+    }
+
+    /// List the latest metadata snapshot per session (Greptime only),
+    /// newest activity first. JSONL: always empty (registry-only listing).
+    pub async fn list_meta(&self, _root: &Path) -> Result<Vec<SessionMeta>> {
+        match self {
+            SessionStore::Jsonl => Ok(Vec::new()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session.lock().await.list_meta().await,
+        }
+    }
+
+    /// Hide a session from the sessions list by deleting ALL of its
+    /// metadata rows (Greptime only). The transcript in `session_entries`
+    /// is untouched, so resume still works. JSONL: no-op.
+    #[allow(unused_variables)]
+    pub async fn delete_meta(&self, _root: &Path, session: &str) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => Ok(()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => greptime_session.lock().await.delete_meta(session).await,
+        }
+    }
+
+    /// One-time bootstrap migration: create metadata rows for sessions
+    /// that predate the `sessions` table (they have `session_entries` but
+    /// no metadata row). Idempotent: sessions that already have a row are
+    /// skipped, so running it twice yields identical results. Only the
+    /// server bootstrap calls this — never `connect` (L3) and never gated
+    /// on table emptiness (M1). JSONL: no-op.
+    pub async fn backfill_sessions(&self, _root: &Path) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => Ok(()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session.lock().await.backfill_sessions().await
+            }
         }
     }
 

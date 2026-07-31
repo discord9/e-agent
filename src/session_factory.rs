@@ -208,6 +208,11 @@ impl SessionFactory {
         &self.root
     }
 
+    /// The session storage backend this factory builds stores for.
+    pub fn backend(&self) -> &crate::config::SessionBackend {
+        &self.backend
+    }
+
     /// The main model's context window (already cleared when `--model`
     /// overrode the profile's wire model).
     pub fn main_context_window(&self) -> Option<u64> {
@@ -281,11 +286,9 @@ impl SessionFactory {
             eprintln!("e-agent: forked session: {new_id}");
             session = new_id;
         }
-        let background_timeout = crate::config::resolve_background_timeout(
-            self.config.as_ref(),
-            &self.root,
-        )
-        .unwrap_or(None);
+        let background_timeout =
+            crate::config::resolve_background_timeout(self.config.as_ref(), &self.root)
+                .unwrap_or(None);
         let (mut tools, background) = builtins(
             self.workspace.clone(),
             self.sandbox.clone(),
@@ -387,6 +390,22 @@ impl SessionFactory {
         }
 
         let model_name = self.main_model.display_name().to_owned();
+        // Sessions metadata: write the creation snapshot for a brand-new
+        // session (model/role from the factory configuration; parent links
+        // are None for main sessions). A resumed session (`--session`,
+        // server resume, fork-source reconnect) already has its row —
+        // create_meta is idempotent and appends nothing — and the runner's
+        // turn-boundary touch keeps it fresh.
+        store
+            .create_meta(
+                &self.root,
+                &session,
+                Some(&model_name),
+                role_name.as_deref(),
+                None,
+                None,
+            )
+            .await?;
         let (runner, handle) = SessionRunner::new(
             agent,
             store.clone(),
