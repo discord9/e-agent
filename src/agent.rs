@@ -1024,7 +1024,9 @@ mod tests {
         // then the real result lands later (duplicate call_id). The second
         // Tool message has no pending tool_call and must be dropped.
         let messages = vec![
-            Message::User { content: "u".into() },
+            Message::User {
+                content: "u".into(),
+            },
             Message::Assistant(AssistantMessage {
                 content: None,
                 tool_calls: vec![call("call-1", "bash", r#"{"cmd":"x"}"#)],
@@ -1062,13 +1064,17 @@ mod tests {
     #[test]
     fn repair_tool_pairs_synthesizes_missing_results_in_order() {
         let messages = vec![
-            Message::User { content: "u".into() },
+            Message::User {
+                content: "u".into(),
+            },
             Message::Assistant(AssistantMessage {
                 content: None,
                 tool_calls: vec![call("call-1", "bash", r#"{}"#)],
                 reasoning: None,
             }),
-            Message::User { content: "next".into() },
+            Message::User {
+                content: "next".into(),
+            },
         ];
         let repaired = repair_tool_pairs(messages);
         assert!(repaired.iter().any(|message| matches!(
