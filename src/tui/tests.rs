@@ -2714,7 +2714,11 @@ fn prepend_lines_shifts_window_indices_and_keeps_viewport() {
     );
     state.prepend_lines(Vec::new());
     assert_eq!(
-        (state.lines.len(), state.window.source_start, state.window.source_end),
+        (
+            state.lines.len(),
+            state.window.source_start,
+            state.window.source_end
+        ),
         before
     );
 }
@@ -2759,7 +2763,10 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
             reasoning: None,
         }),
     });
-    assert!(out.is_empty(), "tool-call-only assistant renders nothing on replay");
+    assert!(
+        out.is_empty(),
+        "tool-call-only assistant renders nothing on replay"
+    );
 
     // Tool result → ok/error line like push_tool_result.
     let out = lines(&SessionEntry::Message {

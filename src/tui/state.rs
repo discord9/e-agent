@@ -1449,10 +1449,12 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
         } => message
             .content
             .clone()
-            .map(|text| vec![DisplayLine {
-                text,
-                kind: LineKind::Normal,
-            }])
+            .map(|text| {
+                vec![DisplayLine {
+                    text,
+                    kind: LineKind::Normal,
+                }]
+            })
             .unwrap_or_default(),
         SessionEntry::Message {
             message: Message::Tool {
