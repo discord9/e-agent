@@ -65,12 +65,18 @@ CREATE TABLE IF NOT EXISTS running_tasks (
 ///
 /// Semantics: an append-only lifecycle AUDIT log, not a one-row-per-session
 /// upsert table. Every create/touch appends a COMPLETE snapshot row
-/// (created_at/model/role/parent/entry_count all carried on every row) at a
-/// fresh `last_active_at`; the TIME INDEX keeps the rows ordered, and the
-/// list view deduplicates per primary key taking the latest `last_active_at`
-/// (explicitly in SQL — the query is correct whether or not the engine
-/// auto-dedups same-PK rows). Because each row is a full snapshot, a touch
-/// can never wipe immutable columns: there is no partial-row rewrite at all.
+/// (created_at/model/role/parent/entry_count/title all carried on every
+/// row) at a fresh `last_active_at`; the TIME INDEX keeps the rows ordered,
+/// and the list view deduplicates per primary key taking the latest
+/// `last_active_at` (explicitly in SQL — the query is correct whether or
+/// not the engine auto-dedups same-PK rows). Because each row is a full
+/// snapshot, a touch can never wipe immutable columns: there is no
+/// partial-row rewrite at all.
+///
+/// `title` is the user-assigned session name (manual, never auto-generated;
+/// `NULL` = unnamed, the frontend shows the id). It is added to
+/// pre-existing tables by the idempotent migration in `connect` — see the
+/// `ALTER TABLE` comment there.
 const CREATE_TABLE_SESSIONS: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     workspace_id STRING NOT NULL,
@@ -79,6 +85,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_active_at TIMESTAMP(9) NOT NULL,
     model STRING NULL,
     "role" STRING NULL,
+    title STRING NULL,
     entry_count BIGINT NOT NULL DEFAULT 0,
     parent_session_id STRING NULL,
     parent_task_id BIGINT NULL,
@@ -158,7 +165,7 @@ pub struct GreptimeSession {
     session_id: String,
     /// The session's latest metadata snapshot, cached at connect time so
     /// every touch carries the immutable columns (created_at/model/role/
-    /// parent) without re-reading them. `None` = no row yet (brand-new
+    /// parent/title) without re-reading them. `None` = no row yet (brand-new
     /// session, or a subagent whose parent has not written its row yet).
     /// Interior mutability because every touch path takes `&self` while
     /// the store hands the session out behind a tokio Mutex.
@@ -192,31 +199,74 @@ impl GreptimeSession {
             .await
             .context("cannot create sessions table")?;
 
+        // Idempotent schema migration for the `title` column — a
+        // table-structure evolution: `sessions` shipped without it, so
+        // pre-existing databases need an ALTER (fresh databases already
+        // have it via CREATE_TABLE_SESSIONS above). There are no
+        // historical rows to backfill: old rows simply read `title` back
+        // as NULL (the read path treats it as `Option`). A failed
+        // migration must NOT block the connection (GreptimeDB's pg-wire
+        // supports `ALTER TABLE ... ADD COLUMN`, but if it errors anyway
+        // — e.g. an ancient engine — we keep running with the title
+        // feature degraded: the meta-row cache below is skipped and later
+        // title-bearing queries fail loudly with context; transcript
+        // operations are unaffected).
+        let mut title_available = true;
+        match client
+            .query_opt(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = 'sessions' AND column_name = 'title'",
+                &[],
+            )
+            .await
+            .context("cannot inspect sessions table schema")?
+        {
+            Some(_) => {}
+            None => match client
+                .execute("ALTER TABLE sessions ADD COLUMN title STRING NULL", &[])
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    title_available = false;
+                    eprintln!(
+                        "e-agent: cannot add sessions.title column (session titles unavailable): \
+                         {error:#}"
+                    );
+                }
+            },
+        }
+
         // Cache the session's latest metadata snapshot (if any) so later
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
         // wins (ORDER BY last_active_at DESC LIMIT 1).
-        let meta_row = client
-            .query_opt(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id \
-                 FROM sessions \
-                 WHERE workspace_id = $1 AND session_id = $2 \
-                 ORDER BY last_active_at DESC LIMIT 1",
-                &[&workspace_id, &session_id],
-            )
-            .await
-            .context("cannot query session metadata")?;
-        let cached_meta = meta_row.map(|row| SessionMeta {
-            session_id: session_id.to_string(),
-            created_at: row.get("created_at"),
-            last_active_at: row.get("last_active_at"),
-            model: row.get("model"),
-            role: row.get("role"),
-            entry_count: row.get("entry_count"),
-            parent_session_id: row.get("parent_session_id"),
-            parent_task_id: row.get("parent_task_id"),
-        });
+        let cached_meta = if title_available {
+            let meta_row = client
+                .query_opt(
+                    "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                            parent_session_id, parent_task_id, title \
+                     FROM sessions \
+                     WHERE workspace_id = $1 AND session_id = $2 \
+                     ORDER BY last_active_at DESC LIMIT 1",
+                    &[&workspace_id, &session_id],
+                )
+                .await
+                .context("cannot query session metadata")?;
+            meta_row.map(|row| SessionMeta {
+                session_id: session_id.to_string(),
+                created_at: row.get("created_at"),
+                last_active_at: row.get("last_active_at"),
+                model: row.get("model"),
+                role: row.get("role"),
+                entry_count: row.get("entry_count"),
+                parent_session_id: row.get("parent_session_id"),
+                parent_task_id: row.get("parent_task_id"),
+                title: row.get("title"),
+            })
+        } else {
+            None
+        };
 
         let mut session = Self {
             client,
@@ -927,10 +977,10 @@ impl GreptimeSession {
     // Greptime has no UPDATE: "upsert" is a same-PK INSERT and
     // last-write-wins by the TIME INDEX. The sessions table is an
     // append-only lifecycle audit log: every create/touch appends a
-    // COMPLETE snapshot row (created_at/model/role/parent/entry_count all
-    // carried on every row), and the list view deduplicates per session
-    // taking the latest last_active_at. There is no partial-row rewrite,
-    // so a touch can never wipe immutable columns.
+    // COMPLETE snapshot row (created_at/model/role/parent/entry_count/
+    // title all carried on every row), and the list view deduplicates per
+    // session taking the latest last_active_at. There is no partial-row
+    // rewrite, so a touch can never wipe immutable columns.
 
     /// Latest metadata snapshot for one session, or `None` when the
     /// session has no row yet (brand-new session, or a subagent whose
@@ -940,7 +990,7 @@ impl GreptimeSession {
             .client
             .query_opt(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id \
+                        parent_session_id, parent_task_id, title \
                  FROM sessions \
                  WHERE workspace_id = $1 AND session_id = $2 \
                  ORDER BY last_active_at DESC LIMIT 1",
@@ -957,6 +1007,7 @@ impl GreptimeSession {
             entry_count: row.get("entry_count"),
             parent_session_id: row.get("parent_session_id"),
             parent_task_id: row.get("parent_task_id"),
+            title: row.get("title"),
         }))
     }
 
@@ -965,8 +1016,8 @@ impl GreptimeSession {
             .execute(
                 "INSERT INTO sessions \
                  (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-                  entry_count, parent_session_id, parent_task_id) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                  entry_count, parent_session_id, parent_task_id, title) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 &[
                     &self.workspace_id,
                     &meta.session_id,
@@ -977,6 +1028,7 @@ impl GreptimeSession {
                     &meta.entry_count,
                     &meta.parent_session_id,
                     &meta.parent_task_id,
+                    &meta.title,
                 ],
             )
             .await
@@ -1032,6 +1084,7 @@ impl GreptimeSession {
             entry_count: self.next_seq,
             parent_session_id: parent_session_id.map(str::to_owned),
             parent_task_id,
+            title: None, // a fresh session is unnamed until the user names it
         };
         self.insert_meta(&meta).await?;
         *self.cached_meta.lock().unwrap() = Some(meta);
@@ -1058,6 +1111,40 @@ impl GreptimeSession {
         self.insert_meta(&meta).await
     }
 
+    /// Manually name a session: append one full snapshot row carrying the
+    /// new `title` and a fresh `last_active_at` (the audit log keeps the
+    /// previous title in earlier rows; the list view shows the newest).
+    /// `title = None` clears the name (stored as NULL = unnamed).
+    ///
+    /// Never self-creates (R3, mirroring `touch_meta`): when the session
+    /// has no metadata row yet, returns `Ok` and writes nothing. In
+    /// practice the server's lazily built sessions always have a row
+    /// (`build` → `create_meta`); the no-op guard only protects callers
+    /// against racing a session that was never created.
+    ///
+    /// `session_id` is explicit (like [`Self::delete_meta`]) so a
+    /// workspace-scoped meta store can rename historical sessions it is
+    /// not bound to; for the bound session the cached snapshot is used
+    /// (and refreshed) so the rename is immediately visible to later
+    /// touches.
+    pub async fn set_title(&self, session_id: &str, title: Option<&str>) -> Result<()> {
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            return Ok(());
+        };
+        meta.title = title.map(str::to_owned);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta);
+        }
+        Ok(())
+    }
+
     /// Latest metadata snapshot per session, newest activity first.
     ///
     /// The table is append-only, so one session has many rows; the list
@@ -1069,7 +1156,7 @@ impl GreptimeSession {
             .client
             .query(
                 "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
-                        s.entry_count, s.parent_session_id, s.parent_task_id \
+                        s.entry_count, s.parent_session_id, s.parent_task_id, s.title \
                  FROM sessions s \
                  INNER JOIN ( \
                      SELECT session_id, MAX(last_active_at) AS max_ts \
@@ -1093,6 +1180,7 @@ impl GreptimeSession {
                 entry_count: row.get("entry_count"),
                 parent_session_id: row.get("parent_session_id"),
                 parent_task_id: row.get("parent_task_id"),
+                title: row.get("title"),
             })
             .collect())
     }
@@ -1105,7 +1193,7 @@ impl GreptimeSession {
             .client
             .query(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id \
+                        parent_session_id, parent_task_id, title \
                  FROM sessions \
                  WHERE workspace_id = $1 AND session_id = $2 \
                  ORDER BY last_active_at ASC",
@@ -1124,6 +1212,7 @@ impl GreptimeSession {
                 entry_count: row.get("entry_count"),
                 parent_session_id: row.get("parent_session_id"),
                 parent_task_id: row.get("parent_task_id"),
+                title: row.get("title"),
             })
             .collect())
     }
@@ -1194,6 +1283,7 @@ impl GreptimeSession {
                 entry_count: row.get("entry_count"),
                 parent_session_id: None,
                 parent_task_id: None,
+                title: None, // pre-table sessions have no user-assigned name
             })
             .await?;
         }
@@ -2901,6 +2991,82 @@ mod tests {
         assert_eq!(latest.role.as_deref(), Some("fixer"));
         assert_eq!(latest.parent_session_id.as_deref(), Some("parent-x"));
         assert_eq!(latest.parent_task_id, Some(7));
+    }
+
+    #[tokio::test]
+    async fn sessions_meta_set_title_persists_and_survives_touch() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-title-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // set_title on a session with no row yet is a no-op Ok (R3: never
+        // self-create), mirroring touch_meta.
+        session.set_title(&sid, Some("ghost title")).await.unwrap();
+        assert!(
+            session.audit_meta(&sid).await.unwrap().is_empty(),
+            "set_title must not self-create a row"
+        );
+
+        session
+            .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+            .await
+            .unwrap();
+
+        // Rename → the list shows the new title, the audit trail appends
+        // one snapshot, created_at survives.
+        session.set_title(&sid, Some("My Session")).await.unwrap();
+        let list = session.list_meta().await.unwrap();
+        let renamed = list
+            .iter()
+            .find(|m| m.session_id == sid)
+            .expect("session still listed after rename");
+        assert_eq!(renamed.title.as_deref(), Some("My Session"));
+        assert_eq!(
+            renamed.model.as_deref(),
+            Some("model-x"),
+            "rename preserves other columns"
+        );
+        assert_eq!(
+            session.audit_meta(&sid).await.unwrap().len(),
+            2,
+            "create + rename = 2 audit rows"
+        );
+
+        // touch carries the title: the append-only snapshot semantics mean
+        // the newest row still has it.
+        session.touch_meta().await.unwrap();
+        let latest = session
+            .list_meta()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.session_id == sid)
+            .expect("session listed after touch");
+        assert_eq!(
+            latest.title.as_deref(),
+            Some("My Session"),
+            "touch preserves title"
+        );
+        assert_eq!(
+            latest.created_at, renamed.created_at,
+            "touch must preserve created_at"
+        );
+
+        // Clearing (None) stores NULL and is visible on the read path.
+        session.set_title(&sid, None).await.unwrap();
+        let latest = session
+            .list_meta()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.session_id == sid)
+            .expect("session listed after clear");
+        assert_eq!(latest.title, None, "clear stores NULL");
     }
 
     #[tokio::test]

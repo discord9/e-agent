@@ -51,6 +51,10 @@ pub struct SessionMeta {
     pub entry_count: i64,
     pub parent_session_id: Option<String>,
     pub parent_task_id: Option<i64>,
+    /// User-assigned session name (manual, never auto-generated). `None`
+    /// = unnamed (the frontend shows the session id). Greptime only —
+    /// the JSONL backend has no meta table and never produces values.
+    pub title: Option<String>,
 }
 
 #[derive(Clone)]
@@ -442,6 +446,30 @@ impl SessionStore {
                 session: greptime_session,
                 ..
             } => greptime_session.lock().await.delete_meta(session).await,
+        }
+    }
+
+    /// Rename a session in the sessions metadata table (Greptime only):
+    /// appends one full snapshot row with the new `title` and a fresh
+    /// `last_active_at`. `title = None` clears the name (stored as NULL).
+    /// Never self-creates (R3): a session with no metadata row is a no-op
+    /// `Ok`, mirroring `touch_meta`. JSONL: no-op `Ok` — the JSONL
+    /// backend has no meta table, so titles exist only on Greptime.
+    #[allow(unused_variables)]
+    pub async fn set_title(&self, _root: &Path, session: &str, title: Option<&str>) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => Ok(()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                greptime_session
+                    .lock()
+                    .await
+                    .set_title(session, title)
+                    .await
+            }
         }
     }
 
