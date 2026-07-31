@@ -205,7 +205,13 @@ impl Config {
             (None, None) => {
                 bail!("[web_search] requires exactly one of `api_key_file` or `api_key_env`")
             }
-            (Some(file), None) => self.read_key_file("web_search", file)?,
+            (Some(file), None) => match self.read_key_file("web_search", file) {
+                // Web search is optional: a missing or unreadable key file
+                // disables the tool instead of failing startup (unlike
+                // provider credentials, which are required).
+                Ok(key) => key,
+                Err(_) => return Ok(None),
+            },
             (None, Some(variable)) => std::env::var(variable)
                 .with_context(|| format!("api_key_env `{variable}` for [web_search] is not set"))?
                 .trim()
