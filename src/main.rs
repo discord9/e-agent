@@ -227,9 +227,12 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             event_time: None,
             seq,
         };
+        // The marker sits at the fork point: source prefix first, then the
+        // marker, then the session's own new messages — so scrolling the
+        // forked session reads as "source history … forked from … new work".
         let mut fork_entries = Vec::with_capacity(prefix.len() + 1);
-        fork_entries.push(marker);
         fork_entries.extend(prefix);
+        fork_entries.push(marker);
         let new_id = e_agent::session::new_id_prefixed("fork-");
         store = SessionStore::connect(&backend, &root, &new_id).await?;
         match backend {
