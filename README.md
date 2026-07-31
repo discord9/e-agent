@@ -143,10 +143,32 @@ the model only sees the latest compaction summary and everything after it.
 Legacy `.json` sessions are migrated on first load. `--version` (or `-V`) prints the exact
 package build version without loading the workspace or configuration. Optional CLI overrides
 are `--base-url URL`, `--model MODEL`, `--profile PROFILE`, `--workspace PATH`, `--session NAME`,
-and `--max-rounds N` (tool-call rounds are unlimited by default; the flag sets an explicit cap).
+`--fork SESSION`, `--at N`, and `--max-rounds N` (tool-call rounds are unlimited by default;
+the flag sets an explicit cap).
 `--profile` selects a TOML profile and requires a TOML config. When config is
 used, `--base-url` and `--model` are raw API wire-value overrides and take
 precedence over the selected profile values.
+
+### Forking a session
+
+`e-agent --fork <session-id> [--at <n>] [PROMPT]` starts a brand-new session whose
+history is a verbatim copy of the source session up to a completed turn. The
+source session is never modified. The fork keeps the source's history prefix up
+to (and including) the last completed turn — an assistant message with no
+pending tool calls, or a compaction — and drops anything after it
+(background-completion notices, for example). `--at <n>` picks the fork point
+explicitly: `n` is 1-based and inclusive, and it must land on a turn boundary,
+otherwise the fork fails rather than cutting mid-turn. Without a completed turn
+in the source, the fork fails.
+
+The new session starts with a `ForkedFrom` marker entry recording the source id
+and fork point. The marker is display/audit only: it is rendered as a dim notice
+in the TUI and is never sent to the provider on the model wire. The forked
+session has fresh token accounting (usage counters start at zero) and is
+resumed or forked again like any other session. The new id is printed as
+`e-agent: forked session: <id>`; `--fork` is mutually exclusive with `--session`
+and cannot be combined with `--at` without `--fork`. JSONL and GreptimeDB
+backends behave equivalently.
 
 Keys in the TUI: Esc always leaves the current view — it detaches from a
 subagent view, closes the tasks panel, or (at the plain idle prompt) quits

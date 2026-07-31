@@ -5,7 +5,7 @@ use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
-use e_agent::agent::{Agent, AgentEvent, preview};
+use e_agent::agent::{Agent, AgentEvent, SessionEntry, preview};
 use e_agent::codex::CodexModel;
 use e_agent::codex_auth::{CodexAuth, login, logout};
 use e_agent::config::{AuthMode, ResolvedModel};
@@ -83,6 +83,8 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     let mut profile = None;
     let mut workspace = None;
     let mut session: Option<String> = None;
+    let mut fork: Option<String> = None;
+    let mut at: Option<usize> = None;
     let mut max_rounds = None;
     let mut repl_mode = false;
     let mut prompt = Vec::new();
@@ -94,6 +96,14 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             "--profile" => profile = Some(next_value(&mut arguments, "--profile")?),
             "--workspace" => workspace = Some(next_value(&mut arguments, "--workspace")?),
             "--session" | "-s" => session = Some(next_value(&mut arguments, "--session")?),
+            "--fork" => fork = Some(next_value(&mut arguments, "--fork")?),
+            "--at" => {
+                let value = next_value(&mut arguments, "--at")?;
+                let parsed = value.parse::<usize>().ok().filter(|n| *n > 0);
+                at = Some(parsed.with_context(|| {
+                    format!("--at must be a 1-based entry index, got {value:?}")
+                })?);
+            }
             "--max-rounds" => {
                 max_rounds = Some(
                     next_value(&mut arguments, "--max-rounds")?
@@ -104,12 +114,20 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             "--repl" => repl_mode = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--max-rounds N] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup)"
+                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--fork SESSION] [--at N] [--max-rounds N] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup);\npass --fork <id> to start a new session from a completed turn of an existing one\n(--at N forks at the N-th entry, 1-based and inclusive, and must be a turn boundary)"
                 );
                 return Ok(());
             }
             value => prompt.push(value.to_owned()),
         }
+    }
+    if at.is_some() && fork.is_none() {
+        return Err(anyhow!("--at requires --fork <session-id>"));
+    }
+    if fork.is_some() && session.is_some() {
+        return Err(anyhow!(
+            "--fork cannot be combined with --session (the forked session gets a new id)"
+        ));
     }
     let tui_mode = prompt.is_empty() && std::io::stdout().is_terminal() && !repl_mode;
     let prompt = if prompt.is_empty() && !tui_mode && !repl_mode {
@@ -144,7 +162,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             eprintln!("e-agent: migrated session {old} -> {new}");
         }
     }
-    let session = match session {
+    let mut session = match session {
         Some(name) => {
             e_agent::session::validate_session_name(&name)?;
             name
@@ -153,7 +171,9 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             let id = e_agent::session::new_id();
             // TUI mode shows the id in the input border instead (printing
             // here would pollute the screen before the alternate screen).
-            if !tui_mode {
+            // A --fork run replaces this placeholder with the forked id, so
+            // do not announce it.
+            if !tui_mode && fork.is_none() {
                 eprintln!("e-agent: session {id}");
             }
             id
@@ -181,7 +201,55 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
     {
         unsafe { std::env::set_var("EXA_API_KEY", key) };
     }
-    let store = SessionStore::connect(&backend, &root, &session).await?;
+    let mut store = SessionStore::connect(&backend, &root, &session).await?;
+    if let Some(source) = fork {
+        // Fork: copy the source session's history up to a completed-turn
+        // boundary into a brand-new session id. The source is only read;
+        // it never changes.
+        let source_store = SessionStore::connect(&backend, &root, &source).await?;
+        let with_seq = source_store
+            .load_with_seq(&root, &source)
+            .await
+            .with_context(|| format!("cannot load source session {source} for fork"))?;
+        let source_entries: Vec<SessionEntry> =
+            with_seq.iter().map(|(_, entry)| entry.clone()).collect();
+        let prefix = e_agent::agent::fork_prefix(&source_entries, at)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("cannot fork session {source}"))?;
+        // `at` (1-based, inclusive) is the index of the last kept entry.
+        let at = prefix.len();
+        let seq = with_seq.get(at - 1).map(|(seq, _)| *seq);
+        let marker = SessionEntry::ForkedFrom {
+            source: source.clone(),
+            at,
+            // JSONL has no event_time column and SessionStore does not
+            // expose one; kept as an optional provenance slot.
+            event_time: None,
+            seq,
+        };
+        let mut fork_entries = Vec::with_capacity(prefix.len() + 1);
+        fork_entries.push(marker);
+        fork_entries.extend(prefix);
+        let new_id = e_agent::session::new_id_prefixed("fork-");
+        store = SessionStore::connect(&backend, &root, &new_id).await?;
+        match backend {
+            // Atomic create-or-replace for a brand-new JSONL session file.
+            e_agent::config::SessionBackend::Jsonl => {
+                store.rewrite(&root, &new_id, &fork_entries).await?
+            }
+            // Greptime: fresh session (no rows, next_seq = 0); append writes
+            // contiguous seqs with fresh timestamps. The marker's provenance
+            // fields are payload-only.
+            e_agent::config::SessionBackend::Greptime { .. } => {
+                store.append(&root, &new_id, &fork_entries).await?
+            }
+        }
+        if tui_mode {
+            _tui_report.session = Some(new_id.clone());
+        }
+        eprintln!("e-agent: forked session: {new_id}");
+        session = new_id;
+    }
     let (main_resolved, role_resolved, all_roles) = match &config {
         Some(config) => (
             Some(config.resolve(profile.as_deref())?),

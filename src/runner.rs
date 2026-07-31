@@ -873,6 +873,9 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
                 label: label.clone(),
             })
         }
+        SessionEntry::ForkedFrom { source, at, .. } => Some(AgentEvent::Notice(format!(
+            "forked from {source} at entry {at}"
+        ))),
     }
 }
 
