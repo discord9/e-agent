@@ -281,8 +281,17 @@ impl SessionFactory {
             eprintln!("e-agent: forked session: {new_id}");
             session = new_id;
         }
-        let (mut tools, background) =
-            builtins(self.workspace.clone(), self.sandbox.clone(), self.read_only);
+        let background_timeout = crate::config::resolve_background_timeout(
+            self.config.as_ref(),
+            &self.root,
+        )
+        .unwrap_or(None);
+        let (mut tools, background) = builtins(
+            self.workspace.clone(),
+            self.sandbox.clone(),
+            self.read_only,
+            background_timeout,
+        );
         // Read-only sessions skip MCP entirely: MCP tools carry no read-only
         // marker, so exposing them would defeat the policy. Delegation stays —
         // spawning a subagent does not mutate this session's host state, and
