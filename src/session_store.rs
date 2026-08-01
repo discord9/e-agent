@@ -55,6 +55,11 @@ pub struct SessionMeta {
     /// = unnamed (the frontend shows the session id). Greptime only —
     /// the JSONL backend has no meta table and never produces values.
     pub title: Option<String>,
+    /// User pin flag: `Some(true)` = pinned (sorted first in the list),
+    /// `Some(false)` = explicitly unpinned, `None` = never touched (reads
+    /// as unpinned). Greptime only — the JSONL backend has no meta table
+    /// and never produces values.
+    pub pinned: Option<bool>,
     /// Task-panel label of the delegate task that spawned this session
     /// (see [`SessionStore::label_for_subagent`]). Never stored in the
     /// sessions table — it lives in `running_tasks` and is resolved at
@@ -473,6 +478,30 @@ impl SessionStore {
                     .lock()
                     .await
                     .set_title(session, title)
+                    .await
+            }
+        }
+    }
+
+    /// Pin or unpin a session in the sessions metadata table (Greptime
+    /// only): appends one full snapshot row with the new `pinned` flag
+    /// and a fresh `last_active_at`. Never self-creates (R3): a session
+    /// with no metadata row is a no-op `Ok`, mirroring `set_title`.
+    /// JSONL: no-op `Ok` — the JSONL backend has no meta table, so pins
+    /// exist only on Greptime.
+    #[allow(unused_variables)]
+    pub async fn set_pinned(&self, _root: &Path, session: &str, pinned: bool) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => Ok(()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                greptime_session
+                    .lock()
+                    .await
+                    .set_pinned(session, pinned)
                     .await
             }
         }
