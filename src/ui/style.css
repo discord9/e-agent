@@ -593,6 +593,7 @@ mmlEqnNo}
      手机（≤600px）保持覆盖式：内容不位移、保留半透明遮罩。 */
   @media (min-width: 601px) {
     #sidebarOverlay { display: none; }
+    #sidebar.open ~ #topbar,
     #sidebar.open ~ #listView,
     #sidebar.open ~ #chatView {
       margin-left: 280px;
