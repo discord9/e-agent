@@ -84,6 +84,12 @@
   opacity: 0;
   transition: opacity 0.2s;
   z-index: 3;
+  /* × 字符在圆形按钮内精确居中（flex 居中 + 微调视觉偏移） */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  padding-bottom: 1px;   /* × 字符视觉重心略偏上，向下微调 */
 }
 .pet-whale:hover .pet-close { opacity: 1; }
 .pet-close:hover { background: #dc322f; }
