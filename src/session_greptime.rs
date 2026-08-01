@@ -1188,15 +1188,54 @@ impl GreptimeSession {
         }
     }
 
+    /// Snapshot that backfills a parent link onto a session whose first
+    /// meta row was written by `SessionFactory::build` (parent = None).
+    /// The append-only sessions table has no UPDATE, so the link lands as
+    /// a fresh audit row with a newer `last_active_at` (the list view
+    /// takes max `last_active_at` per session and therefore picks it up);
+    /// immutable columns are carried over from the existing snapshot, and
+    /// caller-supplied `model`/`role` win over the existing values.
+    /// Pure — unit-testable without a live DB.
+    fn backfill_parent_meta(
+        existing: &SessionMeta,
+        now: chrono::NaiveDateTime,
+        model: Option<&str>,
+        role: Option<&str>,
+        parent_session_id: &str,
+        parent_task_id: Option<i64>,
+    ) -> SessionMeta {
+        SessionMeta {
+            session_id: existing.session_id.clone(),
+            created_at: existing.created_at,
+            last_active_at: now,
+            model: model.map(str::to_owned).or_else(|| existing.model.clone()),
+            role: role.map(str::to_owned).or_else(|| existing.role.clone()),
+            entry_count: existing.entry_count,
+            parent_session_id: Some(parent_session_id.to_owned()),
+            parent_task_id,
+            title: existing.title.clone(),
+            pinned: existing.pinned,
+            writer: None, // stamped by insert_meta with the writing process
+            label: None,  // label lives in running_tasks, resolved at list time
+        }
+    }
+
     /// Create the session's first metadata snapshot row. Synchronous
     /// (awaited by the caller) so the list sees the session immediately.
     ///
     /// Idempotent per session: when a row already exists this is a resume,
     /// not a creation, so nothing is appended (a second creation snapshot
-    /// would rewrite `created_at` and pollute the audit log). `model` /
-    /// `role` / parent links are supplied by the caller — the parent
-    /// process writes subagent rows at spawn time; the main session's row
-    /// is written by `SessionFactory::build`.
+    /// would rewrite `created_at` and pollute the audit log). The one
+    /// exception is the parent-link backfill: a btw/subagent session's
+    /// first row is written by `SessionFactory::build` with
+    /// `parent_session_id = None`, and the parent process later records
+    /// the real link via [`Self::backfill_parent_meta`] — one fresh
+    /// snapshot carrying the parent, appended once (a second call finds
+    /// the parent already set and appends nothing).
+    ///
+    /// `model` / `role` / parent links are supplied by the caller — the
+    /// parent process writes subagent rows at spawn time; the main
+    /// session's row is written by `SessionFactory::build`.
     pub async fn create_meta(
         &self,
         session_id: &str,
@@ -1205,7 +1244,25 @@ impl GreptimeSession {
         parent_session_id: Option<&str>,
         parent_task_id: Option<i64>,
     ) -> Result<()> {
-        if self.load_meta_row(session_id).await?.is_some() {
+        if let Some(existing) = self.load_meta_row(session_id).await? {
+            // Row already exists (resume, or a btw/subagent row whose
+            // parent link was unknown at build time): only ever backfill
+            // the parent link — never UPDATE/DELETE, and never overwrite
+            // an existing link or append without a parent to record.
+            if let Some(parent) = parent_session_id
+                && existing.parent_session_id.is_none()
+            {
+                let mut meta = Self::backfill_parent_meta(
+                    &existing,
+                    us_to_datetime(next_event_time_us()),
+                    model,
+                    role,
+                    parent,
+                    parent_task_id,
+                );
+                self.insert_meta(&mut meta).await?;
+                *self.cached_meta.lock().unwrap() = Some(meta);
+            }
             return Ok(());
         }
         let now = us_to_datetime(next_event_time_us());
@@ -2887,6 +2944,68 @@ mod tests {
         assert!(!nonce.is_empty(), "nonce must never be empty: {first}");
     }
 
+    /// The parent-link backfill snapshot (btw/subagent rows first written
+    /// by `SessionFactory::build` with parent = None) must carry a fresh
+    /// `last_active_at` so the list view (max `last_active_at` per
+    /// session) picks it up, preserve the immutable columns, prefer the
+    /// caller's `model`/`role` when supplied, and leave `writer` unstamped
+    /// (insert_meta stamps it at write time).
+    #[test]
+    fn backfill_parent_meta_preserves_immutable_columns() {
+        let created = us_to_datetime(next_event_time_us());
+        let existing = SessionMeta {
+            session_id: "btw-abc123".into(),
+            created_at: created,
+            last_active_at: created,
+            model: Some("model-x".into()),
+            role: Some("main".into()),
+            entry_count: 3,
+            parent_session_id: None,
+            parent_task_id: None,
+            title: Some("a title".into()),
+            pinned: Some(true),
+            writer: None,
+            label: None,
+        };
+        let now = us_to_datetime(next_event_time_us());
+        let backfilled = GreptimeSession::backfill_parent_meta(
+            &existing,
+            now,
+            Some("model-y"),
+            None,
+            "parent-1",
+            Some(7),
+        );
+        assert_eq!(backfilled.session_id, "btw-abc123");
+        assert_eq!(
+            backfilled.created_at, created,
+            "backfill must preserve the original creation time"
+        );
+        assert_eq!(
+            backfilled.last_active_at, now,
+            "backfill must carry a fresh last_active_at so the list picks it up"
+        );
+        assert_eq!(
+            backfilled.model.as_deref(),
+            Some("model-y"),
+            "caller-supplied model wins over the existing value"
+        );
+        assert_eq!(
+            backfilled.role.as_deref(),
+            Some("main"),
+            "existing role kept when the caller passes none"
+        );
+        assert_eq!(backfilled.entry_count, 3, "entry_count preserved");
+        assert_eq!(backfilled.parent_session_id.as_deref(), Some("parent-1"));
+        assert_eq!(backfilled.parent_task_id, Some(7));
+        assert_eq!(backfilled.title.as_deref(), Some("a title"));
+        assert_eq!(backfilled.pinned, Some(true));
+        assert_eq!(
+            backfilled.writer, None,
+            "writer is stamped by insert_meta, never by the constructor"
+        );
+    }
+
     // ------------------------------------------------------------------
     // advance_next_seq_from_snapshot_len — fallible monotonic advance
     // ------------------------------------------------------------------
@@ -3350,6 +3469,133 @@ mod tests {
         assert_eq!(latest.role.as_deref(), Some("fixer"));
         assert_eq!(latest.parent_session_id.as_deref(), Some("parent-x"));
         assert_eq!(latest.parent_task_id, Some(7));
+    }
+
+    /// btw/subagent parent-link backfill: `SessionFactory::build` writes
+    /// the first row with parent = None, and the parent process's later
+    /// `create_meta` records the real link by appending ONE fresh snapshot
+    /// (append-only, never UPDATE). The backfill is idempotent — re-
+    /// recording the same session appends nothing once the link is set —
+    /// and an existing parent link is never overwritten.
+    #[tokio::test]
+    async fn sessions_meta_backfills_parent_link_once() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-meta-backfill-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // 1. build writes the first row with parent = None.
+        session
+            .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+            .await
+            .unwrap();
+        let trail = session.audit_meta(&sid).await.unwrap();
+        assert_eq!(trail.len(), 1);
+        assert_eq!(trail[0].parent_session_id, None);
+        let original_created_at = trail[0].created_at;
+
+        // 2. the parent records the real link → one fresh row is appended,
+        //    the old row is kept, and the latest snapshot carries the link.
+        session
+            .create_meta(
+                &sid,
+                Some("model-x"),
+                Some("main"),
+                Some("parent-1"),
+                Some(7),
+            )
+            .await
+            .unwrap();
+        let trail = session.audit_meta(&sid).await.unwrap();
+        assert_eq!(trail.len(), 2, "backfill appends one row, old row kept");
+        let latest = session
+            .list_meta()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.session_id == sid)
+            .expect("session listed");
+        assert_eq!(latest.parent_session_id.as_deref(), Some("parent-1"));
+        assert_eq!(latest.parent_task_id, Some(7));
+        assert_eq!(
+            latest.created_at, original_created_at,
+            "backfill must preserve the original creation time"
+        );
+
+        // 3. idempotent: re-recording the same parent appends nothing.
+        session
+            .create_meta(
+                &sid,
+                Some("model-x"),
+                Some("main"),
+                Some("parent-1"),
+                Some(7),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.audit_meta(&sid).await.unwrap().len(),
+            2,
+            "re-backfill with the same parent must not append"
+        );
+
+        // 4. a different parent never overwrites the recorded link.
+        session
+            .create_meta(
+                &sid,
+                Some("model-x"),
+                Some("main"),
+                Some("parent-2"),
+                Some(8),
+            )
+            .await
+            .unwrap();
+        let trail = session.audit_meta(&sid).await.unwrap();
+        assert_eq!(
+            trail.len(),
+            2,
+            "existing parent link must not be overwritten"
+        );
+        let latest = session
+            .list_meta()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.session_id == sid)
+            .expect("session listed");
+        assert_eq!(
+            latest.parent_session_id.as_deref(),
+            Some("parent-1"),
+            "the first recorded link wins"
+        );
+
+        // 5. create_meta without a parent over an existing parent-less row
+        //    appends nothing (the plain resume path stays a no-op).
+        let sid2 = format!(
+            "test-gt-meta-backfill-noparent-{}",
+            crate::session::new_id()
+        );
+        let session2 = GreptimeSession::connect(&conn, &wid, &sid2).await.unwrap();
+        session2
+            .create_meta(&sid2, Some("model-x"), Some("main"), None, None)
+            .await
+            .unwrap();
+        session2
+            .create_meta(&sid2, Some("model-x"), Some("main"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            session2.audit_meta(&sid2).await.unwrap().len(),
+            1,
+            "parent-less create over an existing parent-less row must not append"
+        );
+
+        session.delete_meta(&sid).await.unwrap();
+        session2.delete_meta(&sid2).await.unwrap();
     }
 
     #[tokio::test]
