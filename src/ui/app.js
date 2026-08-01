@@ -1683,7 +1683,7 @@ async function refreshSessionsForSidebar() {
  * 数据来自 state.lastList（pollSessions）。列表未变化时跳过重绘，
  * 保留展开状态与滚动位置。
  * ===================================================================*/
-const MAX_TREE_ROOTS = 15;
+const MAX_TREE_ROOTS = 8;   // 默认只显示最近 8 个主会话（任务组在树顶部，少滑即见）
 let lastTreeSig = "";
 
 function sidebarTreeSig() {
