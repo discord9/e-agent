@@ -945,9 +945,18 @@ function buildTreeRoot(s, kids) {
     });
   }
   const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
-  const title = s.title || s.id;   // 无标题显示完整 id（用户需要认出是哪个会话）
-  const titleEl = el("span", "tree-id", title);
-  titleEl.title = s.title || s.id;        // 完整 title（无 title 时回退完整 id）
+  // 有标题：两行（title 行 + 完整 id 行）；无标题：一行完整 id。
+  // 单行 ellipsis 截断的长 id 无法区分会话，双行让 title/id 都可见。
+  const hasTitle = !!s.title;
+  const titleEl = el("span", "tree-id" + (hasTitle ? " has-title" : ""),
+    hasTitle ? "" : s.id);
+  titleEl.title = s.title || s.id;        // hover 显示完整 title/id
+  if (hasTitle) {
+    titleEl.append(
+      el("span", "tree-title", s.title),
+      el("span", "tree-idline", s.id),
+    );
+  }
   const edit = el("button", "tree-edit", "✎");
   edit.type = "button";
   edit.title = "重命名";
@@ -1020,9 +1029,17 @@ function renderSubagentRows(container, kids, hist) {
                    (state.sessionId === k.id ? " current" : ""));
     const dot = el("span", "busy-dot" + (k.busy ? " busy" : ""));
     // label 优先：subagent 的任务面板标题最友好；旧 server 无 label → 回退 title/id
-    const title = k.label || k.title || k.id;   // 无 label/title 显示完整 id
-    const titleEl = el("span", "tree-id", title);
+    // 有 label/title：两行（label/title 行 + 完整 id 行）；无则一行完整 id。
+    const hasTitle = !!(k.label || k.title);
+    const titleEl = el("span", "tree-id" + (hasTitle ? " has-title" : ""),
+      hasTitle ? "" : k.id);
     titleEl.title = k.label || k.title || k.id;
+    if (hasTitle) {
+      titleEl.append(
+        el("span", "tree-title", k.label || k.title),
+        el("span", "tree-idline", k.id),
+      );
+    }
     const edit = el("button", "tree-edit", "✎");
     edit.type = "button";
     edit.title = "重命名";
