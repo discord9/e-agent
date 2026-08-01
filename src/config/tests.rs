@@ -148,6 +148,43 @@ model = "deepseek-chat"
 }
 
 #[test]
+fn thinking_defaults_to_false_and_reads_from_model_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "deepseek/v3"
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_file = "key"
+[models."deepseek/v3"]
+model = "deepseek-chat"
+reasoning_effort = "max"
+thinking = true
+"#,
+    );
+    let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
+    assert!(resolved.thinking);
+
+    // Absent `thinking` means false (deepseek-style default).
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "deepseek/v3"
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_file = "key"
+[models."deepseek/v3"]
+model = "deepseek-chat"
+reasoning_effort = "high"
+"#,
+    );
+    let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
+    assert!(!resolved.thinking);
+}
+
+#[test]
 fn roles_main_falls_back_when_no_default() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("key"), "key").unwrap();

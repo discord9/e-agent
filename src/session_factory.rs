@@ -645,7 +645,8 @@ fn configured_model(
                     model.unwrap_or(resolved.model),
                     resolved.reasoning_effort,
                 )?
-                .with_vision(resolved.vision),
+                .with_vision(resolved.vision)
+                .with_thinking(resolved.thinking),
             );
             cm.display = display;
             Ok(cm)
