@@ -242,6 +242,11 @@ els.searchInput.addEventListener("input", () => {
   renderSessionList(state.lastList);   // 轮询仍会全量重绘，但搜索词留在 state 里，过滤持续生效
 });
 els.backBtn.addEventListener("click", backToList);
+// 「← 主会话」：从 subagent 会话快速返回其父会话（无父则不显示按钮）
+els.backParentBtn.addEventListener("click", () => {
+  const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
+  if (cur && cur.parent_session_id) openSession(cur.parent_session_id);
+});
 els.sidebarBtn.addEventListener("click", () => {
   if (state.sidebar.open) closeSidebar();
   else openSidebar();

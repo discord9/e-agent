@@ -356,6 +356,9 @@ function openSession(id, onReady) {
   els.listView.classList.add("hidden");
   els.chatView.classList.remove("hidden");
   els.topActions.hidden = false;
+  // subagent 会话：显示「← 主会话」快速返回父会话（主会话/无父则隐藏）
+  const cur = (state.lastList || []).find((s) => s.id === id);
+  els.backParentBtn.hidden = !(cur && cur.parent_session_id);
   els.chatSessionId.textContent = "会话 " + id;
   updateComposerMeta();          // 显示当前会话 model · role（缓存/首开/恢复共用）
   els.usageInfo.textContent = "";
@@ -414,6 +417,7 @@ function backToList() {
   els.chatView.classList.add("hidden");
   els.listView.classList.remove("hidden");
   els.topActions.hidden = true;
+  els.backParentBtn.hidden = true;
   refreshBanner();
   history.replaceState(null, "", "/");
   pollSessions();

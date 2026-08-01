@@ -75,7 +75,7 @@ const state = {
 /* 常用 DOM 引用 */
 const $ = (id) => document.getElementById(id);
 const els = {
-  topActions: $("topActions"), backBtn: $("backBtn"), connState: $("connState"),
+  topActions: $("topActions"), backBtn: $("backBtn"), backParentBtn: $("backParentBtn"), connState: $("connState"),
   banner: $("banner"), tokenInput: $("tokenInput"), tokenToggle: $("tokenToggle"),
   listView: $("listView"), chatView: $("chatView"),
   newPrompt: $("newPrompt"), newSessionBtn: $("newSessionBtn"),

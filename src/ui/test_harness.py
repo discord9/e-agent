@@ -181,7 +181,7 @@ class El {
   blur(){}
 }
 const elsById={};
-for(const id of ["topActions","backBtn","connState","banner","tokenInput","tokenToggle","listView","chatView",
+for(const id of ["topActions","backBtn","backParentBtn","connState","banner","tokenInput","tokenToggle","listView","chatView",
   "newPrompt","newSessionBtn","sessionList","listMeta","listHint","chatSessionId","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn","searchInput",
   "queueBar","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
@@ -561,6 +561,23 @@ async function main(){
     chk("resolve unknown delegate → null",
         resolveSubagentSessionId({ session_id: "s1", label: "不存在的任务" }) === null
         && resolveSubagentSessionId({ session_id: "s1", label: "" }) === null);
+    // 「← 主会话」按钮：subagent 会话显示，点击返回父会话；主会话隐藏
+    state.lastList = [
+      { id: "s1", parent_session_id: null, label: null },
+      { id: "sub-1", parent_session_id: "s1", label: "子任务X", active: true },
+    ];
+    openSession("sub-1");
+    chk("subagent shows back-to-parent",
+        elsById["backParentBtn"].hidden === false,
+        "hidden=" + elsById["backParentBtn"].hidden);
+    elsById["backParentBtn"]._listeners["click"][0]();
+    chk("back-to-parent switches to parent",
+        state.sessionId === "s1" && state.view === "chat",
+        "sid=" + state.sessionId + " view=" + state.view);
+    openSession("s1");
+    chk("main session hides back-to-parent",
+        elsById["backParentBtn"].hidden === true,
+        "hidden=" + elsById["backParentBtn"].hidden);
     // 任务结束（从轮询列表消失）：面板清空，轮询停止
     tasksData = [];
     await pollTasks();
