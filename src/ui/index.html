@@ -24,7 +24,7 @@
 
 <div id="banner" class="banner" hidden></div>
 
-<!-- ============ 会话侧边栏（会话树 + 运行中任务） ============ -->
+<!-- ============ 会话侧边栏（会话树，运行中任务并入树顶部折叠分组） ============ -->
 <div id="sidebarOverlay" hidden></div>
 <aside id="sidebar" hidden>
   <div class="sidebar-head">
@@ -35,9 +35,6 @@
     <input id="sidebarFilter" type="search" placeholder="筛选标题 / ID…" autocomplete="off" spellcheck="false">
   </div>
   <div id="sidebarTree" class="sidebar-tree"></div>
-  <div class="sidebar-divider"></div>
-  <h3 class="sidebar-tasks-title" id="sidebarTasksTitle">运行中任务</h3>
-  <div id="sidebarTasks" class="sidebar-tasks"></div>
 </aside>
 
 <!-- ============ 会话列表视图 ============ -->
@@ -74,6 +71,13 @@
        不随 messages 滚动；在 messages 内会被滚动带走） -->
   <button id="jumpBottomBtn" class="jump-bottom" title="回到底部" hidden>↓</button>
   <div class="composer">
+    <!-- 运行中任务折叠条 + 面板（TUI 式）：输入区上方、queueBar 同区域；
+         默认收起，有任务时计数高亮（计数即徽标），点击展开面板 -->
+    <div id="tasksToggleBar" class="tasks-toggle-bar" hidden title="运行中任务：点击展开 / 收起">
+      <span class="tasks-toggle-label">运行中任务 (0)</span>
+      <span class="tasks-toggle-chevron">▸</span>
+    </div>
+    <div id="composerTasks" class="composer-tasks" hidden></div>
     <div id="queueBar" class="queue-bar" hidden></div>
     <textarea id="promptInput" rows="1" placeholder="输入消息：Enter 发送，Shift+Enter 换行…" title="支持斜杠命令：/compact 压缩上下文；/rename &lt;标题&gt; 重命名（留空可清除）；/btw &lt;问题&gt; 旁路子代理"></textarea>
     <div class="composer-foot">
