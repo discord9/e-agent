@@ -884,6 +884,9 @@ function renderEntries(entries, prepend) {
 function renderHistory(entries) {
   renderEntries(entries, false);
   scrollBottom(true);
+  // 历史渲染完成后补挂当前会话运行中 bash 任务的输出块（追加在末尾，
+  // 不打断消息流；块内的轮询由此启动/续上）
+  reconcileTaskOutputBlocks(state.tasks.list);
 }
 
 /* =====================================================================
@@ -1074,10 +1077,13 @@ function handleSSEBlock(block, id) {
       real.innerHTML = temp.innerHTML;
       els.messages = real;
       state.initSource = "snapshot";
+      // 重放期间消息区被整体替换：补挂输出块并续轮询
+      reconcileTaskOutputBlocks(state.tasks.list);
     } catch (e) {
       els.messages = real;
       real.innerHTML = backup;
       appendNotice("⚠ 会话同步失败，已保留原内容");
+      reconcileTaskOutputBlocks(state.tasks.list);   // 回滚后同样续上块轮询
     }
     return;
   }
@@ -1309,6 +1315,10 @@ function openSession(id) {
     const atBottom = m.scrollHeight - m.scrollTop - m.clientHeight <= 4;
     userScrolled = !atBottom;      // 恢复到非底部位置：不自动跟随滚动
     els.jumpBottomBtn.hidden = atBottom;
+    // 缓存 DOM 里的 .task-output-block 随 innerHTML 恢复：重连后重启
+    // 对应 key 的轮询（块在 DOM → 轮询更新它；已结束的块标 ✓ 且不轮询）。
+    // 切走期间轮询已停（DOM 被替换 / backToList 显式停止），这里续上。
+    reconcileTaskOutputBlocks(state.tasks.list);
     openWith(id, false);           // 只重连 SSE，跳过历史加载与 snapshot
   } else {
     // 首次打开：走既有流程（加载历史 + SSE）
@@ -1332,6 +1342,8 @@ function backToList() {
   saveSessionState();          // 返回列表也保存视图状态：再次打开该会话时恢复
   state.renameActive = false;  // 同 openSession：视图切换即销毁编辑框
   stopSSE();
+  stopAllTaskBlockPollers();   // 离开聊天视图：停消息块轮询（块留在缓存 DOM，
+                               // 切回时 openSession restored 分支重启）
   state.sessionId = null;
   state.view = "list";
   state.acc = null;
@@ -1483,13 +1495,16 @@ function stopPolling() {
 }
 
 /* =====================================================================
- * 运行中任务（两处显示，共用同一轮询）
+ * 运行中任务（三处显示，共用同一轮询）
  *   1. 侧边栏会话树顶部：「运行中任务 (N)」折叠分组（默认收起，
  *      state.sidebar.tasksOpen；树重绘时创建组壳，任务内容由 pollTasks
  *      就地更新，不整树重绘）
  *   2. 聊天视图 composer 上方：#tasksToggleBar 折叠条（计数即徽标，
  *      有任务时高亮）+ #composerTasks 面板（默认收起，state.tasks.composerOpen）
- * 统一轮询 pollTasks()（2s 常驻）：一次 GET /api/tasks 同时更新两处。
+ *   3. 消息列表（els.messages）末尾：当前会话每个运行中 bash 任务的
+ *      「任务输出块」.task-output-block（默认展开实时看输出，见
+ *      reconcileTaskOutputBlocks / ensureTaskOutputBlock）
+ * 统一轮询 pollTasks()（2s 常驻）：一次 GET /api/tasks 同时更新三处。
  * ===================================================================*/
 /* GET /api/tasks → 任务数组；失败/无 token 返回 null（调用方决定如何处理） */
 async function fetchTasks() {
@@ -1509,7 +1524,8 @@ async function fetchTasks() {
 }
 
 /* 统一任务轮询（防重入：seq 竞态序号只应用最新一次响应）。
-   一次 fetchTasks 同时更新侧边栏树分组 + composer 折叠条/面板。 */
+   一次 fetchTasks 同时更新侧边栏树分组 + composer 折叠条/面板 +
+   消息列表输出块（当前会话的 bash 任务）。 */
 async function pollTasks() {
   const seq = ++state.tasks.seq;
   const tasks = await fetchTasks();
@@ -1517,6 +1533,7 @@ async function pollTasks() {
   state.tasks.list = tasks;
   updateSidebarTasksGroup();
   renderComposerTasks();
+  reconcileTaskOutputBlocks(tasks);   // 消息列表输出块：创建/续轮询/结束收起
 }
 
 /* 侧边栏树内「运行中任务 (N)」分组就地更新：计数/可见性/任务行。
@@ -1557,8 +1574,8 @@ function renderComposerTasks() {
   }
 }
 
-/* delegate 行点击不再切走会话（用户用侧边栏树切换）：行点击 = 就地展开
-   内嵌 SSE 流式输出（见 renderTaskList / startTaskStream）。 */
+/* delegate 行点击现在切到 subagent 会话（见 renderTaskList）；就地流式区
+   .task-stream 保留为「解析不到 subagent 会话」时的回退路径。 */
 
 function shortTaskLabel(t) {
   // delegate 显示 label；bash 显示截断的 full_command（label 兜底）
@@ -1568,44 +1585,50 @@ function shortTaskLabel(t) {
 
 /* ---- 任务行就地流式：bash 轮询 output 端点 + delegate 内嵌 SSE ---- */
 
-/* bash 输出轮询：展开后立即拉一次，随后每 500ms GET
-   /api/sessions/{sid}/tasks/{tid}/output 全量刷新输出区（textContent）。
-   旧后端（端点 404）→ 静默停轮询，保持静态尾部；网络失败同样停轮询。
-   句柄存 state.tasks.pollers（key=session_id:id），收起/重绘时清除防泄漏。 */
-function startTaskOutputPolling(t, key, pre, status) {
+/* bash 输出轮询（通用）：给定任务 key + 目标 pre 元素 + 状态回调，500ms
+   GET /api/sessions/{sid}/tasks/{tid}/output 全量刷新输出区（textContent）。
+   旧后端（端点 404）→ 静默停轮询并记为降级（重绘不再重启），保持静态尾部；
+   网络失败 / 元素脱离 DOM 同样停轮询。句柄存 state.tasks.pollers
+   （key=session_id:id）。卡片行与消息列表输出块共用同一实现：同一 key
+   同时只有一处活跃（bash 卡片行不再就地展开，活跃的是消息块），
+   后启动的会先停掉旧句柄再接管。onPhase 回调可选：
+   onPhase("start"|"stop"|"degraded")，卡片行用它驱动状态小字显隐。 */
+function startOutputPoller(key, t, pre, onPhase) {
   stopTaskPoller(key);
-  if (status) status.hidden = false;
+  if (onPhase) onPhase("start");
   let intervalId = null;
   // 只停自己的轮询：2s 重绘会先停旧轮询再启新轮询，旧 tick 的异步收尾
   // 不能误清新轮询（竞态：key 相同）。
-  const stop = () => {
-    if (state.tasks.pollers.get(key) === intervalId) stopTaskPoller(key);
+  const stop = (degraded) => {
+    if (state.tasks.pollers.get(key) !== intervalId) return;
+    stopTaskPoller(key);
+    if (degraded) state.tasks.degraded.add(key);
+    if (onPhase) onPhase(degraded ? "degraded" : "stop");
   };
   const tick = async () => {
-    if (!state.token) { stop(); if (status) status.hidden = true; return; }
+    if (!state.token) { stop(false); return; }
     try {
       const res = await api("/api/sessions/" + encodeURIComponent(t.session_id || "")
         + "/tasks/" + encodeURIComponent(t.id) + "/output");
       if (res.status === 401 || res.status === 403) {
         setBanner("⚠ 认证失败：请检查 Token。");
-        stop(); if (status) status.hidden = true; return;
+        stop(false); return;
       }
       if (res.status === 404 || !res.ok) {
         // 旧后端/端点不可用：停轮询并记为降级（重绘不再重启），输出区保持静态尾部
-        state.tasks.degraded.add(key);
-        stop(); if (status) status.hidden = true; return;
+        stop(true); return;
       }
       const text = await res.text();
-      if (!pre.isConnected) { stop(); if (status) status.hidden = true; return; }
+      if (!pre.isConnected) { stop(false); return; }
       const txt = String(text).trim() !== "" ? String(text) : "";
       pre.classList.toggle("empty", txt === "");
       pre.textContent = txt || "(无输出)";
       pre.scrollTop = pre.scrollHeight;
     } catch (e) {
-      stop(); if (status) status.hidden = true;   // 网络失败：停轮询，保留已有内容
+      stop(false);   // 网络失败：停轮询，保留已有内容
     }
   };
-  tick();   // 展开即拉一次
+  tick();   // 启动即拉一次
   intervalId = setInterval(tick, 500);
   state.tasks.pollers.set(key, intervalId);
 }
@@ -1613,6 +1636,130 @@ function startTaskOutputPolling(t, key, pre, status) {
 function stopTaskPoller(key) {
   const id = state.tasks.pollers.get(key);
   if (id != null) { clearInterval(id); state.tasks.pollers.delete(key); }
+}
+
+/* ---- 消息列表内的 bash 任务输出块（.task-output-block） ----
+   每个运行中的 bash 任务在 els.messages 末尾有一块：details 默认展开，
+   summary = badge「bash」+ 任务 label + 状态/结束标记，pre 轮询刷新输出。
+   块按任务 key（session_id:id）对应，任务结束后收起标记、保留最后输出，
+   不删除（位置保持，新消息自然排在后面）。 */
+
+function taskKey(t) {
+  return (t.session_id || "") + ":" + (t.id != null ? t.id : "");
+}
+
+function findTaskOutputBlock(key) {
+  if (!els.messages) return null;
+  for (const b of els.messages.querySelectorAll(".task-output-block")) {
+    if (b.getAttribute("data-task") === key) return b;
+  }
+  return null;
+}
+
+/* 确保消息列表末尾存在该任务的输出块；不存在则创建（默认展开）。
+   已存在且用户手动折叠的块保持原状（不强制重开）。服务重启等导致
+   task id 复用（旧块已标「✓ 已结束」）时复活为运行中并展开。 */
+function ensureTaskOutputBlock(t) {
+  const key = taskKey(t);
+  let block = findTaskOutputBlock(key);
+  if (!block) {
+    block = el("details", "task-output-block");
+    block.setAttribute("data-task", key);
+    const sum = el("summary", "task-output-head");
+    sum.appendChild(el("span", "kind-badge bash", "bash"));
+    sum.appendChild(el("span", "task-output-label", shortTaskLabel(t)));
+    if (t.session_id) sum.appendChild(el("span", "task-output-sid", "会话 " + shortId(t.session_id)));
+    sum.appendChild(el("span", "task-output-state", "● 运行中"));
+    const initOut = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
+    const body = el("pre", "task-output-body" + (initOut ? "" : " empty"), initOut || "(等待输出…)");
+    block.append(sum, body);
+    els.messages.appendChild(block);
+    scrollBottom(false);
+    block.setAttribute("open", "");   // 新建：默认展开（用户要实时看编译进度）
+  } else {
+    const st = block.querySelector(".task-output-state");
+    if (st && st.classList.contains("done")) {   // 旧 key 复用：复活为运行中
+      st.classList.remove("done");
+      st.textContent = "● 运行中";
+      state.tasks.degraded.delete(key);
+      block.setAttribute("open", "");
+    }
+  }
+  return block;
+}
+
+/* 任务结束（从轮询列表消失）：块收起 + summary 标「✓ 已结束」，
+   保留最后看到的输出文本；停轮询并清降级标记。 */
+function finishTaskOutputBlock(block, key) {
+  stopTaskPoller(key);
+  state.tasks.degraded.delete(key);
+  block.removeAttribute("open");
+  const st = block.querySelector(".task-output-state");
+  if (st) { st.textContent = "✓ 已结束"; st.classList.add("done"); }
+}
+
+/* bash 任务行点击：滚动到消息列表对应输出块 + 短暂高亮提示 */
+function flashTaskOutputBlock(block) {
+  if (typeof block.scrollIntoView === "function") block.scrollIntoView({ block: "nearest" });
+  block.classList.add("flash");
+  if (block._flashTimer) clearTimeout(block._flashTimer);
+  block._flashTimer = setTimeout(() => block.classList.remove("flash"), 2000);
+}
+
+/* 对齐消息列表输出块与当前运行任务（pollTasks 每 2s + 历史/快照渲染后调用）：
+   - 当前会话运行中的 bash 任务 → 确保块存在并启动/续上轮询（块拥有该 key 的
+     轮询：始终重启，覆盖可能残留的卡片轮询）；降级（输出端点 404）→ 用
+     /api/tasks 的 2000 字符尾部静态刷新，不重启轮询。
+   - 已不在列表的任务 → 块收起、标「✓ 已结束」、停轮询（保留最后输出）。
+   只操作当前会话消息区：其它会话的块在各自缓存 DOM 里，切回时由
+   openSession restored 分支再次调用本函数重启轮询。 */
+function reconcileTaskOutputBlocks(tasks) {
+  if (state.view !== "chat" || !state.sessionId) return;
+  const running = new Set();
+  for (const t of tasks || []) {
+    if (t.kind === "delegate") continue;
+    if (t.session_id !== state.sessionId) continue;   // 只渲染当前会话的任务
+    const key = taskKey(t);
+    running.add(key);
+    const block = ensureTaskOutputBlock(t);
+    if (!block) continue;
+    const pre = block.querySelector(".task-output-body");
+    if (!pre) continue;
+    if (state.tasks.degraded.has(key)) {
+      // 旧后端无 output 端点：用任务列表尾部输出静态刷新（2s 粒度）
+      const out = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
+      pre.classList.toggle("empty", out === "");
+      pre.textContent = out || "(无输出)";
+    } else {
+      startOutputPoller(key, t, pre, null);   // 块在 DOM → 轮询更新它
+    }
+  }
+  for (const block of els.messages.querySelectorAll(".task-output-block")) {
+    const key = block.getAttribute("data-task");
+    if (!key || running.has(key)) continue;
+    finishTaskOutputBlock(block, key);
+  }
+}
+
+/* 停掉消息列表所有输出块的轮询（返回列表视图时调用；块留在缓存 DOM，
+   切回时由 reconcileTaskOutputBlocks 重启）。 */
+function stopAllTaskBlockPollers() {
+  if (!els.messages) return;
+  for (const block of els.messages.querySelectorAll(".task-output-block")) {
+    stopTaskPoller(block.getAttribute("data-task"));
+  }
+}
+
+/* delegate 任务 → 对应 subagent 会话 id。
+   /api/tasks 的 delegate 条目 session_id 是父会话（任务注册在父的
+   registry）；subagent 自己的会话出现在 /api/sessions，以
+   parent_session_id === 父 id 且 label === 任务 label 关联。列表未加载
+   或该 delegate 已结束（label 行被消费）→ null。 */
+function resolveSubagentSessionId(t) {
+  if (!t || !t.session_id || !t.label) return null;
+  const list = state.lastList || [];
+  const hit = list.find((s) => s.parent_session_id === t.session_id && s.label === t.label);
+  return hit ? hit.id : null;
 }
 
 /* delegate（subagent）内嵌 SSE：复用 /api/sessions/{sid}/events，只取
@@ -1751,27 +1898,35 @@ function handleTaskStreamBlock(block, streamEl, key) {
   }
 }
 
-/* 渲染任务列表到指定容器（树分组 + composer 面板两处共用）。
-   bash：行点击展开 .task-output（静态尾部）+ 500ms 轮询 output 端点
-   （旧后端 404 → 停轮询，降级为静态尾部）；delegate：行点击展开内嵌
-   SSE 流式区 .task-stream（/api/sessions/{sid}/events），不再切走会话。
+/* 渲染任务列表到指定容器（侧边栏树分组 + composer 面板两处共用）。
+   bash：行点击 → 滚动到消息列表里的 .task-output-block 并高亮（对应输出在
+   消息区可滚动查看）；无对应块（列表视图 / 非当前会话）时回退为就地展开
+   .task-output（静态尾部）+ 500ms 轮询 output 端点（旧后端 404 → 停轮询，
+   降级为静态尾部）。delegate：行点击 → openSession(该 subagent 的会话)，
+   那边有完整消息/工具卡片/思考块渲染；解析不到 subagent 会话时回退为就地
+   展开内嵌 SSE 流式区 .task-stream。.task-output / .task-stream 的渲染代码
+   保留（prevExpanded 恢复逻辑依赖），只是点击分支改变。
    重绘前记录已展开的行并按任务 key（session_id:id）恢复——2s 轮询重绘
-   不打断正在查看的输出/流；消失的任务在此停掉轮询/流并清理文本缓冲。 */
+   不打断正在查看的输出/流；消失的任务在此停掉轮询/流并清理文本缓冲。
+   只停「本容器已展开行」的轮询/流：消息列表输出块的轮询（同一 key）不
+   受影响——bash 行不再就地展开，块轮询独立存活，由 reconcile 接管。 */
 function renderTaskList(tasks, container) {
   const list = container;
   if (!list) return;
-  // 记录「已展开」的行（输出区或流式区），并停掉本容器所有轮询/流——
-  // 重建行后按展开状态重启；仍在列表里的任务重连（流用缓冲续上），
-  // 已消失的任务下方统一清理。
+  // 记录「已展开」的行（输出区或流式区），重建后按展开状态重启；
+  // 只停这些行的轮询/流（见函数头注释）。
   const prevExpanded = new Set();
   for (const row of list.querySelectorAll(".task-row")) {
     const key = row.getAttribute("data-task");
     if (!key) continue;
     const pre = row.querySelector(".task-output");
     const streamEl = row.querySelector(".task-stream");
-    if ((pre && !pre.hidden) || (streamEl && !streamEl.hidden)) prevExpanded.add(key);
-    stopTaskPoller(key);
-    stopTaskStream(key);
+    const expanded = (pre && !pre.hidden) || (streamEl && !streamEl.hidden);
+    if (expanded) {
+      prevExpanded.add(key);
+      stopTaskPoller(key);
+      stopTaskStream(key);
+    }
   }
   // 消失的任务：清理已累积的流式文本缓冲与降级标记（轮询/流已在上方停掉）。
   // 放在空列表早退之前：任务全部结束时也要清理，防泄漏。
@@ -1795,7 +1950,7 @@ function renderTaskList(tasks, container) {
     const key = (t.session_id || "") + ":" + (t.id != null ? t.id : "");
     row.setAttribute("data-task", key);
     const isDelegate = t.kind === "delegate";
-    row.title = isDelegate ? "点击就地查看子代理流式输出" : "点击展开 / 收起输出";
+    row.title = isDelegate ? "点击切换到该子代理的会话" : "点击跳转到消息区输出块";
     const line = el("div", "task-line");
     const badge = el("span", "kind-badge " + (isDelegate ? "delegate" : "bash"),
       isDelegate ? "子代理" : "bash");
@@ -1830,7 +1985,8 @@ function renderTaskList(tasks, container) {
       await cancelTask(t);
     });
     row.appendChild(cancel);
-    row.addEventListener("click", () => {
+    // 就地展开/收起（回退路径：找不到消息块 / 解析不到 subagent 会话时用）
+    const toggleRow = () => {
       const showing = isDelegate ? !streamEl.hidden : !pre.hidden;
       if (showing) {                 // 当前展开 → 收起：停轮询/流
         if (isDelegate) {
@@ -1851,11 +2007,33 @@ function renderTaskList(tasks, container) {
         } else {
           pre.hidden = false;
           if (!state.tasks.degraded.has(key)) {   // 已降级（404）：只显示静态尾部
-            startTaskOutputPolling(t, key, pre, status);
+            startOutputPoller(key, t, pre, (phase) => { status.hidden = phase !== "start"; });
           }
         }
         cancel.hidden = false;
       }
+    };
+    row.addEventListener("click", () => {
+      if (isDelegate) {
+        // 新行为：切到该 subagent 的会话（完整消息/工具卡片/思考块渲染）
+        const subId = resolveSubagentSessionId(t);
+        if (subId) { openSession(subId); return; }
+        // 列表可能还没拉到这个 subagent（刚创建）：补拉一次再试，
+        // 仍解析不到 → 回退就地展开
+        refreshSessionsForSidebar().then(() => {
+          const subId2 = resolveSubagentSessionId(t);
+          if (subId2) openSession(subId2);
+          else toggleRow();
+        });
+        return;
+      }
+      // bash：新行为 → 滚动到消息区对应输出块 + 高亮；无块（列表视图/
+      // 非当前会话/未渲染）→ 回退就地展开
+      if (state.view === "chat" && state.sessionId === t.session_id) {
+        const block = findTaskOutputBlock(key);
+        if (block) { flashTaskOutputBlock(block); return; }
+      }
+      toggleRow();
     });
     if (prevExpanded.has(key)) {     // 轮询重绘恢复展开态：重启轮询/流
       if (isDelegate) {
@@ -1864,7 +2042,7 @@ function renderTaskList(tasks, container) {
       } else {
         pre.hidden = false;
         if (!state.tasks.degraded.has(key)) {     // 降级行不重启轮询
-          startTaskOutputPolling(t, key, pre, status);
+          startOutputPoller(key, t, pre, (phase) => { status.hidden = phase !== "start"; });
         }
       }
       cancel.hidden = false;

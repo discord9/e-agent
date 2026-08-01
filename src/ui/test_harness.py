@@ -149,8 +149,10 @@ class El {
     c._classes=new Set(this._classes); c.textContent=this.textContent;
     c.hidden=this.hidden; c._attrs=Object.assign({}, this._attrs); return c; }
   append(...nodes){ for(const n of nodes){ if(n==null) continue;
-    const c=typeof n==="string"?{text:n}:n; this._children.push(c); if(c._parent===undefined) c._parent=this; } }
+    const c=typeof n==="string"?{text:n}:n; this._children.push(c);
+    if(c._parent==null) c._parent=this; } }
   appendChild(n){ this._children.push(n); n._parent=this; return n; }
+  get isConnected(){ return this._parent != null; }
   insertBefore(n, ref){ const p=n._parent; if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
     const i=this._children.indexOf(ref);
     if(i<0) this._children.push(n); else this._children.splice(i,0,n);
@@ -235,10 +237,17 @@ function stream(){
   } }; } };
 }
 function resp(status, body){ return Promise.resolve({ ok:status>=200&&status<300, status, body,
-  json:async()=>typeof body==="string"?JSON.parse(body):body }); }
+  json:async()=>typeof body==="string"?JSON.parse(body):body,
+  text:async()=>String(body) }); }
+// 任务输出块测试用：/api/tasks 响应与 output 端点文本（测试中可变）
+let tasksData = [];
+let taskOutputText = "";
 globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
   const m=(opts.method||"GET").toUpperCase();
+  if(url==="/api/tasks") return resp(200, tasksData);
+  if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output"))
+    return resp(200, taskOutputText);
   if(url==="/api/sessions"&&m==="GET") return resp(200,[{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}]);
   if(url==="/api/sessions"&&m==="POST") return resp(201,{id:"sess-new",status:"Idle"});
   if(url.startsWith("/api/sessions/s1/history")) {
@@ -467,6 +476,100 @@ async function main(){
     chk("restored rendered assistant not bound",
         state.acc.assistantEl === null && state.acc.assistantText === "",
         "="+String(state.acc.assistantEl));
+
+    // ---- 任务输出块（消息列表）：运行中 bash 任务 → 块创建 + 轮询 ----
+    tasksData = [{ session_id: "s1", id: 7, kind: "bash", label: "cargo build",
+      full_command: "cargo build", output: "Compiling e-agent…", role: null }];
+    taskOutputText = "Compiling e-agent…\n   Compiling e-agent-util…\n";
+    await pollTasks();
+    await flush();
+    let blocks = elsById["messages"].querySelectorAll(".task-output-block");
+    chk("task block created", blocks.length === 1, "n=" + blocks.length);
+    chk("task block default open + running",
+        blocks[0].hasAttribute("open")
+        && blocks[0].querySelector(".task-output-state").textContent === "● 运行中",
+        "open=" + blocks[0].hasAttribute("open"));
+    chk("task block badge+label",
+        blocks[0].querySelector(".kind-badge").textContent === "bash"
+        && blocks[0].querySelector(".task-output-label").textContent.includes("cargo build"));
+    chk("task block poller started", state.tasks.pollers.has("s1:7"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    await flush();   // 启动即拉一次：output 端点全量刷新 pre 文本
+    chk("task block output live",
+        blocks[0].querySelector(".task-output-body").textContent.includes("e-agent-util"),
+        "=" + blocks[0].querySelector(".task-output-body").textContent);
+    // 多任务各自独立：同会话第二个任务 → 第二个块（按 key 对应）
+    tasksData = [
+      { session_id: "s1", id: 7, kind: "bash", label: "cargo build", full_command: "cargo build", output: "", role: null },
+      { session_id: "s1", id: 8, kind: "bash", label: "cargo test", full_command: "cargo test", output: "running tests", role: null },
+    ];
+    await pollTasks();
+    await flush();
+    blocks = elsById["messages"].querySelectorAll(".task-output-block");
+    chk("second block created", blocks.length === 2, "n=" + blocks.length);
+    chk("blocks polled independently", state.tasks.pollers.has("s1:7") && state.tasks.pollers.has("s1:8"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    // 用户手动折叠的块不被 reconcile 强制重开（只新建/复活时展开）
+    blocks[0].removeAttribute("open");
+    await pollTasks();
+    await flush();
+    chk("user-collapsed block stays collapsed", !findTaskOutputBlock("s1:7").hasAttribute("open"),
+        "open=" + findTaskOutputBlock("s1:7").hasAttribute("open"));
+    // bash 行点击（composer 面板）→ 滚动到消息块 + 高亮，不就地展开
+    renderTaskList(tasksData, elsById["composerTasks"]);
+    const trows = elsById["composerTasks"].querySelectorAll(".task-row");
+    chk("composer rows rendered", trows.length === 2, "n=" + trows.length);
+    const block7 = findTaskOutputBlock("s1:7");
+    trows[0]._listeners["click"][0]();
+    chk("bash row click flashes block", block7.classList.contains("flash"),
+        "cls=" + block7.className);
+    chk("bash row not expanded in place", trows[0].querySelector(".task-output").hidden === true,
+        "hidden=" + trows[0].querySelector(".task-output").hidden);
+    // delegate 行 → subagent 会话解析（/api/tasks 的 delegate 条目 session_id
+    // 是父会话；subagent 会话以 parent_session_id+label 关联）
+    state.lastList = [
+      { id: "s1", parent_session_id: null, label: null },
+      { id: "sub-1", parent_session_id: "s1", label: "子任务X", active: true },
+    ];
+    chk("resolve subagent id",
+        resolveSubagentSessionId({ session_id: "s1", label: "子任务X" }) === "sub-1",
+        "=" + String(resolveSubagentSessionId({ session_id: "s1", label: "子任务X" })));
+    chk("resolve unknown delegate → null",
+        resolveSubagentSessionId({ session_id: "s1", label: "不存在的任务" }) === null
+        && resolveSubagentSessionId({ session_id: "s1", label: "" }) === null);
+    // 任务结束（从轮询列表消失）：块收起 + ✓ 已结束 + 停轮询，位置保留
+    tasksData = [];
+    await pollTasks();
+    await flush();
+    blocks = elsById["messages"].querySelectorAll(".task-output-block");
+    chk("ended blocks kept in place", blocks.length === 2, "n=" + blocks.length);
+    chk("ended block collapsed", !blocks[0].hasAttribute("open"),
+        "open=" + blocks[0].hasAttribute("open"));
+    chk("ended block marked done",
+        blocks[0].querySelector(".task-output-state").textContent === "✓ 已结束",
+        "=" + blocks[0].querySelector(".task-output-state").textContent);
+    chk("ended block retains output",
+        blocks[0].querySelector(".task-output-body").textContent.includes("e-agent-util"));
+    chk("ended pollers stopped",
+        !state.tasks.pollers.has("s1:7") && !state.tasks.pollers.has("s1:8"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    // 切走（backToList 停块轮询 + 缓存 html 含块）→ 切回 restored 续轮询
+    tasksData = [{ session_id: "s1", id: 9, kind: "bash", label: "cargo run",
+      full_command: "cargo run", output: "building", role: null }];
+    await pollTasks();
+    await flush();
+    chk("block before switch", state.tasks.pollers.has("s1:9"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    backToList();
+    chk("backToList stops block pollers", !state.tasks.pollers.has("s1:9"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    chk("cache keeps blocks", !!state.sessionStates["s1"]
+        && state.sessionStates["s1"].html.includes("task-output-block"));
+    openSession("s1");
+    await flush();
+    chk("restored restarts block poller", state.tasks.pollers.has("s1:9"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    chk("restored block in messages", findTaskOutputBlock("s1:9") !== null);
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);
@@ -480,7 +583,7 @@ with open(out, 'w', encoding='utf-8') as f:
 r = subprocess.run(['gjs', out], capture_output=True, text=True)
 print(r.stdout, end="")
 if r.stderr.strip():
-    print(r.stderr[:4000])
+    print(r.stderr[:12000])
 if os.environ.get('KEEP') != '1':
     os.unlink(out)
 sys.exit(0 if "ALL PASS" in r.stdout + r.stderr else 1)
