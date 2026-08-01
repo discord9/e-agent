@@ -3340,3 +3340,217 @@ async fn undo_command_reverses_last_file_op_and_notices() {
     let notice = state.lines.last().unwrap().text.clone();
     assert!(notice.contains("已撤销 write_file: file.txt"), "{notice}");
 }
+
+// ── /fork ──────────────────────────────────────────────────────────────
+
+/// Two completed turns: turn 1 is a plain User → Assistant exchange
+/// (boundary at index 1), turn 2 is a User → Assistant(tool_calls) →
+/// Tool → Assistant exchange (boundary at index 5). Indexes are 0-based
+/// JSONL line ordinals, so `load_with_seq` reports seq 1 and seq 5.
+fn fork_session_entries() -> Vec<SessionEntry> {
+    use crate::agent::{AssistantMessage, Message, ToolCall};
+    let mut entries: Vec<SessionEntry> = vec![
+        Message::User {
+            content: "q1".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a1".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: "q2".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning: None,
+        })
+        .into(),
+        Message::Tool {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            content: "ok".into(),
+            is_error: false,
+            synthetic: false,
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a2".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ];
+    // A trailing non-boundary entry must be dropped from every fork.
+    entries.push(SessionEntry::Notice {
+        text: "[background task 1 completed]\nzzz".into(),
+    });
+    entries
+}
+
+/// The one `fork-…` session file in a temp root's sessions dir, if any.
+fn fork_session_file(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = root.join(".e-agent/sessions");
+    let mut forks: Vec<_> = std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("fork-") && name.ends_with(".jsonl"))
+        })
+        .collect();
+    assert!(
+        forks.len() <= 1,
+        "expected at most one fork session: {forks:?}"
+    );
+    forks.pop()
+}
+
+/// A TuiState wired like `run_inner` does for a Jsonl-backed session,
+/// with the given session id and root.
+fn fork_state(root: &std::path::Path, session_id: &str) -> TuiState {
+    TuiState {
+        store: Some(crate::session_store::SessionStore::Jsonl),
+        backend: Some(crate::config::SessionBackend::Jsonl),
+        root: root.to_path_buf(),
+        session_id: session_id.to_string(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn fork_latest_creates_session_up_to_newest_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    crate::session::Session::rewrite(temp.path(), "src-session", &fork_session_entries()).unwrap();
+
+    let mut state = fork_state(temp.path(), "src-session");
+    super::handle_fork(ForkCommand::Latest, &mut state).await;
+
+    let notice = state.lines.last().unwrap().text.clone();
+    assert!(notice.starts_with("已 fork 到新会话：fork-"), "{notice}");
+    assert!(notice.contains("保留 6 条历史"), "{notice}");
+    let fork_path = fork_session_file(temp.path()).expect("fork session must exist");
+    let loaded = crate::session::Session::load(
+        temp.path(),
+        fork_path.file_stem().unwrap().to_str().unwrap(),
+    )
+    .unwrap();
+    // 6 source entries up to the newest boundary (a2) + ForkedFrom marker;
+    // the trailing Notice is dropped.
+    assert_eq!(loaded.entries.len(), 7);
+    assert_eq!(
+        loaded.entries[..6],
+        fork_session_entries()[..6],
+        "prefix must keep everything up to the newest boundary"
+    );
+    match loaded.entries.last().unwrap() {
+        SessionEntry::ForkedFrom {
+            source,
+            at,
+            event_time: None,
+            seq: Some(seq),
+        } => {
+            assert_eq!(source, "src-session");
+            assert_eq!(*at, 6, "marker at = prefix len");
+            assert_eq!(*seq, 5, "marker seq = the boundary's JSONL ordinal");
+        }
+        other => panic!("expected ForkedFrom marker, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fork_at_n_counts_boundaries_from_newest() {
+    let temp = tempfile::tempdir().unwrap();
+    crate::session::Session::rewrite(temp.path(), "src-session", &fork_session_entries()).unwrap();
+
+    let mut state = fork_state(temp.path(), "src-session");
+    super::handle_fork(ForkCommand::At(2), &mut state).await;
+
+    let notice = state.lines.last().unwrap().text.clone();
+    assert!(notice.starts_with("已 fork 到新会话：fork-"), "{notice}");
+    assert!(notice.contains("保留 2 条历史"), "{notice}");
+    let fork_path = fork_session_file(temp.path()).expect("fork session must exist");
+    let loaded = crate::session::Session::load(
+        temp.path(),
+        fork_path.file_stem().unwrap().to_str().unwrap(),
+    )
+    .unwrap();
+    // 2 source entries up to the first boundary (a1) + ForkedFrom marker.
+    assert_eq!(loaded.entries.len(), 3);
+    assert_eq!(
+        loaded.entries[..2],
+        fork_session_entries()[..2],
+        "prefix must keep everything up to the 2nd-newest boundary"
+    );
+    match loaded.entries.last().unwrap() {
+        SessionEntry::ForkedFrom {
+            source,
+            at,
+            event_time: None,
+            seq: Some(seq),
+        } => {
+            assert_eq!(source, "src-session");
+            assert_eq!(*at, 2);
+            assert_eq!(*seq, 1, "marker seq = the first boundary's JSONL ordinal");
+        }
+        other => panic!("expected ForkedFrom marker, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fork_beyond_boundary_count_notices_and_creates_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    crate::session::Session::rewrite(temp.path(), "src-session", &fork_session_entries()).unwrap();
+
+    let mut state = fork_state(temp.path(), "src-session");
+    super::handle_fork(ForkCommand::At(99), &mut state).await;
+
+    let notice = state.lines.last().unwrap().text.clone();
+    assert_eq!(notice, "无法 fork：只有 2 个可 fork 的回合边界", "{notice}");
+    assert!(
+        fork_session_file(temp.path()).is_none(),
+        "out-of-range fork must not create a session"
+    );
+}
+
+#[tokio::test]
+async fn fork_usage_and_unwired_state_notice_without_creating() {
+    let temp = tempfile::tempdir().unwrap();
+
+    // Usage: no session file, usage notice.
+    let mut state = fork_state(temp.path(), "src-session");
+    super::handle_fork(ForkCommand::Usage, &mut state).await;
+    assert!(
+        state.lines.last().unwrap().text.contains("用法：/fork"),
+        "{}",
+        state.lines.last().unwrap().text
+    );
+    assert!(fork_session_file(temp.path()).is_none());
+
+    // Unwired (Default) state: "TUI 未接线" notice, no panic, no session.
+    let mut state = TuiState::default();
+    super::handle_fork(ForkCommand::Latest, &mut state).await;
+    assert!(
+        state
+            .lines
+            .last()
+            .unwrap()
+            .text
+            .contains("无法 fork：TUI 未接线"),
+        "{}",
+        state.lines.last().unwrap().text
+    );
+    assert!(fork_session_file(temp.path()).is_none());
+}
