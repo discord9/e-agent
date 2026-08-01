@@ -1448,6 +1448,10 @@ async function refreshSessionsForSidebar() {
  * 会话侧边栏：会话树
  * 主会话（parent_session_id 空）为根，默认折叠；subagent 挂父节点下
  * （缩进 + 「子」徽章），展开才渲染子节点；孤儿 subagent 归入「未关联」。
+ * 每个父节点（及「未关联」组）默认只显示活跃 subagent（active !== false，
+ * 即活跃或 busy；旧 server 无 active 字段 → 视为活跃）：非活跃 subagent
+ * 收进折叠的「历史子会话 (N)」分组（点击展开，不持久化展开状态）。
+ * subagent 标题优先用 label（running_tasks 任务面板标题），回退 title/id。
  * 默认只渲染最近 15 个主会话（列表按 last_active_at 降序），超出显示
  * 「+N 个更早的会话」按钮点击显示全部；子会话/孤儿组不计数。
  * 筛选时（state.sidebar.filter 非空）：主会话按 title/id 匹配才显示，
@@ -1460,9 +1464,10 @@ let lastTreeSig = "";
 
 function sidebarTreeSig() {
   const list = state.lastList || [];
-  // 签名含当前会话 id：打开/切换会话后重绘以更新 .current 高亮
+  // 签名含当前会话 id：打开/切换会话后重绘以更新 .current 高亮；
+  // 含 label：subagent 任务标题变化时树要重绘
   return state.sessionId + "|" + JSON.stringify(list.map((s) => [
-    s.id, s.title || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
+    s.id, s.title || "", s.label || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
     s.entry_count ?? 0, s.parent_session_id || "",
   ]));
 }
@@ -1589,14 +1594,27 @@ function toggleSidebarNode(id, toggle, kids) {
   }
 }
 
+/* 父节点 / 「未关联」组的子节点渲染：默认只显示活跃 subagent
+   （active !== false，即活跃或 busy），非活跃收进折叠的
+   「历史子会话 (N)」分组（buildHistGroup，默认收起、点击展开）。 */
 function renderTreeChildren(container, kids) {
   container.innerHTML = "";
+  const active = [], hist = [];
+  for (const k of kids) (k.active === false ? hist : active).push(k);
+  renderSubagentRows(container, active);
+  if (hist.length) container.appendChild(buildHistGroup(hist));
+}
+
+/* 渲染 subagent 行（不做活跃/历史分组）；hist=true 时行灰显小字 */
+function renderSubagentRows(container, kids, hist) {
   for (const k of kids) {
-    const row = el("div", "tree-row tree-row-child" + (state.sessionId === k.id ? " current" : ""));
+    const row = el("div", "tree-row tree-row-child" + (hist ? " tree-hist" : "") +
+                   (state.sessionId === k.id ? " current" : ""));
     const dot = el("span", "busy-dot" + (k.busy ? " busy" : ""));
-    const title = k.title || shortId(k.id);
+    // label 优先：subagent 的任务面板标题最友好；旧 server 无 label → 回退 title/id
+    const title = k.label || k.title || shortId(k.id);
     const titleEl = el("span", "tree-id", title);
-    titleEl.title = k.title || k.id;
+    titleEl.title = k.label || k.title || k.id;
     const edit = el("button", "tree-edit", "✎");
     edit.type = "button";
     edit.title = "重命名";
@@ -1607,13 +1625,32 @@ function renderTreeChildren(container, kids) {
     const badge = el("span", "child-badge", "子");
     row.append(dot, titleEl, edit, badge);
     // busy 的 subagent：title 提示可发送消息（点击行 openSession 是现有行为，保持不变）
-    row.title = (k.title || k.id) + (k.busy ? "（处理中）· 可发送消息" : "");
+    row.title = (k.label || k.title || k.id) + (k.busy ? "（处理中）· 可发送消息" : "");
     row.addEventListener("click", () => {
       if (k.active === false) { resumeSession(k.id); return; }
       openSession(k.id);
     });
     container.appendChild(row);
   }
+}
+
+/* 「历史子会话 (N)」折叠分组：非活跃 subagent 默认收起，点击展开；
+   不持久化展开状态（每次重绘默认折叠，简单）。 */
+function buildHistGroup(kids) {
+  const node = el("div", "tree-node");
+  const row = el("div", "tree-row tree-hist-row");
+  const toggle = el("button", "tree-toggle", "▸");
+  toggle.type = "button";
+  toggle.title = "展开 / 收起";
+  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle));
+  const idEl = el("span", "tree-id tree-group tree-hist-label", "历史子会话 (" + kids.length + ")");
+  row.append(toggle, idEl);
+  node.appendChild(row);
+  const children = el("div", "tree-children");
+  children.hidden = true;
+  renderSubagentRows(children, kids, true);
+  node.appendChild(children);
+  return node;
 }
 
 /* 「未关联」分组：孤儿 subagent 的根节点，默认折叠 */
@@ -1623,19 +1660,7 @@ function buildTreeGroup(label, kids) {
   const toggle = el("button", "tree-toggle", "▸");
   toggle.type = "button";
   toggle.title = "展开 / 收起";
-  toggle.addEventListener("click", (ev) => {
-    ev.stopPropagation();
-    const children = toggle.closest(".tree-node").querySelector(".tree-children");
-    if (children.hidden) {
-      children.hidden = false;
-      toggle.classList.add("open");
-      toggle.textContent = "▾";
-    } else {
-      children.hidden = true;
-      toggle.classList.remove("open");
-      toggle.textContent = "▸";
-    }
-  });
+  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle));
   const idEl = el("span", "tree-id tree-group", label);
   row.append(toggle, idEl);
   node.appendChild(row);
@@ -1644,6 +1669,21 @@ function buildTreeGroup(label, kids) {
   renderTreeChildren(children, kids);
   node.appendChild(children);
   return node;
+}
+
+/* 分组折叠切换（未关联 / 历史子会话）：默认收起，点击展开，不持久化 */
+function toggleTreeGroup(ev, toggle) {
+  ev.stopPropagation();
+  const children = toggle.closest(".tree-node").querySelector(".tree-children");
+  if (children.hidden) {
+    children.hidden = false;
+    toggle.classList.add("open");
+    toggle.textContent = "▾";
+  } else {
+    children.hidden = true;
+    toggle.classList.remove("open");
+    toggle.textContent = "▸";
+  }
 }
 
 /* =====================================================================

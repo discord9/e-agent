@@ -686,6 +686,9 @@ mmlEqnNo}
     border: 1px solid var(--violet);
     flex: 0 0 auto;
   }
+  /* 「历史子会话 (N)」折叠分组：灰显、小字（与「未关联」组一致） */
+  .tree-hist-label { color: var(--base01); font-size: 12px; }
+  .tree-row-child.tree-hist .tree-id { color: var(--base01); font-size: 13px; }
 
   /* ---------- 会话重命名：✎ / ✓ / × 小按钮与编辑态 ---------- */
   /* ✎ 按钮：≥24px 点击区、muted 色、hover 背景；树节点与列表行共用 */
