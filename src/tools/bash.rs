@@ -184,6 +184,13 @@ struct ProcessGroupGuard {
     handle: Option<windows_sys::Win32::Foundation::HANDLE>,
 }
 
+// Windows HANDLEs are plain values: CloseHandle/TerminateProcess are
+// documented as callable from any thread, so the guard is Send even though
+// HANDLE is `*mut c_void` under the hood. Required because the guard lives
+// across awaits inside a `Send + 'static` background future.
+#[cfg(windows)]
+unsafe impl Send for ProcessGroupGuard {}
+
 #[cfg(windows)]
 impl ProcessGroupGuard {
     fn armed(pid: u32) -> Self {
@@ -229,7 +236,13 @@ fn bash_executable() -> Result<String, String> {
     #[cfg(windows)]
     {
         let path_candidates = std::env::var_os("PATH")
-            .map(|path| std::env::split_paths(&path).map(|dir| dir.join("bash.exe")))
+            .map(|path| {
+                // collect: split_paths borrows the OsString; materialize the
+                // owned PathBufs before the closure returns (E0515 otherwise)
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join("bash.exe"))
+                    .collect::<Vec<_>>()
+            })
             .into_iter()
             .flatten();
         let candidates = path_candidates.chain([

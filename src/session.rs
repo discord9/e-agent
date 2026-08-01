@@ -196,6 +196,7 @@ impl Session {
             return Ok(());
         }
         let path = session_path(root, name, "jsonl")?;
+        #[cfg(unix)]
         let created = !path.exists();
         let directory = path.parent().unwrap();
         std::fs::create_dir_all(directory)
@@ -258,6 +259,7 @@ impl Session {
         let path = background_record_path(root, session)?;
         let directory = path.parent().unwrap();
         std::fs::create_dir_all(directory)?;
+        #[cfg(unix)]
         let created = !path.exists();
         let mut file = std::fs::OpenOptions::new()
             .create(true)
