@@ -101,3 +101,18 @@ Every session supports the same steering operations through its concrete
 the in-flight turn. Main-agent and subagent frontends use this same transport.
 Queued prompts are transient UI state; `UserPrompt` is emitted and persisted
 only when the runner consumes the prompt. Do not add a second steering path.
+
+## Images: delegate to the `seer` role
+
+The main model and most subagents run text-only models. When the user
+references an image (a path, an attachment, "look at this screenshot") or
+asks anything that requires seeing an image, do NOT say you cannot see it
+and do NOT pass the image into your own context: delegate to a `seer`
+subagent instead.
+
+- Use the `delegate` tool with `role: "seer"` and a task that names the
+  image path (or says the image is attached) and the user's exact question.
+- The seer runs on a vision-capable model, calls `read_image` itself, and
+  returns a text description you can relay verbatim.
+- For follow-up questions about the same image, `resume` the same seer
+  session (`resume: "<sub-...>"`) so it keeps its context.

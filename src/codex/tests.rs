@@ -310,3 +310,95 @@ async fn backend_401_refreshes_once_persists_rotation_and_retries_once() {
             .contains("rotated-refresh")
     );
 }
+
+#[tokio::test]
+async fn transient_connect_errors_are_retried_then_fail_with_context() {
+    // A port with no listener: every attempt fails with ECONNREFUSED, which
+    // reqwest reports as an is_connect() error (same family as the
+    // "tls handshake eof" users hit). The loop must exhaust all 3 attempts
+    // before the context-wrapped error surfaces.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let temp = tempfile::tempdir().unwrap();
+    let mut model = CodexModel::with_endpoint(
+        crate::codex_auth::CodexAuth::test_auth(temp.path().join("auth.json")),
+        format!("http://{addr}/responses"),
+    );
+    let started = std::time::Instant::now();
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+    // 3 attempts => 500ms + 1000ms of backoff; this proves the retries ran.
+    assert!(started.elapsed() >= Duration::from_millis(1500));
+    let text = format!("{error:#}");
+    assert!(text.contains("ChatGPT Responses request failed"), "{text}");
+}
+
+#[tokio::test]
+async fn transient_connect_error_retries_and_recovers() {
+    // Bind a listener to learn a free port, then drop it: the model's first
+    // send attempt hits ECONNREFUSED (is_connect()). The mock server rebinds
+    // that port shortly after, so the retry lands on a live server.
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = first.local_addr().unwrap();
+    drop(first);
+    let endpoint = format!("http://{addr}/responses");
+    let server = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let count = stream.read(&mut request).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&request[..count])
+                .to_ascii_lowercase()
+                .contains("authorization: bearer access")
+        );
+        let done = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n";
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    done.len(),
+                    done
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let mut model = CodexModel::with_endpoint(
+        crate::codex_auth::CodexAuth::test_auth(temp.path().join("auth.json")),
+        endpoint,
+    );
+    let (message, usage) = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(message.content, None);
+    assert_eq!(
+        usage,
+        Some(Usage {
+            input_tokens: 1,
+            output_tokens: 2
+        })
+    );
+}

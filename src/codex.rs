@@ -5,6 +5,7 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::agent::{
     AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
@@ -79,19 +80,36 @@ impl CodexModel {
         } else {
             self.auth.current_access_token_and_account().await?
         };
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .bearer_auth(&access_token)
-            .header("ChatGPT-Account-ID", account_id)
-            .header("originator", "codex_cli_rs")
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .header(reqwest::header::USER_AGENT, "codex_cli_rs/0.0.0 (e-agent)")
-            .json(request)
-            .send()
-            .await
-            .context("ChatGPT Responses request failed")?;
-        Ok((response, access_token))
+        // Transient connectivity hiccups (e.g. "tls handshake eof") recover on
+        // retry; only connection/timeout errors qualify, HTTP status errors are
+        // handled by the caller (401 refresh). Mirrors src/model.rs's chat-wire
+        // retry with a couple more attempts.
+        let mut last_error = None;
+        for attempt in 1..=3 {
+            match self
+                .client
+                .post(&self.endpoint)
+                .bearer_auth(&access_token)
+                .header("ChatGPT-Account-ID", account_id.as_str())
+                .header("originator", "codex_cli_rs")
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .header(reqwest::header::USER_AGENT, "codex_cli_rs/0.0.0 (e-agent)")
+                .json(request)
+                .send()
+                .await
+            {
+                Ok(response) => return Ok((response, access_token)),
+                Err(error) if attempt < 3 && (error.is_timeout() || error.is_connect()) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                }
+                Err(error) => return Err(error).context("ChatGPT Responses request failed"),
+            }
+        }
+        // Unreachable in practice (every arm above returns); defensive.
+        Err(anyhow::anyhow!(
+            "ChatGPT Responses request failed: {last_error:?}"
+        ))
     }
 }
 
