@@ -29,10 +29,15 @@ enum ExternalCapability {
 
 impl Workspace {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, String> {
-        let root = std::fs::canonicalize(root.as_ref())
+        // Canonicalize first — keeping the verbatim-prefixed form for the
+        // open keeps >260-char Windows workspaces openable — then store the
+        // prefix-stripped path so comparisons and `strip_prefix` against
+        // ordinary user-provided paths work on Windows.
+        let canonical = std::fs::canonicalize(root.as_ref())
             .map_err(|error| format!("cannot canonicalize workspace: {error}"))?;
-        let dir = Dir::open_ambient_dir(&root, ambient_authority())
+        let dir = Dir::open_ambient_dir(&canonical, ambient_authority())
             .map_err(|error| format!("cannot open workspace: {error}"))?;
+        let root = crate::strip_verbatim_prefix(&canonical);
         Ok(Self {
             policy_anchor: root.join(".e-agent/config.toml"),
             root,
@@ -223,9 +228,9 @@ impl Workspace {
             self.root.join(path)
         };
         let is_policy = target == *policy
-            || std::fs::canonicalize(&target)
+            || crate::canonicalize_path(&target)
                 .ok()
-                .zip(std::fs::canonicalize(policy).ok())
+                .zip(crate::canonicalize_path(policy).ok())
                 .is_some_and(|(target, policy)| target == policy);
         if is_policy {
             return Err(".e-agent/config.toml controls sandbox and file capabilities; it must be modified by the user outside the agent".into());
@@ -324,8 +329,38 @@ fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String
         .map_err(|error| format!("write failed: {error}"))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String> {
+    // Degraded write for Windows only (openat2 is Linux-only): fall back to
+    // cap-std's regular capability-relative open/truncate/write. The
+    // BENEATH|NO_SYMLINKS resolution guarantees of the Linux path are lost
+    // (tree-internal symlinks are followed but cannot escape the capability
+    // root — cap-std resolves components with FollowSymlinks::No and rejects
+    // absolute/escaping targets), but `path` is still validated to contain
+    // only normal components by the caller's `relative()`/`external()`, and
+    // `dir` is the capability root, so the write cannot escape the
+    // authorized directory. Other non-Linux platforms (macOS etc.) keep the
+    // fail-closed error below — the C plan only covers Windows.
+    // Keeps the same signature and error type as the Linux path.
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        dir.create_dir_all(parent)
+            .map_err(|error| format!("create directory failed: {error}"))?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    let mut file = dir
+        .open_with(path, &options)
+        .map_err(|error| format!("write failed: {error}"))?;
+    file.write_all(content)
+        .and_then(|()| file.flush())
+        .map_err(|error| format!("write failed: {error}"))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn secure_dir_write(_dir: &Dir, _path: &Path, _content: &[u8]) -> Result<(), String> {
+    // Other non-Linux platforms (macOS, BSD, …) keep the original
+    // fail-closed behavior: secure directory writes require Linux's
+    // openat2. The C plan deliberately covers Windows only.
     Err("write failed: secure directory writes require Linux".into())
 }
 

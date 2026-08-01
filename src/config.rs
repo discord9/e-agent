@@ -370,7 +370,7 @@ pub fn config_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(xdg).join("e-agent"));
     }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/e-agent"))
+    crate::home_dir().map(|home| home.join(".config/e-agent"))
 }
 
 #[derive(Default, Deserialize)]
@@ -504,8 +504,10 @@ fn linked_worktree_main_repo(workspace: &Path) -> anyhow::Result<Option<PathBuf>
         return Ok(None);
     }
     let main_repo = main_repo.to_path_buf();
-    // Canonicalize to defeat symlink tricks and normalize the root.
-    match std::fs::canonicalize(&main_repo) {
+    // Canonicalize to defeat symlink tricks and normalize the root (the
+    // Windows `\\?\` verbatim prefix is stripped so the result compares
+    // equal to the roots produced by `canonical_roots`).
+    match crate::canonicalize_path(&main_repo) {
         Ok(canonical) if canonical.is_dir() => Ok(Some(canonical)),
         _ => Ok(None),
     }
@@ -609,7 +611,7 @@ fn canonical_roots(
     let mut roots = Vec::new();
     for configured in paths {
         let expanded = expand_sandbox_path(configured, workspace)?;
-        let path = match std::fs::canonicalize(&expanded) {
+        let path = match crate::canonicalize_path(&expanded) {
             Ok(path) => path,
             Err(error) if skip_missing && error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -714,9 +716,9 @@ fn utf8_roots(roots: Vec<PathBuf>) -> anyhow::Result<Vec<String>> {
 
 fn expand_sandbox_path(path: &str, workspace: &Path) -> anyhow::Result<PathBuf> {
     if path == "~" || path.starts_with("~/") {
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| anyhow!("cannot expand `{path}`: HOME is not set"))?;
-        return Ok(PathBuf::from(home).join(path.strip_prefix("~/").unwrap_or("")));
+        let home =
+            crate::home_dir().ok_or_else(|| anyhow!("cannot expand `{path}`: HOME is not set"))?;
+        return Ok(home.join(path.strip_prefix("~/").unwrap_or("")));
     }
     let candidate = PathBuf::from(path);
     Ok(if candidate.is_absolute() {
@@ -731,8 +733,8 @@ fn config_paths() -> Vec<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         paths.push(PathBuf::from(xdg).join("e-agent/config.toml"));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let fallback = PathBuf::from(home).join(".config/e-agent/config.toml");
+    if let Some(home) = crate::home_dir() {
+        let fallback = home.join(".config/e-agent/config.toml");
         if !paths.contains(&fallback) {
             paths.push(fallback);
         }

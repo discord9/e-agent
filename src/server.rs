@@ -196,7 +196,7 @@ pub fn state_dir_inner(
 fn state_dir() -> Option<PathBuf> {
     state_dir_inner(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+        crate::home_dir().as_deref().map(std::path::Path::as_os_str),
     )
 }
 

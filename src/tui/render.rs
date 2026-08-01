@@ -565,8 +565,10 @@ pub(crate) fn cwd_usage_text(
 }
 
 /// Replace a leading `$HOME` with `~` (e.g. `/home/alice/work` → `~/work`).
+/// Display-only; on Windows the backslash separators and case differences
+/// may prevent the collapse (acceptable — the overlay just stays absolute).
 pub(crate) fn shorten_home(cwd: &str) -> std::borrow::Cow<'_, str> {
-    match std::env::var_os("HOME") {
+    match crate::home_dir() {
         Some(home) => {
             let home = home.to_string_lossy();
             if cwd == home.as_ref() {

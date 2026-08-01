@@ -173,6 +173,78 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
+/// Windows degradation for process-tree kill: Windows has no POSIX process
+/// groups, so this guard terminates the top-level shell process only. Child
+/// processes spawned by the shell are NOT killed — a full Job Object based
+/// tree-kill is a later milestone. When the top-level bash dies, its
+/// children typically observe EOF on the shared stdout/stderr pipes, which
+/// is usually enough for interactive shells to exit.
+#[cfg(windows)]
+struct ProcessGroupGuard {
+    handle: Option<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+impl ProcessGroupGuard {
+    fn armed(pid: u32) -> Self {
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE};
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        Self {
+            handle: (!handle.is_null()).then_some(handle),
+        }
+    }
+
+    fn disarm(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        if let Some(handle) = self.handle.take() {
+            unsafe {
+                let _ = TerminateProcess(handle, 1);
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+        }
+    }
+}
+
+/// Resolve the bash executable. Non-Windows: `/bin/bash` (unchanged).
+/// Windows: Git Bash is not at a fixed path, so search `PATH` for
+/// `bash.exe` first, then fall back to the common Git for Windows install
+/// locations. Returns a clear error when bash cannot be found.
+fn bash_executable() -> Result<String, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = ();
+        Ok("/bin/bash".into())
+    }
+    #[cfg(windows)]
+    {
+        let path_candidates = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).map(|dir| dir.join("bash.exe")))
+            .into_iter()
+            .flatten();
+        let candidates = path_candidates.chain([
+            std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+            std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin\bash.exe"),
+        ]);
+        for candidate in candidates {
+            if candidate.is_file() {
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
+        }
+        Err("bash not found: Windows requires Git Bash — put bash.exe on PATH or install it at C:\\Program Files\\Git\\bin\\bash.exe".into())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_bash(
     workspace: &Workspace,
@@ -189,6 +261,7 @@ pub(super) async fn run_bash(
     // system dirs read-only, workspace writable (per config), /tmp scratch,
     // no new privileges, TIOCSTI blocked, die with the parent. Network is
     // shared by default (agents often need to fetch); config can disable it.
+    let bash = bash_executable()?;
     let mut process = match sandbox {
         Some(sandbox) => {
             let root = workspace.root();
@@ -309,7 +382,7 @@ pub(super) async fn run_bash(
             if !sandbox.network {
                 args.push("--unshare-net".into());
             }
-            args.push("/bin/bash".into());
+            args.push(bash.clone());
             args.push("-lc".into());
             args.push(command.to_owned());
             let mut cmd = Command::new("bwrap");
@@ -327,7 +400,7 @@ pub(super) async fn run_bash(
             cmd
         }
         None => {
-            let mut cmd = Command::new("/bin/bash");
+            let mut cmd = Command::new(bash);
             cmd.arg("-lc").arg(command);
             cmd
         }
@@ -356,14 +429,26 @@ pub(super) async fn run_bash(
             .ok_or("bash exited before its process group was recorded")? as i32,
     )
     .ok_or("bash returned an invalid process id")?;
+    #[cfg(windows)]
+    let child_pid = child
+        .id()
+        .ok_or("bash exited before its pid was recorded")?;
     #[cfg(unix)]
     if let Some(slot) = &process_group_slot {
         slot.store(process_group.as_raw_nonzero().get(), Ordering::Release);
     }
-    // Kills the process group if this future is dropped mid-execution
-    // (e.g. the user cancelled the turn).
+    #[cfg(windows)]
+    if let Some(slot) = &process_group_slot {
+        // The registry's kill-on-drop reads this as a u32 pid on Windows.
+        slot.store(child_pid as i32, Ordering::Release);
+    }
+    // Kills the process group (Unix) or the top-level process (Windows,
+    // degraded) if this future is dropped mid-execution (e.g. the user
+    // cancelled the turn).
     #[cfg(unix)]
     let mut cancel_guard = ProcessGroupGuard::armed(process_group);
+    #[cfg(windows)]
+    let mut cancel_guard = ProcessGroupGuard::armed(child_pid);
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
     let run = async {
@@ -408,7 +493,7 @@ pub(super) async fn run_bash(
         None => run.await,
     };
     let (stdout, stderr, status) = result.map_err(|error| format!("shell I/O failed: {error}"))?;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     cancel_guard.disarm();
     if let Some(slot) = &process_group_slot {
         slot.store(0, Ordering::Release);

@@ -40,6 +40,12 @@ name = "e-agent-import-jsonl"
 path = "src/bin/import_jsonl.rs"
 required-features = ["greptime"]
 
+# Windows-only: TerminateProcess for the degraded process-kill path
+# (ProcessGroupGuard). Kept target-gated so Linux/macOS builds never pull
+# the windows-sys dependency.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [features]
 default = ["greptime"]
 greptime = ["dep:tokio-postgres"]
