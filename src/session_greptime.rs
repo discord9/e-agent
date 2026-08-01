@@ -263,6 +263,7 @@ impl GreptimeSession {
                 parent_session_id: row.get("parent_session_id"),
                 parent_task_id: row.get("parent_task_id"),
                 title: row.get("title"),
+                label: None, // label lives in running_tasks, resolved at list time
             })
         } else {
             None
@@ -1008,6 +1009,7 @@ impl GreptimeSession {
             parent_session_id: row.get("parent_session_id"),
             parent_task_id: row.get("parent_task_id"),
             title: row.get("title"),
+            label: None, // label lives in running_tasks, resolved at list time
         }))
     }
 
@@ -1085,6 +1087,7 @@ impl GreptimeSession {
             parent_session_id: parent_session_id.map(str::to_owned),
             parent_task_id,
             title: None, // a fresh session is unnamed until the user names it
+            label: None, // label lives in running_tasks, resolved at list time
         };
         self.insert_meta(&meta).await?;
         *self.cached_meta.lock().unwrap() = Some(meta);
@@ -1181,6 +1184,7 @@ impl GreptimeSession {
                 parent_session_id: row.get("parent_session_id"),
                 parent_task_id: row.get("parent_task_id"),
                 title: row.get("title"),
+                label: None, // label lives in running_tasks, resolved at list time
             })
             .collect())
     }
@@ -1213,6 +1217,7 @@ impl GreptimeSession {
                 parent_session_id: row.get("parent_session_id"),
                 parent_task_id: row.get("parent_task_id"),
                 title: row.get("title"),
+                label: None, // label lives in running_tasks, resolved at list time
             })
             .collect())
     }
@@ -1284,6 +1289,7 @@ impl GreptimeSession {
                 parent_session_id: None,
                 parent_task_id: None,
                 title: None, // pre-table sessions have no user-assigned name
+                label: None, // label lives in running_tasks, resolved at list time
             })
             .await?;
         }
@@ -1427,6 +1433,27 @@ impl GreptimeSession {
                 .context("cannot clear unfinished subagent tasks")?;
         }
         Ok(labels)
+    }
+
+    /// The task-panel label for a subagent session: the label of the newest
+    /// `running_tasks` row whose `subagent_session_id` matches. A subagent
+    /// can have several rows (one per delegate task, possibly from
+    /// different parents); the most recently started survives. Rows are
+    /// consumed when the task completes, so this returns `None` for a
+    /// subagent with no live delegate task. Non-destructive (unlike the
+    /// `take_unfinished_*` lookups) — called from `/api/sessions` listing.
+    pub async fn label_for_subagent(&self, subagent_session_id: &str) -> Result<Option<String>> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT label FROM running_tasks \
+                 WHERE workspace_id = $1 AND subagent_session_id = $2 \
+                 ORDER BY started_at DESC LIMIT 1",
+                &[&self.workspace_id, &subagent_session_id],
+            )
+            .await
+            .context("cannot look up subagent task label")?;
+        Ok(row.map(|row| row.get("label")))
     }
 }
 
@@ -2827,6 +2854,56 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn running_tasks_label_for_subagent_returns_latest() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let subagent = format!("sub-label-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &subagent)
+            .await
+            .unwrap();
+        assert_eq!(
+            session.label_for_subagent(&subagent).await.unwrap(),
+            None,
+            "no rows yet → no label"
+        );
+
+        // Two delegate tasks for the same subagent; the newest started_at wins.
+        let parent = format!("parent-label-{}", crate::session::new_id());
+        session
+            .record_task_start(&parent, 20, "first label", Some(&subagent))
+            .await
+            .unwrap();
+        session
+            .record_task_start(&parent, 21, "latest label", Some(&subagent))
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .label_for_subagent(&subagent)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("latest label"),
+            "newest running_tasks row wins"
+        );
+
+        // Another subagent's rows never leak into this lookup.
+        let other = format!("other-label-{}", crate::session::new_id());
+        assert_eq!(session.label_for_subagent(&other).await.unwrap(), None);
+
+        // Consuming the rows (task completion/resume) removes the label.
+        session
+            .take_unfinished_tasks_for_subagent(&subagent)
+            .await
+            .unwrap();
+        assert_eq!(session.label_for_subagent(&subagent).await.unwrap(), None);
     }
 
     // ------------------------------------------------------------------

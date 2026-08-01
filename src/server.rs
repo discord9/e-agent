@@ -379,6 +379,12 @@ pub struct SessionMeta {
     /// registry DTO itself carries no title), so live renames show up on
     /// the next list.
     pub title: Option<String>,
+    /// Task-panel label of the delegate task that spawned this subagent
+    /// (`running_tasks.label`, newest surviving row — the sessions metadata
+    /// table does not store it). `None` = no live delegate task carries
+    /// this session; the frontend falls back to the session id. Filled by
+    /// `list_sessions` after the merge; `None` everywhere else.
+    pub label: Option<String>,
 }
 
 async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -> SessionMeta {
@@ -407,6 +413,9 @@ async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -
         // session's metadata-table snapshot (a built session always has
         // one — `build` → `create_meta`).
         title: None,
+        // The label lives in running_tasks; `list_sessions` fills it for
+        // subagent items after the merge.
+        label: None,
     }
 }
 
@@ -498,6 +507,12 @@ fn merge_session_metas(
                 if occupied.get().title.is_none() {
                     occupied.get_mut().title = meta.title.clone();
                 }
+                // Same for the parent link: a resumed subagent's live entry
+                // must stay recognizable as a subagent so `list_sessions`
+                // can fill its label from `running_tasks`.
+                if occupied.get().parent_session_id.is_none() {
+                    occupied.get_mut().parent_session_id = meta.parent_session_id.clone();
+                }
             }
             std::collections::hash_map::Entry::Vacant(vacant) => {
                 vacant.insert(SessionMeta {
@@ -520,6 +535,8 @@ fn merge_session_metas(
                     active: false,
                     parent_session_id: meta.parent_session_id,
                     title: meta.title,
+                    // Label lives in running_tasks; `list_sessions` fills it.
+                    label: None,
                 });
             }
         }
@@ -546,7 +563,24 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
             Vec::new()
         }
     };
-    Json(merge_session_metas(active, historical))
+    let mut merged = merge_session_metas(active, historical);
+    // Subagent items carry the task-panel label of their delegate task,
+    // which lives in `running_tasks` (the sessions metadata table has no
+    // label column). One lookup per subagent item — fine in practice
+    // because only a handful of delegates run at once; a batched
+    // `subagent_session_id = ANY(...)` query stays premature until that
+    // assumption breaks.
+    for meta in &mut merged {
+        if meta.parent_session_id.is_some() {
+            match state.meta_store.label_for_subagent(root, &meta.id).await {
+                Ok(label) => meta.label = label,
+                Err(error) => {
+                    eprintln!("e-agent: cannot look up subagent label: {error:#}");
+                }
+            }
+        }
+    }
+    Json(merged)
 }
 
 #[derive(Deserialize)]
@@ -1633,6 +1667,7 @@ mod tests {
             "active",
             "parent_session_id",
             "title",
+            "label",
         ] {
             assert!(value.get(key).is_some(), "missing field {key}");
         }
@@ -1666,6 +1701,7 @@ mod tests {
             active: false,
             parent_session_id: None,
             title: None,
+            label: None,
         };
         let history = |id: &str, created: i64, count: i64, title: Option<&str>| HistoryMeta {
             session_id: id.to_owned(),
@@ -1677,6 +1713,7 @@ mod tests {
             parent_session_id: None,
             parent_task_id: None,
             title: title.map(str::to_owned),
+            label: None,
         };
         // One registry session plus two historical sessions, one of which
         // overlaps a registry id (the registry entry wins; the renamed
