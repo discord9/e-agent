@@ -1815,7 +1815,7 @@ function buildTreeRoot(s, kids) {
     });
   }
   const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
-  const title = s.title || shortId(s.id);
+  const title = s.title || s.id;   // 无标题显示完整 id（用户需要认出是哪个会话）
   const titleEl = el("span", "tree-id", title);
   titleEl.title = s.title || s.id;        // 完整 title（无 title 时回退完整 id）
   const edit = el("button", "tree-edit", "✎");
@@ -1893,7 +1893,7 @@ function renderSubagentRows(container, kids, hist) {
                    (state.sessionId === k.id ? " current" : ""));
     const dot = el("span", "busy-dot" + (k.busy ? " busy" : ""));
     // label 优先：subagent 的任务面板标题最友好；旧 server 无 label → 回退 title/id
-    const title = k.label || k.title || shortId(k.id);
+    const title = k.label || k.title || k.id;   // 无 label/title 显示完整 id
     const titleEl = el("span", "tree-id", title);
     titleEl.title = k.label || k.title || k.id;
     const edit = el("button", "tree-edit", "✎");
