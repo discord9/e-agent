@@ -36,13 +36,14 @@ const state = {
     expanded: new Set(),     // 已展开的主会话 id（会话树；重绘时保留）
     filter: "",              // 筛选关键词（已小写化）；空 = 默认显示
     showAll: false,          // 是否已展开全部主会话（超出 15 条限制时）
+    tasksOpen: false,        // 树顶部「运行中任务」分组展开状态（默认收起）
   },
-  tasks: {                   // 运行中任务（渲染进侧边栏）
-    badgeSeq: 0,             // 徽标轮询竞态序号：只应用最新一次响应
-    panelSeq: 0,             // 面板轮询竞态序号
-    badgeTimer: null,        // 徽标轮询（独立 3s，侧边栏关闭时也跑）
-    panelTimer: null,        // 侧边栏打开时的任务列表刷新（2s）
+  tasks: {                   // 运行中任务（侧边栏树分组 + composer 面板两处显示）
+    seq: 0,                  // 统一轮询竞态序号：只应用最新一次响应
+    timer: null,             // 统一轮询定时器（2s 常驻；替代原徽标/面板双轮询）
+    list: [],                // 最近一次 /api/tasks 结果（两处渲染共用）
     cancelling: new Set(),   // 正在取消的任务 id（防重复点击）
+    composerOpen: false,     // composer 任务面板展开状态（默认收起）
   },
   renameActive: false,       // 行内重命名进行中：列表页 1s 轮询重绘跳过，防编辑框被冲掉
 };
@@ -64,8 +65,8 @@ const els = {
   sidebarBtn: $("sidebarBtn"), sidebarOverlay: $("sidebarOverlay"),
   sidebar: $("sidebar"), sidebarCloseBtn: $("sidebarCloseBtn"),
   sidebarFilter: $("sidebarFilter"),
-  sidebarTree: $("sidebarTree"), sidebarTasks: $("sidebarTasks"),
-  sidebarTasksTitle: $("sidebarTasksTitle"),
+  sidebarTree: $("sidebarTree"),
+  tasksToggleBar: $("tasksToggleBar"), composerTasks: $("composerTasks"),
 };
 
 /* =====================================================================
@@ -1444,7 +1445,13 @@ function stopPolling() {
 }
 
 /* =====================================================================
- * 会话侧边栏：运行中任务（复用原任务面板逻辑，渲染进 #sidebarTasks）
+ * 运行中任务（两处显示，共用同一轮询）
+ *   1. 侧边栏会话树顶部：「运行中任务 (N)」折叠分组（默认收起，
+ *      state.sidebar.tasksOpen；树重绘时创建组壳，任务内容由 pollTasks
+ *      就地更新，不整树重绘）
+ *   2. 聊天视图 composer 上方：#tasksToggleBar 折叠条（计数即徽标，
+ *      有任务时高亮）+ #composerTasks 面板（默认收起，state.tasks.composerOpen）
+ * 统一轮询 pollTasks()（2s 常驻）：一次 GET /api/tasks 同时更新两处。
  * ===================================================================*/
 /* GET /api/tasks → 任务数组；失败/无 token 返回 null（调用方决定如何处理） */
 async function fetchTasks() {
@@ -1459,32 +1466,78 @@ async function fetchTasks() {
     const list = await res.json();
     return Array.isArray(list) ? list : [];
   } catch (e) {
-    return null;   // 网络/404：静默，保持徽标现状，不刷屏
+    return null;   // 网络/404：静默，保持现状，不刷屏
   }
 }
 
-/* 任务数显示在侧边栏「运行中任务 (N)」标题上（原顶栏任务按钮徽标） */
-function updateTasksTitle(count) {
-  const n = Number(count) || 0;
-  if (els.sidebarTasksTitle) {
-    els.sidebarTasksTitle.textContent = "运行中任务" + (n > 0 ? " (" + n + ")" : "");
+/* 统一任务轮询（防重入：seq 竞态序号只应用最新一次响应）。
+   一次 fetchTasks 同时更新侧边栏树分组 + composer 折叠条/面板。 */
+async function pollTasks() {
+  const seq = ++state.tasks.seq;
+  const tasks = await fetchTasks();
+  if (tasks === null || seq !== state.tasks.seq) return;  // 过期响应丢弃
+  state.tasks.list = tasks;
+  updateSidebarTasksGroup();
+  renderComposerTasks();
+}
+
+/* 侧边栏树内「运行中任务 (N)」分组就地更新：计数/可见性/任务行。
+   组壳由 buildSidebarTasksGroup 在树重绘时创建；此处不整树重绘，
+   保留会话树的展开状态与滚动位置。无任务时整组隐藏。 */
+function updateSidebarTasksGroup() {
+  const tree = els.sidebarTree;
+  if (!tree) return;
+  const group = tree.querySelector(".tasks-group");
+  if (!group) return;
+  const n = (state.tasks.list || []).length;
+  const label = group.querySelector(".tasks-group-label");
+  if (label) label.textContent = "运行中任务 (" + n + ")";
+  group.hidden = n === 0;
+  const body = group.querySelector(".tasks-group-body");
+  if (body) renderTaskList(state.tasks.list || [], body, { onOpen: onDelegateTaskOpen });
+}
+
+/* composer 上方折叠条 + 面板：计数即徽标；有任务时高亮，无任务整条隐藏。
+   面板内容仅在展开时渲染（收起时只更新计数/箭头/高亮）。 */
+function renderComposerTasks() {
+  const bar = els.tasksToggleBar;
+  if (!bar) return;
+  const n = (state.tasks.list || []).length;
+  bar.hidden = n === 0;
+  bar.classList.toggle("active", n > 0);
+  bar.classList.toggle("open", state.tasks.composerOpen);
+  const label = bar.querySelector(".tasks-toggle-label");
+  if (label) label.textContent = "运行中任务 (" + n + ")";
+  const chevron = bar.querySelector(".tasks-toggle-chevron");
+  if (chevron) chevron.textContent = state.tasks.composerOpen ? "▾" : "▸";
+  const panel = els.composerTasks;
+  if (panel) {
+    panel.hidden = !state.tasks.composerOpen;
+    if (state.tasks.composerOpen) {
+      renderTaskList(state.tasks.list || [], panel, { onOpen: onDelegateTaskOpen });
+    }
   }
 }
 
-/* 徽标轮询（独立 3s，侧边栏关闭时也运行）；序号防竞态 */
-async function pollTasksBadge() {
-  const seq = ++state.tasks.badgeSeq;
-  const tasks = await fetchTasks();
-  if (tasks === null || seq !== state.tasks.badgeSeq) return;  // 过期响应丢弃
-  updateTasksTitle(tasks.length);
-}
-
-/* 侧边栏打开时的任务列表刷新（2s 一次） */
-async function refreshSidebarTasks() {
-  const seq = ++state.tasks.panelSeq;
-  const tasks = await fetchTasks();
-  if (tasks === null || seq !== state.tasks.panelSeq || !state.sidebar.open) return;
-  renderTaskList(tasks, els.sidebarTasks);
+/* delegate 任务行点击（树分组 + composer 面板共用）：
+   依赖后端 live 回退（main 已合入 feat/subagent-live：/api/sessions 会把
+   运行中的 subagent 标为 active，history/SSE/prompt 均可访问）——
+   session_id 已在会话列表（state.lastList）→ openSession 正常切换；
+   旧服务器（未合入，session_id 不在列表）→ 降级：banner 提示 + 仅展开输出。
+   从 composer 面板切走时顺手收起面板（聊天视图已切换，保持简洁）。 */
+function onDelegateTaskOpen(t, row) {
+  const known = (state.lastList || []).some((s) => s.id === t.session_id);
+  if (known) {
+    openSession(t.session_id);
+    if (state.tasks.composerOpen) {
+      state.tasks.composerOpen = false;
+      renderComposerTasks();
+    }
+    return;
+  }
+  setBanner("⚠ 当前服务器不支持直接打开运行中的子代理会话（旧后端）；仅展开输出。", true);
+  const pre = row && row.querySelector(".task-output");
+  if (pre) pre.hidden = false;
 }
 
 function shortTaskLabel(t) {
@@ -1493,8 +1546,22 @@ function shortTaskLabel(t) {
   return truncate(t.full_command || t.label || "", 80);
 }
 
-function renderTaskList(tasks, container) {
-  const list = container || els.sidebarTasks;
+/* 渲染任务列表到指定容器（树分组 + composer 面板两处共用）。
+   opts.onOpen：delegate 行点击回调（bash 行点击永远只是展开/收起输出）。
+   重绘前记录已展开输出的行并按任务 key（session_id:id）恢复——2s 轮询
+   重绘不打断正在查看的输出。 */
+function renderTaskList(tasks, container, opts) {
+  const list = container;
+  if (!list) return;
+  // 轮询重绘前保留「输出已展开」的行（按任务 key 恢复）
+  const prevExpanded = new Set();
+  for (const row of list.querySelectorAll(".task-row")) {
+    const pre = row.querySelector(".task-output");
+    if (pre && !pre.hidden) {
+      const key = row.getAttribute("data-task");
+      if (key) prevExpanded.add(key);
+    }
+  }
   list.innerHTML = "";
   if (!tasks.length) {
     list.appendChild(el("div", "tasks-empty", "暂无运行中的任务"));
@@ -1502,7 +1569,11 @@ function renderTaskList(tasks, container) {
   }
   for (const t of tasks) {
     const row = el("div", "task-row");
-    row.title = "点击展开 / 收起输出";
+    row.setAttribute("data-task", t.session_id + ":" + t.id);
+    const isDelegate = t.kind === "delegate" && opts && typeof opts.onOpen === "function";
+    row.title = isDelegate
+      ? "点击切换到 subagent 会话（旧后端：仅展开输出）"
+      : "点击展开 / 收起输出";
     const line = el("div", "task-line");
     const badge = el("span", "kind-badge " + (t.kind === "delegate" ? "delegate" : "bash"),
       t.kind === "delegate" ? "子代理" : "bash");
@@ -1523,7 +1594,11 @@ function renderTaskList(tasks, container) {
     const pre = el("pre", "task-output" + (out ? "" : " empty"), out || "(无输出)");
     pre.hidden = true;
     row.appendChild(pre);
-    row.addEventListener("click", () => { pre.hidden = !pre.hidden; });
+    row.addEventListener("click", () => {
+      if (isDelegate) { opts.onOpen(t, row); return; }
+      pre.hidden = !pre.hidden;
+    });
+    if (prevExpanded.has(row.getAttribute("data-task"))) pre.hidden = false;
     list.appendChild(row);
   }
 }
@@ -1539,9 +1614,8 @@ async function cancelTask(t) {
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
     if (res.status === 404) { setBanner("⚠ 任务不存在（可能已完成）。"); return; }
     if (res.status !== 204) throw new Error("HTTP " + res.status);
-    // 成功：立即刷新列表 + 徽标
-    await refreshSidebarTasks();
-    await pollTasksBadge();
+    // 成功：立即刷新两处显示（统一轮询）
+    await pollTasks();
   } catch (e) {
     setBanner("⚠ 取消失败：" + e.message);
   } finally {
@@ -1564,9 +1638,7 @@ function openSidebar() {
   els.sidebar.hidden = false;
   // 双 rAF：先让浏览器以 -100% 位姿渲染一帧，再加 .open 触发左滑过渡
   requestAnimationFrame(() => requestAnimationFrame(() => els.sidebar.classList.add("open")));
-  refreshSidebarTasks();
-  stopTasksPanelPolling();
-  state.tasks.panelTimer = setInterval(refreshSidebarTasks, 2000);
+  pollTasks();   // 打开时立即刷新树内任务分组（统一轮询常驻，这里只求即时性）
   // 聊天视图下会话轮询已停：补拉一次列表，树与 busy/current 状态保持新鲜
   if (state.view === "chat") refreshSessionsForSidebar();
 }
@@ -1577,7 +1649,6 @@ function closeSidebar() {
   persistSidebarOpen();                // 跨刷新保持关闭状态
   els.sidebarOverlay.hidden = true;
   els.sidebar.classList.remove("open");
-  stopTasksPanelPolling();
   window.setTimeout(() => {
     if (!state.sidebar.open) els.sidebar.hidden = true;
   }, 220);
@@ -1625,6 +1696,39 @@ function sidebarTreeSig() {
   ]));
 }
 
+/* 树内「运行中任务 (N)」折叠分组（树顶部、筛选框下、会话根之前）：
+   默认收起（state.sidebar.tasksOpen，不持久化）；有任务时标题带计数。
+   组壳随树重绘创建，任务行由 pollTasks → updateSidebarTasksGroup 就地
+   刷新（不整树重绘）。行渲染与 composer 面板共用 renderTaskList。 */
+function buildSidebarTasksGroup() {
+  const node = el("div", "tree-node tasks-group");
+  const row = el("div", "tree-row tasks-group-head");
+  const toggle = el("button", "tree-toggle", state.sidebar.tasksOpen ? "▾" : "▸");
+  toggle.type = "button";
+  toggle.title = "展开 / 收起运行中任务";
+  toggle.classList.toggle("open", state.sidebar.tasksOpen);
+  toggle.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    state.sidebar.tasksOpen = !state.sidebar.tasksOpen;
+    const body = node.querySelector(".tasks-group-body");
+    if (body) body.hidden = !state.sidebar.tasksOpen;
+    toggle.classList.toggle("open", state.sidebar.tasksOpen);
+    toggle.textContent = state.sidebar.tasksOpen ? "▾" : "▸";
+    if (state.sidebar.tasksOpen && body) {
+      renderTaskList(state.tasks.list || [], body, { onOpen: onDelegateTaskOpen });
+    }
+  });
+  const label = el("span", "tree-id tree-group tasks-group-label", "运行中任务 (0)");
+  row.append(toggle, label);
+  node.appendChild(row);
+  const body = el("div", "tree-children tasks-group-body");
+  body.hidden = !state.sidebar.tasksOpen;
+  node.appendChild(body);
+  renderTaskList(state.tasks.list || [], body, { onOpen: onDelegateTaskOpen });
+  node.hidden = !(state.tasks.list || []).length;   // 无任务：整组隐藏（与 updateSidebarTasksGroup 一致）
+  return node;
+}
+
 /* force=true 时无视签名强制重绘（筛选输入、展开全部按钮） */
 function renderSidebarTree(force) {
   const tree = els.sidebarTree;
@@ -1634,6 +1738,9 @@ function renderSidebarTree(force) {
   lastTreeSig = sig;
   const prevScroll = tree.scrollTop;
   tree.innerHTML = "";
+  // 树顶部（筛选框下方、会话根之前）：运行中任务折叠分组（任务并入会话树；
+  // 无任务时组壳隐藏，见 updateSidebarTasksGroup）
+  tree.appendChild(buildSidebarTasksGroup());
   const list = state.lastList || [];
   if (!list.length) {
     tree.appendChild(el("div", "tree-empty", "暂无会话"));
@@ -1970,16 +2077,14 @@ async function togglePin(s, afterToggle) {
   }
 }
 
-function stopTasksPanelPolling() {
-  if (state.tasks.panelTimer) { clearInterval(state.tasks.panelTimer); state.tasks.panelTimer = null; }
+/* 统一任务轮询定时器（2s 常驻）：侧边栏树分组 + composer 折叠条/面板
+   共用一次 /api/tasks（替代原「徽标 3s + 面板 2s」双轮询） */
+function startTasksPolling() {
+  stopTasksPolling();
+  state.tasks.timer = setInterval(pollTasks, 2000);
 }
-
-function startTasksBadgePolling() {
-  stopTasksBadgePolling();
-  state.tasks.badgeTimer = setInterval(pollTasksBadge, 3000);
-}
-function stopTasksBadgePolling() {
-  if (state.tasks.badgeTimer) { clearInterval(state.tasks.badgeTimer); state.tasks.badgeTimer = null; }
+function stopTasksPolling() {
+  if (state.tasks.timer) { clearInterval(state.tasks.timer); state.tasks.timer = null; }
 }
 
 /* =====================================================================
@@ -2005,6 +2110,13 @@ els.sidebarFilter.addEventListener("input", () => {
   state.sidebar.showAll = false;   // 清空筛选后回到默认 15 条限制
   renderSidebarTree(true);
 });
+/* composer 任务折叠条：点击展开 / 收起面板（有任务时才可见） */
+if (els.tasksToggleBar) {
+  els.tasksToggleBar.addEventListener("click", () => {
+    state.tasks.composerOpen = !state.tasks.composerOpen;
+    renderComposerTasks();
+  });
+}
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && state.sidebar.open) closeSidebar();
 });
@@ -2050,10 +2162,10 @@ function init() {
   try {
     if (localStorage.getItem("e-agent.sidebar.open") === "1") openSidebar();
   } catch (e) { /* 静默 */ }
-  // 任务数（侧边栏标题）：独立轻量轮询，侧边栏关闭时也保持更新（无 token 时静默跳过）
-  updateTasksTitle(0);
-  startTasksBadgePolling();
-  pollTasksBadge();
+  // 运行中任务：统一轮询（2s 常驻）同时更新侧边栏树分组 + composer
+  // 折叠条/面板（无 token 时 fetchTasks 静默跳过；填 token 后下一轮生效）
+  startTasksPolling();
+  pollTasks();
 }
 
 init();

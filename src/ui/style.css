@@ -552,6 +552,43 @@ mmlEqnNo}
     flex: 0 0 auto;
   }
 
+  /* 运行中任务折叠条 + 面板（TUI 式）：输入区上方、与 queueBar 同区域；
+     默认收起；有任务时计数高亮（计数即徽标），点击展开/收起面板。
+     无任务时整条隐藏（renderComposerTasks 置 hidden）。 */
+  .tasks-toggle-bar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    color: var(--base01);
+    background: var(--base2);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .tasks-toggle-bar:hover { border-color: var(--blue); color: var(--base02); }
+  /* 有任务：高亮 + 计数加粗（徽标语义） */
+  .tasks-toggle-bar.active { color: var(--blue); border-color: var(--blue); }
+  .tasks-toggle-bar.active .tasks-toggle-label { font-weight: bold; }
+  .tasks-toggle-bar.open { background: var(--base3); }
+  .tasks-toggle-chevron { margin-left: auto; font-size: 11px; color: var(--base01); }
+  /* 面板：任务行复用 .task-row 系列；限高滚动，避免撑爆 composer */
+  #composerTasks {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 30vh;
+    overflow-y: auto;
+    padding: 8px;
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    background: var(--base2);
+  }
+
   /* ---------- 汉堡按钮 ---------- */
   #sidebarBtn {
     flex: 0 0 auto;
@@ -691,6 +728,17 @@ mmlEqnNo}
     text-align: center;
   }
   .tree-more:hover { border-color: var(--blue); color: var(--blue); background: var(--base3); }
+  /* 树顶部「运行中任务 (N)」折叠分组：复用 .tree-row/.tree-toggle/.tree-children
+     骨架与 .task-row 系列任务行；组壳无任务时整组隐藏（updateSidebarTasksGroup） */
+  .tasks-group { margin-bottom: 2px; }
+  .tasks-group-head .tasks-group-label { color: var(--base01); }
+  .tasks-group-body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 2px;
+    padding-bottom: 4px;
+  }
   /* 子节点：缩进 16px + 紫色「子」徽章 */
   .tree-children { padding-left: 16px; }
   .tree-row-child .tree-id { color: var(--base00); }
@@ -766,21 +814,7 @@ mmlEqnNo}
     outline: none;
   }
   .rename-input:focus { border-color: var(--cyan); }
-  .sidebar-divider { border-top: 1px solid var(--base1); margin: 0 14px; flex: 0 0 auto; }
-  .sidebar-tasks-title {
-    margin: 10px 14px 6px;
-    font-size: 14px;
-    color: var(--base02);
-    flex: 0 0 auto;
-  }
-  #sidebarTasks {
-    padding: 0 14px 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    min-height: 56px;
-    flex: 0 0 auto;
-  }
+
   .tasks-empty { color: var(--base01); font-size: 14px; padding: 14px 2px; text-align: center; }
 
   .task-row {
@@ -859,5 +893,4 @@ mmlEqnNo}
       max-width: 34vw;
     }
     #tokenInput { width: 108px; min-width: 0; }
-    #sidebarTasks { max-height: 38%; }
   }
