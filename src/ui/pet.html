@@ -3,10 +3,17 @@
      可拖拽移动（pointer events, localStorage 记忆位置）；点击互动；
      hover 出现关闭按钮。 -->
 <div id="petWhale" class="pet-whale" title="DeepSeek 蓝鲸 · 拖我走，点我玩！">
-  <svg viewBox="0 0 24 24" class="pet-whale-svg" aria-hidden="true">
+  <div class="pet-motion">
+    <div class="pet-turn">
+      <svg viewBox="0 0 24 24" class="pet-whale-svg" aria-hidden="true">
     <path class="pet-body" d="M23.748 4.651c-.254-.124-.364.113-.512.233-.051.04-.094.09-.137.137-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.155-.708-.311-.955-.65-.172-.24-.219-.509-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.094.172.187.129.323-.082.28-.18.553-.266.833-.055.179-.137.218-.328.14a5.5 5.5 0 0 1-1.737-1.179c-.857-.828-1.631-1.743-2.597-2.46a12 12 0 0 0-.689-.47c-.985-.957.13-1.743.387-1.836.27-.098.094-.433-.778-.428-.872.003-1.67.295-2.687.685a3 3 0 0 1-.465.136 9.6 9.6 0 0 0-2.883-.101c-1.885.21-3.39 1.1-4.497 2.622C.082 8.776-.231 10.854.152 13.02c.403 2.284 1.568 4.175 3.36 5.653 1.857 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.132-.284 4.994-1.86.47.234.962.328 1.78.398.629.058 1.235-.031 1.705-.129.735-.155.684-.836.418-.961-2.155-1.004-1.682-.595-2.112-.926 1.095-1.295 2.768-3.598 3.284-6.733.05-.346.115-.834.108-1.114-.004-.171.035-.238.23-.257a4.2 4.2 0 0 0 1.545-.475c1.397-.763 1.96-2.016 2.093-3.517.02-.23-.004-.467-.247-.588M11.58 18.168c-2.088-1.642-3.101-2.183-3.52-2.16-.39.024-.32.472-.234.763.09.288.207.487.371.74.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.168-1.361-.801-2.5-1.86-3.301-3.306-.775-1.393-1.225-2.888-1.299-4.482-.02-.385.094-.522.477-.592a4.7 4.7 0 0 1 1.53-.038c2.131.311 3.946 1.264 5.467 2.774.868.86 1.525 1.887 2.202 2.89.72 1.066 1.494 2.082 2.48 2.915.348.291.626.513.892.677-.802.09-2.14.109-3.055-.615zm1.001-6.44a.306.306 0 0 1 .415-.287.3.3 0 0 1 .113.074.3.3 0 0 1 .086.214c0 .17-.136.307-.308.307a.303.303 0 0 1-.306-.307m3.11 1.596c-.2.081-.4.151-.591.16a1.25 1.25 0 0 1-.798-.254c-.274-.23-.47-.358-.551-.758a1.7 1.7 0 0 1 .015-.588c.07-.327-.007-.537-.238-.727-.188-.156-.426-.199-.689-.199a.6.6 0 0 1-.254-.078.253.253 0 0 1-.114-.358 1 1 0 0 1 .192-.21c.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.392.451.462.576.685.915.176.264.336.536.446.848.066.194-.02.353-.25.45" fill="#4d6bfe"/>
-  </svg>
-  <button id="petClose" class="pet-close" title="关掉蓝鲸">×</button>
+      </svg>
+    </div>
+    <span class="pet-bubble b1" aria-hidden="true"></span>
+    <span class="pet-bubble b2" aria-hidden="true"></span>
+    <span class="pet-bubble b3" aria-hidden="true"></span>
+  </div>
+  <button id="petClose" class="pet-close" title="关掉蓝鲸" aria-label="关掉蓝鲸">×</button>
   <div id="petSay" class="pet-say" hidden></div>
 </div>
 <style>
@@ -21,27 +28,77 @@
   cursor: grab;
   user-select: none;
   touch-action: none;          /* 拖拽：禁默认触摸滚动 */
-  animation: pet-swim 5s ease-in-out infinite;
-  transition: transform 0.2s;  /* hover/active 缩放（拖拽时由 JS 接管） */
 }
-.pet-whale.dragging { cursor: grabbing; animation: none; transition: none; }
-.pet-whale:active:not(.dragging) { transform: scale(0.92) rotate(-3deg); }
-.pet-whale-svg { width: 100%; height: 100%; overflow: visible; }
+/* 把游动与 fixed 定位分层，拖拽读取位置时不会带入动画位移。 */
+.pet-motion {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  transform-origin: 50% 56%;
+  transform-style: preserve-3d;
+  animation: pet-swim 5.6s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
+  will-change: transform;
+}
+.pet-turn {
+  width: 100%;
+  height: 100%;
+  transform-origin: 58% 52%;
+  transform-style: preserve-3d;
+  transition: transform 260ms ease-out;
+}
+.pet-whale-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  transform-origin: center;
+  animation: pet-breathe 3.8s ease-in-out infinite;
+}
 /* 整体轻微摆动（尾巴侧是左边，绕中心微转） */
-.pet-body { transform-origin: 12px 12px; animation: pet-wag 1.6s ease-in-out infinite; }
-/* 泡泡（从左边冒） */
-.pet-bubble {
-  position: absolute;
-  left: 4px;
-  width: 8px; height: 8px;
-  border-radius: 50%;
-  background: #cfe6fb;
-  opacity: 0;
-  animation: pet-rise 3s ease-in infinite;
+.pet-body {
+  transform-box: view-box;
+  transform-origin: 12px 12px;
+  animation: pet-wag 1.8s ease-in-out infinite;
 }
-.b1 { top: 30px; animation-delay: 0s; }
-.b2 { top: 22px; animation-delay: 1s; }
-.b3 { top: 14px; animation-delay: 2s; }
+/* 悬停时游快一点，同时轻轻转头看向用户。 */
+.pet-whale:hover:not(.dragging):not(.startled) .pet-motion { animation-duration: 3.1s; }
+.pet-whale:hover:not(.dragging) .pet-turn {
+  transform: perspective(180px) rotateY(-9deg) rotateZ(-1.5deg) translateX(-1px);
+}
+.pet-whale:hover:not(.dragging) .pet-body { animation-duration: 1.05s; }
+
+/* 被抓住时短促挣动；点击后覆盖游动，做一次“吓一跳”。 */
+.pet-whale.dragging { cursor: grabbing; }
+.pet-whale.dragging .pet-motion {
+  animation: pet-held 130ms ease-in-out infinite alternate;
+}
+.pet-whale.dragging .pet-turn { transition: none; transform: scale(0.98) rotate(-1deg); }
+.pet-whale.startled .pet-motion {
+  animation: pet-startled 440ms cubic-bezier(0.2, 0.8, 0.25, 1) both;
+}
+
+/* 泡泡从鲸鱼左侧错落冒出；尺寸、速度和横向漂移由 CSS 变量控制。 */
+.pet-bubble {
+  --bubble-size: 7px;
+  --bubble-time: 3.4s;
+  --bubble-drift: -5px;
+  position: absolute;
+  left: 5px;
+  top: 34px;
+  width: var(--bubble-size);
+  height: var(--bubble-size);
+  border: 1px solid rgba(77, 107, 254, 0.18);
+  border-radius: 50%;
+  background: rgba(207, 230, 251, 0.72);
+  box-shadow: inset 1px 1px 0 rgba(255, 255, 255, 0.82);
+  opacity: 0;
+  pointer-events: none;
+  animation: pet-rise var(--bubble-time) ease-in infinite;
+}
+.b1 { --bubble-size: 6px; --bubble-time: 3.2s; --bubble-drift: -4px; animation-delay: -0.4s; }
+.b2 { --bubble-size: 9px; --bubble-time: 4.1s; --bubble-drift: 3px; animation-delay: -2.1s; }
+.b3 { --bubble-size: 5px; --bubble-time: 3.7s; --bubble-drift: -7px; animation-delay: -3s; }
+
 /* 说话气泡 */
 .pet-say {
   position: absolute;
@@ -82,7 +139,7 @@
   line-height: 1;
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.2s;
+  transition: opacity 0.2s, background-color 0.2s;
   z-index: 3;
   /* × 字符在圆形按钮内精确居中（flex 居中 + 微调视觉偏移） */
   display: flex;
@@ -91,21 +148,55 @@
   padding: 0;
   padding-bottom: 1px;   /* × 字符视觉重心略偏上，向下微调 */
 }
-.pet-whale:hover .pet-close { opacity: 1; }
+.pet-whale:hover .pet-close,
+.pet-whale:focus-within .pet-close { opacity: 1; }
 .pet-close:hover { background: #dc322f; }
+.pet-close:focus-visible {
+  opacity: 1;
+  outline: 2px solid #4d6bfe;
+  outline-offset: 2px;
+}
 
 @keyframes pet-swim {
-  0%, 100% { transform: translateY(0); }
-  50%      { transform: translateY(-6px); }
+  0%, 100% { transform: translate3d(0, 1px, 0) rotateZ(-0.8deg) rotateY(-2deg); }
+  22%      { transform: translate3d(-2px, -3px, 0) rotateZ(-0.2deg) rotateY(3deg); }
+  50%      { transform: translate3d(1px, -7px, 0) rotateZ(1deg) rotateY(7deg); }
+  76%      { transform: translate3d(3px, -3px, 0) rotateZ(0.2deg) rotateY(1deg); }
+}
+@keyframes pet-breathe {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.02); }
 }
 @keyframes pet-wag {
   0%, 100% { transform: rotate(0deg); }
-  50%      { transform: rotate(-4deg); }
+  45%      { transform: rotate(-4deg); }
+  65%      { transform: rotate(-2.5deg); }
+}
+@keyframes pet-held {
+  from { transform: translate3d(-1px, 0, 0) rotate(-1.1deg); }
+  to   { transform: translate3d(1px, -1px, 0) rotate(1.1deg); }
+}
+@keyframes pet-startled {
+  0%   { transform: translateY(0) scale(1) rotate(0); }
+  28%  { transform: translateY(-11px) scale(1.13, 0.94) rotate(-4deg); }
+  52%  { transform: translateY(2px) scale(0.94, 1.08) rotate(2deg); }
+  74%  { transform: translateY(-3px) scale(1.03, 0.98) rotate(-1deg); }
+  100% { transform: translateY(0) scale(1) rotate(0); }
 }
 @keyframes pet-rise {
-  0%   { transform: translateY(0); opacity: 0; }
-  15%  { opacity: 0.85; }
-  100% { transform: translateY(-46px); opacity: 0; }
+  0%   { transform: translate3d(0, 0, 0) scale(0.72); opacity: 0; }
+  14%  { opacity: 0.78; }
+  72%  { opacity: 0.52; }
+  100% { transform: translate3d(var(--bubble-drift), -50px, 0) scale(1.08); opacity: 0; }
+}
+/* 尊重系统“减少动态”：保留桌宠交互，但关闭位移、缩放、摆动和泡泡。 */
+@media (prefers-reduced-motion: reduce) {
+  .pet-motion,
+  .pet-whale-svg,
+  .pet-body { animation: none !important; }
+  .pet-turn { transform: none !important; transition: none; }
+  .pet-bubble { display: none; }
+  .pet-close { transition: none; }
 }
 /* 小屏隐藏 */
 @media (max-width: 480px) {
@@ -152,10 +243,12 @@
   const say = document.getElementById("petSay");
 
   /* --- 拖拽（pointer events，支持鼠标/触摸） --- */
-  let dragging = false, startX = 0, startY = 0, origLeft = 0, origTop = 0;
+  let dragging = false, moved = false;
+  let startX = 0, startY = 0, origLeft = 0, origTop = 0;
   fish.addEventListener("pointerdown", (ev) => {
     if (ev.target === closeBtn) return;
     dragging = true;
+    moved = false;
     fish.classList.add("dragging");
     const rect = fish.getBoundingClientRect();
     origLeft = rect.left; origTop = rect.top;
@@ -166,6 +259,7 @@
   fish.addEventListener("pointermove", (ev) => {
     if (!dragging) return;
     const dx = ev.clientX - startX, dy = ev.clientY - startY;
+    if (Math.hypot(dx, dy) > 4) moved = true;
     fish.style.left = (origLeft + dx) + "px";
     fish.style.top = (origTop + dy) + "px";
     fish.style.right = "auto";
@@ -185,7 +279,15 @@
   fish.addEventListener("pointercancel", endDrag);
 
   /* --- 点击互动（非拖拽时） --- */
-  let sayTimer = null;
+  let sayTimer = null, startleTimer = null;
+  function startle() {
+    fish.classList.remove("startled");
+    /* 重排让连续点击也能从第一帧重新播放，而非叠加 transform。 */
+    void fish.offsetWidth;
+    fish.classList.add("startled");
+    clearTimeout(startleTimer);
+    startleTimer = setTimeout(() => fish.classList.remove("startled"), 460);
+  }
   function sayFor(text, ms, isSummary) {
     if (!say) return;
     say.textContent = text;
@@ -214,8 +316,12 @@
   /* 点击：奇数点击显示当前会话总结（📊）；偶数点击随机说句梗台词。
      计数器持久化到 localStorage（跨刷新保持奇偶交替）。 */
   fish.addEventListener("click", (ev) => {
-    if (ev.target === closeBtn || dragging) return;
+    if (ev.target === closeBtn || moved) {
+      moved = false;
+      return;
+    }
     if (!say) return;
+    startle();
     const st = window.state;
     const sid = st && st.sessionId;
     // 奇数/偶数交替（1 起）：奇数 → 总结，偶数 → 梗台词
