@@ -26,15 +26,20 @@ mmlEqnNo}
   [hidden] { display: none !important; }
 
   html, body {
-    height: 100%;
+    /* 布局高度跟随 app.js 的 syncAppHeight()：软键盘弹出时 visualViewport
+       收缩，--app-height 随之变小，flex 布局自动收缩（顶栏/侧边栏/composer
+       都在可视区内）。JS 未跑时回退 100%（老浏览器）/100dvh（见下）。 */
+    height: var(--app-height, 100%);
     margin: 0;
   }
 
-  /* 移动浏览器（地址栏收展）里 100% 不等于可视高度：用 100dvh 兜底，
+  /* 移动浏览器（地址栏收展）里 100% 不等于可视高度：用 100dvh 兜底；
+     软键盘弹出时 100dvh 不收缩（键盘是覆盖式，visualViewport 变小但布局
+     高度不变）→ 由 JS 动态设置的 --app-height 覆盖它，布局随键盘收缩。
      并禁止 body 滚动——所有滚动都必须发生在内部容器（messages / 列表
      card），否则顶栏/状态行会跟着 body 一起滚出屏幕 */
   @supports (height: 100dvh) {
-    html, body { height: 100dvh; }
+    html, body { height: var(--app-height, 100dvh); }
   }
   body {
     overflow: hidden;

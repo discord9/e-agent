@@ -2159,8 +2159,40 @@ els.jumpBottomBtn.addEventListener("click", () => {
   els.jumpBottomBtn.hidden = true;
 });
 
+/* =====================================================================
+ * 软键盘适配：visualViewport 高度 → CSS 变量 --app-height
+ * ===================================================================*/
+/* 移动端软键盘弹出时 100dvh 不收缩（键盘是覆盖式：visualViewport 变小但
+   布局视口高度不变）→ 底部 composer 被键盘盖住、顶栏/侧边栏被挤出可视区。
+   标准解法：监听 visualViewport 的 resize（键盘弹出/收起触发），动态把
+   visualViewport.height 写入 --app-height，布局用它替代 100dvh（style.css
+   html/body 高度）。桌面 visualViewport.height === innerHeight，设的值等于
+   原高度，无视觉变化。 */
+let appHeightRaf = null;
+function syncAppHeight() {
+  if (appHeightRaf !== null) return;        // 节流：合并同帧内连续 resize
+  appHeightRaf = requestAnimationFrame(() => {
+    appHeightRaf = null;
+    const vv = window.visualViewport;
+    const h = (vv && vv.height) ? vv.height : window.innerHeight;
+    document.documentElement.style.setProperty("--app-height", h + "px");
+    // 兜底：布局收缩后 composer 应在可视区底部（body flex column 内）。
+    // 若个别浏览器仍有偏移，把输入框滚进可视区；正常收缩时是 no-op
+    // （block:nearest 只滚最近的可滚祖先，不打断用户滚动位置）。
+    const inp = els.promptInput;
+    if (inp && inp.offsetParent !== null) inp.scrollIntoView({ block: "nearest" });
+  });
+}
+
 function init() {
   refreshBanner();
+  // 软键盘适配：初始按当前 visualViewport 高度设置 --app-height；并绑定
+  // visualViewport.resize（键盘弹出/收起触发，iOS Safari 关键路径）+
+  // window.resize（无 visualViewport 的浏览器兜底）。
+  syncAppHeight();
+  const vv = window.visualViewport;
+  if (vv && vv.addEventListener) vv.addEventListener("resize", syncAppHeight);
+  window.addEventListener("resize", syncAppHeight);
   els.chatView.classList.add("hidden");
   els.topActions.hidden = true;
   // URL 深链：?session=<id>。只在列表拿到数据（pollSessions）且 token 就绪后
