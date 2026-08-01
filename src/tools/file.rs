@@ -1,6 +1,8 @@
 use super::*;
 
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
@@ -172,8 +174,18 @@ impl Tool for WriteFile {
 
     async fn execute(&self, arguments: Value) -> Result<String, String> {
         let content = required_string(&arguments, "content")?;
-        self.workspace
-            .write(required_string(&arguments, "path")?, content)?;
+        let path = required_string(&arguments, "path")?;
+        // Snapshot before writing: the old content (or `None` when the file
+        // did not exist) is what undo restores.
+        let old_content = self.workspace.try_read_to_string(path)?;
+        self.workspace.write(path, content)?;
+        record_file_op(
+            FileOpKind::Write,
+            path,
+            old_content,
+            content.to_owned(),
+            &self.workspace,
+        );
         Ok("file written".into())
     }
 }
@@ -254,6 +266,197 @@ impl Tool for EditFile {
             LineEnding::Lf => replaced,
         };
         self.workspace.write(path, output)?;
+        // The edit's old/new fragments are the exact reverse parameters:
+        // undo replaces `new` back with `old` (zero snapshot round-trip).
+        record_file_op(
+            FileOpKind::Edit,
+            path,
+            Some(old.to_owned()),
+            new.to_owned(),
+            &self.workspace,
+        );
         Ok(format!("file edited (line {line})"))
     }
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Undo stack
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// A recorded file operation, kept in process memory so the user can undo
+/// the most recent `edit_file` / `write_file`. Undo is a short-lived,
+/// session-scoped convenience: the stack is never persisted.
+#[derive(Debug)]
+pub struct FileOpSnapshot {
+    pub op: FileOpKind,
+    /// The path as passed to the tool (workspace-relative or absolute
+    /// external); undo applies to the same workspace the op ran on.
+    pub path: String,
+    /// `write`: the full old file content, `None` when the file did not
+    /// exist before (undo = delete the file). `edit`: the `old` fragment.
+    pub old_content: Option<String>,
+    /// `write`: the full content that was written. `edit`: the `new`
+    /// fragment that undo replaces back with `old_content`.
+    pub new_content: String,
+    /// Audit metadata required by the snapshot design (`{op, path,
+    /// old_content, new_content, at, seq}`). Kept for debugging/audit; the
+    /// current undo logic only consults the content fields.
+    #[allow(dead_code)]
+    pub at: std::time::Instant,
+    #[allow(dead_code)]
+    pub seq: u64,
+    /// The workspace the operation was performed on.
+    workspace: Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOpKind {
+    Write,
+    Edit,
+}
+
+/// Cap on the undo stack: undos are short-lived, so a bounded stack keeps
+/// process memory from growing without bound (oldest entries are dropped).
+pub(super) const UNDO_STACK_LIMIT: usize = 50;
+
+pub(super) static UNDO_STACK: Mutex<Vec<FileOpSnapshot>> = Mutex::new(Vec::new());
+static UNDO_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The undo stack, tolerant of poisoning: undo is a convenience feature and
+/// must never panic the process over a poisoned lock.
+fn undo_stack() -> std::sync::MutexGuard<'static, Vec<FileOpSnapshot>> {
+    UNDO_STACK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record a successful file operation for later undo. Called only after the
+/// write/edit itself succeeded, so the stack only ever holds operations
+/// that actually happened.
+fn record_file_op(
+    op: FileOpKind,
+    path: &str,
+    old_content: Option<String>,
+    new_content: String,
+    workspace: &Workspace,
+) {
+    let mut stack = undo_stack();
+    stack.push(FileOpSnapshot {
+        op,
+        path: path.to_owned(),
+        old_content,
+        new_content,
+        at: std::time::Instant::now(),
+        seq: UNDO_SEQ.fetch_add(1, Ordering::Relaxed),
+        workspace: workspace.clone(),
+    });
+    if stack.len() > UNDO_STACK_LIMIT {
+        let overflow = stack.len() - UNDO_STACK_LIMIT;
+        stack.drain(0..overflow);
+    }
+}
+
+/// Undo the most recent file operation (`edit_file` / `write_file`) by
+/// applying its exact reverse to the workspace the operation ran on.
+///
+/// On success the snapshot is popped — an undone operation cannot be undone
+/// again. On failure the snapshot is restored so the user can retry once
+/// the conflict is resolved. Failures are clear Chinese error messages,
+/// never panics.
+pub fn undo_file_op() -> Result<String, String> {
+    let snapshot = undo_stack().pop();
+    let Some(snapshot) = snapshot else {
+        return Err("无法撤销：没有可撤销的文件操作".into());
+    };
+    let result = match snapshot.op {
+        FileOpKind::Write => undo_write(
+            &snapshot.workspace,
+            &snapshot.path,
+            snapshot.old_content.as_deref(),
+            &snapshot.new_content,
+        ),
+        FileOpKind::Edit => undo_edit(
+            &snapshot.workspace,
+            &snapshot.path,
+            snapshot.old_content.as_deref().unwrap_or_default(),
+            &snapshot.new_content,
+        ),
+    };
+    match result {
+        Ok(message) => Ok(message),
+        Err(error) => {
+            undo_stack().push(snapshot);
+            Err(error)
+        }
+    }
+}
+
+/// Reverse a `write`: the file must still contain exactly what was written
+/// (otherwise a later modification would be clobbered); then restore the
+/// old content, or delete the file when it did not exist before.
+fn undo_write(
+    workspace: &Workspace,
+    path: &str,
+    old_content: Option<&str>,
+    new_content: &str,
+) -> Result<String, String> {
+    let current = workspace
+        .try_read_to_string(path)
+        .map_err(|error| format!("无法撤销 {path}：{error}"))?;
+    let Some(current) = current else {
+        return Err(format!("无法撤销 {path}：文件已不存在"));
+    };
+    if current != new_content {
+        return Err(format!("无法撤销 {path}：文件已被后续修改"));
+    }
+    match old_content {
+        Some(old) => {
+            workspace
+                .write(path, old)
+                .map_err(|error| format!("无法撤销 {path}：{error}"))?;
+            Ok(format!("已撤销 write_file: {path}"))
+        }
+        None => {
+            workspace
+                .remove_file(path)
+                .map_err(|error| format!("无法撤销 {path}：{error}"))?;
+            Ok(format!("已撤销 write_file: {path}（新建文件已删除）"))
+        }
+    }
+}
+
+/// Reverse an `edit`: the current file must still contain the `new` text
+/// exactly once; replace it back with the `old` text, preserving the file's
+/// line-ending style (mirror of [`EditFile::execute`]).
+fn undo_edit(
+    workspace: &Workspace,
+    path: &str,
+    old_fragment: &str,
+    new_fragment: &str,
+) -> Result<String, String> {
+    let content = workspace
+        .read_to_string(path)
+        .map_err(|error| format!("无法撤销 {path}：{error}"))?;
+    let (content_lf, output_line_ending) = normalize_lf(&content);
+    let new_lf = normalize_lf(new_fragment).0;
+    let old_lf = normalize_lf(old_fragment).0;
+    if content_lf.match_indices(&new_lf).count() != 1 {
+        return Err(format!("无法撤销 {path}：文件已被后续修改"));
+    }
+    let replaced = content_lf.replacen(&new_lf, &old_lf, 1);
+    let output = match output_line_ending {
+        LineEnding::Crlf => lf_to_crlf(&replaced),
+        LineEnding::Lf => replaced,
+    };
+    workspace
+        .write(path, output)
+        .map_err(|error| format!("无法撤销 {path}：{error}"))?;
+    Ok(format!("已撤销 edit_file: {path}"))
+}
+
+/// Empty the undo stack. Test-only: the stack is process-global, so tests
+/// must clear it (under [`UNDO_TEST_LOCK`]) to isolate each scenario.
+#[cfg(test)]
+pub(super) fn clear_undo_stack() {
+    undo_stack().clear();
 }

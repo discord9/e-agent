@@ -191,6 +191,56 @@ impl Workspace {
         String::from_utf8(self.read(input)?).map_err(|error| format!("read failed: {error}"))
     }
 
+    /// Read a file as UTF-8, mapping a missing file to `None` — callers can
+    /// distinguish "the file did not exist" from other read failures (used
+    /// by write_file's undo snapshot, where `None` means undo = delete).
+    pub fn try_read_to_string(&self, input: &str) -> Result<Option<String>, String> {
+        let path = Path::new(input);
+        let exists = if !path.is_absolute() {
+            self.dir
+                .try_exists(self.relative(input)?)
+                .map_err(|error| format!("stat failed: {error}"))?
+        } else {
+            let (root, remainder) = self.external(path, false)?;
+            match &root.capability {
+                ExternalCapability::Dir(dir) => dir
+                    .try_exists(remainder)
+                    .map_err(|error| format!("stat failed: {error}"))?,
+                // The capability is an open file handle; it exists by
+                // definition (opened at startup).
+                ExternalCapability::File(_) if remainder.as_os_str().is_empty() => true,
+                ExternalCapability::File(_) => {
+                    return Err("external file capability does not authorize sibling paths".into());
+                }
+            }
+        };
+        if !exists {
+            return Ok(None);
+        }
+        self.read_to_string(input).map(Some)
+    }
+
+    /// Delete a file (used by undo for a `write_file` that created it).
+    pub fn remove_file(&self, input: &str) -> Result<(), String> {
+        let path = Path::new(input);
+        if !path.is_absolute() {
+            let path = self.relative(input)?;
+            return self
+                .dir
+                .remove_file(path)
+                .map_err(|error| format!("delete failed: {error}"));
+        }
+        let (root, remainder) = self.external(path, true)?;
+        match &root.capability {
+            ExternalCapability::Dir(dir) => dir
+                .remove_file(remainder)
+                .map_err(|error| format!("delete failed: {error}")),
+            ExternalCapability::File(_) => {
+                Err("external file capability does not authorize deletion".into())
+            }
+        }
+    }
+
     pub fn write(&self, input: &str, content: impl AsRef<[u8]>) -> Result<(), String> {
         let path = Path::new(input);
         if !path.is_absolute() {

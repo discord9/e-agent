@@ -339,6 +339,7 @@ async fn edit(temp: &tempfile::TempDir, old: &str, new: &str) -> Result<String, 
 
 #[tokio::test]
 async fn edit_requires_exactly_one_match() {
+    let _guard = undo_test_guard().await;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("file.txt");
     std::fs::write(&path, "one two one").unwrap();
@@ -363,6 +364,7 @@ async fn edit_requires_exactly_one_match() {
 
 #[tokio::test]
 async fn edit_preserves_crlf_line_endings() {
+    let _guard = undo_test_guard().await;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("file.txt");
     // CRLF file (Windows-style); the model's old/new use LF.
@@ -379,6 +381,7 @@ async fn edit_preserves_crlf_line_endings() {
 
 #[tokio::test]
 async fn edit_matches_lf_old_against_crlf_file() {
+    let _guard = undo_test_guard().await;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("file.txt");
     // Old text passed by the model without \r must still match a CRLF file.
@@ -386,6 +389,138 @@ async fn edit_matches_lf_old_against_crlf_file() {
     let result = edit(&temp, "beta", "BETA").await.unwrap();
     assert_eq!(result, "file edited (line 2)");
     assert_eq!(std::fs::read_to_string(path).unwrap(), "alpha\r\nBETA\r\n");
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Undo stack
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// Serialize undo tests against the process-global undo stack and reset it,
+/// so each scenario starts from a known empty state.
+async fn undo_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = UNDO_TEST_LOCK.lock().await;
+    clear_undo_stack();
+    guard
+}
+
+#[tokio::test]
+async fn undo_write_restores_old_content() {
+    let _guard = undo_test_guard().await;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("file.txt");
+    std::fs::write(&path, "old content").unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    WriteFile {
+        workspace: workspace.clone(),
+    }
+    .execute(json!({"path": "file.txt", "content": "new content"}))
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
+
+    let message = undo_file_op().unwrap();
+    assert!(message.contains("已撤销 write_file: file.txt"), "{message}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old content");
+    // An undone operation is gone from the stack: nothing left to undo.
+    assert!(undo_file_op().unwrap_err().contains("没有可撤销"));
+}
+
+#[tokio::test]
+async fn undo_edit_reverses_fragments() {
+    let _guard = undo_test_guard().await;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("file.txt");
+    std::fs::write(&path, "one two three").unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    EditFile {
+        workspace: workspace.clone(),
+    }
+    .execute(json!({"path": "file.txt", "old": "two", "new": "TWO"}))
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "one TWO three");
+
+    let message = undo_file_op().unwrap();
+    assert!(message.contains("已撤销 edit_file: file.txt"), "{message}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "one two three");
+}
+
+#[tokio::test]
+async fn undo_created_write_deletes_the_file() {
+    let _guard = undo_test_guard().await;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    WriteFile {
+        workspace: workspace.clone(),
+    }
+    .execute(json!({"path": "new.txt", "content": "brand new"}))
+    .await
+    .unwrap();
+    assert!(temp.path().join("new.txt").exists());
+
+    let message = undo_file_op().unwrap();
+    assert!(message.contains("已撤销 write_file: new.txt"), "{message}");
+    assert!(!temp.path().join("new.txt").exists());
+}
+
+#[tokio::test]
+async fn undo_fails_when_file_modified_afterwards() {
+    let _guard = undo_test_guard().await;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("file.txt");
+    let workspace = Workspace::new(temp.path()).unwrap();
+
+    // edit path: the `new` fragment has been overwritten by a later edit.
+    std::fs::write(&path, "one two three").unwrap();
+    EditFile {
+        workspace: workspace.clone(),
+    }
+    .execute(json!({"path": "file.txt", "old": "two", "new": "TWO"}))
+    .await
+    .unwrap();
+    std::fs::write(&path, "one THREE three").unwrap();
+    let error = undo_file_op().unwrap_err();
+    assert!(error.contains("无法撤销"), "{error}");
+    assert!(error.contains("已被后续修改"), "{error}");
+
+    // write path: the written content has been tampered with.
+    clear_undo_stack();
+    std::fs::write(&path, "original").unwrap();
+    WriteFile {
+        workspace: workspace.clone(),
+    }
+    .execute(json!({"path": "file.txt", "content": "written"}))
+    .await
+    .unwrap();
+    std::fs::write(&path, "tampered").unwrap();
+    let error = undo_file_op().unwrap_err();
+    assert!(error.contains("无法撤销"), "{error}");
+    assert!(error.contains("已被后续修改"), "{error}");
+}
+
+#[tokio::test]
+async fn undo_stack_is_bounded() {
+    let _guard = undo_test_guard().await;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    for i in 0..UNDO_STACK_LIMIT + 5 {
+        WriteFile {
+            workspace: workspace.clone(),
+        }
+        .execute(json!({"path": format!("f{i}.txt"), "content": format!("content {i}")}))
+        .await
+        .unwrap();
+    }
+    let stack = UNDO_STACK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(stack.len(), UNDO_STACK_LIMIT);
+    // The oldest operations were dropped, the newest kept.
+    assert_eq!(stack.first().unwrap().path, "f5.txt");
+    assert_eq!(
+        stack.last().unwrap().path,
+        format!("f{}.txt", UNDO_STACK_LIMIT + 4)
+    );
 }
 
 async fn read(temp: &tempfile::TempDir, arguments: Value) -> Result<String, String> {
@@ -398,6 +533,7 @@ async fn read(temp: &tempfile::TempDir, arguments: Value) -> Result<String, Stri
 
 #[tokio::test]
 async fn external_absolute_file_tools_enforce_policy_and_reuse_semantics() {
+    let _guard = undo_test_guard().await;
     let temp = tempfile::tempdir().unwrap();
     let workspace_dir = temp.path().join("workspace");
     let readable = temp.path().join("readable");
@@ -475,6 +611,7 @@ async fn external_absolute_file_tools_enforce_policy_and_reuse_semantics() {
 
 #[tokio::test]
 async fn policy_file_tools_allow_read_but_reject_relative_and_external_absolute_writes() {
+    let _guard = undo_test_guard().await;
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join(".e-agent")).unwrap();
     let policy_path = temp.path().join(".e-agent/config.toml");
@@ -627,6 +764,7 @@ async fn read_rejects_invalid_paging_arguments() {
 
 #[tokio::test]
 async fn write_creates_a_new_nested_file() {
+    let _guard = undo_test_guard().await;
     let temp = tempfile::tempdir().unwrap();
     let tool = WriteFile {
         workspace: Workspace::new(temp.path()).unwrap(),
@@ -1025,6 +1163,7 @@ async fn sandbox_read_only_workspace_rejects_bash_but_not_file_tool_writes() {
         return;
     };
     sandbox.workspace_writable = false;
+    let _guard = undo_test_guard().await;
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
     WriteFile {
