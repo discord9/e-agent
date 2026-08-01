@@ -2418,3 +2418,27 @@ async fn read_file_hints_read_image_for_image_extensions() {
         "plain"
     );
 }
+
+#[tokio::test]
+async fn background_event_sender_is_shared_across_clones() {
+    // Regression: LiveSession and the Delegate tool hold separate clones of
+    // the BackgroundTasks registry. Agent::new only calls set_event_sender on
+    // the Delegate's clone; the LiveSession's clone must still observe the
+    // sender (shared via Arc<Mutex<_>>) so btw subagent spawning does not
+    // fail with "background task delivery is unavailable".
+    let background = BackgroundTasks::new(None, None);
+    let mut a = background.clone();
+    let b = background.clone();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    a.set_event_sender(tx);
+    assert!(b.completion_delivery_available());
+    let started = b.spawn_with_id(
+        "label".into(),
+        None,
+        None,
+        None,
+        |_id| {},
+        || async move { String::new() },
+    );
+    assert!(started.is_ok(), "spawn failed: {:?}", started);
+}

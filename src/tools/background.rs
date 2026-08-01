@@ -13,7 +13,10 @@ pub struct BackgroundTasks {
     registry: Arc<BackgroundRegistry>,
     /// Compatibility sender for callers which schedule directly on a registry
     /// (delegates do this). Bash deliberately does not use this field.
-    sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    /// Wrapped in `Arc<Mutex<Option<_>>>` so that `Agent::new`'s
+    /// `set_event_sender` on one clone (the Delegate tool's) is visible to
+    /// every other clone (e.g. the LiveSession's), which share the registry.
+    sender: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>>>,
     /// Background bash timeout; `None` = no timeout (run forever).
     timeout: Option<Duration>,
     sandbox: Option<crate::config::Sandbox>,
@@ -327,7 +330,7 @@ impl BackgroundTasks {
                 next_id: AtomicU64::new(1),
                 running: std::sync::Mutex::new(Vec::new()),
             }),
-            sender: None,
+            sender: Arc::new(std::sync::Mutex::new(None)),
             timeout,
             sandbox,
         }
@@ -336,7 +339,7 @@ impl BackgroundTasks {
     /// Set the channel used to deliver background completions. Called by the
     /// agent for tools that hold a shared clone of this registry.
     pub fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
-        self.sender = Some(sender);
+        *self.sender.lock().unwrap() = Some(sender);
     }
 
     /// Whether background completion delivery is currently usable.
@@ -345,6 +348,8 @@ impl BackgroundTasks {
     /// sender check to guard against the receiver closing in the meantime.
     pub fn completion_delivery_available(&self) -> bool {
         self.sender
+            .lock()
+            .unwrap()
             .as_ref()
             .is_some_and(|sender| !sender.is_closed())
     }
@@ -432,7 +437,7 @@ impl BackgroundTasks {
             workspace,
             command,
             protect_git,
-            self.sender.clone(),
+            self.sender.lock().unwrap().clone(),
             self.sandbox.clone(),
         )
     }
@@ -532,7 +537,7 @@ impl BackgroundTasks {
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
         self.spawn_with_id_to(
-            self.sender.clone(),
+            self.sender.lock().unwrap().clone(),
             label,
             role,
             process_group,
