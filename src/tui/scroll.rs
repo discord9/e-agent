@@ -434,7 +434,7 @@ pub(crate) fn extend_window_down(
         state.window.local_offset = state
             .window
             .local_offset
-            .min(total_visual.saturating_sub(1).max(0));
+            .min(total_visual.saturating_sub(1));
         on_extension(state);
     } else if !state.window.follow_bottom
         && state.window.frozen_tail_cursor.is_some()

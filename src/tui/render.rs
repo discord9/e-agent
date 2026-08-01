@@ -243,7 +243,7 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
         scroll_state.window.local_offset = scroll_state
             .window
             .local_offset
-            .min(total_rows.saturating_sub(height).max(0));
+            .min(total_rows.saturating_sub(height));
         // Terminal-style placement for a following window that renders fewer
         // rows than the viewport: a head-anchored (fits) window starts at the
         // top; only a tail-anchored window whose bounded source budget is
@@ -765,7 +765,7 @@ pub(crate) fn render_task_detail(
     detail.window.local_offset = detail
         .window
         .local_offset
-        .min(total_rows.saturating_sub(content_height).max(0));
+        .min(total_rows.saturating_sub(content_height));
     {
         let buf = frame.buffer_mut();
         buf.set_style(inner, SOLARIZED_LIGHT.screen_style());

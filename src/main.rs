@@ -400,12 +400,7 @@ async fn consume_stderr_events(mut events: tokio::sync::broadcast::Receiver<Agen
                     preview(&output, 500)
                 )
             }
-            AgentEvent::BackgroundCompletionNotice {
-                id: _,
-                output,
-                label: _,
-                ..
-            } => {
+            AgentEvent::BackgroundCompletionNotice { output, .. } => {
                 // REPL/stderr: show a finite preview with middle ellipsis
                 let lines: Vec<&str> = output.lines().collect();
                 if lines.len() <= 8 && output.len() <= 500 {

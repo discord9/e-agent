@@ -1609,11 +1609,13 @@ impl TuiState {
     ) {
         const DIFF_LINE_LIMIT: usize = 30;
         let mut lines = text.lines();
-        let mut number = start.unwrap_or(0);
-        for line in lines.by_ref().take(DIFF_LINE_LIMIT) {
+        for (line, number) in lines
+            .by_ref()
+            .take(DIFF_LINE_LIMIT)
+            .zip(start.unwrap_or(0)..)
+        {
             let label = start.map_or_else(String::new, |_| format!("{number:>4} "));
             self.push_line(format!("{prefix}{label}{line}"), kind);
-            number += 1;
         }
         let remaining = lines.count();
         if remaining > 0 {
