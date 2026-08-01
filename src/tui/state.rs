@@ -142,6 +142,27 @@ pub(crate) struct TuiState {
     /// from the tasks panel; `None` (tests, `Default`) falls back to the
     /// JSONL record file directly.
     pub(crate) store: Option<crate::session_store::SessionStore>,
+    /// The main session's model; btw fork subagents (`/btw`) inherit it
+    /// (`delegate::BtwContext::model`).
+    pub(crate) model: Option<crate::model::ConfiguredModel>,
+    /// The workspace the main session works in; btw fork subagents inherit
+    /// it.
+    pub(crate) workspace: Option<crate::workspace::Workspace>,
+    /// bwrap policy inherited by btw fork subagents (`None` = sandbox
+    /// disabled, wired by `run_inner` together with the other components).
+    pub(crate) sandbox: Option<crate::config::Sandbox>,
+    /// Session backend configuration for btw fork subagent persistence.
+    pub(crate) backend: Option<crate::config::SessionBackend>,
+    /// Read-only policy inherited by btw fork subagents (a read-only parent
+    /// forks read-only subagents).
+    pub(crate) read_only: bool,
+    /// Parent session's background record (root + session id + store):
+    /// records the btw task for the killed-on-exit notice and supplies the
+    /// `parent_session_id` metadata link.
+    pub(crate) record_in: Option<crate::session_store::BackgroundRecord>,
+    /// Live subagent registry btw fork subagents register into (F2 task
+    /// panel attach).
+    pub(crate) sessions: Option<crate::delegate::Sessions>,
     /// Older-history paging state, driven by `handle_scroll` + the run loop:
     ///
     /// - `older_pending`: an Up/PageUp at the scrollback top (or Home,

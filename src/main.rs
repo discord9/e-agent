@@ -270,6 +270,16 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
         // The fork (if any) happened inside build; report the effective id.
         _tui_report.session = Some(built.session.clone());
         let task = built.runner.start(None);
+        // The btw fork record mirrors the server's /btw endpoint: the
+        // parent session's background record (workspace root + effective
+        // session id + its store) so btw tasks are reported as killed on
+        // exit and carry the parent_session_id metadata link. Cloned
+        // before the moved `built.session` / `built.store` args below.
+        let record_in = Some(e_agent::session_store::BackgroundRecord {
+            root: factory.root().to_path_buf(),
+            session: built.session.clone(),
+            store: built.store.clone(),
+        });
         let result = tui::run(
             built.handle,
             task,
@@ -281,6 +291,12 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             built.role_name,
             factory.main_context_window(),
             built.store,
+            factory.main_model().clone(),
+            factory.workspace().clone(),
+            factory.sandbox().cloned(),
+            factory.backend().clone(),
+            read_only,
+            record_in,
         )
         .await;
         _tui_report.success = result.is_ok();

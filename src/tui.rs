@@ -269,6 +269,12 @@ pub async fn run(
     role_name: Option<String>,
     context_window: Option<u64>,
     store: crate::session_store::SessionStore,
+    model: crate::model::ConfiguredModel,
+    workspace: crate::workspace::Workspace,
+    sandbox: Option<crate::config::Sandbox>,
+    session_backend: crate::config::SessionBackend,
+    read_only: bool,
+    record_in: Option<crate::session_store::BackgroundRecord>,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard::new();
@@ -291,6 +297,12 @@ pub async fn run(
         sessions,
         context_window,
         store,
+        model,
+        workspace,
+        sandbox,
+        session_backend,
+        read_only,
+        record_in,
     )
     .await;
     drop(terminal);
@@ -347,6 +359,12 @@ async fn run_inner(
     sessions: Sessions,
     context_window: Option<u64>,
     store: crate::session_store::SessionStore,
+    model: crate::model::ConfiguredModel,
+    workspace: crate::workspace::Workspace,
+    sandbox: Option<crate::config::Sandbox>,
+    backend: crate::config::SessionBackend,
+    read_only: bool,
+    record_in: Option<crate::session_store::BackgroundRecord>,
 ) -> anyhow::Result<Option<String>> {
     let (sender, mut inbox) = mpsc::unbounded_channel::<UiEvent>();
     let (snapshot, mut live, mut status) = handle.attach();
@@ -371,6 +389,16 @@ async fn run_inner(
     state.context_window = context_window;
     state.background = Some(background);
     state.store = Some(store);
+    // btw fork context (delegate::BtwContext), wired from the factory like
+    // the server's /btw endpoint does: the subagent inherits the main
+    // session's model, workspace, sandbox, read-only policy and backend.
+    state.model = Some(model);
+    state.workspace = Some(workspace);
+    state.sandbox = sandbox;
+    state.backend = Some(backend);
+    state.read_only = read_only;
+    state.record_in = record_in;
+    state.sessions = Some(sessions.clone());
     set_terminal_title(&labels.session);
     let probe = sessions.clone();
     state.attachable = Some(Box::new(move |id| probe.get(id).is_some()));
@@ -431,7 +459,7 @@ async fn run_inner(
                             state.load_newer_history().await;
                         }
                     }
-                    else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else if let Some(command)=parse_rename(&prompt) { handle_rename(command, &mut state).await; } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
+                    else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else if let Some(command)=parse_rename(&prompt) { handle_rename(command, &mut state).await; } else if let Some(command)=parse_btw(&prompt) { handle_btw(command, &mut state).await; } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
                 Some(Ok(Event::Paste(text))) => state.handle_paste(&text),
                 // Resize needs no explicit handling: the next draw()
@@ -522,6 +550,81 @@ async fn handle_rename(command: RenameCommand, state: &mut TuiState) {
     }
 }
 
+/// A parsed `/btw` command from the input line.
+#[derive(Debug, PartialEq, Eq)]
+enum BtwCommand {
+    /// Bare `/btw` (or `/btw ` with only whitespace) — show usage.
+    Usage,
+    /// `/btw <question>` — fork a persistent interactive subagent.
+    Ask(String),
+}
+
+/// Parse a `/btw` command. Returns `None` for any other input so the
+/// caller falls through to the normal prompt path. Command matching is
+/// strict (`/btw` plus a space separator): `/btwxxx` stays a prompt.
+fn parse_btw(prompt: &str) -> Option<BtwCommand> {
+    if prompt == "/btw" {
+        return Some(BtwCommand::Usage);
+    }
+    let rest = prompt.strip_prefix("/btw ")?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        Some(BtwCommand::Usage)
+    } else {
+        Some(BtwCommand::Ask(rest.to_string()))
+    }
+}
+
+/// Assemble the [`crate::delegate::BtwContext`] for `/btw` from the state
+/// wired by `run_inner`. Returns `None` when a required component is
+/// missing — only possible in unit-test state without a run loop, since
+/// `run_inner` sets every field together.
+fn btw_context(state: &TuiState) -> Option<crate::delegate::BtwContext> {
+    Some(crate::delegate::BtwContext {
+        model: state.model.clone()?,
+        context_window: state.context_window,
+        workspace: state.workspace.clone()?,
+        sandbox: state.sandbox.clone(),
+        read_only: state.read_only,
+        background: state.background.clone()?,
+        sessions: state.sessions.clone()?,
+        persist_root: state.root.clone(),
+        backend: state.backend.clone()?,
+        record_in: state.record_in.clone(),
+    })
+}
+
+/// Run a `/btw` command: fork this session's full history into a
+/// persistent interactive "btw fork" subagent and start it with the
+/// question as its first user message. The main session keeps running
+/// untouched — the fork is deliberately NOT auto-attached; it shows up in
+/// the F2 task panel and can be attached to there. Success and failure are
+/// both surfaced as a Notice (pushed into the TUI scrollback — display
+/// only, same as `/rename`).
+async fn handle_btw(command: BtwCommand, state: &mut TuiState) {
+    let question = match command {
+        BtwCommand::Usage => {
+            state.push_agent_event(AgentEvent::Notice(
+                "用法：/btw <问题>（fork 出独立子代理继续探讨，F2 任务面板可 attach）".to_string(),
+            ));
+            return;
+        }
+        BtwCommand::Ask(question) => question,
+    };
+    let Some(context) = btw_context(state) else {
+        state.push_agent_event(AgentEvent::Notice(
+            "btw 创建失败：TUI 未接线（缺少模型/工作区/后端配置）".to_string(),
+        ));
+        return;
+    };
+    match crate::delegate::spawn_btw_subagent(&state.session_id, &question, context).await {
+        Ok(id) => state.push_agent_event(AgentEvent::Notice(format!(
+            "已创建 btw subagent：{id}（F2 任务面板可 attach）"
+        ))),
+        Err(error) => state.push_agent_event(AgentEvent::Notice(format!("btw 创建失败：{error}"))),
+    }
+}
+
 #[cfg(test)]
 mod rename_tests {
     use super::{RenameCommand, parse_rename};
@@ -543,5 +646,32 @@ mod rename_tests {
         assert_eq!(parse_rename("/renamexxx"), None);
         assert_eq!(parse_rename("/compact"), None);
         assert_eq!(parse_rename("hello"), None);
+    }
+}
+
+#[cfg(test)]
+mod btw_tests {
+    use super::{BtwCommand, parse_btw};
+
+    #[test]
+    fn parse_btw_commands() {
+        // Bare `/btw` shows usage.
+        assert_eq!(parse_btw("/btw"), Some(BtwCommand::Usage));
+        assert_eq!(parse_btw("/btw "), Some(BtwCommand::Usage));
+        assert_eq!(parse_btw("/btw   "), Some(BtwCommand::Usage));
+        assert_eq!(
+            parse_btw("/btw 为什么这个 bug 会出现？"),
+            Some(BtwCommand::Ask("为什么这个 bug 会出现？".to_string()))
+        );
+        assert_eq!(
+            parse_btw("/btw   padded question  "),
+            Some(BtwCommand::Ask("padded question".to_string()))
+        );
+        // Non-btw input falls through to the normal prompt path.
+        assert_eq!(parse_btw("/btwxxx"), None);
+        assert_eq!(parse_btw("/btwx question"), None);
+        assert_eq!(parse_btw("/compact"), None);
+        assert_eq!(parse_btw("/rename x"), None);
+        assert_eq!(parse_btw("hello"), None);
     }
 }
