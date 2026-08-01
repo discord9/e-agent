@@ -48,6 +48,21 @@ mmlEqnNo}
     flex-direction: column;
   }
 
+  /* ---------- 应用主体：侧边栏与内容区 flex 并排 ---------- */
+  #appBody {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: row;   /* 侧边栏 + 内容区左右并排；侧边栏宽度变化时内容区 flex:1 自然收缩 */
+    min-height: 0;         /* flex 子项默认 min-height:auto：内容高时撑开 body 导致整页滚动 */
+  }
+  #contentWrap {
+    flex: 1 1 auto;
+    min-width: 0;          /* flex 子项默认 min-width:auto：侧边栏 + 长内容会横向溢出 */
+    display: flex;
+    flex-direction: column;
+    position: relative;    /* 聊天区内 absolute 定位（回到底部按钮）的锚点 */
+  }
+
   /* ---------- 顶栏 ---------- */
   #topbar {
     display: flex;
@@ -599,14 +614,15 @@ mmlEqnNo}
   }
 
   /* ---------- 会话侧边栏 ---------- */
-  /* 半透明遮罩，z-index 高于顶栏（10） */
+  /* 半透明遮罩，z-index 高于顶栏（10）；仅手机覆盖式使用，桌面 display:none */
   #sidebarOverlay {
     position: fixed;
     inset: 0;
     background: rgba(0, 43, 54, 0.45);
     z-index: 100;
   }
-  /* 左滑面板：全高、约 280px 宽；transform 过渡实现左滑动画 */
+  /* 手机（≤600px）左滑面板：全高、约 280px 宽；transform 过渡实现左滑动画。
+     覆盖式——fixed 盖住顶栏与内容区，内容不位移。 */
   #sidebar {
     position: fixed;
     top: 0;
@@ -625,16 +641,29 @@ mmlEqnNo}
     transition: transform 0.2s ease;
   }
   #sidebar.open { transform: translateX(0); }
-  /* 宽屏（>600px）：侧边栏打开时挤压内容而非覆盖——列表/消息视图右移 280px；
+  /* 宽屏（>600px）：真正的 flex 并排——#appBody 内与 #contentWrap 左右相邻，
+     侧边栏宽度变化时内容区自然收缩（flex:1），无需 margin 平移；
+     #topbar 是 body 直系子项，不参与挤压。
      遮罩此时无意义（内容已被推开、不被遮挡），直接隐藏。
      手机（≤600px）保持覆盖式：内容不位移、保留半透明遮罩。 */
   @media (min-width: 601px) {
     #sidebarOverlay { display: none; }
-    body.sidebar-open #topbar,
-    body.sidebar-open #listView,
-    body.sidebar-open #chatView {
-      margin-left: 280px;
-      transition: margin-left 0.2s ease;   /* 与侧边栏滑入/滑出同节奏 */
+    #sidebar {
+      position: relative;
+      top: auto;
+      left: auto;
+      bottom: auto;
+      width: 0;                 /* 收起 = 宽度 0；.open 时过渡到 280px */
+      flex: 0 0 auto;
+      overflow: hidden;         /* 宽度过渡时裁剪内容，防挤压变形 */
+      transform: none;          /* 桌面不用 translateX（宽度过渡代替） */
+      transition: width 0.2s ease;
+      box-shadow: none;         /* 并排布局靠右边框分隔，不需要投影 */
+      border-right-color: transparent;   /* 宽度 0 时不残留 1px 竖线 */
+    }
+    #sidebar.open {
+      width: 280px;
+      border-right-color: var(--base1);
     }
   }
   .sidebar-head {
@@ -661,7 +690,9 @@ mmlEqnNo}
   .sidebar-filter input::placeholder { color: var(--base01); }
   .sidebar-filter input:focus { border-color: var(--blue); }
   .sidebar-tree {
-    flex: 0 0 auto;
+    flex: 1 1 auto;
+    min-height: 0;   /* 树长于视口时自身收缩并内部滚动（head/filter 保持固定） */
+    overflow-y: auto;
     padding: 8px;
   }
   .tree-empty { color: var(--base01); font-size: 14px; padding: 14px 2px; text-align: center; }
