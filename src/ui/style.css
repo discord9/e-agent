@@ -914,6 +914,36 @@ mmlEqnNo}
     color: var(--base02);
   }
   .task-output.empty { color: var(--base01); font-style: italic; }
+  /* delegate 内嵌 SSE 流式区：就地输出（与 .task-output 同基调；
+     monospace、限高 30vh 滚动，避免撑爆 composer） */
+  .task-stream {
+    margin: 6px 0 0;
+    padding: 6px 8px;
+    background: var(--base2);
+    border: 1px solid var(--base1);
+    border-radius: 3px;
+    font-family: monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    max-height: 30vh;
+    overflow-y: auto;
+    color: var(--base02);
+  }
+  .task-stream.empty { color: var(--base01); font-style: italic; }
+  /* 轮询/流式进行中的轻量视觉提示：行内小字 + 呼吸闪烁圆点 */
+  .task-stream-status {
+    flex: 0 0 auto;
+    font-size: 11px;
+    color: var(--cyan);
+    white-space: nowrap;
+    animation: task-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes task-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
 
   /* 小屏适配 */
   @media (max-width: 640px) {

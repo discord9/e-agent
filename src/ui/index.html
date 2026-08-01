@@ -78,7 +78,9 @@
   <button id="jumpBottomBtn" class="jump-bottom" title="回到底部" hidden>↓</button>
   <div class="composer">
     <!-- 运行中任务折叠条 + 面板（TUI 式）：输入区上方、queueBar 同区域；
-         默认收起，有任务时计数高亮（计数即徽标），点击展开面板 -->
+         默认收起，有任务时计数高亮（计数即徽标），点击展开面板。
+         任务行由 renderTaskList 渲染：bash 行展开后轮询 output 端点，
+         delegate 行展开后内嵌 SSE 流式输出（不切走会话）。 -->
     <div id="tasksToggleBar" class="tasks-toggle-bar" hidden title="运行中任务：点击展开 / 收起">
       <span class="tasks-toggle-label">运行中任务 (0)</span>
       <span class="tasks-toggle-chevron">▸</span>

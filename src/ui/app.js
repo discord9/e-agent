@@ -44,6 +44,10 @@ const state = {
     list: [],                // 最近一次 /api/tasks 结果（两处渲染共用）
     cancelling: new Set(),   // 正在取消的任务 id（防重复点击）
     composerOpen: false,     // composer 任务面板展开状态（默认收起）
+    pollers: new Map(),      // 展开中 bash 行的 output 轮询句柄（key=session_id:id → interval id）
+    streams: new Map(),      // 展开中 delegate 行的 SSE AbortController（key=session_id:id）
+    streamText: new Map(),   // 展开中 delegate 行的已累积流式文本（key → string，重绘恢复用）
+    degraded: new Set(),     // bash 行 output 端点 404/不可用 → 降级静态尾部（key；重绘不再重启轮询）
   },
   renameActive: false,       // 行内重命名进行中：列表页 1s 轮询重绘跳过，防编辑框被冲掉
 };
@@ -1494,7 +1498,7 @@ function updateSidebarTasksGroup() {
   if (label) label.textContent = "运行中任务 (" + n + ")";
   group.hidden = n === 0;
   const body = group.querySelector(".tasks-group-body");
-  if (body) renderTaskList(state.tasks.list || [], body, { onOpen: onDelegateTaskOpen });
+  if (body) renderTaskList(state.tasks.list || [], body);
 }
 
 /* composer 上方折叠条 + 面板：计数即徽标；有任务时高亮，无任务整条隐藏。
@@ -1514,33 +1518,13 @@ function renderComposerTasks() {
   if (panel) {
     panel.hidden = !state.tasks.composerOpen;
     if (state.tasks.composerOpen) {
-      renderTaskList(state.tasks.list || [], panel, { onOpen: onDelegateTaskOpen });
+      renderTaskList(state.tasks.list || [], panel);
     }
   }
 }
 
-/* delegate 任务行点击（树分组 + composer 面板共用）：
-   依赖后端 live 回退（main 已合入 feat/subagent-live：/api/sessions 会把
-   运行中的 subagent 标为 active，history/SSE/prompt 均可访问）——
-   session_id 已在会话列表（state.lastList）→ openSession 正常切换；
-   旧服务器（未合入，session_id 不在列表）→ 降级：banner 提示 + 仅展开输出。
-   从 composer 面板切走时顺手收起面板（聊天视图已切换，保持简洁）。 */
-function onDelegateTaskOpen(t, row) {
-  const known = (state.lastList || []).some((s) => s.id === t.session_id);
-  if (known) {
-    openSession(t.session_id);
-    if (state.tasks.composerOpen) {
-      state.tasks.composerOpen = false;
-      renderComposerTasks();
-    }
-    return;
-  }
-  setBanner("⚠ 当前服务器不支持直接打开运行中的子代理会话（旧后端）；仅展开输出。", true);
-  const pre = row && row.querySelector(".task-output");
-  if (pre) pre.hidden = false;
-  const cancel = row && row.querySelector(".task-cancel");
-  if (cancel) cancel.hidden = false;   // 展开输出时同步显示取消按钮（与行点击逻辑一致）
-}
+/* delegate 行点击不再切走会话（用户用侧边栏树切换）：行点击 = 就地展开
+   内嵌 SSE 流式输出（见 renderTaskList / startTaskStream）。 */
 
 function shortTaskLabel(t) {
   // delegate 显示 label；bash 显示截断的 full_command（label 兜底）
@@ -1548,21 +1532,224 @@ function shortTaskLabel(t) {
   return truncate(t.full_command || t.label || "", 80);
 }
 
+/* ---- 任务行就地流式：bash 轮询 output 端点 + delegate 内嵌 SSE ---- */
+
+/* bash 输出轮询：展开后立即拉一次，随后每 500ms GET
+   /api/sessions/{sid}/tasks/{tid}/output 全量刷新输出区（textContent）。
+   旧后端（端点 404）→ 静默停轮询，保持静态尾部；网络失败同样停轮询。
+   句柄存 state.tasks.pollers（key=session_id:id），收起/重绘时清除防泄漏。 */
+function startTaskOutputPolling(t, key, pre, status) {
+  stopTaskPoller(key);
+  if (status) status.hidden = false;
+  let intervalId = null;
+  // 只停自己的轮询：2s 重绘会先停旧轮询再启新轮询，旧 tick 的异步收尾
+  // 不能误清新轮询（竞态：key 相同）。
+  const stop = () => {
+    if (state.tasks.pollers.get(key) === intervalId) stopTaskPoller(key);
+  };
+  const tick = async () => {
+    if (!state.token) { stop(); if (status) status.hidden = true; return; }
+    try {
+      const res = await api("/api/sessions/" + encodeURIComponent(t.session_id || "")
+        + "/tasks/" + encodeURIComponent(t.id) + "/output");
+      if (res.status === 401 || res.status === 403) {
+        setBanner("⚠ 认证失败：请检查 Token。");
+        stop(); if (status) status.hidden = true; return;
+      }
+      if (res.status === 404 || !res.ok) {
+        // 旧后端/端点不可用：停轮询并记为降级（重绘不再重启），输出区保持静态尾部
+        state.tasks.degraded.add(key);
+        stop(); if (status) status.hidden = true; return;
+      }
+      const text = await res.text();
+      if (!pre.isConnected) { stop(); if (status) status.hidden = true; return; }
+      const txt = String(text).trim() !== "" ? String(text) : "";
+      pre.classList.toggle("empty", txt === "");
+      pre.textContent = txt || "(无输出)";
+      pre.scrollTop = pre.scrollHeight;
+    } catch (e) {
+      stop(); if (status) status.hidden = true;   // 网络失败：停轮询，保留已有内容
+    }
+  };
+  tick();   // 展开即拉一次
+  intervalId = setInterval(tick, 500);
+  state.tasks.pollers.set(key, intervalId);
+}
+
+function stopTaskPoller(key) {
+  const id = state.tasks.pollers.get(key);
+  if (id != null) { clearInterval(id); state.tasks.pollers.delete(key); }
+}
+
+/* delegate（subagent）内嵌 SSE：复用 /api/sessions/{sid}/events，只取
+   assistant 相关事件文本追加到 .task-stream 滚动区。snapshot/resync
+   （重连重放最近事件）→ 整体替换为其中的 assistant 文本，避免重复；
+   live AssistantText → 替换；AssistantDelta → 追加。
+   404（历史 subagent 会话已结束/不存在）→ 提示「任务已结束」。
+   收起/任务消失/重绘 → abort 流。累积文本存 state.tasks.streamText，
+   2s 轮询重绘重启流时恢复，不闪断。 */
+function startTaskStream(t, key, streamEl, status) {
+  stopTaskStream(key);
+  const ctrl = new AbortController();
+  state.tasks.streams.set(key, ctrl);
+  if (status) status.hidden = false;
+  streamEl.classList.remove("empty");
+  streamEl.textContent = state.tasks.streamText.get(key) || "(等待流式输出…)";
+  streamEl.scrollTop = streamEl.scrollHeight;
+  (async () => {
+    try {
+      const res = await api("/api/sessions/" + encodeURIComponent(t.session_id || "") + "/events", {
+        headers: { "Accept": "text/event-stream" },
+        signal: ctrl.signal,
+      });
+      if (res.status === 401 || res.status === 403) {
+        setBanner("⚠ 认证失败：请检查 Token。");
+        if (status) status.hidden = true;
+        return;
+      }
+      if (res.status === 404) {              // 历史 subagent：会话已结束
+        setTaskStreamText(streamEl, key, "任务已结束");
+        if (status) status.hidden = true;
+        return;
+      }
+      if (!res.ok || !res.body) {
+        setTaskStreamText(streamEl, key, "流式输出不可用（HTTP " + res.status + "）");
+        if (status) status.hidden = true;
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (ctrl.signal.aborted) break;
+        buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          handleTaskStreamBlock(block, streamEl, key);
+        }
+      }
+      // 正常结束（后端关闭流）：停止消费，保留已显示内容
+      if (status) status.hidden = true;
+    } catch (e) {
+      if (e && e.name === "AbortError") return;   // 主动收起/任务消失/重绘
+      // 网络失败：保留已显示内容
+    } finally {
+      // 只清自己的条目：2s 重绘会先 abort 旧流再启新流（key 相同），
+      // 旧流的 finally 不能误删新流的 AbortController
+      if (state.tasks.streams.get(key) === ctrl) state.tasks.streams.delete(key);
+    }
+  })();
+}
+
+function stopTaskStream(key) {
+  const ctrl = state.tasks.streams.get(key);
+  if (ctrl) { ctrl.abort(); state.tasks.streams.delete(key); }
+}
+
+/* 整体替换流式区文本（snapshot 重放 / AssistantText / 404 提示） */
+function setTaskStreamText(streamEl, key, text) {
+  state.tasks.streamText.set(key, text);
+  if (streamEl.isConnected) {
+    streamEl.classList.toggle("empty", String(text).trim() === "");
+    streamEl.textContent = text;
+    streamEl.scrollTop = streamEl.scrollHeight;
+  }
+}
+
+/* 追加流式文本（live AssistantDelta） */
+function appendTaskStreamText(streamEl, key, text) {
+  if (!text) return;
+  const next = (state.tasks.streamText.get(key) || "") + text;
+  state.tasks.streamText.set(key, next);
+  if (streamEl.isConnected) {
+    streamEl.classList.remove("empty");
+    streamEl.textContent = next;
+    streamEl.scrollTop = streamEl.scrollHeight;
+  }
+}
+
+/* 解析单个 SSE 事件块（轻量：只处理 assistant 相关事件）。
+   live 帧 event 名为 CamelCase（AssistantText/AssistantDelta），data 是
+   {text|delta,...}；snapshot/resync 的 data 是 AgentEvent 数组
+   （{type:"assistant_text"|"assistant_delta", data:"..."}）。 */
+function handleTaskStreamBlock(block, streamEl, key) {
+  let eventName = "message";
+  const dataLines = [];
+  for (const line of block.split("\n")) {
+    if (line.startsWith(":")) continue;                 // 心跳/注释行
+    if (line.startsWith("event:")) eventName = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+  }
+  if (!dataLines.length) return;
+  const data = dataLines.join("\n");
+
+  if (eventName === "snapshot" || eventName === "resync") {
+    // 重连重放：整体替换（assistant_text 置替、assistant_delta 追加），防重复
+    try {
+      const parsed = JSON.parse(data);
+      const events = Array.isArray(parsed) ? parsed : (parsed.events || []);
+      let acc = "";
+      for (const ev of events) {
+        if (!ev || typeof ev !== "object") continue;
+        const txt = ev.data !== undefined ? ev.data : "";
+        if (ev.type === "assistant_text") acc = String(txt);
+        else if (ev.type === "assistant_delta") acc += String(txt);
+      }
+      if (acc) setTaskStreamText(streamEl, key, acc);
+    } catch (e) { /* 坏数据：忽略 */ }
+    return;
+  }
+  if (eventName === "AssistantText") {
+    let txt = data;
+    try { txt = pickText(JSON.parse(data), ["text", "content"]); } catch (e) { /* 原样 */ }
+    if (txt) setTaskStreamText(streamEl, key, String(txt));
+    return;
+  }
+  if (eventName === "AssistantDelta") {
+    let txt = data;
+    try { txt = pickText(JSON.parse(data), ["delta", "text", "content"]); } catch (e) { /* 原样 */ }
+    appendTaskStreamText(streamEl, key, String(txt));
+    return;
+  }
+}
+
 /* 渲染任务列表到指定容器（树分组 + composer 面板两处共用）。
-   opts.onOpen：delegate 行点击回调（bash 行点击永远只是展开/收起输出）。
-   重绘前记录已展开输出的行并按任务 key（session_id:id）恢复——2s 轮询
-   重绘不打断正在查看的输出。 */
-function renderTaskList(tasks, container, opts) {
+   bash：行点击展开 .task-output（静态尾部）+ 500ms 轮询 output 端点
+   （旧后端 404 → 停轮询，降级为静态尾部）；delegate：行点击展开内嵌
+   SSE 流式区 .task-stream（/api/sessions/{sid}/events），不再切走会话。
+   重绘前记录已展开的行并按任务 key（session_id:id）恢复——2s 轮询重绘
+   不打断正在查看的输出/流；消失的任务在此停掉轮询/流并清理文本缓冲。 */
+function renderTaskList(tasks, container) {
   const list = container;
   if (!list) return;
-  // 轮询重绘前保留「输出已展开」的行（按任务 key 恢复）
+  // 记录「已展开」的行（输出区或流式区），并停掉本容器所有轮询/流——
+  // 重建行后按展开状态重启；仍在列表里的任务重连（流用缓冲续上），
+  // 已消失的任务下方统一清理。
   const prevExpanded = new Set();
   for (const row of list.querySelectorAll(".task-row")) {
+    const key = row.getAttribute("data-task");
+    if (!key) continue;
     const pre = row.querySelector(".task-output");
-    if (pre && !pre.hidden) {
-      const key = row.getAttribute("data-task");
-      if (key) prevExpanded.add(key);
-    }
+    const streamEl = row.querySelector(".task-stream");
+    if ((pre && !pre.hidden) || (streamEl && !streamEl.hidden)) prevExpanded.add(key);
+    stopTaskPoller(key);
+    stopTaskStream(key);
+  }
+  // 消失的任务：清理已累积的流式文本缓冲与降级标记（轮询/流已在上方停掉）。
+  // 放在空列表早退之前：任务全部结束时也要清理，防泄漏。
+  const activeKeys = new Set();
+  for (const t of tasks) {
+    activeKeys.add((t.session_id || "") + ":" + (t.id != null ? t.id : ""));
+  }
+  for (const k of Array.from(state.tasks.streamText.keys())) {
+    if (!activeKeys.has(k)) state.tasks.streamText.delete(k);
+  }
+  for (const k of Array.from(state.tasks.degraded.keys())) {
+    if (!activeKeys.has(k)) state.tasks.degraded.delete(k);
   }
   list.innerHTML = "";
   if (!tasks.length) {
@@ -1571,25 +1758,34 @@ function renderTaskList(tasks, container, opts) {
   }
   for (const t of tasks) {
     const row = el("div", "task-row");
-    row.setAttribute("data-task", t.session_id + ":" + t.id);
-    const isDelegate = t.kind === "delegate" && opts && typeof opts.onOpen === "function";
-    row.title = isDelegate
-      ? "点击切换到 subagent 会话（旧后端：仅展开输出）"
-      : "点击展开 / 收起输出";
+    const key = (t.session_id || "") + ":" + (t.id != null ? t.id : "");
+    row.setAttribute("data-task", key);
+    const isDelegate = t.kind === "delegate";
+    row.title = isDelegate ? "点击就地查看子代理流式输出" : "点击展开 / 收起输出";
     const line = el("div", "task-line");
-    const badge = el("span", "kind-badge " + (t.kind === "delegate" ? "delegate" : "bash"),
-      t.kind === "delegate" ? "子代理" : "bash");
+    const badge = el("span", "kind-badge " + (isDelegate ? "delegate" : "bash"),
+      isDelegate ? "子代理" : "bash");
     line.appendChild(badge);
     line.appendChild(el("span", "task-label", shortTaskLabel(t)));
     if (t.role) line.appendChild(el("span", "task-meta trole", t.role));
     if (t.session_id) line.appendChild(el("span", "task-meta tsid", "会话 " + shortId(t.session_id)));
+    const status = el("span", "task-stream-status", "● 流式输出中…");
+    status.hidden = true;   // 仅轮询/流进行中显示（轻量视觉提示）
+    line.appendChild(status);
     row.appendChild(line);
 
-    const out = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
-    const pre = el("pre", "task-output" + (out ? "" : " empty"), out || "(无输出)");
-    pre.hidden = true;
-    row.appendChild(pre);
-    // 取消按钮默认不显示，藏进展开的输出区（防误触）：行展开输出时才出现，
+    let pre = null, streamEl = null;
+    if (isDelegate) {
+      streamEl = el("pre", "task-stream", "(等待流式输出…)");
+      streamEl.hidden = true;
+      row.appendChild(streamEl);
+    } else {
+      const out = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
+      pre = el("pre", "task-output" + (out ? "" : " empty"), out || "(无输出)");
+      pre.hidden = true;
+      row.appendChild(pre);
+    }
+    // 取消按钮默认不显示，藏进展开的输出/流式区（防误触）：展开时才出现，
     // 点击需 confirm 确认后才真正取消。
     const cancel = el("button", "task-cancel task-cancel-inside", "取消");
     cancel.title = "取消任务 " + (t.id != null ? t.id : "");
@@ -1601,12 +1797,42 @@ function renderTaskList(tasks, container, opts) {
     });
     row.appendChild(cancel);
     row.addEventListener("click", () => {
-      if (isDelegate) { opts.onOpen(t, row); return; }
-      pre.hidden = !pre.hidden;
-      cancel.hidden = !cancel.hidden;   // 收起输出时同步隐藏取消按钮
+      const showing = isDelegate ? !streamEl.hidden : !pre.hidden;
+      if (showing) {                 // 当前展开 → 收起：停轮询/流
+        if (isDelegate) {
+          streamEl.hidden = true;
+          stopTaskStream(key);
+          state.tasks.streamText.delete(key);
+        } else {
+          pre.hidden = true;
+          stopTaskPoller(key);
+          state.tasks.degraded.delete(key);   // 收起即重置：重新展开时重新尝试轮询
+        }
+        status.hidden = true;
+        cancel.hidden = true;
+      } else {                       // 当前收起 → 展开：启动轮询/流
+        if (isDelegate) {
+          streamEl.hidden = false;
+          startTaskStream(t, key, streamEl, status);
+        } else {
+          pre.hidden = false;
+          if (!state.tasks.degraded.has(key)) {   // 已降级（404）：只显示静态尾部
+            startTaskOutputPolling(t, key, pre, status);
+          }
+        }
+        cancel.hidden = false;
+      }
     });
-    if (prevExpanded.has(row.getAttribute("data-task"))) {
-      pre.hidden = false;
+    if (prevExpanded.has(key)) {     // 轮询重绘恢复展开态：重启轮询/流
+      if (isDelegate) {
+        streamEl.hidden = false;
+        startTaskStream(t, key, streamEl, status);
+      } else {
+        pre.hidden = false;
+        if (!state.tasks.degraded.has(key)) {     // 降级行不重启轮询
+          startTaskOutputPolling(t, key, pre, status);
+        }
+      }
       cancel.hidden = false;
     }
     list.appendChild(row);
@@ -1726,7 +1952,7 @@ function buildSidebarTasksGroup() {
     toggle.classList.toggle("open", state.sidebar.tasksOpen);
     toggle.textContent = state.sidebar.tasksOpen ? "▾" : "▸";
     if (state.sidebar.tasksOpen && body) {
-      renderTaskList(state.tasks.list || [], body, { onOpen: onDelegateTaskOpen });
+      renderTaskList(state.tasks.list || [], body);
     }
   });
   const label = el("span", "tree-id tree-group tasks-group-label", "运行中任务 (0)");
@@ -1735,7 +1961,7 @@ function buildSidebarTasksGroup() {
   const body = el("div", "tree-children tasks-group-body");
   body.hidden = !state.sidebar.tasksOpen;
   node.appendChild(body);
-  renderTaskList(state.tasks.list || [], body, { onOpen: onDelegateTaskOpen });
+  renderTaskList(state.tasks.list || [], body);
   node.hidden = !(state.tasks.list || []).length;   // 无任务：整组隐藏（与 updateSidebarTasksGroup 一致）
   return node;
 }
