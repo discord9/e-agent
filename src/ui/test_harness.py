@@ -186,7 +186,7 @@ for(const id of ["topActions","backBtn","backParentBtn","connState","banner","ba
   "newPrompt","newSessionBtn","sessionList","listMeta","listHint","chatSessionId","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn","searchInput",
   "queueBar","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
-  "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks"]) elsById[id]=new El(id);
+  "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks","forkMenu"]) elsById[id]=new El(id);
 
 const _ls={};
 globalThis.localStorage={ getItem:k=>_ls[k]??null, setItem:(k,v)=>{_ls[k]=v;}, removeItem:k=>{delete _ls[k];} };
@@ -255,6 +255,13 @@ function resp(status, body){ return Promise.resolve({ ok:status>=200&&status<300
 // 任务输出块测试用：/api/tasks 响应与 output 端点文本（测试中可变）
 let tasksData = [];
 let taskOutputText = "";
+// fork 面板测试用：/fork-candidates 候选与 /fork POST 响应（测试中可变）
+let forkCandidatesData = [
+  {at:2, seq:2, preview:"用户：你好，帮我看看"},
+  {at:5, seq:7, preview:"助手：完成。这是一段很长的回复内容，需要被截断显示以保持菜单行整洁……"},
+  {at:8, seq:10, preview:"系统提示行"},
+];
+let forkPostResp = resp(201,{id:"fork-1"});
 globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
   const m=(opts.method||"GET").toUpperCase();
@@ -271,8 +278,12 @@ globalThis.fetch=(url,opts={})=>{
     return resp(200, historyData);   // 含 ?limit=…（loadHistory 尾部翻页）
   }
   if(url.startsWith("/api/sessions/s2/history")) return resp(200, historyData);
+  if(url.startsWith("/api/sessions/fork-1/history")) return resp(200, {entries:[], next_before_seq:null});
   if(url==="/api/sessions/s1/events") return resp(200, stream());
   if(url==="/api/sessions/s2/events") return resp(200, stream());
+  if(url==="/api/sessions/fork-1/events") return resp(200, stream());
+  if(url==="/api/sessions/s1/fork-candidates") return resp(200, forkCandidatesData);
+  if(url==="/api/sessions/s1/fork"&&m==="POST") return forkPostResp;
   if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/compact")) return resp(202,{});
@@ -357,12 +368,12 @@ async function main(){
     const pin = elsById["promptInput"];
     const kd = (key, extra) => { for (const fn of pin._listeners["keydown"] || []) fn(Object.assign({ key, shiftKey: false, preventDefault(){} }, extra || {})); };
     const inp = () => { for (const fn of pin._listeners["input"] || []) fn(); };
-    // 输入 /（命令起始）→ 弹出 4 个候选，首项选中
+    // 输入 /（命令起始）→ 弹出 5 个候选，首项选中
     pin.value = "/";
     pin.selectionStart = pin.selectionEnd = 1;
     inp();
     chk("slash menu opens on /", slashMenu.open === true && sm.hidden === false
-        && sm.querySelectorAll(".slash-item").length === 4,
+        && sm.querySelectorAll(".slash-item").length === 5,
         "open=" + slashMenu.open + " items=" + sm.querySelectorAll(".slash-item").length);
     chk("slash first item selected", slashMenu.selected === 0
         && sm.querySelectorAll(".slash-item")[0].classList.contains("selected"));
@@ -382,7 +393,7 @@ async function main(){
     chk("slash arrow down moves selection", slashMenu.selected === 1,
         "sel=" + slashMenu.selected);
     kd("ArrowUp"); kd("ArrowUp");
-    chk("slash arrow up wraps", slashMenu.selected === 3, "sel=" + slashMenu.selected);
+    chk("slash arrow up wraps", slashMenu.selected === 4, "sel=" + slashMenu.selected);
     kd("ArrowDown");
     chk("slash arrow down wraps to 0", slashMenu.selected === 0, "sel=" + slashMenu.selected);
     // Enter 填入带参数命令：/rename <标题>，光标在参数位（占位被选中，输入即覆盖）
@@ -441,6 +452,98 @@ async function main(){
         "n=" + slashMenu.items.length);
     pin.value = "";
     inp();
+
+    // ---- fork 面板：/fork 命令 + 候选列表 + POST /fork 建新会话 ----
+    const fm = elsById["forkMenu"];
+    // /fork 输入后回车 → sendPrompt 命中命令分支 → 打开面板并拉取候选
+    pin.value = "/fork";
+    await sendPrompt();
+    await flush();
+    chk("fork menu opens on /fork", forkMenu.open === true && fm.hidden === false
+        && fm.querySelectorAll(".fork-item").length === 3,
+        "open=" + forkMenu.open + " items=" + fm.querySelectorAll(".fork-item").length);
+    chk("fork first item selected", forkMenu.selected === 0
+        && fm.querySelectorAll(".fork-item")[0].classList.contains("selected"));
+    const frow0 = fm.querySelectorAll(".fork-item")[0];
+    chk("fork row shows at + preview", frow0.querySelector(".fork-at").textContent === "2"
+        && frow0.querySelector(".fork-preview").textContent.includes("你好"),
+        "at=" + frow0.querySelector(".fork-at").textContent);
+    // ↑↓ 循环移动选中
+    kd("ArrowDown");
+    chk("fork arrow down moves", forkMenu.selected === 1, "sel=" + forkMenu.selected);
+    kd("ArrowUp"); kd("ArrowUp");
+    chk("fork arrow up wraps", forkMenu.selected === 2, "sel=" + forkMenu.selected);
+    // Esc 关闭
+    kd("Escape");
+    chk("fork esc closes", forkMenu.open === false && fm.hidden === true);
+    // 空候选 → 面板显示空提示
+    forkCandidatesData = [];
+    pin.value = "/fork";
+    await sendPrompt();
+    await flush();
+    chk("fork empty hint shown", forkMenu.open === true && fm.hidden === false
+        && fm.querySelector(".fork-empty") !== null
+        && fm.textContent.includes("没有可 fork 的边界消息"),
+        "open=" + forkMenu.open);
+    kd("Escape");
+    // 选中一项 → POST /fork → 打开新会话、清空输入框、成功 banner
+    forkCandidatesData = [{at:2, seq:2, preview:"用户：你好，帮我看看"}];
+    const forkFetchBefore = FETCHES.filter(u => u.endsWith("/fork")).length;
+    pin.value = "/fork";
+    await sendPrompt();
+    await flush();
+    kd("Enter");
+    await flush();
+    await flush();
+    chk("fork select POSTs /fork", FETCHES.filter(u => u.endsWith("/fork")).length === forkFetchBefore + 1,
+        "n=" + FETCHES.filter(u => u.endsWith("/fork")).length);
+    chk("fork select opens new session", state.sessionId === "fork-1" && state.view === "chat",
+        "sid=" + state.sessionId);
+    chk("fork clears input", pin.value === "");
+    chk("fork success banner", elsById["bannerText"].textContent.includes("fork-1"),
+        "banner=" + elsById["bannerText"].textContent);
+    // 409（非边界/越界）：提示原因并重开面板（保留候选供重选）
+    forkPostResp = resp(409, { error: "at 不是 turn 边界" });
+    openSession("s1");
+    await flush();
+    await flush();
+    pin.value = "/fork";
+    await sendPrompt();
+    await flush();
+    kd("Enter");
+    await flush();
+    chk("fork 409 reopens menu", forkMenu.open === true && fm.hidden === false
+        && fm.querySelectorAll(".fork-item").length === 1,
+        "open=" + forkMenu.open + " items=" + fm.querySelectorAll(".fork-item").length);
+    chk("fork 409 warns", elsById["bannerText"].textContent.includes("不是 turn 边界"),
+        "banner=" + elsById["bannerText"].textContent);
+    kd("Escape");
+    // 失焦关闭
+    forkPostResp = resp(201, {id:"fork-1"});
+    pin.value = "/fork";
+    await sendPrompt();
+    await flush();
+    chk("fork open before blur", forkMenu.open === true);
+    for (const fn of pin._listeners["blur"] || []) fn();
+    chk("fork blur closes", forkMenu.open === false && fm.hidden === true);
+    // 点击行选中（mousedown preventDefault 保焦点 + click 触发）
+    pin.value = "/fork";
+    await sendPrompt();
+    await flush();
+    const frow = fm.querySelectorAll(".fork-item")[0];
+    frow._listeners["mousedown"][0]({ preventDefault(){} });
+    frow._listeners["click"][0]();
+    await flush();
+    await flush();
+    chk("fork click selects", state.sessionId === "fork-1" && forkMenu.open === false,
+        "sid=" + state.sessionId);
+    // 回 s1（缓存恢复 nextBeforeSeq/olderDone），保持后续重连/分页测试前提
+    openSession("s1");
+    await flush();
+    await flush();
+    chk("fork back to s1 restores paging", state.sessionId === "s1"
+        && state.nextBeforeSeq === 100 && state.olderDone === false,
+        "sid=" + state.sessionId + " next=" + state.nextBeforeSeq);
 
     // 断线重连：销毁当前流后应重新走 history+SSE
     const oldInit = state.initSource;

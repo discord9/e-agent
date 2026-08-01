@@ -273,6 +273,16 @@ els.sendBtn.addEventListener("click", sendPrompt);
 els.cancelBtn.addEventListener("click", cancelTurn);
 els.compactBtn.addEventListener("click", compactSession);
 els.promptInput.addEventListener("keydown", (e) => {
+  // fork 面板开着时优先处理：↑↓ 移动选中、Enter/Tab 选中、Esc 关闭
+  // （fork 面板与 slash 菜单不会同时开——input 事件在 fork 面板开着时
+  //  跳过 updateSlashMenu——但顺序上仍先判 forkMenu.open）。
+  if (forkMenu.open) {
+    if (e.key === "ArrowDown") { e.preventDefault(); moveForkMenu(1); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); moveForkMenu(-1); return; }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); selectForkItem(forkMenu.selected); return; }
+    if (e.key === "Tab") { e.preventDefault(); selectForkItem(forkMenu.selected); return; }
+    if (e.key === "Escape") { e.preventDefault(); closeForkMenu(); return; }
+  }
   // 斜杠菜单开着时：↑↓ 移动选中、Esc 关闭、Tab 填入；Enter 落到下方分支
   // （菜单开着 = 选中当前项填入，菜单关着 = 正常发送）。
   if (slashMenu.open) {
@@ -287,8 +297,12 @@ els.promptInput.addEventListener("keydown", (e) => {
     else sendPrompt();
   }
 });
-els.promptInput.addEventListener("input", () => { autosizeInput(); updateSlashMenu(); });
-els.promptInput.addEventListener("blur", closeSlashMenu);   // 失焦关闭菜单
+els.promptInput.addEventListener("input", () => {
+  autosizeInput();
+  if (forkMenu.open) return;   // fork 面板开着：不弹 slash 菜单，避免两面板重叠
+  updateSlashMenu();
+});
+els.promptInput.addEventListener("blur", () => { closeSlashMenu(); closeForkMenu(); });   // 失焦关闭菜单/面板
 els.messages.addEventListener("scroll", (ev) => {
   // 只有用户主动滚动才处理；程序滚动（scrollTop 赋值）不碰 userScrolled。
   if (!ev.isTrusted) return;

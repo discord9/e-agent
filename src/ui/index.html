@@ -92,6 +92,9 @@
     <!-- 斜杠命令补全菜单：输入框上方浮出（absolute 定位在 composer 内），
          输入 / 且是命令起始时弹出，↑↓ 选择、Enter/Tab 填入、Esc 关闭 -->
     <div id="slashMenu" class="slash-menu" hidden></div>
+    <!-- fork 面板：/fork 命令弹出的历史边界消息选择（absolute 定位在
+         composer 内，与 slash 菜单同风格；选中一项 → POST /fork 建新会话） -->
+    <div id="forkMenu" class="fork-menu" hidden></div>
     <textarea id="promptInput" rows="1" placeholder="输入消息：Enter 发送，Shift+Enter 换行…" title="支持斜杠命令：/compact 压缩上下文；/rename &lt;标题&gt; 重命名（留空可清除）；/btw &lt;问题&gt; 旁路子代理"></textarea>
     <div class="composer-foot">
       <div id="composerMeta" class="composer-meta" hidden></div>
