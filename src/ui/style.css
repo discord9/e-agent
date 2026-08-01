@@ -888,6 +888,13 @@ mmlEqnNo}
   }
   .task-cancel:hover:not(:disabled) { background: var(--red); color: var(--base3); border-color: var(--red); }
   .task-cancel:disabled { opacity: 0.4; cursor: not-allowed; }
+  /* 展开输出区内的取消按钮（行内默认不再显示，防误触）：
+     位于输出下方，红字红边与 .task-cancel 一致，略大一点点击区 */
+  .task-cancel-inside {
+    display: block;
+    margin: 8px 0 0 auto;   /* 与输出间距 8px，右对齐 */
+    padding: 2px 12px;
+  }
   .task-output {
     margin: 6px 0 0;
     padding: 6px 8px;

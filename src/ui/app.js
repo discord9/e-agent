@@ -1538,6 +1538,8 @@ function onDelegateTaskOpen(t, row) {
   setBanner("⚠ 当前服务器不支持直接打开运行中的子代理会话（旧后端）；仅展开输出。", true);
   const pre = row && row.querySelector(".task-output");
   if (pre) pre.hidden = false;
+  const cancel = row && row.querySelector(".task-cancel");
+  if (cancel) cancel.hidden = false;   // 展开输出时同步显示取消按钮（与行点击逻辑一致）
 }
 
 function shortTaskLabel(t) {
@@ -1581,24 +1583,32 @@ function renderTaskList(tasks, container, opts) {
     line.appendChild(el("span", "task-label", shortTaskLabel(t)));
     if (t.role) line.appendChild(el("span", "task-meta trole", t.role));
     if (t.session_id) line.appendChild(el("span", "task-meta tsid", "会话 " + shortId(t.session_id)));
-    const cancel = el("button", "task-cancel", "取消");
-    cancel.title = "取消任务 " + (t.id != null ? t.id : "");
-    cancel.addEventListener("click", async (ev) => {
-      ev.stopPropagation();
-      await cancelTask(t);
-    });
-    line.appendChild(cancel);
     row.appendChild(line);
 
     const out = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
     const pre = el("pre", "task-output" + (out ? "" : " empty"), out || "(无输出)");
     pre.hidden = true;
     row.appendChild(pre);
+    // 取消按钮默认不显示，藏进展开的输出区（防误触）：行展开输出时才出现，
+    // 点击需 confirm 确认后才真正取消。
+    const cancel = el("button", "task-cancel task-cancel-inside", "取消");
+    cancel.title = "取消任务 " + (t.id != null ? t.id : "");
+    cancel.hidden = true;
+    cancel.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      if (!window.confirm("确认取消任务 " + shortTaskLabel(t) + "？")) return;
+      await cancelTask(t);
+    });
+    row.appendChild(cancel);
     row.addEventListener("click", () => {
       if (isDelegate) { opts.onOpen(t, row); return; }
       pre.hidden = !pre.hidden;
+      cancel.hidden = !cancel.hidden;   // 收起输出时同步隐藏取消按钮
     });
-    if (prevExpanded.has(row.getAttribute("data-task"))) pre.hidden = false;
+    if (prevExpanded.has(row.getAttribute("data-task"))) {
+      pre.hidden = false;
+      cancel.hidden = false;
+    }
     list.appendChild(row);
   }
 }
