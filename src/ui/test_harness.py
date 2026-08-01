@@ -10,8 +10,10 @@ Not part of the product; safe to delete.
 import os, re, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-html = open(os.path.join(HERE, 'index.html'), encoding='utf-8').read()
-js = re.findall(r'<script>(.*?)</script>', html, re.S)[0]
+# index.html 的 <script> 是构建期占位符（/*__JS_APP__*/ 等由 server.rs 替换），
+# 直接读 app.js + vendor/marked.min.js，等价于 server 组装的单文件。
+js = open(os.path.join(HERE, 'app.js'), encoding='utf-8').read()
+vendor_js = open(os.path.join(HERE, 'vendor', 'marked.min.js'), encoding='utf-8').read()
 
 MODE = os.environ.get('MODE', 'open')   # 'open' = openSession path, 'direct' = loadHistory
 TRACE = os.environ.get('TRACE') == '1'
@@ -34,15 +36,89 @@ if TRACE:
         'if (!res.ok || !res.body) throw new Error("HTTP " + res.status);\n    console.log("SSE: body ok, has getReader:", typeof res.body.getReader);')
 
 HARNESS = r'''
+/* 极简 HTML 序列化/解析：让 innerHTML 读-写往返与真实浏览器行为一致
+   （restored 分支的缓存恢复、resync 的离屏容器替换都依赖 innerHTML）。 */
+function escHtml(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+function serEl(e){
+  if (e.tag === "#comment") return "<!--" + (e.textContent||"") + "-->";
+  let out = "<" + e.tag;
+  if (e._classes.size) out += ' class="' + [...e._classes].join(" ") + '"';
+  out += ">";
+  if (e._children.length) {
+    for (const c of e._children) {
+      out += (c instanceof El) ? serEl(c) : (c.text != null ? escHtml(c.text) : "");
+    }
+  } else if (e._innerHTML) {
+    out += e._innerHTML;   // renderMarkdown 等直接赋的 HTML 串
+  } else if (e.textContent) {
+    out += escHtml(e.textContent);
+  }
+  return out + "</" + e.tag + ">";
+}
+function parseHtml(html){
+  const roots = [];
+  const s = String(html);
+  let i = 0;
+  const n = s.length;
+  const pushText = (parent, t) => { if (t) parent.push({text: t}); };
+  function walk(parent, stopTag){
+    let text = "";
+    while (i < n) {
+      if (s[i] === "<") {
+        if (s.startsWith("<!--", i)) { const e = s.indexOf("-->", i); i = e >= 0 ? e + 3 : n; continue; }
+        if (s.startsWith("</", i)) {
+          const m = /^<\/([a-zA-Z0-9-]+)>/.exec(s.slice(i));
+          if (m) { i += m[0].length; if (stopTag && m[1] === stopTag) { pushText(parent, text); return; } continue; }
+        }
+        const m = /^<([a-zA-Z0-9-]+)((?:\s+[a-zA-Z-]+="[^"]*")*)\s*\/?>/.exec(s.slice(i));
+        if (m) {
+          pushText(parent, text); text = "";
+          i += m[0].length;
+          const tag = m[1];
+          const voidEl = tag === "br" || tag === "hr" || tag === "img" || m[0].endsWith("/>");
+          const e = new El(tag);
+          const cls = [];
+          let am;
+          const attrRe = /\s+([a-zA-Z-]+)="([^"]*)"/g;
+          while ((am = attrRe.exec(m[2]))) { if (am[1] === "class") cls.push(am[2]); }
+          if (cls.length) e.className = cls.join(" ");
+          parent.push(e);
+          if (!voidEl) walk(e._children, tag);
+          continue;
+        }
+      }
+      if (s.startsWith("&lt;", i)) { text += "<"; i += 4; continue; }
+      if (s.startsWith("&gt;", i)) { text += ">"; i += 4; continue; }
+      if (s.startsWith("&amp;", i)) { text += "&"; i += 5; continue; }
+      if (s.startsWith("&quot;", i)) { text += '"'; i += 6; continue; }
+      if (s.startsWith("&#39;", i)) { text += "'"; i += 5; continue; }
+      text += s[i]; i += 1;
+    }
+    pushText(parent, text);
+  }
+  walk(roots, null);
+  return roots;
+}
+function matchSel(el, sel){
+  const parts = String(sel).split(".");
+  let tag = parts[0];
+  const classes = parts.slice(1).filter(Boolean);
+  if (tag === "*") tag = "";
+  if (tag && el.tag !== tag) return false;
+  for (const c of classes) if (!(el._classes && el._classes.has(c))) return false;
+  return true;
+}
 class El {
   constructor(tag){ this.tag=tag; this._children=[]; this._classes=new Set();
-    this._className=""; this.textContent=""; this._innerHTML=""; this.hidden=false;
-    this.disabled=false; this.value=""; this.title=""; this.style={};
-    this.scrollHeight=0; this.scrollTop=0; this.clientHeight=0;
-    this._parent=null; this._listeners={};
+    this._className=""; this._text=""; this._innerHTML=""; this.hidden=false;
+    this.disabled=false; this.value=""; this.title=""; this.type=""; this.style={};
+    this.scrollHeight=0; this.scrollTop=0; this.clientHeight=0; this.offsetParent=null;
+    this._parent=null; this._listeners={}; this._attrs={};
     this.classList={ add:(...c)=>c.forEach(x=>this._classes.add(x)),
       remove:(...c)=>c.forEach(x=>this._classes.delete(x)),
-      contains:(c)=>this._classes.has(c) }; }
+      contains:(c)=>this._classes.has(c),
+      toggle:(c,force)=>{ const on = force !== undefined ? !!force : !this._classes.has(c);
+        if (on) this._classes.add(c); else this._classes.delete(c); return on; } }; }
   get children(){ return this._children; }
   get firstChild(){ return this._children[0] ?? null; }
   get nextSibling(){ if(!this._parent) return null;
@@ -50,8 +126,28 @@ class El {
     return i>=0 && i+1<this._parent._children.length ? this._parent._children[i+1] : null; }
   get className(){ return this._className; }
   set className(v){ this._className=String(v); this._classes=new Set(String(v).split(/\s+/).filter(Boolean)); }
-  get innerHTML(){ return this._innerHTML; }
-  set innerHTML(v){ if(v==="") this._children=[]; this._innerHTML=v; }
+  /* innerHTML 序列化只含内容（不含自身标签），与真实 DOM 一致 */
+  get innerHTML(){ if (this._children.length)
+      return this._children.map((c) => (c instanceof El) ? serEl(c) : (c.text != null ? escHtml(c.text) : "")).join("");
+    if (this._innerHTML) return this._innerHTML;
+    if (this.textContent) return escHtml(this.textContent);
+    return ""; }
+  set innerHTML(v){ if(String(v)==="") { this._children=[]; this._innerHTML=""; }
+    else { this._children = parseHtml(v); this._innerHTML=""; } }
+  /* 与真实 DOM 一致：textContent 取文本后代拼接；赋值则整体替换（清子节点） */
+  get textContent(){ if (this._children.length) {
+      let out = "";
+      for (const c of this._children) out += (c instanceof El) ? c.textContent : (c.text != null ? c.text : "");
+      return out;
+    } return this._text; }
+  set textContent(v){ this._text = String(v == null ? "" : v); this._children = []; this._innerHTML = ""; }
+  setAttribute(k, v){ this._attrs[k]=String(v); }
+  getAttribute(k){ return Object.prototype.hasOwnProperty.call(this._attrs,k) ? this._attrs[k] : null; }
+  hasAttribute(k){ return Object.prototype.hasOwnProperty.call(this._attrs,k); }
+  removeAttribute(k){ delete this._attrs[k]; }
+  cloneNode(){ const c = new El(this.tag); c._className=this._className;
+    c._classes=new Set(this._classes); c.textContent=this.textContent;
+    c.hidden=this.hidden; c._attrs=Object.assign({}, this._attrs); return c; }
   append(...nodes){ for(const n of nodes){ if(n==null) continue;
     const c=typeof n==="string"?{text:n}:n; this._children.push(c); if(c._parent===undefined) c._parent=this; } }
   appendChild(n){ this._children.push(n); n._parent=this; return n; }
@@ -64,21 +160,33 @@ class El {
     this._parent=null; } }
   insertAdjacentText(pos, t){ if(pos==="beforeend") this._children.push({text:t}); }
   addEventListener(type, fn){ (this._listeners[type] || (this._listeners[type]=[])).push(fn); }
-  querySelector(sel){ const cls=sel.replace(".","");
-    const walk=(e)=>{ for(const c of e._children){ if(c._classes&&c._classes.has(cls)) return c; const r=walk(c); if(r) return r; } return null; };
-    return walk(this); }
+  querySelectorAll(sel){ const out=[];
+    const walk=(e)=>{ for(const c of e._children){ if(c instanceof El){
+      if(matchSel(c,sel)) out.push(c); walk(c); } } };
+    walk(this); return out; }
+  querySelector(sel){ return this.querySelectorAll(sel)[0] ?? null; }
 }
 const elsById={};
 for(const id of ["topActions","backBtn","connState","banner","tokenInput","listView","chatView",
   "newPrompt","newSessionBtn","sessionList","listMeta","listHint","chatSessionId","chatStatus",
-  "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn"]) elsById[id]=new El(id);
+  "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn","searchInput",
+  "queueBar","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
+  "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks"]) elsById[id]=new El(id);
 
 const _ls={};
 globalThis.localStorage={ getItem:k=>_ls[k]??null, setItem:(k,v)=>{_ls[k]=v;}, removeItem:k=>{delete _ls[k];} };
+const _docEl = new El("html");
 globalThis.document={ createElement:t=>new El(t), createComment:t=>new El("#comment"),
-  getElementById:id=>elsById[id] };
+  getElementById:id=>elsById[id], addEventListener(){}, documentElement:_docEl };
 globalThis.navigator={ onLine:true };
 globalThis.confirm=()=>true;
+// gjs 自带 window 全局（不可整体替换）：就地补上页面需要的属性
+window.visualViewport=null; window.innerHeight=800;
+window.addEventListener=()=>{}; window.confirm=()=>true; window.setTimeout=()=>0;
+globalThis.history={ replaceState(){} };
+globalThis.location={ search:"" };
+globalThis.URLSearchParams=class{ constructor(){} get(){ return null; } };
+globalThis.requestAnimationFrame=()=>0;
 globalThis.AbortController=class{ constructor(){this.signal={};} abort(){} };
 // gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；用工厂替换页面里的 new TextDecoder()
 function makeTextDecoder(){ return { decode(v){ return typeof v==="string"?v:""; } }; }
@@ -88,7 +196,7 @@ globalThis.clearInterval=()=>{};
 globalThis.setTimeout=()=>0;
 globalThis.clearTimeout=()=>{};
 
-const history={entries:[
+const historyData={entries:[
   {type:"message", message:{User:{content:"你好，帮我看看", images:[]}}},
   {type:"message", message:{Assistant:{content:"好的，我来处理。", tool_calls:[{id:"call1",name:"bash",arguments:'{"command":"ls"}'}], reasoning:null}}},
   {type:"message", message:{Tool:{call_id:"call1", name:"bash", content:"file1\nfile2", is_error:false, synthetic:false}}},
@@ -99,7 +207,7 @@ const history={entries:[
   {type:"forked_from", source:"sess-old", at:3},
 ], next_before_seq:100};
 /* 滚动分页：更早的一页（before_seq=100 之后没有更老的段） */
-const historyOlder={entries:[
+const historyOlderData={entries:[
   {type:"message", message:{User:{content:"更早的历史消息：这是更老的一段", images:[]}}},
   {type:"notice", text:"更早的通知行"},
 ], next_before_seq:null};
@@ -133,10 +241,12 @@ globalThis.fetch=(url,opts={})=>{
   const m=(opts.method||"GET").toUpperCase();
   if(url==="/api/sessions"&&m==="GET") return resp(200,[{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}]);
   if(url==="/api/sessions"&&m==="POST") return resp(201,{id:"sess-new",status:"Idle"});
-  if(url==="/api/sessions/s1/history") return resp(200,history);
-  if(url.startsWith("/api/sessions/s1/history?before_seq=")) {
-    const seq=url.split("before_seq=")[1];
-    return resp(200, seq==="100" ? historyOlder : {entries:[], next_before_seq:null});
+  if(url.startsWith("/api/sessions/s1/history")) {
+    if (url.includes("before_seq=")) {
+      const seq=url.split("before_seq=")[1].split("&")[0];
+      return resp(200, seq==="100" ? historyOlderData : {entries:[], next_before_seq:null});
+    }
+    return resp(200, historyData);   // 含 ?limit=…（loadHistory 尾部翻页）
   }
   if(url==="/api/sessions/s1/events") return resp(200, stream());
   if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{});
@@ -203,7 +313,11 @@ async function main(){
     chk("live tool call", t.includes("read_file"));
     chk("live tool result err", t.includes("文件不存在"));
     chk("live assistant text", t.includes("出错了，"));
-    chk("live assistant markdown", t.includes("<strong>换个方式</strong>"));
+    const _asList = elsById["messages"].querySelectorAll(".msg-assistant");
+    const _lastAs = _asList[_asList.length - 1];
+    const _mdStrong = _lastAs ? _lastAs.querySelector("strong") : null;
+    chk("live assistant markdown",
+        !!_mdStrong && _mdStrong._children.some((c) => c.text === "换个方式"));
     chk("live notice", t.includes("系统提示行"));
     chk("live error", t.includes("错误: 回合失败"));
     chk("usage shown", elsById["usageInfo"].textContent.includes("1234"), "="+elsById["usageInfo"].textContent);
@@ -246,7 +360,7 @@ async function main(){
     const realAppend = msgEl.appendChild.bind(msgEl);
     msgEl.appendChild = (n) => { const r = realAppend(n); msgEl.scrollHeight += 25; return r; };
     const oldFetchCount = FETCHES.filter(u=>u.includes("before_seq=")).length;
-    for (const fn of handlers) fn();        // scrollTop=0 < 30 → 触发 loadOlder
+    for (const fn of handlers) fn({isTrusted:true});   // scrollTop=0 < 30 → 触发 loadOlder
     await flush();
     await flush();
     chk("older fetch issued", FETCHES.filter(u=>u.includes("before_seq=100")).length === oldFetchCount + 1,
@@ -264,10 +378,95 @@ async function main(){
     chk("paging olderDone true", state.olderDone === true, "="+state.olderDone);
     // null 后不再触发：再次滚动到顶部不应发起任何请求
     const fetchAfterDone = FETCHES.length;
-    for (const fn of handlers) fn();
+    for (const fn of handlers) fn({isTrusted:true});
     await flush();
     chk("no fetch when olderDone", FETCHES.length === fetchAfterDone,
         "delta="+(FETCHES.length-fetchAfterDone));
+    // ---- 回归：restored 分支 reattachInFlight（切回缓存会话不重复思考块） ----
+    function buildInflightView(){
+      const m = elsById["messages"];
+      m.innerHTML = "";
+      const det = document.createElement("details");
+      det.className = "thinking";
+      const sum = document.createElement("summary");
+      const dot = document.createElement("span");
+      dot.className = "think-dot active";
+      const lbl = document.createElement("span");
+      lbl.className = "think-label";
+      lbl.textContent = "思考中…";
+      sum.append(dot, lbl);
+      const tb = document.createElement("div");
+      tb.className = "think-body";
+      tb.textContent = "缓存的思考";
+      det.append(sum, tb);
+      m.appendChild(det);
+      const as = document.createElement("div");
+      as.className = "msg msg-assistant";
+      const who = document.createElement("span");
+      who.className = "who";
+      who.textContent = "ai>";
+      const ab = document.createElement("div");
+      ab.className = "msg-body";
+      ab.textContent = "缓存的助手回复";
+      as.append(who, ab);
+      m.appendChild(as);
+      const card = buildToolCard("read_file", '{"path":"a.txt"}', "执行中…", "pending", null);
+      m.appendChild(card);
+      return { det, dot, tb, ab, card };
+    }
+    // 预置带 .think-dot.active 的缓存 HTML（序列化 innerHTML，模拟 saveSessionState）
+    function cacheCurrentView(){
+      state.sessionStates["s1"] = { html: elsById["messages"].innerHTML, scrollTop: 0,
+        nextBeforeSeq: null, olderDone: false, draft: "" };
+    }
+    function openRestored(){           // 从列表页切回 → restored 分支
+      state.sessionId = null;          // 避免 saveSessionState 覆盖上面的缓存
+      state.view = "list";
+      openSession("s1");
+    }
+    let iv = buildInflightView();
+    cacheCurrentView();
+    openRestored();
+    chk("restored initSource", state.initSource === "restored", "="+state.initSource);
+    const rDets = elsById["messages"].querySelectorAll("details.thinking");
+    const rAs = elsById["messages"].querySelectorAll(".msg-assistant");
+    const rCards = elsById["messages"].querySelectorAll("details.tool-card");
+    chk("restored thinking reattached", rDets.length === 1 && state.acc.thinkingEl === rDets[0]
+        && state.acc.thinkBody === rDets[0].querySelector(".think-body"));
+    chk("restored assistant reattached", rAs.length === 1 && state.acc.assistantEl === rAs[0]
+        && state.acc.assistantBody === rAs[0].querySelector(".msg-body")
+        && state.acc.assistantText === "缓存的助手回复");
+    chk("restored tool card queued", rCards.length === 1 && state.acc.toolStack.length === 1
+        && state.acc.toolStack[0].filled === false && state.acc.toolStack[0].el === rCards[0]);
+    // 注入 reasoning_delta：应续写进同一块，而不是新建第二个 details.thinking
+    handleSSEBlock("event: ReasoningDelta\ndata: {\"type\":\"reasoning_delta\",\"session_id\":\"s1\",\"seq\":99,\"delta\":\"续写思考\"}\n\n", "s1");
+    const detsAfter = elsById["messages"].querySelectorAll("details.thinking");
+    const tbAfter = detsAfter[0].querySelector(".think-body");
+    chk("restored single thinking block", detsAfter.length === 1, "n="+detsAfter.length);
+    chk("restored thinking continues", state.acc.thinkBody === tbAfter
+        && tbAfter._children.some((c) => c.text === "缓存的思考")
+        && tbAfter._children.some((c) => c.text === "续写思考"));
+    // assistant delta 续写旧块；ToolResult 填回旧卡片（都不新建）
+    handleSSEBlock("event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"s1\",\"seq\":100,\"delta\":\"续写回复\"}\n\n", "s1");
+    const abAfter = elsById["messages"].querySelector(".msg-assistant").querySelector(".msg-body");
+    chk("restored assistant continues", state.acc.assistantBody === abAfter
+        && abAfter._children.some((c) => c.text === "续写回复"));
+    handleSSEBlock("event: ToolResult\ndata: {\"type\":\"tool_result\",\"session_id\":\"s1\",\"seq\":101,\"is_error\":false,\"content\":\"结果内容\"}\n\n", "s1");
+    chk("restored tool result fills old card", state.acc.toolStack.length === 1
+        && state.acc.toolStack[0].filled === true
+        && elsById["messages"].querySelector(".tool-state").textContent === "完成"
+        && elsById["messages"].querySelectorAll("details.tool-card").length === 1);
+    // 已完成（dot done）的 thinking 绝不绑定；已 markdown 化（有子元素）的助手消息绝不绑定
+    iv = buildInflightView();
+    iv.dot.className = "think-dot done";
+    iv.ab.appendChild(document.createElement("em"));   // 模拟 markdown 渲染出的子元素
+    cacheCurrentView();
+    openRestored();
+    chk("restored done thinking not bound", state.acc.thinkingEl === null,
+        "="+String(state.acc.thinkingEl));
+    chk("restored rendered assistant not bound",
+        state.acc.assistantEl === null && state.acc.assistantText === "",
+        "="+String(state.acc.assistantEl));
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);
@@ -277,7 +476,7 @@ main();
 
 out = os.path.join(HERE, '.test_harness.js')
 with open(out, 'w', encoding='utf-8') as f:
-    f.write(HARNESS + js + TAIL)
+    f.write(HARNESS + vendor_js + "\n" + js + TAIL)
 r = subprocess.run(['gjs', out], capture_output=True, text=True)
 print(r.stdout, end="")
 if r.stderr.strip():

@@ -659,6 +659,38 @@ function buildToolCard(name, args, stateText, stateCls, resultText) {
   return card;
 }
 
+/* 切回缓存会话（openSession restored 分支）时，把缓存 DOM 里「进行中」的
+   元素重新绑定到新的累积器上：后续 ReasoningDelta / AssistantDelta /
+   ToolResult 续写进旧块，而不是另起一块（否则同一个思考/助手/工具卡片会
+   重复出现多个）。历史/已完成（dot.done / 已 markdown 化）的元素绝不绑定。 */
+function reattachInFlight(acc) {
+  // 1. thinking：最后一个 details.thinking，且其 .think-dot 没有 .done（进行中）才绑定
+  const thinks = [...els.messages.querySelectorAll("details.thinking")];
+  const t = thinks[thinks.length - 1];
+  if (t && !t.querySelector(".think-dot.done")) {
+    acc.thinkingEl = t;
+    acc.thinkBody = t.querySelector(".think-body");
+  }
+  // 2. assistant：最后一个 .msg-assistant，且其 .msg-body 是纯文本（流式期间
+  //    未 markdown 化，无元素子节点）→ 进行中，绑定并把 textContent 取回
+  const as = [...els.messages.querySelectorAll(".msg-assistant")];
+  const a = as[as.length - 1];
+  if (a) {
+    const body = a.querySelector(".msg-body");
+    if (body && !body.querySelector("*")) {   // 无子元素 = 纯文本 = 流式中
+      acc.assistantEl = a;
+      acc.assistantBody = body;
+      acc.assistantText = body.textContent;
+    }
+  }
+  // 3. 工具卡片：所有 .tool-state 文本为 "执行中…" 的 details.tool-card →
+  //    push 进 acc.toolStack（filled:false），供 appendToolResult 的 fallback 配对
+  for (const c of [...els.messages.querySelectorAll("details.tool-card")]) {
+    const st = c.querySelector(".tool-state");
+    if (st && st.textContent === "执行中…") acc.toolStack.push({ el: c, filled: false });
+  }
+}
+
 /* 提示行（Notice / 排队等） */
 function appendNotice(text) {
   const n = el("div", "notice", text);
@@ -1268,6 +1300,8 @@ function openSession(id) {
     state.olderDone = cached.olderDone;
     state.acc = newAccumulator();
     els.messages.innerHTML = cached.html;
+    reattachInFlight(state.acc);   // 重新绑定缓存里「进行中」的思考/助手/工具卡片，
+                                   // 使增量续写而不是新建（防止重复出现多个块）
     els.messages.scrollTop = cached.scrollTop;
     els.promptInput.value = cached.draft || "";
     autosizeInput();
