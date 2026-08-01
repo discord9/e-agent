@@ -510,21 +510,29 @@ function renderTaskList(tasks, container) {
       // bash：点击 → 总是切到该任务所属会话，视图就绪后滚动高亮输出块
       // （openSession 的 onReady 在 restored/fresh 两条路径的消息区就绪后触发）。
       // 已在目标会话 → 直接 flash；找不到输出块（任务已结束/未渲染）→
-      // 回退就地展开 toggleRow。
+      // 强制创建输出块（消息列表里流式显示），绝不在卡片内就地展开——
+      // 用户期望「点 bash 卡片 → 该任务的消息列表 → 看流式输出」。
       if (!t.session_id) { toggleRow(); return; }   // 无会话归属：就地展开
       if (state.view === "chat" && state.sessionId === t.session_id) {
-        const block = findTaskOutputBlock(key);
+        let block = findTaskOutputBlock(key);
+        if (!block) block = ensureTaskOutputBlock(t);
         if (block) { flashTaskOutputBlock(block); return; }
         toggleRow();
         return;
       }
       openSession(t.session_id, () => {
-        const block = findTaskOutputBlock(key);
-        if (block) { flashTaskOutputBlock(block); return; }
-        // 找不到输出块（任务不在该会话消息区 / 已结束）：回退就地展开。
-        // 异步回调期间行可能已被 2s 轮询重绘（旧行脱离 DOM）：只在仍
-        // 挂载时展开，避免展开到已离屏的旧行（轮询句柄泄漏）。
-        if (row.isConnected) toggleRow();
+        // 目标会话视图就绪：确保该 bash 任务的输出块存在（消息列表里流式
+        // 显示输出），然后滚动高亮。找不到任务（已结束）时用任务列表尾部
+        // 静态数据兜底；绝不再回退到卡片内就地展开——用户期望「点卡片 →
+        // 该任务的消息列表 → 看流式输出」。
+        let block = findTaskOutputBlock(key);
+        if (!block) {
+          block = ensureTaskOutputBlock(t);
+          // 刚创建：消息区通常不在底部，滚动过去让用户看到输出在实时刷新
+          if (block) flashTaskOutputBlock(block);
+        } else {
+          flashTaskOutputBlock(block);
+        }
       });
     });
     if (prevExpanded.has(key)) {     // 轮询重绘恢复展开态：重启轮询/流
