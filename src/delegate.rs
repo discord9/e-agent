@@ -758,7 +758,7 @@ impl Tool for Delegate {
                     "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
                     "background": {"type": "boolean", "default": true, "description": "run without blocking and deliver the answer as a background completion (default true); pass false to wait for the final answer"},
                     "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
-                    "workspace": {"type": "string", "description": "working directory for the subagent (absolute path); defaults to the parent's workspace"}
+                    "workspace": {"type": "string", "description": "working directory for the subagent (MUST be an absolute path like /home/user/project or C:\\Users\\user\\project; never pass `.` or a relative path — the parent's workspace is used by default)"}
                 },
                 "required": ["task"]
             }),
@@ -928,6 +928,12 @@ impl Tool for Delegate {
             .and_then(Value::as_str)
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
+        // `.`/`./` (and Windows `.\`) are common model mistakes — the parent
+        // workspace is the sane interpretation, so fall back to it instead
+        // of erroring (reroot() rejects non-absolute paths).
+        let explicit_workspace_arg = explicit_workspace_arg.filter(|s| {
+            s != "." && s != "./" && s != ".\\" && !s.starts_with("./") && !s.starts_with(".\\")
+        });
         let workspace = match &explicit_workspace_arg {
             Some(path) => self
                 .workspace
