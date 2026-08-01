@@ -190,6 +190,11 @@ struct DelegatedTask {
     /// its bash runs in a narrowed read-only sandbox with network disabled.
     read_only: bool,
     sandbox: Option<crate::config::Sandbox>,
+    /// True for a btw fork: an interactive side conversation, not a one-shot
+    /// delegated task. Swaps the system instructions (no "return a concise
+    /// final answer" — the user keeps replying) and pairs with a
+    /// `WaitForInput` idle policy so the subagent stays alive.
+    interactive: bool,
 }
 
 impl Delegate {
@@ -309,6 +314,7 @@ impl Delegate {
         task: DelegatedTask,
         persist: PersistConfig,
         resume_entries: Option<Vec<crate::agent::SessionEntry>>,
+        policy: IdlePolicy,
     ) -> Result<(SessionHandle, crate::runner::SessionTask), String> {
         let model_name = model.display_name().to_owned();
         let agents_instructions = workspace
@@ -328,6 +334,12 @@ impl Delegate {
         let mut instructions = match task.role_prompt {
             Some(template) => format!(
                 "{template}\n\nYou are running as a subagent inside the e-agent coding assistant (on the `{model_name}` model). Work autonomously on the delegated task with the file/bash tools and, when configured, public web search, then return a concise final answer."
+            ),
+            // btw fork: an interactive side conversation forked from the
+            // main session. No "final answer" framing — the subagent runs
+            // under WaitForInput and the user keeps replying to it.
+            None if task.interactive => format!(
+                "You are a persistent subagent in a btw fork of the main e-agent session (running on the `{model_name}` model). This is an interactive side conversation that continues the main session's history outside the main line: discuss the user's question with the file/bash tools and, when configured, public web search, and keep the conversation going — the user may keep replying, so do not treat a single answer as final."
             ),
             None => format!(
                 "You are a subagent inside the e-agent coding assistant (running on the `{model_name}` model). Work autonomously on the delegated task with the file/bash tools and, when configured, public web search, then return a concise final answer."
@@ -349,13 +361,8 @@ impl Delegate {
         let store = SessionStore::connect(&persist.backend, &persist.root, &persist.session_id)
             .await
             .map_err(|e| format!("subagent failed: {e:#}"))?;
-        let (runner, handle) = SessionRunner::new(
-            agent,
-            store,
-            persist.root,
-            persist.session_id,
-            IdlePolicy::FinishWhenIdle,
-        );
+        let (runner, handle) =
+            SessionRunner::new(agent, store, persist.root, persist.session_id, policy);
         let runner_task = runner.start(Some(task.task));
         Ok((handle, runner_task))
     }
@@ -427,6 +434,253 @@ fn sync_result(session_id: &str, result: SessionResult) -> Result<String, String
     let (completed, output) = result_output(result);
     let output = format!("subagent session: {session_id}\n{output}");
     if completed { Ok(output) } else { Err(output) }
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// btw fork subagent (`/btw <question>` backend)
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// Everything [`spawn_btw_subagent`] needs to fork a live session's history
+/// into a persistent interactive subagent: the model/tools configuration the
+/// subagent inherits from its parent session, plus the registries it joins.
+/// The server endpoint (and, in the future, the TUI `/btw` wiring)
+/// assembles this from the parent session's live state + the session
+/// factory.
+pub struct BtwContext {
+    /// The subagent's model: the parent session's own model.
+    pub model: ConfiguredModel,
+    /// Context window for `model` (the parent's).
+    pub context_window: Option<u64>,
+    /// Workspace the subagent works in (the parent's).
+    pub workspace: Workspace,
+    /// bwrap policy inherited from the parent (`None` = sandbox disabled).
+    pub sandbox: Option<crate::config::Sandbox>,
+    /// Read-only policy inherited from the parent session.
+    pub read_only: bool,
+    /// Shared running-task registry: the btw task-panel entry and the
+    /// subagent's own background bash both live here.
+    pub background: BackgroundTasks,
+    /// Live subagent registry the btw subagent registers into (TUI attach).
+    pub sessions: Sessions,
+    /// Directory where the subagent persists its session file.
+    pub persist_root: std::path::PathBuf,
+    /// Session backend configuration for the subagent's store.
+    pub backend: SessionBackend,
+    /// Parent session's background record (root + parent session id + the
+    /// parent's store): records the btw task for the killed-on-exit notice
+    /// and supplies the `parent_session_id` metadata link.
+    pub record_in: Option<crate::session_store::BackgroundRecord>,
+}
+
+/// The initial history of a btw fork: the source session's prefix up to its
+/// last completed turn (the same cut [`crate::agent::fork_prefix`] applies
+/// to `--fork` main sessions), then the `ForkedFrom` marker, then the
+/// explanatory notice line. The question itself is NOT part of the history
+/// — it is delivered as the runner's initial prompt (the first user
+/// message).
+fn btw_fork_entries(
+    source: &str,
+    entries: &[crate::agent::SessionEntry],
+) -> Result<Vec<crate::agent::SessionEntry>, String> {
+    let prefix = crate::agent::fork_prefix(entries, None)?;
+    let at = prefix.len();
+    let mut fork_entries = Vec::with_capacity(prefix.len() + 2);
+    fork_entries.extend(prefix);
+    fork_entries.push(crate::agent::SessionEntry::ForkedFrom {
+        source: source.to_owned(),
+        at,
+        // JSONL has no event_time column and the fork path keeps seq as an
+        // optional provenance slot (mirrors session_factory's fork marker).
+        event_time: None,
+        seq: None,
+    });
+    fork_entries.push(crate::agent::SessionEntry::Notice {
+        text: "（btw fork：在主线之外继续探讨）".to_owned(),
+    });
+    Ok(fork_entries)
+}
+
+/// Fork a live session's full history into a persistent interactive
+/// "btw fork" subagent and start it with `question` as its first user
+/// message. Returns the new subagent's session id (e.g. `btw-…`).
+///
+/// Semantics (user-confirmed):
+/// - The source session's history is loaded and cut at the last completed
+///   turn, stamped with a `ForkedFrom` marker plus the
+///   「（btw fork：在主线之外继续探讨）」 notice, and written to a fresh
+///   `btw-…` subagent session — the same fork rule `--fork` main sessions
+///   use, but as the SUBAGENT's starting history (the `resume_entries`
+///   path of [`Delegate::start_runner`]).
+/// - The subagent runs under [`IdlePolicy::WaitForInput`] and stays
+///   registered for the whole conversation. Unlike a `delegate` tool task
+///   it is NOT a one-shot delegated task: there is no parent tool loop
+///   waiting for an answer, so it never "completes" and is never cleaned up
+///   as a finished delegate. Its task-panel entry and `Sessions` entry live
+///   until the user cancels the task (or the process exits — the parent's
+///   background record then reports it as killed on the next launch).
+/// - `question` is queued as the runner's initial prompt, so the first turn
+///   starts immediately; the main session is untouched and continues.
+pub async fn spawn_btw_subagent(
+    source_session: &str,
+    question: &str,
+    context: BtwContext,
+) -> Result<String, String> {
+    let question = question.trim();
+    if question.is_empty() {
+        return Err("prompt must not be empty".into());
+    }
+    let BtwContext {
+        model,
+        context_window,
+        workspace,
+        sandbox,
+        read_only,
+        background,
+        sessions,
+        persist_root,
+        backend,
+        record_in,
+    } = context;
+    let model_name = model.display_name().to_owned();
+    let cwd = workspace.root().display().to_string();
+    // Load the source session's full history; the fork source is only read,
+    // exactly like the `--fork` path in session_factory.
+    let source_store = SessionStore::connect(&backend, &persist_root, source_session)
+        .await
+        .map_err(|e| format!("btw fork failed: {e:#}"))?;
+    let source_entries = source_store
+        .load(&persist_root, source_session)
+        .await
+        .map_err(|e| format!("btw fork failed: {e:#}"))?
+        .entries;
+    let fork_entries = btw_fork_entries(source_session, &source_entries)
+        .map_err(|e| format!("cannot fork session {source_session}: {e}"))?;
+    let session_id = crate::session::new_id_prefixed("btw-");
+    let persist = PersistConfig {
+        root: persist_root.clone(),
+        session_id: session_id.clone(),
+        backend: backend.clone(),
+    };
+    // Persist the fork entries into the fresh subagent session BEFORE the
+    // runner starts: the runner only appends new entries, restored history
+    // is never written back (the delegate `resume` path relies on the
+    // entries already living in the file). JSONL rewrite / Greptime append
+    // mirror the main-session fork path.
+    let fork_store = SessionStore::connect(&backend, &persist.root, &session_id)
+        .await
+        .map_err(|e| format!("btw fork failed: {e:#}"))?;
+    match &backend {
+        SessionBackend::Jsonl => fork_store
+            .rewrite(&persist.root, &session_id, &fork_entries)
+            .await
+            .map_err(|e| format!("btw fork failed: {e:#}"))?,
+        // Greptime: fresh session (no rows, next_seq = 0); append writes
+        // contiguous seqs with fresh timestamps (the fork marker's
+        // provenance fields are payload-only).
+        SessionBackend::Greptime { .. } => fork_store
+            .append(&persist.root, &session_id, &fork_entries)
+            .await
+            .map_err(|e| format!("btw fork failed: {e:#}"))?,
+    }
+    let (handle, runner_task) = Delegate::start_runner(
+        model,
+        context_window,
+        workspace,
+        background.clone(),
+        DelegatedTask {
+            task: question.to_owned(),
+            role_prompt: None,
+            read_only,
+            sandbox,
+            interactive: true,
+        },
+        persist,
+        Some(fork_entries),
+        IdlePolicy::WaitForInput,
+    )
+    .await?;
+    // Sessions metadata: the subagent's row links back to the parent
+    // (parent_session_id = source session) and its btw task id, exactly
+    // like a delegate's row (R3: written by the parent at spawn time).
+    // Connected here (before `persist` is consumed) with the same root.
+    let meta_store = SessionStore::connect(&backend, &persist_root, &session_id)
+        .await
+        .map_err(|e| format!("btw fork failed: {e:#}"))?;
+    let parent_session_id = record_in.as_ref().map(|record| record.session.clone());
+    let meta_persist_root = persist_root.clone();
+    // Register as a persistent task-panel entry. The panel entry is what
+    // makes the subagent attachable (the TUI F2 panel and the web task
+    // panel key off the shared task registry, and the `Sessions` entry
+    // holds the attach handle). The wrapper's work future never completes
+    // on its own — with WaitForInput the runner only ends when the user
+    // cancels the task (or the process exits) — so this registration lives
+    // for the whole conversation instead of being cleaned up like a
+    // finished delegate task. `DelegateCleanup` still runs on cancel so a
+    // cancelled btw session does not leak its registration or background
+    // record.
+    let label = format!("btw: {}", task_label(None, None, question));
+    let sessions_hook = sessions.clone();
+    let slot = Arc::new(Mutex::new(None::<u64>));
+    let slot_in_hook = slot.clone();
+    let entry = Arc::new(SessionEntry {
+        handle: handle.clone(),
+        model: model_name.clone(),
+        role: None,
+        cwd,
+        session_id: session_id.clone(),
+        context_window,
+    });
+    let entry_for_hook = entry.clone();
+    let hook_session_id = session_id.clone();
+    let cleanup = DelegateCleanup::new(slot, sessions.clone(), record_in.clone());
+    let record = record_in.clone();
+    let record_label = label.clone();
+    let record_session_id = session_id.clone();
+    let output_session_id = session_id.clone();
+    background.spawn_with_id(
+        label,
+        None,
+        None,
+        Some(crate::tools::TaskDisplayMeta {
+            background: true,
+            workspace: None,
+        }),
+        move |id| {
+            match slot_in_hook.lock() {
+                Ok(mut slot) => *slot = Some(id),
+                Err(poisoned) => *poisoned.into_inner() = Some(id),
+            }
+            sessions_hook.insert(id, entry_for_hook);
+            if let Some(record) = &record {
+                record.store.record_background_start(
+                    &record.root,
+                    &record.session,
+                    id,
+                    &record_label,
+                    Some(&record_session_id),
+                );
+            }
+            spawn_subagent_meta_create(
+                meta_store.clone(),
+                meta_persist_root.clone(),
+                hook_session_id.clone(),
+                model_name.clone(),
+                None,
+                parent_session_id.as_deref(),
+                id,
+            );
+        },
+        move || {
+            let cleanup = cleanup;
+            async move {
+                let (_, output) =
+                    result_output(Delegate::runner_result(&handle, runner_task).await);
+                cleanup.finish();
+                format!("btw session: {output_session_id}\n{output}")
+            }
+        },
+    )?;
+    Ok(session_id)
 }
 
 #[async_trait]
@@ -710,9 +964,11 @@ impl Tool for Delegate {
                 role_prompt,
                 read_only,
                 sandbox: task_sandbox,
+                interactive: false,
             },
             persist,
             resume_entries,
+            IdlePolicy::FinishWhenIdle,
         )
         .await?;
         let sessions = self.sessions.clone();

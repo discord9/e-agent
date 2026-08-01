@@ -11,6 +11,7 @@
 //! | GET    | `/api/sessions/{id}/events`       | SSE: snapshot, then live events    |
 //! | GET    | `/api/sessions/{id}/history`      | segmented history (head or older)  |
 //! | POST   | `/api/sessions/{id}/prompt`       | queue a prompt                     |
+//! | POST   | `/api/sessions/{id}/btw`          | fork into a persistent subagent    |
 //! | POST   | `/api/sessions/{id}/cancel`       | cancel the in-flight turn          |
 //! | POST   | `/api/sessions/{id}/compact`      | request compaction                 |
 //! | PUT    | `/api/sessions/{id}/title`        | rename a session (Greptime only)   |
@@ -153,6 +154,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/sessions/{id}/history", get(session_history))
         .route("/api/sessions/{id}/prompt", post(session_prompt))
+        .route("/api/sessions/{id}/btw", post(session_btw))
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/compact", post(session_compact))
         .route("/api/sessions/{id}/title", put(session_title))
@@ -687,6 +689,61 @@ async fn session_prompt(
     }
     session.handle.prompt(body.prompt);
     Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Deserialize)]
+struct BtwBody {
+    /// The question; becomes the btw subagent's first user message.
+    prompt: String,
+}
+
+/// `POST /api/sessions/{id}/btw` — fork the live session's full history
+/// into a persistent interactive subagent ("btw fork") and start it
+/// immediately with the question as its first user message. The subagent
+/// runs under `IdlePolicy::WaitForInput` — unlike a `delegate` task it
+/// never completes on its own, so it stays alive for further turns until
+/// the user closes it (task-panel cancel / process exit) — and is
+/// registered in the task panel + sessions metadata, so it shows up in the
+/// sidebar and can be attached to exactly like any other subagent.
+/// 201 + `{"id": "<btw-…>"}`; 404 when the source session is not live.
+async fn session_btw(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<BtwBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    if body.prompt.trim().is_empty() {
+        return Err(error(StatusCode::BAD_REQUEST, "prompt must not be empty"));
+    }
+    let session = live(&state, &id)?;
+    let subagent_id = crate::delegate::spawn_btw_subagent(
+        &id,
+        &body.prompt,
+        crate::delegate::BtwContext {
+            // The btw subagent runs on the source session's own model
+            // (user-confirmed): the factory's main model, shared by every
+            // built session.
+            model: state.factory.main_model().clone(),
+            context_window: state.factory.main_context_window(),
+            workspace: state.factory.workspace().clone(),
+            sandbox: state.factory.sandbox().cloned(),
+            read_only: state.factory.read_only(),
+            background: session.background.clone(),
+            sessions: session.sessions.clone(),
+            persist_root: state.factory.root().to_path_buf(),
+            backend: state.factory.backend().clone(),
+            record_in: Some(crate::session_store::BackgroundRecord {
+                root: state.factory.root().to_path_buf(),
+                session: id.clone(),
+                store: session.store.clone(),
+            }),
+        },
+    )
+    .await
+    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": subagent_id })),
+    ))
 }
 
 async fn session_cancel(
@@ -1517,6 +1574,53 @@ mod tests {
             serde_json::from_str(r#"{"id": "web-x", "initial_prompt": "go"}"#).unwrap();
         assert_eq!(with_id.id.as_deref(), Some("web-x"));
         assert_eq!(with_id.initial_prompt.as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn btw_body_parses_prompt() {
+        let body: BtwBody = serde_json::from_str(r#"{"prompt": "why?"}"#).unwrap();
+        assert_eq!(body.prompt, "why?");
+    }
+
+    /// `POST /api/sessions/{id}/btw` rejects an empty prompt with 400 and
+    /// an unknown source session with 404 — both short-circuit before any
+    /// spawn work (no store I/O, no model call).
+    #[tokio::test]
+    async fn session_btw_rejects_empty_prompt_and_unknown_session() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let state = test_app_state("sekrit");
+        let app = router(state);
+        let request = |uri: String, body: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let empty = request(
+            "/api/sessions/web-empty/btw".to_owned(),
+            r#"{"prompt": "   "}"#.to_owned(),
+        )
+        .await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST, "empty prompt");
+        let ghost = request(
+            "/api/sessions/web-ghost/btw".to_owned(),
+            r#"{"prompt": "hi"}"#.to_owned(),
+        )
+        .await;
+        assert_eq!(ghost.status(), StatusCode::NOT_FOUND, "unknown session");
     }
 
     #[test]

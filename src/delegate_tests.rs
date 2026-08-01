@@ -1183,3 +1183,222 @@ async fn resume_replays_scrollback_into_session_sink() {
         "expected 'earlier answer' in AssistantText events, got {assistant_texts:?}"
     );
 }
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// btw fork subagent
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// `btw_fork_entries` cuts the source history at the last completed turn,
+/// then stamps the `ForkedFrom` marker + the explanation notice. Entries
+/// after the boundary are dropped; an empty session (or one with no
+/// completed turn) is rejected.
+#[test]
+fn btw_fork_entries_cuts_at_last_completed_turn() {
+    use crate::agent::SessionEntry as AgentEntry;
+    let user = |text: &str| AgentEntry::Message {
+        message: Message::User {
+            content: text.into(),
+            images: vec![],
+        },
+    };
+    let assistant = |text: &str| AgentEntry::Message {
+        message: Message::Assistant(AssistantMessage {
+            content: Some(text.into()),
+            tool_calls: vec![],
+            reasoning: None,
+        }),
+    };
+    let entries = vec![
+        user("hello"),
+        assistant("hi"),
+        user("question 1"),
+        assistant("answer 1"),
+        // Trailing entries after the last completed turn are dropped.
+        AgentEntry::Notice {
+            text: "[background task 1 completed]".into(),
+        },
+    ];
+    let fork = btw_fork_entries("web-main", &entries).unwrap();
+    assert_eq!(fork.len(), 6, "prefix + marker + notice: {fork:?}");
+    assert_eq!(fork[0], user("hello"));
+    assert_eq!(fork[1], assistant("hi"));
+    assert_eq!(fork[2], user("question 1"));
+    assert_eq!(fork[3], assistant("answer 1"));
+    assert_eq!(
+        fork[4],
+        AgentEntry::ForkedFrom {
+            source: "web-main".into(),
+            at: 4,
+            event_time: None,
+            seq: None,
+        }
+    );
+    assert_eq!(
+        fork[5],
+        AgentEntry::Notice {
+            text: "（btw fork：在主线之外继续探讨）".into(),
+        }
+    );
+    // No completed turn → error (mirrors `fork_prefix`).
+    let no_boundary = vec![user("only a question")];
+    assert!(btw_fork_entries("web-main", &no_boundary).is_err());
+    assert!(btw_fork_entries("web-main", &[]).is_err());
+}
+
+/// Full JSONL spawn: the source session's history is forked into a fresh
+/// `btw-…` session (prefix + ForkedFrom marker + notice), the question
+/// lands as the first user message, the subagent is registered in the task
+/// registry + `Sessions` with a `btw:` label, and cancelling the task
+/// cleans up the registration and the parent's background record. The
+/// runner model points at a dead port, so the first turn fails fast and
+/// the subagent settles into Idle (WaitForInput — it never finishes on its
+/// own, which is exactly the persistent semantics).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
+    use crate::agent::SessionEntry as AgentEntry;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    // A source session with one completed turn.
+    let source_entries = vec![
+        AgentEntry::Message {
+            message: Message::User {
+                content: "main question".into(),
+                images: vec![],
+            },
+        },
+        AgentEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: Some("main answer".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        },
+    ];
+    crate::session::Session::append(&root, "web-main", &source_entries).unwrap();
+
+    let workspace = Workspace::new(&root).unwrap();
+    let (_, mut background) = builtins(workspace.clone(), None, false, None);
+    let (sender, _completions) = tokio::sync::mpsc::unbounded_channel();
+    background.set_event_sender(sender);
+    let sessions = Sessions::default();
+    // Dead port: connection refused instantly, no retry hang.
+    let model = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(
+            "http://127.0.0.1:9".into(),
+            "test-key".into(),
+            "test-model".into(),
+            None,
+        )
+        .unwrap(),
+    );
+    let id = spawn_btw_subagent(
+        "web-main",
+        "side question",
+        BtwContext {
+            model,
+            context_window: None,
+            workspace,
+            sandbox: None,
+            read_only: false,
+            background: background.clone(),
+            sessions: sessions.clone(),
+            persist_root: root.clone(),
+            backend: SessionBackend::Jsonl,
+            record_in: Some(crate::session_store::BackgroundRecord {
+                root: root.clone(),
+                session: "web-main".into(),
+                store: crate::session_store::SessionStore::Jsonl,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(id.starts_with("btw-"), "btw session id, got {id}");
+
+    // Registered in the task registry (attachable via the TUI panel / web
+    // task panel) and the live-session registry.
+    let tasks = background.running();
+    assert_eq!(tasks.len(), 1, "one btw task: {tasks:?}");
+    assert_eq!(tasks[0].kind, "delegate");
+    assert!(
+        tasks[0].label.starts_with("btw: "),
+        "label: {}",
+        tasks[0].label
+    );
+    let task_id = tasks[0].id;
+    let entry = sessions.get(task_id).expect("btw session registered");
+    assert_eq!(entry.session_id, id);
+    assert_eq!(entry.model, "test-model");
+    assert_eq!(entry.role, None);
+
+    // The btw session file: fork prefix + marker + notice, then the
+    // question as the first user message (committed by the runner; poll
+    // because the commit is async).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let loaded = loop {
+        let loaded = crate::session::Session::load(&root, &id).unwrap().entries;
+        if loaded.len() >= 5 || std::time::Instant::now() > deadline {
+            break loaded;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        loaded.len(),
+        5,
+        "2 prefix + marker + notice + question: {loaded:?}"
+    );
+    assert_eq!(loaded[0], source_entries[0]);
+    assert_eq!(loaded[1], source_entries[1]);
+    assert_eq!(
+        loaded[2],
+        AgentEntry::ForkedFrom {
+            source: "web-main".into(),
+            at: 2,
+            event_time: None,
+            seq: None,
+        }
+    );
+    assert_eq!(
+        loaded[3],
+        AgentEntry::Notice {
+            text: "（btw fork：在主线之外继续探讨）".into(),
+        }
+    );
+    assert_eq!(
+        loaded[4],
+        AgentEntry::Message {
+            message: Message::User {
+                content: "side question".into(),
+                images: vec![],
+            },
+        }
+    );
+
+    // The task stays registered (WaitForInput: the runner does not finish
+    // when idle), so the subagent is persistent — not cleaned up like a
+    // completed delegate.
+    assert_eq!(background.running().len(), 1);
+    assert!(sessions.get(task_id).is_some());
+
+    // Cancelling the task (the current close path for a btw subagent)
+    // aborts the runner and cleans up the registration + the parent's
+    // background record.
+    assert!(background.cancel(task_id).is_some());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let sessions_empty = sessions.sessions.lock().unwrap().is_empty();
+        let tasks_empty = background.running().is_empty();
+        if sessions_empty && tasks_empty {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cleanup did not complete: sessions_empty={sessions_empty} tasks_empty={tasks_empty}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        crate::session::Session::take_unfinished_background(&root, "web-main").is_empty(),
+        "cancelled btw task must not leave a killed-on-exit record"
+    );
+}
