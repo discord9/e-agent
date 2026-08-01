@@ -11,21 +11,27 @@ import os, re, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # index.html 的 <script> 是构建期占位符（/*__JS_APP__*/ 等由 server.rs 替换），
-# 直接读 app.js + vendor/marked.min.js，等价于 server 组装的单文件。
-js = open(os.path.join(HERE, 'app.js'), encoding='utf-8').read()
+# 直接读拆分后的 JS 文件清单（与 server.rs 拼接顺序一致，同一 <script> 内
+# 顶层声明全局可见）+ vendor/marked.min.js，等价于 server 组装的单文件。
+JS_FILES = ['app.js', 'render.js', 'sessions.js', 'tasks.js', 'sse.js']
+js = "\n".join(open(os.path.join(HERE, f), encoding='utf-8').read() for f in JS_FILES)
 vendor_js = open(os.path.join(HERE, 'vendor', 'marked.min.js'), encoding='utf-8').read()
 
 MODE = os.environ.get('MODE', 'open')   # 'open' = openSession path, 'direct' = loadHistory
 TRACE = os.environ.get('TRACE') == '1'
-# gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；页面 JS 里的 new TextDecoder() 换成桩工厂
-js = js.replace('const decoder = new TextDecoder();', 'const decoder = makeTextDecoder();')
+# gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；页面 JS 里的 new TextDecoder() 换成桩工厂。
+# 注意：拆分后 tasks.js（startTaskStream）在 sse.js 之前拼接，无缩进的搜索串会先命中
+# startTaskStream 里的同名行；这里带 2 空格缩进精确匹配 readSSEStream（唯一 2 空格缩进的
+# 那处），保持与拆分前一致的注入目标（startTaskStream 的 TextDecoder 在 harness 中从不执行）。
+js = js.replace('  const decoder = new TextDecoder();', '  const decoder = makeTextDecoder();')
 if TRACE:
     js = js.replace('async function readSSEStream(reader, id) {',
         'async function readSSEStream(reader, id) {\n  console.log("SSE: stream start");')
-    js = js.replace('const { done, value } = await reader.read();',
-        'const { done, value } = await reader.read();\n    console.log("SSE: got value", done, JSON.stringify(String(value).slice(0, 120)));')
-    js = js.replace('buf += decoder.decode(value, { stream: true }).replace(/\\r\\n/g, "\\n");',
-        'buf += decoder.decode(value, { stream: true }).replace(/\\r\\n/g, "\\n");\n    console.log("SSE: buf len=" + buf.length + " idx=" + buf.indexOf("\\n\\n"));')
+    # 下面两处与 startTaskStream 内的同名字符串区分：带 4 空格缩进只命中 readSSEStream
+    js = js.replace('    const { done, value } = await reader.read();',
+        '    const { done, value } = await reader.read();\n    console.log("SSE: got value", done, JSON.stringify(String(value).slice(0, 120)));')
+    js = js.replace('    buf += decoder.decode(value, { stream: true }).replace(/\\r\\n/g, "\\n");',
+        '    buf += decoder.decode(value, { stream: true }).replace(/\\r\\n/g, "\\n");\n    console.log("SSE: buf len=" + buf.length + " idx=" + buf.indexOf("\\n\\n"));')
     js = js.replace('function handleSSEBlock(block, id) {',
         'function handleSSEBlock(block, id) {\n  console.log("SSE: block event=" + (block.split("\\n")[0] || ""));')
     js = js.replace('function connectSSE(id) {\n  stopSSE();',

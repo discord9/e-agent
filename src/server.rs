@@ -1489,7 +1489,15 @@ async fn index() -> impl IntoResponse {
         let katex_css = read("vendor/katex.min.css")?;
         let css = read("style.css")?;
         let vendor_js = read("vendor/marked.min.js")?;
-        let app_js = read("app.js")?;
+        // app.js 已按功能域拆为多文件：同一 <script> 内按序拼接（顶层声明跨
+        // 文件全局可见，函数互调无需 export/import；事件绑定与 init 在最后一个
+        // 文件 sse.js 尾部执行）。顺序即依赖：核心 → 渲染 → 会话 → 任务 → SSE；
+        // 任一文件读失败都会走 `?` 冒泡 → 500（与原来单文件读取一致）。
+        let mut app_js = String::new();
+        for name in ["app.js", "render.js", "sessions.js", "tasks.js", "sse.js"] {
+            app_js.push_str(&read(name)?);
+            app_js.push('\n');
+        }
         Ok(skeleton
             .replace("/*__KATEX_CSS__*/", &katex_css)
             .replace("/*__CSS__*/", &css)

@@ -55,7 +55,11 @@ def assemble_html():
                        .replace("/*__KATEX_CSS__*/", rd("vendor/katex.min.css"))
                        .replace("/*__CSS__*/", rd("style.css"))
                        .replace("/*__JS_VENDOR__*/", rd("vendor/marked.min.js"))
-                       .replace("/*__JS_APP__*/", rd("app.js")))
+                       # 与 server.rs 一致：按序拼接拆分后的 JS 文件（同一 <script> 内
+                       # 顶层声明全局可见；事件绑定与 init 在 sse.js 尾部执行）
+                       .replace("/*__JS_APP__*/", "\n".join(
+                           rd(f) for f in ["app.js", "render.js", "sessions.js",
+                                           "tasks.js", "sse.js"])))
     return _HTML_CACHE
 
 
