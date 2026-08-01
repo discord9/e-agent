@@ -1,0 +1,164 @@
+<!-- ============ DeepSeek 蓝鲸桌宠（独立文件，自包含） ============
+     固定右下角；CSS 动画：游动起伏、尾巴摆动、鳍摆动、吐泡泡；
+     点击随机说话 + 瞳孔互动；hover 出现关闭按钮（localStorage 记忆）。 -->
+<div id="petWhale" class="pet-whale" title="蓝鲸 · 点我玩！">
+  <svg viewBox="0 0 160 100" class="pet-whale-svg" aria-hidden="true">
+    <!-- 尾巴（分叉，摆动） -->
+    <path class="pet-tail" d="M10 52 Q-6 40 0 26 Q10 42 22 50 Z" fill="#4a90d9"/>
+    <path class="pet-tail" d="M10 52 Q-6 64 0 78 Q10 62 22 54 Z" fill="#3b7bc4"/>
+    <!-- 身体：圆滚滚的 DeepSeek 鲸鱼（大椭圆） -->
+    <ellipse cx="80" cy="52" rx="62" ry="42" fill="#5aa7e8"/>
+    <!-- 肚皮（浅色，圆弧） -->
+    <ellipse cx="80" cy="66" rx="46" ry="26" fill="#eaf4fd"/>
+    <!-- 背鳍（小圆角三角） -->
+    <path class="pet-dorsal" d="M64 14 Q78 0 92 16 Q78 24 64 14 Z" fill="#4a90d9"/>
+    <!-- 胸鳍（划水摆动） -->
+    <path class="pet-pectoral" d="M52 62 Q38 74 46 88 Q58 76 64 68 Z" fill="#4a90d9"/>
+    <!-- 喷水孔 + 水柱（间歇喷水动画） -->
+    <path class="pet-spout" d="M96 12 Q100 -6 96 -18 Q102 -6 106 12 Z" fill="#cfe6fb"/>
+    <!-- 腮线 -->
+    <path d="M42 48 Q50 52 42 58" stroke="#7db8ee" stroke-width="2.5" fill="none"/>
+    <!-- 大眼睛（DeepSeek 风格：圆眼 + 高光） -->
+    <circle cx="118" cy="42" r="12" fill="white"/>
+    <circle class="pet-pupil" cx="121" cy="43" r="5.5" fill="#1a3350"/>
+    <circle cx="124" cy="39" r="2" fill="white"/>
+    <!-- 微笑嘴（弧线） -->
+    <path d="M130 56 Q136 62 142 56" stroke="#2a5a8f" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+    <!-- 泡泡 -->
+    <circle class="pet-bubble b1" cx="140" cy="34" r="3.5" fill="#cfe6fb"/>
+    <circle class="pet-bubble b2" cx="145" cy="22" r="2.5" fill="#cfe6fb"/>
+    <circle class="pet-bubble b3" cx="136" cy="12" r="2.8" fill="#cfe6fb"/>
+  </svg>
+  <button id="petClose" class="pet-close" title="关掉蓝鲸">×</button>
+  <div id="petSay" class="pet-say" hidden></div>
+</div>
+<style>
+/* ============ DeepSeek 蓝鲸桌宠样式 ============ */
+.pet-whale {
+  position: fixed;
+  right: 16px;
+  bottom: 12px;
+  width: 150px;
+  height: 94px;
+  z-index: 9999;
+  cursor: pointer;
+  user-select: none;
+  animation: pet-swim 5s ease-in-out infinite;
+  transition: transform 0.2s;
+}
+.pet-whale:hover { transform: scale(1.05); }
+.pet-whale:active { transform: scale(0.93) rotate(-3deg); }
+.pet-whale-svg { width: 100%; height: 100%; overflow: visible; }
+/* 尾巴摆动（分叉两片交替） */
+.pet-tail { transform-origin: 20px 52px; animation: pet-wag 0.8s ease-in-out infinite; }
+.pet-tail:last-of-type { animation-delay: 0.12s; }
+/* 背鳍 / 胸鳍 */
+.pet-dorsal { transform-origin: 64px 16px; animation: pet-wag 1.2s ease-in-out infinite; }
+.pet-pectoral { transform-origin: 52px 66px; animation: pet-wag 1s ease-in-out infinite; }
+/* 喷水柱（间歇） */
+.pet-spout { animation: pet-spout 4s ease-in-out infinite; opacity: 0; }
+/* 瞳孔互动 */
+.pet-pupil { transition: cx 0.3s, cy 0.3s; }
+/* 泡泡上浮 */
+.pet-bubble { animation: pet-rise 3s ease-in infinite; opacity: 0; }
+.b1 { animation-delay: 0s; }
+.b2 { animation-delay: 1s; }
+.b3 { animation-delay: 2s; }
+/* 说话气泡 */
+.pet-say {
+  position: absolute;
+  left: -8px;
+  bottom: 92px;
+  background: var(--base2, #eee8d5);
+  border: 1px solid var(--base1, #93a1a1);
+  border-radius: 8px;
+  padding: 4px 9px;
+  font-size: 12px;
+  color: var(--base02, #586e75);
+  white-space: nowrap;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+  z-index: 2;
+}
+/* 关闭按钮 */
+.pet-close {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.45);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.2s;
+  z-index: 3;
+}
+.pet-whale:hover .pet-close { opacity: 1; }
+.pet-close:hover { background: #dc322f; }
+
+@keyframes pet-swim {
+  0%, 100% { transform: translateY(0) rotate(-1.5deg); }
+  50%      { transform: translateY(-8px) rotate(1.5deg); }
+}
+@keyframes pet-wag {
+  0%, 100% { transform: rotate(0deg); }
+  50%      { transform: rotate(13deg); }
+}
+@keyframes pet-rise {
+  0%   { transform: translateY(0); opacity: 0; }
+  15%  { opacity: 0.9; }
+  100% { transform: translateY(-52px); opacity: 0; }
+}
+@keyframes pet-spout {
+  0%, 70%, 100% { transform: scaleY(0); opacity: 0; }
+  78%, 92%      { transform: scaleY(1); opacity: 0.9; }
+}
+/* 小屏隐藏，避免遮挡输入 */
+@media (max-width: 480px) {
+  .pet-whale { display: none; }
+}
+</style>
+<script>
+/* ============ 蓝鲸桌宠交互 ============ */
+(function () {
+  const PET_KEY = "e-agent.pet.hidden";
+  const SAYS = [
+    "咕噜咕噜～",
+    "今天也要加油鸭！",
+    "编译过了吗？",
+    "摸鱼中…",
+    "这条消息我看不懂～",
+    "干得漂亮！",
+    "要不要休息一下？",
+    "我是 DeepSeek 蓝鲸～",
+  ];
+  const fish = document.getElementById("petWhale");
+  if (!fish) return;
+  try { if (localStorage.getItem(PET_KEY) === "1") fish.hidden = true; } catch (e) {}
+  const closeBtn = document.getElementById("petClose");
+  const say = document.getElementById("petSay");
+  fish.addEventListener("click", (ev) => {
+    if (ev.target === closeBtn) return;
+    if (!say) return;
+    say.textContent = SAYS[Math.floor(Math.random() * SAYS.length)];
+    say.hidden = false;
+    const pupil = fish.querySelector(".pet-pupil");
+    if (pupil) pupil.setAttribute("cx", "119");
+    setTimeout(() => {
+      say.hidden = true;
+      if (pupil) pupil.setAttribute("cx", "121");
+    }, 1700);
+  });
+  if (closeBtn) closeBtn.addEventListener("click", () => {
+    fish.hidden = true;
+    try { localStorage.setItem(PET_KEY, "1"); } catch (e) {}
+  });
+})();
+</script>
