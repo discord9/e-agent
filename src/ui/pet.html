@@ -111,6 +111,7 @@
 (function () {
   const PET_KEY = "e-agent.pet.hidden";
   const PET_POS_KEY = "e-agent.pet.pos";
+  const PET_CLICK_KEY = "e-agent.pet.clicks";   // 点击计数器（奇数=总结，偶数=梗台词）
   const SAYS = [
     "咕噜咕噜～",
     "今天也要加油鸭！",
@@ -204,12 +205,23 @@
     } catch (e) { return ""; }
   }
 
-  /* 点击：优先显示当前会话总结（📊）；无总结/加载失败 → 运行中任务 → 梗台词 */
+  /* 点击：奇数点击显示当前会话总结（📊）；偶数点击随机说句梗台词。
+     计数器持久化到 localStorage（跨刷新保持奇偶交替）。 */
   fish.addEventListener("click", (ev) => {
     if (ev.target === closeBtn || dragging) return;
     if (!say) return;
     const st = window.state;
     const sid = st && st.sessionId;
+    // 奇数/偶数交替（1 起）：奇数 → 总结，偶数 → 梗台词
+    let clicks = 0;
+    try { clicks = parseInt(localStorage.getItem(PET_CLICK_KEY) || "0", 10) || 0; } catch (e) {}
+    clicks += 1;
+    try { localStorage.setItem(PET_CLICK_KEY, String(clicks)); } catch (e) {}
+    const wantSummary = (clicks % 2) === 1;
+    if (!wantSummary) {
+      sayFor(SAYS[Math.floor(Math.random() * SAYS.length)], 1700);
+      return;
+    }
     const taskText = runningTaskText();
     if (!sid) {
       sayFor(SAYS[Math.floor(Math.random() * SAYS.length)], 1700);
