@@ -78,6 +78,14 @@ CREATE TABLE IF NOT EXISTS running_tasks (
 /// flag (`NULL` = never touched, reads as unpinned; the list sorts pinned
 /// sessions first). Both are added to pre-existing tables by the idempotent
 /// migration in `connect` — see the `ALTER TABLE` comment there.
+///
+/// `writer` is the process identity of the process that wrote this snapshot
+/// row (the most recent `insert_meta`'s stamping process, `pid@hostname#nonce`
+/// — see [`process_identity`]). It serves two purposes: an audit trail of
+/// who wrote each snapshot, and a best-effort hint in concurrent-write
+/// conflict errors (the "recent snapshot writer", which may not be the
+/// conflicting writer — see the conflict bail). Added to pre-existing
+/// tables by the same idempotent migration as `title`/`pinned`.
 const CREATE_TABLE_SESSIONS: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     workspace_id STRING NOT NULL,
@@ -88,6 +96,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     "role" STRING NULL,
     title STRING NULL,
     pinned BOOLEAN NULL,
+    writer STRING NULL,
     entry_count BIGINT NOT NULL DEFAULT 0,
     parent_session_id STRING NULL,
     parent_task_id BIGINT NULL,
@@ -101,6 +110,43 @@ CREATE TABLE IF NOT EXISTS sessions (
 /// namespace (different workspaces get different on-disk directories).
 pub fn derive_workspace_id(root: &Path) -> String {
     root.to_string_lossy().to_string()
+}
+
+/// Process identity for the `sessions.writer` audit column, formatted as
+/// `pid@hostname#nonce`. Computed once per process (module-level
+/// `OnceLock`); every metadata snapshot row is stamped with it at
+/// `insert_meta` time so the sessions audit table records which process
+/// wrote each row, and concurrent-write conflict errors can name the
+/// likely adversary.
+///
+/// Why not just `pid`? A pid alone is ambiguous: the OS reuses pids across
+/// restarts, so two snapshots written by *different* processes could carry
+/// the same pid. Why not rely on `hostname`? `HOSTNAME` is not guaranteed
+/// to be set (hence the `COMPUTERNAME` fallback for Windows, then
+/// `"unknown"`). The `nonce` disambiguates pid reuse: a simple hash of the
+/// boot-time `SystemTime` nanos XORed with the pid — no new dependency,
+/// and different processes (or restarts with a reused pid) get different
+/// values with overwhelming probability.
+static PROCESS_IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The current process's identity string (see [`PROCESS_IDENTITY`]).
+fn process_identity() -> &'static str {
+    PROCESS_IDENTITY.get_or_init(|| {
+        let pid = std::process::id();
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "unknown".to_owned());
+        let nonce = {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            // Simple mixing of the timestamp and pid; hex keeps the string
+            // short. Same pid at a different boot time → different nonce.
+            format!("{:x}", (nanos as u64) ^ (pid as u64))
+        };
+        format!("{pid}@{hostname}#{nonce}")
+    })
 }
 
 /// Monotonic real-time microsecond timestamp. Uses wall clock but guarantees
@@ -202,12 +248,12 @@ impl GreptimeSession {
             .await
             .context("cannot create sessions table")?;
 
-        // Idempotent schema migration for the `title` and `pinned`
-        // columns — a table-structure evolution: `sessions` shipped
-        // without them, so pre-existing databases need an ALTER (fresh
-        // databases already have them via CREATE_TABLE_SESSIONS above).
-        // There are no historical rows to backfill: old rows simply read
-        // the columns back as NULL (the read path treats them as
+        // Idempotent schema migration for the `title`, `pinned` and
+        // `writer` columns — a table-structure evolution: `sessions`
+        // shipped without them, so pre-existing databases need an ALTER
+        // (fresh databases already have them via CREATE_TABLE_SESSIONS
+        // above). There are no historical rows to backfill: old rows simply
+        // read the columns back as NULL (the read path treats them as
         // `Option`). A failed migration must NOT block the connection
         // (GreptimeDB's pg-wire supports `ALTER TABLE ... ADD COLUMN`,
         // but if it errors anyway — e.g. an ancient engine — we keep
@@ -216,6 +262,7 @@ impl GreptimeSession {
         // context; transcript operations are unaffected).
         let mut title_available = true;
         let mut pinned_available = true;
+        let mut writer_available = true;
         let columns: Vec<String> = client
             .query(
                 "SELECT column_name FROM information_schema.columns \
@@ -257,16 +304,31 @@ impl GreptimeSession {
                 }
             }
         }
+        if !columns.iter().any(|c| c == "writer") {
+            match client
+                .execute("ALTER TABLE sessions ADD COLUMN writer STRING NULL", &[])
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    writer_available = false;
+                    eprintln!(
+                        "e-agent: cannot add sessions.writer column (writer audit unavailable): \
+                         {error:#}"
+                    );
+                }
+            }
+        }
 
         // Cache the session's latest metadata snapshot (if any) so later
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
         // wins (ORDER BY last_active_at DESC LIMIT 1).
-        let cached_meta = if title_available && pinned_available {
+        let cached_meta = if title_available && pinned_available && writer_available {
             let meta_row = client
                 .query_opt(
                     "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                            parent_session_id, parent_task_id, title, pinned \
+                            parent_session_id, parent_task_id, title, pinned, writer \
                      FROM sessions \
                      WHERE workspace_id = $1 AND session_id = $2 \
                      ORDER BY last_active_at DESC LIMIT 1",
@@ -285,6 +347,7 @@ impl GreptimeSession {
                 parent_task_id: row.get("parent_task_id"),
                 title: row.get("title"),
                 pinned: row.get("pinned"),
+                writer: row.get("writer"),
                 label: None, // label lives in running_tasks, resolved at list time
             })
         } else {
@@ -842,15 +905,52 @@ impl GreptimeSession {
                 .overlap_conflict_seq(&prepped, base_seq, overlap_hi)
                 .await?;
             if let Some(seq) = conflict_seq {
-                anyhow::bail!(
-                    "concurrent write conflict on session '{}': database max \
-                     seq is {db_max} but this writer expected to start at seq \
-                     {base_seq}; this session is being written concurrently by \
-                     another client (another e-agent process / TUI / Web \
-                     window). First divergence at seq {seq}. Stop the other \
-                     writer or continue in a fresh session, then retry.",
-                    self.session_id,
-                );
+                // Best-effort writer hint for the error message: read the
+                // latest metadata snapshot's writer from the sessions audit
+                // table. The hint is labeled "latest metadata writer"
+                // because snapshot timing is not guaranteed to match the
+                // conflicting append exactly — two writers could in theory
+                // touch within the same nanosecond, and snapshots never
+                // overwrite (append-only). In practice, though, the latest
+                // writer is almost always the adversary: the losing writer
+                // B's touch runs after its own (conflicting) append, so B
+                // re-stamps the row with B's identity after A's last
+                // snapshot. A failed or empty lookup falls back to the
+                // plain message (the `concurrent write conflict` substring
+                // is preserved — `friendly_failure` depends on it).
+                let writer_hint = self
+                    .client
+                    .query_opt(
+                        "SELECT writer FROM sessions \
+                         WHERE workspace_id = $1 AND session_id = $2 \
+                         ORDER BY last_active_at DESC LIMIT 1",
+                        &[&self.workspace_id, &self.session_id],
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|row| row.get::<_, Option<String>>("writer"));
+                match writer_hint {
+                    Some(writer) => anyhow::bail!(
+                        "concurrent write conflict on session '{}': database max \
+                         seq is {db_max} but this writer expected to start at seq \
+                         {base_seq}; this session is being written concurrently by \
+                         another client (another e-agent process / TUI / Web \
+                         window). First divergence at seq {seq}. Stop the other \
+                         writer or continue in a fresh session, then retry. \
+                         ; latest metadata writer: {writer}",
+                        self.session_id,
+                    ),
+                    None => anyhow::bail!(
+                        "concurrent write conflict on session '{}': database max \
+                         seq is {db_max} but this writer expected to start at seq \
+                         {base_seq}; this session is being written concurrently by \
+                         another client (another e-agent process / TUI / Web \
+                         window). First divergence at seq {seq}. Stop the other \
+                         writer or continue in a fresh session, then retry.",
+                        self.session_id,
+                    ),
+                }
             }
             // The whole overlap matches this batch: it is our own earlier
             // commit (committed-then-errored append whose next_seq never
@@ -1013,7 +1113,7 @@ impl GreptimeSession {
             .client
             .query_opt(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned \
+                        parent_session_id, parent_task_id, title, pinned, writer \
                  FROM sessions \
                  WHERE workspace_id = $1 AND session_id = $2 \
                  ORDER BY last_active_at DESC LIMIT 1",
@@ -1032,17 +1132,24 @@ impl GreptimeSession {
             parent_task_id: row.get("parent_task_id"),
             title: row.get("title"),
             pinned: row.get("pinned"),
+            writer: row.get("writer"),
             label: None, // label lives in running_tasks, resolved at list time
         }))
     }
 
-    async fn insert_meta(&self, meta: &SessionMeta) -> Result<()> {
+    async fn insert_meta(&self, meta: &mut SessionMeta) -> Result<()> {
+        // Stamp the writer identity at insert time, not at construction
+        // (P3): every snapshot row records the process that actually wrote
+        // it, and a cross-process resume never replays a stale identity
+        // from a row cached by another process. Callers construct with
+        // `writer: None`; the stamped value is what lands in the column.
+        meta.writer = Some(process_identity().to_owned());
         self.client
             .execute(
                 "INSERT INTO sessions \
                  (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-                  entry_count, parent_session_id, parent_task_id, title, pinned) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                  entry_count, parent_session_id, parent_task_id, title, pinned, writer) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                 &[
                     &self.workspace_id,
                     &meta.session_id,
@@ -1055,6 +1162,7 @@ impl GreptimeSession {
                     &meta.parent_task_id,
                     &meta.title,
                     &meta.pinned,
+                    &meta.writer,
                 ],
             )
             .await
@@ -1101,7 +1209,7 @@ impl GreptimeSession {
             return Ok(());
         }
         let now = us_to_datetime(next_event_time_us());
-        let meta = SessionMeta {
+        let mut meta = SessionMeta {
             session_id: session_id.to_owned(),
             created_at: now,
             last_active_at: now,
@@ -1112,9 +1220,10 @@ impl GreptimeSession {
             parent_task_id,
             title: None,  // a fresh session is unnamed until the user names it
             pinned: None, // a fresh session is unpinned until the user pins it
+            writer: None, // stamped by insert_meta with the writing process
             label: None,  // label lives in running_tasks, resolved at list time
         };
-        self.insert_meta(&meta).await?;
+        self.insert_meta(&mut meta).await?;
         *self.cached_meta.lock().unwrap() = Some(meta);
         Ok(())
     }
@@ -1136,7 +1245,7 @@ impl GreptimeSession {
         let mut meta = meta;
         meta.last_active_at = us_to_datetime(next_event_time_us());
         meta.entry_count = self.next_seq;
-        self.insert_meta(&meta).await
+        self.insert_meta(&mut meta).await
     }
 
     /// Manually name a session: append one full snapshot row carrying the
@@ -1166,7 +1275,7 @@ impl GreptimeSession {
         };
         meta.title = title.map(str::to_owned);
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        self.insert_meta(&meta).await?;
+        self.insert_meta(&mut meta).await?;
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = Some(meta);
         }
@@ -1200,7 +1309,7 @@ impl GreptimeSession {
         };
         meta.pinned = Some(pinned);
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        self.insert_meta(&meta).await?;
+        self.insert_meta(&mut meta).await?;
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = Some(meta);
         }
@@ -1218,7 +1327,8 @@ impl GreptimeSession {
             .client
             .query(
                 "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
-                        s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned \
+                        s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned, \
+                        s.writer \
                  FROM sessions s \
                  INNER JOIN ( \
                      SELECT session_id, MAX(last_active_at) AS max_ts \
@@ -1244,6 +1354,7 @@ impl GreptimeSession {
                 parent_task_id: row.get("parent_task_id"),
                 title: row.get("title"),
                 pinned: row.get("pinned"),
+                writer: row.get("writer"),
                 label: None, // label lives in running_tasks, resolved at list time
             })
             .collect())
@@ -1257,7 +1368,7 @@ impl GreptimeSession {
             .client
             .query(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned \
+                        parent_session_id, parent_task_id, title, pinned, writer \
                  FROM sessions \
                  WHERE workspace_id = $1 AND session_id = $2 \
                  ORDER BY last_active_at ASC",
@@ -1278,6 +1389,7 @@ impl GreptimeSession {
                 parent_task_id: row.get("parent_task_id"),
                 title: row.get("title"),
                 pinned: row.get("pinned"),
+                writer: row.get("writer"),
                 label: None, // label lives in running_tasks, resolved at list time
             })
             .collect())
@@ -1340,7 +1452,7 @@ impl GreptimeSession {
             if existing.iter().any(|id| id == &session_id) {
                 continue;
             }
-            self.insert_meta(&SessionMeta {
+            self.insert_meta(&mut SessionMeta {
                 session_id,
                 created_at: row.get("created_at"),
                 last_active_at: row.get("last_active_at"),
@@ -1351,6 +1463,7 @@ impl GreptimeSession {
                 parent_task_id: None,
                 title: None,  // pre-table sessions have no user-assigned name
                 pinned: None, // pre-table sessions are unpinned
+                writer: None, // stamped by insert_meta with the writing process
                 label: None,  // label lives in running_tasks, resolved at list time
             })
             .await?;
@@ -1871,6 +1984,13 @@ mod tests {
         let mut writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         writer_a.append(&entries[..2]).await.unwrap();
         assert_eq!(writer_a.next_seq, 2);
+        // A metadata snapshot row (any writer path — create_meta/touch/
+        // set_title/set_pinned/backfill — stamps the writer identity), so
+        // the conflict error below can name the latest snapshot writer.
+        writer_a
+            .create_meta(&sid, Some("m"), None, None, None)
+            .await
+            .unwrap();
         drop(writer_a);
 
         // Writer A2: a second concurrent writer (fresh connect, as a TUI +
@@ -1903,6 +2023,11 @@ mod tests {
         assert!(
             msg.contains("max seq") && msg.contains("expected to start"),
             "error must report both the DB max seq and this writer's start seq: {msg}"
+        );
+        assert!(
+            msg.contains("latest metadata writer") && msg.contains(process_identity()),
+            "conflict message must name the latest snapshot writer (all snapshots \
+             were written by this process in the test): {msg}"
         );
 
         // The rejected attempt wrote nothing (detection happens before any
@@ -2728,6 +2853,40 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// The writer identity is computed once per process (OnceLock) and has
+    /// the `pid@hostname#nonce` shape: `@` and `#` present, pid is ours,
+    /// hostname never empty (HOSTNAME → COMPUTERNAME → "unknown"), nonce
+    /// never empty.
+    #[test]
+    fn process_identity_is_stable_and_wellformed() {
+        let first = process_identity();
+        let second = process_identity();
+        assert_eq!(
+            first, second,
+            "OnceLock: identity is computed once per process"
+        );
+        assert!(
+            first.contains('@'),
+            "expected pid@hostname#nonce, got: {first}"
+        );
+        assert!(
+            first.contains('#'),
+            "expected pid@hostname#nonce, got: {first}"
+        );
+        let (pid_part, rest) = first.split_once('@').expect("has @ separator");
+        assert_eq!(
+            pid_part,
+            std::process::id().to_string(),
+            "pid must be the current process pid: {first}"
+        );
+        let (hostname, nonce) = rest.split_once('#').expect("has # separator");
+        assert!(
+            !hostname.is_empty(),
+            "hostname fallback must never be empty: {first}"
+        );
+        assert!(!nonce.is_empty(), "nonce must never be empty: {first}");
+    }
+
     // ------------------------------------------------------------------
     // advance_next_seq_from_snapshot_len — fallible monotonic advance
     // ------------------------------------------------------------------
@@ -3042,6 +3201,67 @@ mod tests {
                 .iter()
                 .any(|m| m.session_id == sid),
             "deleted session must not be listed"
+        );
+    }
+
+    /// Every snapshot row is stamped with the writing process's identity
+    /// (`pid@hostname#nonce`): after create_meta + touch, both the list
+    /// (latest snapshot) and the audit trail (every row) carry
+    /// `writer == process_identity()`.
+    #[tokio::test]
+    async fn sessions_meta_writer_is_process_identity() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-meta-writer-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // create → the snapshot row is stamped with this process's identity.
+        session
+            .create_meta(&sid, Some("model-x"), None, None, None)
+            .await
+            .unwrap();
+        session.touch_meta().await.unwrap();
+        session.touch_meta().await.unwrap();
+
+        // The list view (latest snapshot per session) carries the writer.
+        let list = session.list_meta().await.unwrap();
+        let latest = list
+            .iter()
+            .find(|m| m.session_id == sid)
+            .expect("created session must be listed");
+        assert_eq!(
+            latest.writer.as_deref(),
+            Some(process_identity()),
+            "latest snapshot writer must be this process's identity"
+        );
+
+        // The audit trail stamps every row, not just the newest.
+        for row in session.audit_meta(&sid).await.unwrap() {
+            assert_eq!(
+                row.writer.as_deref(),
+                Some(process_identity()),
+                "every audit row is stamped with the writing process"
+            );
+        }
+
+        // A fresh connect re-reads the stamped writer from the DB (the
+        // cached row is built from the table, not reconstructed).
+        let resumed = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let resumed_latest = resumed
+            .list_meta()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.session_id == sid)
+            .expect("resumed session must still be listed");
+        assert_eq!(
+            resumed_latest.writer.as_deref(),
+            Some(process_identity()),
+            "reconnect must read the writer back from the snapshot row"
         );
     }
 
