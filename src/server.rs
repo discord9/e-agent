@@ -10,6 +10,7 @@
 //! | POST   | `/api/sessions`                   | create a session                   |
 //! | GET    | `/api/sessions/{id}/events`       | SSE: snapshot, then live events    |
 //! | GET    | `/api/sessions/{id}/history`      | segmented history (head or older)  |
+//! | GET    | `/api/sessions/{id}/summary`     | per-turn summary cache (desktop pet) |
 //! | POST   | `/api/sessions/{id}/prompt`       | queue a prompt                     |
 //! | POST   | `/api/sessions/{id}/btw`          | fork into a persistent subagent    |
 //! | POST   | `/api/sessions/{id}/cancel`       | cancel the in-flight turn          |
@@ -44,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::agent::{AgentEvent, SessionEntry};
+use crate::agent::{AgentEvent, Message, Model, SessionEntry, preview};
 use crate::delegate::Sessions;
 use crate::runner::{IdlePolicy, SessionHandle, SessionStatus, SessionTask};
 use crate::session_factory::{SessionBuild, SessionFactory, UnfinishedPolicy};
@@ -100,6 +101,7 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
         registry: Arc::new(SessionRegistry::default()),
         token,
         meta_store,
+        summaries: Arc::new(Mutex::new(HashMap::new())),
     });
     eprintln!(
         "e-agent: serving on http://{host}:{port} (token: {}; also at {})",
@@ -137,8 +139,19 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// One cached session summary: the one-sentence Chinese text generated at
+/// the end of the most recent turn with real activity, plus the time it was
+/// generated. Written by the per-session turn-end listener, read by the
+/// desktop pet. Entries are never evicted: a live session has at most one,
+/// and a stale-but-bounded cache is fine for a click-time display.
+#[derive(Clone)]
+pub struct SummaryEntry {
+    pub text: String,
+    pub at: std::time::SystemTime,
+}
+
 /// Everything the handlers need: the shared factory, the live-session
-/// registry, and the startup token.
+/// registry, the startup token, and the per-session summary cache.
 pub struct AppState {
     pub factory: SessionFactory,
     pub registry: Arc<SessionRegistry>,
@@ -147,6 +160,11 @@ pub struct AppState {
     /// `GET /api/sessions` (Greptime) and `delete_meta` hiding. The Jsonl
     /// variant is the registry-only marker (list is always empty).
     pub meta_store: SessionStore,
+    /// session_id -> (总结文本, 生成时间戳): written at the end of every
+    /// turn with real activity, read by the desktop pet via
+    /// `GET /api/sessions/{id}/summary`. Read-mostly, so a plain
+    /// `Mutex<HashMap>` suffices.
+    pub summaries: Arc<Mutex<HashMap<String, SummaryEntry>>>,
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -154,6 +172,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/sessions/{id}/history", get(session_history))
+        .route("/api/sessions/{id}/summary", get(session_summary))
         .route("/api/sessions/{id}/prompt", post(session_prompt))
         .route("/api/sessions/{id}/btw", post(session_btw))
         .route("/api/sessions/{id}/cancel", post(session_cancel))
@@ -713,6 +732,10 @@ async fn create_session(
         created_at: chrono::Utc::now(),
     });
     state.registry.insert(id.clone(), session.clone());
+    // 桌宠总结：每个 turn（Busy→Idle）结束时后台生成一句话中文总结并缓存。
+    // 监听任务订阅 runner 的 status watch（不改 runner.rs）；会话删除/运行器
+    // 退出（watch sender drop）时自动结束。
+    spawn_summary_listener(state.clone(), id.clone(), session.clone());
     let root = state.factory.root();
     Ok((
         StatusCode::CREATED,
@@ -1223,6 +1246,239 @@ async fn session_history(
         entries: cap_entries(entries, params.limit),
         next_before_seq,
     }))
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Session summaries (desktop pet)
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// How many of the most recent substantive events feed one summary.
+const SUMMARY_MAX_EVENTS: usize = 20;
+
+/// Hard cap for one summary model call: summaries are background best-effort
+/// work, so a slow/stuck model must never pile up behind a turn.
+const SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn summary_put(state: &AppState, id: &str, text: String) {
+    state.summaries.lock().unwrap().insert(
+        id.to_owned(),
+        SummaryEntry {
+            text,
+            at: std::time::SystemTime::now(),
+        },
+    );
+}
+
+fn summary_get(state: &AppState, id: &str) -> Option<SummaryEntry> {
+    state.summaries.lock().unwrap().get(id).cloned()
+}
+
+/// Count of "substantive" events in the in-memory event log: stable events
+/// that persist into history or drive the model (user prompts, assistant
+/// text, tool calls/results, errors, background-completion injections).
+/// Streaming deltas and transient queue projections are skipped, so a turn
+/// that produced only empty chatter never triggers a summary model call.
+fn is_substantive(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::UserPrompt(_)
+            | AgentEvent::AssistantText(_)
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::ToolResult { .. }
+            | AgentEvent::Error(_)
+            | AgentEvent::BackgroundCompletionNotice { .. }
+    )
+}
+
+fn substantive_count(events: &[AgentEvent]) -> usize {
+    events.iter().filter(|event| is_substantive(event)).count()
+}
+
+/// Compress the most recent `max` substantive events into a few short lines
+/// for the summarizer model (newest kept, oldest dropped).
+fn digest_recent(events: &[AgentEvent], max: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for event in events.iter().rev() {
+        let line = match event {
+            AgentEvent::UserPrompt(text) => Some(format!("用户: {}", preview(text, 80))),
+            AgentEvent::AssistantText(text) => Some(format!("助手: {}", preview(text, 80))),
+            AgentEvent::ToolCall { name, arguments } => {
+                Some(format!("调用工具 {name}: {}", preview(arguments, 60)))
+            }
+            AgentEvent::ToolResult { is_error, content } => {
+                let prefix = if *is_error {
+                    "工具出错"
+                } else {
+                    "工具结果"
+                };
+                Some(format!("{prefix}: {}", preview(content, 60)))
+            }
+            AgentEvent::Error(text) => Some(format!("错误: {}", preview(text, 80))),
+            AgentEvent::BackgroundCompletionNotice { output, .. } => {
+                Some(format!("后台任务完成: {}", preview(output, 60)))
+            }
+            _ => None,
+        };
+        if let Some(line) = line {
+            lines.push(line);
+            if lines.len() >= max {
+                break;
+            }
+        }
+    }
+    lines.reverse();
+    lines.join("\n")
+}
+
+/// Generate and cache one one-sentence Chinese summary for a live session.
+/// Best-effort and fully silent: any failure (empty digest, model error,
+/// timeout, empty/absent reply) leaves the previous cache entry untouched
+/// and never blocks or fails the session.
+async fn generate_summary(state: &AppState, id: &str, digest: &str) {
+    if digest.is_empty() {
+        return; // 空总结不调模型
+    }
+    // 用专门的 summarizer 角色（[roles] summarizer，如 deepseek/flash 关思考），
+    // 便宜且不占主模型；未配置时回退主模型。
+    let mut model = state.factory.summarizer_model();
+    let messages = vec![
+        Message::System {
+            content: "你是 e-agent 桌宠的会话总结器。用一句不超过 30 字的中文，\
+概括这个 AI 编程会话最近在做什么。只输出总结本身，不要任何前缀、引号或解释。"
+                .into(),
+        },
+        Message::User {
+            content: format!("最近的会话记录：\n{digest}"),
+            images: Vec::new(),
+        },
+    ];
+    let Ok(Ok((assistant, _))) =
+        tokio::time::timeout(SUMMARY_TIMEOUT, model.complete(&messages, &[], None)).await
+    else {
+        return; // 模型失败/超时：静默，不阻塞会话
+    };
+    let Some(text) = assistant.content else {
+        return;
+    };
+    let text = text.trim().to_owned();
+    if text.is_empty() {
+        return;
+    }
+    summary_put(state, id, text);
+}
+
+/// Background per-session turn-end hook: subscribes to the runner's status
+/// watch + event broadcast (no runner.rs changes) and summarizes after every
+/// Busy→Idle turn whose substantive event count grew. The initial Idle is
+/// the baseline, so a fresh session never summarizes; Compacting and
+/// Finished are ignored (they are not turns).
+///
+/// The task deliberately holds only the watch/broadcast *receivers*, not a
+/// `SessionHandle`: a handle clone would keep the runner's shared state
+/// (event log, command channel) alive after session deletion, so the status
+/// sender would never drop and the task would leak. Receivers die with the
+/// senders, so the task exits on its own when the session is deleted or the
+/// runner exits. On a broadcast lag it resyncs through the registry exactly
+/// like `forward_events` does.
+fn spawn_summary_listener(state: Arc<AppState>, id: String, session: Arc<LiveSession>) {
+    tokio::spawn(async move {
+        let (snapshot, mut events, mut status) = session.handle.attach();
+        drop(session); // 不持有 handle：见函数注释
+        // 自维护计数 + 最近 N 条实质事件窗口（attach 快照 + 增量广播）。
+        let mut recent: Vec<AgentEvent> = Vec::new();
+        let mut substantive = 0usize;
+        for event in snapshot {
+            if is_substantive(&event) {
+                substantive += 1;
+                if recent.len() == SUMMARY_MAX_EVENTS {
+                    recent.remove(0);
+                }
+                recent.push(event);
+            }
+        }
+        let mut baseline = substantive;
+        loop {
+            tokio::select! {
+                changed = status.changed() => {
+                    if changed.is_err() {
+                        return; // 会话已删除 / 运行器退出：sender drop
+                    }
+                    let current = status.borrow().clone();
+                    match current {
+                        SessionStatus::Busy => {
+                            // turn 起点基线：只有该 turn 新增的实质事件才触发总结
+                            baseline = substantive;
+                        }
+                        SessionStatus::Idle => {
+                            if substantive > baseline {
+                                baseline = substantive;
+                                generate_summary(
+                                    &state,
+                                    &id,
+                                    &digest_recent(&recent, SUMMARY_MAX_EVENTS),
+                                )
+                                .await;
+                            }
+                        }
+                        _ => {} // Compacting / Finished：不是 turn，不触发
+                    }
+                }
+                event = events.recv() => match event {
+                    Ok(event) => {
+                        if is_substantive(&event) {
+                            substantive += 1;
+                            if recent.len() == SUMMARY_MAX_EVENTS {
+                                recent.remove(0);
+                            }
+                            recent.push(event);
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        // 广播落后：经 registry 重新 attach 恢复（同 forward_events）。
+                        let Some(session) = state.registry.get(&id) else { return };
+                        let (snapshot, new_events, new_status) = session.handle.attach();
+                        substantive = substantive_count(&snapshot);
+                        events = new_events;
+                        status = new_status;
+                        if matches!(*status.borrow(), SessionStatus::Busy) {
+                            baseline = substantive;
+                        } else if matches!(*status.borrow(), SessionStatus::Idle)
+                            && substantive > baseline
+                        {
+                            // 落后期间错过了一次完整 turn：补上这次总结。
+                            baseline = substantive;
+                            generate_summary(
+                                &state,
+                                &id,
+                                &digest_recent(&snapshot, SUMMARY_MAX_EVENTS),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(RecvError::Closed) => return,
+                },
+            }
+        }
+    });
+}
+
+/// `GET /api/sessions/{id}/summary` — the desktop pet's click-time read of
+/// the per-turn summary cache. `{"summary": "...", "at": "<rfc3339>"}`;
+/// 404 when the session is unknown or no summary has been generated yet
+/// (the pet then falls back to its catchphrases).
+async fn session_summary(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let _ = live(&state, &id)?;
+    let Some(entry) = summary_get(&state, &id) else {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!("session {id} has no summary yet"),
+        ));
+    };
+    let at = chrono::DateTime::<chrono::Utc>::from(entry.at).to_rfc3339();
+    Ok(Json(serde_json::json!({ "summary": entry.text, "at": at })))
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1824,6 +2080,131 @@ mod tests {
         );
     }
 
+    /// Summary machinery: substantive counting skips streaming deltas and
+    /// transient queue projections; the digest keeps the newest `max`
+    /// substantive events in chronological order.
+    #[test]
+    fn summary_substantive_count_and_digest() {
+        let events = vec![
+            AgentEvent::PromptQueued("queued".into()),
+            AgentEvent::UserPrompt("帮我修 bug".into()),
+            AgentEvent::AssistantDelta("增量".into()),
+            AgentEvent::AssistantText("我先看看".into()),
+            AgentEvent::ToolCall {
+                name: "bash".into(),
+                arguments: "cargo build".into(),
+            },
+            AgentEvent::ToolResult {
+                is_error: false,
+                content: "ok".into(),
+            },
+            AgentEvent::ReasoningDelta("思考".into()),
+            AgentEvent::Notice("后台任务完成".into()),
+            AgentEvent::BackgroundCompletionNotice {
+                id: 1,
+                output: "done".into(),
+                label: None,
+            },
+            AgentEvent::Usage {
+                context_input: 1,
+                context_window: None,
+                session: crate::agent::Usage {
+                    input_tokens: 1,
+                    output_tokens: 0,
+                },
+            },
+        ];
+        // Substantive: UserPrompt, AssistantText, ToolCall, ToolResult,
+        // BackgroundCompletionNotice = 5. PromptQueued/AssistantDelta/
+        // ReasoningDelta/Notice/Usage are not counted.
+        assert_eq!(substantive_count(&events), 5);
+        let digest = digest_recent(&events, 3);
+        assert_eq!(
+            digest,
+            "调用工具 bash: cargo build\n工具结果: ok\n后台任务完成: done"
+        );
+        // `max` caps from the newest side.
+        let digest2 = digest_recent(&events, 2);
+        assert_eq!(digest2, "工具结果: ok\n后台任务完成: done");
+        // All-transient log -> empty digest (no model call).
+        assert_eq!(
+            digest_recent(
+                &[
+                    AgentEvent::PromptQueued("q".into()),
+                    AgentEvent::AssistantDelta("d".into())
+                ],
+                20
+            ),
+            ""
+        );
+    }
+
+    /// Summary cache + endpoint: put/get roundtrip; 404 when the session is
+    /// unknown or live but not yet summarized; 200 + `{"summary","at"}`
+    /// once a summary exists.
+    #[tokio::test]
+    async fn summary_cache_and_endpoint() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let state = test_app_state("sekrit");
+        let app = router(state.clone());
+
+        // Unknown session -> 404 (registry miss before the cache is read).
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/nope/summary")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Live session without a cached summary -> 404 (pet falls back).
+        let (id, session) = live_session("web-abc");
+        state.registry.insert(id.clone(), session.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/summary"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Cached summary -> 200 with text + rfc3339 timestamp.
+        summary_put(&state, &id, "正在调试 Windows 沙盒编译错误".into());
+        assert!(summary_get(&state, &id).is_some());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/summary"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["summary"], "正在调试 Windows 沙盒编译错误");
+        // chrono's `to_rfc3339()` renders UTC as "+00:00" (not "Z").
+        let at = value["at"].as_str().expect("at is a string");
+        assert!(!at.is_empty() && at.contains('T') && at.ends_with("+00:00"));
+    }
+
     #[test]
     fn prompt_body_accepts_text_and_prompt() {
         // The frontend sends `JSON.stringify({ text })`.
@@ -1967,6 +2348,7 @@ mod tests {
             registry: Arc::new(SessionRegistry::default()),
             token: token.to_owned(),
             meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2482,6 +2864,7 @@ mod tests {
             registry: Arc::new(SessionRegistry::default()),
             token: "sekrit".to_owned(),
             meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
         });
         let app = router(state);
         let response = app

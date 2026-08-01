@@ -171,12 +171,58 @@
   fish.addEventListener("pointercancel", endDrag);
 
   /* --- 点击互动（非拖拽时） --- */
+  let sayTimer = null;
+  function sayFor(text, ms) {
+    if (!say) return;
+    say.textContent = text;
+    say.hidden = false;
+    clearTimeout(sayTimer);
+    sayTimer = setTimeout(() => { say.hidden = true; }, ms);
+  }
+
+  /* 当前会话运行中的任务 → 一行任务信息（从 window.state.tasks.list 读） */
+  function runningTaskText() {
+    try {
+      const st = window.state;
+      const sid = st && st.sessionId;
+      const list = (st && st.tasks && st.tasks.list) || [];
+      const mine = list.filter((t) => t.session_id === sid);
+      if (mine.length === 0) return "";
+      const t = mine[0];
+      const what = t.kind === "delegate" ? (t.label || "子代理任务")
+        : (t.full_command || t.label || "后台命令");
+      const cmd = what.length > 60 ? what.slice(0, 60) + "…" : what;
+      return (t.kind === "delegate" ? "子代理在跑 " : "后台在跑 ") + cmd;
+    } catch (e) { return ""; }
+  }
+
+  /* 点击：优先显示当前会话总结（📊）；无总结/加载失败 → 运行中任务 → 梗台词 */
   fish.addEventListener("click", (ev) => {
     if (ev.target === closeBtn || dragging) return;
     if (!say) return;
-    say.textContent = SAYS[Math.floor(Math.random() * SAYS.length)];
-    say.hidden = false;
-    setTimeout(() => { say.hidden = true; }, 1700);
+    const st = window.state;
+    const sid = st && st.sessionId;
+    const taskText = runningTaskText();
+    if (!sid) {
+      sayFor(SAYS[Math.floor(Math.random() * SAYS.length)], 1700);
+      return;
+    }
+    const headers = st && st.token ? { "Authorization": "Bearer " + st.token } : {};
+    fetch("/api/sessions/" + encodeURIComponent(sid) + "/summary", { headers })
+      .then((res) => res.ok ? res.json() : null)
+      .then((data) => {
+        if (data && data.summary) {
+          sayFor("📊 " + data.summary + (taskText ? " · " + taskText : ""), 2600);
+        } else if (taskText) {
+          sayFor("🐳 " + taskText, 2200);
+        } else {
+          sayFor(SAYS[Math.floor(Math.random() * SAYS.length)], 1700);
+        }
+      })
+      .catch(() => {
+        if (taskText) sayFor("🐳 " + taskText, 2200);
+        else sayFor(SAYS[Math.floor(Math.random() * SAYS.length)], 1700);
+      });
   });
   if (closeBtn) closeBtn.addEventListener("click", (ev) => {
     ev.stopPropagation();
