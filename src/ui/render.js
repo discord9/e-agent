@@ -30,9 +30,19 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
   btn._target = container;
   const full = el("span", "expand-full", s);
   container.append(preview, full);
-  // 按钮不塞进正文 pre：追加到卡片/区块底部的 footer（操作控件与正文分离）
-  if (footerEl) footerEl.appendChild(btn);
-  else container.appendChild(btn);   // 无 footer（旧调用）时退回原位
+  // 按钮紧跟正文后面（就近），但用独立控件样式与正文区分：
+  // footerEl（卡片底部）已废弃——按钮放 container 后面，视觉上是操作控件
+  const parent = container.parentNode || (footerEl && footerEl.parentNode);
+  if (parent && parent !== container) {
+    // 插到 container 后面
+    const next = container.nextSibling;
+    if (next) parent.insertBefore(btn, next);
+    else parent.appendChild(btn);
+  } else if (footerEl) {
+    footerEl.appendChild(btn);
+  } else {
+    container.appendChild(btn);
+  }
   return container;
 }
 /* =====================================================================
@@ -295,16 +305,15 @@ function buildToolCard(name, args, stateText, stateCls, resultText) {
   let argsText = args != null ? String(args) : "";
   let pretty = argsText;
   try { pretty = JSON.stringify(JSON.parse(argsText), null, 2); } catch (e) { /* 保持原文 */ }
-  // 展开按钮统一放卡片底部 footer（与正文分离，视觉上是操作控件）
-  const footer = el("div", "expand-footer");
-  const argsEl = maybeTruncateEl(el("pre", "tool-args"), pretty, LONG_TEXT_THRESHOLD, footer, "参数");
-
-  const resEl = maybeTruncateEl(el("pre", "tool-result " + stateCls),
-    resultText != null ? resultText : (stateCls === "pending" ? "等待结果…" : ""),
-    LONG_TEXT_THRESHOLD, footer, "结果");
+  // 先 append 到 card（maybeTruncateEl 需要 parentNode 把按钮插到 pre 后面），
+  // 再处理长内容展开
+  const argsEl = el("pre", "tool-args");
+  const resEl = el("pre", "tool-result " + stateCls);
   card.append(head, argsEl, resEl);
-  // 无长内容时 footer 为空，不占空间（hidden 由内容驱动，见 CSS）
-  if (footer.children.length) card.appendChild(footer);
+  maybeTruncateEl(argsEl, pretty, LONG_TEXT_THRESHOLD, null, "参数");
+  maybeTruncateEl(resEl,
+    resultText != null ? resultText : (stateCls === "pending" ? "等待结果…" : ""),
+    LONG_TEXT_THRESHOLD, null, "结果");
   return card;
 }
 

@@ -536,18 +536,22 @@ mmlEqnNo}
   .expandable .expand-full { display: none; }
   .expandable.expanded .expand-preview { display: none; }
   .expandable.expanded .expand-full { display: inline; }
+  /* 展开按钮：控件样式（底色+边框+圆角），紧跟正文 pre 后面，与正文明显区分 */
   .expand-toggle {
+    display: inline-block;
     cursor: pointer;
-    background: none;
-    border: none;
-    padding: 0 0 0 4px;
-    margin: 0;
+    background: var(--base2);
+    border: 1px solid var(--base1);
+    border-radius: 3px;
+    padding: 1px 8px;
+    margin: 2px 0 4px 4px;
     font: inherit;
-    font-size: 12px;
+    font-size: 11px;
     color: var(--blue);
-    text-decoration: underline;
     user-select: none;
+    transition: background 0.15s, border-color 0.15s;
   }
+  .expand-toggle:hover { background: var(--base1); border-color: var(--blue); }
   /* 箭头由 CSS 绘制：收起=下指（▾ 语义），展开旋转 180° 上指（▴ 语义） */
   .expand-toggle::after {
     content: "";
@@ -562,15 +566,6 @@ mmlEqnNo}
     transition: transform 0.15s;
   }
   .expandable.expanded .expand-toggle::after { transform: rotate(180deg); }
-  /* 展开按钮容器：卡片/notice 底部独立一行，操作控件与正文分离；
-     只在有长内容时由 JS 追加（无内容不占位） */
-  .expand-footer {
-    display: flex;
-    justify-content: flex-end;
-    margin-top: 4px;
-    padding-top: 2px;
-    border-top: 1px dashed var(--base1);
-  }
 
   /* notice 内的长正文（后台任务输出 / 未知条目 JSON）：pre 保持可选中复制 */
   .notice .notice-output {

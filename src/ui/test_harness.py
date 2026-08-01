@@ -127,6 +127,7 @@ class El {
       toggle:(c,force)=>{ const on = force !== undefined ? !!force : !this._classes.has(c);
         if (on) this._classes.add(c); else this._classes.delete(c); return on; } }; }
   get children(){ return this._children; }
+  get parentNode(){ return this._parent ?? null; }
   get firstChild(){ return this._children[0] ?? null; }
   get nextSibling(){ if(!this._parent) return null;
     const i=this._parent._children.indexOf(this);
@@ -645,6 +646,11 @@ async function main(){
         && argsShortA.textContent === JSON.stringify(JSON.parse('{"cmd":"ls"}'), null, 2),
         "text=" + JSON.stringify(argsShortA.textContent));
     // 点击展开 → 显示全文；再点收起 → 回到预览
+    // 按钮在正文 pre 外面（紧跟其后），不在 pre 内部
+    const btnHost = resPreA._parent;
+    chk("A expand button outside pre",
+        btnHost && btnHost._children.some((c) => c instanceof El && c._classes && c._classes.has("expand-toggle")),
+        "host=" + (btnHost && btnHost.tag));
     const clicksA = (elsById["messages"]._listeners["click"] || []);
     // footer 里有两个展开按钮（args + result）：取控制 resPreA 的那个
     const btnA = cardA.querySelectorAll(".expand-toggle")
