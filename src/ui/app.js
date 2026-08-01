@@ -289,7 +289,10 @@ function renderSessionList(list) {
       (s.parent_session_id ? " · 子会话 ← " + s.parent_session_id : "");
 
     const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
-    const sid = el("span", "sid", s.id);   // 完整 ID：用户需要知道是哪个会话
+    // 有标题优先显示标题，后面跟短 id（完整 id 放 title 属性）
+    const sid = el("span", "sid",
+      s.title ? s.title + " · " + shortId(s.id) : s.id);
+    if (s.title) sid.title = s.id;
     const edit = el("button", "tree-edit", "✎");
     edit.type = "button";
     edit.title = "重命名";
