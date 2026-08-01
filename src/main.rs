@@ -540,7 +540,9 @@ fn crash_dir_inner(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf>
 fn crash_dir() -> Option<PathBuf> {
     crash_dir_inner(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+        e_agent::home_dir()
+            .as_deref()
+            .map(std::path::Path::as_os_str),
     )
 }
 

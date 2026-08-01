@@ -131,7 +131,7 @@ pub fn image_store_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|x| !x.is_empty()) {
         Some(PathBuf::from(xdg).join("e-agent/images"))
     } else {
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/e-agent/images"))
+        crate::home_dir().map(|home| home.join(".config/e-agent/images"))
     }
 }
 

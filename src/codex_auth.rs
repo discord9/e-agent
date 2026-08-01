@@ -155,8 +155,8 @@ pub fn auth_path() -> anyhow::Result<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(path).join("e-agent/auth.json"));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".config/e-agent/auth.json"));
+    if let Some(home) = crate::home_dir() {
+        return Ok(home.join(".config/e-agent/auth.json"));
     }
     bail!("cannot locate ChatGPT auth storage: set XDG_CONFIG_HOME or HOME")
 }

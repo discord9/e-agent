@@ -683,5 +683,25 @@ impl Drop for BackgroundRegistry {
                 );
             }
         }
+        #[cfg(windows)]
+        for task in self.running.lock().unwrap().iter() {
+            // Degraded kill: terminate the top-level process only. The
+            // process tree is not enumerated (no Job Object yet — that is a
+            // later milestone), so grandchildren may survive.
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+            };
+            let pid = task.process_group.load(Ordering::Acquire) as u32;
+            if pid != 0 {
+                unsafe {
+                    let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                    if !handle.is_null() {
+                        let _ = TerminateProcess(handle, 1);
+                        CloseHandle(handle);
+                    }
+                }
+            }
+        }
     }
 }
