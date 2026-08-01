@@ -437,6 +437,7 @@ const SLASH_COMMANDS = [
   { name: "/btw", desc: "fork 旁路 subagent 继续探讨", args: "<问题>" },
   { name: "/fork", desc: "从历史消息 fork 出新会话", args: "" },
   { name: "/undo", desc: "撤销最近的文件操作", args: "" },
+  { name: "/help", desc: "显示所有命令及用法", args: "" },
 ];
 
 const slashMenu = {
@@ -659,6 +660,19 @@ async function sendPrompt() {
   if (text === "/compact") {
     // fire-and-forget：compactSession 自带 confirm、提交提示与失败 banner，无需 await
     compactSession();
+    els.promptInput.value = "";
+    autosizeInput();
+    return;
+  }
+  if (raw === "/help") {
+    // 命令列表较长，走 scrollback Notice（pre-wrap 多行）而非顶部 banner
+    appendNotice([
+      "/compact - 压缩上下文",
+      "/rename <标题> - 重命名会话",
+      "/btw <问题> - fork 旁路 subagent",
+      "/fork - 从历史消息 fork",
+      "/undo - 撤销文件操作",
+    ].join("\n"));
     els.promptInput.value = "";
     autosizeInput();
     return;

@@ -368,12 +368,12 @@ async function main(){
     const pin = elsById["promptInput"];
     const kd = (key, extra) => { for (const fn of pin._listeners["keydown"] || []) fn(Object.assign({ key, shiftKey: false, preventDefault(){} }, extra || {})); };
     const inp = () => { for (const fn of pin._listeners["input"] || []) fn(); };
-    // 输入 /（命令起始）→ 弹出 5 个候选，首项选中
+    // 输入 /（命令起始）→ 弹出 6 个候选，首项选中
     pin.value = "/";
     pin.selectionStart = pin.selectionEnd = 1;
     inp();
     chk("slash menu opens on /", slashMenu.open === true && sm.hidden === false
-        && sm.querySelectorAll(".slash-item").length === 5,
+        && sm.querySelectorAll(".slash-item").length === 6,
         "open=" + slashMenu.open + " items=" + sm.querySelectorAll(".slash-item").length);
     chk("slash first item selected", slashMenu.selected === 0
         && sm.querySelectorAll(".slash-item")[0].classList.contains("selected"));
@@ -393,7 +393,7 @@ async function main(){
     chk("slash arrow down moves selection", slashMenu.selected === 1,
         "sel=" + slashMenu.selected);
     kd("ArrowUp"); kd("ArrowUp");
-    chk("slash arrow up wraps", slashMenu.selected === 4, "sel=" + slashMenu.selected);
+    chk("slash arrow up wraps", slashMenu.selected === 5, "sel=" + slashMenu.selected);
     kd("ArrowDown");
     chk("slash arrow down wraps to 0", slashMenu.selected === 0, "sel=" + slashMenu.selected);
     // Enter 填入带参数命令：/rename <标题>，光标在参数位（占位被选中，输入即覆盖）
@@ -424,6 +424,20 @@ async function main(){
     chk("slash compact executes via sendPrompt",
         pin.value === "" && FETCHES.some(u => u.endsWith("/compact")),
         "cleared=" + (pin.value === ""));
+    // /help：Enter 执行 → scrollback 出现多行命令列表 Notice，输入框清空
+    pin.value = "/help";
+    pin.selectionStart = pin.selectionEnd = 5;
+    kd("Enter");
+    await flush();
+    const helpNotices = elsById["messages"].querySelectorAll(".notice");
+    const lastHelpNotice = helpNotices[helpNotices.length - 1];
+    chk("slash /help shows command list",
+        pin.value === "" && lastHelpNotice
+          && lastHelpNotice.textContent.includes("/compact - 压缩上下文")
+          && lastHelpNotice.textContent.includes("/btw <问题>")
+          && lastHelpNotice.textContent.includes("/undo - 撤销文件操作"),
+        "cleared=" + (pin.value === "") + " notice="
+          + (lastHelpNotice ? JSON.stringify(lastHelpNotice.textContent) : "none"));
     // Esc 关闭
     pin.value = "/";
     pin.selectionStart = pin.selectionEnd = 1;

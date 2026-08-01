@@ -602,6 +602,8 @@ async fn handle_pressed_key(
             handle.compact();
         } else if prompt == "/undo" {
             handle_undo(state);
+        } else if prompt == "/help" {
+            state.push_agent_event(AgentEvent::Notice(HELP_TEXT.to_string()));
         } else if let Some(command) = parse_rename(&prompt) {
             handle_rename(command, state).await;
         } else if let Some(command) = parse_btw(&prompt) {
@@ -618,6 +620,15 @@ async fn handle_pressed_key(
     }
     Ok(KeyHandled::Continue)
 }
+
+/// `/help` output: the supported slash commands (kept in sync with the web
+/// UI's SLASH_COMMANDS in `src/ui/sessions.js`).
+const HELP_TEXT: &str = "\
+/compact - 压缩上下文
+/rename <标题> - 重命名会话
+/btw <问题> - fork 旁路 subagent
+/fork - 从历史消息 fork
+/undo - 撤销文件操作";
 
 fn route_idle_events(
     state: &mut TuiState,
