@@ -667,6 +667,7 @@ pub async fn spawn_btw_subagent(
         Some(crate::tools::TaskDisplayMeta {
             background: true,
             workspace: None,
+            subagent_session_id: Some(session_id.clone()),
         }),
         move |id| {
             match slot_in_hook.lock() {
@@ -942,13 +943,6 @@ impl Tool for Delegate {
             None => self.workspace.clone(),
         };
 
-        // Build structured display metadata for the F2 task panel. Background
-        // reflects the effective execution mode; workspace remains explicit-only.
-        let task_display = crate::tools::TaskDisplayMeta {
-            background,
-            workspace: explicit_workspace_arg.clone(),
-        };
-
         let model_name = model.display_name().to_string();
         let (resume_id, resume_entries) = match resume {
             Some((id, entries)) => (Some(id), Some(entries)),
@@ -963,6 +957,16 @@ impl Tool for Delegate {
             backend: self.persist_backend.clone(),
         };
         let session_id = persist.session_id.clone();
+        // Build structured display metadata for the F2 task panel. Background
+        // reflects the effective execution mode; workspace remains explicit-only.
+        // The subagent session id lets the web task panel jump straight to the
+        // subagent's transcript without label matching (labels are lost once
+        // the Greptime `running_tasks` row is cleared at completion).
+        let task_display = crate::tools::TaskDisplayMeta {
+            background,
+            workspace: explicit_workspace_arg.clone(),
+            subagent_session_id: Some(session_id.clone()),
+        };
         // Sessions metadata (audit table): the subagent's row is written
         // by the PARENT at spawn time — model/role/parent links are all
         // known here (R3) — never by the subagent's own touch path (which

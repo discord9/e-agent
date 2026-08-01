@@ -790,10 +790,16 @@ function stopPolling() {
 }
 /* delegate 任务 → 对应 subagent 会话 id。
    /api/tasks 的 delegate 条目 session_id 是父会话（任务注册在父的
-   registry）；subagent 自己的会话出现在 /api/sessions，以
+   registry）；新版后端直接在条目上带 subagent_session_id，优先用它跳转，
+   不再依赖 label 匹配（任务完成时 Greptime running_tasks 行被清除，
+   /api/sessions 的 label 变 null，label 匹配永远失效）。
+   旧后端回退：subagent 自己的会话出现在 /api/sessions，以
    parent_session_id === 父 id 且 label === 任务 label 关联。列表未加载
    或该 delegate 已结束（label 行被消费）→ null。 */
 function resolveSubagentSessionId(t) {
+  // 新版后端：任务条目直接带 subagent 会话 id，无需 label 匹配
+  if (t && t.subagent_session_id) return t.subagent_session_id;
+  // 旧后端回退：label 匹配（保留现状逻辑）
   if (!t || !t.session_id || !t.label) return null;
   const list = state.lastList || [];
   const hit = list.find((s) => s.parent_session_id === t.session_id && s.label === t.label);
