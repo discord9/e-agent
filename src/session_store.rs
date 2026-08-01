@@ -55,6 +55,11 @@ pub struct SessionMeta {
     /// = unnamed (the frontend shows the session id). Greptime only —
     /// the JSONL backend has no meta table and never produces values.
     pub title: Option<String>,
+    /// Task-panel label of the delegate task that spawned this session
+    /// (see [`SessionStore::label_for_subagent`]). Never stored in the
+    /// sessions table — it lives in `running_tasks` and is resolved at
+    /// list time, so this is always `None` when read from the DB.
+    pub label: Option<String>,
 }
 
 #[derive(Clone)]
@@ -621,6 +626,30 @@ impl SessionStore {
                     .lock()
                     .await
                     .take_unfinished_tasks_for_subagent(subagent_session_id)
+                    .await
+            }
+        }
+    }
+
+    /// The task-panel label for a subagent session: the label of the newest
+    /// surviving `running_tasks` row whose `subagent_session_id` matches
+    /// (rows are deleted when the delegate task completes, so `None` means
+    /// "no live delegate task carries this session" and the frontend falls
+    /// back to the session id). Greptime only — the JSONL backend has no
+    /// global task table and always reports `None`.
+    pub async fn label_for_subagent(
+        &self,
+        _root: &Path,
+        subagent_session_id: &str,
+    ) -> Result<Option<String>> {
+        match self {
+            SessionStore::Jsonl => Ok(None),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session
+                    .lock()
+                    .await
+                    .label_for_subagent(subagent_session_id)
                     .await
             }
         }
