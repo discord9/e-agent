@@ -1473,9 +1473,16 @@ async function cancelTask(t) {
   }
 }
 
+/* 侧边栏开关状态跨刷新持久化（localStorage；隐私模式禁用时静默失败，不影响功能） */
+function persistSidebarOpen() {
+  try { localStorage.setItem("e-agent.sidebar.open", state.sidebar.open ? "1" : "0"); }
+  catch (e) { /* 静默 */ }
+}
+
 function openSidebar() {
   if (state.sidebar.open) return;
   state.sidebar.open = true;
+  persistSidebarOpen();                // 跨刷新保持打开状态
   renderSidebarTree();                 // 树可能已随轮询刷新；打开时确保渲染
   els.sidebarOverlay.hidden = false;
   els.sidebar.hidden = false;
@@ -1491,6 +1498,7 @@ function openSidebar() {
 function closeSidebar() {
   if (!state.sidebar.open) return;
   state.sidebar.open = false;
+  persistSidebarOpen();                // 跨刷新保持关闭状态
   els.sidebarOverlay.hidden = true;
   els.sidebar.classList.remove("open");
   stopTasksPanelPolling();
@@ -1867,7 +1875,6 @@ els.searchInput.addEventListener("input", () => {
   renderSessionList(state.lastList);   // 轮询仍会全量重绘，但搜索词留在 state 里，过滤持续生效
 });
 els.backBtn.addEventListener("click", backToList);
-els.backBtn.addEventListener("click", closeSidebar);   // 返回列表时收起侧边栏
 els.sidebarBtn.addEventListener("click", () => {
   if (state.sidebar.open) closeSidebar();
   else openSidebar();
@@ -1920,6 +1927,10 @@ function init() {
   if (dl) state.deepLink.pending = dl;
   startPolling();
   pollSessions();
+  // 侧边栏跨刷新恢复：上次开着就继续开（切会话/返回列表都不关，仅手动关）
+  try {
+    if (localStorage.getItem("e-agent.sidebar.open") === "1") openSidebar();
+  } catch (e) { /* 静默 */ }
   // 任务数（侧边栏标题）：独立轻量轮询，侧边栏关闭时也保持更新（无 token 时静默跳过）
   updateTasksTitle(0);
   startTasksBadgePolling();
