@@ -299,7 +299,10 @@ els.messages.addEventListener("click", (ev) => {
   const t = ev.target;
   if (!t || !t.classList) return;
   if (t.classList.contains("expand-toggle")) {
-    const c = t.closest(".expandable");
+    // 按钮在卡片/notice 底部的 footer（与正文分离）；_target 是它控制的
+    // 正文 pre（卡片可能有多个 .expandable），回退到就近查找（旧布局）
+    const c = t._target || t.closest(".expandable")
+      || (t.closest(".tool-card") || t.closest(".notice") || {}).querySelector?.(".expandable");
     if (!c) return;
     const expanded = c.classList.toggle("expanded");
     t.textContent = expanded ? "收起" : "展开全文";

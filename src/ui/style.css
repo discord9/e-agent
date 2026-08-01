@@ -562,6 +562,15 @@ mmlEqnNo}
     transition: transform 0.15s;
   }
   .expandable.expanded .expand-toggle::after { transform: rotate(180deg); }
+  /* 展开按钮容器：卡片/notice 底部独立一行，操作控件与正文分离；
+     只在有长内容时由 JS 追加（无内容不占位） */
+  .expand-footer {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 4px;
+    padding-top: 2px;
+    border-top: 1px dashed var(--base1);
+  }
 
   /* notice 内的长正文（后台任务输出 / 未知条目 JSON）：pre 保持可选中复制 */
   .notice .notice-output {

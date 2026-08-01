@@ -640,12 +640,15 @@ async function main(){
     const shortCardA = buildToolCard("bash", '{"cmd":"ls"}', "完成", "", "ok");
     const argsShortA = shortCardA.querySelector(".tool-args");
     chk("A short args direct output",
-        !argsShortA.classList.contains("expandable") && argsShortA.querySelector(".expand-toggle") === null
+        !argsShortA.classList.contains("expandable")
+        && shortCardA.querySelector(".expand-footer") === null
         && argsShortA.textContent === JSON.stringify(JSON.parse('{"cmd":"ls"}'), null, 2),
         "text=" + JSON.stringify(argsShortA.textContent));
     // 点击展开 → 显示全文；再点收起 → 回到预览
     const clicksA = (elsById["messages"]._listeners["click"] || []);
-    const btnA = resPreA.querySelector(".expand-toggle");
+    // footer 里有两个展开按钮（args + result）：取控制 resPreA 的那个
+    const btnA = cardA.querySelectorAll(".expand-toggle")
+      .find((b) => b._target === resPreA) || cardA.querySelector(".expand-toggle");
     for (const fn of clicksA) fn({ target: btnA });
     chk("A expand toggles full text",
         resPreA.classList.contains("expanded") && btnA.textContent === "收起"
@@ -680,7 +683,7 @@ async function main(){
         restoredResA.classList.contains("expandable")
         && restoredResA.querySelector(".expand-full").textContent === "z".repeat(400)
         && !restoredResA.classList.contains("expanded"));
-    const restoredBtnA = restoredResA.querySelector(".expand-toggle");
+    const restoredBtnA = restoredCardA[restoredCardA.length - 1].querySelector(".expand-toggle");
     for (const fn of clicksA) fn({ target: restoredBtnA });
     chk("A round-trip toggle still works",
         restoredResA.classList.contains("expanded") && restoredBtnA.textContent === "收起",

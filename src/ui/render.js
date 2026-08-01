@@ -16,7 +16,7 @@
    替换）后仍能展开——按钮监听走消息容器事件委托，快照重建后依然可点；
    代价是长内容在 DOM 里多一份文本。调用方传 pre（工具参数/结果、notice
    长文本等），保持 pre 语义：文本可选中复制。 */
-function maybeTruncateEl(container, text, threshold) {
+function maybeTruncateEl(container, text, threshold, footerEl) {
   const s = String(text == null ? "" : text);
   const n = (threshold > 0) ? threshold : LONG_TEXT_THRESHOLD;
   if (s.length <= n) { container.textContent = s; return container; }
@@ -25,8 +25,14 @@ function maybeTruncateEl(container, text, threshold) {
   const preview = el("span", "expand-preview", s.slice(0, n) + "\n… ");
   const btn = el("button", "expand-toggle", "展开全文");
   btn.type = "button";
+  // 记住按钮控制的正文 pre：卡片里可能有多个 .expandable（args/result），
+  // 事件委托用这个引用精确定位，而不是就近找第一个
+  btn._target = container;
   const full = el("span", "expand-full", s);
-  container.append(preview, full, btn);
+  container.append(preview, full);
+  // 按钮不塞进正文 pre：追加到卡片/区块底部的 footer（操作控件与正文分离）
+  if (footerEl) footerEl.appendChild(btn);
+  else container.appendChild(btn);   // 无 footer（旧调用）时退回原位
   return container;
 }
 /* =====================================================================
@@ -263,7 +269,7 @@ function appendToolResult(isError, content, acc, callId) {
     resEl.classList.remove("pending");
     resEl.classList.toggle("err", isError);
     maybeTruncateEl(resEl, content || (isError ? "(无错误信息)" : "(无输出)"),
-      LONG_TEXT_THRESHOLD);
+      LONG_TEXT_THRESHOLD, ensureCardFooter(card));
     card.removeAttribute("open");   // 结果到达：收起为标题行（默认折叠）
   } else {
     // 没有可配对的卡片：独立展示结果行
@@ -289,13 +295,27 @@ function buildToolCard(name, args, stateText, stateCls, resultText) {
   let argsText = args != null ? String(args) : "";
   let pretty = argsText;
   try { pretty = JSON.stringify(JSON.parse(argsText), null, 2); } catch (e) { /* 保持原文 */ }
-  const argsEl = maybeTruncateEl(el("pre", "tool-args"), pretty, LONG_TEXT_THRESHOLD);
+  // 展开按钮统一放卡片底部 footer（与正文分离，视觉上是操作控件）
+  const footer = el("div", "expand-footer");
+  const argsEl = maybeTruncateEl(el("pre", "tool-args"), pretty, LONG_TEXT_THRESHOLD, footer);
 
   const resEl = maybeTruncateEl(el("pre", "tool-result " + stateCls),
     resultText != null ? resultText : (stateCls === "pending" ? "等待结果…" : ""),
-    LONG_TEXT_THRESHOLD);
+    LONG_TEXT_THRESHOLD, footer);
   card.append(head, argsEl, resEl);
+  // 无长内容时 footer 为空，不占空间（hidden 由内容驱动，见 CSS）
+  if (footer.children.length) card.appendChild(footer);
   return card;
+}
+
+/* 取卡片底部的展开按钮容器；结果后填时（live/历史）按钮要进这里 */
+function ensureCardFooter(card) {
+  let footer = card.querySelector(".expand-footer");
+  if (!footer) {
+    footer = el("div", "expand-footer");
+    card.appendChild(footer);
+  }
+  return footer;
 }
 
 /* 切回缓存会话（openSession restored 分支）时，把缓存 DOM 里「进行中」的
@@ -343,8 +363,10 @@ function appendNotice(text) {
 function appendNoticeLong(prefix, text) {
   const n = el("div", "notice");
   if (prefix) n.append(prefix);
-  const pre = maybeTruncateEl(el("pre", "notice-output"), text, LONG_TEXT_THRESHOLD);
+  const footer = el("div", "expand-footer");
+  const pre = maybeTruncateEl(el("pre", "notice-output"), text, LONG_TEXT_THRESHOLD, footer);
   n.append(pre);
+  if (footer.children.length) n.append(footer);
   els.messages.appendChild(n);
   scrollBottom(false);
   pruneMessages();
@@ -477,7 +499,7 @@ function renderMessage(m, acc, pendingCards) {
       resEl.classList.remove("pending");
       resEl.classList.toggle("err", t.is_error);
       maybeTruncateEl(resEl, t.content || (t.is_error ? "(无错误信息)" : "(无输出)"),
-        LONG_TEXT_THRESHOLD);
+        LONG_TEXT_THRESHOLD, ensureCardFooter(card));
     } else {
       // 无对应 ToolCall（如历史截断后）：独立卡片
       const card2 = buildToolCard(t.name, "", t.is_error ? "失败" : "完成",
