@@ -16,14 +16,14 @@
    替换）后仍能展开——按钮监听走消息容器事件委托，快照重建后依然可点；
    代价是长内容在 DOM 里多一份文本。调用方传 pre（工具参数/结果、notice
    长文本等），保持 pre 语义：文本可选中复制。 */
-function maybeTruncateEl(container, text, threshold, footerEl) {
+function maybeTruncateEl(container, text, threshold, footerEl, label) {
   const s = String(text == null ? "" : text);
   const n = (threshold > 0) ? threshold : LONG_TEXT_THRESHOLD;
   if (s.length <= n) { container.textContent = s; return container; }
   container.textContent = "";
   container.classList.add("expandable");
   const preview = el("span", "expand-preview", s.slice(0, n) + "\n… ");
-  const btn = el("button", "expand-toggle", "展开全文");
+  const btn = el("button", "expand-toggle", "展开全文" + (label ? "（" + label + "）" : ""));
   btn.type = "button";
   // 记住按钮控制的正文 pre：卡片里可能有多个 .expandable（args/result），
   // 事件委托用这个引用精确定位，而不是就近找第一个
@@ -297,11 +297,11 @@ function buildToolCard(name, args, stateText, stateCls, resultText) {
   try { pretty = JSON.stringify(JSON.parse(argsText), null, 2); } catch (e) { /* 保持原文 */ }
   // 展开按钮统一放卡片底部 footer（与正文分离，视觉上是操作控件）
   const footer = el("div", "expand-footer");
-  const argsEl = maybeTruncateEl(el("pre", "tool-args"), pretty, LONG_TEXT_THRESHOLD, footer);
+  const argsEl = maybeTruncateEl(el("pre", "tool-args"), pretty, LONG_TEXT_THRESHOLD, footer, "参数");
 
   const resEl = maybeTruncateEl(el("pre", "tool-result " + stateCls),
     resultText != null ? resultText : (stateCls === "pending" ? "等待结果…" : ""),
-    LONG_TEXT_THRESHOLD, footer);
+    LONG_TEXT_THRESHOLD, footer, "结果");
   card.append(head, argsEl, resEl);
   // 无长内容时 footer 为空，不占空间（hidden 由内容驱动，见 CSS）
   if (footer.children.length) card.appendChild(footer);

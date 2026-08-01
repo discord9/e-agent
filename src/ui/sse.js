@@ -305,7 +305,8 @@ els.messages.addEventListener("click", (ev) => {
       || (t.closest(".tool-card") || t.closest(".notice") || {}).querySelector?.(".expandable");
     if (!c) return;
     const expanded = c.classList.toggle("expanded");
-    t.textContent = expanded ? "收起" : "展开全文";
+    const label = t.textContent.includes("（") ? t.textContent.slice(t.textContent.indexOf("（")) : "";
+    t.textContent = expanded ? "收起" + label : "展开全文" + label;
     return;
   }
   if (t.classList.contains("older-load")) {

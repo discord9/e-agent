@@ -651,12 +651,12 @@ async function main(){
       .find((b) => b._target === resPreA) || cardA.querySelector(".expand-toggle");
     for (const fn of clicksA) fn({ target: btnA });
     chk("A expand toggles full text",
-        resPreA.classList.contains("expanded") && btnA.textContent === "收起"
+        resPreA.classList.contains("expanded") && btnA.textContent === "收起（结果）"
         && resPreA.querySelector(".expand-full").textContent === "y".repeat(500),
         "btn=" + btnA.textContent);
     for (const fn of clicksA) fn({ target: btnA });
     chk("A collapse returns to preview",
-        !resPreA.classList.contains("expanded") && btnA.textContent === "展开全文",
+        !resPreA.classList.contains("expanded") && btnA.textContent === "展开全文（结果）",
         "btn=" + btnA.textContent);
     // 工具结果（live/history 路径）也走辅助：长结果默认折叠、短结果直出
     elsById["messages"].innerHTML = "";      // 清掉 restored 测试遗留的 pending 卡片，保证独立卡片分支
@@ -686,7 +686,7 @@ async function main(){
     const restoredBtnA = restoredCardA[restoredCardA.length - 1].querySelector(".expand-toggle");
     for (const fn of clicksA) fn({ target: restoredBtnA });
     chk("A round-trip toggle still works",
-        restoredResA.classList.contains("expanded") && restoredBtnA.textContent === "收起",
+        restoredResA.classList.contains("expanded") && restoredBtnA.textContent === "收起（结果）",
         "btn=" + restoredBtnA.textContent);
     appendToolResult(true, "err-x", state.acc, null);
     const standAloneB = elsById["messages"].querySelectorAll("details.tool-card");
