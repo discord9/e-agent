@@ -10,7 +10,7 @@
 
 /* 长内容「预览 + 展开全文」辅助（Solarized Light 一致，文本可选中复制）：
    内容 ≤ threshold 直出（不增加任何交互成本）；超过则渲染截断预览 +
-   「展开全文 ▾」按钮，完整文本以隐藏 span 常驻 DOM（display:none），
+   「展开全文」按钮（箭头由 CSS ::after 绘制），完整文本以隐藏 span 常驻 DOM（display:none），
    点击按钮原地切换（展开显示全文 / 收起回预览，按钮文案随之切换）。
    完整文本常驻是为了 innerHTML 快照往返（会话缓存恢复、resync 离屏
    替换）后仍能展开——按钮监听走消息容器事件委托，快照重建后依然可点；
@@ -23,7 +23,7 @@ function maybeTruncateEl(container, text, threshold) {
   container.textContent = "";
   container.classList.add("expandable");
   const preview = el("span", "expand-preview", s.slice(0, n) + "\n… ");
-  const btn = el("button", "expand-toggle", "展开全文 ▾");
+  const btn = el("button", "expand-toggle", "展开全文");
   btn.type = "button";
   const full = el("span", "expand-full", s);
   container.append(preview, full, btn);

@@ -707,13 +707,13 @@ function buildTreeRoot(s, kids) {
   const row = el("div", "tree-row" + (state.sessionId === s.id ? " current" : "") +
     (s.pinned === true ? " pinned" : ""));
   const hasKids = kids.length > 0;
-  const toggle = el("button", "tree-toggle", hasKids ? "▸" : "");
+  const toggle = el("button", "tree-toggle");
   toggle.type = "button";
   toggle.disabled = !hasKids;      // 无子会话时留位（占 24px，不响应）
   if (hasKids) {
     toggle.title = "展开 / 收起子会话";
     toggle.addEventListener("click", (ev) => {
-      ev.stopPropagation();          // 点击 ▸ 只展开/收起，不切换会话
+      ev.stopPropagation();          // 点击箭头只展开/收起，不切换会话
       toggleSidebarNode(s.id, toggle, kids);
     });
   }
@@ -753,7 +753,6 @@ function buildTreeRoot(s, kids) {
     if (showKids) {
       children.hidden = false;
       toggle.classList.add("open");
-      toggle.textContent = "▾";
       renderTreeChildren(children, kids);
     }
     node.appendChild(children);
@@ -767,13 +766,11 @@ function toggleSidebarNode(id, toggle, kids) {
   if (children.hidden) {
     children.hidden = false;
     toggle.classList.add("open");
-    toggle.textContent = "▾";
     renderTreeChildren(children, kids);   // 展开时才渲染子节点（400+ 会话不拖慢树）
     state.sidebar.expanded.add(id);
   } else {
     children.hidden = true;
     toggle.classList.remove("open");
-    toggle.textContent = "▸";
     state.sidebar.expanded.delete(id);
   }
 }
@@ -823,7 +820,7 @@ function renderSubagentRows(container, kids, hist) {
 function buildHistGroup(kids) {
   const node = el("div", "tree-node");
   const row = el("div", "tree-row tree-hist-row");
-  const toggle = el("button", "tree-toggle", "▸");
+  const toggle = el("button", "tree-toggle");
   toggle.type = "button";
   toggle.title = "展开 / 收起";
   toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle));
@@ -841,7 +838,7 @@ function buildHistGroup(kids) {
 function buildTreeGroup(label, kids) {
   const node = el("div", "tree-node");
   const row = el("div", "tree-row");
-  const toggle = el("button", "tree-toggle", "▸");
+  const toggle = el("button", "tree-toggle");
   toggle.type = "button";
   toggle.title = "展开 / 收起";
   toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle));
@@ -862,11 +859,9 @@ function toggleTreeGroup(ev, toggle) {
   if (children.hidden) {
     children.hidden = false;
     toggle.classList.add("open");
-    toggle.textContent = "▾";
   } else {
     children.hidden = true;
     toggle.classList.remove("open");
-    toggle.textContent = "▸";
   }
 }
 /* =====================================================================

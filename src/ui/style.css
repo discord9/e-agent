@@ -449,9 +449,13 @@ mmlEqnNo}
   }
   .tool-card .tool-head::-webkit-details-marker { display: none; }  /* 隐藏默认三角，用统一风格 */
   .tool-card .tool-head::before {
-    content: "▸";
-    color: var(--base01);
-    font-size: 10px;
+    content: "";
+    width: 0;
+    height: 0;
+    flex: 0 0 auto;
+    border-left: 6px solid var(--base01);
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
     transition: transform 0.15s;
   }
   .tool-card[open] .tool-head::before { transform: rotate(90deg); }
@@ -512,9 +516,13 @@ mmlEqnNo}
   }
   .task-output-block .task-output-head::-webkit-details-marker { display: none; }
   .task-output-block .task-output-head::before {
-    content: "▸";
-    color: var(--base01);
-    font-size: 10px;
+    content: "";
+    width: 0;
+    height: 0;
+    flex: 0 0 auto;
+    border-left: 6px solid var(--base01);
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
     transition: transform 0.15s;
   }
   .task-output-block[open] .task-output-head::before { transform: rotate(90deg); }
@@ -614,6 +622,20 @@ mmlEqnNo}
     text-decoration: underline;
     user-select: none;
   }
+  /* 箭头由 CSS 绘制：收起=下指（▾ 语义），展开旋转 180° 上指（▴ 语义） */
+  .expand-toggle::after {
+    content: "";
+    display: inline-block;
+    width: 0;
+    height: 0;
+    margin-left: 3px;
+    border-top: 6px solid var(--blue);
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    vertical-align: middle;
+    transition: transform 0.15s;
+  }
+  .expandable.expanded .expand-toggle::after { transform: rotate(180deg); }
 
   /* notice 内的长正文（后台任务输出 / 未知条目 JSON）：pre 保持可选中复制 */
   .notice .notice-output {
@@ -651,9 +673,13 @@ mmlEqnNo}
   }
   .older-collapse summary::-webkit-details-marker { display: none; }
   .older-collapse summary::before {
-    content: "▸";
-    color: var(--base01);
-    font-size: 10px;
+    content: "";
+    width: 0;
+    height: 0;
+    flex: 0 0 auto;
+    border-left: 6px solid var(--base01);
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
     transition: transform 0.15s;
   }
   .older-collapse[open] summary::before { transform: rotate(90deg); }
@@ -749,7 +775,18 @@ mmlEqnNo}
   .tasks-toggle-bar.active { color: var(--blue); border-color: var(--blue); }
   .tasks-toggle-bar.active .tasks-toggle-label { font-weight: bold; }
   .tasks-toggle-bar.open { background: var(--base3); }
-  .tasks-toggle-chevron { margin-left: auto; font-size: 11px; color: var(--base01); }
+  .tasks-toggle-chevron { margin-left: auto; display: inline-flex; align-items: center; }
+  .tasks-toggle-chevron::before {
+    content: "";
+    width: 0;
+    height: 0;
+    flex: 0 0 auto;
+    border-left: 6px solid var(--base01);
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
+    transition: transform 0.15s;
+  }
+  .tasks-toggle-bar.open .tasks-toggle-chevron::before { transform: rotate(90deg); }
   /* 面板：任务行复用 .task-row 系列；限高滚动，避免撑爆 composer */
   #composerTasks {
     flex: 0 0 auto;
@@ -873,7 +910,8 @@ mmlEqnNo}
   /* 置顶主会话节点：金色左边条；与 .current 同现时 current 的蓝色优先（蓝色 = 当前打开） */
   .tree-row.pinned { border-left-color: var(--yellow); }
   .tree-row.current { border-left-color: var(--blue); background: var(--base3); }
-  /* 折叠按钮：真正的 <button>，≥24px 点击区、16px 字号、hover 背景；
+  /* 折叠按钮：真正的 <button>，≥24px 点击区、hover 背景；
+     箭头由 ::before CSS 三角绘制（不依赖 Unicode 字符），
      ▸→▾ 仍由 .open 旋转 90° 实现 */
   .tree-toggle {
     flex: 0 0 auto;
@@ -884,15 +922,25 @@ mmlEqnNo}
     border-radius: 3px;
     background: transparent;
     color: var(--base01);
-    font-size: 16px;
-    line-height: 1;
-    text-align: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     cursor: pointer;
     user-select: none;
     transition: transform 0.15s, background 0.15s;
   }
+  .tree-toggle::before {
+    content: "";
+    width: 0;
+    height: 0;
+    flex: 0 0 auto;
+    border-left: 6px solid var(--base01);
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
+  }
   .tree-toggle:hover:not(:disabled) { background: var(--base1); }
   .tree-toggle:disabled { cursor: default; }
+  .tree-toggle:disabled::before { content: none; }   /* 无子会话：仅占位，不画箭头 */
   .tree-toggle.open { transform: rotate(90deg); }
   .tree-row .busy-dot { width: 7px; height: 7px; flex: 0 0 auto; }
   .tree-id {

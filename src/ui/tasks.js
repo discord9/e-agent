@@ -55,8 +55,6 @@ function renderComposerTasks() {
   bar.classList.toggle("open", state.tasks.composerOpen);
   const label = bar.querySelector(".tasks-toggle-label");
   if (label) label.textContent = "运行中任务 (" + n + ")";
-  const chevron = bar.querySelector(".tasks-toggle-chevron");
-  if (chevron) chevron.textContent = state.tasks.composerOpen ? "▾" : "▸";
   const panel = els.composerTasks;
   if (panel) {
     panel.hidden = !state.tasks.composerOpen;
