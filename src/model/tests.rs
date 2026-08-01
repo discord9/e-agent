@@ -17,6 +17,7 @@ fn converts_internal_messages_and_function_schemas() {
     let request = ChatRequest::from_internal(
         "test-model",
         None,
+        false,
         &[
             Message::Assistant(AssistantMessage {
                 content: None,
@@ -54,6 +55,7 @@ fn omits_empty_tool_calls_on_plain_assistant_messages() {
     let request = ChatRequest::from_internal(
         "test-model",
         None,
+        false,
         &[Message::Assistant(AssistantMessage {
             content: Some("done".into()),
             tool_calls: vec![],
@@ -69,16 +71,50 @@ fn omits_empty_tool_calls_on_plain_assistant_messages() {
 
 #[test]
 fn serializes_reasoning_effort_at_the_top_level() {
-    let request = ChatRequest::from_internal("test-model", Some("max"), &[], &[], None);
+    let request = ChatRequest::from_internal("test-model", Some("max"), false, &[], &[], None);
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["reasoning_effort"], "max");
 }
 
 #[test]
 fn omits_reasoning_effort_when_unset() {
-    let request = ChatRequest::from_internal("test-model", None, &[], &[], None);
+    let request = ChatRequest::from_internal("test-model", None, false, &[], &[], None);
     let value = serde_json::to_value(request).unwrap();
     assert!(value.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn serializes_thinking_switch_when_enabled() {
+    let request = ChatRequest::from_internal("test-model", Some("max"), true, &[], &[], None);
+    let value = serde_json::to_value(request).unwrap();
+    assert_eq!(value["thinking"]["type"], "enabled");
+}
+
+#[test]
+fn omits_thinking_switch_when_disabled_or_without_effort() {
+    // `thinking = false` must not emit the field even with an effort set.
+    let disabled = serde_json::to_value(ChatRequest::from_internal(
+        "test-model",
+        Some("max"),
+        false,
+        &[],
+        &[],
+        None,
+    ))
+    .unwrap();
+    assert!(disabled.get("thinking").is_none());
+
+    // `thinking = true` alone (no reasoning_effort) must not emit it either.
+    let no_effort = serde_json::to_value(ChatRequest::from_internal(
+        "test-model",
+        None,
+        true,
+        &[],
+        &[],
+        None,
+    ))
+    .unwrap();
+    assert!(no_effort.get("thinking").is_none());
 }
 
 async fn read_request(stream: &mut TcpStream) -> serde_json::Value {
@@ -197,6 +233,7 @@ fn wire_messages_never_echo_reasoning() {
     let request = ChatRequest::from_internal(
         "test-model",
         None,
+        false,
         &[Message::Assistant(AssistantMessage {
             content: Some("done".into()),
             tool_calls: vec![],
@@ -366,6 +403,7 @@ fn chat_wire_emits_image_url_object_parts_for_attached_images() {
     let request = ChatRequest::from_internal(
         "vision-model",
         None,
+        false,
         &[Message::User {
             content: "what is this?".into(),
             images: vec![ImagePart {
@@ -396,6 +434,7 @@ fn chat_wire_emits_image_url_object_parts_for_attached_images() {
     let request = ChatRequest::from_internal(
         "vision-model",
         None,
+        false,
         &[Message::System {
             content: "sys".into(),
         }],
@@ -411,6 +450,7 @@ fn chat_wire_degrades_missing_image_file_to_text_placeholder() {
     let request = ChatRequest::from_internal(
         "vision-model",
         None,
+        false,
         &[Message::User {
             content: "hi".into(),
             images: vec![ImagePart {

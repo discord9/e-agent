@@ -127,6 +127,13 @@ struct Provider {
 struct ModelProfile {
     model: Option<String>,
     reasoning_effort: Option<String>,
+    /// Force the OpenAI-compatible `thinking` switch (`thinking:
+    /// {"type": "enabled"}`) on chat requests. DeepSeek V4's `max`
+    /// reasoning effort needs the explicit switch (high enables thinking
+    /// by default); most other providers ignore unknown top-level fields.
+    /// Defaults to false; set `thinking = true` to enable.
+    #[serde(default)]
+    thinking: Option<bool>,
     /// Maximum context window in tokens (e.g. 131072). When set, the agent
     /// auto-compacts when usage exceeds 80% of this value, and the TUI
     /// shows a percentage alongside the token count.
@@ -145,6 +152,9 @@ pub struct ResolvedModel {
     pub api_key: String,
     pub model: String,
     pub reasoning_effort: Option<String>,
+    /// Force the OpenAI-compatible `thinking` switch (`thinking:
+    /// {"type": "enabled"}`) on chat requests; DeepSeek V4 `max` needs it.
+    pub thinking: bool,
     pub auth: AuthMode,
     pub display: String,
     pub context_window: Option<u64>,
@@ -269,6 +279,7 @@ impl Config {
             .ok_or_else(|| anyhow!("model profile `{profile}` requires `model`"))?
             .to_owned();
         let reasoning_effort = model_profile.reasoning_effort.clone();
+        let thinking = model_profile.thinking.unwrap_or(false);
         let provider = self.providers.get(provider_name).ok_or_else(|| {
             anyhow!("provider `{provider_name}` for profile `{profile}` is not defined")
         })?;
@@ -289,6 +300,7 @@ impl Config {
                 api_key: String::new(),
                 model,
                 reasoning_effort,
+                thinking,
                 auth: AuthMode::ChatGpt,
                 display: profile.to_owned(),
                 context_window: model_profile.context_window,
@@ -324,6 +336,7 @@ impl Config {
             api_key,
             model,
             reasoning_effort,
+            thinking,
             auth: AuthMode::ApiKey,
             display: profile.to_owned(),
             context_window: model_profile.context_window,

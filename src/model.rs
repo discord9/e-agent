@@ -87,6 +87,11 @@ pub struct OpenAiModel {
     api_key: String,
     model: String,
     reasoning_effort: Option<String>,
+    /// Force the OpenAI-compatible `thinking` switch (`thinking:
+    /// {"type": "enabled"}`) on chat requests. DeepSeek V4's `max`
+    /// reasoning effort needs the explicit switch; `high` enables thinking
+    /// by default. Other OpenAI-compatible providers ignore the field.
+    thinking: bool,
     /// Whether the model accepts image input (chat wire builds image_url
     /// parts only for vision-capable models; see `ensure_vision_supported`).
     vision: bool,
@@ -138,6 +143,14 @@ impl OpenAiModel {
         self
     }
 
+    /// Force the OpenAI-compatible `thinking` switch on chat requests
+    /// (`thinking: {"type": "enabled"}`), for providers whose reasoning
+    /// mode is off by default (DeepSeek V4 `max`).
+    pub fn with_thinking(mut self, thinking: bool) -> Self {
+        self.thinking = thinking;
+        self
+    }
+
     #[cfg(test)]
     fn with_image_store(mut self, store: PathBuf) -> Self {
         self.image_store = Some(store);
@@ -162,6 +175,7 @@ impl OpenAiModel {
             api_key,
             model,
             reasoning_effort,
+            thinking: false,
             vision,
             image_store: crate::agent::image_store_dir(),
         })
@@ -189,6 +203,7 @@ impl Model for OpenAiModel {
         let request = ChatRequest::from_internal(
             &self.model,
             self.reasoning_effort.as_deref(),
+            self.thinking,
             messages,
             tools,
             self.image_store.as_deref(),
@@ -329,15 +344,29 @@ struct ChatRequest<'a> {
     model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    /// DeepSeek V4 thinking switch (`thinking: {"type": "enabled"}`), sent
+    /// as a top-level field when the profile sets `thinking = true` AND a
+    /// `reasoning_effort` is present: DeepSeek's `max` mode requires the
+    /// explicit switch (high enables thinking by default). Other
+    /// OpenAI-compatible providers ignore unknown top-level fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Thinking>,
     messages: Vec<WireMessage>,
     tools: Vec<WireTool<'a>>,
     stream: bool,
+}
+
+/// The OpenAI-compatible thinking switch payload.
+#[derive(Debug, Serialize)]
+struct Thinking {
+    r#type: &'static str,
 }
 
 impl<'a> ChatRequest<'a> {
     fn from_internal(
         model: &str,
         reasoning_effort: Option<&str>,
+        thinking: bool,
         messages: &[Message],
         tools: &'a [ToolSpec],
         image_store: Option<&Path>,
@@ -345,6 +374,11 @@ impl<'a> ChatRequest<'a> {
         Self {
             model: model.into(),
             reasoning_effort: reasoning_effort.map(str::to_owned),
+            // Only force the switch when the profile opted in
+            // (`thinking = true`) and a reasoning effort is set.
+            thinking: reasoning_effort
+                .filter(|_| thinking)
+                .map(|_| Thinking { r#type: "enabled" }),
             messages: messages
                 .iter()
                 .map(|message| WireMessage::from_internal(message, image_store))
