@@ -542,23 +542,18 @@ function renderEntries(entries, prepend) {
 /* =====================================================================
  * 消息列表上限（MAX_MESSAGE_BLOCKS）：新增块后 pruneMessages 维护上限。
  * 超过上限时把最早的一批「已完成」块（用户/助手/系统消息、思考块、
- * 工具卡片、notice/错误/压缩线/分叉行、已结束任务输出块）移进顶部
- * 占位 details.older-collapse：折叠 = 移入占位容器，展开 = 原位显示。
- * 移动不销毁元素——任务块轮询（元素引用）、expand 按钮（事件委托）、
- * innerHTML 快照（会话缓存/恢复）都不受影响，快照反而更小（折叠进
- * details 后内容仍是完整的）。进行中（流式）的块绝不折叠：流式助手
- * （state.acc.assistantEl）、流式思考（acc.thinkingEl）、执行中的工具
- * 卡片（.tool-state == "执行中…"）、运行中的任务输出块（"● 运行中"）。
+ * 工具卡片、notice/错误/压缩线/分叉行）移进顶部占位
+ * details.older-collapse：折叠 = 移入占位容器，展开 = 原位显示。
+ * 移动不销毁元素——expand 按钮（事件委托）、innerHTML 快照（会话缓存/
+ * 恢复）都不受影响，快照反而更小（折叠进 details 后内容仍是完整的）。
+ * 进行中（流式）的块绝不折叠：流式助手（state.acc.assistantEl）、流式
+ * 思考（acc.thinkingEl）、执行中的工具卡片（.tool-state == "执行中…"）。
  * 只约束渲染块数：不删数据、不动后端（历史仍可滚动分页加载）。
  * 取舍：占位折叠的是块而不是删除，被折叠块的全部信息仍在 DOM 里；
  * 代价是长会话 DOM 总量不下降（上限约束的是「直接子块数」）。
  * ===================================================================*/
 function isInflightBlock(k) {
   if (state.acc && (state.acc.assistantEl === k || state.acc.thinkingEl === k)) return true;
-  if (k.classList.contains("task-output-block")) {
-    const st = k.querySelector(".task-output-state");
-    return st && st.textContent === "● 运行中";
-  }
   if (k.classList.contains("tool-card")) {
     const st = k.querySelector(".tool-state");
     return st && st.textContent === "执行中…";
@@ -570,7 +565,7 @@ function isFoldableBlock(k) {
   return k.classList.contains("msg") || k.classList.contains("notice")
     || k.classList.contains("msg-error") || k.classList.contains("compaction")
     || k.classList.contains("forked") || k.classList.contains("thinking")
-    || k.classList.contains("tool-card") || k.classList.contains("task-output-block");
+    || k.classList.contains("tool-card");
 }
 
 function pruneMessages() {
@@ -616,9 +611,6 @@ function pruneMessages() {
 function renderHistory(entries) {
   renderEntries(entries, false);
   scrollBottom(true);
-  // 历史渲染完成后补挂当前会话运行中 bash 任务的输出块（追加在末尾，
-  // 不打断消息流；块内的轮询由此启动/续上）
-  reconcileTaskOutputBlocks(state.tasks.list);
 }
 
 /* =====================================================================

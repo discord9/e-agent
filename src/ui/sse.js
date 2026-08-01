@@ -3,7 +3,7 @@
  * scheduleReconnect/stopSSE/setConn；并在文件尾部承载「事件绑定与启动」
  * 区块（软键盘适配、init()）。该区块必须在整个拼接的最后执行：此时所有
  * 文件的顶层声明（含 const/let）均已就绪。
- * 依赖 app.js + render.js + sessions.js + tasks.js（reconcileTaskOutputBlocks）。
+ * 依赖 app.js + render.js + sessions.js + tasks.js。
  * =============================================================================*/
 
 /* =====================================================================
@@ -135,13 +135,10 @@ function handleSSEBlock(block, id) {
       real.innerHTML = temp.innerHTML;
       els.messages = real;
       state.initSource = "snapshot";
-      // 重放期间消息区被整体替换：补挂输出块并续轮询
-      reconcileTaskOutputBlocks(state.tasks.list);
     } catch (e) {
       els.messages = real;
       real.innerHTML = backup;
       appendNotice("⚠ 会话同步失败，已保留原内容");
-      reconcileTaskOutputBlocks(state.tasks.list);   // 回滚后同样续上块轮询
     }
     return;
   }

@@ -1,19 +1,19 @@
 /* =============================================================================
  * tasks.js — 运行中任务：/api/tasks 统一轮询（fetchTasks/pollTasks）、
- * composer 任务面板（renderComposerTasks/renderTaskList）、消息列表 bash
- * 输出块（ensureTaskOutputBlock/reconcileTaskOutputBlocks）、delegate 内嵌
- * SSE 流式（startTaskStream/handleTaskStreamBlock）、任务取消（cancelTask）。
+ * composer 任务面板（renderComposerTasks/renderTaskList，卡片内就地展开：
+ * bash 流式轮询 .task-output / delegate 内嵌 SSE 流式 .task-stream）、
+ * 任务取消（cancelTask）。
  * 依赖 app.js + render.js + sessions.js（resolveSubagentSessionId）。
  * =============================================================================*/
 
 /* =====================================================================
- * 运行中任务（两处显示，共用同一轮询）
+ * 运行中任务（统一轮询）
  *   1. 聊天视图 composer 上方：#tasksToggleBar 折叠条（计数即徽标，
- *      有任务时高亮）+ #composerTasks 面板（默认收起，state.tasks.composerOpen）
- *   2. 消息列表（els.messages）末尾：当前会话每个运行中 bash 任务的
- *      「任务输出块」.task-output-block（默认展开实时看输出，见
- *      reconcileTaskOutputBlocks / ensureTaskOutputBlock）
- * 统一轮询 pollTasks()（2s 常驻）：一次 GET /api/tasks 同时更新两处。
+ *      有任务时高亮）+ #composerTasks 面板（默认收起，state.tasks.composerOpen）。
+ *      面板内每行一张任务卡片：bash 点击就地展开/收起 .task-output 并
+ *      500ms 流式轮询 output 端点；delegate 点击切到 subagent 会话
+ *      （解析不到时回退就地展开 .task-stream 内嵌 SSE）。
+ * 统一轮询 pollTasks()（2s 常驻）：一次 GET /api/tasks 更新面板。
  * ===================================================================*/
 /* GET /api/tasks → 任务数组；失败/无 token 返回 null（调用方决定如何处理） */
 async function fetchTasks() {
@@ -32,16 +32,13 @@ async function fetchTasks() {
   }
 }
 
-/* 统一任务轮询（防重入：seq 竞态序号只应用最新一次响应）。
-   一次 fetchTasks 同时更新 composer 折叠条/面板 + 消息列表输出块
-   （当前会话的 bash 任务）。 */
+/* 统一任务轮询（防重入：seq 竞态序号只应用最新一次响应）。 */
 async function pollTasks() {
   const seq = ++state.tasks.seq;
   const tasks = await fetchTasks();
   if (tasks === null || seq !== state.tasks.seq) return;  // 过期响应丢弃
   state.tasks.list = tasks;
   renderComposerTasks();
-  reconcileTaskOutputBlocks(tasks);   // 消息列表输出块：创建/续轮询/结束收起
 }
 
 /* composer 上方折叠条 + 面板：计数即徽标；有任务时高亮，无任务整条隐藏。
@@ -79,10 +76,9 @@ function shortTaskLabel(t) {
    GET /api/sessions/{sid}/tasks/{tid}/output 全量刷新输出区（textContent）。
    旧后端（端点 404）→ 静默停轮询并记为降级（重绘不再重启），保持静态尾部；
    网络失败 / 元素脱离 DOM 同样停轮询。句柄存 state.tasks.pollers
-   （key=session_id:id）。卡片行与消息列表输出块共用同一实现：同一 key
-   同时只有一处活跃（bash 卡片行不再就地展开，活跃的是消息块），
-   后启动的会先停掉旧句柄再接管。onPhase 回调可选：
-   onPhase("start"|"stop"|"degraded")，卡片行用它驱动状态小字显隐。 */
+   （key=session_id:id），同一 key 同时只有一处活跃，后启动的会先停掉旧
+   句柄再接管。onPhase 回调可选：onPhase("start"|"stop"|"degraded")，
+   卡片用它驱动状态小字显隐。 */
 function startOutputPoller(key, t, pre, onPhase) {
   stopTaskPoller(key);
   if (onPhase) onPhase("start");
@@ -126,119 +122,6 @@ function startOutputPoller(key, t, pre, onPhase) {
 function stopTaskPoller(key) {
   const id = state.tasks.pollers.get(key);
   if (id != null) { clearInterval(id); state.tasks.pollers.delete(key); }
-}
-
-/* ---- 消息列表内的 bash 任务输出块（.task-output-block） ----
-   每个运行中的 bash 任务在 els.messages 末尾有一块：details 默认展开，
-   summary = badge「bash」+ 任务 label + 状态/结束标记，pre 轮询刷新输出。
-   块按任务 key（session_id:id）对应，任务结束后收起标记、保留最后输出，
-   不删除（位置保持，新消息自然排在后面）。 */
-
-function taskKey(t) {
-  return (t.session_id || "") + ":" + (t.id != null ? t.id : "");
-}
-
-function findTaskOutputBlock(key) {
-  if (!els.messages) return null;
-  for (const b of els.messages.querySelectorAll(".task-output-block")) {
-    if (b.getAttribute("data-task") === key) return b;
-  }
-  return null;
-}
-
-/* 确保消息列表末尾存在该任务的输出块；不存在则创建（默认展开）。
-   已存在且用户手动折叠的块保持原状（不强制重开）。服务重启等导致
-   task id 复用（旧块已标「✓ 已结束」）时复活为运行中并展开。 */
-function ensureTaskOutputBlock(t) {
-  const key = taskKey(t);
-  let block = findTaskOutputBlock(key);
-  if (!block) {
-    block = el("details", "task-output-block");
-    block.setAttribute("data-task", key);
-    const sum = el("summary", "task-output-head");
-    sum.appendChild(el("span", "kind-badge bash", "bash"));
-    sum.appendChild(el("span", "task-output-label", shortTaskLabel(t)));
-    if (t.session_id) sum.appendChild(el("span", "task-output-sid", "会话 " + shortId(t.session_id)));
-    sum.appendChild(el("span", "task-output-state", "● 运行中"));
-    const initOut = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
-    const body = el("pre", "task-output-body" + (initOut ? "" : " empty"), initOut || "(等待输出…)");
-    block.append(sum, body);
-    els.messages.appendChild(block);
-    scrollBottom(false);
-    block.setAttribute("open", "");   // 新建：默认展开（用户要实时看编译进度）
-    pruneMessages();                  // 新块是「● 运行中」：进行中，不折叠
-  } else {
-    const st = block.querySelector(".task-output-state");
-    if (st && st.classList.contains("done")) {   // 旧 key 复用：复活为运行中
-      st.classList.remove("done");
-      st.textContent = "● 运行中";
-      state.tasks.degraded.delete(key);
-      block.setAttribute("open", "");
-    }
-  }
-  return block;
-}
-
-/* 任务结束（从轮询列表消失）：块收起 + summary 标「✓ 已结束」，
-   保留最后看到的输出文本；停轮询并清降级标记。 */
-function finishTaskOutputBlock(block, key) {
-  stopTaskPoller(key);
-  state.tasks.degraded.delete(key);
-  block.removeAttribute("open");
-  const st = block.querySelector(".task-output-state");
-  if (st) { st.textContent = "✓ 已结束"; st.classList.add("done"); }
-}
-
-/* bash 任务行点击：滚动到消息列表对应输出块 + 短暂高亮提示 */
-function flashTaskOutputBlock(block) {
-  if (typeof block.scrollIntoView === "function") block.scrollIntoView({ block: "nearest" });
-  block.classList.add("flash");
-  if (block._flashTimer) clearTimeout(block._flashTimer);
-  block._flashTimer = setTimeout(() => block.classList.remove("flash"), 2000);
-}
-
-/* 对齐消息列表输出块与当前运行任务（pollTasks 每 2s + 历史/快照渲染后调用）：
-   - 当前会话运行中的 bash 任务 → 确保块存在并启动/续上轮询（块拥有该 key 的
-     轮询：始终重启，覆盖可能残留的卡片轮询）；降级（输出端点 404）→ 用
-     /api/tasks 的 2000 字符尾部静态刷新，不重启轮询。
-   - 已不在列表的任务 → 块收起、标「✓ 已结束」、停轮询（保留最后输出）。
-   只操作当前会话消息区：其它会话的块在各自缓存 DOM 里，切回时由
-   openSession restored 分支再次调用本函数重启轮询。 */
-function reconcileTaskOutputBlocks(tasks) {
-  if (state.view !== "chat" || !state.sessionId) return;
-  const running = new Set();
-  for (const t of tasks || []) {
-    if (t.kind === "delegate") continue;
-    if (t.session_id !== state.sessionId) continue;   // 只渲染当前会话的任务
-    const key = taskKey(t);
-    running.add(key);
-    const block = ensureTaskOutputBlock(t);
-    if (!block) continue;
-    const pre = block.querySelector(".task-output-body");
-    if (!pre) continue;
-    if (state.tasks.degraded.has(key)) {
-      // 旧后端无 output 端点：用任务列表尾部输出静态刷新（2s 粒度）
-      const out = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
-      pre.classList.toggle("empty", out === "");
-      pre.textContent = out || "(无输出)";
-    } else {
-      startOutputPoller(key, t, pre, null);   // 块在 DOM → 轮询更新它
-    }
-  }
-  for (const block of els.messages.querySelectorAll(".task-output-block")) {
-    const key = block.getAttribute("data-task");
-    if (!key || running.has(key)) continue;
-    finishTaskOutputBlock(block, key);
-  }
-}
-
-/* 停掉消息列表所有输出块的轮询（返回列表视图时调用；块留在缓存 DOM，
-   切回时由 reconcileTaskOutputBlocks 重启）。 */
-function stopAllTaskBlockPollers() {
-  if (!els.messages) return;
-  for (const block of els.messages.querySelectorAll(".task-output-block")) {
-    stopTaskPoller(block.getAttribute("data-task"));
-  }
 }
 
 /* delegate（subagent）内嵌 SSE：复用 /api/sessions/{sid}/events，只取
@@ -378,18 +261,12 @@ function handleTaskStreamBlock(block, streamEl, key) {
 }
 
 /* 渲染任务列表到指定容器（composer 面板等；当前无侧边栏分组调用）。
-   bash：行点击 → 切到该任务所属会话，视图就绪后滚动到消息列表里的
-   .task-output-block 并高亮（对应输出在消息区可滚动查看）；已在该会话
-   时直接 flash；找不到对应块（任务已结束 / 未渲染）时回退为就地展开
-   .task-output（静态尾部）+ 500ms 轮询 output 端点（旧后端 404 → 停轮询，
-   降级为静态尾部）。delegate：行点击 → openSession(该 subagent 的会话)，
-   那边有完整消息/工具卡片/思考块渲染；解析不到 subagent 会话时回退为就地
-   展开内嵌 SSE 流式区 .task-stream。.task-output / .task-stream 的渲染代码
-   保留（prevExpanded 恢复逻辑依赖），只是点击分支改变。
+   bash：行点击 → 就地展开/收起 .task-output（500ms 轮询 output 端点
+   流式更新；旧后端 404 → 停轮询，降级为静态尾部）。delegate：行点击 →
+   openSession(该 subagent 的会话)，那边有完整消息/工具卡片/思考块渲染；
+   解析不到 subagent 会话时回退为就地展开内嵌 SSE 流式区 .task-stream。
    重绘前记录已展开的行并按任务 key（session_id:id）恢复——2s 轮询重绘
-   不打断正在查看的输出/流；消失的任务在此停掉轮询/流并清理文本缓冲。
-   只停「本容器已展开行」的轮询/流：消息列表输出块的轮询（同一 key）不
-   受影响——bash 行不再就地展开，块轮询独立存活，由 reconcile 接管。 */
+   不打断正在查看的输出/流；消失的任务在此停掉轮询/流并清理文本缓冲。 */
 function renderTaskList(tasks, container) {
   const list = container;
   if (!list) return;
@@ -430,7 +307,7 @@ function renderTaskList(tasks, container) {
     const key = (t.session_id || "") + ":" + (t.id != null ? t.id : "");
     row.setAttribute("data-task", key);
     const isDelegate = t.kind === "delegate";
-    row.title = isDelegate ? "点击切换到该子代理的会话" : "点击切换到该任务的会话并跳转输出块";
+    row.title = isDelegate ? "点击切换到该子代理的会话" : "点击展开/收起输出（流式更新）";
     const line = el("div", "task-line");
     const badge = el("span", "kind-badge " + (isDelegate ? "delegate" : "bash"),
       isDelegate ? "子代理" : "bash");
@@ -465,7 +342,7 @@ function renderTaskList(tasks, container) {
       await cancelTask(t);
     });
     row.appendChild(cancel);
-    // 就地展开/收起（回退路径：找不到消息块 / 解析不到 subagent 会话时用）
+    // 就地展开/收起（bash 点击主路径；delegate 解析不到 subagent 会话时的回退）
     const toggleRow = () => {
       const showing = isDelegate ? !streamEl.hidden : !pre.hidden;
       if (showing) {                 // 当前展开 → 收起：停轮询/流
@@ -507,33 +384,10 @@ function renderTaskList(tasks, container) {
         });
         return;
       }
-      // bash：点击 → 总是切到该任务所属会话，视图就绪后滚动高亮输出块
-      // （openSession 的 onReady 在 restored/fresh 两条路径的消息区就绪后触发）。
-      // 已在目标会话 → 直接 flash；找不到输出块（任务已结束/未渲染）→
-      // 强制创建输出块（消息列表里流式显示），绝不在卡片内就地展开——
-      // 用户期望「点 bash 卡片 → 该任务的消息列表 → 看流式输出」。
-      if (!t.session_id) { toggleRow(); return; }   // 无会话归属：就地展开
-      if (state.view === "chat" && state.sessionId === t.session_id) {
-        let block = findTaskOutputBlock(key);
-        if (!block) block = ensureTaskOutputBlock(t);
-        if (block) { flashTaskOutputBlock(block); return; }
-        toggleRow();
-        return;
-      }
-      openSession(t.session_id, () => {
-        // 目标会话视图就绪：确保该 bash 任务的输出块存在（消息列表里流式
-        // 显示输出），然后滚动高亮。找不到任务（已结束）时用任务列表尾部
-        // 静态数据兜底；绝不再回退到卡片内就地展开——用户期望「点卡片 →
-        // 该任务的消息列表 → 看流式输出」。
-        let block = findTaskOutputBlock(key);
-        if (!block) {
-          block = ensureTaskOutputBlock(t);
-          // 刚创建：消息区通常不在底部，滚动过去让用户看到输出在实时刷新
-          if (block) flashTaskOutputBlock(block);
-        } else {
-          flashTaskOutputBlock(block);
-        }
-      });
+      // bash：点击 → 就地展开/收起卡片内 .task-output + 启动 500ms 流式
+      // 轮询（startOutputPoller 实时刷新输出；旧后端 404 自动降级为静态
+      // 尾部）。命令输出放卡片里，流式保持。
+      toggleRow();
     });
     if (prevExpanded.has(key)) {     // 轮询重绘恢复展开态：重启轮询/流
       if (isDelegate) {
@@ -562,7 +416,7 @@ async function cancelTask(t) {
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
     if (res.status === 404) { setBanner("⚠ 任务不存在（可能已完成）。"); return; }
     if (res.status !== 204) throw new Error("HTTP " + res.status);
-    // 成功：立即刷新两处显示（统一轮询）
+    // 成功：立即刷新面板（统一轮询）
     await pollTasks();
   } catch (e) {
     setBanner("⚠ 取消失败：" + e.message);
@@ -570,8 +424,7 @@ async function cancelTask(t) {
     state.tasks.cancelling.delete(t.id);
   }
 }
-/* 统一任务轮询定时器（2s 常驻）：composer 折叠条/面板 + 消息列表输出块
-   共用一次 /api/tasks（替代原「徽标 3s + 面板 2s」双轮询） */
+/* 统一任务轮询定时器（2s 常驻）：composer 折叠条/面板共用一次 /api/tasks */
 function startTasksPolling() {
   stopTasksPolling();
   state.tasks.timer = setInterval(pollTasks, 2000);
