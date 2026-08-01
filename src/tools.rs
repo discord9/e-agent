@@ -191,14 +191,16 @@ fn tools_with_background_and_exa_key(
     } else {
         sandbox
     };
-    if !read_only || bash_sandbox.is_some() {
-        tools.push(bash_tool(
+    if (!read_only || bash_sandbox.is_some())
+        && let Ok(tool) = bash_tool(
             workspace,
             background,
             bash_sandbox,
             protect_git,
             bash_timeout,
-        ));
+        )
+    {
+        tools.push(tool);
     }
     if let Some(key) = exa_api_key
         .map(|key| key.trim().to_owned())

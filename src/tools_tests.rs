@@ -644,6 +644,7 @@ async fn bash_timeout_kills_its_background_process_group() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30 * 60)), None),
         sandbox: None,
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     assert!(
         tool.execute(json!({"command": "sleep 30 & echo $! > child.pid; wait"}))
@@ -675,6 +676,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         background: background.clone(),
         sandbox: None,
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     let plain_desc = plain.spec().description;
     assert!(!plain_desc.contains("sandbox"), "{plain_desc}");
@@ -693,6 +695,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             readable_paths: vec!["~/.rustup".into()],
         }),
         protect_git: true,
+        shell: Shell::detect().unwrap(),
     };
     let desc = sandboxed.spec().description;
     assert!(desc.contains("bubblewrap sandbox"), "{desc}");
@@ -720,6 +723,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             readable_paths: vec![],
         }),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     let desc_ro = sandboxed_ro.spec().description;
     assert!(desc_ro.contains("workspace is read-only"), "{desc_ro}");
@@ -744,6 +748,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             readable_paths: vec![],
         }),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     let desc_main = sandboxed_main.spec().description;
     assert!(
@@ -870,6 +875,7 @@ async fn background_bash_uses_the_facade_sandbox_not_the_registry_one() {
         ),
         sandbox: Some(narrowed),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     bash.set_event_sender(sender.clone());
     bash.background.set_event_sender(sender);
@@ -905,6 +911,7 @@ fn background_bash(
         background: BackgroundTasks::new(Some(timeout), None),
         sandbox: None,
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     bash.set_event_sender(sender.clone());
     // This helper also exercises BackgroundTasks directly in a few tests.
@@ -938,6 +945,7 @@ async fn sandbox_allows_workspace_writes_but_not_outside() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     // Writing inside the workspace succeeds.
     tool.execute(json!({"command": "echo hi > inside.txt"}))
@@ -971,6 +979,7 @@ async fn sandbox_can_disable_network() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     // No loopback either in a fresh net namespace: connecting anywhere fails.
     let result = tool
@@ -1004,6 +1013,7 @@ async fn sandbox_read_only_workspace_rejects_bash_but_not_file_tool_writes() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     assert!(
         tool.execute(json!({"command": "touch bash-file"}))
@@ -1032,6 +1042,7 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox.clone()),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     assert!(
         read_only
@@ -1051,6 +1062,7 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     writable
         .execute(json!({"command": "touch workspace-wins"}))
@@ -1077,6 +1089,7 @@ async fn sandbox_read_only_workspace_allows_explicit_writable_child() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     tool.execute(json!({"command": "touch child/allowed"}))
         .await
@@ -1117,6 +1130,7 @@ async fn sandbox_reroot_keeps_startup_policy_anchor_read_only() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     assert!(
         tool.execute(json!({"command": "echo no > ../.e-agent/config.toml"}))
@@ -1144,6 +1158,7 @@ async fn sandbox_missing_policy_cannot_be_created_through_writable_e_agent_child
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     assert!(
         tool.execute(json!({"command": "touch .e-agent/config.toml"}))
@@ -1172,6 +1187,7 @@ async fn sandbox_ro_parent_allows_rw_child_override() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     tool.execute(json!({"command": format!("touch '{}/yes'", child.display())}))
         .await
@@ -1207,6 +1223,7 @@ async fn sandbox_extra_writable_and_readable_paths() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     let cache_path = cache.path().to_string_lossy().into_owned();
     let data_path = data.path().to_string_lossy().into_owned();
@@ -1248,6 +1265,7 @@ async fn sandbox_protects_workspace_git_directory() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: true,
+        shell: Shell::detect().unwrap(),
     };
     // Reading .git/HEAD must succeed (git commands read metadata).
     let out = tool
@@ -1288,6 +1306,7 @@ async fn sandbox_protects_workspace_git_file_linked_worktree() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: true,
+        shell: Shell::detect().unwrap(),
     };
     // Reading the .git pointer must succeed.
     let out = tool.execute(json!({"command": "cat .git"})).await.unwrap();
@@ -1323,6 +1342,7 @@ async fn sandbox_mounts_systemd_resolve_when_present() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     // Check whether /run/systemd/resolve exists on this host.
     let host_has_resolve = std::path::Path::new("/run/systemd/resolve").exists();
@@ -1369,6 +1389,7 @@ async fn sandbox_cat_etc_resolv_conf_works() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     // /etc/resolv.conf is always mounted (--ro-bind-try). Its contents
     // depend on the host config; we just check it is readable.
@@ -1404,6 +1425,7 @@ async fn sandbox_dns_resolution_live_smoke() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     // Live DNS resolution: this is a network-dependent smoke test.
     // Skip if /run/systemd/resolve does not exist on the host (no
@@ -1519,6 +1541,7 @@ async fn background_without_timeout_runs_to_completion() {
         background: BackgroundTasks::new(None, None),
         sandbox: None,
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     bash.set_event_sender(sender.clone());
     bash.background.set_event_sender(sender);
@@ -1972,6 +1995,7 @@ async fn sandbox_does_not_protect_git_when_protect_git_is_false() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     // Writing to .git/HEAD must succeed (main agent orchestrates git).
     let write = tool
@@ -2013,6 +2037,7 @@ async fn sandbox_does_not_protect_git_file_when_protect_git_is_false() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
         sandbox: Some(sandbox),
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     // Overwriting the .git pointer must succeed.
     let write = tool
@@ -2049,6 +2074,7 @@ async fn background_bash_inherits_protect_git_from_parent_bash() {
         background: BackgroundTasks::new(Some(Duration::from_secs(30 * 60)), Some(sandbox.clone())),
         sandbox: Some(sandbox),
         protect_git: true,
+        shell: Shell::detect().unwrap(),
     };
     bash.set_event_sender(sender);
 
@@ -2084,6 +2110,7 @@ async fn shared_registry_clone_drop_does_not_kill_another_bash_origin() {
         sender: None,
         sandbox: None,
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     bash.set_event_sender(origin_tx);
     // Dropping an unrelated facade must not tear down the shared registry.
@@ -2111,6 +2138,7 @@ async fn shared_bash_facades_keep_completions_at_their_origins() {
         sender: None,
         sandbox: None,
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     let mut second = Bash {
         workspace,
@@ -2119,6 +2147,7 @@ async fn shared_bash_facades_keep_completions_at_their_origins() {
         sender: None,
         sandbox: None,
         protect_git: false,
+        shell: Shell::detect().unwrap(),
     };
     first.set_event_sender(first_tx);
     second.set_event_sender(second_tx);

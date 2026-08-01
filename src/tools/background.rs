@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::agent::{AgentEvent, preview};
 
-use super::bash::run_bash;
+use super::bash::{Shell, run_bash};
 
 #[derive(Clone)]
 pub struct BackgroundTasks {
@@ -453,6 +453,7 @@ impl BackgroundTasks {
         sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
         sandbox: Option<crate::config::Sandbox>,
     ) -> Result<String, String> {
+        let shell = Shell::detect()?;
         let process_group = Arc::new(AtomicI32::new(0));
         let output: OutputSlot = Arc::new(std::sync::Mutex::new(Vec::new()));
         let spool: Arc<TaskSpool> = Arc::new(TaskSpool::new());
@@ -478,6 +479,7 @@ impl BackgroundTasks {
             },
             move || async move {
                 match run_bash(
+                    &shell,
                     &workspace,
                     &command,
                     timeout,

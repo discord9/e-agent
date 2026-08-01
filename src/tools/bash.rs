@@ -23,15 +23,17 @@ pub fn bash_tool(
     sandbox: Option<crate::config::Sandbox>,
     protect_git: bool,
     timeout: Option<Duration>,
-) -> Box<dyn Tool> {
-    Box::new(Bash {
+) -> Result<Box<dyn Tool>, String> {
+    let shell = Shell::detect()?;
+    Ok(Box::new(Bash {
         workspace,
         timeout,
         background,
         sender: None,
         sandbox,
         protect_git,
-    })
+        shell,
+    }))
 }
 
 pub(super) struct Bash {
@@ -46,18 +48,17 @@ pub(super) struct Bash {
     /// When true and sandbox is enabled, bind `<workspace>/.git` read-only
     /// so subagents / fixers cannot corrupt the repository metadata.
     pub(super) protect_git: bool,
+    /// Resolved platform shell (pwsh on Windows, bash elsewhere).
+    pub(super) shell: Shell,
 }
 
 #[async_trait]
 impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
         let mut description = "Run a shell command with the workspace as its current directory. Without bubblewrap, the command retains ambient host filesystem access; file-tool capabilities are an independent boundary.".to_owned();
-        // Tell the model which shell syntax to use: PowerShell on Windows,
-        // bash elsewhere.
-        #[cfg(windows)]
-        description.push_str(" The current shell is PowerShell (pwsh): use PowerShell syntax (Get-ChildItem, Get-Content, $env:VAR, etc.), not bash syntax.");
-        #[cfg(not(windows))]
-        description.push_str(" The current shell is bash: use POSIX/bash syntax.");
+        // Tell the model which shell syntax to use (pwsh on Windows, bash
+        // elsewhere).
+        description.push_str(self.shell.syntax_hint);
         if let Some(sandbox) = &self.sandbox {
             let ws_mode = if sandbox.workspace_writable {
                 "writable"
@@ -102,7 +103,7 @@ impl Tool for Bash {
             }
         }
         ToolSpec {
-            name: shell_tool_name().into(),
+            name: self.shell.tool_name.into(),
             description,
             parameters: json!({
                 "type": "object",
@@ -130,6 +131,7 @@ impl Tool for Bash {
             );
         }
         run_bash(
+            &self.shell,
             &self.workspace,
             command,
             self.timeout,
@@ -229,67 +231,77 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
-/// Shell invocation arguments for `command`: PowerShell uses
-/// `-NoProfile -Command`, bash uses `-lc`.
-fn shell_invoke_args(command: &str) -> Vec<String> {
-    #[cfg(windows)]
-    {
-        vec!["-NoProfile".into(), "-Command".into(), command.to_owned()]
-    }
-    #[cfg(not(windows))]
-    {
-        vec!["-lc".into(), command.to_owned()]
-    }
+/// The shell backend: everything platform-specific about the shell tool is
+/// concentrated here — the wire name the model sees, the executable to
+/// spawn, the invocation arguments, and the syntax hint in the tool
+/// description. Platform differences live in exactly one place.
+#[derive(Debug, Clone)]
+pub(super) struct Shell {
+    /// Tool name exposed to the model: `pwsh` on Windows so the model picks
+    /// PowerShell syntax, `bash` everywhere else.
+    pub(super) tool_name: &'static str,
+    executable: String,
+    invoke_args: Vec<String>,
+    /// Sentence appended to the tool description telling the model which
+    /// shell syntax to use.
+    syntax_hint: &'static str,
 }
 
-/// Tool name exposed to the model: `pwsh` on Windows (PowerShell is the
-/// native shell there and the model sees the right name to pick the right
-/// syntax), `bash` everywhere else. The internal `run_bash`/`kind="bash"`
-/// plumbing is unchanged — only the wire name differs.
-fn shell_tool_name() -> &'static str {
+impl Shell {
     #[cfg(windows)]
-    {
-        "pwsh"
+    pub(super) fn detect() -> Result<Self, String> {
+        // Prefer PowerShell (native, no Git install needed), fall back to
+        // Windows PowerShell, then Git Bash.
+        let executable = ["pwsh.exe", "powershell.exe"]
+            .into_iter()
+            .find_map(which_on_path)
+            .or_else(|| which_on_path("bash.exe"))
+            .or_else(|| {
+                [r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe"]
+                    .into_iter()
+                    .find(|p| std::path::Path::new(p).is_file())
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                "no shell found: install PowerShell 7 (pwsh) or Git Bash — put pwsh.exe/powershell.exe/bash.exe on PATH".to_owned()
+            })?;
+        let (tool_name, invoke_args, syntax_hint) = if executable.ends_with("bash.exe") {
+            (
+                "pwsh", // keep the wire name stable; bash is the fallback shell
+                vec!["-lc".to_owned()],
+                " The current shell is bash (Git Bash fallback): use POSIX/bash syntax.",
+            )
+        } else {
+            (
+                "pwsh",
+                vec!["-NoProfile".to_owned(), "-Command".to_owned()],
+                " The current shell is PowerShell (pwsh): use PowerShell syntax (Get-ChildItem, Get-Content, $env:VAR, etc.), not bash syntax.",
+            )
+        };
+        Ok(Self {
+            tool_name,
+            executable,
+            invoke_args,
+            syntax_hint,
+        })
     }
-    #[cfg(not(windows))]
-    {
-        "bash"
-    }
-}
 
-/// Resolve the shell executable. Non-Windows: `/bin/bash` (unchanged).
-/// Windows: prefer PowerShell (`pwsh`, falling back to Windows PowerShell
-/// `powershell`) since it is native and needs no Git installation; if
-/// neither is found, fall back to Git Bash (`bash.exe` on PATH or the
-/// common install locations). Returns a clear error when no shell exists.
-fn bash_executable() -> Result<String, String> {
     #[cfg(not(windows))]
-    {
-        let _ = ();
-        Ok("/bin/bash".into())
+    pub(super) fn detect() -> Result<Self, String> {
+        Ok(Self {
+            tool_name: "bash",
+            executable: "/bin/bash".into(),
+            invoke_args: vec!["-lc".into()],
+            syntax_hint: " The current shell is bash: use POSIX/bash syntax.",
+        })
     }
-    #[cfg(windows)]
-    {
-        // 1. pwsh (PowerShell 7+) / powershell (Windows PowerShell 5.1)
-        for name in ["pwsh.exe", "powershell.exe"] {
-            if let Some(path) = which_on_path(name) {
-                return Ok(path);
-            }
-        }
-        // 2. Git Bash fallback (PATH, then common install locations)
-        if let Some(path) = which_on_path("bash.exe") {
-            return Ok(path);
-        }
-        for candidate in [
-            r"C:\Program Files\Git\bin\bash.exe",
-            r"C:\Program Files\Git\usr\bin\bash.exe",
-        ] {
-            let p = std::path::PathBuf::from(candidate);
-            if p.is_file() {
-                return Ok(candidate.to_string());
-            }
-        }
-        Err("no shell found: install PowerShell 7 (pwsh) or Git Bash — put pwsh.exe/powershell.exe/bash.exe on PATH".into())
+
+    /// Full command-line arguments for a user command: invocation args +
+    /// the command itself.
+    fn command_args(&self, command: &str) -> Vec<String> {
+        let mut args = self.invoke_args.clone();
+        args.push(command.to_owned());
+        args
     }
 }
 
@@ -308,6 +320,7 @@ fn which_on_path(name: &str) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_bash(
+    shell: &Shell,
     workspace: &Workspace,
     command: &str,
     timeout: Option<Duration>,
@@ -322,7 +335,6 @@ pub(super) async fn run_bash(
     // system dirs read-only, workspace writable (per config), /tmp scratch,
     // no new privileges, TIOCSTI blocked, die with the parent. Network is
     // shared by default (agents often need to fetch); config can disable it.
-    let bash = bash_executable()?;
     let mut process = match sandbox {
         Some(sandbox) => {
             let root = workspace.root();
@@ -443,8 +455,8 @@ pub(super) async fn run_bash(
             if !sandbox.network {
                 args.push("--unshare-net".into());
             }
-            args.push(bash.clone());
-            args.extend(shell_invoke_args(command));
+            args.push(shell.executable.clone());
+            args.extend(shell.command_args(command));
             let mut cmd = Command::new("bwrap");
             cmd.args(args);
             // Strip credential env vars so they are not inherited by the
@@ -460,8 +472,8 @@ pub(super) async fn run_bash(
             cmd
         }
         None => {
-            let mut cmd = Command::new(bash);
-            cmd.args(shell_invoke_args(command));
+            let mut cmd = Command::new(&shell.executable);
+            cmd.args(shell.command_args(command));
             cmd
         }
     };
