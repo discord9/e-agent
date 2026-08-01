@@ -124,6 +124,17 @@ pub fn tool_path_argument(arguments: &str) -> Option<String> {
         .and_then(|value| value.get("path").and_then(Value::as_str).map(str::to_owned))
 }
 
+/// Remove image attachments from user messages. Non-vision models cannot
+/// consume image parts, so compaction strips them before sending the
+/// request (the vision gate would otherwise reject it and lock the session).
+pub fn strip_images(messages: &mut [Message]) {
+    for message in messages {
+        if let Message::User { images, .. } = message {
+            images.clear();
+        }
+    }
+}
+
 /// Global content-addressed image store: `$XDG_STATE_HOME/e-agent/images`,
 /// falling back to `~/.config/e-agent/images` — the same base the crash
 /// directory uses in main.rs. None when neither variable is set.
@@ -476,6 +487,12 @@ pub trait Model: Send {
     /// Display name for the UI (e.g. input-box label). Defaults to "?".
     fn name(&self) -> &str {
         "?"
+    }
+
+    /// Whether the model accepts image input. Used to gate read_image's
+    /// image attachment before it enters history.
+    fn supports_vision(&self) -> bool {
+        false
     }
 }
 
@@ -846,6 +863,10 @@ impl Agent {
             anyhow::bail!("nothing to compact");
         }
         let mut request = context[..split].to_vec();
+        // Non-vision models cannot consume image parts; strip them so
+        // compaction still works on sessions that attached images (the
+        // vision gate would otherwise reject the compaction request too).
+        strip_images(&mut request);
         request.push(Message::User {
             content: "Summarize the earlier conversation. Preserve the user's goals, decisions made, files changed, and unfinished work. Be concise and use Chinese or English to match the conversation language.".into(),
             images: vec![],
@@ -1046,9 +1067,20 @@ impl Agent {
                 // summary (base64 never enters the scrollback), then attach
                 // the image as a synthetic User message right after the tool
                 // result (images can only ride on user role messages).
-                let (summary, image) = match &result {
+                // Non-vision models cannot consume image parts: keep the
+                // text summary but skip the attachment, so the session is
+                // not locked out of every later model call by the vision
+                // gate (compaction would fail the same way).
+                let (mut summary, image) = match &result {
                     Ok(content) => split_image_marker(content),
                     Err(error) => (error.clone(), None),
+                };
+                let supports_vision = self.model.supports_vision();
+                let image = if image.is_some() && !supports_vision {
+                    summary.push_str("（当前模型不支持图片，已跳过附加）");
+                    None
+                } else {
+                    image
                 };
                 self.emit(AgentEvent::ToolResult {
                     is_error: result.is_err(),

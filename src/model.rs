@@ -67,6 +67,13 @@ impl Model for ConfiguredModel {
             ConfiguredModelKind::Codex(model) => model.name(),
         }
     }
+
+    fn supports_vision(&self) -> bool {
+        match &self.kind {
+            ConfiguredModelKind::Chat(model) => model.supports_vision(),
+            ConfiguredModelKind::Codex(model) => model.supports_vision(),
+        }
+    }
     async fn complete(
         &mut self,
         messages: &[Message],
@@ -191,6 +198,10 @@ impl OpenAiModel {
 impl Model for OpenAiModel {
     fn name(&self) -> &str {
         self.name()
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.vision
     }
 
     async fn complete(

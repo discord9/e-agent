@@ -1577,10 +1577,15 @@ impl Tool for ImageTool {
 struct ImageRoundModel {
     requests: Arc<Mutex<Vec<Vec<Message>>>>,
     calls: usize,
+    vision: bool,
 }
 
 #[async_trait]
 impl Model for ImageRoundModel {
+    fn supports_vision(&self) -> bool {
+        self.vision
+    }
+
     async fn complete(
         &mut self,
         messages: &[Message],
@@ -1618,6 +1623,7 @@ async fn run_loop_strips_marker_and_attaches_synthetic_user_with_image() {
         Box::new(ImageRoundModel {
             requests: requests.clone(),
             calls: 0,
+            vision: true,
         }),
         vec![Box::new(ImageTool { workspace: temp })],
     );
@@ -1661,6 +1667,54 @@ async fn run_loop_strips_marker_and_attaches_synthetic_user_with_image() {
         Message::User { content, images } if content.starts_with("[image attached:")
             && !images.is_empty()
     )));
+}
+
+#[tokio::test]
+async fn run_loop_skips_image_attachment_on_non_vision_models() {
+    let temp = tempfile::tempdir().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ImageRoundModel {
+            requests: requests.clone(),
+            calls: 0,
+            vision: false,
+        }),
+        vec![Box::new(ImageTool { workspace: temp })],
+    );
+    let answer = agent.run("describe".into()).await.unwrap();
+    assert_eq!(answer, "final");
+    let history = agent.history();
+    // Tool result keeps the text summary, annotated that the attachment
+    // was skipped (the vision gate would otherwise lock the session).
+    let tool = history
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Message {
+                message: Message::Tool { content, .. },
+            } => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(tool.starts_with("[image read: pics/cat.png]"));
+    assert!(tool.contains("已跳过附加"));
+    assert!(!tool.contains("__EA_IMAGE__"));
+    // No synthetic user message with an image reference.
+    let synthetic = history.iter().any(|entry| match entry {
+        SessionEntry::Message {
+            message: Message::User { content, images },
+        } => content.starts_with("[image attached:") && !images.is_empty(),
+        _ => false,
+    });
+    assert!(!synthetic);
+    // The second round's context carries no images.
+    let calls = requests.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    let second = &calls[1];
+    assert!(
+        second
+            .iter()
+            .all(|message| !matches!(message, Message::User { images, .. } if !images.is_empty()))
+    );
 }
 
 #[test]
@@ -1722,4 +1776,67 @@ fn image_store_dedups_by_hash_and_mime_whitelist() {
     );
     assert_eq!(load_image_bytes(Some(temp.path()), "missing"), None);
     assert_eq!(load_image_bytes(None, &first), None);
+}
+
+// ── strip_images (compaction image stripping) ────────────────────────
+
+#[test]
+fn strip_images_clears_user_images_keeps_content_and_role() {
+    let mut messages = vec![
+        Message::System {
+            content: "sys".into(),
+        },
+        Message::User {
+            content: "with image".into(),
+            images: vec![ImagePart {
+                hash: "deadbeef".into(),
+                mime: "image/png".into(),
+            }],
+        },
+        Message::Assistant(AssistantMessage {
+            content: Some("ok".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        }),
+        Message::Tool {
+            call_id: "1".into(),
+            name: "read_image".into(),
+            content: "[image read: a.png]".into(),
+            is_error: false,
+            synthetic: false,
+        },
+        Message::User {
+            content: "plain".into(),
+            images: vec![],
+        },
+    ];
+    strip_images(&mut messages);
+    assert_eq!(
+        messages,
+        vec![
+            Message::System {
+                content: "sys".into(),
+            },
+            Message::User {
+                content: "with image".into(),
+                images: vec![],
+            },
+            Message::Assistant(AssistantMessage {
+                content: Some("ok".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+            Message::Tool {
+                call_id: "1".into(),
+                name: "read_image".into(),
+                content: "[image read: a.png]".into(),
+                is_error: false,
+                synthetic: false,
+            },
+            Message::User {
+                content: "plain".into(),
+                images: vec![],
+            },
+        ]
+    );
 }

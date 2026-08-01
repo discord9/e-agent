@@ -101,6 +101,10 @@ impl Model for CodexModel {
         &self.model
     }
 
+    fn supports_vision(&self) -> bool {
+        self.vision
+    }
+
     async fn complete(
         &mut self,
         messages: &[Message],
