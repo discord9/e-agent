@@ -7,8 +7,9 @@
   * sidebar_filter —— 筛选：主会话按 title/id 匹配，匹配的展开显示全部子会话；
                        孤儿组按自身 title/id 匹配；无匹配提示。
   * sidebar_limit  —— 15 条限制 + 「+N 个更早的会话」展开全部。
-
-未合入（见 cases/skipped.py，TODO）：挤压布局、持续打开/持久化。
+  * sidebar_squeeze —— 挤压布局（桌面 >600px）：内容右移 280px、遮罩 display:none、
+                       点内容区不关（旧覆盖式点遮罩才关）。
+  * sidebar_persist —— 持续打开：切会话/返回列表保持打开 + localStorage 跨刷新恢复。
 """
 import json
 
@@ -51,11 +52,14 @@ async def run_sidebar_tree(c):
 
     # ---------- 开合 ----------
     await c.open_sidebar()
-    overlay_ok = await c.ev(
-        "!els.sidebarOverlay.hidden && getComputedStyle(els.sidebarOverlay).display !== 'none'")
-    c.check("打开：.open + 遮罩显示", overlay_ok, "")
-    n_roots = await c.page.locator("#sidebarTree > .tree-node > .tree-row").count()
-    c.check("默认全部折叠：3 根 + 未关联 = 4 行", n_roots == 4, f"rows={n_roots}")
+    c.check("打开：.open + 侧边栏可见",
+            await c.page.locator("#sidebar.open").count() == 1 and await c.ev("!els.sidebar.hidden"), "")
+    c.check("桌面打开：遮罩 display:none（挤压布局，不遮挡内容）",
+            await c.ev("getComputedStyle(els.sidebarOverlay).display") == "none", "")
+    n_roots = await c.page.locator(
+        "#sidebarTree > .tree-node:not(.tasks-group) > .tree-row").count()
+    c.check("默认全部折叠：3 根 + 未关联 = 4 行（不含隐藏的「运行中任务」组）",
+            n_roots == 4, f"rows={n_roots}")
 
     tree = lambda: c.page.locator("#sidebarTree")
 
@@ -146,15 +150,16 @@ async def run_sidebar_tree(c):
     c.check("E Escape 关闭侧边栏", await c.ev("!state.sidebar.open"), "")
 
     await c.open_sidebar()
-    await c.page.mouse.click(1000, 450)          # 点遮罩区域
+    await c.page.mouse.click(1000, 450)          # 桌面挤压：点内容区（遮罩 display:none）
     await c.page.wait_for_timeout(400)
-    c.check("E 点遮罩关闭侧边栏", await c.ev("!state.sidebar.open"), "")
+    c.check("E 桌面点内容区不关（挤压布局；手机点遮罩关闭见 mobile_390）",
+            await c.ev("state.sidebar.open"), "")
 
 async def run_sidebar_filter(c):
     c.sessions = SESSIONS
     await c.start()
     await c.open_sidebar()
-    await c.page.wait_for_selector("#sidebarTree .tree-row", timeout=5000)
+    await c.page.wait_for_selector("#sidebarTree .tree-row:not(.tasks-group-head)", timeout=5000)
 
     # 无匹配 -> 空态提示
     await c.page.fill("#sidebarFilter", "zzz-不存在")
@@ -167,7 +172,7 @@ async def run_sidebar_filter(c):
     # 按主会话 title 匹配 -> 1 根 + 其子会话随父展开显示
     await c.page.fill("#sidebarFilter", "根会话B")
     await c.page.wait_for_timeout(200)
-    roots = await c.page.locator("#sidebarTree > .tree-node > .tree-row").count()
+    roots = await c.page.locator("#sidebarTree > .tree-node:not(.tasks-group) > .tree-row").count()
     c.check("筛选命中 1 个主会话", roots == 1, f"roots={roots}")
     # root-b 全非活跃：子会话收进历史组（筛选时父节点自动展开）
     hist = await c.page.locator("#sidebarTree .tree-hist-row").count()
@@ -188,26 +193,114 @@ async def run_sidebar_filter(c):
     # 清空 -> 恢复默认 4 行
     await c.page.fill("#sidebarFilter", "")
     await c.page.wait_for_timeout(200)
-    n = await c.page.locator("#sidebarTree > .tree-node > .tree-row").count()
+    n = await c.page.locator("#sidebarTree > .tree-node:not(.tasks-group) > .tree-row").count()
     c.check("清空筛选恢复 3 根 + 未关联", n == 4, f"rows={n}")
 
 async def run_sidebar_limit(c):
-    # 18 个主会话（无子会话）：默认只渲染 15 条 + 「+3 个更早的会话」按钮
+    # 18 个主会话（无子会话）：默认只渲染最近 8 条 + 「+10 个更早的会话」按钮
     sessions = [S("root-%02d" % i, None, "主会话%02d" % i, True) for i in range(18)]
     c.sessions = sessions
     await c.start()
     await c.open_sidebar()
-    await c.page.wait_for_selector("#sidebarTree .tree-row", timeout=5000)
-    n = await c.page.locator("#sidebarTree > .tree-node > .tree-row").count()
-    c.check("默认只渲染最近 15 个主会话", n == 15, f"rows={n}")
+    await c.page.wait_for_selector("#sidebarTree .tree-row:not(.tasks-group-head)", timeout=5000)
+    n = await c.page.locator("#sidebarTree > .tree-node:not(.tasks-group) > .tree-row").count()
+    c.check("默认只渲染最近 8 个主会话", n == 8, f"rows={n}")
     more = c.page.locator("#sidebarTree .tree-more")
-    c.check("显示「+3 个更早的会话」按钮",
-            await more.count() == 1 and await more.text_content() == "+3 个更早的会话",
+    c.check("显示「+10 个更早的会话」按钮",
+            await more.count() == 1 and await more.text_content() == "+10 个更早的会话",
             f"n={await more.count()}")
     await more.click()
     await c.page.wait_for_timeout(300)
-    n2 = await c.page.locator("#sidebarTree > .tree-node > .tree-row").count()
+    n2 = await c.page.locator("#sidebarTree > .tree-node:not(.tasks-group) > .tree-row").count()
     c.check("点击后展开全部 18 个主会话", n2 == 18, f"rows={n2}")
+
+
+async def run_sidebar_squeeze(c):
+    """桌面视口（>600px）：打开侧边栏时挤压内容——#topbar/#listView/#chatView 右移
+    280px、遮罩 display:none；点内容区不关（遮罩不拦截）。"""
+    c.sessions = [
+        S("root-a", None, "根会话A", True),
+        S("root-b", None, "根会话B", True),
+        S("root-c", None, "根会话C", True),
+    ]
+    await c.start()
+    await c.open_sidebar()
+    await c.page.wait_for_timeout(400)          # 等 margin-left 0.2s 过渡结束
+
+    ml = await c.ev("getComputedStyle(document.getElementById('topbar')).marginLeft")
+    c.check("桌面打开：#topbar margin-left = 280px", ml == "280px", ml)
+    x = await c.ev("els.listView.getBoundingClientRect().x")
+    c.check("桌面打开：#listView 左缘 ≈ 280px", abs(x - 280) <= 2, f"x={x}")
+    ov = await c.ev("getComputedStyle(els.sidebarOverlay).display")
+    c.check("桌面打开：遮罩 display:none（不遮挡内容）", ov == "none", ov)
+
+    # 点内容区（遮罩已 display:none，不会被拦截）→ 不关
+    await c.page.mouse.click(1000, 850)          # 列表卡片底部空白处
+    await c.page.wait_for_timeout(400)
+    c.check("桌面点内容区：侧边栏保持打开", await c.ev("state.sidebar.open"), "")
+
+    # 聊天视图同样右移
+    await c.page.locator("#sessionList .session-row", has_text="根会话A").first.click()
+    await c.page.wait_for_function("() => state.view === 'chat'")
+    await c.page.wait_for_timeout(400)
+    xc = await c.ev("els.chatView.getBoundingClientRect().x")
+    c.check("聊天视图：#chatView 左缘 ≈ 280px", abs(xc - 280) <= 2, f"x={xc}")
+    await c.page.mouse.click(1000, 450)          # 消息区空白处
+    await c.page.wait_for_timeout(400)
+    c.check("聊天视图点消息区：侧边栏保持打开", await c.ev("state.sidebar.open"), "")
+
+    # 关闭后恢复
+    await c.close_sidebar()
+    await c.page.wait_for_timeout(400)
+    x0 = await c.ev("els.chatView.getBoundingClientRect().x")
+    c.check("关闭侧边栏：内容左缘回到 0", abs(x0) <= 2, f"x={x0}")
+
+async def run_sidebar_persist(c):
+    """切会话/返回列表保持打开 + localStorage 跨刷新持久化（仅手动关）。"""
+    c.sessions = [
+        S("root-a", None, "根会话A", True),
+        S("root-b", None, "根会话B", True),
+        S("root-c", None, "根会话C", True),
+    ]
+    await c.start()
+    await c.open_sidebar()
+    await c.page.wait_for_timeout(300)
+    ls = await c.ev("localStorage.getItem('e-agent.sidebar.open')")
+    c.check("打开：localStorage 记录 1", ls == "1", str(ls))
+
+    # 列表点会话行进入聊天：侧边栏保持打开
+    await c.page.locator("#sessionList .session-row", has_text="根会话A").first.click()
+    await c.page.wait_for_function("() => state.view === 'chat' && state.sessionId === 'root-a'")
+    await c.page.wait_for_timeout(300)
+    c.check("切会话后侧边栏保持打开", await c.ev("state.sidebar.open"), "")
+
+    # 返回列表：侧边栏保持打开
+    await c.page.click("#backBtn")
+    await c.page.wait_for_function("() => state.view === 'list'")
+    await c.page.wait_for_timeout(300)
+    c.check("返回列表后侧边栏保持打开", await c.ev("state.sidebar.open"), "")
+
+    # 侧边栏树里切会话：也保持打开
+    await c.page.locator("#sidebarTree .tree-row", has_text="根会话B").first.click()
+    await c.page.wait_for_function("() => state.view === 'chat' && state.sessionId === 'root-b'")
+    await c.page.wait_for_timeout(300)
+    c.check("侧边栏树切会话后保持打开", await c.ev("state.sidebar.open"), "")
+
+    # 刷新：localStorage 恢复打开
+    await c.page.reload(wait_until="load")
+    await c.page.wait_for_function("() => typeof state !== 'undefined' && state.sidebar.open === true", timeout=8000)
+    await c.page.wait_for_selector("#sidebar.open", timeout=5000)
+    c.check("刷新后：侧边栏自动恢复打开", True, "")
+    c.check("刷新后：#sidebar 可见", await c.ev("!els.sidebar.hidden"), "")
+
+    # 关闭 -> localStorage 记录 0；再刷新 -> 保持关闭
+    await c.close_sidebar()
+    await c.page.wait_for_timeout(300)
+    ls0 = await c.ev("localStorage.getItem('e-agent.sidebar.open')")
+    c.check("关闭：localStorage 记录 0", ls0 == "0", str(ls0))
+    await c.page.reload(wait_until="load")
+    await c.page.wait_for_timeout(800)
+    c.check("刷新后：保持关闭", await c.ev("!state.sidebar.open"), "")
 
 CASES = [
     {"name": "sidebar_tree", "desc": "侧边栏开合 + 会话树（活跃/历史分组、label 优先、旧 server 兼容、孤儿）",
@@ -216,4 +309,8 @@ CASES = [
      "run": run_sidebar_filter},
     {"name": "sidebar_limit", "desc": "侧边栏 15 条限制 + 展开全部",
      "run": run_sidebar_limit},
+    {"name": "sidebar_squeeze", "desc": "侧边栏挤压布局：桌面内容右移 280px、遮罩隐藏、点内容区不关",
+     "run": run_sidebar_squeeze},
+    {"name": "sidebar_persist", "desc": "侧边栏持续打开：切会话/返回列表保持 + localStorage 刷新恢复",
+     "run": run_sidebar_persist},
 ]
