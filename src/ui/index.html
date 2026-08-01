@@ -17,8 +17,9 @@
     <span id="connState" class="conn-state"></span>
   </div>
   <div class="token-box">
-    <label for="tokenInput">Token</label>
-    <input id="tokenInput" type="password" placeholder="访问令牌（Bearer）" autocomplete="off" spellcheck="false">
+    <!-- 默认折叠成小按钮：点击展开输入框，再点 / Esc / 失焦收起（app.js） -->
+    <button id="tokenToggle" type="button" class="token-toggle" title="点击展开 Token 输入"></button>
+    <input id="tokenInput" type="password" placeholder="访问令牌（Bearer）" autocomplete="off" spellcheck="false" hidden>
   </div>
 </header>
 
@@ -27,7 +28,7 @@
   <!-- 手机遮罩：桌面 display:none（见 style.css 媒体查询） -->
   <div id="sidebarOverlay" hidden></div>
 
-  <!-- ============ 会话侧边栏（会话树，运行中任务并入树顶部折叠分组） ============ -->
+  <!-- ============ 会话侧边栏（会话树） ============ -->
   <aside id="sidebar" hidden>
   <div class="sidebar-head">
     <h2>会话</h2>

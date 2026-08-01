@@ -177,9 +177,11 @@ class El {
     walk(this); return out; }
   querySelector(sel){ return this.querySelectorAll(sel)[0] ?? null; }
   closest(sel){ let n=this; while(n){ if(matchSel(n,sel)) return n; n=n._parent; } return null; }
+  focus(){}
+  blur(){}
 }
 const elsById={};
-for(const id of ["topActions","backBtn","connState","banner","tokenInput","listView","chatView",
+for(const id of ["topActions","backBtn","connState","banner","tokenInput","tokenToggle","listView","chatView",
   "newPrompt","newSessionBtn","sessionList","listMeta","listHint","chatSessionId","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn","searchInput",
   "queueBar","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
@@ -267,7 +269,9 @@ globalThis.fetch=(url,opts={})=>{
     }
     return resp(200, historyData);   // 含 ?limit=…（loadHistory 尾部翻页）
   }
+  if(url.startsWith("/api/sessions/s2/history")) return resp(200, historyData);
   if(url==="/api/sessions/s1/events") return resp(200, stream());
+  if(url==="/api/sessions/s2/events") return resp(200, stream());
   if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/compact")) return resp(202,{});
@@ -695,6 +699,80 @@ async function main(){
     chk("B load link shown when older available",
         linkB.hidden === false, "hidden=" + linkB.hidden);
     chk("B prune keeps bound", pm.children.length <= 300, "n=" + pm.children.length);
+
+    // ---- bash 卡片点击：总是切到该任务所属会话，视图就绪后 flash ----
+    // （放在 B 测试之后：fresh 打开 s2 会把 nextBeforeSeq 置 100，而 B 的
+    // 「加载更早历史」链接断言依赖 nextBeforeSeq=null，避免互相污染）
+    // (b) 列表视图点击 → restored 恢复目标会话（缓存命中）→ onReady flash
+    state.view = "list";
+    state.sessionId = null;
+    state.sessionStates["s1"] = { html: elsById["messages"].innerHTML, scrollTop: 0,
+      nextBeforeSeq: null, olderDone: false, draft: "" };   // 模拟切走前的缓存
+    const switchTasks = [{ session_id: "s1", id: 55, kind: "bash", label: "cargo run",
+      full_command: "cargo run", output: "building", role: null }];
+    state.tasks.list = switchTasks;
+    renderTaskList(switchTasks, elsById["composerTasks"]);
+    const srow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    srow._listeners["click"][0]();
+    await flush();
+    chk("bash click restored-switch to task session",
+        state.view === "chat" && state.sessionId === "s1",
+        "view=" + state.view + " sid=" + state.sessionId);
+    const sblock = findTaskOutputBlock("s1:55");
+    chk("bash click flashes block after switch", !!sblock && sblock.classList.contains("flash"),
+        "found=" + !!sblock + " cls=" + (sblock && sblock.className));
+    // (c) 列表视图点击 → fresh 打开另一会话（异步 loadHistory）→ 视图就绪后 flash
+    state.view = "list";
+    state.sessionId = null;
+    const freshTasks = [{ session_id: "s2", id: 77, kind: "bash", label: "cargo fmt",
+      full_command: "cargo fmt", output: "formatting", role: null }];
+    state.tasks.list = freshTasks;
+    renderTaskList(freshTasks, elsById["composerTasks"]);
+    const frow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    frow._listeners["click"][0]();
+    await flush();
+    await flush();
+    chk("bash click fresh-switch to task session",
+        state.view === "chat" && state.sessionId === "s2",
+        "view=" + state.view + " sid=" + state.sessionId);
+    const fblock = findTaskOutputBlock("s2:77");
+    chk("bash click fresh path flashes block", !!fblock && fblock.classList.contains("flash"),
+        "found=" + !!fblock + " cls=" + (fblock && fblock.className));
+    // (d) 同会话但无对应输出块（任务已结束/未渲染）→ 回退就地展开 toggleRow
+    const staleTasks = [{ session_id: "s2", id: 999, kind: "bash", label: "cargo stale",
+      full_command: "cargo stale", output: "", role: null }];
+    renderTaskList(staleTasks, elsById["composerTasks"]);
+    const drow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    drow._listeners["click"][0]();
+    chk("bash click no-block falls back to in-place expand",
+        drow.querySelector(".task-output").hidden === false,
+        "hidden=" + drow.querySelector(".task-output").hidden);
+
+    // ---- Token 折叠：默认收起 → 点击展开 → 输入后按钮「已设置」 → 再点收起 ----
+    const tokBtn = elsById["tokenToggle"];
+    const tokInp = elsById["tokenInput"];
+    chk("token collapsed by default",
+        tokInp.hidden === true && tokBtn.textContent.includes("Token") && !tokBtn.classList.contains("set"),
+        "btn=" + tokBtn.textContent + " hidden=" + tokInp.hidden);
+    tokBtn._listeners["click"][0]();
+    chk("token click expands", tokInp.hidden === false, "hidden=" + tokInp.hidden);
+    tokInp.value = "tok-123";
+    tokInp._listeners["input"][0]();
+    await flush();
+    chk("token input updates state+storage",
+        state.token === "tok-123" && localStorage.getItem("eagent_token") === "tok-123",
+        "token=" + state.token);
+    chk("token button shows set",
+        tokBtn.textContent.includes("已设置") && tokBtn.classList.contains("set"),
+        "btn=" + tokBtn.textContent);
+    tokBtn._listeners["click"][0]();
+    chk("token click collapses again", tokInp.hidden === true, "hidden=" + tokInp.hidden);
+    // 失焦延迟收起：blur 后 150ms 才收起（防止「点进去正要输入就收起」）。
+    // gjs 计时器惰性不触发：这里验证 blur 后输入框不会立即收起。
+    tokBtn._listeners["click"][0]();   // 再展开
+    chk("token re-expands", tokInp.hidden === false, "hidden=" + tokInp.hidden);
+    tokInp._listeners["blur"][0]();
+    chk("token blur defers collapse", tokInp.hidden === false, "hidden=" + tokInp.hidden);
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);

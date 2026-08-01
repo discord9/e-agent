@@ -91,7 +91,19 @@ mmlEqnNo}
   .conn-state.err { color: var(--red); }
 
   .token-box { display: flex; align-items: center; gap: 6px; }
-  .token-box label { font-size: 12px; color: var(--base01); }
+  .token-toggle {
+    padding: 4px 10px;
+    font-size: 12px;
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    color: var(--base01);
+    font-family: inherit;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .token-toggle:hover { border-color: var(--blue); color: var(--blue); }
+  .token-toggle.set { color: var(--green); border-color: var(--green); }
   #tokenInput {
     width: 240px;
     padding: 4px 8px;
@@ -907,17 +919,6 @@ mmlEqnNo}
     text-align: center;
   }
   .tree-more:hover { border-color: var(--blue); color: var(--blue); background: var(--base3); }
-  /* 树顶部「运行中任务 (N)」折叠分组：复用 .tree-row/.tree-toggle/.tree-children
-     骨架与 .task-row 系列任务行；组壳无任务时整组隐藏（updateSidebarTasksGroup） */
-  .tasks-group { margin-bottom: 2px; }
-  .tasks-group-head .tasks-group-label { color: var(--base01); }
-  .tasks-group-body {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding-top: 2px;
-    padding-bottom: 4px;
-  }
   /* 子节点：缩进 16px + 紫色「子」徽章 */
   .tree-children { padding-left: 16px; }
   .tree-row-child .tree-id { color: var(--base00); }
@@ -1090,7 +1091,6 @@ mmlEqnNo}
 
   /* 小屏适配 */
   @media (max-width: 640px) {
-    .token-box label { display: none; }
     #tokenInput { width: 150px; }
     #searchInput { max-width: 100%; }   /* 小屏换行后占满整行，不溢出 */
     .session-row .smodel { display: none; }

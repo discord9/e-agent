@@ -57,9 +57,8 @@ const state = {
     expanded: new Set(),     // 已展开的主会话 id（会话树；重绘时保留）
     filter: "",              // 筛选关键词（已小写化）；空 = 默认显示
     showAll: false,          // 是否已展开全部主会话（超出 15 条限制时）
-    tasksOpen: false,        // 树顶部「运行中任务」分组展开状态（默认收起）
   },
-  tasks: {                   // 运行中任务（侧边栏树分组 + composer 面板两处显示）
+  tasks: {                   // 运行中任务（composer 折叠条/面板 + 消息列表输出块）
     seq: 0,                  // 统一轮询竞态序号：只应用最新一次响应
     timer: null,             // 统一轮询定时器（2s 常驻；替代原徽标/面板双轮询）
     list: [],                // 最近一次 /api/tasks 结果（两处渲染共用）
@@ -77,7 +76,7 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const els = {
   topActions: $("topActions"), backBtn: $("backBtn"), connState: $("connState"),
-  banner: $("banner"), tokenInput: $("tokenInput"),
+  banner: $("banner"), tokenInput: $("tokenInput"), tokenToggle: $("tokenToggle"),
   listView: $("listView"), chatView: $("chatView"),
   newPrompt: $("newPrompt"), newSessionBtn: $("newSessionBtn"),
   sessionList: $("sessionList"), listMeta: $("listMeta"), listHint: $("listHint"),
@@ -144,6 +143,24 @@ function pickText(payload, keys) {
 /* =====================================================================
  * Token 与认证
  * ===================================================================*/
+let tokenBoxOpen = false;          // token 输入框展开状态（默认折叠，只显示按钮）
+let tokenBlurTimer = null;         // 失焦延迟收起句柄（防止「点进去正要输入就收起」）
+
+/* 折叠按钮文案/高亮跟随 token 设置状态 */
+function updateTokenToggle() {
+  if (!els.tokenToggle) return;
+  const set = !!state.token;
+  els.tokenToggle.textContent = set ? "🔑 已设置" : "🔑 Token";
+  els.tokenToggle.classList.toggle("set", set);
+  els.tokenToggle.title = set ? "已设置 Token（点击展开 / 收起）" : "点击展开 Token 输入";
+}
+
+function setTokenBoxOpen(open) {
+  tokenBoxOpen = open;
+  els.tokenInput.hidden = !open;
+  if (tokenBlurTimer) { clearTimeout(tokenBlurTimer); tokenBlurTimer = null; }
+}
+
 els.tokenInput.value = state.token;
 els.tokenInput.addEventListener("input", () => {
   state.token = els.tokenInput.value.trim();
@@ -151,7 +168,21 @@ els.tokenInput.addEventListener("input", () => {
   else localStorage.removeItem("eagent_token");
   refreshBanner();
   restartTransport();   // token 变化 → 重启轮询 / SSE
+  updateTokenToggle();  // 按钮文案跟随设置状态
 });
+els.tokenToggle.addEventListener("click", () => {
+  if (tokenBoxOpen) { setTokenBoxOpen(false); els.tokenInput.blur(); }
+  else { setTokenBoxOpen(true); els.tokenInput.focus(); }
+});
+/* 失焦延迟收起：blur 后短暂停留，期间重新聚焦（点进输入框）则取消收起 */
+els.tokenInput.addEventListener("focus", () => {
+  if (tokenBlurTimer) { clearTimeout(tokenBlurTimer); tokenBlurTimer = null; }
+});
+els.tokenInput.addEventListener("blur", () => {
+  tokenBlurTimer = setTimeout(() => setTokenBoxOpen(false), 150);
+});
+setTokenBoxOpen(false);   // 默认折叠：只留按钮，不挤顶栏
+updateTokenToggle();
 
 function refreshBanner() {
   if (!state.token) {

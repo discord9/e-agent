@@ -293,13 +293,16 @@ async function loadOlder() {
   }
 }
 
-/* history 加载（可选）+ 连接 SSE；auth/gone 时不再重试连接 */
-function openWith(id, withHistory) {
+/* history 加载（可选）+ 连接 SSE；auth/gone 时不再重试连接。
+   onReady：视图就绪后的回调（历史渲染完 / 缓存恢复完，消息区可操作时
+   触发一次）。bash 任务行点击用它做「切会话后滚动高亮输出块」。 */
+function openWith(id, withHistory, onReady) {
   const step = withHistory ? loadHistory(id) : Promise.resolve("ok");
   step.then((r) => {
     if (state.sessionId !== id) return;   // 已切换会话：丢弃过期回调
     if (r === "auth" || r === "gone") return;
     connectSSE(id);
+    if (onReady) onReady();
   });
 }
 
@@ -341,7 +344,7 @@ function saveSessionState() {
   };
 }
 
-function openSession(id) {
+function openSession(id, onReady) {
   saveSessionState();          // 切走：保存当前会话（消息/滚动/分页/草稿）
   state.renameActive = false;  // 切换会话会销毁编辑框：清标志，恢复轮询重绘
   stopSSE();
@@ -382,7 +385,8 @@ function openSession(id) {
     // 对应 key 的轮询（块在 DOM → 轮询更新它；已结束的块标 ✓ 且不轮询）。
     // 切走期间轮询已停（DOM 被替换 / backToList 显式停止），这里续上。
     reconcileTaskOutputBlocks(state.tasks.list);
-    openWith(id, false);           // 只重连 SSE，跳过历史加载与 snapshot
+    openWith(id, false, onReady);  // 只重连 SSE，跳过历史加载与 snapshot；
+                                   // onReady 在恢复完成（微任务）后触发
   } else {
     // 首次打开：走既有流程（加载历史 + SSE）
     state.initSource = null;
@@ -396,7 +400,8 @@ function openSession(id) {
     els.promptInput.value = "";    // 输入框草稿跟随会话：新会话从空开始
     autosizeInput();
     userScrolled = false;          // 打开新会话：恢复自动跟随
-    openWith(id, true);
+    openWith(id, true, onReady);   // onReady 在 loadHistory 渲染完成（含
+                                   // reconcileTaskOutputBlocks）后触发
   }
   renderSidebarTree();             // 更新 .current 高亮
 }
@@ -628,7 +633,7 @@ async function refreshSessionsForSidebar() {
  * 数据来自 state.lastList（pollSessions）。列表未变化时跳过重绘，
  * 保留展开状态与滚动位置。
  * ===================================================================*/
-const MAX_TREE_ROOTS = 8;   // 默认只显示最近 8 个主会话（任务组在树顶部，少滑即见）
+const MAX_TREE_ROOTS = 8;   // 默认只显示最近 8 个主会话（少滑即见）
 let lastTreeSig = "";
 
 function sidebarTreeSig() {
@@ -641,39 +646,6 @@ function sidebarTreeSig() {
   ]));
 }
 
-/* 树内「运行中任务 (N)」折叠分组（树顶部、筛选框下、会话根之前）：
-   默认收起（state.sidebar.tasksOpen，不持久化）；有任务时标题带计数。
-   组壳随树重绘创建，任务行由 pollTasks → updateSidebarTasksGroup 就地
-   刷新（不整树重绘）。行渲染与 composer 面板共用 renderTaskList。 */
-function buildSidebarTasksGroup() {
-  const node = el("div", "tree-node tasks-group");
-  const row = el("div", "tree-row tasks-group-head");
-  const toggle = el("button", "tree-toggle", state.sidebar.tasksOpen ? "▾" : "▸");
-  toggle.type = "button";
-  toggle.title = "展开 / 收起运行中任务";
-  toggle.classList.toggle("open", state.sidebar.tasksOpen);
-  toggle.addEventListener("click", (ev) => {
-    ev.stopPropagation();
-    state.sidebar.tasksOpen = !state.sidebar.tasksOpen;
-    const body = node.querySelector(".tasks-group-body");
-    if (body) body.hidden = !state.sidebar.tasksOpen;
-    toggle.classList.toggle("open", state.sidebar.tasksOpen);
-    toggle.textContent = state.sidebar.tasksOpen ? "▾" : "▸";
-    if (state.sidebar.tasksOpen && body) {
-      renderTaskList(state.tasks.list || [], body);
-    }
-  });
-  const label = el("span", "tree-id tree-group tasks-group-label", "运行中任务 (0)");
-  row.append(toggle, label);
-  node.appendChild(row);
-  const body = el("div", "tree-children tasks-group-body");
-  body.hidden = !state.sidebar.tasksOpen;
-  node.appendChild(body);
-  renderTaskList(state.tasks.list || [], body);
-  node.hidden = !(state.tasks.list || []).length;   // 无任务：整组隐藏（与 updateSidebarTasksGroup 一致）
-  return node;
-}
-
 /* force=true 时无视签名强制重绘（筛选输入、展开全部按钮） */
 function renderSidebarTree(force) {
   const tree = els.sidebarTree;
@@ -683,9 +655,6 @@ function renderSidebarTree(force) {
   lastTreeSig = sig;
   const prevScroll = tree.scrollTop;
   tree.innerHTML = "";
-  // 树顶部（筛选框下方、会话根之前）：运行中任务折叠分组（任务并入会话树；
-  // 无任务时组壳隐藏，见 updateSidebarTasksGroup）
-  tree.appendChild(buildSidebarTasksGroup());
   const list = state.lastList || [];
   if (!list.length) {
     tree.appendChild(el("div", "tree-empty", "暂无会话"));

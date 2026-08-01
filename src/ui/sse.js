@@ -265,6 +265,7 @@ if (els.tasksToggleBar) {
 }
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && state.sidebar.open) closeSidebar();
+  if (e.key === "Escape" && tokenBoxOpen) setTokenBoxOpen(false);   // Esc 收起 token 输入框
 });
 els.sendBtn.addEventListener("click", sendPrompt);
 els.cancelBtn.addEventListener("click", cancelTurn);
