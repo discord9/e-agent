@@ -65,18 +65,19 @@ CREATE TABLE IF NOT EXISTS running_tasks (
 ///
 /// Semantics: an append-only lifecycle AUDIT log, not a one-row-per-session
 /// upsert table. Every create/touch appends a COMPLETE snapshot row
-/// (created_at/model/role/parent/entry_count/title all carried on every
-/// row) at a fresh `last_active_at`; the TIME INDEX keeps the rows ordered,
-/// and the list view deduplicates per primary key taking the latest
+/// (created_at/model/role/parent/entry_count/title/pinned all carried on
+/// every row) at a fresh `last_active_at`; the TIME INDEX keeps the rows
+/// ordered, and the list view deduplicates per primary key taking the latest
 /// `last_active_at` (explicitly in SQL — the query is correct whether or
 /// not the engine auto-dedups same-PK rows). Because each row is a full
 /// snapshot, a touch can never wipe immutable columns: there is no
 /// partial-row rewrite at all.
 ///
 /// `title` is the user-assigned session name (manual, never auto-generated;
-/// `NULL` = unnamed, the frontend shows the id). It is added to
-/// pre-existing tables by the idempotent migration in `connect` — see the
-/// `ALTER TABLE` comment there.
+/// `NULL` = unnamed, the frontend shows the id). `pinned` is the user pin
+/// flag (`NULL` = never touched, reads as unpinned; the list sorts pinned
+/// sessions first). Both are added to pre-existing tables by the idempotent
+/// migration in `connect` — see the `ALTER TABLE` comment there.
 const CREATE_TABLE_SESSIONS: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     workspace_id STRING NOT NULL,
@@ -86,6 +87,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model STRING NULL,
     "role" STRING NULL,
     title STRING NULL,
+    pinned BOOLEAN NULL,
     entry_count BIGINT NOT NULL DEFAULT 0,
     parent_session_id STRING NULL,
     parent_task_id BIGINT NULL,
@@ -165,8 +167,9 @@ pub struct GreptimeSession {
     session_id: String,
     /// The session's latest metadata snapshot, cached at connect time so
     /// every touch carries the immutable columns (created_at/model/role/
-    /// parent/title) without re-reading them. `None` = no row yet (brand-new
-    /// session, or a subagent whose parent has not written its row yet).
+    /// parent/title/pinned) without re-reading them. `None` = no row yet
+    /// (brand-new session, or a subagent whose parent has not written its
+    /// row yet).
     /// Interior mutability because every touch path takes `&self` while
     /// the store hands the session out behind a tokio Mutex.
     cached_meta: std::sync::Mutex<Option<SessionMeta>>,
@@ -199,30 +202,33 @@ impl GreptimeSession {
             .await
             .context("cannot create sessions table")?;
 
-        // Idempotent schema migration for the `title` column — a
-        // table-structure evolution: `sessions` shipped without it, so
-        // pre-existing databases need an ALTER (fresh databases already
-        // have it via CREATE_TABLE_SESSIONS above). There are no
-        // historical rows to backfill: old rows simply read `title` back
-        // as NULL (the read path treats it as `Option`). A failed
-        // migration must NOT block the connection (GreptimeDB's pg-wire
-        // supports `ALTER TABLE ... ADD COLUMN`, but if it errors anyway
-        // — e.g. an ancient engine — we keep running with the title
-        // feature degraded: the meta-row cache below is skipped and later
-        // title-bearing queries fail loudly with context; transcript
-        // operations are unaffected).
+        // Idempotent schema migration for the `title` and `pinned`
+        // columns — a table-structure evolution: `sessions` shipped
+        // without them, so pre-existing databases need an ALTER (fresh
+        // databases already have them via CREATE_TABLE_SESSIONS above).
+        // There are no historical rows to backfill: old rows simply read
+        // the columns back as NULL (the read path treats them as
+        // `Option`). A failed migration must NOT block the connection
+        // (GreptimeDB's pg-wire supports `ALTER TABLE ... ADD COLUMN`,
+        // but if it errors anyway — e.g. an ancient engine — we keep
+        // running with the feature degraded: the meta-row cache below is
+        // skipped and later column-bearing queries fail loudly with
+        // context; transcript operations are unaffected).
         let mut title_available = true;
-        match client
-            .query_opt(
+        let mut pinned_available = true;
+        let columns: Vec<String> = client
+            .query(
                 "SELECT column_name FROM information_schema.columns \
-                 WHERE table_name = 'sessions' AND column_name = 'title'",
+                 WHERE table_name = 'sessions'",
                 &[],
             )
             .await
             .context("cannot inspect sessions table schema")?
-        {
-            Some(_) => {}
-            None => match client
+            .iter()
+            .map(|row| row.get("column_name"))
+            .collect();
+        if !columns.iter().any(|c| c == "title") {
+            match client
                 .execute("ALTER TABLE sessions ADD COLUMN title STRING NULL", &[])
                 .await
             {
@@ -234,18 +240,33 @@ impl GreptimeSession {
                          {error:#}"
                     );
                 }
-            },
+            }
+        }
+        if !columns.iter().any(|c| c == "pinned") {
+            match client
+                .execute("ALTER TABLE sessions ADD COLUMN pinned BOOLEAN NULL", &[])
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    pinned_available = false;
+                    eprintln!(
+                        "e-agent: cannot add sessions.pinned column (session pinning unavailable): \
+                         {error:#}"
+                    );
+                }
+            }
         }
 
         // Cache the session's latest metadata snapshot (if any) so later
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
         // wins (ORDER BY last_active_at DESC LIMIT 1).
-        let cached_meta = if title_available {
+        let cached_meta = if title_available && pinned_available {
             let meta_row = client
                 .query_opt(
                     "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                            parent_session_id, parent_task_id, title \
+                            parent_session_id, parent_task_id, title, pinned \
                      FROM sessions \
                      WHERE workspace_id = $1 AND session_id = $2 \
                      ORDER BY last_active_at DESC LIMIT 1",
@@ -263,6 +284,7 @@ impl GreptimeSession {
                 parent_session_id: row.get("parent_session_id"),
                 parent_task_id: row.get("parent_task_id"),
                 title: row.get("title"),
+                pinned: row.get("pinned"),
                 label: None, // label lives in running_tasks, resolved at list time
             })
         } else {
@@ -979,9 +1001,9 @@ impl GreptimeSession {
     // last-write-wins by the TIME INDEX. The sessions table is an
     // append-only lifecycle audit log: every create/touch appends a
     // COMPLETE snapshot row (created_at/model/role/parent/entry_count/
-    // title all carried on every row), and the list view deduplicates per
-    // session taking the latest last_active_at. There is no partial-row
-    // rewrite, so a touch can never wipe immutable columns.
+    // title/pinned all carried on every row), and the list view
+    // deduplicates per session taking the latest last_active_at. There is
+    // no partial-row rewrite, so a touch can never wipe immutable columns.
 
     /// Latest metadata snapshot for one session, or `None` when the
     /// session has no row yet (brand-new session, or a subagent whose
@@ -991,7 +1013,7 @@ impl GreptimeSession {
             .client
             .query_opt(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title \
+                        parent_session_id, parent_task_id, title, pinned \
                  FROM sessions \
                  WHERE workspace_id = $1 AND session_id = $2 \
                  ORDER BY last_active_at DESC LIMIT 1",
@@ -1009,6 +1031,7 @@ impl GreptimeSession {
             parent_session_id: row.get("parent_session_id"),
             parent_task_id: row.get("parent_task_id"),
             title: row.get("title"),
+            pinned: row.get("pinned"),
             label: None, // label lives in running_tasks, resolved at list time
         }))
     }
@@ -1018,8 +1041,8 @@ impl GreptimeSession {
             .execute(
                 "INSERT INTO sessions \
                  (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-                  entry_count, parent_session_id, parent_task_id, title) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                  entry_count, parent_session_id, parent_task_id, title, pinned) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 &[
                     &self.workspace_id,
                     &meta.session_id,
@@ -1031,6 +1054,7 @@ impl GreptimeSession {
                     &meta.parent_session_id,
                     &meta.parent_task_id,
                     &meta.title,
+                    &meta.pinned,
                 ],
             )
             .await
@@ -1086,8 +1110,9 @@ impl GreptimeSession {
             entry_count: self.next_seq,
             parent_session_id: parent_session_id.map(str::to_owned),
             parent_task_id,
-            title: None, // a fresh session is unnamed until the user names it
-            label: None, // label lives in running_tasks, resolved at list time
+            title: None,  // a fresh session is unnamed until the user names it
+            pinned: None, // a fresh session is unpinned until the user pins it
+            label: None,  // label lives in running_tasks, resolved at list time
         };
         self.insert_meta(&meta).await?;
         *self.cached_meta.lock().unwrap() = Some(meta);
@@ -1148,6 +1173,40 @@ impl GreptimeSession {
         Ok(())
     }
 
+    /// Pin or unpin a session: append one full snapshot row carrying the
+    /// new `pinned` flag and a fresh `last_active_at` (the audit log keeps
+    /// the previous state in earlier rows; the list view shows the newest
+    /// and sorts pinned sessions first). `pinned = false` stores
+    /// `Some(false)` — explicitly unpinned, distinct from the `None` of a
+    /// never-touched session (both read as unpinned).
+    ///
+    /// Never self-creates (R3, mirroring `set_title` / `touch_meta`):
+    /// when the session has no metadata row yet, returns `Ok` and writes
+    /// nothing.
+    ///
+    /// `session_id` is explicit (like [`Self::set_title`]) so a
+    /// workspace-scoped meta store can pin/unpin historical sessions it is
+    /// not bound to; for the bound session the cached snapshot is used
+    /// (and refreshed) so the change is immediately visible to later
+    /// touches.
+    pub async fn set_pinned(&self, session_id: &str, pinned: bool) -> Result<()> {
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            return Ok(());
+        };
+        meta.pinned = Some(pinned);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta);
+        }
+        Ok(())
+    }
+
     /// Latest metadata snapshot per session, newest activity first.
     ///
     /// The table is append-only, so one session has many rows; the list
@@ -1159,7 +1218,7 @@ impl GreptimeSession {
             .client
             .query(
                 "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
-                        s.entry_count, s.parent_session_id, s.parent_task_id, s.title \
+                        s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned \
                  FROM sessions s \
                  INNER JOIN ( \
                      SELECT session_id, MAX(last_active_at) AS max_ts \
@@ -1184,6 +1243,7 @@ impl GreptimeSession {
                 parent_session_id: row.get("parent_session_id"),
                 parent_task_id: row.get("parent_task_id"),
                 title: row.get("title"),
+                pinned: row.get("pinned"),
                 label: None, // label lives in running_tasks, resolved at list time
             })
             .collect())
@@ -1197,7 +1257,7 @@ impl GreptimeSession {
             .client
             .query(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title \
+                        parent_session_id, parent_task_id, title, pinned \
                  FROM sessions \
                  WHERE workspace_id = $1 AND session_id = $2 \
                  ORDER BY last_active_at ASC",
@@ -1217,6 +1277,7 @@ impl GreptimeSession {
                 parent_session_id: row.get("parent_session_id"),
                 parent_task_id: row.get("parent_task_id"),
                 title: row.get("title"),
+                pinned: row.get("pinned"),
                 label: None, // label lives in running_tasks, resolved at list time
             })
             .collect())
@@ -1288,8 +1349,9 @@ impl GreptimeSession {
                 entry_count: row.get("entry_count"),
                 parent_session_id: None,
                 parent_task_id: None,
-                title: None, // pre-table sessions have no user-assigned name
-                label: None, // label lives in running_tasks, resolved at list time
+                title: None,  // pre-table sessions have no user-assigned name
+                pinned: None, // pre-table sessions are unpinned
+                label: None,  // label lives in running_tasks, resolved at list time
             })
             .await?;
         }
@@ -3144,6 +3206,90 @@ mod tests {
             .find(|m| m.session_id == sid)
             .expect("session listed after clear");
         assert_eq!(latest.title, None, "clear stores NULL");
+    }
+
+    #[tokio::test]
+    async fn sessions_meta_set_pinned_persists_and_survives_touch() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-pin-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // set_pinned on a session with no row yet is a no-op Ok (R3: never
+        // self-create), mirroring set_title / touch_meta.
+        session.set_pinned(&sid, true).await.unwrap();
+        assert!(
+            session.audit_meta(&sid).await.unwrap().is_empty(),
+            "set_pinned must not self-create a row"
+        );
+
+        session
+            .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+            .await
+            .unwrap();
+        let created = session
+            .list_meta()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.session_id == sid)
+            .expect("created session must be listed");
+        assert_eq!(
+            created.pinned, None,
+            "a fresh session reads as never-touched (None)"
+        );
+
+        // Pin → the list shows pinned=true, the audit trail appends one
+        // snapshot, created_at survives.
+        session.set_pinned(&sid, true).await.unwrap();
+        let list = session.list_meta().await.unwrap();
+        let pinned = list
+            .iter()
+            .find(|m| m.session_id == sid)
+            .expect("session still listed after pin");
+        assert_eq!(pinned.pinned, Some(true));
+        assert_eq!(
+            pinned.model.as_deref(),
+            Some("model-x"),
+            "pin preserves other columns"
+        );
+        assert_eq!(
+            session.audit_meta(&sid).await.unwrap().len(),
+            2,
+            "create + pin = 2 audit rows"
+        );
+
+        // touch carries the pin: the append-only snapshot semantics mean
+        // the newest row still has it.
+        session.touch_meta().await.unwrap();
+        let latest = session
+            .list_meta()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.session_id == sid)
+            .expect("session listed after touch");
+        assert_eq!(latest.pinned, Some(true), "touch preserves the pin flag");
+        assert_eq!(
+            latest.created_at, pinned.created_at,
+            "touch must preserve created_at"
+        );
+
+        // Unpin stores Some(false) — distinct from the None of a
+        // never-touched session, both read as unpinned.
+        session.set_pinned(&sid, false).await.unwrap();
+        let latest = session
+            .list_meta()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.session_id == sid)
+            .expect("session listed after unpin");
+        assert_eq!(latest.pinned, Some(false), "unpin stores Some(false)");
     }
 
     #[tokio::test]

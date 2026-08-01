@@ -158,6 +158,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/compact", post(session_compact))
         .route("/api/sessions/{id}/title", put(session_title))
+        .route("/api/sessions/{id}/pin", put(session_pin))
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/tasks", get(list_tasks))
         .route("/api/sessions/{id}/tasks/{task_id}", delete(cancel_task))
@@ -356,8 +357,9 @@ pub struct SessionMeta {
     pub role: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Last activity time (session start / last tool call / last message);
-    /// the session list sorts by this descending so the most recently
-    /// active session renders first.
+    /// the session list sorts by this descending within the pinned group so
+    /// the most recently active session renders first (pinned sessions sort
+    /// ahead of unpinned ones).
     pub last_active_at: chrono::DateTime<chrono::Utc>,
     /// CamelCase frontend status string (`"Idle" | "Busy" | "Compacting" |
     /// "Finished"`); the UI's `statusLabel`/`statusChipClass`/`applyStatus`
@@ -381,6 +383,11 @@ pub struct SessionMeta {
     /// registry DTO itself carries no title), so live renames show up on
     /// the next list.
     pub title: Option<String>,
+    /// User pin flag: `Some(true)` = pinned (sorted first in the list),
+    /// `Some(false)` / `None` = unpinned. Registry sessions are built from
+    /// the metadata table via [`merge_session_metas`] (the registry DTO
+    /// itself carries no pin), so live pins show up on the next list.
+    pub pinned: Option<bool>,
     /// Task-panel label of the delegate task that spawned this subagent
     /// (`running_tasks.label`, newest surviving row — the sessions metadata
     /// table does not store it). `None` = no live delegate task carries
@@ -415,6 +422,9 @@ async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -
         // session's metadata-table snapshot (a built session always has
         // one — `build` → `create_meta`).
         title: None,
+        // The registry DTO has no pin; the merge fills it from the
+        // session's metadata-table snapshot like the title.
+        pinned: None,
         // The label lives in running_tasks; `list_sessions` fills it for
         // subagent items after the merge.
         label: None,
@@ -509,6 +519,12 @@ fn merge_session_metas(
                 if occupied.get().title.is_none() {
                     occupied.get_mut().title = meta.title.clone();
                 }
+                // Same for the pin flag: the registry DTO has no pin, so
+                // a live session's pinned state comes from its
+                // metadata-table snapshot.
+                if occupied.get().pinned.is_none() {
+                    occupied.get_mut().pinned = meta.pinned;
+                }
                 // Same for the parent link: a resumed subagent's live entry
                 // must stay recognizable as a subagent so `list_sessions`
                 // can fill its label from `running_tasks`.
@@ -537,6 +553,7 @@ fn merge_session_metas(
                     active: false,
                     parent_session_id: meta.parent_session_id,
                     title: meta.title,
+                    pinned: meta.pinned,
                     // Label lives in running_tasks; `list_sessions` fills it.
                     label: None,
                 });
@@ -544,9 +561,15 @@ fn merge_session_metas(
         }
     }
     let mut metas: Vec<SessionMeta> = by_id.into_values().collect();
-    // Newest activity first so the frontend shows the most recently active
-    // session at the top.
-    metas.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
+    // Backend sort (the frontend renders the array order as-is): pinned
+    // sessions first (`pinned = Some(true)`), then newest activity first
+    // within each group.
+    metas.sort_by(|a, b| {
+        b.pinned
+            .unwrap_or(false)
+            .cmp(&a.pinned.unwrap_or(false))
+            .then_with(|| b.last_active_at.cmp(&a.last_active_at))
+    });
     metas
 }
 
@@ -815,6 +838,50 @@ async fn session_title(
     };
     store
         .set_title(root, &id, title.as_deref())
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PinBody {
+    /// The frontend sends `JSON.stringify({ pinned })`.
+    pinned: bool,
+}
+
+/// `PUT /api/sessions/{id}/pin` — pin or unpin a session. Body
+/// `{"pinned": true|false}`; one endpoint toggles both directions. Works
+/// for both live sessions (via their session-bound store — a built session
+/// always has a metadata row, `build` → `create_meta`) and historical
+/// sessions (via the workspace-scoped `meta_store`, so a pin survives the
+/// session leaving the registry). 404 when the id is neither live nor
+/// present in the metadata table. The JSONL backend has no meta table:
+/// pinning a live session is a silent no-op (pins are Greptime-only).
+async fn session_pin(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PinBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let root = state.factory.root();
+    let store = match state.registry.get(&id) {
+        Some(session) => session.store.clone(),
+        None => {
+            let historical = state
+                .meta_store
+                .list_meta(root)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            if !historical.iter().any(|m| m.session_id == id) {
+                return Err(error(
+                    StatusCode::NOT_FOUND,
+                    format!("session {id} not found"),
+                ));
+            }
+            state.meta_store.clone()
+        }
+    };
+    store
+        .set_pinned(root, &id, body.pinned)
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
@@ -1771,6 +1838,7 @@ mod tests {
             "active",
             "parent_session_id",
             "title",
+            "pinned",
             "label",
         ] {
             assert!(value.get(key).is_some(), "missing field {key}");
@@ -1805,6 +1873,7 @@ mod tests {
             active: false,
             parent_session_id: None,
             title: None,
+            pinned: None,
             label: None,
         };
         let history = |id: &str, created: i64, count: i64, title: Option<&str>| HistoryMeta {
@@ -1817,6 +1886,7 @@ mod tests {
             parent_session_id: None,
             parent_task_id: None,
             title: title.map(str::to_owned),
+            pinned: None,
             label: None,
         };
         // One registry session plus two historical sessions, one of which
@@ -1840,6 +1910,10 @@ mod tests {
             Some("renamed"),
             "live session title backfilled from the metadata table"
         );
+        assert_eq!(
+            web1.pinned, None,
+            "unpinned history leaves the live entry unpinned"
+        );
         let tui1 = merged.iter().find(|m| m.id == "tui-1").unwrap();
         assert!(!tui1.active, "historical session is inactive");
         assert_eq!(tui1.entry_count, 7);
@@ -1855,6 +1929,20 @@ mod tests {
             vec!["web-1", "tui-1"],
             "most recently active sorts first"
         );
+
+        // Pinned sorting: a pinned session (even an older one) moves to the
+        // front of the list; the pin backfills a live entry too.
+        let mut pinned_history = history("tui-1", 50, 7, None);
+        pinned_history.pinned = Some(true);
+        let merged = merge_session_metas(vec![wire("web-1", 200)], vec![pinned_history]);
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["tui-1", "web-1"],
+            "pinned sessions sort first, newest activity second"
+        );
+        let tui1 = merged.iter().find(|m| m.id == "tui-1").unwrap();
+        assert_eq!(tui1.pinned, Some(true), "historical pin passes through");
     }
 
     /// Delete is idempotent for unknown/historical ids: it removes the
