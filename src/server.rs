@@ -1098,20 +1098,59 @@ fn cap_entries(entries: Vec<SessionEntry>, limit: Option<usize>) -> Vec<SessionE
 /// `limit` entries with one). `next_before_seq` is the cursor for the next
 /// older page (feed it back to page further back); `null` means the oldest
 /// segment/page or no compaction.
+///
+/// Resolution: the live registry (and live subagent registries) first, then
+/// a historical fallback — a registry miss connects a store directly by id
+/// so historical sessions and finished subagents (transcripts persisted in
+/// the jsonl file / greptime table) are viewable without resuming them
+/// first (resuming a finished subagent is meaningless, but its history
+/// must stay readable). This mirrors the `btw`/`title`/`pin` "live first,
+/// then historical" pattern. 404 is only returned when the transcript
+/// truly does not exist: the connected store loads empty (or the id can
+/// never exist, e.g. an invalid session name). The SSE events endpoint is
+/// intentionally unchanged — streaming needs a live runner, so historical
+/// sessions keep 404 there; the frontend only connects SSE after a resume.
 async fn session_history(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(params): Query<HistoryParams>,
 ) -> Result<Json<HistoryResponse>, (StatusCode, String)> {
-    let session = live(&state, &id)?;
     let root = state.factory.root();
-    // Both variants carry a session-bound store: the live registry session
-    // owns one, and a subagent's `SessionEntry` carries its own (connected
-    // at spawn time), so history reads the same rows the session itself
-    // persists to — no per-request store connect.
-    let store = match &session {
-        SessionRef::Live(session) => session.store.clone(),
-        SessionRef::Subagent(entry) => entry.store.clone(),
+    // Live path: both variants carry a session-bound store — the live
+    // registry session owns one, and a subagent's `SessionEntry` carries
+    // its own (connected at spawn time) — so history reads the same rows
+    // the session itself persists to, with no per-request store connect.
+    let store = match live(&state, &id) {
+        Ok(SessionRef::Live(session)) => session.store.clone(),
+        Ok(SessionRef::Subagent(entry)) => entry.store.clone(),
+        Err((StatusCode::NOT_FOUND, _)) => {
+            // Historical session: not in any registry, but the transcript
+            // may still be persisted. Connect a store by id and read the
+            // same rows the live path would. A truly unknown id leaves the
+            // store empty → 404; ids that can never exist (invalid session
+            // name) also 404, keeping the previous registry-miss semantics.
+            if crate::session::validate_session_name(&id).is_err() {
+                return Err(error(
+                    StatusCode::NOT_FOUND,
+                    format!("session {id} not found"),
+                ));
+            }
+            let store = SessionStore::connect(state.factory.backend(), root, &id)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let loaded = store
+                .load_head(root, &id)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            if loaded.entries.is_empty() {
+                return Err(error(
+                    StatusCode::NOT_FOUND,
+                    format!("session {id} not found"),
+                ));
+            }
+            store
+        }
+        Err(err) => return Err(err),
     };
     let (entries, next_before_seq) = match params.before_seq {
         None => {
@@ -2350,6 +2389,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// M5: a historical session — entries persisted, no live registry
+    /// entry — must be readable via `session_history` without resuming it
+    /// first (the 404-registry-miss now falls back to a direct store
+    /// connect; 404 is reserved for transcripts that truly do not exist).
+    /// Exercised on the JSONL backend: write a session file, then hit the
+    /// handler with a state whose registry is empty.
+    #[tokio::test]
+    async fn session_history_reads_historical_session_without_registry() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::agent::{Message, SessionEntry};
+        use crate::session::Session;
+
+        // Own temp root: the shared test_app_state root must not receive
+        // stray session files (parallel tests share it).
+        let root =
+            std::env::temp_dir().join(format!("e-agent-server-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let id = "historical-subagent";
+        Session::append(
+            &root,
+            id,
+            &[SessionEntry::Message {
+                message: Message::User {
+                    content: "hello from the past".into(),
+                    images: vec![],
+                },
+            }],
+        )
+        .unwrap();
+
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(root.clone()),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+        });
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/history"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["entries"],
+            serde_json::json!([
+                {"type": "message", "message": {"User": {"content": "hello from the past"}}}
+            ])
+        );
+        assert_eq!(value["next_before_seq"], serde_json::Value::Null);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M5: `session_history` with a `before_seq` cursor must forward
