@@ -185,7 +185,7 @@ const elsById={};
 for(const id of ["topActions","backBtn","backParentBtn","connState","banner","tokenInput","tokenToggle","listView","chatView",
   "newPrompt","newSessionBtn","sessionList","listMeta","listHint","chatSessionId","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn","searchInput",
-  "queueBar","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
+  "queueBar","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
   "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks"]) elsById[id]=new El(id);
 
 const _ls={};
@@ -351,6 +351,96 @@ async function main(){
     chk("prompt request 202", elsById["promptInput"].value==="");
     await cancelTurn();
     await compactSession();
+
+    // ---- 斜杠命令补全菜单 ----
+    const sm = elsById["slashMenu"];
+    const pin = elsById["promptInput"];
+    const kd = (key, extra) => { for (const fn of pin._listeners["keydown"] || []) fn(Object.assign({ key, shiftKey: false, preventDefault(){} }, extra || {})); };
+    const inp = () => { for (const fn of pin._listeners["input"] || []) fn(); };
+    // 输入 /（命令起始）→ 弹出 4 个候选，首项选中
+    pin.value = "/";
+    pin.selectionStart = pin.selectionEnd = 1;
+    inp();
+    chk("slash menu opens on /", slashMenu.open === true && sm.hidden === false
+        && sm.querySelectorAll(".slash-item").length === 4,
+        "open=" + slashMenu.open + " items=" + sm.querySelectorAll(".slash-item").length);
+    chk("slash first item selected", slashMenu.selected === 0
+        && sm.querySelectorAll(".slash-item")[0].classList.contains("selected"));
+    // 前缀过滤：/r → 只剩 /rename
+    pin.value = "/r";
+    pin.selectionStart = pin.selectionEnd = 2;
+    inp();
+    chk("slash filters by prefix", slashMenu.items.length === 1
+        && slashMenu.items[0].name === "/rename"
+        && sm.querySelectorAll(".slash-item").length === 1,
+        "n=" + slashMenu.items.length);
+    // ↑↓ 移动选中（循环）
+    pin.value = "/";
+    pin.selectionStart = pin.selectionEnd = 1;
+    inp();
+    kd("ArrowDown");
+    chk("slash arrow down moves selection", slashMenu.selected === 1,
+        "sel=" + slashMenu.selected);
+    kd("ArrowUp"); kd("ArrowUp");
+    chk("slash arrow up wraps", slashMenu.selected === 3, "sel=" + slashMenu.selected);
+    kd("ArrowDown");
+    chk("slash arrow down wraps to 0", slashMenu.selected === 0, "sel=" + slashMenu.selected);
+    // Enter 填入带参数命令：/rename <标题>，光标在参数位（占位被选中，输入即覆盖）
+    kd("ArrowDown");   // 选中 /rename
+    kd("Enter");
+    chk("slash enter fills command", pin.value === "/rename <标题>"
+        && slashMenu.open === false && sm.hidden === true,
+        "value=" + JSON.stringify(pin.value));
+    chk("slash caret at param", pin.selectionStart === "/rename ".length
+        && pin.selectionEnd === pin.value.length,
+        "start=" + pin.selectionStart + " end=" + pin.selectionEnd);
+    // 删除到没有 / → 菜单关闭
+    pin.value = "";
+    inp();
+    chk("slash closes when / removed", slashMenu.open === false && sm.hidden === true);
+    // /compact 无参数：Enter 填入 → 用户回车走现有 sendPrompt 执行
+    pin.value = "/comp";
+    pin.selectionStart = pin.selectionEnd = 5;
+    inp();
+    chk("slash filters to compact", slashMenu.items.length === 1
+        && slashMenu.items[0].name === "/compact",
+        "n=" + slashMenu.items.length);
+    kd("Enter");
+    chk("slash compact filled", pin.value === "/compact" && slashMenu.open === false,
+        "value=" + JSON.stringify(pin.value));
+    kd("Enter");
+    await flush();
+    chk("slash compact executes via sendPrompt",
+        pin.value === "" && FETCHES.some(u => u.endsWith("/compact")),
+        "cleared=" + (pin.value === ""));
+    // Esc 关闭
+    pin.value = "/";
+    pin.selectionStart = pin.selectionEnd = 1;
+    inp();
+    chk("slash reopens", slashMenu.open === true);
+    kd("Escape");
+    chk("slash esc closes", slashMenu.open === false && sm.hidden === true);
+    // 失焦关闭
+    pin.value = "/";
+    inp();
+    chk("slash open before blur", slashMenu.open === true);
+    for (const fn of pin._listeners["blur"] || []) fn();
+    chk("slash blur closes", slashMenu.open === false && sm.hidden === true);
+    // 非命令起始（词中间，/ 前不是空白）不弹出
+    pin.value = "hello/";
+    pin.selectionStart = pin.selectionEnd = 6;
+    inp();
+    chk("slash mid-word stays closed", slashMenu.open === false,
+        "open=" + slashMenu.open);
+    // 空白后的 / 是命令起始 → 弹出并过滤
+    pin.value = "hello /c";
+    pin.selectionStart = pin.selectionEnd = 8;
+    inp();
+    chk("slash after whitespace opens", slashMenu.open === true
+        && slashMenu.items.length === 1 && slashMenu.items[0].name === "/compact",
+        "n=" + slashMenu.items.length);
+    pin.value = "";
+    inp();
 
     // 断线重连：销毁当前流后应重新走 history+SSE
     const oldInit = state.initSource;

@@ -634,6 +634,7 @@ mmlEqnNo}
     border-top: 1px solid var(--base1);
     padding-top: 8px;
     background: var(--base3);
+    position: relative;   /* 斜杠菜单 absolute 定位的锚点 */
   }
   #promptInput {
     width: 100%;
@@ -682,6 +683,49 @@ mmlEqnNo}
     line-height: 1.5;
     flex: 0 0 auto;
   }
+
+  /* 斜杠命令补全菜单：输入框上方浮出（absolute 钉在 composer 顶部外侧），
+     不占布局、不随消息滚动。Solarized Light：base2 底、base1 边框、
+     选中项蓝色高亮（与 tasks-toggle-bar.active / 链接 hover 一致）。 */
+  .slash-menu {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 100%;
+    margin-bottom: 6px;
+    z-index: 20;
+    background: var(--base2);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    box-shadow: 0 2px 8px rgba(0, 43, 54, 0.18);
+    max-height: 40vh;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+  .slash-item {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 6px 10px;
+    font-size: 13px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .slash-item .slash-name { font-weight: bold; color: var(--blue); flex: 0 0 auto; }
+  .slash-item .slash-args { color: var(--base01); font-style: italic; flex: 0 0 auto; }
+  .slash-item .slash-desc {
+    color: var(--base00);
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .slash-item:hover { background: var(--base3); }
+  .slash-item.selected { background: var(--blue); }
+  .slash-item.selected .slash-name,
+  .slash-item.selected .slash-args,
+  .slash-item.selected .slash-desc { color: var(--base3); }
 
   /* 运行中任务折叠条 + 面板（TUI 式）：输入区上方、与 queueBar 同区域；
      默认收起；有任务时计数高亮（计数即徽标），点击展开/收起面板。
