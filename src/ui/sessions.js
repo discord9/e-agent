@@ -435,6 +435,7 @@ const SLASH_COMMANDS = [
   { name: "/compact", desc: "压缩上下文（释放 token）", args: "" },
   { name: "/rename", desc: "重命名当前会话", args: "<标题>" },
   { name: "/btw", desc: "fork 旁路 subagent 继续探讨", args: "<问题>" },
+  { name: "/fork", desc: "从历史消息 fork 出新会话", args: "" },
   { name: "/undo", desc: "撤销最近的文件操作", args: "" },
 ];
 
@@ -523,6 +524,131 @@ function selectSlashItem(i) {
   inp.focus();
 }
 
+/* =====================================================================
+ * fork 面板：/fork 命令弹出，列出当前会话的历史 turn 边界
+ * （GET /api/sessions/{id}/fork-candidates，只列边界消息），↑↓ 选择、
+ * Enter/Tab 选中、Esc/失焦关闭；选中 → POST /api/sessions/{id}/fork
+ * body {"at": N} 建新会话并打开。面板与 slash 菜单同风格（absolute
+ * 定位在 composer 内、选中高亮、mousedown preventDefault 保焦点）。
+ * ===================================================================*/
+const forkMenu = {
+  open: false,     // 面板是否显示
+  items: [],       // 候选 [{at, seq, preview}, ...]（与渲染行一一对应）
+  selected: 0,     // 当前选中索引
+  loading: false,  // 是否正在拉取候选（渲染「加载中…」）
+};
+
+async function openForkMenu() {
+  if (!state.sessionId) return;
+  forkMenu.open = true;
+  forkMenu.loading = true;
+  forkMenu.items = [];
+  forkMenu.selected = 0;
+  renderForkMenu();
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId) + "/fork-candidates");
+    if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。", true); closeForkMenu(); return; }
+    if (res.status === 404 || res.status === 405) { setBanner("⚠ 服务器不支持 fork（需新版后端）", true); closeForkMenu(); return; }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    forkMenu.items = Array.isArray(data) ? data : [];
+    forkMenu.loading = false;
+    renderForkMenu();
+  } catch (e) {
+    forkMenu.loading = false;
+    setBanner("⚠ 加载 fork 候选失败：" + e.message, true);
+    closeForkMenu();
+  }
+}
+
+function closeForkMenu() {
+  if (!forkMenu.open) return;
+  forkMenu.open = false;
+  forkMenu.items = [];
+  forkMenu.selected = 0;
+  forkMenu.loading = false;
+  if (els.forkMenu) els.forkMenu.hidden = true;
+}
+
+function renderForkMenu() {
+  const menu = els.forkMenu;
+  if (!menu) return;
+  menu.innerHTML = "";
+  if (forkMenu.loading) {
+    menu.appendChild(el("div", "fork-loading", "加载中…"));
+    menu.hidden = false;
+    return;
+  }
+  if (!forkMenu.items.length) {
+    menu.appendChild(el("div", "fork-empty", "没有可 fork 的边界消息"));
+    menu.hidden = false;
+    return;
+  }
+  forkMenu.items.forEach((c, i) => {
+    const row = el("div", "fork-item" + (i === forkMenu.selected ? " selected" : ""));
+    row.append(
+      el("span", "fork-at", c.at != null ? String(c.at) : ""),
+      el("span", "fork-preview", truncate(c.preview || "", 60)),
+    );
+    // mousedown 阻止默认：行点击不抢走输入框焦点（否则 blur 先关面板，click 落空）
+    row.addEventListener("mousedown", (e) => { if (e.preventDefault) e.preventDefault(); });
+    row.addEventListener("click", () => selectForkItem(i));
+    menu.appendChild(row);
+  });
+  menu.hidden = false;
+}
+
+/* ↑↓ 移动选中（循环） */
+function moveForkMenu(delta) {
+  if (!forkMenu.open || !forkMenu.items.length) return;
+  const n = forkMenu.items.length;
+  forkMenu.selected = (forkMenu.selected + delta + n) % n;
+  renderForkMenu();
+}
+
+/* 选中当前项（Enter/Tab/点击）→ POST /fork 建新会话 */
+async function selectForkItem(i) {
+  const item = forkMenu.items[i];
+  if (!item) return;
+  const sid = state.sessionId;
+  const savedItems = forkMenu.items;       // 409 冲突时重开面板保留候选
+  const savedSelected = forkMenu.selected;
+  closeForkMenu();
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(sid) + "/fork",
+      { method: "POST", body: JSON.stringify({ at: item.at }) });
+    if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。", true); return; }
+    if (res.status === 409) {
+      // 后端拒绝（非边界/越界）：提示原因并重开面板，保留候选供重选
+      let msg = "HTTP 409";
+      try {
+        const d = await res.json();
+        if (d && typeof d.error === "string") msg = d.error;
+        else if (d && typeof d.message === "string") msg = d.message;
+      } catch (e) { /* 非 JSON 响应：用通用文本 */ }
+      setBanner("⚠ " + msg, true);
+      forkMenu.items = savedItems;
+      forkMenu.selected = savedSelected;
+      forkMenu.open = true;
+      renderForkMenu();
+      return;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const id = data && data.id;
+    if (!id) throw new Error("响应缺少 id");
+    // 成功：清空输入框，打开新会话并刷新侧边栏列表；banner 放最后——
+    // openSession 内部会 refreshBanner()（token 就绪时清空横幅），先设会被抹掉
+    els.promptInput.value = "";
+    autosizeInput();
+    openSession(id);
+    refreshSessionsForSidebar();
+    setBanner("已从历史 fork 出新会话：" + id);
+  } catch (e) {
+    setBanner("⚠ fork 失败：" + e.message, true);
+  }
+}
+
 async function sendPrompt() {
   closeSlashMenu();                    // 发送（按钮/回车）时关闭菜单
   const raw = els.promptInput.value;   // 命令解析用原始输入（/rename 空标题=清除需区分尾部空格）
@@ -585,6 +711,10 @@ async function sendPrompt() {
       setBanner("⚠ 创建 btw subagent 失败：" + e.message, true);
     }
     return;
+  }
+  if (raw === "/fork") {
+    openForkMenu();
+    return;   // 保留输入框；面板选中成功后才清空（selectForkItem）
   }
   if (!state.token) { setBanner("⚠ 请先输入 Token。", true); return; }
   // 防御：Finished 会话的按钮/输入框已被 applyStatus 禁用，这里再挡一道，

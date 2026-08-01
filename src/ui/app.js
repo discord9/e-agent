@@ -84,7 +84,7 @@ const els = {
   searchInput: $("searchInput"),
   chatSessionId: $("chatSessionId"), chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
   messages: $("messages"), promptInput: $("promptInput"), queueBar: $("queueBar"),
-  slashMenu: $("slashMenu"),
+  slashMenu: $("slashMenu"), forkMenu: $("forkMenu"),
   composerMeta: $("composerMeta"),
   jumpBottomBtn: $("jumpBottomBtn"),
   sendBtn: $("sendBtn"), cancelBtn: $("cancelBtn"), compactBtn: $("compactBtn"),
