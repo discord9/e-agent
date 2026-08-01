@@ -424,7 +424,107 @@ function backToList() {
 }
 
 /* 发送 / 取消 / 压缩 */
+
+/* =====================================================================
+ * 斜杠命令自动补全菜单（Slack/Discord 风格）
+ * 输入框内输入 / 且是命令起始（开头或前面是空白）→ 弹出候选列表；
+ * 继续输入按前缀过滤；↑↓ 移动选中、Enter/Tab 填入、Esc/失焦/发送关闭。
+ * 填入后走现有 sendPrompt 的斜杠命令处理逻辑（用户补参数回车执行）。
+ * ===================================================================*/
+const SLASH_COMMANDS = [
+  { name: "/compact", desc: "压缩上下文（释放 token）", args: "" },
+  { name: "/rename", desc: "重命名当前会话", args: "<标题>" },
+  { name: "/btw", desc: "fork 旁路 subagent 继续探讨", args: "<问题>" },
+  { name: "/undo", desc: "撤销最近的文件操作", args: "" },
+];
+
+const slashMenu = {
+  open: false,     // 菜单是否显示
+  items: [],       // 当前过滤后的候选（与渲染行一一对应）
+  selected: 0,     // 当前选中索引
+};
+
+/* 光标前的「当前词」：以 / 开头且前面是输入框开头或空白 → 返回该词（如 "/com"）；
+   否则返回 null（不是命令起始，菜单不应出现）。 */
+function currentSlashWord() {
+  const v = els.promptInput.value;
+  const caret = (els.promptInput.selectionStart == null)
+    ? v.length : els.promptInput.selectionStart;
+  const before = v.slice(0, caret);
+  const m = /(^|\s)(\/[^\s]*)$/.exec(before);
+  return m ? m[2] : null;
+}
+
+/* input 事件驱动：更新菜单（显示/过滤/关闭）。输入、删除都走这里。 */
+function updateSlashMenu() {
+  const word = currentSlashWord();
+  if (word === null) { closeSlashMenu(); return; }
+  const items = SLASH_COMMANDS.filter((c) => c.name.startsWith(word));
+  if (!items.length) { closeSlashMenu(); return; }   // 无匹配：关闭
+  slashMenu.items = items;
+  if (slashMenu.selected >= items.length) slashMenu.selected = 0;
+  slashMenu.open = true;
+  renderSlashMenu();
+}
+
+function renderSlashMenu() {
+  const menu = els.slashMenu;
+  if (!menu) return;
+  menu.innerHTML = "";
+  slashMenu.items.forEach((c, i) => {
+    const row = el("div", "slash-item" + (i === slashMenu.selected ? " selected" : ""));
+    row.append(el("span", "slash-name", c.name), el("span", "slash-desc", c.desc));
+    if (c.args) row.append(el("span", "slash-args", c.args));
+    // mousedown 阻止默认：菜单项点击不抢走输入框焦点（否则 blur 先关菜单，click 落空）
+    row.addEventListener("mousedown", (e) => { if (e.preventDefault) e.preventDefault(); });
+    row.addEventListener("click", () => selectSlashItem(i));
+    menu.appendChild(row);
+  });
+  menu.hidden = false;
+}
+
+function closeSlashMenu() {
+  if (!slashMenu.open) return;
+  slashMenu.open = false;
+  slashMenu.items = [];
+  slashMenu.selected = 0;
+  if (els.slashMenu) els.slashMenu.hidden = true;
+}
+
+/* ↑↓ 移动选中（循环） */
+function moveSlashMenu(delta) {
+  if (!slashMenu.open || !slashMenu.items.length) return;
+  const n = slashMenu.items.length;
+  slashMenu.selected = (slashMenu.selected + delta + n) % n;
+  renderSlashMenu();
+}
+
+/* 选中当前项（Enter/Tab/点击）→ 填入输入框。
+   带参数命令填入 "/cmd <占位>" 并选中占位符（输入即覆盖）；无参数命令
+   只填 "/cmd"，光标在末尾，用户回车执行（与现有 sendPrompt 衔接）。 */
+function acceptSlashMenu() {
+  selectSlashItem(slashMenu.selected);
+}
+
+function selectSlashItem(i) {
+  const c = slashMenu.items[i];
+  if (!c) return;
+  const inp = els.promptInput;
+  inp.value = c.args ? c.name + " " + c.args : c.name;
+  if (c.args) {
+    const at = (c.name + " ").length;   // 光标落在参数占位起始处
+    inp.selectionStart = at;
+    inp.selectionEnd = inp.value.length;   // 选中占位符：直接输入即覆盖
+  } else {
+    inp.selectionStart = inp.selectionEnd = inp.value.length;
+  }
+  closeSlashMenu();
+  autosizeInput();
+  inp.focus();
+}
+
 async function sendPrompt() {
+  closeSlashMenu();                    // 发送（按钮/回车）时关闭菜单
   const raw = els.promptInput.value;   // 命令解析用原始输入（/rename 空标题=清除需区分尾部空格）
   const text = raw.trim();
   if (!text || !state.sessionId) return;

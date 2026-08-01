@@ -273,9 +273,22 @@ els.sendBtn.addEventListener("click", sendPrompt);
 els.cancelBtn.addEventListener("click", cancelTurn);
 els.compactBtn.addEventListener("click", compactSession);
 els.promptInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+  // 斜杠菜单开着时：↑↓ 移动选中、Esc 关闭、Tab 填入；Enter 落到下方分支
+  // （菜单开着 = 选中当前项填入，菜单关着 = 正常发送）。
+  if (slashMenu.open) {
+    if (e.key === "ArrowDown") { e.preventDefault(); moveSlashMenu(1); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); moveSlashMenu(-1); return; }
+    if (e.key === "Escape") { e.preventDefault(); closeSlashMenu(); return; }
+    if (e.key === "Tab") { e.preventDefault(); acceptSlashMenu(); return; }
+  }
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    if (slashMenu.open) acceptSlashMenu();
+    else sendPrompt();
+  }
 });
-els.promptInput.addEventListener("input", autosizeInput);
+els.promptInput.addEventListener("input", () => { autosizeInput(); updateSlashMenu(); });
+els.promptInput.addEventListener("blur", closeSlashMenu);   // 失焦关闭菜单
 els.messages.addEventListener("scroll", (ev) => {
   // 只有用户主动滚动才处理；程序滚动（scrollTop 赋值）不碰 userScrolled。
   if (!ev.isTrusted) return;
