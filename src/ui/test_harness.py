@@ -647,10 +647,9 @@ async function main(){
         "text=" + JSON.stringify(argsShortA.textContent));
     // 点击展开 → 显示全文；再点收起 → 回到预览
     // 按钮在正文 pre 外面（紧跟其后），不在 pre 内部
-    const btnHost = resPreA._parent;
-    chk("A expand button outside pre",
-        btnHost && btnHost._children.some((c) => c instanceof El && c._classes && c._classes.has("expand-toggle")),
-        "host=" + (btnHost && btnHost.tag));
+    chk("A expand button inside pre",
+        resPreA._children.some((c) => c instanceof El && c._classes && c._classes.has("expand-toggle")),
+        "in-pre=" + resPreA._children.filter((c) => c instanceof El).map((c) => c._className).join(","));
     const clicksA = (elsById["messages"]._listeners["click"] || []);
     // footer 里有两个展开按钮（args + result）：取控制 resPreA 的那个
     const btnA = cardA.querySelectorAll(".expand-toggle")

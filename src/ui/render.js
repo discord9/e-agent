@@ -30,19 +30,10 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
   btn._target = container;
   const full = el("span", "expand-full", s);
   container.append(preview, full);
-  // 按钮紧跟正文后面（就近），但用独立控件样式与正文区分：
-  // footerEl（卡片底部）已废弃——按钮放 container 后面，视觉上是操作控件
-  const parent = container.parentNode || (footerEl && footerEl.parentNode);
-  if (parent && parent !== container) {
-    // 插到 container 后面
-    const next = container.nextSibling;
-    if (next) parent.insertBefore(btn, next);
-    else parent.appendChild(btn);
-  } else if (footerEl) {
-    footerEl.appendChild(btn);
-  } else {
-    container.appendChild(btn);
-  }
+  // 按钮在正文 pre 框内末尾（同框，控件样式与正文区分）；footerEl 保留
+  // 为兼容参数（当前无调用传它）
+  if (footerEl) footerEl.appendChild(btn);
+  else container.appendChild(btn);
   return container;
 }
 /* =====================================================================
@@ -279,7 +270,7 @@ function appendToolResult(isError, content, acc, callId) {
     resEl.classList.remove("pending");
     resEl.classList.toggle("err", isError);
     maybeTruncateEl(resEl, content || (isError ? "(无错误信息)" : "(无输出)"),
-      LONG_TEXT_THRESHOLD, ensureCardFooter(card));
+      LONG_TEXT_THRESHOLD, null);
     card.removeAttribute("open");   // 结果到达：收起为标题行（默认折叠）
   } else {
     // 没有可配对的卡片：独立展示结果行
@@ -317,15 +308,6 @@ function buildToolCard(name, args, stateText, stateCls, resultText) {
   return card;
 }
 
-/* 取卡片底部的展开按钮容器；结果后填时（live/历史）按钮要进这里 */
-function ensureCardFooter(card) {
-  let footer = card.querySelector(".expand-footer");
-  if (!footer) {
-    footer = el("div", "expand-footer");
-    card.appendChild(footer);
-  }
-  return footer;
-}
 
 /* 切回缓存会话（openSession restored 分支）时，把缓存 DOM 里「进行中」的
    元素重新绑定到新的累积器上：后续 ReasoningDelta / AssistantDelta /
@@ -372,10 +354,8 @@ function appendNotice(text) {
 function appendNoticeLong(prefix, text) {
   const n = el("div", "notice");
   if (prefix) n.append(prefix);
-  const footer = el("div", "expand-footer");
-  const pre = maybeTruncateEl(el("pre", "notice-output"), text, LONG_TEXT_THRESHOLD, footer);
+  const pre = maybeTruncateEl(el("pre", "notice-output"), text, LONG_TEXT_THRESHOLD, null);
   n.append(pre);
-  if (footer.children.length) n.append(footer);
   els.messages.appendChild(n);
   scrollBottom(false);
   pruneMessages();
@@ -508,7 +488,7 @@ function renderMessage(m, acc, pendingCards) {
       resEl.classList.remove("pending");
       resEl.classList.toggle("err", t.is_error);
       maybeTruncateEl(resEl, t.content || (t.is_error ? "(无错误信息)" : "(无输出)"),
-        LONG_TEXT_THRESHOLD, ensureCardFooter(card));
+        LONG_TEXT_THRESHOLD, null);
     } else {
       // 无对应 ToolCall（如历史截断后）：独立卡片
       const card2 = buildToolCard(t.name, "", t.is_error ? "失败" : "完成",
