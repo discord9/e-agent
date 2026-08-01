@@ -207,6 +207,8 @@ mmlEqnNo}
     font-size: 12px;
     color: var(--base01);
   }
+  /* 置顶会话行：金色左边条（inset，不挤占布局）+ 浅底色，Solarized 协调 */
+  .session-row.pinned { box-shadow: inset 3px 0 0 var(--yellow); background: var(--base2); }
   .busy-dot {
     width: 8px; height: 8px;
     border-radius: 50%;
@@ -630,6 +632,8 @@ mmlEqnNo}
     line-height: 1.4;
   }
   .tree-row:hover { background: var(--base3); }
+  /* 置顶主会话节点：金色左边条；与 .current 同现时 current 的蓝色优先（蓝色 = 当前打开） */
+  .tree-row.pinned { border-left-color: var(--yellow); }
   .tree-row.current { border-left-color: var(--blue); background: var(--base3); }
   /* 折叠按钮：真正的 <button>，≥24px 点击区、16px 字号、hover 背景；
      ▸→▾ 仍由 .open 旋转 90° 实现 */
@@ -713,6 +717,24 @@ mmlEqnNo}
     background: var(--base1);
     color: var(--base02);
   }
+  /* 📌 置顶按钮：默认 muted，置顶时金色高亮（Solarized yellow #b58900）；
+     列表行与侧边栏主会话节点共用（subagent 子节点不渲染）。 */
+  .pin-btn {
+    flex: 0 0 auto;
+    min-width: 24px;
+    min-height: 24px;
+    padding: 0 4px;
+    border: none;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--base01);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+  }
+  .pin-btn:hover { background: var(--base1); color: var(--base02); }
+  .pin-btn.on { color: var(--yellow); }
   /* 编辑态：input 内嵌行内（原位替换标题文本） */
   .rename-box {
     display: inline-flex;

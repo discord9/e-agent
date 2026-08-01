@@ -261,6 +261,8 @@ function renderSessionList(list) {
   // 保存/取消后由 enterRename 清除标志并自行重绘
   if (state.renameActive) return;
   state.lastList = Array.isArray(list) ? list : [];
+  // 排序：后端保证 pinned 置顶在前、组内按 last_active_at 降序；前端按数组
+  // 顺序渲染、不自行重排（旧 server / mock 返回什么顺序就渲染什么顺序）。
   let rows = state.lastList;
   if (state.searchQuery) {
     const q = state.searchQuery;
@@ -284,7 +286,8 @@ function renderSessionList(list) {
     // Historical (inactive) sessions come from the metadata table: grey
     // row, clicking resumes them instead of opening directly.
     const inactive = s.active === false;
-    const row = el("div", "session-row" + (inactive ? " inactive" : ""));
+    const row = el("div", "session-row" + (inactive ? " inactive" : "") +
+      (s.pinned === true ? " pinned" : ""));
     row.title = s.id + (s.model ? " · " + s.model : "") +
       (s.parent_session_id ? " · 子会话 ← " + s.parent_session_id : "");
 
@@ -306,6 +309,13 @@ function renderSessionList(list) {
     edit.addEventListener("click", (ev) => {
       ev.stopPropagation();                // 不触发打开会话
       enterRename(sid, s, () => { renderSessionList(state.lastList); });
+    });
+    const pin = el("button", "pin-btn" + (s.pinned === true ? " on" : ""), "📌");
+    pin.type = "button";
+    pin.title = "置顶/取消置顶";
+    pin.addEventListener("click", (ev) => {
+      ev.stopPropagation();                // 不触发打开会话
+      togglePin(s, () => { renderSessionList(state.lastList); renderSidebarTree(true); });
     });
     const chip = el("span", "status-chip " + statusChipClass(s.status), statusLabel(s.status));
     const model = el("span", "smodel", s.model || "");
@@ -330,7 +340,7 @@ function renderSessionList(list) {
       if (inactive) { resumeSession(s.id); return; }
       openSession(s.id);
     });
-    row.append(dot, sid, edit, chip, model, meta, del);
+    row.append(dot, sid, edit, pin, chip, model, meta, del);
     els.sessionList.appendChild(row);
   }
 }
@@ -1534,10 +1544,10 @@ let lastTreeSig = "";
 function sidebarTreeSig() {
   const list = state.lastList || [];
   // 签名含当前会话 id：打开/切换会话后重绘以更新 .current 高亮；
-  // 含 label：subagent 任务标题变化时树要重绘
+  // 含 label：subagent 任务标题变化时树要重绘；含 pinned：置顶态变化（轮询/本端）都要反映
   return state.sessionId + "|" + JSON.stringify(list.map((s) => [
     s.id, s.title || "", s.label || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
-    s.entry_count ?? 0, s.parent_session_id || "",
+    s.entry_count ?? 0, s.parent_session_id || "", s.pinned === true ? 1 : 0,
   ]));
 }
 
@@ -1599,7 +1609,8 @@ function renderSidebarTree(force) {
 
 function buildTreeRoot(s, kids) {
   const node = el("div", "tree-node");
-  const row = el("div", "tree-row" + (state.sessionId === s.id ? " current" : ""));
+  const row = el("div", "tree-row" + (state.sessionId === s.id ? " current" : "") +
+    (s.pinned === true ? " pinned" : ""));
   const hasKids = kids.length > 0;
   const toggle = el("button", "tree-toggle", hasKids ? "▸" : "");
   toggle.type = "button";
@@ -1623,7 +1634,16 @@ function buildTreeRoot(s, kids) {
     enterRename(titleEl, s, () => { renderSidebarTree(true); });
   });
   const count = el("span", "tree-count", (s.entry_count ?? 0) + " 条");
-  row.append(toggle, dot, titleEl, edit, count);
+  // 📌 置顶按钮（仅主会话根节点）：放行尾 count 后。subagent 子节点不加——
+  // pin 是会话级操作，subagent 的置顶语义后续需要时再单独支持。
+  const pin = el("button", "pin-btn" + (s.pinned === true ? " on" : ""), "📌");
+  pin.type = "button";
+  pin.title = "置顶/取消置顶";
+  pin.addEventListener("click", (ev) => {
+    ev.stopPropagation();                  // 不触发切换会话
+    togglePin(s, () => { renderSidebarTree(true); renderSessionList(state.lastList); });
+  });
+  row.append(toggle, dot, titleEl, edit, count, pin);
   row.title = (s.title || s.id) + (s.model ? " · " + s.model : "") + (s.busy ? "（处理中）" : "");
   row.addEventListener("click", () => {
     if (s.active === false) { resumeSession(s.id); return; }   // 与列表页一致：历史会话先恢复
@@ -1840,6 +1860,39 @@ async function saveTitle(s, newTitle) {
   } catch (e) {
     setBanner("⚠ 重命名失败：" + e.message, true);
     return false;
+  }
+}
+
+/* PUT 切换置顶（📌 → PUT /api/sessions/{id}/pin {"pinned": bool}）；成功写回
+   传入的会话对象（即 state.lastList 里的对象）并回调调用方重绘（列表行与树主
+   节点共用）。旧服务器没有 pin 端点：404/405 统一提示「服务器不支持置顶」
+   （与重命名一致）；pinned 字段缺失（undefined）视为未置顶。
+   列表顺序信任后端（pinned 置顶在前、组内 last_active_at 降序），前端不重排。 */
+async function togglePin(s, afterToggle) {
+  if (!state.token) { setBanner("⚠ 请先输入 Token。", true); return; }
+  const target = s.pinned !== true;   // 兼容旧 server 无 pinned 字段：undefined → 置顶
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(s.id) + "/pin",
+      { method: "PUT", body: JSON.stringify({ pinned: target }) });
+    if (res.status === 401 || res.status === 403) {
+      setBanner("⚠ 认证失败：请检查 Token。");
+      return;
+    }
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 405) {
+        setBanner("⚠ 服务器不支持置顶。", true);
+      } else {
+        setBanner("⚠ 置顶失败：HTTP " + res.status, true);
+      }
+      return;
+    }
+    // 轮询可能已换掉 state.lastList 里的对象引用（列表数据未变时树/列表不重绘，
+    // 但数组每轮都是新的）：按 id 重新解析当前对象再写回，确保重绘反映新状态
+    const cur = (state.lastList || []).find((x) => x.id === s.id) || s;
+    cur.pinned = target;
+    afterToggle();
+  } catch (e) {
+    setBanner("⚠ 置顶失败：" + e.message, true);
   }
 }
 
