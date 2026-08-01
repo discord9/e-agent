@@ -347,6 +347,9 @@ function syncAppHeight() {
 }
 
 function init() {
+  // 挂到 window：pet.html 是独立 <script>，顶层 const state 对它不可见；
+  // 桌宠点击时从这里读当前 sessionId / token / 运行中任务。
+  window.state = state;
   refreshBanner();
   // 软键盘适配：初始按当前 visualViewport 高度设置 --app-height；并绑定
   // visualViewport.resize（键盘弹出/收起触发，iOS Safari 关键路径）+

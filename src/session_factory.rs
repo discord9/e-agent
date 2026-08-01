@@ -250,6 +250,16 @@ impl SessionFactory {
         &self.main_model
     }
 
+    /// The summarizer model for cheap per-turn session summaries (desktop
+    /// pet). Routed via `[roles] summarizer` (e.g. deepseek/flash with
+    /// thinking off); falls back to the main model when not configured.
+    pub fn summarizer_model(&self) -> ConfiguredModel {
+        self.role_models
+            .get("summarizer")
+            .cloned()
+            .unwrap_or_else(|| self.main_model.clone())
+    }
+
     /// The workspace every session works in; btw fork subagents inherit it.
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
