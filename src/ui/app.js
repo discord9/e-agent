@@ -1254,6 +1254,36 @@ async function sendPrompt() {
     // 失败：saveTitle 内部已提示，保留输入框可重试
     return;
   }
+  if (raw === "/btw") {
+    setBanner("用法：/btw <问题>：从当前会话 fork 一个旁路 subagent 继续探讨");
+    return;   // 保留输入框，方便直接补参数
+  }
+  if (raw.startsWith("/btw ")) {
+    const question = raw.slice("/btw ".length).trim();
+    if (!question) {
+      setBanner("用法：/btw <问题>：从当前会话 fork 一个旁路 subagent 继续探讨");
+      return;   // 保留输入框
+    }
+    try {
+      const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId) + "/btw",
+        { method: "POST", body: JSON.stringify({ prompt: question }) });
+      if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。", true); return; }
+      // 旧 server 无 /btw 端点：404/405 → 明确提示，其余按通用错误处理
+      if (res.status === 404 || res.status === 405) { setBanner("⚠ 服务器不支持 /btw", true); return; }
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const id = data && data.id;
+      if (!id) throw new Error("响应缺少 id");
+      // 成功：清空输入框，拉最新列表让新 subagent 出现在侧边栏树里
+      els.promptInput.value = "";
+      autosizeInput();
+      setBanner("已创建 btw subagent：" + id + "（侧边栏可切换）");
+      refreshSessionsForSidebar();
+    } catch (e) {
+      setBanner("⚠ 创建 btw subagent 失败：" + e.message, true);
+    }
+    return;
+  }
   if (!state.token) { setBanner("⚠ 请先输入 Token。", true); return; }
   // 防御：Finished 会话的按钮/输入框已被 applyStatus 禁用，这里再挡一道，
   // 避免陈旧状态或直接调用时对 finished 会话发出 409

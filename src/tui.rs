@@ -431,6 +431,15 @@ async fn run_inner(
                             state.load_newer_history().await;
                         }
                     }
+                    // TODO(btw): 前端 /btw 接线待后端函数就绪后补上。Web 端已先行
+                    // 实现（src/ui/app.js sendPrompt 的 /btw 分支，POST
+                    // /api/sessions/{id}/btw）。TUI 是本地进程，无法走 HTTP，必须调用
+                    // 后端提供的函数（fork 主会话历史 → WaitForInput subagent → 立即
+                    // 发问题）。待该函数合入后，在此加一个
+                    // `else if prompt == "/btw" || prompt.starts_with("/btw ")` 分支：
+                    // 裸 /btw 提示用法，`/btw <问题>` 调后端函数并把结果以 Notice
+                    // 推入滚动条（参考 handle_rename 的模式）。当前不接，避免后端
+                    // 未合入导致编译失败。
                     else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else if let Some(command)=parse_rename(&prompt) { handle_rename(command, &mut state).await; } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
                 Some(Ok(Event::Paste(text))) => state.handle_paste(&text),
