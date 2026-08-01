@@ -685,6 +685,9 @@ loading is workspace-root-only: there is no parent/nested discovery or merging.
 Subagents exist but are deliberately minimal: no agent-to-agent messaging,
 no delegation deeper than 1 level, and no process-level isolation yet
 (subagents are runtime tasks, not subprocesses).
+Windows 当前没有安全 sandbox；Job Object 即使加入也只治理进程树，不隔离文件或网络，
+且不承诺与 bwrap 等价。完整 Windows 后端实现前，Windows 上
+`[sandbox] enabled = true` 必须 fail-closed。
 It does speak MCP to local stdio servers (tools only), but it does NOT do
 remote MCP over HTTP/SSE, MCP OAuth, MCP resources/prompts, server-initiated
 notifications, `listChanged` refresh, server restart on crash, or concurrent
