@@ -295,7 +295,7 @@ async function loadOlder() {
 
 /* history 加载（可选）+ 连接 SSE；auth/gone 时不再重试连接。
    onReady：视图就绪后的回调（历史渲染完 / 缓存恢复完，消息区可操作时
-   触发一次）。bash 任务行点击用它做「切会话后滚动高亮输出块」。 */
+   触发一次）。 */
 function openWith(id, withHistory, onReady) {
   const step = withHistory ? loadHistory(id) : Promise.resolve("ok");
   step.then((r) => {
@@ -381,10 +381,6 @@ function openSession(id, onReady) {
     const atBottom = m.scrollHeight - m.scrollTop - m.clientHeight <= 4;
     userScrolled = !atBottom;      // 恢复到非底部位置：不自动跟随滚动
     els.jumpBottomBtn.hidden = atBottom;
-    // 缓存 DOM 里的 .task-output-block 随 innerHTML 恢复：重连后重启
-    // 对应 key 的轮询（块在 DOM → 轮询更新它；已结束的块标 ✓ 且不轮询）。
-    // 切走期间轮询已停（DOM 被替换 / backToList 显式停止），这里续上。
-    reconcileTaskOutputBlocks(state.tasks.list);
     openWith(id, false, onReady);  // 只重连 SSE，跳过历史加载与 snapshot；
                                    // onReady 在恢复完成（微任务）后触发
   } else {
@@ -400,8 +396,7 @@ function openSession(id, onReady) {
     els.promptInput.value = "";    // 输入框草稿跟随会话：新会话从空开始
     autosizeInput();
     userScrolled = false;          // 打开新会话：恢复自动跟随
-    openWith(id, true, onReady);   // onReady 在 loadHistory 渲染完成（含
-                                   // reconcileTaskOutputBlocks）后触发
+    openWith(id, true, onReady);   // onReady 在 loadHistory 渲染完成后触发
   }
   renderSidebarTree();             // 更新 .current 高亮
 }
@@ -410,8 +405,6 @@ function backToList() {
   saveSessionState();          // 返回列表也保存视图状态：再次打开该会话时恢复
   state.renameActive = false;  // 同 openSession：视图切换即销毁编辑框
   stopSSE();
-  stopAllTaskBlockPollers();   // 离开聊天视图：停消息块轮询（块留在缓存 DOM，
-                               // 切回时 openSession restored 分支重启）
   state.sessionId = null;
   state.view = "list";
   state.acc = null;

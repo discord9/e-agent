@@ -491,54 +491,64 @@ async function main(){
         state.acc.assistantEl === null && state.acc.assistantText === "",
         "="+String(state.acc.assistantEl));
 
-    // ---- 任务输出块（消息列表）：运行中 bash 任务 → 块创建 + 轮询 ----
+    // ---- bash 任务卡片：点击 → 卡片内就地展开 .task-output + 流式轮询 ----
+    // （命令输出放卡片里，流式保持；消息列表输出块已移除）
+    state.tasks.composerOpen = true;   // 面板展开：pollTasks 渲染卡片行
     tasksData = [{ session_id: "s1", id: 7, kind: "bash", label: "cargo build",
       full_command: "cargo build", output: "Compiling e-agent…", role: null }];
     taskOutputText = "Compiling e-agent…\n   Compiling e-agent-util…\n";
     await pollTasks();
     await flush();
-    let blocks = elsById["messages"].querySelectorAll(".task-output-block");
-    chk("task block created", blocks.length === 1, "n=" + blocks.length);
-    chk("task block default open + running",
-        blocks[0].hasAttribute("open")
-        && blocks[0].querySelector(".task-output-state").textContent === "● 运行中",
-        "open=" + blocks[0].hasAttribute("open"));
-    chk("task block badge+label",
-        blocks[0].querySelector(".kind-badge").textContent === "bash"
-        && blocks[0].querySelector(".task-output-label").textContent.includes("cargo build"));
-    chk("task block poller started", state.tasks.pollers.has("s1:7"),
+    let trows = elsById["composerTasks"].querySelectorAll(".task-row");
+    chk("bash card rendered", trows.length === 1, "n=" + trows.length);
+    const brow = trows[0];
+    const bpre = brow.querySelector(".task-output");
+    chk("bash output collapsed by default", bpre.hidden === true, "hidden=" + bpre.hidden);
+    chk("bash poller not started", !state.tasks.pollers.has("s1:7"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    // 点击 → 就地展开 + 启动 500ms 流式轮询
+    brow._listeners["click"][0]();
+    chk("bash click expands in place", bpre.hidden === false, "hidden=" + bpre.hidden);
+    chk("bash poller started", state.tasks.pollers.has("s1:7"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
     await flush();   // 启动即拉一次：output 端点全量刷新 pre 文本
-    chk("task block output live",
-        blocks[0].querySelector(".task-output-body").textContent.includes("e-agent-util"),
-        "=" + blocks[0].querySelector(".task-output-body").textContent);
-    // 多任务各自独立：同会话第二个任务 → 第二个块（按 key 对应）
+    chk("bash output live", bpre.textContent.includes("e-agent-util"),
+        "=" + bpre.textContent);
+    // 再点 → 收起 + 停轮询
+    brow._listeners["click"][0]();
+    chk("bash second click collapses", bpre.hidden === true, "hidden=" + bpre.hidden);
+    chk("bash collapse stops poller", !state.tasks.pollers.has("s1:7"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    // 重新展开（模拟用户正在看输出）：供下面的 2s 重绘恢复展开态
+    brow._listeners["click"][0]();
+    chk("bash re-expands", bpre.hidden === false && state.tasks.pollers.has("s1:7"),
+        "hidden=" + bpre.hidden + " keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    // 多任务各自独立：第二个任务 → 第二张卡片，独立轮询 key
     tasksData = [
       { session_id: "s1", id: 7, kind: "bash", label: "cargo build", full_command: "cargo build", output: "", role: null },
       { session_id: "s1", id: 8, kind: "bash", label: "cargo test", full_command: "cargo test", output: "running tests", role: null },
     ];
     await pollTasks();
     await flush();
-    blocks = elsById["messages"].querySelectorAll(".task-output-block");
-    chk("second block created", blocks.length === 2, "n=" + blocks.length);
-    chk("blocks polled independently", state.tasks.pollers.has("s1:7") && state.tasks.pollers.has("s1:8"),
-        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
-    // 用户手动折叠的块不被 reconcile 强制重开（只新建/复活时展开）
-    blocks[0].removeAttribute("open");
-    await pollTasks();
-    await flush();
-    chk("user-collapsed block stays collapsed", !findTaskOutputBlock("s1:7").hasAttribute("open"),
-        "open=" + findTaskOutputBlock("s1:7").hasAttribute("open"));
-    // bash 行点击（composer 面板）→ 滚动到消息块 + 高亮，不就地展开
-    renderTaskList(tasksData, elsById["composerTasks"]);
-    const trows = elsById["composerTasks"].querySelectorAll(".task-row");
-    chk("composer rows rendered", trows.length === 2, "n=" + trows.length);
-    const block7 = findTaskOutputBlock("s1:7");
-    trows[0]._listeners["click"][0]();
-    chk("bash row click flashes block", block7.classList.contains("flash"),
-        "cls=" + block7.className);
-    chk("bash row not expanded in place", trows[0].querySelector(".task-output").hidden === true,
+    trows = elsById["composerTasks"].querySelectorAll(".task-row");
+    chk("second card rendered", trows.length === 2, "n=" + trows.length);
+    // 2s 重绘恢复展开态：s1:7 上一轮已展开 → 重建后自动展开并续轮询
+    chk("rebuild keeps expanded row", trows[0].querySelector(".task-output").hidden === false,
         "hidden=" + trows[0].querySelector(".task-output").hidden);
+    chk("rebuild restarts poller", state.tasks.pollers.has("s1:7"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    // 展开第二张卡片：各自独立轮询
+    trows[1]._listeners["click"][0]();
+    chk("second card expands", trows[1].querySelector(".task-output").hidden === false,
+        "hidden=" + trows[1].querySelector(".task-output").hidden);
+    chk("cards polled independently",
+        state.tasks.pollers.has("s1:7") && state.tasks.pollers.has("s1:8"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    // 收起第一张：只停自己的轮询
+    trows[0]._listeners["click"][0]();
+    chk("collapse stops own poller only",
+        !state.tasks.pollers.has("s1:7") && state.tasks.pollers.has("s1:8"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
     // delegate 行 → subagent 会话解析（/api/tasks 的 delegate 条目 session_id
     // 是父会话；subagent 会话以 parent_session_id+label 关联）
     state.lastList = [
@@ -551,39 +561,35 @@ async function main(){
     chk("resolve unknown delegate → null",
         resolveSubagentSessionId({ session_id: "s1", label: "不存在的任务" }) === null
         && resolveSubagentSessionId({ session_id: "s1", label: "" }) === null);
-    // 任务结束（从轮询列表消失）：块收起 + ✓ 已结束 + 停轮询，位置保留
+    // 任务结束（从轮询列表消失）：面板清空，轮询停止
     tasksData = [];
     await pollTasks();
     await flush();
-    blocks = elsById["messages"].querySelectorAll(".task-output-block");
-    chk("ended blocks kept in place", blocks.length === 2, "n=" + blocks.length);
-    chk("ended block collapsed", !blocks[0].hasAttribute("open"),
-        "open=" + blocks[0].hasAttribute("open"));
-    chk("ended block marked done",
-        blocks[0].querySelector(".task-output-state").textContent === "✓ 已结束",
-        "=" + blocks[0].querySelector(".task-output-state").textContent);
-    chk("ended block retains output",
-        blocks[0].querySelector(".task-output-body").textContent.includes("e-agent-util"));
+    chk("empty tasks clears panel",
+        elsById["composerTasks"].querySelectorAll(".task-row").length === 0,
+        "n=" + elsById["composerTasks"].querySelectorAll(".task-row").length);
     chk("ended pollers stopped",
         !state.tasks.pollers.has("s1:7") && !state.tasks.pollers.has("s1:8"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
-    // 切走（backToList 停块轮询 + 缓存 html 含块）→ 切回 restored 续轮询
+    // 切走（backToList）→ 切回：卡片轮询独立于会话缓存，backToList 不停轮询
     tasksData = [{ session_id: "s1", id: 9, kind: "bash", label: "cargo run",
       full_command: "cargo run", output: "building", role: null }];
     await pollTasks();
     await flush();
-    chk("block before switch", state.tasks.pollers.has("s1:9"),
+    trows = elsById["composerTasks"].querySelectorAll(".task-row");
+    trows[0]._listeners["click"][0]();
+    chk("card poller before switch", state.tasks.pollers.has("s1:9"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
     backToList();
-    chk("backToList stops block pollers", !state.tasks.pollers.has("s1:9"),
+    chk("backToList keeps card poller", state.tasks.pollers.has("s1:9"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
-    chk("cache keeps blocks", !!state.sessionStates["s1"]
-        && state.sessionStates["s1"].html.includes("task-output-block"));
+    chk("cached html saved", !!state.sessionStates["s1"]
+        && state.sessionStates["s1"].html.length > 0,
+        "len=" + (state.sessionStates["s1"] && state.sessionStates["s1"].html.length));
     openSession("s1");
     await flush();
-    chk("restored restarts block poller", state.tasks.pollers.has("s1:9"),
-        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
-    chk("restored block in messages", findTaskOutputBlock("s1:9") !== null);
+    chk("restored chat view", state.view === "chat" && state.sessionId === "s1",
+        "view=" + state.view + " sid=" + state.sessionId);
 
     // ---- A: 长内容「预览 + 展开全文」（maybeTruncateEl） ----
     const longArgsA = JSON.stringify({ cmd: "echo hi", data: "x".repeat(700) });
@@ -700,10 +706,10 @@ async function main(){
         linkB.hidden === false, "hidden=" + linkB.hidden);
     chk("B prune keeps bound", pm.children.length <= 300, "n=" + pm.children.length);
 
-    // ---- bash 卡片点击：总是切到该任务所属会话，视图就绪后 flash ----
+    // ---- bash 卡片点击：就地展开卡片输出 + 流式轮询，不切会话 ----
     // （放在 B 测试之后：fresh 打开 s2 会把 nextBeforeSeq 置 100，而 B 的
     // 「加载更早历史」链接断言依赖 nextBeforeSeq=null，避免互相污染）
-    // (b) 列表视图点击 → restored 恢复目标会话（缓存命中）→ onReady flash
+    // (b) 列表视图下点击 bash 卡片：不切会话，就地展开 + 启动轮询
     state.view = "list";
     state.sessionId = null;
     state.sessionStates["s1"] = { html: elsById["messages"].innerHTML, scrollTop: 0,
@@ -715,43 +721,43 @@ async function main(){
     const srow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
     srow._listeners["click"][0]();
     await flush();
-    chk("bash click restored-switch to task session",
-        state.view === "chat" && state.sessionId === "s1",
+    chk("bash click stays in list view", state.view === "list" && state.sessionId === null,
         "view=" + state.view + " sid=" + state.sessionId);
-    const sblock = findTaskOutputBlock("s1:55");
-    chk("bash click flashes block after switch", !!sblock && sblock.classList.contains("flash"),
-        "found=" + !!sblock + " cls=" + (sblock && sblock.className));
-    // (c) 列表视图点击 → fresh 打开另一会话（异步 loadHistory）→ 视图就绪后 flash
-    state.view = "list";
-    state.sessionId = null;
-    const freshTasks = [{ session_id: "s2", id: 77, kind: "bash", label: "cargo fmt",
-      full_command: "cargo fmt", output: "formatting", role: null }];
-    state.tasks.list = freshTasks;
-    renderTaskList(freshTasks, elsById["composerTasks"]);
-    const frow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
-    frow._listeners["click"][0]();
+    chk("bash click expands card in place", srow.querySelector(".task-output").hidden === false,
+        "hidden=" + srow.querySelector(".task-output").hidden);
+    chk("bash click starts card poller", state.tasks.pollers.has("s1:55"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    // 再点 → 收起 + 停轮询
+    srow._listeners["click"][0]();
+    chk("bash click collapses card", srow.querySelector(".task-output").hidden === true,
+        "hidden=" + srow.querySelector(".task-output").hidden);
+    chk("bash collapse stops poller", !state.tasks.pollers.has("s1:55"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    // (c) delegate 卡片点击 → 切到 subagent 会话（openSession + resolve）
+    const subTasks = [{ session_id: "s1", id: 66, kind: "delegate", label: "子任务Y",
+      full_command: null, output: null, role: null }];
+    state.lastList = [
+      { id: "s1", parent_session_id: null, label: null },
+      { id: "sub-2", parent_session_id: "s1", label: "子任务Y", active: true },
+    ];
+    renderTaskList(subTasks, elsById["composerTasks"]);
+    const drow2 = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    drow2._listeners["click"][0]();
+    await flush();
+    chk("delegate click switches to subagent session",
+        state.view === "chat" && state.sessionId === "sub-2",
+        "view=" + state.view + " sid=" + state.sessionId);
+    // (d) delegate 解析不到 subagent → 回退就地展开 .task-stream
+    const orphanTasks = [{ session_id: "s1", id: 67, kind: "delegate", label: "孤儿任务",
+      full_command: null, output: null, role: null }];
+    renderTaskList(orphanTasks, elsById["composerTasks"]);
+    const orow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    orow._listeners["click"][0]();
     await flush();
     await flush();
-    chk("bash click fresh-switch to task session",
-        state.view === "chat" && state.sessionId === "s2",
-        "view=" + state.view + " sid=" + state.sessionId);
-    const fblock = findTaskOutputBlock("s2:77");
-    chk("bash click fresh path flashes block", !!fblock && fblock.classList.contains("flash"),
-        "found=" + !!fblock + " cls=" + (fblock && fblock.className));
-    // (d) 同会话但无对应输出块（任务已结束/未渲染）→ 强制创建输出块并高亮
-    //     （用户期望：点 bash 卡片永远进消息列表看流式输出，不回退卡片展开）
-    const staleTasks = [{ session_id: "s2", id: 999, kind: "bash", label: "cargo stale",
-      full_command: "cargo stale", output: "tail", role: null }];
-    renderTaskList(staleTasks, elsById["composerTasks"]);
-    const drow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
-    drow._listeners["click"][0]();
-    const dblock = findTaskOutputBlock("s2:999");
-    chk("bash click no-block creates block",
-        !!dblock && dblock.classList.contains("flash"),
-        "found=" + !!dblock + " cls=" + (dblock && dblock.className));
-    chk("bash click no-block does NOT expand in place",
-        drow.querySelector(".task-output").hidden === true,
-        "hidden=" + drow.querySelector(".task-output").hidden);
+    chk("delegate fallback expands stream in place",
+        orow.querySelector(".task-stream").hidden === false,
+        "hidden=" + orow.querySelector(".task-stream").hidden);
 
     // ---- Token 折叠：默认收起 → 点击展开 → 输入后按钮「已设置」 → 再点收起 ----
     const tokBtn = elsById["tokenToggle"];
