@@ -304,6 +304,9 @@ pub struct TaskDisplayMeta {
     /// Explicit user-provided workspace path (trimmed, non-empty); `None`
     /// means the parent's default workspace was inherited.
     pub workspace: Option<String>,
+    /// The subagent's session id (delegate tasks only); lets the web task
+    /// panel jump straight to the subagent's transcript without label matching.
+    pub subagent_session_id: Option<String>,
 }
 
 /// A snapshot of one running background task, for display.

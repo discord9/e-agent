@@ -520,6 +520,11 @@ pub struct TaskMeta {
     pub background: bool,
     /// `display_meta.workspace` (delegate tasks); `None` otherwise.
     pub workspace: Option<String>,
+    /// The delegate subagent's session id (delegate tasks); `None` otherwise.
+    /// Lets the web task panel jump straight to the subagent's transcript
+    /// without label matching (labels vanish once the `running_tasks` row is
+    /// cleared at task completion).
+    pub subagent_session_id: Option<String>,
 }
 
 /// Cap for `TaskMeta.output`. The per-task output tail is already capped at
@@ -550,6 +555,10 @@ fn task_meta(session_id: &str, info: BackgroundTaskInfo) -> TaskMeta {
             .as_ref()
             .map(|meta| meta.background)
             .unwrap_or(false),
+        subagent_session_id: info
+            .display_meta
+            .as_ref()
+            .and_then(|meta| meta.subagent_session_id.clone()),
         workspace: info.display_meta.and_then(|meta| meta.workspace),
     }
 }
@@ -1065,7 +1074,9 @@ async fn delete_session(
 /// across all live sessions (bash and delegate). Task ids are only unique
 /// per session, so each entry carries its `session_id`; the list is sorted
 /// by `(session_id, id)` for a stable render across registry iteration
-/// order (the registry is a HashMap).
+/// order (the registry is a HashMap). Delegate entries additionally carry
+/// `subagent_session_id` so clients can jump straight to the subagent's
+/// transcript without label matching.
 async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<TaskMeta>> {
     let mut tasks: Vec<TaskMeta> = Vec::new();
     for (session_id, session) in state.registry.list() {
@@ -3773,8 +3784,8 @@ mod tests {
 
     /// The `task_meta` field mapping: bash output becomes lossy UTF-8
     /// truncated at `TASK_OUTPUT_LIMIT` chars, and delegate display metadata
-    /// is flattened into `background` + `workspace` (both empty for
-    /// non-delegate tasks).
+    /// is flattened into `background` + `workspace` + `subagent_session_id`
+    /// (all empty for non-delegate tasks).
     #[test]
     fn task_meta_maps_fields_and_truncates_output() {
         let long = task_meta(
@@ -3798,6 +3809,7 @@ mod tests {
         assert_eq!(long.output.chars().count(), TASK_OUTPUT_LIMIT);
         assert!(!long.background, "non-delegate tasks have no display meta");
         assert_eq!(long.workspace, None);
+        assert_eq!(long.subagent_session_id, None);
         // Invalid UTF-8 becomes the lossy replacement character; short
         // output passes through untruncated.
         let lossy = task_meta(
@@ -3813,7 +3825,8 @@ mod tests {
             },
         );
         assert_eq!(lossy.output, "\u{FFFD}\u{FFFD}");
-        // Delegate display metadata is flattened into background + workspace.
+        // Delegate display metadata is flattened into background + workspace
+        // and the subagent session id passes through for direct jumps.
         let delegate = task_meta(
             "web-y",
             BackgroundTaskInfo {
@@ -3826,12 +3839,14 @@ mod tests {
                 display_meta: Some(TaskDisplayMeta {
                     background: true,
                     workspace: Some("/tmp/w".into()),
+                    subagent_session_id: Some("sub-abc".into()),
                 }),
             },
         );
         assert_eq!(delegate.kind, "delegate");
         assert!(delegate.background);
         assert_eq!(delegate.workspace.as_deref(), Some("/tmp/w"));
+        assert_eq!(delegate.subagent_session_id.as_deref(), Some("sub-abc"));
     }
 
     /// `GET /api/tasks` on an empty registry (and on sessions with no
@@ -4102,6 +4117,7 @@ mod tests {
                 Some(TaskDisplayMeta {
                     background: true,
                     workspace: Some("/tmp/dw".into()),
+                    subagent_session_id: None,
                 }),
                 |_| {},
                 || async {

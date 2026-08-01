@@ -755,6 +755,15 @@ async function main(){
     chk("resolve unknown delegate → null",
         resolveSubagentSessionId({ session_id: "s1", label: "不存在的任务" }) === null
         && resolveSubagentSessionId({ session_id: "s1", label: "" }) === null);
+    // 新版后端：任务条目直接带 subagent_session_id，无需 label 匹配
+    // （已完成任务的 subagent 已不在 /api/sessions 列表里也要能跳转）
+    state.lastList = [];
+    chk("resolve via subagent_session_id",
+        resolveSubagentSessionId({ session_id: "s1", label: "子任务X", subagent_session_id: "sub-9" }) === "sub-9",
+        "=" + String(resolveSubagentSessionId({ session_id: "s1", label: "子任务X", subagent_session_id: "sub-9" })));
+    chk("subagent_session_id wins over label match",
+        resolveSubagentSessionId({ session_id: "s1", label: "别的任务", subagent_session_id: "sub-7" }) === "sub-7",
+        "=" + String(resolveSubagentSessionId({ session_id: "s1", label: "别的任务", subagent_session_id: "sub-7" })));
     // 「← 主会话」按钮：subagent 会话显示，点击返回父会话；主会话隐藏
     state.lastList = [
       { id: "s1", parent_session_id: null, label: null },
