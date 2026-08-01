@@ -1716,7 +1716,7 @@ pub(crate) fn format_tool_call(name: &str, arguments: &str) -> String {
     };
 
     match name {
-        "bash" => {
+        "bash" | "pwsh" => {
             let cmd = value
                 .get("command")
                 .and_then(|v| v.as_str())

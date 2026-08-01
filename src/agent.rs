@@ -904,7 +904,7 @@ impl Agent {
 
     pub(crate) fn after_tool_entry(&mut self, call: &ToolCall, result: &Result<String, String>) {
         if result.is_ok()
-            && call.name == "bash"
+            && (call.name == "bash" || call.name == "pwsh")
             && is_background_call(call)
             && let Some(id) = started_task_id(result.as_deref().unwrap_or_default())
         {

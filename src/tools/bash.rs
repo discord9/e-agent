@@ -52,6 +52,12 @@ pub(super) struct Bash {
 impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
         let mut description = "Run a shell command with the workspace as its current directory. Without bubblewrap, the command retains ambient host filesystem access; file-tool capabilities are an independent boundary.".to_owned();
+        // Tell the model which shell syntax to use: PowerShell on Windows,
+        // bash elsewhere.
+        #[cfg(windows)]
+        description.push_str(" The current shell is PowerShell (pwsh): use PowerShell syntax (Get-ChildItem, Get-Content, $env:VAR, etc.), not bash syntax.");
+        #[cfg(not(windows))]
+        description.push_str(" The current shell is bash: use POSIX/bash syntax.");
         if let Some(sandbox) = &self.sandbox {
             let ws_mode = if sandbox.workspace_writable {
                 "writable"
@@ -96,7 +102,7 @@ impl Tool for Bash {
             }
         }
         ToolSpec {
-            name: "bash".into(),
+            name: shell_tool_name().into(),
             description,
             parameters: json!({
                 "type": "object",
@@ -223,10 +229,39 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
-/// Resolve the bash executable. Non-Windows: `/bin/bash` (unchanged).
-/// Windows: Git Bash is not at a fixed path, so search `PATH` for
-/// `bash.exe` first, then fall back to the common Git for Windows install
-/// locations. Returns a clear error when bash cannot be found.
+/// Shell invocation arguments for `command`: PowerShell uses
+/// `-NoProfile -Command`, bash uses `-lc`.
+fn shell_invoke_args(command: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec!["-NoProfile".into(), "-Command".into(), command.to_owned()]
+    }
+    #[cfg(not(windows))]
+    {
+        vec!["-lc".into(), command.to_owned()]
+    }
+}
+
+/// Tool name exposed to the model: `pwsh` on Windows (PowerShell is the
+/// native shell there and the model sees the right name to pick the right
+/// syntax), `bash` everywhere else. The internal `run_bash`/`kind="bash"`
+/// plumbing is unchanged — only the wire name differs.
+fn shell_tool_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "pwsh"
+    }
+    #[cfg(not(windows))]
+    {
+        "bash"
+    }
+}
+
+/// Resolve the shell executable. Non-Windows: `/bin/bash` (unchanged).
+/// Windows: prefer PowerShell (`pwsh`, falling back to Windows PowerShell
+/// `powershell`) since it is native and needs no Git installation; if
+/// neither is found, fall back to Git Bash (`bash.exe` on PATH or the
+/// common install locations). Returns a clear error when no shell exists.
 fn bash_executable() -> Result<String, String> {
     #[cfg(not(windows))]
     {
@@ -235,27 +270,40 @@ fn bash_executable() -> Result<String, String> {
     }
     #[cfg(windows)]
     {
-        let path_candidates = std::env::var_os("PATH")
-            .map(|path| {
-                // collect: split_paths borrows the OsString; materialize the
-                // owned PathBufs before the closure returns (E0515 otherwise)
-                std::env::split_paths(&path)
-                    .map(|dir| dir.join("bash.exe"))
-                    .collect::<Vec<_>>()
-            })
-            .into_iter()
-            .flatten();
-        let candidates = path_candidates.chain([
-            std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
-            std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin\bash.exe"),
-        ]);
-        for candidate in candidates {
-            if candidate.is_file() {
-                return Ok(candidate.to_string_lossy().into_owned());
+        // 1. pwsh (PowerShell 7+) / powershell (Windows PowerShell 5.1)
+        for name in ["pwsh.exe", "powershell.exe"] {
+            if let Some(path) = which_on_path(name) {
+                return Ok(path);
             }
         }
-        Err("bash not found: Windows requires Git Bash — put bash.exe on PATH or install it at C:\\Program Files\\Git\\bin\\bash.exe".into())
+        // 2. Git Bash fallback (PATH, then common install locations)
+        if let Some(path) = which_on_path("bash.exe") {
+            return Ok(path);
+        }
+        for candidate in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+        ] {
+            let p = std::path::PathBuf::from(candidate);
+            if p.is_file() {
+                return Ok(candidate.to_string());
+            }
+        }
+        Err("no shell found: install PowerShell 7 (pwsh) or Git Bash — put pwsh.exe/powershell.exe/bash.exe on PATH".into())
     }
+}
+
+/// Search `PATH` for an executable by name; returns its full path.
+#[cfg(windows)]
+fn which_on_path(name: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -396,8 +444,7 @@ pub(super) async fn run_bash(
                 args.push("--unshare-net".into());
             }
             args.push(bash.clone());
-            args.push("-lc".into());
-            args.push(command.to_owned());
+            args.extend(shell_invoke_args(command));
             let mut cmd = Command::new("bwrap");
             cmd.args(args);
             // Strip credential env vars so they are not inherited by the
@@ -414,7 +461,7 @@ pub(super) async fn run_bash(
         }
         None => {
             let mut cmd = Command::new(bash);
-            cmd.arg("-lc").arg(command);
+            cmd.args(shell_invoke_args(command));
             cmd
         }
     };
