@@ -36,6 +36,12 @@ pub struct SessionEntry {
     pub cwd: String,
     pub session_id: String,
     pub context_window: Option<u64>,
+    /// The subagent's own session store, already bound to `session_id` at
+    /// spawn time (both construction sites have one connected). The web
+    /// server reads a subagent's transcript through this store without
+    /// re-connecting per request; `handle` alone cannot serve history
+    /// (the runner's event log is a recent tail, not the full transcript).
+    pub store: SessionStore,
 }
 
 /// Registry of live session handles, keyed by background-task id (the same
@@ -58,6 +64,19 @@ impl Sessions {
 
     pub fn remove(&self, id: u64) {
         self.sessions.lock().unwrap().remove(&id);
+    }
+
+    /// Snapshot of every `(task_id, entry)` pair; the caller may hold the
+    /// entries beyond the lock. Used by the web server's subagent lookup
+    /// (address a subagent by its session id, not its task id) and by the
+    /// TUI attach panel.
+    pub fn list(&self) -> Vec<(u64, Arc<SessionEntry>)> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, entry)| (*id, entry.clone()))
+            .collect()
     }
 }
 
@@ -629,6 +648,10 @@ pub async fn spawn_btw_subagent(
         cwd,
         session_id: session_id.clone(),
         context_window,
+        // Bound to this subagent's session id (connected just above with
+        // `persist_root` + `session_id`); lets the web server read the
+        // btw transcript without re-connecting per request.
+        store: meta_store.clone(),
     });
     let entry_for_hook = entry.clone();
     let hook_session_id = session_id.clone();
@@ -981,6 +1004,10 @@ impl Tool for Delegate {
             cwd: workspace.root().display().to_string(),
             session_id: session_id.clone(),
             context_window,
+            // Bound to this subagent's session id (connected just above
+            // with `persist.root` + `session_id`); lets the web server read
+            // the subagent's transcript without re-connecting per request.
+            store: meta_store.clone(),
         });
         let entry_for_hook = entry.clone();
         // Owned clone for the move closures; the outer `session_id` stays
