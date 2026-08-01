@@ -1223,8 +1223,37 @@ function backToList() {
 
 /* 发送 / 取消 / 压缩 */
 async function sendPrompt() {
-  const text = els.promptInput.value.trim();
+  const raw = els.promptInput.value;   // 命令解析用原始输入（/rename 空标题=清除需区分尾部空格）
+  const text = raw.trim();
   if (!text || !state.sessionId) return;
+  // 斜杠命令：只拦截已知命令（与 TUI 语义一致），未知 /xxx 当普通消息发给模型。
+  // 命中命令一律不 POST /prompt。
+  if (text === "/compact") {
+    // fire-and-forget：compactSession 自带 confirm、提交提示与失败 banner，无需 await
+    compactSession();
+    els.promptInput.value = "";
+    autosizeInput();
+    return;
+  }
+  if (raw === "/rename") {
+    setBanner("用法：/rename <标题>（留空可清除）");
+    return;   // 保留输入框，方便直接补参数
+  }
+  if (raw.startsWith("/rename ")) {
+    const title = raw.slice("/rename ".length).trim();
+    const cur = (state.lastList || []).find((x) => x.id === state.sessionId);
+    if (!cur) {
+      setBanner("⚠ 未找到当前会话，无法重命名。", true);
+      return;   // 保留输入框
+    }
+    if (await saveTitle(cur, title)) {
+      // 成功：清空输入框；空 title 即清除标题（saveTitle 内部落 null）
+      els.promptInput.value = "";
+      autosizeInput();
+    }
+    // 失败：saveTitle 内部已提示，保留输入框可重试
+    return;
+  }
   if (!state.token) { setBanner("⚠ 请先输入 Token。", true); return; }
   // 防御：Finished 会话的按钮/输入框已被 applyStatus 禁用，这里再挡一道，
   // 避免陈旧状态或直接调用时对 finished 会话发出 409
