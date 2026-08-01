@@ -18,6 +18,7 @@
 //! | DELETE | `/api/sessions/{id}`              | cancel + remove from the registry  |
 //! | GET    | `/api/tasks`                        | running background tasks, all sessions |
 //! | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task          |
+//! | GET    | `/api/sessions/{id}/tasks/{task_id}/output` | full output of a running bash task |
 //!
 //! Authentication: a random token generated at startup (written to
 //! `$XDG_STATE_HOME/e-agent/server.token` or `~/.local/state/e-agent/server.token`,
@@ -162,6 +163,10 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/tasks", get(list_tasks))
         .route("/api/sessions/{id}/tasks/{task_id}", delete(cancel_task))
+        .route(
+            "/api/sessions/{id}/tasks/{task_id}/output",
+            get(task_output),
+        )
         .route_layer(from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/", get(index))
@@ -1044,6 +1049,43 @@ async fn cancel_task(
     };
     match session.background.cancel(task_id) {
         Some(_) => Ok(StatusCode::NO_CONTENT),
+        None => Err(error(
+            StatusCode::NOT_FOUND,
+            format!("task {task_id} not found in session {id}"),
+        )),
+    }
+}
+
+/// `GET /api/sessions/{id}/tasks/{task_id}/output` — the full captured
+/// output of one running background bash task as `text/plain` (lossy
+/// UTF-8). Unlike `/api/tasks`' 2000-char output tail this is the
+/// untruncated full spool (keep-first capped at 16 MiB), so the frontend
+/// can poll it while a task streams. `Cache-Control: no-cache` keeps
+/// polling honest. 404 for an unknown session, a subagent session (its
+/// tasks live in the parent's registry), or a task with no output spool
+/// (delegate tasks).
+async fn task_output(
+    State(state): State<Arc<AppState>>,
+    Path((id, task_id)): Path<(String, u64)>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session = live(&state, &id)?;
+    let SessionRef::Live(session) = session else {
+        // A subagent's background tasks live in its parent's registry and
+        // are addressed by the parent's session id; a subagent id has no
+        // task registry of its own.
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!("session {id} has no background task registry"),
+        ));
+    };
+    match session.background.output(task_id) {
+        Some(output) => Ok((
+            [
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            ],
+            String::from_utf8_lossy(&output).into_owned(),
+        )),
         None => Err(error(
             StatusCode::NOT_FOUND,
             format!("task {task_id} not found in session {id}"),
@@ -2820,6 +2862,168 @@ mod tests {
             StatusCode::NOT_FOUND,
             "unknown task id must 404"
         );
+    }
+
+    /// `GET /api/sessions/{id}/tasks/{task_id}/output` serves the full
+    /// captured output of a running bash task as text/plain with
+    /// `Cache-Control: no-cache` (proving it is the full spool, not the
+    /// 16 KiB tail `/api/tasks` serves), and 404s for unknown sessions,
+    /// subagent sessions (no registry of their own), unknown task ids, and
+    /// delegate tasks (no output spool).
+    #[tokio::test]
+    async fn task_output_serves_full_output_and_404s() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::time::Duration;
+        use tower::util::ServiceExt;
+
+        let state = test_app_state("sekrit");
+        let (id, session, _rx) = live_session_with_background_sender("web-out");
+        state.registry.insert(id.clone(), session.clone());
+        let app = router(state);
+
+        // Unknown session → 404.
+        let ghost = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/ghost/tasks/1/output")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ghost.status(), StatusCode::NOT_FOUND);
+
+        // A live bash task printing 100 KB (well past the 16 KiB tail
+        // slot) and staying alive while we poll.
+        let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
+        session
+            .background
+            .start(
+                workspace,
+                "head -c 100000 /dev/zero | tr '\\0' a; printf '\\nend\\n'; sleep 30".to_string(),
+                false,
+            )
+            .expect("bash background task starts");
+        let uri = format!("/api/sessions/{id}/tasks/1/output");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (headers, body) = loop {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&uri)
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == StatusCode::OK {
+                let headers = response.headers().clone();
+                let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+                    .await
+                    .unwrap();
+                if String::from_utf8_lossy(&bytes).ends_with("\nend\n") {
+                    break (headers, bytes);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "full task output never became available"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache"),
+            "polling endpoint must not be cached"
+        );
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(text.len(), 100_005, "full output, not the 16 KiB tail");
+        assert!(text.starts_with("aaaaa"), "NUL bytes become 'a'");
+        assert!(text.ends_with("\nend\n"), "tail marker intact");
+
+        // Unknown task id in a known session → 404.
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/tasks/999/output"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        // A delegate task (no output spool) → 404.
+        session
+            .background
+            .spawn_with_id(
+                "delegate task".into(),
+                None,
+                None,
+                None,
+                |_| {},
+                || async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    "done".into()
+                },
+            )
+            .expect("delegate background task starts");
+        let delegate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/tasks/2/output"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delegate.status(), StatusCode::NOT_FOUND);
+
+        // A subagent session id → 404 (its tasks live in the parent
+        // session's registry).
+        let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+        let entry = Arc::new(crate::delegate::SessionEntry {
+            handle,
+            model: "sub-model".into(),
+            role: None,
+            cwd: "/tmp".into(),
+            session_id: "sub-out".into(),
+            context_window: None,
+            store: SessionStore::Jsonl,
+        });
+        session.sessions.insert(7, entry);
+        let subagent = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/sub-out/tasks/1/output")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subagent.status(), StatusCode::NOT_FOUND);
+
+        // Clean up the running tasks so the test leaks no processes.
+        session.background.cancel(1);
+        session.background.cancel(2);
     }
 
     /// `GET /api/tasks` lists running bash and delegate tasks across

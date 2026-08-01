@@ -131,6 +131,13 @@ impl TaskSpool {
         self.state.lock().unwrap().truncated
     }
 
+    /// Full spool contents (keep-first capped at [`FULL_SPOOL_LIMIT`]),
+    /// cloned under the lock. The web `/output` endpoint serves these raw
+    /// bytes; lossy UTF-8 decoding happens at the wire boundary.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.state.lock().unwrap().bytes.clone()
+    }
+
     /// A line-aligned window starting at 0-based spool line `start_line`,
     /// at most `max_lines` lines and `max_bytes` bytes of content. Line
     /// content is UTF-8-lossy decoded (matching the panel preview); a
@@ -378,6 +385,22 @@ impl BackgroundTasks {
             .iter()
             .find(|task| task.id == id)
             .and_then(|task| task.spool.clone())
+    }
+
+    /// Full combined stdout+stderr of a running bash task (keep-first
+    /// capped at [`FULL_SPOOL_LIMIT`]); `None` for unknown task ids and
+    /// delegate tasks (which have no output spool). Unlike
+    /// [`Self::running`]'s 16 KiB output tail this is the untruncated full
+    /// output — the web frontend polls it via
+    /// `GET /api/sessions/{id}/tasks/{task_id}/output`.
+    pub fn output(&self, id: u64) -> Option<Vec<u8>> {
+        self.registry
+            .running
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|task| task.id == id)
+            .and_then(|task| task.spool.as_ref().map(|spool| spool.bytes()))
     }
 
     /// Cancel a running background task. Aborting its future drops any
