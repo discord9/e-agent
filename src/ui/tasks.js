@@ -320,7 +320,7 @@ function renderTaskList(tasks, container) {
     // 非 delegate 任务的 kind 是实际 shell 名（bash / pwsh）：徽章显示真实值
     const shellKind = isDelegate ? "delegate" : (t.kind || "shell");
     const badge = el("span", "kind-badge " + (isDelegate ? "delegate" : shellKind),
-      isDelegate ? "子代理" : shellKind);
+      isDelegate ? (t.role || "子代理") : shellKind);
     line.appendChild(badge);
     line.appendChild(el("span", "task-label", shortTaskLabel(t)));
     if (t.role) line.appendChild(el("span", "task-meta trole", t.role));
