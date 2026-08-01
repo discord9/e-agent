@@ -479,6 +479,10 @@ fn save_file(path: &Path, data: &AuthFile) -> anyhow::Result<()> {
             .with_context(|| format!("cannot replace {}", path.display()))?;
         #[cfg(unix)]
         std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        // fsync the directory so the rename is durable — Unix semantics only:
+        // on Windows CreateFile cannot open a directory handle (os error 5,
+        // "access denied") and the OS journals metadata itself, so skip it.
+        #[cfg(unix)]
         std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     });
