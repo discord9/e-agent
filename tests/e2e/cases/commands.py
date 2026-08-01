@@ -41,7 +41,7 @@ async def run_commands(c):
     # ---------- /compact ----------
     await c.page.fill("#promptInput", "/compact")
     await c.page.press("#promptInput", "Enter")
-    await c.page.wait_for_timeout(600)
+    await c.page.wait_for_timeout(900)
     c.check("/compact：POST /compact 发出（不 POST /prompt）",
             len(c.records["compact"]) == 1
             and c.records["compact"][0][0].endswith("/main-idle/compact")

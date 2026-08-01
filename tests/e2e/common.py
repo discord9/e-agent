@@ -152,7 +152,7 @@ def make_intercept(c):
     async def intercept(route):
         url = route.request.url
         method = route.request.method
-        base = url.rstrip("/")
+        base = url.split("?")[0].rstrip("/")   # 忽略 query（app 会用 /?session=<id> 深链）
         if base == BASE:
             return await route.fulfill(status=200, content_type="text/html; charset=utf-8",
                                        body=html)

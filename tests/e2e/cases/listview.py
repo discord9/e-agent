@@ -7,18 +7,22 @@
                      列表/树回退显示 id；✎ 重命名 PUT 404 提示不崩
   * list_resume   —— inactive（历史）会话点击 -> resumeSession（POST /api/sessions {id}）
   * list_delete   —— 删除会话（confirm + DELETE，轮询重绘后行消失）
-
-pin 按钮（feat/pin-frontend）未合入 05fc4c8，见 cases/skipped.py（TODO）。
+  * list_pin      —— 📌 置顶（列表 + 侧边栏树）：PUT /api/sessions/{id}/pin body、
+                     .pinned/.pin-btn.on 高亮、旧 server 404 「服务器不支持置顶」不崩
 """
 import json
 
 import common
 
-def S(id_, status="Idle", busy=False, parent=None, title=None, active=True, n=2):
-    return {"id": id_, "model": "flash", "role": "fixer" if parent else "main",
-            "status": status, "busy": busy, "active": active,
-            "parent_session_id": parent, "title": title,
-            "entry_count": n, "created_at": "2026-01-01T00:00:00Z"}
+def S(id_, status="Idle", busy=False, parent=None, title=None, active=True, n=2,
+      pinned=None):
+    d = {"id": id_, "model": "flash", "role": "fixer" if parent else "main",
+         "status": status, "busy": busy, "active": active,
+         "parent_session_id": parent, "title": title,
+         "entry_count": n, "created_at": "2026-01-01T00:00:00Z"}
+    if pinned is not None:
+        d["pinned"] = pinned
+    return d
 
 async def run_list_two_line(c):
     c.sessions = [
@@ -183,6 +187,109 @@ async def run_list_delete(c):
     c.check("删除：未误删其他行",
             await c.page.locator("#sessionList .session-row", has_text="main-keep").count() == 1, "")
 
+
+async def run_list_pin(c):
+    # pinned 状态由本端维护：mock 轮询返回的 pinned 跟随 PUT 结果（后端排序/
+    # 持久化不可见，这里只测前端渲染与请求）。
+    pinned = {"main-pinned": True, "main-normal": False}
+    base = [
+        S("main-pinned", title="置顶会话"),
+        S("main-normal", title="普通会话"),
+        {"id": "main-legacy", "model": "flash", "role": "main", "status": "Idle",
+         "busy": False, "active": True, "parent_session_id": None,
+         "title": "旧服务器会话", "entry_count": 1,
+         "created_at": "2026-01-01T00:00:00Z"},          # 旧 server：无 pinned 字段
+    ]
+    def sessions():
+        out = []
+        for s in base:
+            d = dict(s)
+            if d["id"] in pinned:
+                d["pinned"] = pinned[d["id"]]
+            out.append(d)
+        return out
+    c.sessions = sessions
+
+    async def on_pin(route, url, method):
+        sid = url.split("/api/sessions/")[1].split("/pin")[0]
+        body = json.loads(route.request.post_data or "{}")
+        pinned[sid] = bool(body.get("pinned"))
+        c.records["pin"].append((url, route.request.post_data))
+        await route.fulfill(status=c.pin_status, content_type="application/json", body="{}")
+    c.extra_handlers.append(
+        (lambda url, method: method == "PUT" and url.endswith("/pin"), on_pin))
+
+    await c.start()
+    c.check("pin：列表渲染 3 行", await c.page.locator(".session-row").count() == 3, "")
+
+    p_row = c.page.locator("#sessionList .session-row", has_text="main-pinned").first
+    c.check("pin：pinned 行带 .pinned + 📌 高亮(.on)",
+            "pinned" in (await p_row.get_attribute("class"))
+            and await p_row.locator(".pin-btn.on").count() == 1,
+            await p_row.get_attribute("class"))
+    n_row = c.page.locator("#sessionList .session-row", has_text="main-normal").first
+    c.check("pin：未置顶行无 .pinned、📌 不高亮",
+            "pinned" not in (await n_row.get_attribute("class"))
+            and await n_row.locator(".pin-btn.on").count() == 0,
+            await n_row.get_attribute("class"))
+    l_row = c.page.locator("#sessionList .session-row", has_text="main-legacy").first
+    c.check("pin：旧 server 行（无 pinned 字段）视为未置顶",
+            "pinned" not in (await l_row.get_attribute("class"))
+            and await l_row.locator(".pin-btn").count() == 1, "")
+
+    # 点 📌 置顶普通会话
+    await n_row.locator(".pin-btn").click()
+    await c.page.wait_for_timeout(500)
+    ok = (len(c.records["pin"]) == 1
+          and c.records["pin"][0][0].endswith("/api/sessions/main-normal/pin")
+          and c.records["pin"][0][1] == '{"pinned":true}')
+    c.check("pin：点 📌 -> PUT /api/sessions/main-normal/pin body {pinned:true}", ok,
+            str(c.records["pin"]))
+    c.check("pin：置顶后行带 .pinned + 📌 高亮",
+            "pinned" in (await n_row.get_attribute("class"))
+            and await n_row.locator(".pin-btn.on").count() == 1,
+            await n_row.get_attribute("class"))
+
+    # 再点取消置顶
+    await n_row.locator(".pin-btn").click()
+    await c.page.wait_for_timeout(500)
+    ok = (len(c.records["pin"]) == 2 and c.records["pin"][1][1] == '{"pinned":false}')
+    c.check("pin：再点 -> PUT body {pinned:false}", ok, str(c.records["pin"]))
+    c.check("pin：取消后 .pinned 移除、📌 不高亮",
+            "pinned" not in (await n_row.get_attribute("class"))
+            and await n_row.locator(".pin-btn.on").count() == 0, "")
+
+    # 侧边栏树：主会话根节点也有 📌（仅主会话；按 title 匹配）
+    await c.open_sidebar()
+    await c.page.wait_for_selector("#sidebarTree .tree-row:not(.tasks-group-head)", timeout=5000)
+    tp = c.page.locator("#sidebarTree .tree-row", has_text="置顶会话").locator(".pin-btn")
+    c.check("pin：侧边栏树 📌 存在 + pinned 高亮",
+            await tp.count() == 1 and "on" in (await tp.get_attribute("class")),
+            await tp.get_attribute("class") if await tp.count() else "no pin-btn")
+    tn = c.page.locator("#sidebarTree .tree-row", has_text="普通会话").locator(".pin-btn")
+    await tn.click()
+    await c.page.wait_for_timeout(500)
+    ok = (len(c.records["pin"]) == 3
+          and c.records["pin"][2][0].endswith("/main-normal/pin")
+          and c.records["pin"][2][1] == '{"pinned":true}')
+    c.check("pin：树点 📌 -> PUT {pinned:true}", ok, str(c.records["pin"]))
+    c.check("pin：树行置顶后带 .pinned",
+            "pinned" in (await c.page.locator("#sidebarTree .tree-row",
+                                              has_text="普通会话").get_attribute("class")), "")
+    await c.close_sidebar()
+    await c.page.wait_for_timeout(300)
+
+    # 旧 server：无 pin 端点（404）-> 提示「服务器不支持置顶」不崩、状态不变
+    c.pin_status = 404
+    await l_row.locator(".pin-btn").click()
+    await c.page.wait_for_timeout(500)
+    b = await c.ev("els.banner.textContent")
+    c.check("pin：旧 server 404 -> 「服务器不支持置顶」", "服务器不支持置顶" in b, b)
+    c.check("pin：提示后页面不崩", await c.ev("1+1") == 2, "")
+    c.check("pin：失败后行状态不变（仍未置顶）",
+            "pinned" not in (await l_row.get_attribute("class"))
+            and await l_row.locator(".pin-btn.on").count() == 0, "")
+
 CASES = [
     {"name": "list_two_line", "desc": "列表：标题两行显示（title + 完整 id）",
      "run": run_list_two_line},
@@ -194,4 +301,6 @@ CASES = [
      "run": run_list_resume},
     {"name": "list_delete", "desc": "列表：删除会话（confirm + DELETE + 行消失）",
      "run": run_list_delete},
+    {"name": "list_pin", "desc": "列表/侧边栏 📌 置顶（PUT /pin body、.pinned 高亮、旧 server 404 提示）",
+     "run": run_list_pin},
 ]

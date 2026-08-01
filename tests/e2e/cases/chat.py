@@ -9,6 +9,9 @@
                           原样恢复，且不重新加载历史。
   * chat_error_render —— 错误渲染：statusLabel('Failed(xx)')=失败、error chip、
                           appendError 前缀、Finished 禁输入。
+  * conflict_card    —— 并发写冲突（按当前合入现状）：Failed 状态 -> 「失败」chip、
+                         冲突错误消息渲染为「错误: 」普通行（无 .msg-error.conflict
+                         友好卡片 —— 卡片未合入，用例登记现状）。
 """
 import json
 
@@ -198,6 +201,53 @@ async def run_chat_error_render(c):
             await c.ev("els.promptInput.placeholder") == "子任务已结束，无法继续发送",
             await c.ev("els.promptInput.placeholder"))
 
+
+async def run_conflict_card(c):
+    """并发写冲突现状（feat/conflict-friendly-web 只合入了「Failed→失败」一行；
+    友好卡片未合入）。冲突回合在服务端表现为 Failed 状态 + 错误消息走 SSE Error，
+    前端渲染为普通「错误: 」行 —— 用例按现状断言，不假设 .conflict 卡片存在。"""
+    c.sessions = [
+        S("main-conflict", "Failed", False, None, "冲突会话"),
+        S("main-ok", "Idle", False, None, "正常会话"),
+    ]
+    c.history = {
+        "entries": [
+            {"type": "message", "message": {"User": {"content": "写日志", "images": []}}},
+        ],
+        "next_before_seq": None,
+    }
+    c.sse_body = ("event: status\ndata: {\"status\":\"Failed(concurrent write conflict)\"}\n\n"
+                  "event: Error\ndata: {\"type\":\"error\",\"session_id\":\"s1\","
+                  "\"seq\":1,\"error\":\"会话被其他客户端占用，已停止写入以避免数据冲突。\"}\n\n")
+
+    await c.start()
+    # 列表：Failed 状态会话 chip 显示「失败」（DOM 断言）
+    row = c.page.locator("#sessionList .session-row", has_text="main-conflict").first
+    chip = row.locator(".status-chip")
+    c.check("冲突会话（Failed）：列表 chip 文本=失败", (await chip.text_content()) == "失败",
+            await chip.text_content())
+    c.check("冲突会话（Failed）：chip error 样式",
+            "error" in (await chip.get_attribute("class")), await chip.get_attribute("class"))
+
+    # statusLabel：Failed* -> 失败（现状唯一合入的友好化改动）
+    c.check("statusLabel('Failed(concurrent write conflict)') === '失败'",
+            await c.ev("statusLabel('Failed(concurrent write conflict)')") == "失败", "")
+
+    # 打开会话：SSE status=Failed + Error 事件（冲突提示）渲染
+    await row.click()
+    await c.page.wait_for_function("() => state.view === 'chat'")
+    await c.page.wait_for_timeout(1000)
+    c.check("冲突回合：聊天状态 chip 文本=失败",
+            (await c.page.locator("#chatStatus").text_content()) == "失败",
+            await c.page.locator("#chatStatus").text_content())
+    t = await c.ev("els.messages.textContent")
+    c.check("冲突错误消息渲染（错误: 前缀）",
+            "错误: 会话被其他客户端占用，已停止写入以避免数据冲突。" in t, "")
+    n_err = await c.ev("els.messages.querySelectorAll('.msg-error').length")
+    n_conf = await c.ev("els.messages.querySelectorAll('.msg-error.conflict').length")
+    c.check("现状：错误行是 .msg-error 普通行（无 .conflict 子类卡片）",
+            n_err >= 1 and n_conf == 0, f"msg-error={n_err} conflict={n_conf}")
+
 CASES = [
     {"name": "chat_open_sse", "desc": "openSession + SSE 基本流（mock 事件渲染）+ Busy 状态",
      "run": run_chat_open_sse},
@@ -205,4 +255,6 @@ CASES = [
      "run": run_chat_state_preserved},
     {"name": "chat_error_render", "desc": "错误渲染（Failed->失败、错误行、Finished 禁输入）",
      "run": run_chat_error_render},
+    {"name": "conflict_card", "desc": "并发写冲突现状：Failed->失败 chip、冲突错误消息行（无 .conflict 卡片）",
+     "run": run_conflict_card},
 ]
