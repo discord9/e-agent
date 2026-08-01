@@ -738,14 +738,19 @@ async function main(){
     const fblock = findTaskOutputBlock("s2:77");
     chk("bash click fresh path flashes block", !!fblock && fblock.classList.contains("flash"),
         "found=" + !!fblock + " cls=" + (fblock && fblock.className));
-    // (d) 同会话但无对应输出块（任务已结束/未渲染）→ 回退就地展开 toggleRow
+    // (d) 同会话但无对应输出块（任务已结束/未渲染）→ 强制创建输出块并高亮
+    //     （用户期望：点 bash 卡片永远进消息列表看流式输出，不回退卡片展开）
     const staleTasks = [{ session_id: "s2", id: 999, kind: "bash", label: "cargo stale",
-      full_command: "cargo stale", output: "", role: null }];
+      full_command: "cargo stale", output: "tail", role: null }];
     renderTaskList(staleTasks, elsById["composerTasks"]);
     const drow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
     drow._listeners["click"][0]();
-    chk("bash click no-block falls back to in-place expand",
-        drow.querySelector(".task-output").hidden === false,
+    const dblock = findTaskOutputBlock("s2:999");
+    chk("bash click no-block creates block",
+        !!dblock && dblock.classList.contains("flash"),
+        "found=" + !!dblock + " cls=" + (dblock && dblock.className));
+    chk("bash click no-block does NOT expand in place",
+        drow.querySelector(".task-output").hidden === true,
         "hidden=" + drow.querySelector(".task-output").hidden);
 
     // ---- Token 折叠：默认收起 → 点击展开 → 输入后按钮「已设置」 → 再点收起 ----
