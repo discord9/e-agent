@@ -19,7 +19,7 @@ pub use background::{
     BackgroundTaskInfo, BackgroundTasks, OutputSlot, SpoolWindow, TaskDisplayMeta, TaskSpool,
 };
 pub use bash::bash_tool;
-pub use file::file_tools;
+pub use file::{file_tools, undo_file_op};
 
 // The `#[cfg(test)] mod tests` child re-imports these names via `use super::*`.
 #[cfg(test)]
@@ -33,6 +33,19 @@ use background::*;
 
 #[cfg(test)]
 use bash::*;
+
+/// Serializes tests that record/undo file operations: the undo stack is
+/// process-global, so parallel tests would steal each other's snapshots.
+/// Async-aware because the tests hold it across tool-execution awaits.
+#[cfg(test)]
+pub(crate) static UNDO_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Empty the undo stack. Test-only: undo tests outside the tools module
+/// (server, TUI) use this to start from a known state.
+#[cfg(test)]
+pub(crate) fn clear_undo_stack() {
+    file::clear_undo_stack();
+}
 
 const READ_LIMIT: usize = 64 * 1024;
 const DEFAULT_READ_LINES: usize = 2000;

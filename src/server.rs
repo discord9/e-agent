@@ -15,6 +15,7 @@
 //! | POST   | `/api/sessions/{id}/btw`          | fork into a persistent subagent    |
 //! | POST   | `/api/sessions/{id}/cancel`       | cancel the in-flight turn          |
 //! | POST   | `/api/sessions/{id}/compact`      | request compaction                 |
+//! | POST   | `/api/sessions/{id}/undo`         | undo the most recent file operation |
 //! | PUT    | `/api/sessions/{id}/title`        | rename a session (Greptime only)   |
 //! | DELETE | `/api/sessions/{id}`              | cancel + remove from the registry  |
 //! | GET    | `/api/tasks`                        | running background tasks, all sessions |
@@ -177,6 +178,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/btw", post(session_btw))
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/compact", post(session_compact))
+        .route("/api/sessions/{id}/undo", post(session_undo))
         .route("/api/sessions/{id}/title", put(session_title))
         .route("/api/sessions/{id}/pin", put(session_pin))
         .route("/api/sessions/{id}", delete(delete_session))
@@ -896,6 +898,24 @@ async fn session_compact(
     let session = live(&state, &id)?;
     session.handle().compact();
     Ok(StatusCode::ACCEPTED)
+}
+
+/// `POST /api/sessions/{id}/undo` — undo the most recent file operation
+/// (`edit_file` / `write_file`) on the workspace it ran on. The undo stack
+/// is process-global and session-agnostic; the endpoint lives under the
+/// session path only to reuse authentication/routing. 200 + `{"ok": true,
+/// "message": "已撤销 write_file: path"}` on success; 404 for an unknown
+/// session id; 409 with a Chinese error message when there is nothing to
+/// undo or the file has been modified since (never a panic).
+async fn session_undo(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    live(&state, &id)?;
+    match crate::tools::undo_file_op() {
+        Ok(message) => Ok(Json(serde_json::json!({ "ok": true, "message": message }))),
+        Err(message) => Err(error(StatusCode::CONFLICT, message)),
+    }
 }
 
 /// Cap for user-assigned session titles: longer titles are truncated
@@ -2272,6 +2292,97 @@ mod tests {
         )
         .await;
         assert_eq!(ghost.status(), StatusCode::NOT_FOUND, "unknown session");
+    }
+
+    /// `POST /api/sessions/{id}/undo` — 404 for an unknown session, 409
+    /// with a Chinese error when the stack is empty, and 200 +
+    /// `{"ok": true, "message": ...}` that actually reverts the file when a
+    /// write_file snapshot exists.
+    #[tokio::test]
+    async fn session_undo_endpoint_reverts_last_file_op() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        // Serialize with the backend undo tests: the undo stack is global.
+        let _guard = crate::tools::UNDO_TEST_LOCK.lock().await;
+        crate::tools::clear_undo_stack();
+
+        let state = test_app_state("sekrit");
+        let app = router(state.clone());
+
+        // Unknown session -> 404 (registry miss, like its siblings).
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/nope/undo")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Live session but nothing recorded -> 409 with a clear message.
+        let (id, session) = live_session("web-undo");
+        state.registry.insert(id.clone(), session.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/undo"))
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("没有可撤销"), "{text}");
+
+        // Record a write_file snapshot on a temp workspace, then undo via
+        // the endpoint: 200 + ok:true + the file reverted.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.txt");
+        std::fs::write(&path, "old").unwrap();
+        let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+        let tools = crate::tools::file_tools(&workspace);
+        let write = tools
+            .iter()
+            .find(|tool| tool.spec().name == "write_file")
+            .expect("file_tools includes write_file");
+        write
+            .execute(serde_json::json!({"path": "file.txt", "content": "new"}))
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/undo"))
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["ok"], true);
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains("已撤销 write_file: file.txt"), "{message}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
     }
 
     #[test]

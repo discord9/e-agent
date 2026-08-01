@@ -600,6 +600,8 @@ async fn handle_pressed_key(
     } else if let Some(prompt) = state.handle_key(key) {
         if prompt == "/compact" {
             handle.compact();
+        } else if prompt == "/undo" {
+            handle_undo(state);
         } else if let Some(command) = parse_rename(&prompt) {
             handle_rename(command, state).await;
         } else if let Some(command) = parse_btw(&prompt) {
@@ -624,6 +626,20 @@ fn route_idle_events(
     while let Ok(event) = inbox.try_recv() {
         state.push_event(event);
     }
+}
+
+/// Run a `/undo` command: reverse the most recent file operation
+/// (`edit_file` / `write_file`) via the in-process undo stack. The TUI is a
+/// local process, so this calls the tools layer directly — the same
+/// function the server's `POST /api/sessions/{id}/undo` endpoint invokes.
+/// Success and failure are both surfaced as a Notice in the scrollback
+/// (display-only, same as `/rename` and `/btw`).
+fn handle_undo(state: &mut TuiState) {
+    let message = match crate::tools::undo_file_op() {
+        Ok(message) => message,
+        Err(error) => error,
+    };
+    state.push_agent_event(AgentEvent::Notice(message));
 }
 
 /// A parsed `/rename` command from the input line.

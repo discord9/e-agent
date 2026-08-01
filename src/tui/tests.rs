@@ -3313,3 +3313,30 @@ async fn jsonl_store_load_newer_marks_done_without_lines() {
     assert_eq!(state.head_start, 0);
     assert_eq!(state.newer_cursor, None);
 }
+
+#[tokio::test]
+async fn undo_command_reverses_last_file_op_and_notices() {
+    // The undo stack is process-global; serialize with the backend undo
+    // tests so no other test steals this snapshot.
+    let _guard = crate::tools::UNDO_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("file.txt");
+    std::fs::write(&path, "old").unwrap();
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    let tools = crate::tools::file_tools(&workspace);
+    let write = tools
+        .iter()
+        .find(|tool| tool.spec().name == "write_file")
+        .expect("file_tools includes write_file");
+    write
+        .execute(serde_json::json!({"path": "file.txt", "content": "new"}))
+        .await
+        .unwrap();
+
+    let mut state = TuiState::default();
+    super::handle_undo(&mut state);
+
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+    let notice = state.lines.last().unwrap().text.clone();
+    assert!(notice.contains("已撤销 write_file: file.txt"), "{notice}");
+}
