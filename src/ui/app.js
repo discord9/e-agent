@@ -19,6 +19,8 @@ const state = {
   status: "Idle",
   initSource: null,          // "history" | "snapshot" | null —— 初始渲染来源
   pollTimer: null,
+  lastValidateSig: null,     // 上一轮校验问题签名（相同则不再刷 banner）
+  validateBannerUp: false,   // 当前 banner 是否由校验提示占用（恢复数据后只清自己的）
   sse: { ctrl: null, retryTimer: null, stopped: false },
   acc: null,                 // 增量渲染累积器（见 newAccumulator）
   nextBeforeSeq: null,       // 历史分页游标：下一段更早历史的 before_seq（loadHistory 响应里取；null=没有更多）
@@ -220,6 +222,58 @@ function shortId(id) {
   return id && id.length > 8 ? id.slice(0, 8) + "…" : (id || "");
 }
 
+/* =====================================================================
+ * API 响应字段校验（诊断辅助，非严格校验）
+ * /api/sessions 字段全靠前端约定：加/漏字段容易出 bug（历史上出过
+ * title 漏传、active 判定问题）。这里只做轻量类型检查：发现问题在
+ * banner 黄条提示，不阻断渲染、不打断轮询。
+ * ===================================================================*/
+function validateSession(s) {
+  const problems = [];
+  if (!s || typeof s !== "object") return ["条目不是对象"];
+  if (typeof s.id !== "string") problems.push("id 缺失或非字符串");
+  if (typeof s.status !== "string") problems.push("status 缺失或非字符串");
+  if (s.entry_count !== undefined && typeof s.entry_count !== "number") problems.push("entry_count 非数字");
+  if (s.busy !== undefined && typeof s.busy !== "boolean") problems.push("busy 非布尔");
+  if (s.active !== undefined && typeof s.active !== "boolean") problems.push("active 非布尔");
+  if (s.parent_session_id !== undefined && s.parent_session_id !== null && typeof s.parent_session_id !== "string") problems.push("parent_session_id 非字符串");
+  if (s.model !== undefined && s.model !== null && typeof s.model !== "string") problems.push("model 非字符串");
+  if (s.role !== undefined && s.role !== null && typeof s.role !== "string") problems.push("role 非字符串");
+  if (s.title !== undefined && s.title !== null && typeof s.title !== "string") problems.push("title 非字符串");
+  if (s.label !== undefined && s.label !== null && typeof s.label !== "string") problems.push("label 非字符串");
+  if (s.pinned !== undefined && s.pinned !== null && typeof s.pinned !== "boolean") problems.push("pinned 非布尔");
+  return problems;
+}
+
+function validateSessions(list) {
+  const problems = [];
+  if (!Array.isArray(list)) return ["列表不是数组"];
+  for (const s of list.slice(0, 3)) {          // 最多报前 3 个会话，避免刷屏
+    const who = (s && typeof s.id === "string") ? shortId(s.id) : "?";
+    for (const p of validateSession(s)) problems.push(who + ": " + p);
+  }
+  return problems;
+}
+
+/* 校验问题 → banner 黄条。同一批问题只报一次（签名相同跳过）；
+   数据恢复正常后只清除自己占用的 banner，不碰其它提示。 */
+function applyValidation(problems) {
+  if (problems.length) {
+    const sig = problems.join("|");
+    if (sig !== state.lastValidateSig) {
+      state.lastValidateSig = sig;
+      state.validateBannerUp = true;
+      const summary = problems.slice(0, 3).join("；") +
+        (problems.length > 3 ? "；等 " + problems.length + " 处" : "");
+      setBanner("⚠ 服务器返回数据异常：" + summary, true);
+    }
+  } else if (state.validateBannerUp) {
+    state.validateBannerUp = false;
+    state.lastValidateSig = null;
+    setBanner("");
+  }
+}
+
 async function pollSessions() {
   if (state.view !== "list" || !state.token) return;
   try {
@@ -229,11 +283,23 @@ async function pollSessions() {
       return;
     }
     if (!res.ok) throw new Error("HTTP " + res.status);
-    const list = await res.json();
+    let list;
+    try {
+      list = await res.json();
+    } catch (e) {
+      // 旧 server 返回 HTML 错误页等非 JSON：不崩，提示后跳过本轮；
+      // 占住校验 banner 位（恢复后由 applyValidation 自动清除），
+      // 并重置签名，恢复后的问题批次会重新上报
+      state.validateBannerUp = true;
+      state.lastValidateSig = null;
+      setBanner("⚠ 服务器返回异常格式（非 JSON，可能为旧版服务器）。", true);
+      return;
+    }
     renderSessionList(Array.isArray(list) ? list : []);
     renderSidebarTree();                 // 侧边栏会话树随轮询刷新
     if (state.view === "chat") updateComposerMeta();   // model/role 可能随轮询更新（幂等）
     maybeHandleDeepLink(Array.isArray(list) ? list : []);
+    applyValidation(validateSessions(list));   // 字段校验：只提示，不阻断渲染
   } catch (e) {
     if (!navigator.onLine || e instanceof TypeError) {
       setBanner("⚠ 无法连接服务器（网络错误）。", true);
@@ -1043,8 +1109,8 @@ function applyLiveEvent(name, payload) {
       queuePromptConsumed();
       break;
     default:
-      // 后端新事件：未知则尽量显示，避免静默丢失
-      appendNotice("事件 " + name + ": " + truncate(JSON.stringify(payload), 200));
+      // 后端未知事件类型：不渲染、不崩，只留 console 警告（诊断辅助）
+      console.warn("[SSE] 未知事件类型，已跳过：", name, payload);
   }
 }
 
