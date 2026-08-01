@@ -372,11 +372,26 @@ function renderQueueBar() {
     bar.textContent = "";
     return;
   }
-  const shown = state.queue.slice(0, 3);
-  const extra = state.queue.length - shown.length;
-  let text = shown.map((t) => "⏳ 排队中: " + t).join("\n");
-  if (extra > 0) text += "\n+ " + extra + " 条排队中";
-  bar.textContent = text;
+  bar.innerHTML = "";
+  const SHOWN = 3;
+  const items = state.queue;
+  const extra = items.length - SHOWN;
+  const expanded = state.queueExpanded;
+  const visible = expanded ? items : items.slice(0, SHOWN);
+  for (const t of visible) {
+    bar.appendChild(el("div", "queue-item", "⏳ 排队中: " + t));
+  }
+  if (extra > 0) {
+    // 超过 3 条时给出展开/折叠按钮：展开看全部，再点收起
+    const toggle = el("button", "queue-toggle",
+      expanded ? "收起排队列表" : "+ " + extra + " 条排队中");
+    toggle.type = "button";
+    toggle.addEventListener("click", () => {
+      state.queueExpanded = !state.queueExpanded;
+      renderQueueBar();
+    });
+    bar.appendChild(toggle);
+  }
   bar.hidden = false;
 }
 

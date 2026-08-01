@@ -50,6 +50,7 @@ const state = {
   searchQuery: "",           // 会话列表搜索词（已小写化）；轮询重绘后过滤依然生效
   lastList: [],              // 最近一次轮询拿到的完整列表，供搜索框重绘
   queue: [],                 // 排队提示（FIFO；最多显示 3 条 + "+N"）
+  queueExpanded: false,      // 排队条是否展开显示全部（默认收起）
   deepLink: { pending: null, handled: false },  // URL ?session= 深链：待打开 id + 一次性标志
   sessionStates: {},         // sessionId -> {html, scrollTop, nextBeforeSeq, olderDone, draft}：切走时保存，切回时恢复（不重新加载历史）
   sidebar: {                 // 会话侧边栏
