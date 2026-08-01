@@ -118,6 +118,9 @@ mmlEqnNo}
 
   /* ---------- 提示横幅 ---------- */
   .banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     padding: 6px 14px;
     background: #fbe3e4;      /* 浅红底 */
     color: var(--red);
@@ -130,6 +133,19 @@ mmlEqnNo}
     color: var(--yellow);
     border-bottom-color: var(--yellow);
   }
+  .banner-text { flex: 1 1 auto; min-width: 0; }
+  .banner-close {
+    flex: 0 0 auto;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+    border-radius: 3px;
+  }
+  .banner-close:hover { background: rgba(0, 0, 0, 0.1); }
 
   /* ---------- 视图容器 ---------- */
   .view {

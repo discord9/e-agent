@@ -76,7 +76,8 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const els = {
   topActions: $("topActions"), backBtn: $("backBtn"), backParentBtn: $("backParentBtn"), connState: $("connState"),
-  banner: $("banner"), tokenInput: $("tokenInput"), tokenToggle: $("tokenToggle"),
+  banner: $("banner"), bannerText: $("bannerText"), bannerClose: $("bannerClose"),
+  tokenInput: $("tokenInput"), tokenToggle: $("tokenToggle"),
   listView: $("listView"), chatView: $("chatView"),
   newPrompt: $("newPrompt"), newSessionBtn: $("newSessionBtn"),
   sessionList: $("sessionList"), listMeta: $("listMeta"), listHint: $("listHint"),
@@ -122,11 +123,18 @@ function fmtTime(iso) {
   return d.toLocaleString("zh-CN", { hour12: false });
 }
 
+let bannerTimer = null;         // 非 warn 提示自动消失计时器（新 setBanner 时先清旧计时器）
+
 function setBanner(msg, isWarn) {
-  els.banner.textContent = msg;
+  if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = null; }
+  els.bannerText.textContent = msg;
   els.banner.className = "banner" + (isWarn ? " warn" : "");
   els.banner.hidden = !msg;
+  if (msg && !isWarn) {
+    bannerTimer = setTimeout(() => { bannerTimer = null; setBanner(""); }, 5000);
+  }
 }
+els.bannerClose.addEventListener("click", () => setBanner(""));
 
 /* 从事件载荷中提取字符串正文：后端字段名可能不同，做防御性兼容 */
 function pickText(payload, keys) {

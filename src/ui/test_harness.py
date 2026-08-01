@@ -182,7 +182,7 @@ class El {
   blur(){}
 }
 const elsById={};
-for(const id of ["topActions","backBtn","backParentBtn","connState","banner","tokenInput","tokenToggle","listView","chatView",
+for(const id of ["topActions","backBtn","backParentBtn","connState","banner","bannerText","bannerClose","tokenInput","tokenToggle","listView","chatView",
   "newPrompt","newSessionBtn","sessionList","listMeta","listHint","chatSessionId","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn","searchInput",
   "queueBar","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
