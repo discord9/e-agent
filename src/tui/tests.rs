@@ -496,6 +496,100 @@ fn task_detail_growth_follows_tail_from_head() {
 }
 
 #[test]
+fn task_detail_tail_reload_is_throttled() {
+    // Draw-driven tail reloads are rate-limited to TAIL_RELOAD_INTERVAL:
+    // a frame within 100 ms of the previous reload keeps the cached page,
+    // and the pending growth survives to the next due frame.
+    let spool = Arc::new(crate::tools::TaskSpool::new());
+    let mut text = String::new();
+    for i in 0..10 {
+        text.push_str(&format!("line {i:03}\n"));
+    }
+    spool.append(text.as_bytes());
+    let mut state = TuiState {
+        task_detail: Some(TaskDetail::new(1, "demo".into(), spool.clone(), false)),
+        ..Default::default()
+    };
+    let backend = ratatui::backend::TestBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    // First draw: the initial reload is always due (10 lines, tail page
+    // base 0 with a 10-row viewport).
+    draw(&mut terminal, &mut state).unwrap();
+    let detail = state.task_detail.as_ref().unwrap();
+    assert_eq!(detail.base_line, 0);
+    assert_eq!(detail.last_seen_lines, 10);
+
+    // Growth inside the throttle window: the cached page stays and
+    // last_seen_lines is NOT advanced, so the growth is not dropped.
+    let mut more = String::new();
+    for i in 10..30 {
+        more.push_str(&format!("line {i:03}\n"));
+    }
+    spool.append(more.as_bytes());
+    draw(&mut terminal, &mut state).unwrap();
+    let detail = state.task_detail.as_ref().unwrap();
+    assert_eq!(detail.base_line, 0, "throttled frame must keep the page");
+    assert_eq!(detail.last_seen_lines, 10);
+
+    // After the interval the next frame reloads the live tail.
+    std::thread::sleep(TAIL_RELOAD_INTERVAL + Duration::from_millis(20));
+    draw(&mut terminal, &mut state).unwrap();
+    let detail = state.task_detail.as_ref().unwrap();
+    assert_eq!(detail.base_line, 20);
+    assert_eq!(detail.last_seen_lines, 30);
+}
+
+#[test]
+fn task_detail_wrap_budget_bounds_follow_wrap() {
+    // Follow mode must not wrap the whole 64 KiB page per frame: the wrap
+    // is bounded to the viewport's cell budget, so a page of long lines
+    // renders its tail (which is all the viewport shows) while the head
+    // of the page is cut instead of being wrapped and thrown away.
+    let spool = Arc::new(crate::tools::TaskSpool::new());
+    let mut text = String::new();
+    for i in 0..10 {
+        // 8-char prefix + 592 X's = 600 bytes per line (6 KiB page, over
+        // the 4 KiB floor of detail_wrap_budget(78, 10)).
+        text.push_str(&format!("line {i:03} {}", "X".repeat(592)));
+        text.push('\n');
+    }
+    spool.append(text.as_bytes());
+    let mut state = TuiState {
+        task_detail: Some(TaskDetail::new(1, "demo".into(), spool, false)),
+        ..Default::default()
+    };
+    let backend = ratatui::backend::TestBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    draw(&mut terminal, &mut state).unwrap();
+    let buffer = terminal.backend().buffer();
+    let page: String = (1..11)
+        .map(|y| {
+            (1..79)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The live tail is on screen: the last line's prefix is visible and
+    // its wrapped tail fills the bottom row (601 chars → 7 full rows of
+    // 78 plus a final row of 55).
+    assert!(page.contains("line 009"), "tail page must be rendered");
+    let bottom: String = (1..79)
+        .map(|x| buffer[(x, 10)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    assert_eq!(bottom.trim_end(), &"X".repeat(55));
+    // The head of the page (cut by the wrap budget, not wrapped) is gone:
+    // a 600-byte line at width 78 wraps to 8 rows, so the full 10-line
+    // page would need 80 rows; the budget keeps only the tail, and the
+    // earliest line that survives is line 003's tail (prefix cut).
+    assert!(
+        !page.contains("line 000") && !page.contains("line 003"),
+        "wrap budget must cut the page head: {page:?}"
+    );
+}
+
+#[test]
 fn task_detail_render_paints_header_and_finished() {
     let spool = Arc::new(crate::tools::TaskSpool::new());
     let mut text = String::new();

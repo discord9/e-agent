@@ -2,7 +2,9 @@ use std::io;
 use std::path::PathBuf;
 
 use crossterm::cursor::Show;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
@@ -423,6 +425,32 @@ async fn run_inner(
                 }
             }
         }
+        // Esc-priority: service urgent keys already queued BEFORE paying
+        // for a (potentially slow) draw. A slow frame — e.g. a cargo build
+        // dumping tens of thousands of lines into the task-detail view —
+        // must never delay leaving the view: Esc/Ctrl-C/x/F2/scroll are
+        // consumed here (via the same handler the select uses, so both
+        // paths behave identically) and the loop redraws after them.
+        // Non-urgent keys stay in the stream and are handled by the select
+        // below, keeping normal typing latency unchanged.
+        if let Some(key) = peek_urgent_key(&mut events).await {
+            let _ = events.next().await; // consume the peeked key
+            match handle_pressed_key(
+                &mut state,
+                key,
+                &handle,
+                &status,
+                &sessions,
+                &sender,
+                terminal,
+                &mut events,
+            )
+            .await?
+            {
+                KeyHandled::Continue => continue,
+                KeyHandled::Exit => return Ok(None),
+            }
+        }
         draw(terminal, &mut state)?;
         tokio::select! {
             changed = status.changed() => {
@@ -443,23 +471,10 @@ async fn run_inner(
             Some(first) = inbox.recv() => route_idle_events(&mut state, first, &mut inbox),
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
-                    if state.task_detail.is_some() { state.handle_task_detail_key(key); continue; }
-                    if state.show_tasks { match state.handle_tasks_panel_key(key) { TaskSelection::Attach(id) => attach_to_task(&mut state,id,&sessions,&sender), TaskSelection::OpenDetail(id) => state.open_task_detail(id), TaskSelection::None => { let _=state.handle_panel_key(key); } } continue; }
-                    if state.attached.is_some() { if key.code==KeyCode::Esc { state.detach(); } else if is_scroll_key(key) { state.attached.as_mut().unwrap().state.handle_scroll(key); } else { let width=attached_input_width(terminal)?; state.handle_attached_key(key,width); } continue; }
-                    let active = matches!(&*status.borrow(), SessionStatus::Busy | SessionStatus::Compacting);
-                    if active && is_cancel(key) { handle.cancel(); continue; }
-                    if !active && is_exit(key) { return Ok(None); }
-                    if is_scroll_key(key) {
-                        state.handle_scroll(key);
-                        drain_ready_scroll_keys(&mut events, &mut state).await;
-                        if state.older_pending {
-                            state.load_older_history().await;
-                        }
-                        if state.newer_pending {
-                            state.load_newer_history().await;
-                        }
+                    match handle_pressed_key(&mut state, key, &handle, &status, &sessions, &sender, terminal, &mut events).await? {
+                        KeyHandled::Continue => continue,
+                        KeyHandled::Exit => return Ok(None),
                     }
-                    else if let Some(prompt)=state.handle_key(key) { if prompt=="/compact" { handle.compact(); } else if let Some(command)=parse_rename(&prompt) { handle_rename(command, &mut state).await; } else if let Some(command)=parse_btw(&prompt) { handle_btw(command, &mut state).await; } else { if !state.session_title_set { set_terminal_title(&sanitize_title(&prompt)); state.session_title_set=true; } handle.prompt(prompt); } }
                 }
                 Some(Ok(Event::Paste(text))) => state.handle_paste(&text),
                 // Resize needs no explicit handling: the next draw()
@@ -471,6 +486,133 @@ async fn run_inner(
             }
         }
     }
+}
+
+/// Outcome of handling a pressed key in the main loop.
+enum KeyHandled {
+    /// Key consumed; the loop redraws on its next iteration.
+    Continue,
+    /// Esc/Ctrl-C from the idle main view: exit the TUI.
+    Exit,
+}
+
+/// Keys that must be serviced before a (potentially slow) draw: leaving a
+/// view (Esc/F2), cancelling (Ctrl-C/x) and scrolling. A slow frame must
+/// never delay these — Esc getting stuck in the task-detail view was the
+/// reported bug.
+fn is_urgent_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        || key.code == KeyCode::F(2)
+        || is_cancel(key)
+        || key.code == KeyCode::Char('x')
+        || is_scroll_key(key)
+}
+
+/// Non-blocking peek for an already-queued urgent key. Returns a COPY of
+/// the key without consuming it, so non-urgent events keep their stream
+/// position for the select below. The caller consumes with `events.next()`.
+async fn peek_urgent_key(
+    events: &mut futures_util::stream::Peekable<EventStream>,
+) -> Option<KeyEvent> {
+    // StreamExt::peek is pin-projected (same as drain_ready_scroll_keys).
+    // A 1 ms timeout keeps this effectively non-blocking: when a key is
+    // already queued the peek resolves on its first poll (no wait at all);
+    // when the queue is empty the loop falls through to draw immediately.
+    let Ok(next) = tokio::time::timeout(
+        std::time::Duration::from_millis(1),
+        std::pin::Pin::new(&mut *events).peek(),
+    )
+    .await
+    else {
+        return None;
+    };
+    match next {
+        Some(Ok(Event::Key(key)))
+            if key.kind == crossterm::event::KeyEventKind::Press && is_urgent_key(*key) =>
+        {
+            Some(*key)
+        }
+        _ => None,
+    }
+}
+
+/// Handle one pressed key in the main loop. Shared by the pre-draw urgent
+/// peek and the select's event branch so both paths behave identically.
+/// The branches mirror the original inline select-arm handler exactly:
+/// task detail, tasks panel, attached session, then the main view
+/// (cancel / exit / scroll / input keys).
+#[allow(clippy::too_many_arguments)]
+async fn handle_pressed_key(
+    state: &mut TuiState,
+    key: KeyEvent,
+    handle: &RunnerHandle,
+    status: &tokio::sync::watch::Receiver<SessionStatus>,
+    sessions: &Sessions,
+    sender: &mpsc::UnboundedSender<UiEvent>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    events: &mut futures_util::stream::Peekable<EventStream>,
+) -> anyhow::Result<KeyHandled> {
+    if state.task_detail.is_some() {
+        state.handle_task_detail_key(key);
+        return Ok(KeyHandled::Continue);
+    }
+    if state.show_tasks {
+        match state.handle_tasks_panel_key(key) {
+            TaskSelection::Attach(id) => attach_to_task(state, id, sessions, sender),
+            TaskSelection::OpenDetail(id) => state.open_task_detail(id),
+            TaskSelection::None => {
+                let _ = state.handle_panel_key(key);
+            }
+        }
+        return Ok(KeyHandled::Continue);
+    }
+    if state.attached.is_some() {
+        if key.code == KeyCode::Esc {
+            state.detach();
+        } else if is_scroll_key(key) {
+            state.attached.as_mut().unwrap().state.handle_scroll(key);
+        } else {
+            let width = attached_input_width(terminal)?;
+            state.handle_attached_key(key, width);
+        }
+        return Ok(KeyHandled::Continue);
+    }
+    let active = matches!(
+        &*status.borrow(),
+        SessionStatus::Busy | SessionStatus::Compacting
+    );
+    if active && is_cancel(key) {
+        handle.cancel();
+        return Ok(KeyHandled::Continue);
+    }
+    if !active && is_exit(key) {
+        return Ok(KeyHandled::Exit);
+    }
+    if is_scroll_key(key) {
+        state.handle_scroll(key);
+        drain_ready_scroll_keys(events, state).await;
+        if state.older_pending {
+            state.load_older_history().await;
+        }
+        if state.newer_pending {
+            state.load_newer_history().await;
+        }
+    } else if let Some(prompt) = state.handle_key(key) {
+        if prompt == "/compact" {
+            handle.compact();
+        } else if let Some(command) = parse_rename(&prompt) {
+            handle_rename(command, state).await;
+        } else if let Some(command) = parse_btw(&prompt) {
+            handle_btw(command, state).await;
+        } else {
+            if !state.session_title_set {
+                set_terminal_title(&sanitize_title(&prompt));
+                state.session_title_set = true;
+            }
+            handle.prompt(prompt);
+        }
+    }
+    Ok(KeyHandled::Continue)
 }
 
 fn route_idle_events(

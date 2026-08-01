@@ -610,6 +610,53 @@ pub(crate) fn render_bounded_window(
     rows
 }
 
+/// Minimum interval between draw-driven tail reloads in the task-detail
+/// view. A task appending output on every frame would otherwise re-read
+/// and re-wrap the spool page per frame; 100 ms caps that at 10 reloads/s
+/// while the cached page keeps rendering in between. Explicit user
+/// actions (End, scroll-to-tail) call `load_tail` directly and bypass it.
+pub(crate) const TAIL_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Floor for the detail view's per-frame wrap budget: even a tiny
+/// terminal keeps at least this many bytes of wrapped tail above the
+/// viewport so follow mode has a few rows of scroll-back buffer.
+const DETAIL_WRAP_BUDGET_FLOOR: usize = 4 * 1024;
+
+/// Per-frame width-wrap budget for the task-detail view. Follow mode
+/// re-wraps the cached page on EVERY frame (not just on reload), so the
+/// wrap must not be able to chew through the whole 64 KiB page budget in
+/// one frame. The budget is the viewport's own cell count — never wrap
+/// more text than one screenful can display — with a 4 KiB floor.
+pub(crate) fn detail_wrap_budget(width: usize, height: usize) -> usize {
+    height
+        .saturating_mul(width.max(1))
+        .clamp(DETAIL_WRAP_BUDGET_FLOOR, MAX_RENDER_BYTES)
+}
+
+/// Keep only the tail of `lines` that fits `budget` bytes (UTF-8-safe),
+/// mirroring the byte walk in `local_window_lines`: whole lines where
+/// possible, a single over-budget line keeps its tail. Used by the detail
+/// view to bound per-frame wrap work. Follow mode shows the tail, so the
+/// head cut is invisible until the user scrolls up into it — and
+/// scrolling up past the kept tail hits the page boundary, which loads
+/// the previous spool page anyway.
+pub(crate) fn bound_wrap_bytes(lines: Vec<DisplayLine>, budget: usize) -> Vec<DisplayLine> {
+    let budget = budget.max(1);
+    let mut remaining = budget;
+    let mut kept = Vec::new();
+    for mut line in lines.into_iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let text = utf8_tail(&line.text, line.text.len(), remaining);
+        remaining = remaining.saturating_sub(text.len());
+        line.text = text.to_owned();
+        kept.push(line);
+    }
+    kept.reverse();
+    kept
+}
+
 /// Full-screen detail view for a background bash task: a bordered header
 /// (#id: label — status — N lines · X MiB (truncated) — key hints), a fixed
 /// banner with the FULL untruncated command (hard-wrapped, Dim), then the
@@ -654,9 +701,21 @@ pub(crate) fn render_task_detail(
     // Follow slides to the tail only when the spool has grown since the
     // last reload: opening shows the head page, a paused task keeps the
     // current page, and new output pulls the view to the live tail.
+    // Reloads are throttled to TAIL_RELOAD_INTERVAL: a task appending
+    // output every frame must not re-read and re-wrap the page on every
+    // frame. `last_seen_lines` is advanced only when a reload actually
+    // happens, so growth during a throttled frame survives to the next
+    // due frame instead of being silently dropped.
     if detail.window.follow_bottom && lines > detail.last_seen_lines {
-        detail.last_seen_lines = lines;
-        detail.load_tail(width, height);
+        let now = std::time::Instant::now();
+        let due = detail
+            .last_tail_reload
+            .is_none_or(|last| now.duration_since(last) >= TAIL_RELOAD_INTERVAL);
+        if due {
+            detail.last_tail_reload = Some(now);
+            detail.last_seen_lines = lines;
+            detail.load_tail(width, height);
+        }
     }
     // A terminal width change re-wraps the page; a scrolled-up
     // (non-follow) window's local_offset is stale, so re-anchor it at the
@@ -685,6 +744,19 @@ pub(crate) fn render_task_detail(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let local = local_window_lines(&detail.lines, &detail.window);
+    // Per-frame wrap budget: follow mode re-wraps the page every frame
+    // (even without a reload), so bound the wrap to the viewport's own
+    // cell count instead of the full 64 KiB page — a cargo build dumping
+    // a few thousand lines of long output per second is digested at a
+    // bounded cost per frame. A scrolled-up (frozen) page keeps the full
+    // local window so scroll offsets stay exact; that wrap is still
+    // bounded by MAX_RENDER_BYTES and is user-paced.
+    let wrap_budget = if detail.window.follow_bottom {
+        detail_wrap_budget(width, content_height)
+    } else {
+        MAX_RENDER_BYTES
+    };
+    let local = bound_wrap_bytes(local, wrap_budget);
     let visual = render_bounded_window(&local, width, false);
     let total_rows = visual.len();
     if detail.window.follow_bottom {

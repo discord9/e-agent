@@ -295,6 +295,13 @@ pub(crate) struct TaskDetail {
     /// resize so a scrolled-up (non-follow) page can be re-anchored at
     /// the new width. `0` means "no frame rendered yet".
     pub(crate) rendered_width: usize,
+    /// Timestamp of the last draw-driven tail reload. Follow-mode draw
+    /// reloads are throttled to [`TAIL_RELOAD_INTERVAL`] so a task that
+    /// appends output every frame does not pay for a full spool re-read
+    /// and re-wrap on every single frame; the cached page keeps rendering
+    /// in between. Explicit user actions (End, scroll-to-tail) call
+    /// `load_tail` directly and bypass the throttle.
+    pub(crate) last_tail_reload: Option<std::time::Instant>,
 }
 
 impl TaskDetail {
@@ -315,6 +322,7 @@ impl TaskDetail {
             window: ScrollWindow::new(),
             last_seen_lines: 0,
             rendered_width: 0,
+            last_tail_reload: None,
         }
     }
 
