@@ -85,11 +85,19 @@ fn registry_tracks_live_sessions() {
         cwd: "/tmp".into(),
         session_id: "sub-test".into(),
         context_window: None,
+        store: SessionStore::Jsonl,
     });
-    sessions.insert(1, entry);
+    sessions.insert(1, entry.clone());
     assert!(sessions.get(1).is_some());
     sessions.remove(1);
     assert!(sessions.get(1).is_none());
+    // `list` snapshots the entries (task_id, entry) pairs, including after
+    // re-insert: the web server's subagent-by-session-id lookup iterates it.
+    sessions.insert(2, entry);
+    let listed = sessions.list();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0, 2);
+    assert_eq!(listed[0].1.session_id, "sub-test");
 }
 
 fn delegate_with_url(workspace: &std::path::Path, base_url: String) -> Delegate {
@@ -203,6 +211,7 @@ fn probe_entry(handle: SessionHandle) -> Arc<SessionEntry> {
         cwd: "/tmp".into(),
         session_id: "sub-probe".into(),
         context_window: None,
+        store: SessionStore::Jsonl,
     })
 }
 

@@ -324,6 +324,40 @@ impl SessionRegistry {
     }
 }
 
+/// A session the web can address by id: either a live registry session or a
+/// live subagent session (delegate/btw) registered in some parent's
+/// [`Sessions`] registry. Subagents are keyed by background-task id there,
+/// not by session id, so they never land in the main registry — `live()`
+/// resolves both so every session endpoint (history/SSE/prompt/cancel/
+/// compact) works on a subagent exactly as it does on a main session.
+///
+/// Design choice (vs. wrapping a `SessionEntry` into an `Arc<LiveSession>`):
+/// the web-facing surface of a subagent is just its handle + session-bound
+/// store + display fields; `LiveSession` additionally carries a runner task,
+/// a `BackgroundTasks` registry and a `Sessions` registry that a subagent
+/// does not own, so padding it would be dead weight and would invite
+/// pretending a subagent has a background-task registry it does not have
+/// (task cancellation stays addressed to the *parent* session).
+pub enum SessionRef {
+    /// A session in the main `SessionRegistry` (key = session id).
+    Live(Arc<LiveSession>),
+    /// A subagent registered in a parent's `Sessions` registry
+    /// (key = background-task id, `entry.session_id` is the address).
+    Subagent(Arc<crate::delegate::SessionEntry>),
+}
+
+impl SessionRef {
+    /// The runner handle both variants carry. Prompt/cancel/compact/SSE
+    /// attach all go through it; history additionally needs the
+    /// session-bound store (`LiveSession.store` / `SessionEntry.store`).
+    fn handle(&self) -> SessionHandle {
+        match self {
+            SessionRef::Live(session) => session.handle.clone(),
+            SessionRef::Subagent(entry) => entry.handle.clone(),
+        }
+    }
+}
+
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // Wire DTOs
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -573,6 +607,19 @@ fn merge_session_metas(
     metas
 }
 
+/// Apply one subagent's running_tasks label lookup to its list entry: a
+/// surviving label means the delegate task that spawned it is still running
+/// (rows are consumed when the task completes), so the subagent is live and
+/// the entry must render in the live group. `None` = no live task, the
+/// entry stays inactive. Pure so the active rule is unit-testable without
+/// a Greptime backend.
+fn apply_subagent_label(meta: &mut SessionMeta, label: Option<String>) {
+    if label.is_some() {
+        meta.active = true;
+    }
+    meta.label = label;
+}
+
 async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMeta>> {
     let root = state.factory.root();
     let mut active: Vec<SessionMeta> = Vec::with_capacity(state.registry.list().len());
@@ -598,7 +645,18 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
     for meta in &mut merged {
         if meta.parent_session_id.is_some() {
             match state.meta_store.label_for_subagent(root, &meta.id).await {
-                Ok(label) => meta.label = label,
+                Ok(label) => {
+                    // A surviving running_tasks row means the delegate task
+                    // that spawned this subagent is still running (rows are
+                    // consumed when the task completes) — so the subagent
+                    // is live right now. Its id is not in the registry, so
+                    // the merge would otherwise leave it grey/inactive;
+                    // mark it active so the sidebar tree renders it in the
+                    // live group (status stays as-is: running_tasks cannot
+                    // tell Idle from Busy, and `active` alone is what the
+                    // live grouping keys off).
+                    apply_subagent_label(meta, label);
+                }
                 Err(error) => {
                     eprintln!("e-agent: cannot look up subagent label: {error:#}");
                 }
@@ -679,11 +737,26 @@ async fn build_session(
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
 }
 
-fn live(state: &AppState, id: &str) -> Result<Arc<LiveSession>, (StatusCode, String)> {
-    state
-        .registry
-        .get(id)
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, format!("session {id} not found")))
+/// Resolve a session id to something the web can attach to: the main
+/// registry first, then every live session's subagent registry (a subagent
+/// is addressable by its session id exactly like the TUI attaches to it).
+/// The scan is bounded in practice — a handful of live sessions, each with
+/// a handful of subagents — and only runs on a registry miss.
+fn live(state: &AppState, id: &str) -> Result<SessionRef, (StatusCode, String)> {
+    if let Some(session) = state.registry.get(id) {
+        return Ok(SessionRef::Live(session));
+    }
+    for (_, session) in state.registry.list() {
+        for (_task_id, entry) in session.sessions.list() {
+            if entry.session_id == id {
+                return Ok(SessionRef::Subagent(entry));
+            }
+        }
+    }
+    Err(error(
+        StatusCode::NOT_FOUND,
+        format!("session {id} not found"),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -703,14 +776,15 @@ async fn session_prompt(
         return Err(error(StatusCode::BAD_REQUEST, "prompt must not be empty"));
     }
     let session = live(&state, &id)?;
-    let status = session.handle.status();
+    let handle = session.handle();
+    let status = handle.status();
     if matches!(*status.borrow(), SessionStatus::Finished(_)) {
         return Err(error(
             StatusCode::CONFLICT,
             format!("session {id} has finished"),
         ));
     }
-    session.handle.prompt(body.prompt);
+    handle.prompt(body.prompt);
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -738,6 +812,15 @@ async fn session_btw(
         return Err(error(StatusCode::BAD_REQUEST, "prompt must not be empty"));
     }
     let session = live(&state, &id)?;
+    let SessionRef::Live(session) = session else {
+        // A subagent does not own a `BackgroundTasks`/`Sessions` registry to
+        // fork from (those belong to its parent); btw forking stays a
+        // main-session feature.
+        return Err(error(
+            StatusCode::CONFLICT,
+            format!("cannot fork subagent session {id}"),
+        ));
+    };
     let subagent_id = crate::delegate::spawn_btw_subagent(
         &id,
         &body.prompt,
@@ -774,7 +857,7 @@ async fn session_cancel(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let session = live(&state, &id)?;
-    session.handle.cancel();
+    session.handle().cancel();
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -783,7 +866,7 @@ async fn session_compact(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let session = live(&state, &id)?;
-    session.handle.compact();
+    session.handle().compact();
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -800,13 +883,14 @@ struct TitleBody {
 
 /// `PUT /api/sessions/{id}/title` — rename a session. Body
 /// `{"title": "..."}`; empty/whitespace clears the title (stored NULL),
-/// longer titles are truncated to [`TITLE_MAX_CHARS`]. Works for both
-/// live sessions (via their session-bound store — a built session always
-/// has a metadata row, `build` → `create_meta`) and historical sessions
-/// (via the workspace-scoped `meta_store`, so a rename survives the
-/// session leaving the registry). 404 when the id is neither live nor
-/// present in the metadata table. The JSONL backend has no meta table:
-/// renaming a live session is a silent no-op (title is Greptime-only).
+/// longer titles are truncated to [`TITLE_MAX_CHARS`]. Works for live
+/// sessions and live subagents (via their session-bound store — a built
+/// session always has a metadata row, `build` → `create_meta`) and
+/// historical sessions (via the workspace-scoped `meta_store`, so a rename
+/// survives the session leaving the registry). 404 when the id is neither
+/// live nor present in the metadata table. The JSONL backend has no meta
+/// table: renaming a live session is a silent no-op (title is
+/// Greptime-only).
 async fn session_title(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -819,9 +903,12 @@ async fn session_title(
         Some(trimmed.chars().take(TITLE_MAX_CHARS).collect::<String>())
     };
     let root = state.factory.root();
-    let store = match state.registry.get(&id) {
-        Some(session) => session.store.clone(),
-        None => {
+    let store = match live(&state, &id) {
+        Ok(SessionRef::Live(session)) => session.store.clone(),
+        // A live subagent's own store is bound to its session id, so the
+        // rename lands on the same rows the meta_store fallback would use.
+        Ok(SessionRef::Subagent(entry)) => entry.store.clone(),
+        Err(_) => {
             let historical = state
                 .meta_store
                 .list_meta(root)
@@ -851,21 +938,22 @@ struct PinBody {
 
 /// `PUT /api/sessions/{id}/pin` — pin or unpin a session. Body
 /// `{"pinned": true|false}`; one endpoint toggles both directions. Works
-/// for both live sessions (via their session-bound store — a built session
-/// always has a metadata row, `build` → `create_meta`) and historical
-/// sessions (via the workspace-scoped `meta_store`, so a pin survives the
-/// session leaving the registry). 404 when the id is neither live nor
-/// present in the metadata table. The JSONL backend has no meta table:
-/// pinning a live session is a silent no-op (pins are Greptime-only).
+/// for live sessions and live subagents (via their session-bound store —
+/// a built session always has a metadata row, `build` → `create_meta`) and
+/// historical sessions (via the workspace-scoped `meta_store`, so a pin
+/// survives the session leaving the registry). 404 when the id is neither
+/// live nor present in the metadata table. The JSONL backend has no meta
+/// table: pinning a live session is a silent no-op (pins are Greptime-only).
 async fn session_pin(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<PinBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let root = state.factory.root();
-    let store = match state.registry.get(&id) {
-        Some(session) => session.store.clone(),
-        None => {
+    let store = match live(&state, &id) {
+        Ok(SessionRef::Live(session)) => session.store.clone(),
+        Ok(SessionRef::Subagent(entry)) => entry.store.clone(),
+        Err(_) => {
             let historical = state
                 .meta_store
                 .list_meta(root)
@@ -894,10 +982,16 @@ async fn delete_session(
     // Live session: cancel + remove from the registry. Dropping the
     // registry entry (and with it the SessionTask) aborts the runner;
     // in-flight SSE streams notice the closed event/status channels and
-    // end themselves. Unknown/historical ids simply skip this step.
-    if let Some(session) = state.registry.get(&id) {
-        session.handle.cancel();
-        state.registry.remove(&id);
+    // end themselves. A live subagent is cancelled through its handle
+    // instead: its delegate/btw wrapper's cleanup then removes the
+    // `Sessions` entry and the running_tasks row (so it stops showing as
+    // active), and the transcript stays in its session file. Unknown or
+    // historical ids skip this step entirely.
+    if let Ok(session) = live(&state, &id) {
+        session.handle().cancel();
+        if matches!(session, SessionRef::Live(_)) {
+            state.registry.remove(&id);
+        }
     }
     // Hide from the sessions list: delete the session's metadata rows
     // (Greptime audit table; JSONL no-op). The transcript stays, so a
@@ -939,6 +1033,15 @@ async fn cancel_task(
     Path((id, task_id)): Path<(String, u64)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let session = live(&state, &id)?;
+    let SessionRef::Live(session) = session else {
+        // A subagent's background tasks live in its parent's registry and
+        // are addressed by the parent's session id; a subagent id has no
+        // task registry of its own.
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!("session {id} has no background task registry"),
+        ));
+    };
     match session.background.cancel(task_id) {
         Some(_) => Ok(StatusCode::NO_CONTENT),
         None => Err(error(
@@ -1002,17 +1105,23 @@ async fn session_history(
 ) -> Result<Json<HistoryResponse>, (StatusCode, String)> {
     let session = live(&state, &id)?;
     let root = state.factory.root();
+    // Both variants carry a session-bound store: the live registry session
+    // owns one, and a subagent's `SessionEntry` carries its own (connected
+    // at spawn time), so history reads the same rows the session itself
+    // persists to — no per-request store connect.
+    let store = match &session {
+        SessionRef::Live(session) => session.store.clone(),
+        SessionRef::Subagent(entry) => entry.store.clone(),
+    };
     let (entries, next_before_seq) = match params.before_seq {
         None => {
             // Head segment; the cursor is the seq of the compaction that
             // opens it (None = the whole session is one head segment).
-            let loaded = session
-                .store
+            let loaded = store
                 .load_head(root, &id)
                 .await
                 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-            let cursor = session
-                .store
+            let cursor = store
                 .head_seq(root, &id)
                 .await
                 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
@@ -1022,8 +1131,7 @@ async fn session_history(
             // Older entries: [prev_comp, before_seq), paged intra-segment
             // by `limit` when present (cursor = oldest seq of the page,
             // crossing into the older segment at a compaction boundary).
-            let (entries, cursor) = session
-                .store
+            let (entries, cursor) = store
                 .load_older(root, &id, before_seq, params.limit)
                 .await
                 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
@@ -1056,10 +1164,10 @@ async fn session_events(
     Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
     let session = live(&state, &id)?;
-    let (snapshot, live, status) = session.handle.attach();
+    let (snapshot, live, status) = session.handle().attach();
     let (tx, rx) = mpsc::channel::<Result<Event, Error>>(SSE_CHANNEL_CAPACITY);
     tokio::spawn(forward_events(
-        state.registry.clone(),
+        state,
         id,
         tail_snapshot(snapshot),
         live,
@@ -1086,10 +1194,10 @@ impl Stream for SseReceiver {
 }
 
 async fn forward_events(
-    registry: Arc<SessionRegistry>,
+    state: Arc<AppState>,
     id: String,
     snapshot: Vec<AgentEvent>,
-    mut live: broadcast::Receiver<AgentEvent>,
+    mut events: broadcast::Receiver<AgentEvent>,
     mut status: watch::Receiver<SessionStatus>,
     tx: mpsc::Sender<Result<Event, Error>>,
 ) {
@@ -1116,7 +1224,7 @@ async fn forward_events(
                 // Status sender dropped: the session was deleted. End the stream.
                 Err(_) => return,
             },
-            event = live.recv() => match event {
+            event = events.recv() => match event {
                 Ok(event) => {
                     if !send(live_event(&event)) {
                         return;
@@ -1128,16 +1236,20 @@ async fn forward_events(
                     // never skips it — it force-replaces the transcript). The
                     // resync carries the recent log tail (capped at
                     // SNAPSHOT_MAX; it only needs to cover the broadcast gap
-                    // with margin). A deleted session ends the stream.
-                    let Some(session) = registry.get(&id) else { return };
-                    let (snapshot, new_live, new_status) = session.handle.attach();
+                    // with margin). The session is re-resolved through the
+                    // unified lookup so a subagent stream resyncs exactly
+                    // like a registry stream; a deleted session (registry
+                    // entry or subagent `Sessions` entry gone) ends the
+                    // stream.
+                    let Ok(session) = live(&state, &id) else { return };
+                    let (snapshot, new_events, new_status) = session.handle().attach();
                     if !send(resync_event(&tail_snapshot(snapshot))) {
                         return;
                     }
                     if !send(status_event(&new_status.borrow().clone())) {
                         return;
                     }
-                    live = new_live;
+                    events = new_events;
                     status = new_status;
                 }
                 // Broadcast sender dropped: the session was deleted.
@@ -1945,6 +2057,86 @@ mod tests {
         assert_eq!(tui1.pinned, Some(true), "historical pin passes through");
     }
 
+    /// The active rule for subagent list entries: a surviving running_tasks
+    /// label means the delegate task is still running, so the subagent is
+    /// live and must render in the live group; `None` (task completed, row
+    /// consumed) keeps the entry inactive.
+    #[test]
+    fn subagent_label_marks_live_subagent_active() {
+        let dt = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let meta = |active: bool| SessionMeta {
+            id: "sub-1".into(),
+            model: "m".into(),
+            role: None,
+            created_at: dt(0),
+            last_active_at: dt(0),
+            status: "Idle".into(),
+            entry_count: 1,
+            busy: false,
+            active,
+            parent_session_id: Some("web-1".into()),
+            title: None,
+            pinned: None,
+            label: None,
+        };
+        let mut live = meta(false);
+        apply_subagent_label(&mut live, Some("delegate task".into()));
+        assert!(
+            live.active,
+            "a surviving running_tasks label means the subagent is live"
+        );
+        assert_eq!(live.label.as_deref(), Some("delegate task"));
+        let mut done = meta(false);
+        apply_subagent_label(&mut done, None);
+        assert!(
+            !done.active,
+            "no live delegate task keeps the subagent inactive"
+        );
+        assert_eq!(done.label, None);
+    }
+
+    /// The web addresses a subagent by session id exactly like the TUI:
+    /// `live()` falls back from the main registry to every live session's
+    /// `Sessions` registry, so history/SSE/prompt/cancel work on a
+    /// subagent without it ever being in the registry.
+    #[tokio::test]
+    async fn live_falls_back_to_parent_subagent_registry() {
+        let state = test_app_state("sekrit");
+        let (parent_id, parent) = live_session("web-parent");
+        let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+        let entry = Arc::new(crate::delegate::SessionEntry {
+            handle,
+            model: "sub-model".into(),
+            role: None,
+            cwd: "/tmp".into(),
+            session_id: "sub-abc".into(),
+            context_window: None,
+            store: SessionStore::Jsonl,
+        });
+        parent.sessions.insert(7, entry);
+        state.registry.insert(parent_id, parent.clone());
+
+        // Registry ids still resolve as Live.
+        assert!(matches!(
+            live(&state, "web-parent").unwrap(),
+            SessionRef::Live(_)
+        ));
+        // Subagent ids resolve through the parent's Sessions registry.
+        match live(&state, "sub-abc").unwrap() {
+            SessionRef::Subagent(entry) => {
+                assert_eq!(entry.session_id, "sub-abc");
+                assert_eq!(entry.model, "sub-model");
+            }
+            _ => panic!("expected a Subagent ref, got a registry session"),
+        }
+        // Unknown ids still 404.
+        assert!(live(&state, "ghost").is_err());
+        // A subagent whose delegate task finished (Sessions entry removed)
+        // is no longer resolvable live.
+        parent.sessions.remove(7);
+        assert!(live(&state, "sub-abc").is_err());
+    }
+
     /// Delete is idempotent for unknown/historical ids: it removes the
     /// registry entry when present and hides the metadata rows (no-op on
     /// the Jsonl test store), returning 204 either way.
@@ -2235,8 +2427,8 @@ mod tests {
         let (handle, emitter, _commands) = crate::runner::session_test_channel();
         let id = "web-lag".to_owned();
         let session = live_session_with_handle(handle.clone());
-        let registry = Arc::new(SessionRegistry::default());
-        registry.insert(id.clone(), session.clone());
+        let state = test_app_state("sekrit");
+        state.registry.insert(id.clone(), session.clone());
 
         // Subscribe, then overflow the broadcast buffer (capacity 256) while
         // the receiver idles so its next recv reports Lagged.
@@ -2248,7 +2440,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<Result<Event, Error>>(16);
         let task = tokio::spawn(forward_events(
-            registry.clone(),
+            state.clone(),
             id.clone(),
             tail_snapshot(snapshot),
             live,
@@ -2279,7 +2471,7 @@ mod tests {
 
         // Drop every sender: the loop sees the closed channels and exits.
         drop(rx);
-        registry.remove(&id);
+        state.registry.remove(&id);
         drop(session);
         drop(handle);
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
@@ -2295,8 +2487,8 @@ mod tests {
     async fn forward_events_disconnects_when_queue_is_full() {
         let (handle, _emitter, _commands) = crate::runner::session_test_channel();
         let (id, session) = live_session("web-full");
-        let registry = Arc::new(SessionRegistry::default());
-        registry.insert(id.clone(), session.clone());
+        let state = test_app_state("sekrit");
+        state.registry.insert(id.clone(), session.clone());
         let (snapshot, live, status) = handle.attach();
 
         // Capacity 1, already occupied: the very first try_send fails and
@@ -2304,7 +2496,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Result<Event, Error>>(1);
         let _ = tx.try_send(Ok(Event::default().comment("prefill")));
         let task = tokio::spawn(forward_events(
-            registry,
+            state,
             id,
             tail_snapshot(snapshot),
             live,
