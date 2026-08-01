@@ -46,13 +46,22 @@ async function pollTasks() {
 function renderComposerTasks() {
   const bar = els.tasksToggleBar;
   if (!bar) return;
+  const panel = els.composerTasks;
   const n = (state.tasks.list || []).length;
   bar.hidden = n === 0;
   bar.classList.toggle("active", n > 0);
+  // 任务清空时整个组件（折叠条+面板）完全消失：强制收起面板，避免
+  // 出现「暂无运行中任务」的空态壳；同时清理所有卡片轮询/流，并清空
+  // 面板内容（面板隐藏后不再走 renderTaskList 的重绘清理路径）
+  if (n === 0) {
+    state.tasks.composerOpen = false;
+    for (const k of [...state.tasks.pollers.keys()]) stopTaskPoller(k);
+    for (const k of [...state.tasks.streams.keys()]) stopTaskStream(k);
+    if (panel) panel.innerHTML = "";
+  }
   bar.classList.toggle("open", state.tasks.composerOpen);
   const label = bar.querySelector(".tasks-toggle-label");
   if (label) label.textContent = "运行中任务 (" + n + ")";
-  const panel = els.composerTasks;
   if (panel) {
     panel.hidden = !state.tasks.composerOpen;
     if (state.tasks.composerOpen) {
@@ -299,8 +308,7 @@ function renderTaskList(tasks, container) {
   }
   list.innerHTML = "";
   if (!tasks.length) {
-    list.appendChild(el("div", "tasks-empty", "暂无运行中的任务"));
-    return;
+    return;   // 组件已由 renderComposerTasks 在 n===0 时整体隐藏，不再渲染空态
   }
   for (const t of tasks) {
     const row = el("div", "task-row");

@@ -568,6 +568,13 @@ async function main(){
     chk("empty tasks clears panel",
         elsById["composerTasks"].querySelectorAll(".task-row").length === 0,
         "n=" + elsById["composerTasks"].querySelectorAll(".task-row").length);
+    chk("empty tasks hides whole widget",
+        elsById["tasksToggleBar"].hidden === true
+        && elsById["composerTasks"].hidden === true
+        && state.tasks.composerOpen === false,
+        "bar.hidden=" + elsById["tasksToggleBar"].hidden
+        + " panel.hidden=" + elsById["composerTasks"].hidden
+        + " open=" + state.tasks.composerOpen);
     chk("ended pollers stopped",
         !state.tasks.pollers.has("s1:7") && !state.tasks.pollers.has("s1:8"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
@@ -576,6 +583,10 @@ async function main(){
       full_command: "cargo run", output: "building", role: null }];
     await pollTasks();
     await flush();
+    // 新任务出现后组件重新显示，但面板默认收起（清空时被强制收起）：
+    // 展开面板使任务行渲染出来
+    state.tasks.composerOpen = true;
+    renderComposerTasks();
     trows = elsById["composerTasks"].querySelectorAll(".task-row");
     trows[0]._listeners["click"][0]();
     chk("card poller before switch", state.tasks.pollers.has("s1:9"),
