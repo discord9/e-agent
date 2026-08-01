@@ -327,7 +327,10 @@ impl Config {
         }
     }
 
-    fn resolve_profile(&self, profile: &str) -> anyhow::Result<ResolvedModel> {
+    /// Resolve a single named profile (`provider/model`) to its wire
+    /// settings. Public so runtime model switches (web/TUI `/model`) reuse
+    /// the exact same resolution the startup path uses.
+    pub fn resolve_profile(&self, profile: &str) -> anyhow::Result<ResolvedModel> {
         let provider_name = profile
             .split_once('/')
             .map(|(provider, _)| provider)

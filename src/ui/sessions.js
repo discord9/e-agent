@@ -433,6 +433,7 @@ function backToList() {
  * ===================================================================*/
 const SLASH_COMMANDS = [
   { name: "/compact", desc: "压缩上下文（释放 token）", args: "" },
+  { name: "/model", desc: "切换当前会话模型", args: "<profile>" },
   { name: "/rename", desc: "重命名当前会话", args: "<标题>" },
   { name: "/btw", desc: "fork 旁路 subagent 继续探讨", args: "<问题>" },
   { name: "/fork", desc: "从历史消息 fork 出新会话", args: "" },
@@ -680,6 +681,39 @@ async function sendPrompt() {
   if (raw === "/rename") {
     setBanner("用法：/rename <标题>（留空可清除）");
     return;   // 保留输入框，方便直接补参数
+  }
+  if (raw === "/model") {
+    setBanner("用法：/model <profile>（如 /model chatgpt/sol）；切换后当前会话继续用新模型");
+    return;   // 保留输入框，方便直接补参数
+  }
+  if (raw.startsWith("/model ")) {
+    const profile = raw.slice("/model ".length).trim();
+    if (!profile) {
+      setBanner("用法：/model <profile>（如 /model chatgpt/sol）");
+      return;
+    }
+    try {
+      const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId) + "/model",
+        { method: "POST", body: JSON.stringify({ profile }) });
+      if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。", true); return; }
+      if (res.status === 404 || res.status === 405) { setBanner("⚠ 服务器不支持 /model", true); return; }
+      if (!res.ok) {
+        // 400：profile 不存在/解析失败（server 返回纯文本错误）
+        const text = await res.text().catch(() => "");
+        setBanner("⚠ " + (text || ("HTTP " + res.status)), true);
+        return;   // 保留输入框，方便改 profile
+      }
+      const data = await res.json();
+      const model = data && data.model ? data.model : profile;
+      // 成功：清空输入框，刷新列表让侧边栏/输入框元信息显示新模型
+      els.promptInput.value = "";
+      autosizeInput();
+      setBanner("已切换到 " + model);
+      refreshSessionsForSidebar();
+    } catch (e) {
+      setBanner("⚠ 切换模型失败：" + e.message, true);
+    }
+    return;
   }
   if (raw.startsWith("/rename ")) {
     const title = raw.slice("/rename ".length).trim();

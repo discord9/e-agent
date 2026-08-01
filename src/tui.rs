@@ -277,6 +277,7 @@ pub async fn run(
     session_backend: crate::config::SessionBackend,
     read_only: bool,
     record_in: Option<crate::session_store::BackgroundRecord>,
+    factory: std::sync::Arc<crate::session_factory::SessionFactory>,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard::new();
@@ -305,6 +306,7 @@ pub async fn run(
         session_backend,
         read_only,
         record_in,
+        factory,
     )
     .await;
     drop(terminal);
@@ -367,6 +369,7 @@ async fn run_inner(
     backend: crate::config::SessionBackend,
     read_only: bool,
     record_in: Option<crate::session_store::BackgroundRecord>,
+    factory: std::sync::Arc<crate::session_factory::SessionFactory>,
 ) -> anyhow::Result<Option<String>> {
     let (sender, mut inbox) = mpsc::unbounded_channel::<UiEvent>();
     let (snapshot, mut live, mut status) = handle.attach();
@@ -401,6 +404,7 @@ async fn run_inner(
     state.read_only = read_only;
     state.record_in = record_in;
     state.sessions = Some(sessions.clone());
+    state.factory = Some(factory);
     set_terminal_title(&labels.session);
     let probe = sessions.clone();
     state.attachable = Some(Box::new(move |id| probe.get(id).is_some()));
@@ -604,6 +608,8 @@ async fn handle_pressed_key(
             handle_undo(state);
         } else if prompt == "/help" {
             state.push_agent_event(AgentEvent::Notice(HELP_TEXT.to_string()));
+        } else if let Some(command) = parse_model(&prompt) {
+            handle_model(command, state, handle);
         } else if let Some(command) = parse_rename(&prompt) {
             handle_rename(command, state).await;
         } else if let Some(command) = parse_btw(&prompt) {
@@ -715,6 +721,69 @@ async fn handle_rename(command: RenameCommand, state: &mut TuiState) {
                 }
                 Err(error) => {
                     state.push_agent_event(AgentEvent::Notice(format!("重命名失败：{error:#}")))
+                }
+            }
+        }
+    }
+}
+
+/// A parsed `/model` command from the input line.
+#[derive(Debug, PartialEq, Eq)]
+enum ModelCommand {
+    /// Bare `/model` — show the current model and usage.
+    Usage,
+    /// `/model <profile>` — switch the session's model at runtime.
+    Switch(String),
+}
+
+/// Parse a `/model` command. Returns `None` for any other input so the
+/// caller falls through to the normal prompt path. Command matching is
+/// strict (`/model` plus a space separator): `/modelxxx` stays a prompt.
+fn parse_model(prompt: &str) -> Option<ModelCommand> {
+    if prompt == "/model" {
+        return Some(ModelCommand::Usage);
+    }
+    let rest = prompt.strip_prefix("/model ")?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        Some(ModelCommand::Usage)
+    } else {
+        Some(ModelCommand::Switch(rest.to_string()))
+    }
+}
+
+/// Run a `/model` command: resolve the profile through the session factory
+/// (the same config + `--base-url`/`--model` overrides the process started
+/// with) and switch the session's model at runtime. The runner installs the
+/// new model on its agent; the display name is mirrored into the input
+/// border immediately. Success and failure are both surfaced as a Notice.
+fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHandle) {
+    match command {
+        ModelCommand::Usage => {
+            let current = state.model_name.clone();
+            state.push_agent_event(AgentEvent::Notice(format!(
+                "当前模型：{current}。用法：/model <profile>（如 /model deepseek/flash）"
+            )));
+        }
+        ModelCommand::Switch(profile) => {
+            let Some(factory) = state.factory.clone() else {
+                state.push_agent_event(AgentEvent::Notice(
+                    "无法解析模型：进程没有配置（无 config.toml）".to_string(),
+                ));
+                return;
+            };
+            match factory.resolve_profile(&profile) {
+                Ok(configured) => {
+                    let name = configured.display_name().to_owned();
+                    state.model_name = name.clone();
+                    state.model = Some(configured.clone());
+                    handle.switch_model(Box::new(configured));
+                    state.push_agent_event(AgentEvent::Notice(format!("已切换到 {name}")));
+                }
+                Err(error) => {
+                    state.push_agent_event(AgentEvent::Notice(format!(
+                        "未知模型 profile：{error:#}"
+                    )));
                 }
             }
         }
@@ -1020,5 +1089,30 @@ mod fork_tests {
         assert_eq!(parse_fork("/btw x"), None);
         assert_eq!(parse_fork("/rename x"), None);
         assert_eq!(parse_fork("hello"), None);
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::{ModelCommand, parse_model};
+
+    #[test]
+    fn parse_model_commands() {
+        assert_eq!(parse_model("/model"), Some(ModelCommand::Usage));
+        assert_eq!(parse_model("/model "), Some(ModelCommand::Usage));
+        assert_eq!(parse_model("/model   "), Some(ModelCommand::Usage));
+        assert_eq!(
+            parse_model("/model chatgpt/sol"),
+            Some(ModelCommand::Switch("chatgpt/sol".to_string()))
+        );
+        assert_eq!(
+            parse_model("/model   deepseek/flash  "),
+            Some(ModelCommand::Switch("deepseek/flash".to_string()))
+        );
+        // Non-model input falls through to the normal prompt path.
+        assert_eq!(parse_model("/modelxxx"), None);
+        assert_eq!(parse_model("/modelx gpt"), None);
+        assert_eq!(parse_model("/compact"), None);
+        assert_eq!(parse_model("hello"), None);
     }
 }

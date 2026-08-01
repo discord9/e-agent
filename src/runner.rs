@@ -2,7 +2,7 @@
 
 use crate::{
     agent::{
-        Agent, AgentEvent, CompactionOutput, ImagePart, Message, RoundOutput, SessionEntry,
+        Agent, AgentEvent, CompactionOutput, ImagePart, Message, Model, RoundOutput, SessionEntry,
         ToolCall, ToolSpec,
     },
     session_store::SessionStore,
@@ -81,7 +81,9 @@ where
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Steering commands accepted by a session's command channel. Not
+/// `Clone`/`Debug`/`PartialEq`/`Eq` because `SwitchModel` carries a
+/// `Box<dyn Model>`; tests compare via `matches!` instead.
 pub enum SessionCommand {
     Prompt(String),
     /// A prompt with an image attached (REPL `/image <path>` entrance).
@@ -91,6 +93,10 @@ pub enum SessionCommand {
     },
     Cancel,
     Compact,
+    /// Runtime model switch (web/TUI `/model <profile>`): the caller
+    /// resolves the profile to a concrete model and hands it over; the
+    /// runner only installs it on the agent.
+    SwitchModel(Box<dyn Model>),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IdlePolicy {
@@ -197,6 +203,21 @@ impl SessionHandle {
         if shared.commands_open
             && !self.commands.is_closed()
             && self.commands.send(SessionCommand::Compact).is_err()
+        {
+            shared.commands_open = false;
+        }
+    }
+    /// Switch the session's model at runtime. The caller resolves the
+    /// profile (web `/model`, TUI `/model`); the runner installs the new
+    /// model on the agent from its next call on.
+    pub fn switch_model(&self, model: Box<dyn Model>) {
+        let mut shared = self.shared.lock().unwrap();
+        if shared.commands_open
+            && !self.commands.is_closed()
+            && self
+                .commands
+                .send(SessionCommand::SwitchModel(model))
+                .is_err()
         {
             shared.commands_open = false;
         }
@@ -548,6 +569,12 @@ impl SessionRunner {
             }
             SessionCommand::Compact => {
                 self.pending.push_back(PendingCommand::Compact);
+                false
+            }
+            SessionCommand::SwitchModel(model) => {
+                // Instant, not queued: the new model applies to the next
+                // model call (a call already in flight keeps its model).
+                self.agent.set_model(model);
                 false
             }
             SessionCommand::Cancel => {

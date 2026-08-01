@@ -66,6 +66,16 @@ pub struct SessionFactory {
     subagent_context_window: Option<u64>,
     role_models: HashMap<String, ConfiguredModel>,
     role_context_windows: HashMap<String, Option<u64>>,
+    /// ChatGPT auth resolved at startup; runtime `/model` switches reuse it
+    /// so `chatgpt` profiles keep working after startup.
+    auth: Option<CodexAuth>,
+    /// `--base-url` override, honored by runtime `/model` switches exactly
+    /// like it is for the main model at startup.
+    base_url: Option<String>,
+    /// `--model` override, honored by runtime `/model` switches exactly like
+    /// it is for the main model at startup (the wire model replaces the
+    /// profile's).
+    model: Option<String>,
     /// Already-resolved bwrap policy (`None` = sandbox disabled).
     sandbox: Option<Sandbox>,
     read_only: bool,
@@ -167,6 +177,10 @@ impl SessionFactory {
                 .values()
                 .any(|value| value.auth == AuthMode::ChatGpt);
         let auth = needs_chatgpt.then(CodexAuth::load).transpose()?;
+        // The startup overrides are consumed by `configured_model` below;
+        // keep clones so runtime `/model` switches honor the same flags.
+        let base_url_override = base_url.clone();
+        let model_override_flag = model.clone();
         let main_model = match main_resolved {
             Some(configured) => configured_model(configured, auth.as_ref(), base_url, model)?,
             None => {
@@ -220,6 +234,9 @@ impl SessionFactory {
             subagent_context_window,
             role_models,
             role_context_windows,
+            auth,
+            base_url: base_url_override,
+            model: model_override_flag,
             sandbox,
             read_only,
             agents_instructions,
@@ -248,6 +265,26 @@ impl SessionFactory {
     /// session's own model, so the server passes this through.
     pub fn main_model(&self) -> &ConfiguredModel {
         &self.main_model
+    }
+
+    /// Resolve a config profile (`provider/model`) to a configured model at
+    /// runtime, for the web/TUI `/model <profile>` switch. Honors the same
+    /// `--base-url`/`--model` overrides the main model was built with. Errors
+    /// when there is no config or the profile is unknown — the caller turns
+    /// that into a 400. Note: a runtime switch does not touch the agent's
+    /// context window (that stays the startup `main_context_window`).
+    pub fn resolve_profile(&self, profile: &str) -> anyhow::Result<ConfiguredModel> {
+        let config = self
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow!("no config file; cannot resolve model profile `{profile}`"))?;
+        let resolved = config.resolve_profile(profile)?;
+        configured_model(
+            resolved,
+            self.auth.as_ref(),
+            self.base_url.clone(),
+            self.model.clone(),
+        )
     }
 
     /// The summarizer model for cheap per-turn session summaries (desktop
@@ -504,6 +541,14 @@ impl SessionFactory {
     /// paths short-circuit before any store I/O), never `build()`.
     #[cfg(test)]
     pub(crate) fn test_factory(root: PathBuf) -> Self {
+        Self::test_factory_with_config(root, None)
+    }
+
+    /// Test-only factory carrying a config, so runtime `/model` endpoint
+    /// tests can exercise real profile resolution (`resolve_profile`)
+    /// without touching the user's global config.
+    #[cfg(test)]
+    pub(crate) fn test_factory_with_config(root: PathBuf, config: Option<Config>) -> Self {
         let workspace = Workspace::new(root.clone()).expect("temp workspace");
         let main_model = ConfiguredModel::chat(
             OpenAiModel::new(
@@ -517,7 +562,7 @@ impl SessionFactory {
         Self {
             workspace,
             root,
-            config: None,
+            config,
             backend: crate::config::SessionBackend::Jsonl,
             main_model,
             main_context_window: None,
@@ -525,6 +570,9 @@ impl SessionFactory {
             subagent_context_window: None,
             role_models: HashMap::new(),
             role_context_windows: HashMap::new(),
+            auth: None,
+            base_url: None,
+            model: None,
             sandbox: None,
             read_only: false,
             agents_instructions: None,

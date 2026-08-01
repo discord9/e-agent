@@ -1030,17 +1030,15 @@ fn attached_enter_steers_and_ctrl_c_cancels_through_the_handle() {
         attached.input.insert("please also check tests");
     }
     state.handle_attached_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), 80);
-    assert_eq!(
+    assert!(matches!(
         source.try_recv().ok(),
-        Some(crate::runner::SessionCommand::Prompt(
-            "please also check tests".into()
-        ))
-    );
+        Some(crate::runner::SessionCommand::Prompt(ref text)) if text == "please also check tests"
+    ));
     state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
-    assert_eq!(
+    assert!(matches!(
         source.try_recv().ok(),
         Some(crate::runner::SessionCommand::Cancel)
-    );
+    ));
     // Finished sessions no longer accept steering.
     state.push_event(UiEvent {
         session: 0,
@@ -1051,7 +1049,7 @@ fn attached_enter_steers_and_ctrl_c_cancels_through_the_handle() {
         },
     });
     state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
-    assert_eq!(source.try_recv().ok(), None);
+    assert!(source.try_recv().ok().is_none());
 }
 
 #[test]
@@ -1075,7 +1073,7 @@ fn attached_enter_on_finished_keeps_input_and_sends_nothing() {
         attached.input.insert("still typing");
     }
     state.handle_attached_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), 80);
-    assert_eq!(source.try_recv().ok(), None, "no command may be sent");
+    assert!(source.try_recv().ok().is_none(), "no command may be sent");
     let attached = state.attached.as_mut().unwrap();
     assert_eq!(
         attached.input.text, "still typing",
@@ -1134,17 +1132,16 @@ fn attached_ctrl_c_clears_input_when_nonempty() {
         attached.input.insert("half-typed");
     }
     state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
-    assert_eq!(
-        source.try_recv().ok(),
-        None,
+    assert!(
+        source.try_recv().ok().is_none(),
         "no cancel while the input is non-empty"
     );
     assert_eq!(state.attached.as_ref().unwrap().input.text, "");
     state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
-    assert_eq!(
+    assert!(matches!(
         source.try_recv().ok(),
         Some(crate::runner::SessionCommand::Cancel)
-    );
+    ));
 }
 
 #[test]

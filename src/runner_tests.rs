@@ -89,6 +89,33 @@ struct ScriptedAssistantModel {
     replies: VecDeque<AssistantMessage>,
 }
 
+/// Mock model that records its own name on every call, so a test can prove
+/// which model served which turn (runtime `/model` switch).
+struct NamedRecordingModel {
+    name: String,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Model for NamedRecordingModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls.lock().unwrap().push(self.name.clone());
+        Ok((
+            AssistantMessage {
+                content: Some(format!("from {}", self.name)),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            },
+            None,
+        ))
+    }
+}
+
 #[async_trait]
 impl Model for ScriptedAssistantModel {
     async fn complete(
@@ -508,6 +535,61 @@ async fn empty_manual_compaction_returns_idle_and_accepts_a_prompt() {
             .snapshot()
             .iter()
             .any(|event| matches!(event, AgentEvent::UserPrompt(text) if text == "still alive"))
+    );
+    drop(handle);
+    drop(task);
+}
+
+#[tokio::test]
+async fn switch_model_applies_to_the_next_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (runner, handle) = SessionRunner::new(
+        Agent::new(
+            Box::new(NamedRecordingModel {
+                name: "model-a".into(),
+                calls: calls.clone(),
+            }),
+            // Keep the background channel open so the runner stays Idle
+            // between turns (see `controlled`).
+            vec![Box::new(KeepAliveTool { sender: None })],
+        ),
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "switch-model".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("first".into()));
+    // Turn 1 runs on the startup model.
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::AssistantText(text) if text == "from model-a"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    // Runtime switch, then turn 2 must run on the new model.
+    handle.switch_model(Box::new(NamedRecordingModel {
+        name: "model-b".into(),
+        calls: calls.clone(),
+    }));
+    handle.prompt("second");
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::AssistantText(text) if text == "from model-b"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec!["model-a".to_string(), "model-b".to_string()]
     );
     drop(handle);
     drop(task);

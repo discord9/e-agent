@@ -284,6 +284,7 @@ globalThis.fetch=(url,opts={})=>{
   if(url==="/api/sessions/fork-1/events") return resp(200, stream());
   if(url==="/api/sessions/s1/fork-candidates") return resp(200, forkCandidatesData);
   if(url==="/api/sessions/s1/fork"&&m==="POST") return forkPostResp;
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/model")&&m==="POST") return resp(200,{ok:true,model:"sol"});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/compact")) return resp(202,{});
@@ -373,7 +374,7 @@ async function main(){
     pin.selectionStart = pin.selectionEnd = 1;
     inp();
     chk("slash menu opens on /", slashMenu.open === true && sm.hidden === false
-        && sm.querySelectorAll(".slash-item").length === 6,
+        && sm.querySelectorAll(".slash-item").length === 7,
         "open=" + slashMenu.open + " items=" + sm.querySelectorAll(".slash-item").length);
     chk("slash first item selected", slashMenu.selected === 0
         && sm.querySelectorAll(".slash-item")[0].classList.contains("selected"));
@@ -393,11 +394,12 @@ async function main(){
     chk("slash arrow down moves selection", slashMenu.selected === 1,
         "sel=" + slashMenu.selected);
     kd("ArrowUp"); kd("ArrowUp");
-    chk("slash arrow up wraps", slashMenu.selected === 5, "sel=" + slashMenu.selected);
+    chk("slash arrow up wraps", slashMenu.selected === 6, "sel=" + slashMenu.selected);
     kd("ArrowDown");
     chk("slash arrow down wraps to 0", slashMenu.selected === 0, "sel=" + slashMenu.selected);
     // Enter 填入带参数命令：/rename <标题>，光标在参数位（占位被选中，输入即覆盖）
-    kd("ArrowDown");   // 选中 /rename
+    kd("ArrowDown");   // -> /model
+    kd("ArrowDown");   // -> /rename
     kd("Enter");
     chk("slash enter fills command", pin.value === "/rename <标题>"
         && slashMenu.open === false && sm.hidden === true,
@@ -558,6 +560,24 @@ async function main(){
     chk("fork back to s1 restores paging", state.sessionId === "s1"
         && state.nextBeforeSeq === 100 && state.olderDone === false,
         "sid=" + state.sessionId + " next=" + state.nextBeforeSeq);
+
+    // ---- /model：运行时切换当前会话模型 ----
+    pin.value = "/model";
+    await sendPrompt();
+    await flush();
+    chk("/model usage banner", elsById["bannerText"].textContent.includes("/model <profile>"),
+        "banner=" + elsById["bannerText"].textContent);
+    // 输入框保留（方便补参数）
+    chk("/model keeps input", pin.value === "/model",
+        "value=" + JSON.stringify(pin.value));
+    pin.value = "/model chatgpt/sol";
+    await sendPrompt();
+    await flush();
+    chk("/model posts to endpoint", pin.value === ""
+        && FETCHES.some(u => u.endsWith("/model")),
+        "cleared=" + (pin.value === ""));
+    chk("/model success banner", elsById["bannerText"].textContent.includes("已切换到 sol"),
+        "banner=" + elsById["bannerText"].textContent);
 
     // 断线重连：销毁当前流后应重新走 history+SSE
     const oldInit = state.initSource;

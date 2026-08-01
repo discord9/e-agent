@@ -280,6 +280,9 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             session: built.session.clone(),
             store: built.store.clone(),
         });
+        // `/model <profile>` resolves profiles at runtime through the same
+        // factory; shadow the factory with an Arc so the TUI can hold it.
+        let factory = std::sync::Arc::new(factory);
         let result = tui::run(
             built.handle,
             task,
@@ -297,6 +300,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             factory.backend().clone(),
             read_only,
             record_in,
+            factory.clone(),
         )
         .await;
         _tui_report.success = result.is_ok();

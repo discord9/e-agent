@@ -17,6 +17,7 @@
 //! | POST   | `/api/sessions/{id}/fork`          | fork at a turn boundary into a `fork-…` session |
 //! | POST   | `/api/sessions/{id}/cancel`       | cancel the in-flight turn          |
 //! | POST   | `/api/sessions/{id}/compact`      | request compaction                 |
+//! | POST   | `/api/sessions/{id}/model`         | switch the session's model at runtime |
 //! | POST   | `/api/sessions/{id}/undo`         | undo the most recent file operation |
 //! | PUT    | `/api/sessions/{id}/title`        | rename a session (Greptime only)   |
 //! | DELETE | `/api/sessions/{id}`              | cancel + remove from the registry  |
@@ -182,6 +183,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/fork", post(session_fork))
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/compact", post(session_compact))
+        .route("/api/sessions/{id}/model", post(session_model))
         .route("/api/sessions/{id}/undo", post(session_undo))
         .route("/api/sessions/{id}/title", put(session_title))
         .route("/api/sessions/{id}/pin", put(session_pin))
@@ -315,9 +317,21 @@ pub struct LiveSession {
     pub background: BackgroundTasks,
     /// Live subagent session registry (background delegates).
     pub sessions: Sessions,
-    pub model_name: String,
+    /// Display model name; mutable so a runtime `/model` switch is
+    /// reflected in `GET /api/sessions` without rebuilding the session.
+    model_name: Mutex<String>,
     pub role_name: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl LiveSession {
+    pub fn model_name(&self) -> String {
+        self.model_name.lock().unwrap().clone()
+    }
+
+    pub fn set_model_name(&self, name: String) {
+        *self.model_name.lock().unwrap() = name;
+    }
 }
 
 /// Active-session registry, keyed by session id. Observers are not tracked
@@ -471,7 +485,7 @@ async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -
         .unwrap_or(0);
     SessionMeta {
         id: id.to_owned(),
-        model: session.model_name.clone(),
+        model: session.model_name(),
         role: session.role_name.clone(),
         created_at: session.created_at,
         // Registry sessions are live right now, so "last active" is the
@@ -742,7 +756,7 @@ async fn create_session(
         store: built.store,
         background: built.background,
         sessions: built.sessions,
-        model_name: built.model_name,
+        model_name: Mutex::new(built.model_name),
         role_name: built.role_name,
         created_at: chrono::Utc::now(),
     });
@@ -911,6 +925,49 @@ async fn session_compact(
     let session = live(&state, &id)?;
     session.handle().compact();
     Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Deserialize)]
+struct ModelBody {
+    profile: String,
+}
+
+/// `POST /api/sessions/{id}/model` — switch the session's model at runtime
+/// (web `/model <profile>`). Body `{"profile": "provider/model"}`; the
+/// profile is resolved against the same config the factory was built with
+/// (honoring `--base-url`/`--model` overrides), then installed on the live
+/// runner's agent — the session keeps its history and continues with the
+/// new model. 200 + `{"ok": true, "model": "<display name>"}` on success;
+/// 400 for an unknown profile / no config; 404 for an unknown session.
+async fn session_model(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ModelBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session = live(&state, &id)?;
+    let profile = body.profile.trim();
+    if profile.is_empty() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "model profile must be provider/model (e.g. chatgpt/sol)",
+        ));
+    }
+    let configured = state.factory.resolve_profile(profile).map_err(|e| {
+        error(
+            StatusCode::BAD_REQUEST,
+            format!("unknown model profile `{profile}`: {e:#}"),
+        )
+    })?;
+    let name = configured.display_name().to_owned();
+    session.handle().switch_model(Box::new(configured));
+    // Mirror the new model into the registry metadata so `GET /api/sessions`
+    // (sidebar / composer meta) reflects the switch immediately. Subagent
+    // sessions keep their spawn-time display name (the delegate entry is
+    // immutable); the switch itself still applies to their runner.
+    if let SessionRef::Live(session) = &session {
+        session.set_model_name(name.clone());
+    }
+    Ok(Json(serde_json::json!({ "ok": true, "model": name })))
 }
 
 /// `POST /api/sessions/{id}/undo` — undo the most recent file operation
@@ -1417,7 +1474,7 @@ async fn session_fork(
         store: built.store,
         background: built.background,
         sessions: built.sessions,
-        model_name: built.model_name,
+        model_name: Mutex::new(built.model_name),
         role_name: built.role_name,
         created_at: chrono::Utc::now(),
     });
@@ -2454,6 +2511,106 @@ mod tests {
         assert_eq!(ghost.status(), StatusCode::NOT_FOUND, "unknown session");
     }
 
+    /// `POST /api/sessions/{id}/model` — 200 + updated registry metadata for
+    /// a valid profile (the live runner gets the switch via its handle; the
+    /// registry display name is mirrored so `GET /api/sessions` reflects the
+    /// new model), 400 for an unknown/empty profile, 404 for an unknown
+    /// session.
+    #[tokio::test]
+    async fn session_model_switches_and_reports_unknown_profile() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let key = temp.path().join("key");
+        std::fs::write(&key, "test-key").unwrap();
+        let config: crate::config::Config = toml::from_str(&format!(
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "{}"
+[models."kimi/k3"]
+model = "k3"
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_file = "{}"
+[models."deepseek/flash"]
+model = "deepseek-chat"
+"#,
+            key.display(),
+            key.display(),
+        ))
+        .unwrap();
+        let registry = SessionRegistry::default();
+        let (id, session) = live_session("web-model");
+        registry.insert(id.clone(), session.clone());
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory_with_config(
+                temp.path().to_path_buf(),
+                Some(config),
+            ),
+            registry: Arc::new(registry),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let app = router(state);
+        let request = |uri: String, body: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let switched = request(
+            format!("/api/sessions/{id}/model"),
+            r#"{"profile": "deepseek/flash"}"#.to_owned(),
+        )
+        .await;
+        assert_eq!(switched.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(switched.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["model"], "flash", "display name short part");
+        // The registry metadata mirrors the switch for `GET /api/sessions`.
+        assert_eq!(session.model_name(), "flash");
+
+        let unknown = request(
+            format!("/api/sessions/{id}/model"),
+            r#"{"profile": "nope/missing"}"#.to_owned(),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST, "unknown profile");
+
+        let empty = request(
+            format!("/api/sessions/{id}/model"),
+            r#"{"profile": "   "}"#.to_owned(),
+        )
+        .await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST, "empty profile");
+
+        let ghost = request(
+            "/api/sessions/web-ghost/model".to_owned(),
+            r#"{"profile": "deepseek/flash"}"#.to_owned(),
+        )
+        .await;
+        assert_eq!(ghost.status(), StatusCode::NOT_FOUND, "unknown session");
+    }
+
     /// `POST /api/sessions/{id}/undo` — 404 for an unknown session, 409
     /// with a Chinese error when the stack is empty, and 200 +
     /// `{"ok": true, "message": ...}` that actually reverts the file when a
@@ -2569,7 +2726,7 @@ mod tests {
             store: SessionStore::Jsonl,
             background,
             sessions: Sessions::default(),
-            model_name: "test-model".into(),
+            model_name: Mutex::new("test-model".into()),
             role_name: None,
             created_at: chrono::Utc::now(),
         })
@@ -2601,7 +2758,7 @@ mod tests {
                 store: SessionStore::Jsonl,
                 background,
                 sessions: Sessions::default(),
-                model_name: "test-model".into(),
+                model_name: Mutex::new("test-model".into()),
                 role_name: None,
                 created_at: chrono::Utc::now(),
             }),
@@ -2643,7 +2800,7 @@ mod tests {
         assert!(registry.list().is_empty());
         let (id, session) = live_session("web-abc");
         registry.insert(id.clone(), session.clone());
-        assert_eq!(registry.get(&id).unwrap().model_name, "test-model");
+        assert_eq!(registry.get(&id).unwrap().model_name(), "test-model");
         assert_eq!(registry.list().len(), 1);
         assert!(registry.list()[0].0 == id);
         let removed = registry.remove(&id);

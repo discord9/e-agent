@@ -145,6 +145,10 @@ pub(crate) struct TuiState {
     /// The main session's model; btw fork subagents (`/btw`) inherit it
     /// (`delegate::BtwContext::model`).
     pub(crate) model: Option<crate::model::ConfiguredModel>,
+    /// The process-global session factory, wired by `run_inner` so `/model
+    /// <profile>` can resolve a profile at runtime. `None` in tests and for
+    /// attached subagent views (which cannot switch models).
+    pub(crate) factory: Option<std::sync::Arc<crate::session_factory::SessionFactory>>,
     /// The workspace the main session works in; btw fork subagents inherit
     /// it.
     pub(crate) workspace: Option<crate::workspace::Workspace>,
