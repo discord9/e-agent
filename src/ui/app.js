@@ -289,9 +289,17 @@ function renderSessionList(list) {
       (s.parent_session_id ? " · 子会话 ← " + s.parent_session_id : "");
 
     const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
-    // 有标题优先显示标题，后面跟完整 id（完整可复制）
-    const sid = el("span", "sid",
-      s.title ? s.title + " · " + s.id : s.id);
+    // 有标题优先显示：标题一行 + 完整 id 小字一行；无标题单行完整 id
+    let sid;
+    if (s.title) {
+      const box = el("span", "sid has-title");
+      const t = el("span", "sid-title", s.title);
+      const i = el("span", "sid-id", s.id);
+      box.append(t, i);
+      sid = box;
+    } else {
+      sid = el("span", "sid", s.id);
+    }
     const edit = el("button", "tree-edit", "✎");
     edit.type = "button";
     edit.title = "重命名";
