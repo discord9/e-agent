@@ -72,6 +72,16 @@ model = "k2"
 subagent = "kimi/k2"
 ```
 
+A project-local `<workspace>/.e-agent/config.toml` overlays `[models]` and
+`[roles]` onto this global config: models merge by name (a project model
+replaces the same-named global model; global models the project does not
+define keep their definitions; an absent or empty `[models]` keeps all global
+models), and roles merge per key. The project file cannot change `default`,
+`[providers]`, `[mcp]`, `[web_search]`, or `[session]`, and it only takes
+effect when a global config exists (it is an override layer, not a standalone
+config). `[sandbox]`, `[background]`, and `[bash]` project overrides are
+described in the sandbox section below.
+
 ### Read-only roles
 
 A role template can declare itself read-only with a leading TOML frontmatter
@@ -149,8 +159,12 @@ unchanged. If either path field appears, selection mode applies and the other
 field is empty. Readable selections may come from global readable or writable
 roots (downgrading authority), while writable selections must come from global
 writable roots. Malformed or
-unreadable project config is a startup error. Project config cannot change
-`enabled`, `network`, or `workspace_writable`. A read-only child under a
+unreadable project config is a startup error. The project `[sandbox]` scalars
+`enabled`, `network`, and `workspace_writable` override the global keys
+per-key: a key present in the project config replaces the global value, and
+absent project keys keep the global values (so a project can turn the sandbox
+on or off, or flip only the network policy, without restating the paths). A
+read-only child under a
 writable parent is rejected rather than silently restoring write authority;
 select a narrower writable root or downgrade the whole selected root instead.
 The exact workspace-relative `.e-agent/config.toml` policy file is readable by

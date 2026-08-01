@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     default: Option<String>,
     #[serde(default)]
@@ -66,7 +66,7 @@ pub struct BashConfig {
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 
 /// Runtime sandbox configuration for the bash tool, from `[sandbox]`.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct Sandbox {
     /// Master switch. Absent section or `enabled = false` means no sandbox.
     #[serde(default)]
@@ -83,6 +83,22 @@ pub struct Sandbox {
     /// Extra readable roots shared by bash mounts and file tools.
     #[serde(default)]
     pub readable_paths: Vec<String>,
+}
+
+impl Default for Sandbox {
+    /// An absent `[sandbox]` section: disabled, but with the documented
+    /// defaults (`network` and `workspace_writable` true) materialized so a
+    /// project `[sandbox] enabled = true` starts from the same baseline as
+    /// a parsed section.
+    fn default() -> Self {
+        Sandbox {
+            enabled: false,
+            network: true,
+            workspace_writable: true,
+            writable_paths: Vec::new(),
+            readable_paths: Vec::new(),
+        }
+    }
 }
 
 /// Backend selection for session persistence.
@@ -109,13 +125,13 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct WebSearch {
     api_key_file: Option<PathBuf>,
     api_key_env: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Provider {
     auth: Option<String>,
     base_url: Option<String>,
@@ -123,7 +139,7 @@ struct Provider {
     api_key_env: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ModelProfile {
     model: Option<String>,
     reasoning_effort: Option<String>,
@@ -175,6 +191,55 @@ impl Config {
             }
         }
         Ok(None)
+    }
+
+    /// Load the effective config for a workspace: the global config
+    /// (`$XDG_CONFIG_HOME`/`~/.config/e-agent/config.toml`) with the
+    /// project-level overrides from `<workspace>/.e-agent/config.toml`
+    /// applied on top ([`Self::merged_with_project`]). Returns `None` when
+    /// there is no global config — the project file is an override layer on
+    /// top of the global config, not a standalone config.
+    pub fn load_for_workspace(workspace: &Path) -> anyhow::Result<Option<Self>> {
+        Self::load()?
+            .map(|config| config.merged_with_project(workspace))
+            .transpose()
+    }
+
+    /// Overlay the project-level overrides from
+    /// `<workspace>/.e-agent/config.toml` over this (global) config and
+    /// return the effective config for the workspace. When the project
+    /// file is absent the global config is returned unchanged.
+    ///
+    /// Merged sections:
+    /// - `[models."<name>"]`: merged **by model name** — a project model
+    ///   replaces the same-named global model; models the project does not
+    ///   define keep their global definitions. An absent or empty `[models]`
+    ///   table keeps every global model.
+    /// - `[roles]`: merged per key — a project role replaces the same-named
+    ///   global role; other roles survive.
+    ///
+    /// `[sandbox]`, `[background]` and `[bash]` are not merged here: they
+    /// keep their workspace-aware resolvers (`resolve_sandbox`,
+    /// `resolve_background_timeout`, `resolve_bash_timeout`), which read
+    /// the project file themselves and apply per-key overrides. All other
+    /// sections (`default`, `providers`, `mcp`, `web_search`, `session`)
+    /// stay global-only.
+    ///
+    /// The merged config keeps the global config's file path, so relative
+    /// `api_key_file` paths keep resolving against the global config
+    /// directory.
+    pub fn merged_with_project(&self, workspace: &Path) -> anyhow::Result<Self> {
+        let Some(project) = project_config(workspace)? else {
+            return Ok(self.clone());
+        };
+        let mut merged = self.clone();
+        if let Some(models) = project.models {
+            merged.models.extend(models);
+        }
+        if let Some(roles) = project.roles {
+            merged.roles.extend(roles);
+        }
+        Ok(merged)
     }
 
     fn from_path(path: &Path) -> anyhow::Result<Self> {
@@ -376,6 +441,12 @@ pub fn config_dir() -> Option<PathBuf> {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectSandbox {
+    /// Per-key scalar overrides: a project key replaces the global key;
+    /// absent project keys keep the global value. Paths below keep the
+    /// narrowing merge (project subpaths of global roots replace them).
+    enabled: Option<bool>,
+    network: Option<bool>,
+    workspace_writable: Option<bool>,
     writable_paths: Option<Vec<String>>,
     readable_paths: Option<Vec<String>>,
 }
@@ -384,13 +455,27 @@ struct ProjectSandbox {
 /// narrowing semantics: project roots that are strict subpaths of a global
 /// root replace that global root (least privilege), while unrelated project
 /// roots accumulate alongside the global ones. Missing global roots are
-/// ignored for compatibility; all returned paths are canonical.
+/// ignored for compatibility; all returned paths are canonical. The
+/// project `[sandbox]` scalars (`enabled`, `network`, `workspace_writable`)
+/// override the global keys per-key; absent project keys keep the global
+/// values.
 pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Result<Sandbox> {
     let mut result = config.and_then(|c| c.sandbox.clone()).unwrap_or_default();
     let global_writable = canonical_roots(&result.writable_paths, workspace, true)?;
     let global_readable = canonical_roots(&result.readable_paths, workspace, true)?;
 
     let local = project_sandbox(workspace)?;
+    if let Some(local) = &local {
+        if let Some(enabled) = local.enabled {
+            result.enabled = enabled;
+        }
+        if let Some(network) = local.network {
+            result.network = network;
+        }
+        if let Some(workspace_writable) = local.workspace_writable {
+            result.workspace_writable = workspace_writable;
+        }
+    }
     let selecting = local
         .as_ref()
         .is_some_and(|s| s.writable_paths.is_some() || s.readable_paths.is_some());
@@ -528,6 +613,31 @@ pub fn resolve_background_timeout(
         Some(secs) => Ok(Some(Duration::from_secs(secs))),
         None => Ok(Some(Duration::from_secs(DEFAULT_BACKGROUND_TIMEOUT_SECS))),
     }
+}
+
+/// Project-level `[models]` / `[roles]` overrides parsed from
+/// `<workspace>/.e-agent/config.toml` (see [`project_config`]).
+#[derive(Deserialize)]
+struct ProjectConfig {
+    models: Option<HashMap<String, ModelProfile>>,
+    roles: Option<HashMap<String, String>>,
+}
+
+/// Read the project-level `[models]` / `[roles]` overrides from
+/// `<workspace>/.e-agent/config.toml` (same pattern as `project_sandbox`);
+/// `None` when the file is absent. Unknown sections (`[background]`,
+/// `[bash]`, `[sandbox]`, `[providers]`, …) are ignored — each resolver
+/// picks up the sections it owns.
+fn project_config(workspace: &Path) -> anyhow::Result<Option<ProjectConfig>> {
+    let path = workspace.join(".e-agent/config.toml");
+    let source = match std::fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let parsed: ProjectConfig = toml::from_str(&source)
+        .with_context(|| format!("cannot parse project config {}", path.display()))?;
+    Ok(Some(parsed))
 }
 
 /// Read `[background]` from `<workspace>/.e-agent/config.toml` (same

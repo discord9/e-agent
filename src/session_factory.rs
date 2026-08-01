@@ -110,7 +110,7 @@ impl SessionFactory {
         let root = workspace.root().to_path_buf();
         let agents_instructions = read_agents(&root)?;
         let skills_instructions = read_skills_merged(&root)?;
-        let config = Config::load()?;
+        let config = Config::load_for_workspace(&root)?;
         let backend = config
             .as_ref()
             .map(|c| c.session_backend())

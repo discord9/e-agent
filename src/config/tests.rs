@@ -724,7 +724,7 @@ fn sandbox_allows_read_only_parent_with_writable_child() {
 }
 
 #[test]
-fn project_sandbox_rejects_unknown_and_policy_switch_fields() {
+fn project_sandbox_rejects_unknown_fields() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("ws");
     std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
@@ -732,9 +732,8 @@ fn project_sandbox_rejects_unknown_and_policy_switch_fields() {
     let config = Config::from_path(&path).unwrap();
     for field in [
         "readible_paths = []",
-        "enabled = true",
-        "network = false",
-        "workspace_writable = false",
+        "writable = []",
+        "future_policy = true",
     ] {
         std::fs::write(
             workspace.join(".e-agent/config.toml"),
@@ -744,6 +743,30 @@ fn project_sandbox_rejects_unknown_and_policy_switch_fields() {
         let error = config.sandbox(&workspace).unwrap_err().to_string();
         assert!(error.contains("cannot parse project config"), "{error}");
     }
+}
+
+#[test]
+fn project_sandbox_policy_switch_fields_are_per_key_overrides() {
+    // The policy-switch scalars (enabled/network/workspace_writable) are
+    // project overrides, not rejected fields: each key present in the
+    // project config replaces the global value, absent keys keep it.
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+    let path = write_config(
+        temp.path(),
+        "[sandbox]\nenabled = true\nnetwork = true\nworkspace_writable = true\n",
+    );
+    let config = Config::from_path(&path).unwrap();
+    std::fs::write(
+        workspace.join(".e-agent/config.toml"),
+        "[sandbox]\nenabled = false\nnetwork = false\n",
+    )
+    .unwrap();
+    let sandbox = config.sandbox(&workspace).unwrap();
+    assert!(!sandbox.enabled);
+    assert!(!sandbox.network);
+    assert!(sandbox.workspace_writable);
 }
 
 #[test]
@@ -1238,4 +1261,256 @@ fn linked_worktree_main_repo_rejects_malicious_pointers() {
     std::fs::create_dir_all(main_repo.join(".git/worktrees/feature")).unwrap();
     let resolved = linked_worktree_main_repo(&worktree).unwrap();
     assert_eq!(resolved, Some(main_repo.canonicalize().unwrap()));
+}
+
+#[test]
+fn merged_with_project_models_merge_by_name_and_roles_by_key() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "global/a"
+[providers.global]
+base_url = "https://global.test/v1"
+api_key_file = "key"
+[providers.project]
+base_url = "https://project.test/v1"
+api_key_file = "key"
+[providers.shared]
+base_url = "https://shared.test/v1"
+api_key_file = "key"
+[models."global/a"]
+model = "a-global"
+[models."shared/b"]
+model = "b-global"
+[roles]
+main = "global/a"
+subagent = "shared/b"
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        r#"
+[models."shared/b"]
+model = "b-project"
+reasoning_effort = "max"
+[models."project/c"]
+model = "c-project"
+[roles]
+subagent = "project/c"
+"#,
+    )
+    .unwrap();
+
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+
+    // Same-name global model replaced by the project definition.
+    let shared = merged.resolve(Some("shared/b")).unwrap();
+    assert_eq!(shared.model, "b-project");
+    assert_eq!(shared.reasoning_effort.as_deref(), Some("max"));
+
+    // Global-only model survives, still served by the global provider.
+    let global_a = merged.resolve(Some("global/a")).unwrap();
+    assert_eq!(global_a.model, "a-global");
+    assert_eq!(global_a.base_url, "https://global.test/v1");
+
+    // Project-only model is defined, served by the global provider block.
+    let project_c = merged.resolve(Some("project/c")).unwrap();
+    assert_eq!(project_c.model, "c-project");
+    assert_eq!(project_c.base_url, "https://project.test/v1");
+
+    // Global default is untouched: resolve(None) still picks global/a.
+    assert_eq!(merged.resolve(None).unwrap().display, "global/a");
+
+    // Roles merge per key: project subagent wins, global main survives.
+    assert_eq!(
+        merged.resolve_role("subagent").unwrap().unwrap().display,
+        "project/c"
+    );
+    assert_eq!(
+        merged.resolve_role("main").unwrap().unwrap().display,
+        "global/a"
+    );
+}
+
+#[test]
+fn merged_with_project_without_project_config_is_identical() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[roles]
+subagent = "kimi/k3"
+"#,
+    );
+    // Workspace exists but has no .e-agent/config.toml.
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+
+    assert_eq!(merged.resolve(None).unwrap().model, "k3");
+    assert_eq!(
+        merged.resolve_role("subagent").unwrap().unwrap().display,
+        "kimi/k3"
+    );
+    // Sandbox stays pure global.
+    let sandbox = merged.sandbox(&ws).unwrap();
+    assert!(!sandbox.enabled);
+    assert!(sandbox.network);
+    assert!(sandbox.workspace_writable);
+    assert!(sandbox.writable_paths.is_empty());
+}
+
+#[test]
+fn merged_with_project_empty_models_table_keeps_all_global() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[providers.deepseek]
+base_url = "https://deepseek.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[models."deepseek/d1"]
+model = "d1"
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    // Empty [models] table (and no [roles]) must not drop any global model.
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[models]\n[sandbox]\nenabled = true\n",
+    )
+    .unwrap();
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+
+    assert_eq!(merged.resolve(Some("kimi/k3")).unwrap().model, "k3");
+    assert_eq!(merged.resolve(Some("deepseek/d1")).unwrap().model, "d1");
+    // The [sandbox] in the project file is ignored by the model merge and
+    // handled by resolve_sandbox instead.
+    assert_eq!(merged.resolve(None).unwrap().display, "kimi/k3");
+}
+
+#[test]
+fn merged_with_project_resolves_key_file_relative_to_global_config() {
+    let temp = tempfile::tempdir().unwrap();
+    // Key file lives ONLY next to the global config, not in the workspace.
+    std::fs::write(temp.path().join("key"), "global-key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        r#"
+[models."kimi/k3"]
+model = "k3-project"
+"#,
+    )
+    .unwrap();
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+    let resolved = merged.resolve(Some("kimi/k3")).unwrap();
+    assert_eq!(resolved.model, "k3-project");
+    assert_eq!(
+        resolved.api_key, "global-key",
+        "relative api_key_file still resolves against the global config dir"
+    );
+}
+
+#[test]
+fn sandbox_project_scalar_fields_override_global() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let external = temp.path().join("external");
+    std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+    std::fs::create_dir_all(&external).unwrap();
+    let path = write_config(
+        temp.path(),
+        &format!(
+            "[sandbox]\nenabled = true\nnetwork = true\nworkspace_writable = true\nwritable_paths = [\"{}\"]\n",
+            external.display()
+        ),
+    );
+    // Project overrides two scalars, leaves workspace_writable and paths
+    // alone: those must keep the global values.
+    std::fs::write(
+        workspace.join(".e-agent/config.toml"),
+        "[sandbox]\nenabled = false\nnetwork = false\n",
+    )
+    .unwrap();
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    assert!(!sandbox.enabled, "project enabled overrides global");
+    assert!(!sandbox.network, "project network overrides global");
+    assert!(
+        sandbox.workspace_writable,
+        "absent project key keeps the global value"
+    );
+    assert_eq!(
+        sandbox.writable_paths,
+        vec![external.to_str().unwrap()],
+        "absent project paths keep the global roots"
+    );
+}
+
+#[test]
+fn sandbox_project_scalars_can_enable_without_global_sandbox() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+    let path = write_config(temp.path(), ""); // no [sandbox] at all
+    std::fs::write(
+        workspace.join(".e-agent/config.toml"),
+        "[sandbox]\nenabled = true\n",
+    )
+    .unwrap();
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    assert!(sandbox.enabled, "project can turn the sandbox on");
+    assert!(
+        sandbox.network && sandbox.workspace_writable,
+        "unset scalars keep Sandbox defaults"
+    );
+    assert!(sandbox.writable_paths.is_empty());
 }
