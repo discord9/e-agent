@@ -422,6 +422,11 @@ pub(super) async fn run_bash(
         .current_dir(workspace.root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Force UTF-8 output from the shell and its children. On Linux this is
+    // already the norm; on Windows (Git Bash) the default console codepage
+    // is GBK/cp936, so without these the byte stream would be mis-decoded
+    // by from_utf8_lossy downstream (mojibake on every command).
+    process.env("LC_ALL", "C.UTF-8").env("LANG", "C.UTF-8");
     #[cfg(unix)]
     process.process_group(0);
     let mut child = match process.spawn() {
