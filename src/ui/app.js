@@ -5,6 +5,15 @@
    导致移动/桌面浏览器滚动卡死。 */
 const HISTORY_PAGE = 200;
 
+/* 长文本「预览 + 展开全文」阈值：超过则默认折叠为预览 + 展开按钮。
+   工具参数原 600 也统一为此值（预览 + 一键展开的成本相同，统一更可预期）。 */
+const LONG_TEXT_THRESHOLD = 300;
+
+/* 消息列表上限：els.messages 直接子块超过该数时，把最早的一批「已完成」
+   块折叠进顶部占位 details（.older-collapse）。只约束渲染块数，不删数据、
+   不动后端（历史仍可滚动分页加载）。 */
+const MAX_MESSAGE_BLOCKS = 300;
+
 /* 输入框默认 placeholder；applyStatus 在 Finished 之外的状态恢复它
    （openSession 每次 applyStatus("Idle") 都会重置输入区）。 */
 const PROMPT_PLACEHOLDER = "输入消息：Enter 发送，Shift+Enter 换行…";
@@ -92,6 +101,28 @@ function el(tag, cls, text) {
 function truncate(s, n) {
   s = String(s);
   return s.length > n ? s.slice(0, n) + "\n… (省略 " + (s.length - n) + " 字符)" : s;
+}
+
+/* 长内容「预览 + 展开全文」辅助（Solarized Light 一致，文本可选中复制）：
+   内容 ≤ threshold 直出（不增加任何交互成本）；超过则渲染截断预览 +
+   「展开全文 ▾」按钮，完整文本以隐藏 span 常驻 DOM（display:none），
+   点击按钮原地切换（展开显示全文 / 收起回预览，按钮文案随之切换）。
+   完整文本常驻是为了 innerHTML 快照往返（会话缓存恢复、resync 离屏
+   替换）后仍能展开——按钮监听走消息容器事件委托，快照重建后依然可点；
+   代价是长内容在 DOM 里多一份文本。调用方传 pre（工具参数/结果、notice
+   长文本等），保持 pre 语义：文本可选中复制。 */
+function maybeTruncateEl(container, text, threshold) {
+  const s = String(text == null ? "" : text);
+  const n = (threshold > 0) ? threshold : LONG_TEXT_THRESHOLD;
+  if (s.length <= n) { container.textContent = s; return container; }
+  container.textContent = "";
+  container.classList.add("expandable");
+  const preview = el("span", "expand-preview", s.slice(0, n) + "\n… ");
+  const btn = el("button", "expand-toggle", "展开全文 ▾");
+  btn.type = "button";
+  const full = el("span", "expand-full", s);
+  container.append(preview, full, btn);
+  return container;
 }
 
 function fmtTime(iso) {
@@ -521,6 +552,7 @@ function appendUserMsg(text) {
   msg.append(who, body);
   els.messages.appendChild(msg);
   scrollBottom(false);
+  pruneMessages();
 }
 
 function appendSystemMsg(text) {
@@ -531,6 +563,7 @@ function appendSystemMsg(text) {
   body.textContent = text;
   msg.append(who, body);
   els.messages.appendChild(msg);
+  pruneMessages();
 }
 
 /* 助手消息：有则累积，无则新建 */
@@ -541,9 +574,10 @@ function assistantBubble(acc, reason) {
     const body = el("div", "msg-body");
     msg.append(who, body);
     els.messages.appendChild(msg);
-    acc.assistantEl = msg;
+    acc.assistantEl = msg;      // 先绑定再 prune：进行中的助手块绝不折叠
     acc.assistantBody = body;
     if (reason) scrollBottom(false);
+    pruneMessages();
   }
   return acc.assistantBody;
 }
@@ -582,8 +616,9 @@ function thinkingBlock(acc) {
     const body = el("div", "think-body");
     det.append(sum, body);
     els.messages.appendChild(det);
-    acc.thinkingEl = det;
+    acc.thinkingEl = det;                   // 先绑定再 prune：进行中的思考块不折叠
     acc.thinkBody = body;
+    pruneMessages();
   }
   return acc.thinkBody;
 }
@@ -607,6 +642,7 @@ function appendToolCall(name, args, acc, callId) {
   if (callId) acc.pendingByCall.set(callId, card);
   els.messages.appendChild(card);
   scrollBottom(true);   // 工具调用卡片出现时强制跟随底部（工具结果常几秒后一次性到达）
+  pruneMessages();      // 卡片是「执行中…」：进行中，不折叠
 }
 
 function appendToolResult(isError, content, acc, callId) {
@@ -625,14 +661,17 @@ function appendToolResult(isError, content, acc, callId) {
   if (card) {
     card.querySelector(".tool-state").textContent = isError ? "失败" : "完成";
     const resEl = card.querySelector(".tool-result");
-    resEl.className = "tool-result" + (isError ? " err" : "");
-    resEl.textContent = content || (isError ? "(无错误信息)" : "(无输出)");
+    resEl.classList.remove("pending");
+    resEl.classList.toggle("err", isError);
+    maybeTruncateEl(resEl, content || (isError ? "(无错误信息)" : "(无输出)"),
+      LONG_TEXT_THRESHOLD);
     card.removeAttribute("open");   // 结果到达：收起为标题行（默认折叠）
   } else {
     // 没有可配对的卡片：独立展示结果行
     const card2 = buildToolCard("工具结果", "", isError ? "失败" : "完成",
       isError ? "err" : "", content || "");
     els.messages.appendChild(card2);
+    pruneMessages();
   }
   scrollBottom(true);   // 工具结果填充后强制滚到底（buildToolCard 内设置的
                         // stateText/resultText 也随此调用被包含）
@@ -651,10 +690,11 @@ function buildToolCard(name, args, stateText, stateCls, resultText) {
   let argsText = args != null ? String(args) : "";
   let pretty = argsText;
   try { pretty = JSON.stringify(JSON.parse(argsText), null, 2); } catch (e) { /* 保持原文 */ }
-  const argsEl = el("pre", "tool-args", truncate(pretty, 600));
+  const argsEl = maybeTruncateEl(el("pre", "tool-args"), pretty, LONG_TEXT_THRESHOLD);
 
-  const resEl = el("pre", "tool-result " + stateCls,
-    resultText != null ? resultText : (stateCls === "pending" ? "等待结果…" : ""));
+  const resEl = maybeTruncateEl(el("pre", "tool-result " + stateCls),
+    resultText != null ? resultText : (stateCls === "pending" ? "等待结果…" : ""),
+    LONG_TEXT_THRESHOLD);
   card.append(head, argsEl, resEl);
   return card;
 }
@@ -696,6 +736,20 @@ function appendNotice(text) {
   const n = el("div", "notice", text);
   els.messages.appendChild(n);
   scrollBottom(false);
+  pruneMessages();
+}
+
+/* notice 变体：前缀 + 可能很长的正文（后台任务输出 / 未知条目 JSON）。
+   正文走 maybeTruncateEl：短直出，长则预览 + 展开全文。 */
+function appendNoticeLong(prefix, text) {
+  const n = el("div", "notice");
+  if (prefix) n.append(prefix);
+  const pre = maybeTruncateEl(el("pre", "notice-output"), text, LONG_TEXT_THRESHOLD);
+  n.append(pre);
+  els.messages.appendChild(n);
+  scrollBottom(false);
+  pruneMessages();
+  return n;
 }
 
 /* =====================================================================
@@ -732,6 +786,7 @@ function appendError(text) {
   const e = el("div", "msg-error", "错误: " + text);
   els.messages.appendChild(e);
   scrollBottom(false);
+  pruneMessages();
 }
 
 /* 压缩分界线 */
@@ -743,6 +798,7 @@ function appendCompaction(summary) {
     els.messages.appendChild(n);
   }
   scrollBottom(false);
+  pruneMessages();
 }
 
 /* =====================================================================
@@ -754,9 +810,9 @@ function renderEntry(entry, acc, pendingCards) {
     case "compaction": return appendCompaction(entry.summary);
     case "notice": return appendNotice(entry.text);
     case "background_completion":
-      return appendNotice("⌛ 后台任务 #" + (entry.id ?? "?") + " 完成"
-        + (entry.label ? "（" + entry.label + "）" : "")
-        + "\n" + truncate(entry.output || "", 300));
+      return appendNoticeLong("⌛ 后台任务 #" + (entry.id ?? "?") + " 完成"
+        + (entry.label ? "（" + entry.label + "）" : "") + "\n",
+        entry.output || "");
     case "forked_from":
       els.messages.appendChild(el("div", "forked",
         "分叉自会话 " + shortId(entry.source) + " @ 条目 #" + (entry.at ?? "?")));
@@ -769,7 +825,7 @@ function renderEntry(entry, acc, pendingCards) {
       return appendNotice("▶ 开始处理排队的提示");
     default:
       // 未知条目类型：尽力显示原始 JSON（后端演进兼容）
-      return appendNotice("未知条目: " + truncate(JSON.stringify(entry), 300));
+      return appendNoticeLong("未知条目: ", JSON.stringify(entry));
   }
 }
 
@@ -821,8 +877,10 @@ function renderMessage(m, acc, pendingCards) {
       pendingCards.delete(t.call_id);
       card.querySelector(".tool-state").textContent = t.is_error ? "失败" : "完成";
       const resEl = card.querySelector(".tool-result");
-      resEl.className = "tool-result" + (t.is_error ? " err" : "");
-      resEl.textContent = t.content || (t.is_error ? "(无错误信息)" : "(无输出)");
+      resEl.classList.remove("pending");
+      resEl.classList.toggle("err", t.is_error);
+      maybeTruncateEl(resEl, t.content || (t.is_error ? "(无错误信息)" : "(无输出)"),
+        LONG_TEXT_THRESHOLD);
     } else {
       // 无对应 ToolCall（如历史截断后）：独立卡片
       const card2 = buildToolCard(t.name, "", t.is_error ? "失败" : "完成",
@@ -833,7 +891,7 @@ function renderMessage(m, acc, pendingCards) {
     return;
   }
   // 其他 message 形状
-  appendNotice("消息: " + truncate(JSON.stringify(m), 300));
+  appendNoticeLong("消息: ", JSON.stringify(m));
 }
 
 /* 渲染一批 SessionEntry。prepend=true 时把新条目插入容器开头（保留既有内容），
@@ -878,6 +936,83 @@ function renderEntries(entries, prepend) {
       n = next;
     }
     sentinel.remove();
+  }
+  // 初始/整体渲染（非前置插入）：超限时折叠最早的已完成块。前置插入
+  // （loadOlder）不 prune——刚加载的更早历史不立即折叠，等下一个底部新块。
+  if (!prepend) pruneMessages();
+}
+
+/* =====================================================================
+ * 消息列表上限（MAX_MESSAGE_BLOCKS）：新增块后 pruneMessages 维护上限。
+ * 超过上限时把最早的一批「已完成」块（用户/助手/系统消息、思考块、
+ * 工具卡片、notice/错误/压缩线/分叉行、已结束任务输出块）移进顶部
+ * 占位 details.older-collapse：折叠 = 移入占位容器，展开 = 原位显示。
+ * 移动不销毁元素——任务块轮询（元素引用）、expand 按钮（事件委托）、
+ * innerHTML 快照（会话缓存/恢复）都不受影响，快照反而更小（折叠进
+ * details 后内容仍是完整的）。进行中（流式）的块绝不折叠：流式助手
+ * （state.acc.assistantEl）、流式思考（acc.thinkingEl）、执行中的工具
+ * 卡片（.tool-state == "执行中…"）、运行中的任务输出块（"● 运行中"）。
+ * 只约束渲染块数：不删数据、不动后端（历史仍可滚动分页加载）。
+ * 取舍：占位折叠的是块而不是删除，被折叠块的全部信息仍在 DOM 里；
+ * 代价是长会话 DOM 总量不下降（上限约束的是「直接子块数」）。
+ * ===================================================================*/
+function isInflightBlock(k) {
+  if (state.acc && (state.acc.assistantEl === k || state.acc.thinkingEl === k)) return true;
+  if (k.classList.contains("task-output-block")) {
+    const st = k.querySelector(".task-output-state");
+    return st && st.textContent === "● 运行中";
+  }
+  if (k.classList.contains("tool-card")) {
+    const st = k.querySelector(".tool-state");
+    return st && st.textContent === "执行中…";
+  }
+  return false;
+}
+
+function isFoldableBlock(k) {
+  return k.classList.contains("msg") || k.classList.contains("notice")
+    || k.classList.contains("msg-error") || k.classList.contains("compaction")
+    || k.classList.contains("forked") || k.classList.contains("thinking")
+    || k.classList.contains("tool-card") || k.classList.contains("task-output-block");
+}
+
+function pruneMessages() {
+  if (suppressScroll) return;   // 批量渲染期间不折叠（loadOlder 前置插入 / 初始渲染）
+  const m = els.messages;
+  const kids = [...m.children];
+  if (kids.length <= MAX_MESSAGE_BLOCKS) return;
+  let holder = null;
+  for (const k of kids) {
+    if (k.classList && k.classList.contains("older-collapse")) { holder = k; break; }
+  }
+  let body = holder ? holder.querySelector(".older-body") : null;
+  if (holder && !body) holder = null;   // 结构异常时按无占位处理
+  let folded = 0;
+  for (const k of kids) {
+    if (k === holder || !k.classList) continue;
+    if (isInflightBlock(k)) break;      // 进行中绝不折叠：从最早开始，遇到即停
+    if (!isFoldableBlock(k)) continue;  // 注释等非块节点跳过
+    if (!holder) {
+      holder = el("details", "older-collapse");
+      const sum = el("summary", "older-head");
+      sum.appendChild(el("span", "older-label", "⬆ 更早的消息"));
+      sum.appendChild(el("span", "older-load", "加载更早历史"));
+      const b = el("div", "older-body");
+      holder.append(sum, b);
+      body = b;
+      m.insertBefore(holder, k);        // 占位放在第一批被折叠块的位置（顺序不乱）
+    }
+    body.appendChild(k);                // 移入（不销毁：轮询/缓存/展开绑定仍在）
+    folded++;
+    if (kids.length - folded <= MAX_MESSAGE_BLOCKS) break;
+  }
+  if (holder && folded > 0) {
+    const n = body.children.length;
+    const lbl = holder.querySelector(".older-label");
+    if (lbl) lbl.textContent = "⬆ 更早的 " + n + " 条消息";
+    // 「加载更早历史」：后端还有更早历史时可见（点击走 loadOlder）
+    const link = holder.querySelector(".older-load");
+    if (link) link.hidden = !(state.nextBeforeSeq !== null && !state.olderDone);
   }
 }
 
@@ -1137,8 +1272,8 @@ function applyLiveEvent(name, payload) {
     case "BackgroundCompletionNotice": {
       const p = (payload && typeof payload === "object") ? payload : {};
       const label = p.label ? "（" + p.label + "）" : "";
-      appendNotice("⌛ 后台任务 #" + (p.id ?? "?") + " 完成" + label + "\n"
-        + truncate(pickText(p, ["output", "text", "content"]) || "", 300));
+      appendNoticeLong("⌛ 后台任务 #" + (p.id ?? "?") + " 完成" + label + "\n",
+        pickText(p, ["output", "text", "content"]) || "");
       break;
     }
     case "Usage":
@@ -1221,6 +1356,10 @@ async function loadOlder() {
     if (state.nextBeforeSeq === null) state.olderDone = true;
     if (entries.length) {
       renderEntries(entries, true);               // 前置插入
+      // 占位折叠块保持在最顶部：更早条目插到它前面后，把它移回最前，
+      // 保证后续 prune 折叠的仍是「最早」的块（占位内展开顺序不乱）。
+      const ph = [...els.messages.children].find((c) => c.classList && c.classList.contains("older-collapse"));
+      if (ph) els.messages.insertBefore(ph, els.messages.firstChild);
       // 保持滚动位置：内容在顶部增高，scrollTop 相应下移
       els.messages.scrollTop += els.messages.scrollHeight - prevHeight;
     }
@@ -1308,6 +1447,7 @@ function openSession(id) {
     els.messages.innerHTML = cached.html;
     reattachInFlight(state.acc);   // 重新绑定缓存里「进行中」的思考/助手/工具卡片，
                                    // 使增量续写而不是新建（防止重复出现多个块）
+    pruneMessages();               // 缓存快照也可能超上限（功能上线前的旧快照）：维持有界
     els.messages.scrollTop = cached.scrollTop;
     els.promptInput.value = cached.draft || "";
     autosizeInput();
@@ -1676,6 +1816,7 @@ function ensureTaskOutputBlock(t) {
     els.messages.appendChild(block);
     scrollBottom(false);
     block.setAttribute("open", "");   // 新建：默认展开（用户要实时看编译进度）
+    pruneMessages();                  // 新块是「● 运行中」：进行中，不折叠
   } else {
     const st = block.querySelector(".task-output-state");
     if (st && st.classList.contains("done")) {   // 旧 key 复用：复活为运行中
@@ -2590,6 +2731,26 @@ els.messages.addEventListener("scroll", (ev) => {
   // 滚到接近顶部时加载更早历史（分页；防重入 / 已全部加载 / 未开会话时跳过）
   if (state.loadingOlder || state.olderDone || !state.sessionId) return;
   if (m.scrollTop < 30) loadOlder();
+});
+/* 长文本「展开全文/收起」+ 占位「加载更早历史」：事件委托在消息容器上。
+   委托原因：innerHTML 快照恢复（缓存会话 / resync 离屏替换）会重建按钮/
+   链接元素，直接绑定的监听器不保留；容器本身不换，委托不受影响。
+   older-load 在 summary 内：preventDefault 阻止 details 的默认开合。 */
+els.messages.addEventListener("click", (ev) => {
+  const t = ev.target;
+  if (!t || !t.classList) return;
+  if (t.classList.contains("expand-toggle")) {
+    const c = t.closest(".expandable");
+    if (!c) return;
+    const expanded = c.classList.toggle("expanded");
+    t.textContent = expanded ? "收起 ▴" : "展开全文 ▾";
+    return;
+  }
+  if (t.classList.contains("older-load")) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    loadOlder();
+  }
 });
 els.jumpBottomBtn.addEventListener("click", () => {
   userScrolled = false;   // 显式回底：覆盖「用户在看历史」的锁定

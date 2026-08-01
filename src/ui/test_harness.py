@@ -61,7 +61,7 @@ function parseHtml(html){
   let i = 0;
   const n = s.length;
   const pushText = (parent, t) => { if (t) parent.push({text: t}); };
-  function walk(parent, stopTag){
+  function walk(parent, stopTag, host){
     let text = "";
     while (i < n) {
       if (s[i] === "<") {
@@ -83,7 +83,8 @@ function parseHtml(html){
           while ((am = attrRe.exec(m[2]))) { if (am[1] === "class") cls.push(am[2]); }
           if (cls.length) e.className = cls.join(" ");
           parent.push(e);
-          if (!voidEl) walk(e._children, tag);
+          e._parent = host || null;   // 与程序化 append/insertBefore 一致：closest 依赖父链
+          if (!voidEl) walk(e._children, tag, e);
           continue;
         }
       }
@@ -96,7 +97,7 @@ function parseHtml(html){
     }
     pushText(parent, text);
   }
-  walk(roots, null);
+  walk(roots, null, null);
   return roots;
 }
 function matchSel(el, sel){
@@ -151,7 +152,9 @@ class El {
   append(...nodes){ for(const n of nodes){ if(n==null) continue;
     const c=typeof n==="string"?{text:n}:n; this._children.push(c);
     if(c._parent==null) c._parent=this; } }
-  appendChild(n){ this._children.push(n); n._parent=this; return n; }
+  appendChild(n){ const p=n._parent;   /* 真实 DOM 语义：移动=先从旧父节点移除 */
+    if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
+    this._children.push(n); n._parent=this; return n; }
   get isConnected(){ return this._parent != null; }
   insertBefore(n, ref){ const p=n._parent; if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
     const i=this._children.indexOf(ref);
@@ -167,6 +170,7 @@ class El {
       if(matchSel(c,sel)) out.push(c); walk(c); } } };
     walk(this); return out; }
   querySelector(sel){ return this.querySelectorAll(sel)[0] ?? null; }
+  closest(sel){ let n=this; while(n){ if(matchSel(n,sel)) return n; n=n._parent; } return null; }
 }
 const elsById={};
 for(const id of ["topActions","backBtn","connState","banner","tokenInput","listView","chatView",
@@ -570,6 +574,121 @@ async function main(){
     chk("restored restarts block poller", state.tasks.pollers.has("s1:9"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
     chk("restored block in messages", findTaskOutputBlock("s1:9") !== null);
+
+    // ---- A: 长内容「预览 + 展开全文」（maybeTruncateEl） ----
+    const longArgsA = JSON.stringify({ cmd: "echo hi", data: "x".repeat(700) });
+    const cardA = buildToolCard("bash", longArgsA, "完成", "", "y".repeat(500));
+    const argsPreA = cardA.querySelector(".tool-args");
+    const resPreA = cardA.querySelector(".tool-result");
+    chk("A long args folded by default",
+        argsPreA.classList.contains("expandable") && !argsPreA.classList.contains("expanded"),
+        "cls=" + argsPreA.className);
+    const previewA = argsPreA.querySelector(".expand-preview");
+    const fullA = argsPreA.querySelector(".expand-full");
+    chk("A long args preview+full split",
+        !!previewA && !!fullA
+        && previewA.textContent.length < fullA.textContent.length
+        && fullA.textContent.length === JSON.stringify(JSON.parse(longArgsA), null, 2).length,
+        "preview=" + (previewA && previewA.textContent.length) + " full=" + (fullA && fullA.textContent.length));
+    chk("A long result folded by default",
+        resPreA.classList.contains("expandable") && !resPreA.classList.contains("expanded"));
+    // 短内容直出：无 expandable、无按钮、文本完整
+    const shortCardA = buildToolCard("bash", '{"cmd":"ls"}', "完成", "", "ok");
+    const argsShortA = shortCardA.querySelector(".tool-args");
+    chk("A short args direct output",
+        !argsShortA.classList.contains("expandable") && argsShortA.querySelector(".expand-toggle") === null
+        && argsShortA.textContent === JSON.stringify(JSON.parse('{"cmd":"ls"}'), null, 2),
+        "text=" + JSON.stringify(argsShortA.textContent));
+    // 点击展开 → 显示全文；再点收起 → 回到预览
+    const clicksA = (elsById["messages"]._listeners["click"] || []);
+    const btnA = resPreA.querySelector(".expand-toggle");
+    for (const fn of clicksA) fn({ target: btnA });
+    chk("A expand toggles full text",
+        resPreA.classList.contains("expanded") && btnA.textContent === "收起 ▴"
+        && resPreA.querySelector(".expand-full").textContent === "y".repeat(500),
+        "btn=" + btnA.textContent);
+    for (const fn of clicksA) fn({ target: btnA });
+    chk("A collapse returns to preview",
+        !resPreA.classList.contains("expanded") && btnA.textContent === "展开全文 ▾",
+        "btn=" + btnA.textContent);
+    // 工具结果（live/history 路径）也走辅助：长结果默认折叠、短结果直出
+    elsById["messages"].innerHTML = "";      // 清掉 restored 测试遗留的 pending 卡片，保证独立卡片分支
+    state.acc = newAccumulator();
+    const cardCountBefore = 0;
+    appendToolResult(false, "z".repeat(400), state.acc, null);   // 无配对卡片 → 独立卡片
+    const standAloneA = elsById["messages"].querySelectorAll("details.tool-card");
+    const lastCardA = standAloneA[standAloneA.length - 1];
+    chk("A standalone long tool result folded",
+        standAloneA.length === cardCountBefore + 1
+        && lastCardA.querySelector(".tool-result").classList.contains("expandable")
+        && !lastCardA.querySelector(".tool-result").classList.contains("expanded")
+        && lastCardA.querySelector(".tool-result").querySelector(".expand-full").textContent === "z".repeat(400),
+        "before=" + cardCountBefore + " after=" + standAloneA.length
+        + " toolStack=" + state.acc.toolStack.length
+        + " cls=" + lastCardA.querySelector(".tool-result").className);
+    // innerHTML 快照往返（缓存恢复 / resync 离屏替换）：折叠状态与完整文本保留，
+    // 展开按钮经消息容器事件委托仍可点（直接绑定的监听器不随快照保留）
+    const snapA = elsById["messages"].innerHTML;
+    elsById["messages"].innerHTML = snapA;
+    const restoredCardA = elsById["messages"].querySelectorAll("details.tool-card");
+    const restoredResA = restoredCardA[restoredCardA.length - 1].querySelector(".tool-result");
+    chk("A innerHTML round-trip keeps fold+full",
+        restoredResA.classList.contains("expandable")
+        && restoredResA.querySelector(".expand-full").textContent === "z".repeat(400)
+        && !restoredResA.classList.contains("expanded"));
+    const restoredBtnA = restoredResA.querySelector(".expand-toggle");
+    for (const fn of clicksA) fn({ target: restoredBtnA });
+    chk("A round-trip toggle still works",
+        restoredResA.classList.contains("expanded") && restoredBtnA.textContent === "收起 ▴",
+        "btn=" + restoredBtnA.textContent);
+    appendToolResult(true, "err-x", state.acc, null);
+    const standAloneB = elsById["messages"].querySelectorAll("details.tool-card");
+    const lastCardB = standAloneB[standAloneB.length - 1];
+    chk("A short tool result direct",
+        standAloneB.length === standAloneA.length + 1
+        && lastCardB.querySelector(".tool-result").textContent === "err-x"
+        && !lastCardB.querySelector(".tool-result").classList.contains("expandable")
+        && lastCardB.querySelector(".tool-result.err") !== null);
+
+    // ---- B: 消息上限 pruneMessages ----
+    const pm = elsById["messages"];
+    pm.innerHTML = "";
+    state.acc = newAccumulator();
+    for (let i = 0; i < 310; i++) appendNotice("旧通知 #" + i);
+    // 进行中的助手块（底部，模拟流式）：appendAssistantDelta 会创建并绑定
+    appendAssistantDelta("流式内容", state.acc);
+    const inflightB = state.acc.assistantEl;
+    chk("B children bounded", pm.children.length <= 300, "n=" + pm.children.length);
+    const phB = pm.children[0];
+    chk("B placeholder at top", phB && phB.classList.contains("older-collapse"),
+        "cls=" + (phB && phB.className));
+    chk("B folded count label",
+        phB.querySelector(".older-label").textContent.includes("条消息"),
+        "=" + phB.querySelector(".older-label").textContent);
+    chk("B folded blocks inside body",
+        phB.querySelector(".older-body").querySelectorAll(".notice").length > 0,
+        "n=" + phB.querySelector(".older-body").querySelectorAll(".notice").length);
+    chk("B earliest folded", phB.querySelector(".older-body").textContent.includes("旧通知 #0"));
+    chk("B in-flight not folded",
+        inflightB !== null && pm.children[pm.children.length - 1] === inflightB
+        && phB.querySelector(".older-body").textContent.indexOf("流式内容") === -1,
+        "last=" + (pm.children[pm.children.length - 1] && pm.children[pm.children.length - 1].className));
+    // 展开：占位 details 打开后原位显示被折叠块（内容一直在 body 里，未删除）
+    phB.setAttribute("open", "");
+    chk("B expanded shows folded blocks",
+        phB.querySelector(".older-body").textContent.includes("旧通知 #0")
+        && phB.querySelector(".older-body").textContent.includes("旧通知 #9"));
+    chk("B direct children still bounded", pm.children.length <= 300, "n=" + pm.children.length);
+    // 「加载更早历史」链接：无更早历史（nextBeforeSeq=null）时隐藏；有则可见
+    const linkB = phB.querySelector(".older-load");
+    chk("B load link hidden when no older",
+        linkB !== null && linkB.hidden === true, "hidden=" + (linkB && linkB.hidden));
+    state.nextBeforeSeq = 100;
+    state.olderDone = false;
+    appendNotice("额外通知");   // 触发一次 prune 刷新链接可见性
+    chk("B load link shown when older available",
+        linkB.hidden === false, "hidden=" + linkB.hidden);
+    chk("B prune keeps bound", pm.children.length <= 300, "n=" + pm.children.length);
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);

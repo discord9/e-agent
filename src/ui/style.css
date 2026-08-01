@@ -584,6 +584,79 @@ mmlEqnNo}
     padding: 4px;
   }
 
+  /* 长内容「预览 + 展开全文」（app.js maybeTruncateEl）：预览与全文互斥显示，
+     完整文本以隐藏 span 常驻（innerHTML 快照往返后仍可展开）；按钮可点。 */
+  .expandable .expand-preview { display: inline; }
+  .expandable .expand-full { display: none; }
+  .expandable.expanded .expand-preview { display: none; }
+  .expandable.expanded .expand-full { display: inline; }
+  .expand-toggle {
+    cursor: pointer;
+    background: none;
+    border: none;
+    padding: 0 0 0 4px;
+    margin: 0;
+    font: inherit;
+    font-size: 12px;
+    color: var(--blue);
+    text-decoration: underline;
+    user-select: none;
+  }
+
+  /* notice 内的长正文（后台任务输出 / 未知条目 JSON）：pre 保持可选中复制 */
+  .notice .notice-output {
+    margin: 4px 0 0;
+    font-size: 12px;
+    background: var(--base2);
+    border: 1px solid var(--base1);
+    border-radius: 3px;
+    padding: 4px 6px;
+    color: var(--base02);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    max-height: 14em;
+    overflow-y: auto;
+  }
+
+  /* 消息上限占位（app.js pruneMessages）：折叠最早的一批已完成块；
+     summary 点击展开原位查看，另附「加载更早历史」链接（无更早时隐藏） */
+  .older-collapse {
+    flex-shrink: 0;
+    margin: 2px 0;
+    border: 1px dashed var(--base1);
+    border-radius: 4px;
+    background: var(--base3);
+  }
+  .older-collapse summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;          /* summary 可点击折叠/展开 */
+    user-select: none;
+    padding: 6px 10px;
+    color: var(--base01);
+    font-size: 12px;
+  }
+  .older-collapse summary::-webkit-details-marker { display: none; }
+  .older-collapse summary::before {
+    content: "▸";
+    color: var(--base01);
+    font-size: 10px;
+    transition: transform 0.15s;
+  }
+  .older-collapse[open] summary::before { transform: rotate(90deg); }
+  .older-collapse .older-load {
+    margin-left: auto;
+    cursor: pointer;
+    color: var(--blue);
+    text-decoration: underline;
+    font-size: 12px;
+  }
+  .older-collapse .older-body {
+    border-top: 1px dashed var(--base1);
+    padding: 4px 8px;
+  }
+
   /* ---------- 输入区 ---------- */
   .composer {
     flex: 0 0 auto;
