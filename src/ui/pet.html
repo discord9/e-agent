@@ -60,6 +60,13 @@
   box-shadow: 0 2px 6px rgba(0,0,0,0.15);
   z-index: 2;
 }
+/* 会话总结：显示全文（多行、加宽、不省略） */
+.pet-say.summary {
+  white-space: normal;
+  max-width: 280px;
+  overflow: visible;
+  line-height: 1.45;
+}
 /* 关闭按钮 */
 .pet-close {
   position: absolute;
@@ -172,9 +179,10 @@
 
   /* --- 点击互动（非拖拽时） --- */
   let sayTimer = null;
-  function sayFor(text, ms) {
+  function sayFor(text, ms, isSummary) {
     if (!say) return;
     say.textContent = text;
+    say.classList.toggle("summary", !!isSummary);
     say.hidden = false;
     clearTimeout(sayTimer);
     sayTimer = setTimeout(() => { say.hidden = true; }, ms);
@@ -212,7 +220,7 @@
       .then((res) => res.ok ? res.json() : null)
       .then((data) => {
         if (data && data.summary) {
-          sayFor("📊 " + data.summary + (taskText ? " · " + taskText : ""), 2600);
+          sayFor("📊 " + data.summary + (taskText ? " · " + taskText : ""), 3200, true);
         } else if (taskText) {
           sayFor("🐳 " + taskText, 2200);
         } else {
