@@ -283,6 +283,9 @@ struct RunningTask {
     role: Option<String>,
     process_group: Arc<AtomicI32>,
     handle: Arc<tokio::task::JoinHandle<()>>,
+    /// Tool name of the shell that ran this task ("bash"/"pwsh"); `None`
+    /// for delegate tasks. Drives the `kind` shown in task lists.
+    shell_name: Option<String>,
     output: Option<OutputSlot>,
     spool: Option<Arc<TaskSpool>>,
     display_meta: Option<TaskDisplayMeta>,
@@ -358,11 +361,7 @@ impl BackgroundTasks {
                 label: task.label.clone(),
                 full_command: task.full_command.clone(),
                 role: task.role.clone(),
-                kind: if task.output.is_some() {
-                    "bash".into()
-                } else {
-                    "delegate".into()
-                },
+                kind: task.shell_name.clone().unwrap_or_else(|| "delegate".into()),
                 output: task
                     .output
                     .as_ref()
@@ -463,6 +462,7 @@ impl BackgroundTasks {
         let command_for_detail = command.clone();
         let timeout = self.timeout;
         let running = self.registry.clone();
+        let shell_name = shell.tool_name.to_owned();
         self.spawn_with_id_to(
             sender,
             preview(&command, 100),
@@ -475,6 +475,7 @@ impl BackgroundTasks {
                     task.output = Some(output);
                     task.spool = Some(spool);
                     task.full_command = Some(command_for_detail);
+                    task.shell_name = Some(shell_name.clone());
                 }
             },
             move || async move {
@@ -659,6 +660,7 @@ impl BackgroundTasks {
             role,
             process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),
             handle: Arc::new(handle),
+            shell_name: None,
             output: None,
             spool: None,
             display_meta,

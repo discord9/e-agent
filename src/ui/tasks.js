@@ -317,8 +317,10 @@ function renderTaskList(tasks, container) {
     const isDelegate = t.kind === "delegate";
     row.title = isDelegate ? "点击切换到该子代理的会话" : "点击展开/收起输出（流式更新）";
     const line = el("div", "task-line");
-    const badge = el("span", "kind-badge " + (isDelegate ? "delegate" : "bash"),
-      isDelegate ? "子代理" : "bash");
+    // 非 delegate 任务的 kind 是实际 shell 名（bash / pwsh）：徽章显示真实值
+    const shellKind = isDelegate ? "delegate" : (t.kind || "shell");
+    const badge = el("span", "kind-badge " + (isDelegate ? "delegate" : shellKind),
+      isDelegate ? "子代理" : shellKind);
     line.appendChild(badge);
     line.appendChild(el("span", "task-label", shortTaskLabel(t)));
     if (t.role) line.appendChild(el("span", "task-meta trole", t.role));

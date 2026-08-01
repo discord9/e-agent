@@ -914,7 +914,7 @@ impl TuiState {
                 let Some(task) = running.get(self.task_cursor) else {
                     return TaskSelection::None;
                 };
-                return if task.kind == "bash" {
+                return if task.kind != "delegate" {
                     TaskSelection::OpenDetail(task.id)
                 } else if attachable(self, task.id) {
                     // Delegate: attach, exactly like a cursor move.
@@ -932,7 +932,7 @@ impl TuiState {
         let Some(task) = running.get(self.task_cursor) else {
             return TaskSelection::None;
         };
-        if task.kind == "bash" {
+        if task.kind != "delegate" {
             TaskSelection::OpenDetail(task.id)
         } else if attachable(self, task.id) {
             TaskSelection::Attach(task.id)
