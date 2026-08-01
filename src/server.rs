@@ -13,6 +13,8 @@
 //! | GET    | `/api/sessions/{id}/summary`     | per-turn summary cache (desktop pet) |
 //! | POST   | `/api/sessions/{id}/prompt`       | queue a prompt                     |
 //! | POST   | `/api/sessions/{id}/btw`          | fork into a persistent subagent    |
+//! | GET    | `/api/sessions/{id}/fork-candidates` | turn boundaries to fork at (at/seq/preview) |
+//! | POST   | `/api/sessions/{id}/fork`          | fork at a turn boundary into a `fork-…` session |
 //! | POST   | `/api/sessions/{id}/cancel`       | cancel the in-flight turn          |
 //! | POST   | `/api/sessions/{id}/compact`      | request compaction                 |
 //! | POST   | `/api/sessions/{id}/undo`         | undo the most recent file operation |
@@ -176,6 +178,8 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/summary", get(session_summary))
         .route("/api/sessions/{id}/prompt", post(session_prompt))
         .route("/api/sessions/{id}/btw", post(session_btw))
+        .route("/api/sessions/{id}/fork-candidates", get(fork_candidates))
+        .route("/api/sessions/{id}/fork", post(session_fork))
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/compact", post(session_compact))
         .route("/api/sessions/{id}/undo", post(session_undo))
@@ -1205,38 +1209,11 @@ async fn session_history(
     // registry session owns one, and a subagent's `SessionEntry` carries
     // its own (connected at spawn time) — so history reads the same rows
     // the session itself persists to, with no per-request store connect.
-    let store = match live(&state, &id) {
-        Ok(SessionRef::Live(session)) => session.store.clone(),
-        Ok(SessionRef::Subagent(entry)) => entry.store.clone(),
-        Err((StatusCode::NOT_FOUND, _)) => {
-            // Historical session: not in any registry, but the transcript
-            // may still be persisted. Connect a store by id and read the
-            // same rows the live path would. A truly unknown id leaves the
-            // store empty → 404; ids that can never exist (invalid session
-            // name) also 404, keeping the previous registry-miss semantics.
-            if crate::session::validate_session_name(&id).is_err() {
-                return Err(error(
-                    StatusCode::NOT_FOUND,
-                    format!("session {id} not found"),
-                ));
-            }
-            let store = SessionStore::connect(state.factory.backend(), root, &id)
-                .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-            let loaded = store
-                .load_head(root, &id)
-                .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-            if loaded.entries.is_empty() {
-                return Err(error(
-                    StatusCode::NOT_FOUND,
-                    format!("session {id} not found"),
-                ));
-            }
-            store
-        }
-        Err(err) => return Err(err),
-    };
+    // Historical fallback (registry miss): connect a store by id and read
+    // the same rows the live path would; a truly unknown id leaves the
+    // store empty → 404, and ids that can never exist (invalid session
+    // name) also 404, keeping the previous registry-miss semantics.
+    let store = resolve_session_store(&state, &id).await?;
     let (entries, next_before_seq) = match params.before_seq {
         None => {
             // Head segment; the cursor is the seq of the compaction that
@@ -1266,6 +1243,178 @@ async fn session_history(
         entries: cap_entries(entries, params.limit),
         next_before_seq,
     }))
+}
+
+/// Resolve a session to a transcript store: the live registry first, then
+/// every live session's subagent registry, then a direct store connect for
+/// historical sessions (404 when the transcript truly does not exist).
+/// Shared by `session_history` and the fork endpoints so all of them accept
+/// the same source set — live sessions, subagents, and finished/historical
+/// sessions alike.
+async fn resolve_session_store(
+    state: &AppState,
+    id: &str,
+) -> Result<SessionStore, (StatusCode, String)> {
+    let root = state.factory.root();
+    match live(state, id) {
+        Ok(SessionRef::Live(session)) => Ok(session.store.clone()),
+        Ok(SessionRef::Subagent(entry)) => Ok(entry.store.clone()),
+        Err((StatusCode::NOT_FOUND, _)) => {
+            if crate::session::validate_session_name(id).is_err() {
+                return Err(error(
+                    StatusCode::NOT_FOUND,
+                    format!("session {id} not found"),
+                ));
+            }
+            let store = SessionStore::connect(state.factory.backend(), root, id)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let loaded = store
+                .load_head(root, id)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            if loaded.entries.is_empty() {
+                return Err(error(
+                    StatusCode::NOT_FOUND,
+                    format!("session {id} not found"),
+                ));
+            }
+            Ok(store)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// One forkable history position, as listed by `fork-candidates` and echoed
+/// straight back to `POST .../fork`.
+#[derive(Serialize)]
+struct ForkCandidate {
+    /// 1-based index into the full history (`fork_prefix` semantics: the
+    /// entry itself is kept, so the fork keeps `entries[0..=at-1]`).
+    at: usize,
+    /// `load_with_seq` seq — the JSONL line number (0-based) or the real
+    /// Greptime seq; passed through untouched as provenance.
+    seq: i64,
+    /// Display text truncated to ≤ 80 chars (with ellipsis).
+    preview: String,
+}
+
+/// Display preview for one history entry, truncated to ≤ 80 chars via
+/// `agent::preview` (keeps a 2:1 head-to-tail ratio inside the budget).
+/// Drives the fork panel's message list.
+fn entry_preview(entry: &SessionEntry) -> String {
+    const MAX: usize = 80;
+    let text = match entry {
+        SessionEntry::Message {
+            message: Message::User { content, .. },
+        } => content.clone(),
+        SessionEntry::Message {
+            message: Message::Assistant(assistant),
+        } => match &assistant.content {
+            Some(content) => content.clone(),
+            None if !assistant.tool_calls.is_empty() => "（工具调用步骤）".to_owned(),
+            None => "（系统条目）".to_owned(),
+        },
+        SessionEntry::Message {
+            message: Message::Tool { name, content, .. },
+        } => format!("{name}: {content}"),
+        SessionEntry::Compaction { summary, .. } => format!("📦 压缩：{summary}"),
+        _ => "（系统条目）".to_owned(),
+    };
+    preview(&text, MAX)
+}
+
+/// `GET /api/sessions/{id}/fork-candidates` — every turn boundary in the
+/// session's full history, for the web fork panel. Each item carries the
+/// 1-based `at` the frontend echoes back to `POST .../fork`, the backend
+/// seq, and a truncated preview. Only turn boundaries are listed, so every
+/// listed position forks without error. Empty session → 200 `[]`; unknown
+/// session → 404 (same resolution and error style as `session_history`).
+async fn fork_candidates(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ForkCandidate>>, (StatusCode, String)> {
+    let root = state.factory.root();
+    let store = resolve_session_store(&state, &id).await?;
+    let with_seq = store
+        .load_with_seq(root, &id)
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let candidates = with_seq
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, entry))| crate::agent::is_turn_boundary(entry))
+        .map(|(index, (seq, entry))| ForkCandidate {
+            at: index + 1,
+            seq: *seq,
+            preview: entry_preview(entry),
+        })
+        .collect();
+    Ok(Json(candidates))
+}
+
+#[derive(Deserialize)]
+struct ForkBody {
+    /// 1-based index into the full history, as listed by `fork-candidates`.
+    /// Optional so a missing field is handled as our 400 (axum's Json
+    /// extractor would otherwise reject with 422 before the handler runs).
+    at: Option<usize>,
+}
+
+/// `POST /api/sessions/{id}/fork` — fork the source session's history up
+/// to the 1-based turn boundary `at` into a fresh `fork-…` session and
+/// register it as live. The new session starts idle (`runner.start(None)`):
+/// it sends nothing until the frontend resumes it, mirroring `--fork` in
+/// the CLI. The source may be live, a subagent, or historical (same
+/// resolution as `fork-candidates` / `session_history`).
+/// 201 + `{"id": "fork-…"}`; 400 when `at` is missing or 0; 404 for an
+/// unknown source; 409 when `at` is not a forkable turn boundary.
+async fn session_fork(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ForkBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    let at = match body.at {
+        Some(at) if at > 0 => at,
+        _ => return Err(error(StatusCode::BAD_REQUEST, "at must be 1-based")),
+    };
+    // Resolve the source first (404 before any build work); the store is
+    // only needed for the existence check — `build` re-connects by id.
+    resolve_session_store(&state, &id).await?;
+    let built = state
+        .factory
+        .build(
+            &id,
+            Some((id.clone(), Some(at))),
+            None,
+            IdlePolicy::WaitForInput,
+            UnfinishedPolicy::Preserve,
+        )
+        .await
+        .map_err(|e| {
+            let message = format!("{e:#}");
+            if message.contains("fork point") || message.contains("no completed turn") {
+                error(StatusCode::CONFLICT, format!("无法 fork：{message}"))
+            } else {
+                error(StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
+        })?;
+    let new_id = built.session.clone();
+    let session = Arc::new(LiveSession {
+        handle: built.handle,
+        task: built.runner.start(None),
+        store: built.store,
+        background: built.background,
+        sessions: built.sessions,
+        model_name: built.model_name,
+        role_name: built.role_name,
+        created_at: chrono::Utc::now(),
+    });
+    state.registry.insert(new_id.clone(), session);
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": new_id })),
+    ))
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3001,6 +3150,394 @@ mod tests {
         );
         assert_eq!(value["next_before_seq"], serde_json::Value::Null);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- Web fork panel: `fork-candidates` + `fork` ---------------------
+
+    fn user_message(content: &str) -> SessionEntry {
+        SessionEntry::Message {
+            message: Message::User {
+                content: content.to_owned(),
+                images: vec![],
+            },
+        }
+    }
+
+    fn assistant_message(content: &str) -> SessionEntry {
+        use crate::agent::AssistantMessage;
+        SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: Some(content.to_owned()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        }
+    }
+
+    /// An assistant message with pending tool calls — NOT a turn boundary.
+    fn assistant_with_tool_calls() -> SessionEntry {
+        use crate::agent::{AssistantMessage, ToolCall};
+        SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    arguments: "ls".into(),
+                }],
+                reasoning: None,
+            }),
+        }
+    }
+
+    fn tool_message(name: &str, content: &str) -> SessionEntry {
+        SessionEntry::Message {
+            message: Message::Tool {
+                call_id: "call_1".into(),
+                name: name.to_owned(),
+                content: content.to_owned(),
+                is_error: false,
+                synthetic: false,
+            },
+        }
+    }
+
+    /// A fresh AppState whose factory root is an isolated temp dir (parallel
+    /// tests share the default test root, so fork tests write their own
+    /// session files to a private one).
+    fn fork_test_state(tag: &str) -> (Arc<AppState>, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("e-agent-server-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(root.clone()),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+        });
+        (state, root)
+    }
+
+    /// `entry_preview` extracts display text per entry kind, truncated to
+    /// ≤ 80 chars: user/assistant content verbatim, mid-turn tool steps as
+    /// "name: content", compactions with a 📦 prefix, and everything else
+    /// a fixed system marker.
+    #[test]
+    fn entry_preview_extracts_display_text() {
+        let long = "字".repeat(100);
+        assert_eq!(entry_preview(&user_message("你好")), "你好");
+        assert_eq!(entry_preview(&assistant_message("回答")), "回答");
+        assert_eq!(
+            entry_preview(&assistant_with_tool_calls()),
+            "（工具调用步骤）"
+        );
+        assert_eq!(entry_preview(&tool_message("bash", "ls")), "bash: ls");
+        assert_eq!(
+            entry_preview(&SessionEntry::Compaction {
+                summary: "前情".into(),
+                retained: vec![],
+            }),
+            "📦 压缩：前情"
+        );
+        assert_eq!(
+            entry_preview(&SessionEntry::Notice {
+                text: "note".into()
+            }),
+            "（系统条目）"
+        );
+        // Truncation: ≤ 80 chars with an ellipsis, tail kept for identity.
+        let preview = entry_preview(&user_message(&long));
+        assert!(preview.chars().count() <= 80, "{preview}");
+        assert!(preview.contains('…'), "{preview}");
+    }
+
+    /// Web fork panel: `GET .../fork-candidates` lists every turn boundary
+    /// of a session — assistant messages with no pending tool calls only —
+    /// with the 1-based `at`, the backend seq, and a truncated preview.
+    /// User, tool and mid-turn assistant entries are skipped.
+    #[tokio::test]
+    async fn fork_candidates_lists_turn_boundaries() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::session::Session;
+
+        let (state, root) = fork_test_state("fork-candidates");
+        let id = "fork-candidates-src";
+        Session::append(
+            &root,
+            id,
+            &[
+                user_message("第一问"),
+                assistant_message("第一答"),
+                user_message("第二问"),
+                assistant_with_tool_calls(),
+                tool_message("bash", "ok"),
+                assistant_message("第二答"),
+            ],
+        )
+        .unwrap();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/fork-candidates"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Only the two completed turns qualify; at is 1-based, seq is the
+        // 0-based JSONL line index.
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {"at": 2, "seq": 1, "preview": "第一答"},
+                {"at": 6, "seq": 5, "preview": "第二答"},
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Web fork panel: unknown session id → 404, same as `session_history`.
+    #[tokio::test]
+    async fn fork_candidates_404_unknown() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let app = router(test_app_state("sekrit"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/does-not-exist/fork-candidates")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `POST .../fork` at a turn boundary copies the source prefix (1-based,
+    /// inclusive) plus a `forked_from` marker into a fresh `fork-…` session,
+    /// registers it as live (immediately readable via history), and returns
+    /// 201 + the new id.
+    #[tokio::test]
+    async fn fork_at_boundary_creates_session() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::session::Session;
+
+        let (state, root) = fork_test_state("fork-create");
+        let id = "fork-src-session";
+        let source = [
+            user_message("hello"),
+            assistant_message("hi there"),
+            user_message("第二个问题"),
+            assistant_message("第二个回答"),
+        ];
+        Session::append(&root, id, &source).unwrap();
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/fork"))
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"at": 4}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let new_id = value["id"].as_str().expect("fork id").to_owned();
+        assert!(new_id.starts_with("fork-"), "{new_id}");
+
+        // The fork- session is registered and its history is the source
+        // prefix (first 4 entries) plus the forked_from marker at the cut.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{new_id}/history"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries: Vec<SessionEntry> = serde_json::from_value(value["entries"].clone()).unwrap();
+        assert_eq!(entries.len(), source.len() + 1);
+        assert_eq!(entries[..source.len()], source);
+        assert_eq!(
+            entries[source.len()],
+            SessionEntry::ForkedFrom {
+                source: id.to_owned(),
+                at: 4,
+                event_time: None,
+                seq: Some(3),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `POST .../fork` rejects an `at` that points at an assistant message
+    /// with pending tool calls (mid-turn) with 409 + a Chinese error.
+    #[tokio::test]
+    async fn fork_rejects_non_boundary_at() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::session::Session;
+
+        let (state, root) = fork_test_state("fork-nonboundary");
+        let id = "fork-nonboundary-src";
+        Session::append(
+            &root,
+            id,
+            &[
+                user_message("q1"),
+                assistant_message("a1"),
+                user_message("q2"),
+                assistant_with_tool_calls(), // index 4 (1-based) — mid-turn
+                tool_message("bash", "ok"),
+                assistant_message("a2"),
+            ],
+        )
+        .unwrap();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/fork"))
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"at": 4}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let message = String::from_utf8(body.to_vec()).unwrap();
+        assert!(message.contains("无法 fork"), "{message}");
+        assert!(message.contains("not a turn boundary"), "{message}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `POST .../fork` rejects an `at` beyond the last entry with 409.
+    #[tokio::test]
+    async fn fork_rejects_out_of_range() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::session::Session;
+
+        let (state, root) = fork_test_state("fork-range");
+        let id = "fork-range-src";
+        Session::append(&root, id, &[user_message("q1"), assistant_message("a1")]).unwrap();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/fork"))
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"at": 99}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let message = String::from_utf8(body.to_vec()).unwrap();
+        assert!(message.contains("无法 fork"), "{message}");
+        assert!(message.contains("out of range"), "{message}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `POST .../fork` on an unknown session id → 404 before any build work.
+    #[tokio::test]
+    async fn fork_unknown_session_404() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let app = router(test_app_state("sekrit"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/does-not-exist/fork")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"at": 1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `POST .../fork` with a missing `at` or `at: 0` → 400.
+    #[tokio::test]
+    async fn fork_missing_at_400() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let app = router(test_app_state("sekrit"));
+        let response = |body: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/api/sessions/some-session/fork")
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let missing = response(r#"{}"#.to_owned()).await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST, "missing at");
+        let zero = response(r#"{"at": 0}"#.to_owned()).await;
+        assert_eq!(zero.status(), StatusCode::BAD_REQUEST, "at = 0");
     }
 
     /// M5: `session_history` with a `before_seq` cursor must forward

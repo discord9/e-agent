@@ -421,7 +421,10 @@ impl From<Message> for SessionEntry {
 /// True for entries that end a completed turn: an assistant message with no
 /// pending tool calls, or a compaction. Forking may only cut the history at
 /// such a boundary, so the forked session never starts mid-turn.
-fn is_turn_boundary(entry: &SessionEntry) -> bool {
+/// `pub(crate)` because the Web fork-candidates endpoint (`src/server.rs`)
+/// lists exactly these positions so the frontend only ever forks at a
+/// boundary.
+pub(crate) fn is_turn_boundary(entry: &SessionEntry) -> bool {
     matches!(entry, SessionEntry::Compaction { .. })
         || matches!(
             entry,
