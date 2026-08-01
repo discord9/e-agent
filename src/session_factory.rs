@@ -243,6 +243,30 @@ impl SessionFactory {
         self.main_context_window
     }
 
+    /// The main model, shared by every built session. The btw fork entry
+    /// (`delegate::spawn_btw_subagent`) runs the subagent on the source
+    /// session's own model, so the server passes this through.
+    pub fn main_model(&self) -> &ConfiguredModel {
+        &self.main_model
+    }
+
+    /// The workspace every session works in; btw fork subagents inherit it.
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
+    }
+
+    /// The resolved bwrap policy (`None` = sandbox disabled); btw fork
+    /// subagents inherit it.
+    pub fn sandbox(&self) -> Option<&Sandbox> {
+        self.sandbox.as_ref()
+    }
+
+    /// The read-only policy every session builds with; btw fork subagents
+    /// inherit it (a read-only parent forks read-only subagents).
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// Build one session end-to-end, in the exact order `main.rs::run()`
     /// used: store connect → fork → tools → MCP → delegate → agent →
     /// context prefix → history restore → unfinished-background handling →
