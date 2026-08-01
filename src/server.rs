@@ -1999,6 +1999,7 @@ mod tests {
             parent_task_id: None,
             title: title.map(str::to_owned),
             pinned: None,
+            writer: None,
             label: None,
         };
         // One registry session plus two historical sessions, one of which

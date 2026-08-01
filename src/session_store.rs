@@ -60,6 +60,16 @@ pub struct SessionMeta {
     /// as unpinned). Greptime only — the JSONL backend has no meta table
     /// and never produces values.
     pub pinned: Option<bool>,
+    /// Writer process identity of this snapshot row
+    /// (`pid@hostname#nonce`, see `session_greptime::process_identity`):
+    /// the process whose `insert_meta` stamped the row (the most recent
+    /// insert_meta for this snapshot — the audit table records every
+    /// snapshot's writer, and the latest one doubles as a best-effort hint
+    /// in concurrent-write conflict errors). `None` for rows written
+    /// before the column existed (the migration reads them back as NULL).
+    /// Greptime only — the JSONL backend has no meta table and never
+    /// produces values.
+    pub writer: Option<String>,
     /// Task-panel label of the delegate task that spawned this session
     /// (see [`SessionStore::label_for_subagent`]). Never stored in the
     /// sessions table — it lives in `running_tasks` and is resolved at
