@@ -178,6 +178,33 @@ impl Tool for WriteFile {
     }
 }
 
+/// Line-ending style of a file, detected from its content.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LineEnding {
+    /// CRLF (`\r\n`) — typical on Windows.
+    Crlf,
+    /// LF (`\n`) — typical on Unix.
+    Lf,
+}
+
+/// Return (content with CRLF normalized to LF, detected line-ending style).
+/// Mixed files are treated as CRLF if any CRLF is present (conservative:
+/// preserves the dominant Windows style).
+fn normalize_lf(content: &str) -> (String, LineEnding) {
+    let has_crlf = content.contains("\r\n");
+    let style = if has_crlf {
+        LineEnding::Crlf
+    } else {
+        LineEnding::Lf
+    };
+    (content.replace("\r\n", "\n"), style)
+}
+
+/// Convert LF back to CRLF (used when writing to a CRLF-style file).
+fn lf_to_crlf(content: &str) -> String {
+    content.replace('\n', "\r\n")
+}
+
 pub(super) struct EditFile {
     pub(super) workspace: Workspace,
 }
@@ -205,15 +232,28 @@ impl Tool for EditFile {
             return Err("`old` must not be empty".into());
         }
         let content = self.workspace.read_to_string(path)?;
-        let count = content.match_indices(old).count();
+        // Normalize line endings before matching: on Windows files are
+        // typically CRLF, but the model's `old`/`new` usually use LF. Match
+        // in LF space and restore the file's own line-ending style on write,
+        // so an edit never flips a CRLF file to LF (or vice versa) and git
+        // does not see fake whole-line diffs.
+        let (content_lf, output_line_ending) = normalize_lf(&content);
+        let old_lf = normalize_lf(old).0;
+        let new_lf = normalize_lf(new).0;
+        let count = content_lf.match_indices(&old_lf).count();
         if count != 1 {
             return Err(format!(
                 "expected `old` exactly once, found {count} occurrences"
             ));
         }
-        let start = content.match_indices(old).next().unwrap().0;
-        let line = content[..start].matches('\n').count() + 1;
-        self.workspace.write(path, content.replacen(old, new, 1))?;
+        let start = content_lf.match_indices(&old_lf).next().unwrap().0;
+        let line = content_lf[..start].matches('\n').count() + 1;
+        let replaced = content_lf.replacen(&old_lf, &new_lf, 1);
+        let output = match output_line_ending {
+            LineEnding::Crlf => lf_to_crlf(&replaced),
+            LineEnding::Lf => replaced,
+        };
+        self.workspace.write(path, output)?;
         Ok(format!("file edited (line {line})"))
     }
 }

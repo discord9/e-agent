@@ -361,6 +361,33 @@ async fn edit_requires_exactly_one_match() {
     assert_eq!(std::fs::read_to_string(path).unwrap(), "one x one");
 }
 
+#[tokio::test]
+async fn edit_preserves_crlf_line_endings() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("file.txt");
+    // CRLF file (Windows-style); the model's old/new use LF.
+    std::fs::write(&path, "line one\r\nline two\r\nline three\r\n").unwrap();
+    let result = edit(&temp, "line two", "line TWO").await.unwrap();
+    assert_eq!(result, "file edited (line 2)");
+    // The whole file must still be CRLF — no fake whole-line diffs.
+    let after = std::fs::read_to_string(path).unwrap();
+    assert_eq!(after, "line one\r\nline TWO\r\nline three\r\n");
+    // Every line ending is CRLF (no lone LF introduced by the edit).
+    assert_eq!(after.matches("\r\n").count(), 3);
+    assert_eq!(after.replace("\r\n", "").matches('\n').count(), 0);
+}
+
+#[tokio::test]
+async fn edit_matches_lf_old_against_crlf_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("file.txt");
+    // Old text passed by the model without \r must still match a CRLF file.
+    std::fs::write(&path, "alpha\r\nbeta\r\n").unwrap();
+    let result = edit(&temp, "beta", "BETA").await.unwrap();
+    assert_eq!(result, "file edited (line 2)");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "alpha\r\nBETA\r\n");
+}
+
 async fn read(temp: &tempfile::TempDir, arguments: Value) -> Result<String, String> {
     ReadFile {
         workspace: Workspace::new(temp.path()).unwrap(),
