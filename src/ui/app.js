@@ -1636,6 +1636,7 @@ function openSidebar() {
   renderSidebarTree();                 // 树可能已随轮询刷新；打开时确保渲染
   els.sidebarOverlay.hidden = false;
   els.sidebar.hidden = false;
+  document.body.classList.add("sidebar-open");
   // 双 rAF：先让浏览器以 -100% 位姿渲染一帧，再加 .open 触发左滑过渡
   requestAnimationFrame(() => requestAnimationFrame(() => els.sidebar.classList.add("open")));
   pollTasks();   // 打开时立即刷新树内任务分组（统一轮询常驻，这里只求即时性）
@@ -1649,6 +1650,7 @@ function closeSidebar() {
   persistSidebarOpen();                // 跨刷新保持关闭状态
   els.sidebarOverlay.hidden = true;
   els.sidebar.classList.remove("open");
+  document.body.classList.remove("sidebar-open");
   window.setTimeout(() => {
     if (!state.sidebar.open) els.sidebar.hidden = true;
   }, 220);
