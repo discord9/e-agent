@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""手机视口用例：390px 不横向溢出（列表 / 聊天 / 侧边栏展开）。
+
+基于 05fc4c8 行为：侧边栏为覆盖式（遮罩显示、内容不位移）；
+挤压布局/持续打开未合入，见 cases/skipped.py（TODO）。
+"""
+import common
+
+def S(id_, parent=None, title=None, label=None, active=True, busy=False):
+    d = {"id": id_, "model": "flash", "role": "fixer" if parent else "main",
+         "status": "Busy" if busy else "Idle", "busy": busy,
+         "parent_session_id": parent, "title": title,
+         "entry_count": 2, "created_at": "2026-01-01T00:00:00Z"}
+    if active is not None:
+        d["active"] = active
+    if label is not None:
+        d["label"] = label
+    return d
+
+SESSIONS = [
+    S("root-a", None, "根会话A"),
+    S("root-b", None, "根会话B"),
+    S("sub-a1", "root-a", "子任务", label="任务A-1"),
+    S("sub-a2", "root-a", "旧任务", active=False, label="任务A-2"),
+    S("orphan-1", "ghost", "孤儿", label="孤儿任务"),
+]
+
+async def run_mobile_390(c):
+    c.sessions = SESSIONS
+    await c.start()
+
+    def overflow_ok():
+        return c.ev("[document.documentElement.scrollWidth <= window.innerWidth,"
+                    " document.documentElement.scrollWidth, window.innerWidth]")
+
+    w = await overflow_ok()
+    c.check("列表视图 390px 不横向溢出", w[0] is True, str(w[1:]))
+
+    # 打开聊天
+    await c.page.locator("#sessionList .session-row", has_text="root-a").first.click()
+    await c.page.wait_for_function("() => state.view === 'chat'")
+    await c.page.wait_for_timeout(400)
+    w = await overflow_ok()
+    c.check("聊天视图 390px 不横向溢出", w[0] is True, str(w[1:]))
+
+    # 打开侧边栏（覆盖式）
+    await c.open_sidebar()
+    await c.page.wait_for_timeout(400)
+    w = await overflow_ok()
+    c.check("侧边栏打开 390px 不横向溢出", w[0] is True, str(w[1:]))
+    sw = await c.ev("els.sidebar.getBoundingClientRect().width")
+    c.check("侧边栏宽度 <= 85vw(331.5)", sw <= 331.5, f"w={sw}")
+    c.check("手机覆盖式：内容不右移",
+            await c.ev("els.chatView.getBoundingClientRect().x") == 0, "")
+    c.check("手机遮罩显示",
+            await c.ev("!els.sidebarOverlay.hidden && getComputedStyle(els.sidebarOverlay).display !== 'none'"), "")
+
+    # 树行切会话：侧边栏保持打开（05fc4c8 行为），聊天可见
+    tree_rows = c.page.locator("#sidebarTree .tree-row")
+    await tree_rows.first.click()
+    await c.page.wait_for_function("() => state.view === 'chat'")
+    await c.page.wait_for_timeout(300)
+    c.check("树行切会话后侧边栏仍打开", await c.ev("state.sidebar.open") is True, "")
+    w = await overflow_ok()
+    c.check("切会话后仍不横向溢出", w[0] is True, str(w[1:]))
+
+    # 点遮罩关闭
+    await c.page.mouse.click(370, 400)
+    await c.page.wait_for_timeout(500)
+    c.check("手机点遮罩关闭侧边栏", await c.ev("!state.sidebar.open"), "")
+
+CASES = [
+    {"name": "mobile_390", "desc": "手机视口 390px：列表/聊天/侧边栏无横向溢出 + 遮罩关闭",
+     "mobile": True, "run": run_mobile_390},
+]
