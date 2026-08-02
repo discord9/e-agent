@@ -15,7 +15,18 @@
   <div class="top-actions" id="topActions" hidden>
     <button id="backBtn">← 返回列表</button>
     <button id="backParentBtn" title="返回主会话" hidden>← 主会话</button>
+    <select id="workspaceSelect" title="切换服务器实例"></select>
+    <button id="workspaceAddBtn" type="button" class="ws-btn" title="添加服务器实例">+</button>
+    <button id="workspaceRemoveBtn" type="button" class="ws-btn danger" title="删除当前服务器实例" disabled>×</button>
     <span id="connState" class="conn-state"></span>
+  </div>
+  <!-- 添加服务器实例的内联编辑面板：点「+」展开，保存后立即激活新实例 -->
+  <div id="workspaceEditor" class="ws-editor" hidden>
+    <input id="wsNameInput" placeholder="名称" autocomplete="off" spellcheck="false">
+    <input id="wsUrlInput" placeholder="URL（留空 = 同源）" autocomplete="off" spellcheck="false">
+    <input id="wsTokenInput" type="password" placeholder="Token（可选）" autocomplete="off" spellcheck="false">
+    <button id="wsSaveBtn" type="button" class="primary">保存</button>
+    <button id="wsCancelBtn" type="button">取消</button>
   </div>
   <div class="token-box">
     <!-- 默认折叠成小按钮：点击展开输入框，再点 / Esc / 失焦收起（app.js） -->

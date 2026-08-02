@@ -35,6 +35,8 @@ const PROMPT_PLACEHOLDER = "输入消息：Enter 发送，Shift+Enter 换行…"
  * ===================================================================*/
 const state = {
   token: localStorage.getItem("eagent_token") || "",
+  workspaces: [],            // [{id,name,url,token}] 多服务器实例（initWorkspaces 填充）
+  workspace: null,           // 当前激活的 workspace 对象（state.token 是其派生字段）
   view: "list",              // "list" | "chat"
   sessionId: null,           // 当前打开的会话
   status: "Idle",
@@ -94,6 +96,10 @@ const els = {
   sidebarFilter: $("sidebarFilter"),
   sidebarTree: $("sidebarTree"),
   tasksToggleBar: $("tasksToggleBar"), composerTasks: $("composerTasks"),
+  workspaceSelect: $("workspaceSelect"), workspaceAddBtn: $("workspaceAddBtn"),
+  workspaceRemoveBtn: $("workspaceRemoveBtn"), workspaceEditor: $("workspaceEditor"),
+  wsNameInput: $("wsNameInput"), wsUrlInput: $("wsUrlInput"), wsTokenInput: $("wsTokenInput"),
+  wsSaveBtn: $("wsSaveBtn"), wsCancelBtn: $("wsCancelBtn"),
 };
 
 /* =====================================================================
@@ -160,6 +166,203 @@ function pickText(payload, keys) {
 }
 
 /* =====================================================================
+ * 多工作区（多服务器实例）
+ * 每个 workspace = {id, name, url, token}：url 是另一台 e-agent 实例的
+ * 根地址（去尾部斜杠；空 = 同源相对路径），token 是该实例的访问令牌。
+ * 持久化：localStorage "eagent.workspaces"（JSON 数组）+
+ * "eagent.activeWorkspace"（激活 id）。state.workspace 是激活对象；
+ * state.token 是派生字段，始终跟随激活 workspace 的 token（既有代码
+ * 全部读 state.token，保持兼容）。
+ * ===================================================================*/
+function normalizeWorkspaceUrl(url) {
+  return String(url || "").trim().replace(/\/+$/, "");
+}
+
+function saveWorkspaces() {
+  try {
+    localStorage.setItem("eagent.workspaces", JSON.stringify(state.workspaces));
+    localStorage.setItem("eagent.activeWorkspace", state.workspace.id);
+  } catch (e) { /* localStorage 不可用（隐私模式等）：静默，功能退化为本次会话内 */ }
+}
+
+/* 启动时加载；从未保存过 → 建默认条目 {id:"default", name:"默认", url:"",
+   token:state.token}，既有单服务器行为完全不变。 */
+function initWorkspaces() {
+  let list = null;
+  try {
+    const raw = localStorage.getItem("eagent.workspaces");
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) list = parsed;
+    }
+  } catch (e) { list = null; }
+  if (!list) list = [{ id: "default", name: "默认", url: "", token: state.token || "" }];
+  for (const ws of list) {
+    if (!ws.id) ws.id = "ws-" + Math.random().toString(36).slice(2, 10);
+    if (!ws.name) ws.name = ws.url || "默认";
+    ws.url = normalizeWorkspaceUrl(ws.url);
+    if (!ws.token) ws.token = "";
+  }
+  state.workspaces = list;
+  let active = null;
+  try {
+    const activeId = localStorage.getItem("eagent.activeWorkspace");
+    active = list.find((w) => w.id === activeId) || null;
+  } catch (e) { active = null; }
+  if (!active) active = list[0];
+  state.workspace = active;
+  state.token = active.token || "";   // state.token 跟随激活 workspace
+  saveWorkspaces();
+  renderWorkspaceSelect();
+}
+
+/* 激活 workspace 的 base url（已去尾部斜杠；空 = 同源相对路径） */
+function workspaceBaseUrl() {
+  const ws = state.workspace;
+  return (ws && ws.url) ? ws.url : "";
+}
+
+/* 相对 API 路径 → 完整 URL：base（无尾斜杠）+ 以 "/" 开头的 path。
+   空 base → 原样返回（同源相对请求，既有行为不变）。 */
+function fullUrl(path) {
+  const base = workspaceBaseUrl();
+  if (!base) return path;
+  return base + (path.startsWith("/") ? path : "/" + path);
+}
+
+function renderWorkspaceSelect() {
+  if (!els.workspaceSelect) return;
+  els.workspaceSelect.innerHTML = "";
+  for (const ws of state.workspaces) {
+    const opt = document.createElement("option");
+    opt.value = ws.id;
+    opt.textContent = ws.name;
+    if (ws === state.workspace) opt.selected = true;
+    els.workspaceSelect.appendChild(opt);
+  }
+  if (els.workspaceRemoveBtn) {
+    els.workspaceRemoveBtn.disabled = state.workspaces.length <= 1;   // 唯一一个时禁止删除
+  }
+}
+
+/* 切换工作区：清空全部会话/聊天/任务状态，视图回到列表，重跑启动加载序列 */
+function switchWorkspace(id) {
+  const ws = state.workspaces.find((w) => w.id === id);
+  if (!ws || ws === state.workspace) return;
+  stopPolling();
+  stopTasksPolling();
+  stopSSE();
+  // ---- 清空全部会话/聊天状态 ----
+  state.sessionId = null;
+  state.view = "list";
+  state.sessionStates = {};
+  state.lastList = [];
+  state.queue.length = 0;
+  state.queueExpanded = false;
+  state.acc = null;
+  state.nextBeforeSeq = null;
+  state.loadingOlder = false;
+  state.olderDone = false;
+  state.searchQuery = "";
+  state.initSource = null;           // 旧工作区的历史/快照来源标志不跨工作区保留
+  state.deepLink.pending = null;
+  state.deepLink.handled = true;
+  state.tasks.list = [];
+  state.tasks.cancelling = new Set();
+  state.tasks.pollers = new Map();
+  state.tasks.streams = new Map();
+  state.tasks.streamText = new Map();
+  state.tasks.degraded = new Set();
+  state.tasks.composerOpen = false;
+  state.sidebar.expanded = new Set();
+  state.sidebar.filter = "";
+  state.sidebar.showAll = false;
+  // ---- 切换激活 workspace；state.token 跟随其 token ----
+  state.workspace = ws;
+  state.token = ws.token || "";
+  saveWorkspaces();
+  if (state.token) localStorage.setItem("eagent_token", state.token);
+  else localStorage.removeItem("eagent_token");
+  // ---- 视图重置到列表页（清空 DOM） ----
+  els.chatView.classList.add("hidden");
+  els.listView.classList.remove("hidden");
+  els.topActions.hidden = true;
+  els.backParentBtn.hidden = true;
+  els.messages.innerHTML = "";
+  els.promptInput.value = "";
+  els.promptInput.placeholder = PROMPT_PLACEHOLDER;
+  els.sessionList.innerHTML = "";
+  els.sidebarTree.innerHTML = "";
+  els.searchInput.value = "";
+  els.sidebarFilter.value = "";
+  els.queueBar.hidden = true;
+  els.tasksToggleBar.hidden = true;
+  els.composerTasks.hidden = true;
+  els.composerTasks.innerHTML = "";
+  els.usageInfo.textContent = "";
+  els.composerMeta.hidden = true;
+  els.composerMeta.textContent = "";
+  els.tokenInput.value = state.token;
+  applyStatus("Idle");               // 重置状态条/按钮/placeholder
+  closeWorkspaceEditor();
+  renderWorkspaceSelect();
+  refreshBanner();
+  updateTokenToggle();
+  history.replaceState(null, "", "/");   // 丢弃可能指向旧工作区会话的 ?session= 深链
+  // ---- 重跑启动加载序列（与 init() 的加载部分一致） ----
+  startPolling();
+  pollSessions();
+  startTasksPolling();
+  pollTasks();
+  refreshSessionsForSidebar();
+}
+
+function openWorkspaceEditor() {
+  els.wsNameInput.value = "";
+  els.wsUrlInput.value = "";
+  els.wsTokenInput.value = "";
+  els.workspaceEditor.hidden = false;
+  els.wsNameInput.focus();
+}
+function closeWorkspaceEditor() {
+  if (els.workspaceEditor) els.workspaceEditor.hidden = true;
+}
+
+/* 「+」面板保存：新增一个 workspace 并立即激活（url 留空 = 同源） */
+function saveWorkspaceFromEditor() {
+  const ws = {
+    id: "ws-" + Math.random().toString(36).slice(2, 10),
+    name: els.wsNameInput.value.trim() || "服务器",
+    url: normalizeWorkspaceUrl(els.wsUrlInput.value),
+    token: els.wsTokenInput.value.trim(),
+  };
+  state.workspaces.push(ws);
+  saveWorkspaces();
+  closeWorkspaceEditor();
+  switchWorkspace(ws.id);
+}
+
+/* 「×」删除当前 workspace（仅剩一个时按钮禁用，switchWorkspace 里再挡一道） */
+function removeActiveWorkspace() {
+  if (state.workspaces.length <= 1) return;
+  const idx = state.workspaces.indexOf(state.workspace);
+  state.workspaces.splice(idx, 1);
+  const next = state.workspaces[Math.max(0, idx - 1)] || state.workspaces[0];
+  saveWorkspaces();
+  switchWorkspace(next.id);
+}
+
+els.workspaceSelect.addEventListener("change", () => switchWorkspace(els.workspaceSelect.value));
+els.workspaceAddBtn.addEventListener("click", openWorkspaceEditor);
+els.workspaceRemoveBtn.addEventListener("click", removeActiveWorkspace);
+els.wsSaveBtn.addEventListener("click", saveWorkspaceFromEditor);
+els.wsCancelBtn.addEventListener("click", closeWorkspaceEditor);
+
+/* 启动即加载（须在下方 token 区块读取 state.token 之前执行：
+   els.tokenInput.value 要跟随激活 workspace 的 token） */
+initWorkspaces();
+
+/* =====================================================================
  * Token 与认证
  * ===================================================================*/
 let tokenBoxOpen = false;          // token 输入框展开状态（默认折叠，只显示按钮）
@@ -183,8 +386,11 @@ function setTokenBoxOpen(open) {
 els.tokenInput.value = state.token;
 els.tokenInput.addEventListener("input", () => {
   state.token = els.tokenInput.value.trim();
+  // 同步进当前 workspace 并持久化：token 是 workspace 的字段之一
+  if (state.workspace) state.workspace.token = state.token;
   if (state.token) localStorage.setItem("eagent_token", state.token);
   else localStorage.removeItem("eagent_token");
+  saveWorkspaces();
   refreshBanner();
   restartTransport();   // token 变化 → 重启轮询 / SSE
   updateTokenToggle();  // 按钮文案跟随设置状态
@@ -211,12 +417,13 @@ function refreshBanner() {
   }
 }
 
-/* 统一请求入口：自动附带 Authorization header */
+/* 统一请求入口：自动附带 Authorization header；路径自动前缀激活 workspace
+   的 base url（空 base = 同源相对请求，既有行为不变） */
 async function api(path, opts = {}) {
   const headers = Object.assign({}, opts.headers || {});
   if (state.token) headers["Authorization"] = "Bearer " + state.token;
   if (opts.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
-  return fetch(path, Object.assign({}, opts, { headers }));
+  return fetch(fullUrl(path), Object.assign({}, opts, { headers }));
 }
 
 /* =====================================================================

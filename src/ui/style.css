@@ -116,6 +116,53 @@ mmlEqnNo}
   }
   #tokenInput:focus { outline: 1px solid var(--blue); }
 
+  /* ---------- 工作区切换器（多服务器实例） ---------- */
+  #workspaceSelect {
+    max-width: 160px;
+    padding: 4px 6px;
+    font-size: 12px;
+    font-family: inherit;
+    color: var(--base02);
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+  }
+  #workspaceSelect:focus { outline: 1px solid var(--blue); }
+  .ws-btn {
+    padding: 4px 9px;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .ws-btn.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+
+  /* 「+」添加面板：钉在顶栏下方右侧（topbar 是 sticky 定位，作 absolute 锚点） */
+  .ws-editor {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 14px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  }
+  .ws-editor input {
+    width: 120px;
+    padding: 4px 8px;
+    font-size: 12px;
+    font-family: inherit;
+    color: var(--base02);
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+  }
+  .ws-editor input:focus { outline: 1px solid var(--blue); }
+  .ws-editor button { padding: 4px 10px; font-size: 12px; }
+
   /* ---------- 提示横幅 ---------- */
   .banner {
     display: flex;
@@ -1298,4 +1345,7 @@ mmlEqnNo}
       max-width: 34vw;
     }
     #tokenInput { width: 108px; min-width: 0; }
+    /* 添加面板窄屏换行，不横向溢出 */
+    .ws-editor { flex-wrap: wrap; max-width: calc(100vw - 20px); right: 10px; }
+    .ws-editor input { flex: 1 1 100px; width: auto; }
   }

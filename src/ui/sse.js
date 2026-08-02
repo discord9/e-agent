@@ -21,7 +21,7 @@ function connectSSE(id) {
   state.sse.ctrl = new AbortController();
   const ctrl = state.sse.ctrl;
 
-  fetch("/api/sessions/" + encodeURIComponent(id) + "/events", {
+  fetch(fullUrl("/api/sessions/" + encodeURIComponent(id) + "/events"), {
     headers: {
       "Authorization": "Bearer " + state.token,
       "Accept": "text/event-stream",

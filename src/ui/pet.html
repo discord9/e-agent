@@ -346,7 +346,8 @@
       return;
     }
     const headers = st && st.token ? { "Authorization": "Bearer " + st.token } : {};
-    fetch("/api/sessions/" + encodeURIComponent(sid) + "/summary", { headers })
+    // 多工作区：同文档内 app.js 的 fullUrl() 把相对路径前缀到激活实例的 base url
+    fetch(fullUrl("/api/sessions/" + encodeURIComponent(sid) + "/summary"), { headers })
       .then((res) => res.ok ? res.json() : null)
       .then((data) => {
         if (seq !== petSummarySeq) return;   // 已被更新的点击取代
