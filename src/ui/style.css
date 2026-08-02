@@ -718,7 +718,8 @@ mmlEqnNo}
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* meta 尾部的会话状态：处理中（橙）、压缩中（蓝）、失败（红） */
+  /* meta 尾部的会话状态：处理中（橙）、压缩中（蓝）、失败（红）；
+     busy/compacting 前置转圈动画（纯 CSS 伪元素，不依赖 JS） */
   .composer-meta .composer-status {
     font-weight: 600;
     margin-left: 2px;
@@ -726,6 +727,28 @@ mmlEqnNo}
   .composer-status.busy { color: var(--orange); }
   .composer-status.compacting { color: var(--blue); }
   .composer-status.error { color: var(--red); }
+  .composer-status.busy::before,
+  .composer-status.compacting::before {
+    content: "";
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    margin-right: 4px;
+    border: 1.5px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: composer-status-spin 0.8s linear infinite;
+    vertical-align: -1px;
+  }
+  @keyframes composer-status-spin {
+    to { transform: rotate(360deg); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .composer-status.busy::before,
+    .composer-status.compacting::before {
+      animation: none;
+    }
+  }
 
   /* 排队提示条：固定在输入区上方（composer 内、messages 容器外），
      不随消息滚动。浅黄底 + 橙字，与 banner（红/黄带底边）区分。 */
