@@ -51,6 +51,10 @@ const state = {
   olderDone: false,          // 更早历史已全部加载（next_before_seq 为 null）
   searchQuery: "",           // 会话列表搜索词（已小写化）；轮询重绘后过滤依然生效
   lastList: [],              // 最近一次轮询拿到的完整列表，供搜索框重绘
+                             //（聚合模式下 = 激活 workspace 的列表；所有既有单服务器路径不变）
+  workspaceLists: {},        // workspaceId -> session[]：每台服务器各自的 /api/sessions 缓存
+                             //（聚合侧边栏/聚合列表视图的数据源；由各自 pollWorkspaceSessions 刷新）
+  workspaceErrors: {},       // workspaceId -> error string|null：轮询失败标记（侧边栏显示「无法连接」）
   queue: [],                 // 排队提示（FIFO；最多显示 3 条 + "+N"）
   queueExpanded: false,      // 排队条是否展开显示全部（默认收起）
   deepLink: { pending: null, handled: false },  // URL ?session= 深链：待打开 id + 一次性标志
@@ -59,7 +63,7 @@ const state = {
     open: false,             // 是否打开
     expanded: new Set(),     // 已展开的主会话 id（会话树；重绘时保留）
     filter: "",              // 筛选关键词（已小写化）；空 = 默认显示
-    showAll: false,          // 是否已展开全部主会话（超出 15 条限制时）
+    showAllWs: new Set(),   // 每 workspace 独立：已展开全部主会话的 wsId 集合（超出 15 条限制时）
   },
   tasks: {                   // 运行中任务（composer 折叠条/面板 + 消息列表输出块）
     seq: 0,                  // 统一轮询竞态序号：只应用最新一次响应
@@ -204,6 +208,8 @@ function initWorkspaces() {
     if (!ws.token) ws.token = "";
   }
   state.workspaces = list;
+  state.workspaceLists = {};     // 重新加载：丢弃旧缓存（轮询会重新填充）
+  state.workspaceErrors = {};
   let active = null;
   try {
     const activeId = localStorage.getItem("eagent.activeWorkspace");
@@ -245,18 +251,30 @@ function renderWorkspaceSelect() {
   }
 }
 
-/* 切换工作区：清空全部会话/聊天/任务状态，视图回到列表，重跑启动加载序列 */
-function switchWorkspace(id) {
+/* 跨 workspace 打开/恢复的竞态防护：每次 openSessionIn/resumeSessionIn 递增
+   一个 token，切换完成后只认自己那次（更新的打开/切换会使旧 token 失效），
+   防止「快速点击两个不同服务器的会话」时过期续开覆盖新打开。 */
+let sessionOpenEpoch = 0;
+
+/* 切换工作区：清空当前工作区的会话/聊天/任务状态，视图回到列表，重跑启动
+   加载序列。async：聚合模式下 cross-server 打开先 await 它再 openSession
+   （切换完成的 next tick 才开目标会话）。聚合侧边栏/列表里其它 workspace
+   的缓存列表（state.workspaceLists）保留，切换后立即渲染、不等轮询。 */
+async function switchWorkspace(id, epoch) {
   const ws = state.workspaces.find((w) => w.id === id);
   if (!ws || ws === state.workspace) return;
+  // 直接切换（入口：下拉/侧边栏/增删服务器）声明新代次，使一切在途打开/
+  // 恢复/历史加载失效；openSessionIn/resumeSessionIn 嵌套调用时传入共享的
+  // 代次（claimed），不在此递增——一次动作只有一个 action epoch。
+  const claimed = (epoch === undefined) ? ++sessionOpenEpoch : epoch;
   stopPolling();
   stopTasksPolling();
   stopSSE();
-  // ---- 清空全部会话/聊天状态 ----
+  // ---- 清空当前工作区的会话/聊天状态（其它 workspace 的聚合缓存保留） ----
   state.sessionId = null;
   state.view = "list";
   state.sessionStates = {};
-  state.lastList = [];
+  state.lastList = (state.workspaceLists[ws.id] !== undefined) ? state.workspaceLists[ws.id] : [];
   state.queue.length = 0;
   state.queueExpanded = false;
   state.acc = null;
@@ -276,7 +294,7 @@ function switchWorkspace(id) {
   state.tasks.composerOpen = false;
   state.sidebar.expanded = new Set();
   state.sidebar.filter = "";
-  state.sidebar.showAll = false;
+  state.sidebar.showAllWs = new Set();
   // ---- 切换激活 workspace；state.token 跟随其 token ----
   state.workspace = ws;
   state.token = ws.token || "";
@@ -309,12 +327,14 @@ function switchWorkspace(id) {
   refreshBanner();
   updateTokenToggle();
   history.replaceState(null, "", "/");   // 丢弃可能指向旧工作区会话的 ?session= 深链
+  // ---- 聚合视图立即重绘（用各 workspace 缓存列表，不等轮询） ----
+  renderSessionList();
+  renderSidebarTree(true);
   // ---- 重跑启动加载序列（与 init() 的加载部分一致） ----
   startPolling();
-  pollSessions();
+  pollAllWorkspaces();
   startTasksPolling();
   pollTasks();
-  refreshSessionsForSidebar();
 }
 
 function openWorkspaceEditor() {
@@ -345,8 +365,11 @@ function saveWorkspaceFromEditor() {
 /* 「×」删除当前 workspace（仅剩一个时按钮禁用，switchWorkspace 里再挡一道） */
 function removeActiveWorkspace() {
   if (state.workspaces.length <= 1) return;
-  const idx = state.workspaces.indexOf(state.workspace);
+  const removed = state.workspace;
+  const idx = state.workspaces.indexOf(removed);
   state.workspaces.splice(idx, 1);
+  delete state.workspaceLists[removed.id];    // 清理聚合缓存：被删服务器不再显示
+  delete state.workspaceErrors[removed.id];
   const next = state.workspaces[Math.max(0, idx - 1)] || state.workspaces[0];
   saveWorkspaces();
   switchWorkspace(next.id);
@@ -417,13 +440,31 @@ function refreshBanner() {
   }
 }
 
-/* 统一请求入口：自动附带 Authorization header；路径自动前缀激活 workspace
-   的 base url（空 base = 同源相对请求，既有行为不变） */
-async function api(path, opts = {}) {
+/* workspace 的生效 token：优先 workspace 自身 token；激活 workspace 未单独
+   配置时回退全局 state.token（历史行为：token 输入框直接写 state.token，
+   再同步进 workspace.token）。聚合模式下各服务器 token 彼此独立。 */
+function workspaceToken(ws) {
+  if (ws && ws.token) return ws.token;
+  if (!ws || ws === state.workspace) return state.token || "";
+  return "";
+}
+
+/* 指定 workspace 的请求入口：base url 与 token 各自独立
+   （空 base = 同源相对请求；空 token = 不带 Authorization header） */
+async function apiFor(ws, path, opts = {}) {
   const headers = Object.assign({}, opts.headers || {});
-  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  const token = workspaceToken(ws);
+  if (token) headers["Authorization"] = "Bearer " + token;
   if (opts.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
-  return fetch(fullUrl(path), Object.assign({}, opts, { headers }));
+  const base = (ws && ws.url) ? ws.url : "";
+  const url = base ? base + (path.startsWith("/") ? path : "/" + path) : path;
+  return fetch(url, Object.assign({}, opts, { headers }));
+}
+
+/* 统一请求入口（激活 workspace）：自动附带 Authorization header；路径自动
+   前缀激活 workspace 的 base url（空 base = 同源相对请求，既有行为不变） */
+async function api(path, opts = {}) {
+  return apiFor(state.workspace, path, opts);
 }
 
 /* =====================================================================

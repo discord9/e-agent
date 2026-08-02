@@ -15,7 +15,10 @@
  *      （解析不到时回退就地展开 .task-stream 内嵌 SSE）。
  * 统一轮询 pollTasks()（2s 常驻）：一次 GET /api/tasks 更新面板。
  * ===================================================================*/
-/* GET /api/tasks → 任务数组；失败/无 token 返回 null（调用方决定如何处理） */
+/* GET /api/tasks → 任务数组；失败/无 token 返回 null（调用方决定如何处理）。
+   注意：任务面板保持「激活 workspace」单服务器作用域——聚合多服务器任务
+   超出本轮范围（任务行已带 [workspace:] 参数标签可区分），侧边栏聚合的是
+   会话而非任务。 */
 async function fetchTasks() {
   if (!state.token) return null;
   try {

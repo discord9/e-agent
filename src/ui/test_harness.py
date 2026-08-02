@@ -25,14 +25,14 @@ TRACE = os.environ.get('TRACE') == '1'
 # 那处），保持与拆分前一致的注入目标（startTaskStream 的 TextDecoder 在 harness 中从不执行）。
 js = js.replace('  const decoder = new TextDecoder();', '  const decoder = makeTextDecoder();')
 if TRACE:
-    js = js.replace('async function readSSEStream(reader, id) {',
+    js = js.replace('async function readSSEStream(reader, id, wsId, epoch, ctrl) {',
         'async function readSSEStream(reader, id) {\n  console.log("SSE: stream start");')
     # 下面两处与 startTaskStream 内的同名字符串区分：带 4 空格缩进只命中 readSSEStream
     js = js.replace('    const { done, value } = await reader.read();',
         '    const { done, value } = await reader.read();\n    console.log("SSE: got value", done, JSON.stringify(String(value).slice(0, 120)));')
     js = js.replace('    buf += decoder.decode(value, { stream: true }).replace(/\\r\\n/g, "\\n");',
         '    buf += decoder.decode(value, { stream: true }).replace(/\\r\\n/g, "\\n");\n    console.log("SSE: buf len=" + buf.length + " idx=" + buf.indexOf("\\n\\n"));')
-    js = js.replace('function handleSSEBlock(block, id) {',
+    js = js.replace('function handleSSEBlock(block, id, wsId, epoch) {',
         'function handleSSEBlock(block, id) {\n  console.log("SSE: block event=" + (block.split("\\n")[0] || ""));')
     js = js.replace('function connectSSE(id) {\n  stopSSE();',
         'function connectSSE(id) {\n  console.log("SSE: connect", id);\n  stopSSE();')
@@ -209,11 +209,13 @@ globalThis.requestAnimationFrame=()=>0;
 globalThis.AbortController=class{ constructor(){this.signal={};} abort(){} };
 // gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；用工厂替换页面里的 new TextDecoder()
 function makeTextDecoder(){ return { decode(v){ return typeof v==="string"?v:""; } }; }
-// gjs timers don't fire here; keep them inert.
+// gjs timers don't fire here; keep them inert. setTimeout 记录回调，测试可手动触发
+// （scheduleReconnect 的重连定时器需要验证触发时的三重校验）。
 globalThis.setInterval=()=>0;
 globalThis.clearInterval=()=>{};
-globalThis.setTimeout=()=>0;
-globalThis.clearTimeout=()=>{};
+const scheduledTimeouts=[];
+globalThis.setTimeout=(fn)=>{ scheduledTimeouts.push(fn); return scheduledTimeouts.length; };
+globalThis.clearTimeout=(id)=>{ if (id>0) scheduledTimeouts[id-1]=null; };
 
 const historyData={entries:[
   {type:"message", message:{User:{content:"你好，帮我看看", images:[]}}},
@@ -256,6 +258,18 @@ function stream(){
 function streamEmpty(){
   return { getReader(){ return { read: async()=>({done:true}) } } };
 }
+/* 手动控制的流：第一个 read 挂起（resolve 保存在 a1StreamReadResolve），
+   之后一次性吐出 value，再结束。用于「切换后 A 的陈旧块才到达」的测试。 */
+function streamManual(){
+  let phase = 0;
+  return { getReader(){ return { read: async () => {
+    if (phase === 0) { phase = 1;
+      return new Promise((resolve) => { a1StreamReadResolve = resolve; });
+    }
+    if (phase === 1) { phase = 2; return { done: false, value: "" }; }
+    return { done: true };
+  } }; } };
+}
 function resp(status, body){ return Promise.resolve({ ok:status>=200&&status<300, status, body,
   json:async()=>typeof body==="string"?JSON.parse(body):body,
   text:async()=>String(body) }); }
@@ -264,6 +278,23 @@ let tasksData = [];
 let taskOutputText = "";
 // 会话列表响应（测试中可变）：默认 s1；Bug C 测试会替换成含 subagent 的列表
 let sessionsData = [{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}];
+// 聚合模式：第二台服务器（url "http://b.local"）的独立列表 + 故障开关
+let sessionsDataB = [
+  {id:"b1",status:"Busy",model:"deepseek",title:"B 主会话",created_at:"2024-02-02T00:00:00Z",entry_count:5,busy:true,active:true},
+  {id:"b-orphan",parent_session_id:"missing-b",status:"Idle",entry_count:1,active:true},
+];
+let sessionsBFail = false;
+// 竞态/格式测试开关：B 的 resume POST 延迟（手动 resolve）、A 的 history 延迟、
+// B 返回非数组 JSON（{}）
+let bPostDelayed = false;
+let bPostResolve = null;
+let aHistoryDelayed = false;
+let aHistoryResolve = null;
+let sessionsBFormat = false;
+// SSE 生命周期测试：a1 的 events 流手动控制（首个 read 挂起，测试切走后
+// 再 resolve 陈旧块；验证陈旧流不渲染到当前会话/workspace）
+let a1StreamManual = false;
+let a1StreamReadResolve = null;
 // fork 面板测试用：/fork-candidates 候选与 /fork POST 响应（测试中可变）
 let forkCandidatesData = [
   {at:2, seq:2, preview:"用户：你好，帮我看看"},
@@ -278,7 +309,26 @@ globalThis.fetch=(url,opts={})=>{
   if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output"))
     return resp(200, taskOutputText);
   if(url==="/api/sessions"&&m==="GET") return resp(200, sessionsData);
+  // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
+  if(url==="http://b.local/api/sessions"&&m==="GET") {
+    if (sessionsBFail) return resp(500, {});
+    return resp(200, sessionsBFormat ? {} : sessionsDataB);
+  }
+  if(url==="http://b.local/api/sessions"&&m==="POST") {
+    if (bPostDelayed) return new Promise((resolve) => { bPostResolve = resolve; });
+    return resp(201, { id: "b-hist", status: "Idle", active: true });
+  }
+  if(url.startsWith("http://b.local/api/sessions/")&&m==="DELETE") return resp(204,null);
   if(url==="/api/sessions"&&m==="POST") return resp(201,{id:"sess-new",status:"Idle"});
+  if(url.startsWith("/api/sessions/a1/history")) {
+    if (aHistoryDelayed) return new Promise((resolve) => { aHistoryResolve = resolve; });
+    return resp(200,{entries:[{type:"message",message:{Assistant:{content:"A 会话内容"}}}], next_before_seq:null});
+  }
+  if(url==="/api/sessions/a1/events")
+    return resp(200, a1StreamManual ? streamManual() : streamEmpty());
+  if(url.startsWith("http://b.local/api/sessions/b1/history"))
+    return resp(200,{entries:[{type:"message",message:{Assistant:{content:"B 会话内容"}}}], next_before_seq:null});
+  if(url==="http://b.local/api/sessions/b1/events") return resp(200, streamEmpty());
   if(url.startsWith("/api/sessions/s1/history")) {
     if (url.includes("before_seq=")) {
       const seq=url.split("before_seq=")[1].split("&")[0];
@@ -338,7 +388,8 @@ async function main(){
         "html=" + (firstPin ? firstPin.innerHTML.slice(0, 40) : "none"));
 
     if (MODE === 'direct') {
-      const r = await loadHistory("s1");
+      state.sessionId = "s1";   // loadHistory 现在按 (wsId, sid, epoch) 三重校验发起上下文
+      const r = await loadHistory("s1", state.workspace.id, sessionOpenEpoch);
       chk("direct loadHistory ok", r==="ok", "="+r);
       chk("direct history rendered", elsById["messages"]._children.length>=1,
           "n="+elsById["messages"]._children.length);
@@ -674,14 +725,15 @@ async function main(){
     // 断线重连：销毁当前流后应重新走 history+SSE
     const oldInit = state.initSource;
     state.sse.stopped = false;
-    scheduleReconnect(state.sessionId);
+    scheduleReconnect(state.sessionId, state.workspace.id, sessionOpenEpoch);
     await flush();
     chk("reconnect resets initSource", state.initSource===null || state.initSource!=null, "after="+state.initSource);
     await flush();
     chk("reconnect reconnected", state.sse.ctrl!=null);
 
     // resync 追平：注入一个 resync 块，验证强制整体替换 transcript 并按事件日志重放
-    handleSSEBlock("event: resync\ndata: [{\"type\":\"user_prompt\",\"data\":\"重放-用户\"},{\"type\":\"assistant_delta\",\"data\":\"重放-\"},{\"type\":\"assistant_delta\",\"data\":\"增量\"}]\n\n", state.sessionId);
+    handleSSEBlock("event: resync\ndata: [{\"type\":\"user_prompt\",\"data\":\"重放-用户\"},{\"type\":\"assistant_delta\",\"data\":\"重放-\"},{\"type\":\"assistant_delta\",\"data\":\"增量\"}]\n\n",
+      state.sessionId, state.workspace.id, sessionOpenEpoch);
     const t3 = allText();
     chk("resync replaces transcript", !t3.includes("你好，帮我看看") && t3.includes("重放-用户"));
     chk("resync replayed deltas", t3.includes("重放-") && t3.includes("增量"));
@@ -782,7 +834,7 @@ async function main(){
     chk("restored tool card queued", rCards.length === 1 && state.acc.toolStack.length === 1
         && state.acc.toolStack[0].filled === false && state.acc.toolStack[0].el === rCards[0]);
     // 注入 reasoning_delta：应续写进同一块，而不是新建第二个 details.thinking
-    handleSSEBlock("event: ReasoningDelta\ndata: {\"type\":\"reasoning_delta\",\"session_id\":\"s1\",\"seq\":99,\"delta\":\"续写思考\"}\n\n", "s1");
+    handleSSEBlock("event: ReasoningDelta\ndata: {\"type\":\"reasoning_delta\",\"session_id\":\"s1\",\"seq\":99,\"delta\":\"续写思考\"}\n\n", "s1", state.workspace.id, sessionOpenEpoch);
     const detsAfter = elsById["messages"].querySelectorAll("details.thinking");
     const tbAfter = detsAfter[0].querySelector(".think-body");
     chk("restored single thinking block", detsAfter.length === 1, "n="+detsAfter.length);
@@ -790,11 +842,11 @@ async function main(){
         && tbAfter._children.some((c) => c.text === "缓存的思考")
         && tbAfter._children.some((c) => c.text === "续写思考"));
     // assistant delta 续写旧块；ToolResult 填回旧卡片（都不新建）
-    handleSSEBlock("event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"s1\",\"seq\":100,\"delta\":\"续写回复\"}\n\n", "s1");
+    handleSSEBlock("event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"s1\",\"seq\":100,\"delta\":\"续写回复\"}\n\n", "s1", state.workspace.id, sessionOpenEpoch);
     const abAfter = elsById["messages"].querySelector(".msg-assistant").querySelector(".msg-body");
     chk("restored assistant continues", state.acc.assistantBody === abAfter
         && abAfter._children.some((c) => c.text === "续写回复"));
-    handleSSEBlock("event: ToolResult\ndata: {\"type\":\"tool_result\",\"session_id\":\"s1\",\"seq\":101,\"is_error\":false,\"content\":\"结果内容\"}\n\n", "s1");
+    handleSSEBlock("event: ToolResult\ndata: {\"type\":\"tool_result\",\"session_id\":\"s1\",\"seq\":101,\"is_error\":false,\"content\":\"结果内容\"}\n\n", "s1", state.workspace.id, sessionOpenEpoch);
     chk("restored tool result fills old card", state.acc.toolStack.length === 1
         && state.acc.toolStack[0].filled === true
         && elsById["messages"].querySelector(".tool-state").textContent === "完成"
@@ -1424,7 +1476,7 @@ async function main(){
     // SSE 连接（sse.js 的 connectSSE）同样前缀新 base
     state.view = "chat";
     state.sessionId = "s1";
-    connectSSE("s1");
+    connectSSE("s1", state.workspace.id, sessionOpenEpoch);
     await flush();
     chk("ws sse targets new base",
         FETCHES.some(u => u === "http://localhost:9000/api/sessions/s1/events"),
@@ -1483,6 +1535,412 @@ async function main(){
     chk("ws remove persisted",
         JSON.parse(localStorage.getItem("eagent.workspaces")).length === 1,
         "n=" + JSON.parse(localStorage.getItem("eagent.workspaces")).length);
+
+    // =====================================================================
+    // 聚合模式：多 workspace 会话聚合（侧边栏分组 + 列表视图 + 跨服务器打开）
+    // 双服务器：wsA（url "" 同源 → 默认路由 sessionsData）+ wsB（http://b.local）
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+      { id: "a2", parent_session_id: "a1", label: "A 子任务", status: "Idle", entry_count: 2, active: true },
+      { id: "a-orphan", parent_session_id: "missing-a", status: "Idle", entry_count: 1, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+      { id: "b-orphan", parent_session_id: "missing-b", status: "Idle", entry_count: 1, active: true },
+    ];
+    sessionsBFail = false;
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+
+    // 1) 聚合侧边栏：两个 workspace 分组，各组只含自己的会话
+    renderSidebarTree(true);
+    let wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("agg sidebar shows both workspace groups", wsSections.length === 2,
+        "n=" + wsSections.length);
+    chk("agg group headers correct",
+        wsSections[0].querySelector(".tree-ws-header").textContent.includes("服务器A")
+        && wsSections[1].querySelector(".tree-ws-header").textContent.includes("服务器B"),
+        "h0=" + wsSections[0].querySelector(".tree-ws-header").textContent
+        + " h1=" + wsSections[1].querySelector(".tree-ws-header").textContent);
+    chk("agg A sessions under A group",
+        wsSections[0].textContent.includes("a1") && !wsSections[0].textContent.includes("b1"),
+        "secA=" + wsSections[0].textContent.slice(0, 60));
+    chk("agg B sessions under B group",
+        wsSections[1].textContent.includes("b1") && !wsSections[1].textContent.includes("a1"),
+        "secB=" + wsSections[1].textContent.slice(0, 60));
+
+    // 5) 孤儿按 workspace 分组：B 的孤儿不出现在 A 组（parent 不跨服务器匹配）
+    chk("agg B orphan not under A",
+        !wsSections[0].textContent.includes("b-orphan")
+        && wsSections[1].textContent.includes("b-orphan"),
+        "A-has=" + wsSections[0].textContent.includes("b-orphan")
+        + " B-has=" + wsSections[1].textContent.includes("b-orphan"));
+
+    // 3) 列表视图（聚合）：激活 workspace 的会话照常渲染 + 行带服务器 chip
+    chk("agg list view renders active workspace sessions",
+        elsById["sessionList"].textContent.includes("a1"),
+        "list=" + elsById["sessionList"].textContent.slice(0, 80));
+    chk("agg list rows carry ws chips",
+        elsById["sessionList"].querySelectorAll(".ws-chip").length >= 2,
+        "chips=" + elsById["sessionList"].querySelectorAll(".ws-chip").length);
+
+    // 4) 同服务器点击：A 激活时点 A 组的 a1 → 直接打开，不切换 workspace
+    wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const aRootRow = wsSections[0].querySelectorAll(".tree-row")[0];
+    aRootRow._listeners["click"][0]();
+    chk("agg same-server click opens directly",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    await flush();
+    await flush();
+
+    // 2) 跨服务器点击：A 激活时点 B 组的 b1 → 先切到 B 再打开（异步，等 next tick）
+    wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const bRootRow = wsSections[1].querySelectorAll(".tree-row")[0];
+    bRootRow._listeners["click"][0]();
+    await flush();
+    await flush();
+    chk("agg cross-server click switches and opens",
+        state.workspace.id === "wsB" && state.sessionId === "b1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+
+    // 6) 服务器失败隔离：B 的 /api/sessions 返回 500 → A 的会话照常渲染，
+    //    B 分组头显示 muted「无法连接」（旧列表保留为 stale）
+    sessionsBFail = true;
+    switchWorkspace("wsA");     // 切回 A（B 缓存保留但标记错误）
+    await flush();
+    await pollAllWorkspaces();
+    await flush();
+    renderSidebarTree(true);
+    wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("agg failure: A sessions still render",
+        wsSections[0].textContent.includes("a1"),
+        "secA=" + wsSections[0].textContent.slice(0, 60));
+    chk("agg failure: B shows error header",
+        wsSections[1].querySelector(".ws-err") !== null
+        && wsSections[1].textContent.includes("无法连接"),
+        "err=" + String(wsSections[1].querySelector(".ws-err") && wsSections[1].querySelector(".ws-err").textContent));
+    chk("agg failure: A list view unaffected",
+        elsById["sessionList"].textContent.includes("a1"),
+        "list=" + elsById["sessionList"].textContent.slice(0, 60));
+    sessionsBFail = false;
+
+    // =====================================================================
+    // 7) 跨服务器 resume 竞态：B 的 resume POST 挂起期间用户切回 A →
+    //    过期 resume 不得打开任何会话（不得在错误服务器上自动 openSession）
+    // =====================================================================
+    bPostDelayed = true;
+    bPostResolve = null;
+    resumeSessionIn("wsB", "b-hist");    // 发起 B 的恢复（POST 挂起，不 await）
+    await flush();
+    chk("agg resume race: switched to B, POST pending",
+        state.workspace.id === "wsB" && state.sessionId === null,
+        "ws=" + state.workspace.id + " sid=" + state.sessionId);
+    switchWorkspace("wsA");              // POST 未决期间用户直接切回 A
+    await flush();
+    bPostResolve(resp(201, { id: "b-hist", status: "Idle", active: true }));   // 手动 resolve 延迟 POST
+    await flush();
+    await flush();
+    chk("agg resume race: stale resume opens nothing",
+        state.workspace.id === "wsA" && state.sessionId === null && state.view === "list",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    bPostDelayed = false;
+
+    // =====================================================================
+    // 8) history 渲染竞态：打开 A 的 a1（history 延迟），resolve 前切到 B →
+    //    A 的历史内容不得画进 B 的 transcript，也不得对 A 起 SSE
+    // =====================================================================
+    aHistoryDelayed = true;
+    aHistoryResolve = null;
+    const fetchBefore8 = FETCHES.length;
+    openSessionIn("wsA", "a1");          // 同服务器打开：history 挂起
+    await flush();
+    chk("agg history race: a1 opened with pending history",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId);
+    switchWorkspace("wsB");              // history 未决期间切到 B
+    await flush();
+    aHistoryResolve(resp(200, { entries: [{ type: "message", message: { Assistant: { content: "A 会话内容" } } }], next_before_seq: null }));
+    await flush();
+    await flush();
+    chk("agg history race: A history not painted into B",
+        !elsById["messages"].textContent.includes("A 会话内容"),
+        "msgs=" + JSON.stringify(elsById["messages"].textContent.slice(0, 60)));
+    chk("agg history race: no SSE to A started",
+        !FETCHES.slice(fetchBefore8).some((u) => u === "/api/sessions/a1/events"),
+        "new=" + JSON.stringify(FETCHES.slice(fetchBefore8)));
+    aHistoryDelayed = false;
+    switchWorkspace("wsA");              // 恢复 A 激活（后续测试在 A 上进行）
+    await flush();
+
+    // =====================================================================
+    // 9) 孤儿隔离（parent 撞名）：B 的孤儿 parent_session_id === A 的 a1 →
+    //    归 B 的「未关联」组，绝不挂到 A 的父节点下
+    // =====================================================================
+    sessionsDataB.push({ id: "b-orphan2", parent_session_id: "a1", status: "Idle", entry_count: 1, active: true });
+    await pollAllWorkspaces();
+    await flush();
+    renderSidebarTree(true);
+    wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("agg orphan collision: B orphan stays in B section",
+        wsSections[1].textContent.includes("b-orphan2")
+        && !wsSections[0].textContent.includes("b-orphan2"),
+        "A-has=" + wsSections[0].textContent.includes("b-orphan2")
+        + " B-has=" + wsSections[1].textContent.includes("b-orphan2"));
+    const bOrphanGroup = wsSections[1].querySelector(".tree-group");
+    chk("agg orphan collision: under B 未关联 group",
+        bOrphanGroup !== null
+        && bOrphanGroup.textContent.includes("未关联")
+        && bOrphanGroup.closest(".tree-node").textContent.includes("b-orphan2"),
+        "g=" + (bOrphanGroup ? bOrphanGroup.textContent : "none"));
+    chk("agg orphan collision: not under A parent node",
+        !wsSections[0].querySelector(".tree-node").textContent.includes("b-orphan2"),
+        "A0=" + wsSections[0].querySelector(".tree-node").textContent.slice(0, 40));
+
+    // =====================================================================
+    // 10) 删除路由：删除 B 的会话 → 只更新 workspaceLists.B；A 的缓存不动；
+    //     激活=A 时 sessionStates 不清除（同名会话的视图缓存属于 A）
+    // =====================================================================
+    state.sessionStates["b1"] = { html: "cache-b1", scrollTop: 0, nextBeforeSeq: null, olderDone: true, draft: "" };
+    const aCacheJson = JSON.stringify(state.workspaceLists["wsA"]);
+    const bHadB1 = state.workspaceLists["wsB"].some((x) => x.id === "b1");
+    renderSessionList();
+    const bRow = [...elsById["sessionList"].querySelectorAll(".session-row")]
+      .find((r) => r.textContent.includes("b1"));
+    chk("agg delete: B row present in aggregate list", bRow !== null && bHadB1,
+        "row=" + (bRow !== null) + " bHad=" + bHadB1);
+    bRow.querySelector(".del")._listeners["click"][0]({ stopPropagation(){} });   // 删除行点击：stopPropagation 需要 event 对象
+    await flush();
+    await flush();
+    chk("agg delete: B cache no longer has b1",
+        !state.workspaceLists["wsB"].some((x) => x.id === "b1"),
+        "B=" + JSON.stringify(state.workspaceLists["wsB"].map((x) => x.id)));
+    chk("agg delete: A cache untouched",
+        JSON.stringify(state.workspaceLists["wsA"]) === aCacheJson
+        && state.workspaceLists["wsA"].some((x) => x.id === "a1"),
+        "A=" + JSON.stringify(state.workspaceLists["wsA"].map((x) => x.id)));
+    chk("agg delete: A sessionStates not cleared (active=A)",
+        state.sessionStates["b1"] !== undefined,
+        "st=" + String(state.sessionStates["b1"] && state.sessionStates["b1"].html));
+    delete state.sessionStates["b1"];   // 清理测试残留
+
+    // =====================================================================
+    // 11) 非数组 JSON：B 返回 {}（合法 JSON 非数组）→ B 分组显示错误标记、
+    //     B 旧缓存保留、A 不受影响、激活=A 时无全局 banner
+    // =====================================================================
+    sessionsBFormat = true;
+    const bCacheRef = state.workspaceLists["wsB"];
+    await pollAllWorkspaces();
+    await flush();
+    renderSidebarTree(true);
+    wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("agg non-array: B error marker",
+        wsSections[1].querySelector(".ws-err") !== null
+        && wsSections[1].textContent.includes("无法连接"),
+        "err=" + String(wsSections[1].querySelector(".ws-err") && wsSections[1].querySelector(".ws-err").textContent));
+    chk("agg non-array: B previous cache retained",
+        state.workspaceLists["wsB"] === bCacheRef
+        && state.workspaceLists["wsB"].some((x) => x.id === "b-orphan"),
+        "sameRef=" + (state.workspaceLists["wsB"] === bCacheRef));
+    chk("agg non-array: A unaffected",
+        wsSections[0].querySelector(".ws-err") === null
+        && wsSections[0].textContent.includes("a1"),
+        "A-err=" + (wsSections[0].querySelector(".ws-err") !== null));
+    chk("agg non-array: no global banner (active=A)", elsById["banner"].hidden === true,
+        "hidden=" + elsById["banner"].hidden);
+    sessionsBFormat = false;
+
+    // =====================================================================
+    // 12) showAll 每 workspace 独立：A、B 各 > MAX_TREE_ROOTS 主会话 →
+    //     只点 A 的「显示全部」→ 只有 A 展开，B 分组仍折叠
+    // =====================================================================
+    for (let i = 0; i < 10; i++) {
+      sessionsData.push({ id: "a-extra" + i, status: "Idle", entry_count: 1, active: true });
+      sessionsDataB.push({ id: "b-extra" + i, status: "Idle", entry_count: 1, active: true });
+    }
+    state.sidebar.showAllWs = new Set();
+    await pollAllWorkspaces();
+    await flush();
+    renderSidebarTree(true);
+    wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const aMore = wsSections[0].querySelector(".tree-more");
+    const bMore = wsSections[1].querySelector(".tree-more");
+    chk("agg showAll per-ws: both sections collapsed initially",
+        aMore !== null && bMore !== null,
+        "aMore=" + (aMore !== null) + " bMore=" + (bMore !== null));
+    aMore._listeners["click"][0]();
+    chk("agg showAll per-ws: only A marked expanded",
+        state.sidebar.showAllWs.has("wsA") && !state.sidebar.showAllWs.has("wsB"),
+        "A=" + state.sidebar.showAllWs.has("wsA") + " B=" + state.sidebar.showAllWs.has("wsB"));
+    renderSidebarTree(true);
+    wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("agg showAll per-ws: A expanded, B still collapsed",
+        wsSections[0].querySelector(".tree-more") === null
+        && wsSections[1].querySelector(".tree-more") !== null,
+        "A-more=" + (wsSections[0].querySelector(".tree-more") !== null)
+        + " B-more=" + (wsSections[1].querySelector(".tree-more") !== null));
+
+    // =====================================================================
+    // 13) SSE 生命周期：SSE 流的三重校验必须覆盖整条流的存活期（Fix 1）。
+    //     A 的流打开后切到 B（代次被取代），随后 A 的陈旧块（snapshot/
+    //     status/delta/resync）才到达——绝不能画进 B 的 DOM/状态。
+    // =====================================================================
+    a1StreamManual = true;
+    a1StreamReadResolve = null;
+    openSessionIn("wsA", "a1");        // 打开 A 的 a1：history 就绪后起 SSE，首个 read 挂起
+    await flush();
+    await flush();
+    chk("agg sse lifetime: a1 stream pending",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat"
+        && a1StreamReadResolve !== null,
+        "ws=" + state.workspace.id + " sid=" + state.sessionId
+        + " pending=" + (a1StreamReadResolve !== null));
+    const epochA1 = sessionOpenEpoch;  // a1 打开动作的唯一代次（此后被 B 取代）
+    openSessionIn("wsB", "b1");        // 切到 B：代次取代，A 的流成为陈旧流
+    await flush();
+    await flush();
+    chk("agg sse lifetime: switched to B",
+        state.workspace.id === "wsB" && state.sessionId === "b1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId);
+    const bMsgsBefore = elsById["messages"].textContent;
+    const bStatBefore = elsById["chatStatus"].textContent;
+    const tBefore13 = scheduledTimeouts.length;
+    // 切换后 A 的流才吐出整批陈旧块（snapshot/status/delta）
+    a1StreamReadResolve({ done: false, value:
+      "event: snapshot\ndata: [{\"type\":\"notice\",\"text\":\"STALE-A-SNAPSHOT\"}]\n\n"
+      + "event: status\ndata: {\"status\":\"Busy\"}\n\n"
+      + "event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"a1\",\"seq\":1,\"delta\":\"STALE-A-DELTA\"}\n\n" });
+    await flush();
+    await flush();
+    chk("agg sse lifetime: stale chunk batch not painted into B",
+        elsById["messages"].textContent === bMsgsBefore
+        && !elsById["messages"].textContent.includes("STALE-A-SNAPSHOT")
+        && !elsById["messages"].textContent.includes("STALE-A-DELTA"),
+        "msgs=" + JSON.stringify(elsById["messages"].textContent.slice(0, 80)));
+    chk("agg sse lifetime: stale status not applied to B",
+        elsById["chatStatus"].textContent === bStatBefore
+        && !elsById["chatStatus"].textContent.includes("处理中"),
+        "status=" + elsById["chatStatus"].textContent);
+    chk("agg sse lifetime: B state untouched",
+        state.workspace.id === "wsB" && state.sessionId === "b1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId);
+    chk("agg sse lifetime: stale stream end schedules no reconnect",
+        scheduledTimeouts.length === tBefore13,
+        "n=" + scheduledTimeouts.length + " (b1 自身空流重连已计入 tBefore13)");
+
+    // 直接注入陈旧块（绕过流循环，验证 handleSSEBlock 顶部三重校验）。
+    // 用「当前会话 id + 陈旧代次」——正是旧代码 line-104 的 id 检查会放过的
+    // 组合：snapshot/status 在 id 检查之前就改了 UI，resync 只看 id。
+    const bDom13b = elsById["messages"].textContent;
+    const bStat13b = elsById["chatStatus"].textContent;
+    state.initSource = null;   // snapshot 分支本可渲染（旧代码会画进 B）
+    handleSSEBlock("event: snapshot\ndata: [{\"type\":\"notice\",\"text\":\"STALE-A-SNAPSHOT\"}]\n\n",
+      "b1", "wsB", epochA1);
+    chk("agg sse lifetime: stale-epoch snapshot dropped at top",
+        elsById["messages"].textContent === bDom13b
+        && !elsById["messages"].textContent.includes("STALE-A-SNAPSHOT")
+        && state.initSource === null,   // snapshot 分支未执行（未置为 "snapshot"）
+        "same=" + (elsById["messages"].textContent === bDom13b)
+        + " src=" + String(state.initSource));
+    handleSSEBlock("event: status\ndata: {\"status\":\"Busy\"}\n\n", "b1", "wsB", epochA1);
+    chk("agg sse lifetime: stale-epoch status dropped at top",
+        elsById["chatStatus"].textContent === bStat13b
+        && !elsById["chatStatus"].textContent.includes("处理中"),
+        "status=" + elsById["chatStatus"].textContent);
+    handleSSEBlock("event: resync\ndata: [{\"type\":\"user_prompt\",\"data\":\"STALE-RESYNC\"}]\n\n",
+      "b1", "wsB", epochA1);
+    chk("agg sse lifetime: stale-epoch resync dropped (no force-replace)",
+        elsById["messages"].textContent === bDom13b
+        && !elsById["messages"].textContent.includes("STALE-RESYNC"),
+        "same=" + (elsById["messages"].textContent === bDom13b));
+    handleSSEBlock("event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"b1\",\"seq\":1,\"delta\":\"STALE-DELTA\"}\n\n",
+      "b1", "wsB", epochA1);
+    chk("agg sse lifetime: stale-epoch delta dropped at top",
+        elsById["messages"].textContent === bDom13b
+        && !elsById["messages"].textContent.includes("STALE-DELTA"),
+        "same=" + (elsById["messages"].textContent === bDom13b));
+    state.initSource = "history";   // 还原（b1 的 history 已渲染）
+
+    // resync 路径（经流循环）：重新打开 A（新流挂起）→ 切到 B → A 的
+    // resync 事件延迟到达 → 不得强制替换 B 的 transcript
+    a1StreamReadResolve = null;
+    openSessionIn("wsA", "a1");
+    await flush();
+    await flush();
+    const epochA1b = sessionOpenEpoch;
+    chk("agg sse lifetime: second a1 stream pending", a1StreamReadResolve !== null,
+        "pending=" + (a1StreamReadResolve !== null));
+    openSessionIn("wsB", "b1");
+    await flush();
+    await flush();
+    const bMsgs13c = elsById["messages"].textContent;
+    a1StreamReadResolve({ done: false, value:
+      "event: resync\ndata: [{\"type\":\"user_prompt\",\"data\":\"STALE-RESYNC-STREAM\"}]\n\n" });
+    await flush();
+    await flush();
+    chk("agg sse lifetime: stale resync via stream does not force-replace B",
+        elsById["messages"].textContent === bMsgs13c
+        && !elsById["messages"].textContent.includes("STALE-RESYNC-STREAM"),
+        "same=" + (elsById["messages"].textContent === bMsgs13c));
+
+    // =====================================================================
+    // 14) scheduleReconnect 的三重校验（Fix 1）：
+    //     陈旧断线回调（旧代次）在调度点就被拒绝；当前上下文的断线重连
+    //     正常调度，触发时仍校验同一上下文才重新 openWith。
+    // =====================================================================
+    a1StreamReadResolve = null;
+    openSessionIn("wsA", "a1");
+    await flush();
+    await flush();
+    const epochA14 = sessionOpenEpoch;
+    openSessionIn("wsB", "b1");
+    await flush();
+    await flush();
+    const tBefore14 = scheduledTimeouts.length;
+    const fetchBefore14 = FETCHES.length;
+    const retryBefore14 = state.sse.retryTimer;
+    scheduleReconnect("a1", "wsA", epochA14);   // A 的陈旧断线回调（迟到的 catch）
+    chk("agg sse lifetime: stale reconnect refused at schedule",
+        scheduledTimeouts.length === tBefore14 && state.sse.retryTimer === retryBefore14,
+        "n=" + scheduledTimeouts.length + " timer=" + String(state.sse.retryTimer));
+    chk("agg sse lifetime: stale reconnect issues no fetch",
+        FETCHES.length === fetchBefore14,
+        "new=" + JSON.stringify(FETCHES.slice(fetchBefore14)));
+    // 当前上下文（b1）的断线回调：正常调度；手动触发定时器 → 仍校验通过
+    // → 重新走 history + SSE（多一次 b1/events 请求）
+    state.sse.stopped = false;
+    scheduleReconnect("b1", "wsB", sessionOpenEpoch);
+    chk("agg sse lifetime: current reconnect schedules",
+        scheduledTimeouts.length === tBefore14 + 1 && state.sse.retryTimer !== null,
+        "n=" + scheduledTimeouts.length);
+    const bEventsBefore14 = FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length;
+    scheduledTimeouts[tBefore14]();   // 触发重连定时器
+    await flush();
+    await flush();
+    chk("agg sse lifetime: current reconnect re-opens b1",
+        state.sessionId === "b1" && state.view === "chat"
+        && FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length === bEventsBefore14 + 1,
+        "events=" + FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length);
+    a1StreamManual = false;
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);

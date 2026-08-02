@@ -14,8 +14,17 @@ function setConn(stateName, text) {
   els.connState.textContent = text;
 }
 
-function connectSSE(id) {
-  if (id !== state.sessionId) return;   // 已切换会话：不动当前会话的流
+/* 三重校验：发起打开时的上下文（同代次、同 workspace、同会话）是否仍成立。
+   连接启动、每条流分块消费、重连调度与触发、以及 handleSSEBlock 每个事件块
+   处理前都调用它——陈旧流（来自已被取代的会话/workspace/代次）的任意内容
+   （snapshot/status/resync/live 事件）一律不得碰 UI。 */
+function stillCurrent(id, wsId, epoch) {
+  return epoch === sessionOpenEpoch && state.workspace.id === wsId && state.sessionId === id;
+}
+
+function connectSSE(id, wsId, epoch) {
+  // 起流前三重校验：陈旧 history 响应绝不能对刚激活的服务器/会话起 SSE。
+  if (!stillCurrent(id, wsId, epoch)) return;
   stopSSE();
   state.sse.stopped = false;
   state.sse.ctrl = new AbortController();
@@ -37,8 +46,10 @@ function connectSSE(id) {
       throw new Error("gone");
     }
     if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
+    // 响应回来时上下文可能已被取代（新打开/切换）：不起流、不画连接状态
+    if (!stillCurrent(id, wsId, epoch)) { try { ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     setConn("ok", "● 已连接");
-    return readSSEStream(res.body.getReader(), id);
+    return readSSEStream(res.body.getReader(), id, wsId, epoch, ctrl);
   }).then(() => {
     // 正常结束（后端关闭流）→ 按断线处理
     throw new Error("stream end");
@@ -46,29 +57,35 @@ function connectSSE(id) {
     if (err && err.name === "AbortError") return;   // 主动停止
     if (state.sse.stopped) return;
     if (err && err.message === "auth") { state.sse.stopped = true; return; }
-    scheduleReconnect(id);
+    scheduleReconnect(id, wsId, epoch);   // 携带断线流的三元组：重连前必须仍是同一上下文
   });
 }
 
-/* 逐块读取 SSE：按空行切分事件块（兼容 \r\n 行尾） */
-async function readSSEStream(reader, id) {
+/* 逐块读取 SSE：按空行切分事件块（兼容 \r\n 行尾）。
+   每次 read 前后都做三重校验：停止/切换后迟到的流立即早退（abort 的是
+   本流自己的 ctrl——绝不能动 state.sse.ctrl，那可能已是新流的控制器）。 */
+async function readSSEStream(reader, id, wsId, epoch, ctrl) {
   const decoder = new TextDecoder();
   let buf = "";
   for (;;) {
+    if (!stillCurrent(id, wsId, epoch)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     const { done, value } = await reader.read();
     if (done) break;
+    if (!stillCurrent(id, wsId, epoch)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
     let idx;
     while ((idx = buf.indexOf("\n\n")) !== -1) {
       const block = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
-      handleSSEBlock(block, id);
+      handleSSEBlock(block, id, wsId, epoch);
     }
   }
 }
 
-/* 解析单个 SSE 事件块 */
-function handleSSEBlock(block, id) {
+/* 解析单个 SSE 事件块：任何分支（snapshot/status/resync/live）动手改 UI 前
+   必须通过三重校验——陈旧流的块整块丢弃，绝不画进当前会话/workspace。 */
+function handleSSEBlock(block, id, wsId, epoch) {
+  if (!stillCurrent(id, wsId, epoch)) return;
   let eventName = "message";
   const dataLines = [];
   for (const line of block.split("\n")) {
@@ -212,14 +229,17 @@ function applyLiveEvent(name, payload) {
   }
 }
 
-/* 断线重连：3 秒后重新加载 history + SSE */
-function scheduleReconnect(id) {
-  if (state.sse.stopped || id !== state.sessionId) return;
+/* 断线重连：3 秒后重新加载 history + SSE。必须携带断线流的三元组
+   (id, wsId, epoch)——调度时与触发时都校验「仍是同一上下文」：期间任何
+   打开/切换/返回列表都会取代代次，陈旧流的重连绝不执行（否则会把已过期
+   的会话重新加载/重画到新激活的上下文上）。 */
+function scheduleReconnect(id, wsId, epoch) {
+  if (state.sse.stopped || !stillCurrent(id, wsId, epoch)) return;
   setConn("retrying", "↻ 连接断开，3 秒后重连…");
   state.sse.retryTimer = setTimeout(() => {
-    if (state.sse.stopped || state.view !== "chat" || id !== state.sessionId) return;
+    if (state.sse.stopped || state.view !== "chat" || !stillCurrent(id, wsId, epoch)) return;
     state.initSource = null;             // 允许 snapshot 兜底
-    openWith(id, true);
+    openWith(id, true, undefined, wsId, epoch);
   }, 3000);
 }
 
@@ -255,7 +275,7 @@ els.sidebarCloseBtn.addEventListener("click", closeSidebar);
 els.sidebarOverlay.addEventListener("click", closeSidebar);   // 点遮罩关闭
 els.sidebarFilter.addEventListener("input", () => {
   state.sidebar.filter = els.sidebarFilter.value.trim().toLowerCase();
-  state.sidebar.showAll = false;   // 清空筛选后回到默认 15 条限制
+  state.sidebar.showAllWs = new Set();   // 清空筛选后回到默认条数限制（每 workspace 独立）
   renderSidebarTree(true);
 });
 /* composer 任务折叠条：点击展开 / 收起面板（有任务时才可见） */
