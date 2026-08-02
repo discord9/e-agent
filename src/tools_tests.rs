@@ -844,6 +844,12 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         shell: Shell::detect().unwrap(),
     };
     let plain_desc = plain.spec().description;
+    #[cfg(windows)]
+    assert!(
+        !plain_desc.contains("restricted primary token"),
+        "{plain_desc}"
+    );
+    #[cfg(not(windows))]
     assert!(!plain_desc.contains("sandbox"), "{plain_desc}");
 
     // Sandboxed with writable workspace AND protect_git = true (subagent).
@@ -863,16 +869,36 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         shell: Shell::detect().unwrap(),
     };
     let desc = sandboxed.spec().description;
-    assert!(desc.contains("bubblewrap sandbox"), "{desc}");
-    assert!(desc.contains("workspace is writable"), "{desc}");
-    assert!(desc.contains("OUTSIDE the sandbox"), "{desc}");
-    assert!(desc.contains("network is disabled"), "{desc}");
+    #[cfg(windows)]
+    {
+        assert!(desc.contains("Windows restricted primary token"), "{desc}");
+        assert!(!desc.to_lowercase().contains("bubblewrap"), "{desc}");
+        assert!(
+            desc.contains("workspace is an allowed write root"),
+            "{desc}"
+        );
+        assert!(desc.contains("not read isolation"), "{desc}");
+        assert!(desc.contains("Everyone"), "{desc}");
+    }
+    #[cfg(not(windows))]
+    {
+        assert!(desc.contains("bubblewrap sandbox"), "{desc}");
+        assert!(desc.contains("workspace is writable"), "{desc}");
+    }
+    #[cfg(not(windows))]
+    {
+        assert!(desc.contains("OUTSIDE the sandbox"), "{desc}");
+        assert!(desc.contains("network is disabled"), "{desc}");
+        assert!(desc.contains("~/.rustup"), "{desc}");
+        assert!(desc.contains("read_file/write_file/edit_file"), "{desc}");
+        assert!(desc.contains("linked-worktree pointer"), "{desc}");
+        assert!(desc.contains("read-only to prevent"), "{desc}");
+    }
     assert!(desc.contains("/mnt/big/cargo-home"), "{desc}");
-    assert!(desc.contains("~/.rustup"), "{desc}");
-    assert!(desc.contains("read_file/write_file/edit_file"), "{desc}");
+    #[cfg(windows)]
+    assert!(desc.contains("protected-git shell execution"), "{desc}");
+    #[cfg(not(windows))]
     assert!(desc.contains("`.git`"), "{desc}");
-    assert!(desc.contains("linked-worktree pointer"), "{desc}");
-    assert!(desc.contains("read-only to prevent"), "{desc}");
 
     // Sandboxed with read-only workspace, protect_git = false (main).
     let sandboxed_ro = Bash {
@@ -891,6 +917,12 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         shell: Shell::detect().unwrap(),
     };
     let desc_ro = sandboxed_ro.spec().description;
+    #[cfg(windows)]
+    assert!(
+        desc_ro.contains("workspace is not an allowed write root"),
+        "{desc_ro}"
+    );
+    #[cfg(not(windows))]
     assert!(desc_ro.contains("workspace is read-only"), "{desc_ro}");
     // Use a precise marker: the protect-git text includes backtick-wrapped `.git`.
     assert!(
@@ -958,30 +990,45 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
         None,
     );
     let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
+    #[cfg(windows)]
+    let shell_name = "pwsh";
+    #[cfg(not(windows))]
+    let shell_name = "bash";
     assert_eq!(
         names,
         [
             "read_file",
             "get_background_tasks",
             "cancel_background_task",
-            "bash",
+            shell_name,
             "web_search"
         ],
-        "read-only with a sandbox keeps bash and web_search"
+        "read-only with a sandbox keeps the shell and web_search"
     );
-    // The bash description must reflect the narrowed policy.
+    // The shell description must reflect the narrowed policy.
     let bash_desc = tools
         .iter()
-        .find(|tool| tool.spec().name == "bash")
+        .find(|tool| tool.spec().name == shell_name)
         .unwrap()
         .spec()
         .description;
-    assert!(bash_desc.contains("workspace is read-only"), "{bash_desc}");
-    assert!(bash_desc.contains("network is disabled"), "{bash_desc}");
-    assert!(
-        bash_desc.contains("~/.rustup"),
-        "readable roots survive the narrowing: {bash_desc}"
-    );
+    #[cfg(windows)]
+    {
+        assert!(
+            bash_desc.contains("workspace is not an allowed write root"),
+            "{bash_desc}"
+        );
+        assert!(bash_desc.contains("no network isolation"), "{bash_desc}");
+    }
+    #[cfg(not(windows))]
+    {
+        assert!(bash_desc.contains("workspace is read-only"), "{bash_desc}");
+        assert!(bash_desc.contains("network is disabled"), "{bash_desc}");
+        assert!(
+            bash_desc.contains("~/.rustup"),
+            "readable roots survive the narrowing: {bash_desc}"
+        );
+    }
     assert!(
         !bash_desc.contains("/mnt/big/cargo-home"),
         "writable roots are dropped from the description: {bash_desc}"

@@ -13,8 +13,8 @@ use crate::agent::AgentEvent;
 use super::background::{BackgroundTasks, OutputSlot, TaskSpool, slot_append};
 
 /// A bash tool bound to a shared background-task registry.
-/// `protect_git`: when true, `<workspace>/.git` is bound read-only
-/// (subagent / fixer); main agent passes false so orchestration works.
+/// `protect_git`: on non-Windows, `<workspace>/.git` is bound read-only for
+/// subagents/fixers. The Windows write-sandbox MVP rejects this mode.
 /// `timeout`: foreground command timeout; `None` means no timeout.
 /// Callers resolve it from config (`[bash]`), defaulting to 30s.
 pub fn bash_tool(
@@ -45,8 +45,8 @@ pub(super) struct Bash {
     /// shared registry. Spawned tasks retain this origin sender.
     pub(super) sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
     pub(super) sandbox: Option<crate::config::Sandbox>,
-    /// When true and sandbox is enabled, bind `<workspace>/.git` read-only
-    /// so subagents / fixers cannot corrupt the repository metadata.
+    /// On non-Windows, bind `<workspace>/.git` read-only when sandboxed.
+    /// The Windows write-sandbox MVP rejects this mode before side effects.
     pub(super) protect_git: bool,
     /// Resolved platform shell (pwsh on Windows, bash elsewhere).
     pub(super) shell: Shell,
@@ -55,51 +55,77 @@ pub(super) struct Bash {
 #[async_trait]
 impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
+        #[cfg(windows)]
+        let mut description = "Run a shell command with the workspace as its current directory. Without the Windows write sandbox, the command retains ambient host filesystem access; file-tool capabilities are an independent boundary.".to_owned();
+        #[cfg(not(windows))]
         let mut description = "Run a shell command with the workspace as its current directory. Without bubblewrap, the command retains ambient host filesystem access; file-tool capabilities are an independent boundary.".to_owned();
         // Tell the model which shell syntax to use (pwsh on Windows, bash
         // elsewhere).
         description.push_str(self.shell.syntax_hint);
         if let Some(sandbox) = &self.sandbox {
-            let ws_mode = if sandbox.workspace_writable {
-                "writable"
-            } else {
-                "read-only"
-            };
-            description.push_str(&format!(
-                " The command runs inside a bubblewrap sandbox: the workspace is {ws_mode}, \
+            #[cfg(windows)]
+            {
+                let ws_mode = if sandbox.workspace_writable {
+                    "an allowed write root"
+                } else {
+                    "not an allowed write root"
+                };
+                description.push_str(&format!(
+                    " The command runs with a Windows restricted primary token. The workspace is {ws_mode}. This is write restriction, not read isolation, and it provides no network isolation; paths already writable through Everyone or the current logon SID, including some public locations, may remain writable. TEMP/TMP, HOME, and toolchain or engine caches are not allowed by default: add every required location to writable_paths explicitly."
+                ));
+                if !sandbox.writable_paths.is_empty() {
+                    description.push_str(&format!(
+                        " Explicit extra writable paths: {}.",
+                        sandbox.writable_paths.join(", ")
+                    ));
+                }
+                if self.protect_git {
+                    description.push_str(" Windows write-sandbox MVP does not support protected-git shell execution; execution fails before token or ACL changes.");
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let ws_mode = if sandbox.workspace_writable {
+                    "writable"
+                } else {
+                    "read-only"
+                };
+                description.push_str(&format!(
+                    " The command runs inside a bubblewrap sandbox: the workspace is {ws_mode}, \
                  system dirs (/usr, /bin, /lib, /etc) are read-only, and most of $HOME is \
                  hidden behind a fresh tmpfs. Files that are not mounted — e.g. ~/.ssh or \
                  ~/.gitconfig — fail with \"No such file or directory\"; that means they are \
                  OUTSIDE the sandbox, not that they don't exist on the host. Do not try to \
                  create such files; if a needed path errors this way, tell the user it is \
                  outside the sandbox.",
-            ));
-            if !sandbox.network {
-                description.push_str(" The network is disabled (no DNS, no connections).");
-            }
-            if !sandbox.writable_paths.is_empty() {
-                description.push_str(&format!(
-                    " Extra writable paths: {}.",
-                    sandbox.writable_paths.join(", ")
                 ));
-            }
-            if !sandbox.readable_paths.is_empty() {
-                description.push_str(&format!(
-                    " Extra read-only paths: {}.",
-                    sandbox.readable_paths.join(", ")
-                ));
-            }
-            description.push_str(
+                if !sandbox.network {
+                    description.push_str(" The network is disabled (no DNS, no connections).");
+                }
+                if !sandbox.writable_paths.is_empty() {
+                    description.push_str(&format!(
+                        " Extra writable paths: {}.",
+                        sandbox.writable_paths.join(", ")
+                    ));
+                }
+                if !sandbox.readable_paths.is_empty() {
+                    description.push_str(&format!(
+                        " Extra read-only paths: {}.",
+                        sandbox.readable_paths.join(", ")
+                    ));
+                }
+                description.push_str(
                 " Bash mounts and read_file/write_file/edit_file capabilities are independent boundaries sharing this resolved path policy.",
             );
-            description.push_str(
+                description.push_str(
                 " In a linked git worktree the main repository is mounted read-only (absolute path); bash can also reach it via relative traversal, but the file tools cannot — use the absolute path with them.",
             );
-            if self.protect_git {
-                description.push_str(
-                    " The workspace `.git` metadata (directory or linked-worktree pointer) \
+                if self.protect_git {
+                    description.push_str(
+                        " The workspace `.git` metadata (directory or linked-worktree pointer) \
                      is bound read-only to prevent accidental corruption by fixer subagents.",
-                );
+                    );
+                }
             }
         }
         ToolSpec {
@@ -188,7 +214,7 @@ impl Drop for ProcessGroupGuard {
 /// children typically observe EOF on the shared stdout/stderr pipes, which
 /// is usually enough for interactive shells to exit.
 #[cfg(windows)]
-struct ProcessGroupGuard {
+pub(super) struct ProcessGroupGuard {
     handle: Option<windows_sys::Win32::Foundation::HANDLE>,
 }
 
@@ -201,7 +227,7 @@ unsafe impl Send for ProcessGroupGuard {}
 
 #[cfg(windows)]
 impl ProcessGroupGuard {
-    fn armed(pid: u32) -> Self {
+    pub(super) fn armed(pid: u32) -> Self {
         use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE};
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
         Self {
@@ -209,7 +235,7 @@ impl ProcessGroupGuard {
         }
     }
 
-    fn disarm(&mut self) {
+    pub(super) fn disarm(&mut self) {
         if let Some(handle) = self.handle.take() {
             unsafe {
                 windows_sys::Win32::Foundation::CloseHandle(handle);
@@ -240,7 +266,7 @@ pub(super) struct Shell {
     /// Tool name exposed to the model: `pwsh` on Windows so the model picks
     /// PowerShell syntax, `bash` everywhere else.
     pub(super) tool_name: &'static str,
-    executable: String,
+    pub(super) executable: String,
     invoke_args: Vec<String>,
     /// Sentence appended to the tool description telling the model which
     /// shell syntax to use.
@@ -298,7 +324,7 @@ impl Shell {
 
     /// Full command-line arguments for a user command: invocation args +
     /// the command itself.
-    fn command_args(&self, command: &str) -> Vec<String> {
+    pub(super) fn command_args(&self, command: &str) -> Vec<String> {
         let mut args = self.invoke_args.clone();
         args.push(command.to_owned());
         args
@@ -330,6 +356,22 @@ pub(super) async fn run_bash(
     spool: Option<Arc<TaskSpool>>,
     sandbox: Option<&crate::config::Sandbox>,
 ) -> Result<String, String> {
+    #[cfg(windows)]
+    if let Some(policy) = sandbox {
+        return super::windows_sandbox::run(
+            shell,
+            workspace,
+            command,
+            timeout,
+            protect_git,
+            process_group_slot,
+            output_slot,
+            spool,
+            policy,
+        )
+        .await;
+    }
+
     // Build the command: bare bash, or wrapped in bwrap when sandboxed.
     // bwrap is a *construction tool*, so we spell out the policy explicitly:
     // system dirs read-only, workspace writable (per config), /tmp scratch,

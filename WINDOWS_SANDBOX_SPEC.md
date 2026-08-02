@@ -2,7 +2,7 @@
 
 > 状态：**设计 / 调研，尚未实现**。
 >
-> 本文记录 Windows 进程树治理与 sandbox 的技术结论、阻断问题和分阶段实施门槛。当前代码没有 Windows 安全 sandbox；也不能声称下述方案与 Linux bubblewrap（bwrap）等价。完整 Windows sandbox 正式接入前，Windows 上 `[sandbox] enabled = true` 必须继续 **fail-closed**，不得回退为裸 shell。
+> 本文记录 Windows 进程树治理与 sandbox 的技术结论、阻断问题和分阶段实施门槛。当前已实现 restricted-token **写限制 MVP**，首要场景是原生 Windows 游戏开发（PowerShell/MSVC/Git/Godot/Unity/Unreal 工具链）。它不是读隔离、网络隔离或 Linux bubblewrap（bwrap）等价物；任一 token、ACL 或 native spawn 步骤失败都 **fail-closed**，不得回退为裸 shell。
 
 ## 1. 定位、威胁模型与保证分层
 
@@ -10,7 +10,8 @@ Windows 实现必须把“进程生命周期”与“安全隔离”分开描述
 
 | 层级 | 机制 | 可以保证 | 不可以保证 |
 |---|---|---|---|
-| Phase A：进程树生命周期 | Job Object，`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，原子入 job | 取消、墙钟超时或后台 registry 销毁时终止该命令的子/孙进程 | 不能限制文件读取/写入，不能限制网络，不是安全 sandbox |
+| 已实现 MVP：写限制 | restricted primary token（`DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED`）+ 稳定 capability SID/ACL | workspace（按 `workspace_writable`）及显式 `writable_paths` 写入；原生工具链兼容 | 不限制读取/网络；Everyone/logon-SID 本来可写的公共位置可能仍可写 |
+| 后续生命周期增强 | Job Object，`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，原子入 job | 取消、墙钟超时或后台 registry 销毁时终止该命令的子/孙进程 | 不阻塞写限制 MVP；本身不提供文件或网络隔离 |
 | Phase B：隔离技术原型 | AppContainer profile/SID、security capabilities、ACL 实验 | 验证文件访问和网络 capability 的可行边界与兼容性 | 尚不承诺正式配置语义、可靠清理或与 bwrap 等价 |
 | Phase C：正式 Windows sandbox | 原子创建时同时应用 Job Object 与 AppContainer；经审定的 ACL 生命周期 | 在明确支持范围内实现 workspace/path 权限、网络能力和进程树清理；任一步失败都关闭执行 | 无 mount namespace、tmpfs HOME 或 bind mount 覆盖；不承诺任意 Windows 环境均兼容 |
 
@@ -162,7 +163,7 @@ AppContainer 不等价于“只有一个低权限用户”：
 - 若选择该 MVP，产品、工具描述、错误信息和 README 都必须明确：**不保证 workspace 外不可读**，不得称其与 bwrap 或完整 Windows sandbox 等价。
 - 只复用本项目现有 pipe shell 模型；不复制 Codex 的 elevated runner、broker/IPC、ConPTY 或整套 Windows 执行框架。
 
-restricted-token MVP 仍需 Job Object、失败关闭和真实 Windows 测试，且不能把“限制写”描述成“文件系统隔离”。
+restricted-token MVP 已实现失败关闭和真实 Windows native spawn；Job Object 改为后续生命周期增强，不阻塞 MVP。它只是防止事故性误写的机制，不能称为安全 sandbox 或文件系统隔离。写根仅为按配置启用的 workspace 和全部 `writable_paths`；`workspace_writable = false` 不添加 workspace 写 ACE，`readable_paths` 不授权写入。无写根时只构造 inert capability SID，不设置文件 ACE。capability SID 由 canonical path 原始 UTF-16 code units 的长度分隔字节与 class 经 SHA-256 稳定派生，保留 canonical path 的原始拼写。只接受已存在、canonical、fixed local NTFS 的目录根；拒绝 UNC/device path、非目录根、根自身为 symlink/reparse point、NULL DACL 及 case-sensitive 根，不声称支持 case-sensitive directory。TokenDefaultDacl 保留 source token 的现有 DACL，只合并 capability SID 的 `GENERIC_ALL` ACE；不会向 Everyone 或 logon SID 新增该权限。`SeChangeNotifyPrivilege` 无法确认已分配时失败关闭。Windows `protect_git = true` shell 不受支持，在任何 token/ACL 变更前失败关闭；不实现 `.git` deny ACE 或 carve-out。成功添加的 synthetic SID ACE 持久保留；若多根 ACL 添加中途失败则不启动进程，先前 ACE 可能持久留下，但对不含 synthetic SID 的普通 token inert，不做危险的整 DACL rollback。不默认放行 TEMP/TMP、HOME、Cargo/NuGet 或引擎缓存。Everyone/logon-SID 原本可写的公共位置仍可能可写，workspace 外仍可读且网络不隔离。嵌套 reparse point 与检查后路径替换（TOCTOU）仍是 remaining risks。policy anchor 没有在 MVP 中猜测性加 deny；现有 `.e-agent/config.toml` 若位于可写根内仍可能被修改。
 
 ## 8. Phase C：门槛通过后的正式接入
 
