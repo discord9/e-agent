@@ -255,6 +255,8 @@ function resp(status, body){ return Promise.resolve({ ok:status>=200&&status<300
 // 任务输出块测试用：/api/tasks 响应与 output 端点文本（测试中可变）
 let tasksData = [];
 let taskOutputText = "";
+// 会话列表响应（测试中可变）：默认 s1；Bug C 测试会替换成含 subagent 的列表
+let sessionsData = [{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}];
 // fork 面板测试用：/fork-candidates 候选与 /fork POST 响应（测试中可变）
 let forkCandidatesData = [
   {at:2, seq:2, preview:"用户：你好，帮我看看"},
@@ -268,7 +270,7 @@ globalThis.fetch=(url,opts={})=>{
   if(url==="/api/tasks") return resp(200, tasksData);
   if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output"))
     return resp(200, taskOutputText);
-  if(url==="/api/sessions"&&m==="GET") return resp(200,[{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}]);
+  if(url==="/api/sessions"&&m==="GET") return resp(200, sessionsData);
   if(url==="/api/sessions"&&m==="POST") return resp(201,{id:"sess-new",status:"Idle"});
   if(url.startsWith("/api/sessions/s1/history")) {
     if (url.includes("before_seq=")) {
@@ -892,6 +894,34 @@ async function main(){
     chk("main session hides back-to-parent",
         elsById["backParentBtn"].hidden === true,
         "hidden=" + elsById["backParentBtn"].hidden);
+    // ---- Bug C：任务面板直连跳转 subagent，lastList 还没包含该会话
+    // （新后端 subagent_session_id 直连路径，轮询未刷新）：
+    // openSession 在 cur 查不到时不得把「← 主会话」误藏（保持现状，
+    // 等 refreshSessionsForSidebar 拉到列表后按 parent_session_id 判定） ----
+    state.lastList = [];
+    elsById["backParentBtn"].hidden = false;   // 模拟上一会话是 subagent（按钮可见）
+    openSession("sub-9");
+    chk("open session unknown to lastList keeps back button",
+        elsById["backParentBtn"].hidden === false,
+        "hidden=" + elsById["backParentBtn"].hidden);
+    // 列表补拉后：subagent（有 parent）→ 显示返回按钮
+    sessionsData = [
+      { id: "s1", parent_session_id: null, label: null, status: "Idle", entry_count: 0, active: true },
+      { id: "sub-9", parent_session_id: "s1", label: null, status: "Idle", entry_count: 0, active: true },
+    ];
+    await refreshSessionsForSidebar();
+    chk("refresh shows back button for subagent",
+        elsById["backParentBtn"].hidden === false,
+        "hidden=" + elsById["backParentBtn"].hidden);
+    // 列表补拉后：主会话（无 parent）→ 隐藏返回按钮
+    sessionsData = [
+      { id: "sub-9", parent_session_id: null, label: null, status: "Idle", entry_count: 0, active: true },
+    ];
+    await refreshSessionsForSidebar();
+    chk("refresh hides back button for main session",
+        elsById["backParentBtn"].hidden === true,
+        "hidden=" + elsById["backParentBtn"].hidden);
+    sessionsData = [{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}];   // 还原
     // 任务结束（从轮询列表消失）：面板清空，轮询停止
     tasksData = [];
     await pollTasks();
@@ -1133,6 +1163,28 @@ async function main(){
     chk("token re-expands", tokInp.hidden === false, "hidden=" + tokInp.hidden);
     tokInp._listeners["blur"][0]();
     chk("token blur defers collapse", tokInp.hidden === false, "hidden=" + tokInp.hidden);
+
+    // ---- Bug A：缺 model/role 的会话 → composerMeta hidden（动作按钮落左的
+    // 前置条件）；布局修复（.composer-actions margin-left:auto）由 python 侧
+    // 校验 style.css（DOM 桩无真实布局，无法断言像素位置） ----
+    const _savedList = state.lastList;
+    const _savedSid = state.sessionId;
+    state.lastList = [{ id: "noid", model: "", role: null, parent_session_id: null,
+                        status: "Idle", entry_count: 0, active: false }];
+    state.sessionId = "noid";
+    updateComposerMeta();
+    chk("model-less session hides composer meta",
+        elsById["composerMeta"].hidden === true && elsById["composerMeta"].textContent === "",
+        "hidden=" + elsById["composerMeta"].hidden);
+    state.lastList = [{ id: "noid", model: "kimi", role: null, parent_session_id: null,
+                        status: "Idle", entry_count: 0, active: false }];
+    updateComposerMeta();
+    chk("modeled session shows composer meta",
+        elsById["composerMeta"].hidden === false && elsById["composerMeta"].textContent.includes("kimi"),
+        "hidden=" + elsById["composerMeta"].hidden + " text=" + elsById["composerMeta"].textContent);
+    state.lastList = _savedList;
+    state.sessionId = _savedSid;
+    updateComposerMeta();   // 还原
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);
@@ -1149,4 +1201,12 @@ if r.stderr.strip():
     print(r.stderr[:12000])
 if os.environ.get('KEEP') != '1':
     os.unlink(out)
-sys.exit(0 if "ALL PASS" in r.stdout + r.stderr else 1)
+
+# Bug A 的布局修复在 CSS 侧（DOM 桩无法算布局）：.composer-actions 必须
+# 带 margin-left:auto，meta 隐藏时按钮仍靠右（不依赖 meta 占位）。
+import re
+_css = open(os.path.join(HERE, 'style.css'), encoding='utf-8').read()
+_m = re.search(r'\.composer-actions\s*\{([^}]*)\}', _css)
+_css_ok = bool(_m and re.search(r'margin-left:\s*auto', _m.group(1)))
+print(("PASS" if _css_ok else "FAIL") + " composer-actions margin-left:auto in style.css")
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok else 1)

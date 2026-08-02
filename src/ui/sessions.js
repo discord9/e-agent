@@ -373,9 +373,12 @@ function openSession(id, onReady) {
   els.listView.classList.add("hidden");
   els.chatView.classList.remove("hidden");
   els.topActions.hidden = false;
-  // subagent 会话：显示「← 主会话」快速返回父会话（主会话/无父则隐藏）
+  // subagent 会话：显示「← 主会话」快速返回父会话（主会话/无父则隐藏）。
+  // 任务面板直连跳转时 lastList 可能还没包含该 subagent（轮询未刷新）：
+  // cur 不存在则不动按钮（保持现状），等 refreshSessionsForSidebar 拉到
+  // 列表后由它判定，避免把返回按钮误藏。
   const cur = (state.lastList || []).find((s) => s.id === id);
-  els.backParentBtn.hidden = !(cur && cur.parent_session_id);
+  if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
   renderChatSessionId(id);
   updateComposerMeta();          // 显示当前会话 model · role（缓存/首开/恢复共用）
   els.usageInfo.textContent = "";
@@ -987,6 +990,10 @@ async function refreshSessionsForSidebar() {
     state.lastList = list;
     renderSidebarTree();
     updateComposerMeta();          // 聊天视图下列表刷新：同步 model/role（幂等）
+    // 同步「← 主会话」按钮：任务面板直连跳转的 subagent 现在已入列表，
+    // 按 parent_session_id 正确显示/隐藏（cur 仍可能查不到——保持现状）。
+    const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
+    if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
   } catch (e) { /* 静默：保留旧列表 */ }
 }
 /* =====================================================================

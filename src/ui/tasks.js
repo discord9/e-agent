@@ -387,7 +387,14 @@ function renderTaskList(tasks, container) {
       if (isDelegate) {
         // 新行为：切到该 subagent 的会话（完整消息/工具卡片/思考块渲染）
         const subId = resolveSubagentSessionId(t);
-        if (subId) { openSession(subId); return; }
+        if (subId) {
+          openSession(subId);
+          // 直连跳转时 lastList 可能还没包含该 subagent（轮询未刷新），
+          // 补拉一次让 openSession/refreshSessionsForSidebar 能按
+          // parent_session_id 显示「← 主会话」返回按钮。
+          refreshSessionsForSidebar();
+          return;
+        }
         // 列表可能还没拉到这个 subagent（刚创建）：补拉一次再试，
         // 仍解析不到 → 回退就地展开
         refreshSessionsForSidebar().then(() => {

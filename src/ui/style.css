@@ -694,7 +694,14 @@ mmlEqnNo}
     max-height: 160px;
     overflow-y: auto;
   }
-  .composer-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .composer-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    /* meta 隐藏时（会话无 model/role）也把按钮推到 flex 行右端：
+       不依赖 .composer-meta 占位（它 hidden 时不占 flex 空间） */
+    margin-left: auto;
+  }
 
   /* 输入框底行：meta（模型·角色）在左下、操作按钮在右下；长 model 省略号 */
   .composer-foot {
