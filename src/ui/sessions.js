@@ -59,39 +59,97 @@ function applyValidation(problems) {
   }
 }
 
-async function pollSessions() {
-  if (state.view !== "list" || !state.token) return;
+async function pollAllWorkspaces() {
+  const wss = (state.workspaces || []).slice();
+  await Promise.allSettled(wss.map((ws) => pollWorkspaceSessions(ws)));
+}
+
+/* 兼容别名：既有调用点（switchWorkspace/backToList/restartTransport/init）
+   语义不变——现在等于聚合轮询全部 workspace。 */
+function pollSessions() {
+  return pollAllWorkspaces();
+}
+
+/* 拉取单个 workspace 的会话列表：
+   - 成功 → state.workspaceLists[ws.id] = list（并清错误标记）
+   - 失败（HTTP/网络/格式/认证）→ 保留旧列表（stale），标记
+     state.workspaceErrors[ws.id]（侧边栏显示「无法连接」分组头）
+   激活 workspace 额外承担既有单服务器职责：更新 state.lastList、
+   列表视图渲染、composer meta、深链、字段校验 banner（全部保持原行为）；
+   背景 workspace 只更新聚合缓存并重绘聚合视图。 */
+async function pollWorkspaceSessions(ws) {
+  if (!workspaceToken(ws)) return;        // 未配置 token 的服务器：跳过（不显示错误）
+  let list = null;
+  let err = null;
   try {
-    const res = await api("/api/sessions");
+    const res = await apiFor(ws, "/api/sessions");
     if (res.status === 401 || res.status === 403) {
-      setBanner("⚠ 认证失败：请检查 Token 是否正确。");
-      return;
+      err = "auth";
+      if (ws === state.workspace && state.view === "list") setBanner("⚠ 认证失败：请检查 Token。");
+    } else if (!res.ok) {
+      err = "http" + res.status;
+    } else {
+      let parsed = null;
+      try {
+        parsed = await res.json();
+      } catch (e) {
+        // 旧 server 返回 HTML 错误页等非 JSON：不崩，提示后跳过本轮；
+        // 占住校验 banner 位（恢复后由 applyValidation 自动清除），
+        // 并重置签名，恢复后的问题批次会重新上报
+        err = "format";
+        if (ws === state.workspace && state.view === "list") {
+          state.validateBannerUp = true;
+          state.lastValidateSig = null;
+          setBanner("⚠ 服务器返回异常格式（非 JSON，可能为旧版服务器）。", true);
+        }
+      }
+      if (!err) {
+        if (Array.isArray(parsed)) {
+          list = parsed;
+        } else {
+          // 合法 JSON 但不是数组（如 {}）：按格式错误处理——保留旧缓存
+          // （stale）+ 错误标记；只有激活 workspace 提示 banner（背景
+          // workspace 的格式错误只标记自己的分组，不弹全局 banner）。
+          err = "format";
+          if (ws === state.workspace && state.view === "list") {
+            state.validateBannerUp = true;
+            state.lastValidateSig = null;
+            setBanner("⚠ 服务器返回异常格式（非数组 JSON）。", true);
+          }
+        }
+      }
     }
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    let list;
-    try {
-      list = await res.json();
-    } catch (e) {
-      // 旧 server 返回 HTML 错误页等非 JSON：不崩，提示后跳过本轮；
-      // 占住校验 banner 位（恢复后由 applyValidation 自动清除），
-      // 并重置签名，恢复后的问题批次会重新上报
-      state.validateBannerUp = true;
-      state.lastValidateSig = null;
-      setBanner("⚠ 服务器返回异常格式（非 JSON，可能为旧版服务器）。", true);
-      return;
-    }
-    renderSessionList(Array.isArray(list) ? list : []);
-    renderSidebarTree();                 // 侧边栏会话树随轮询刷新
-    if (state.view === "chat") updateComposerMeta();   // model/role 可能随轮询更新（幂等）
-    maybeHandleDeepLink(Array.isArray(list) ? list : []);
-    applyValidation(validateSessions(list));   // 字段校验：只提示，不阻断渲染
   } catch (e) {
-    if (!navigator.onLine || e instanceof TypeError) {
+    err = "network";
+    if (ws === state.workspace && state.view === "list"
+        && (!navigator.onLine || e instanceof TypeError)) {
       setBanner("⚠ 无法连接服务器（网络错误）。", true);
     }
   }
+  if (list) {
+    state.workspaceLists[ws.id] = list;
+    state.workspaceErrors[ws.id] = null;
+  } else {
+    if (state.workspaceLists[ws.id] === undefined) state.workspaceLists[ws.id] = [];
+    state.workspaceErrors[ws.id] = err;   // 保留旧列表（stale），标记错误
+  }
+  if (ws === state.workspace) {
+    // ---- 激活 workspace：既有单服务器职责全部保留 ----
+    state.lastList = state.workspaceLists[ws.id];
+    if (state.view === "list") {
+      renderSessionList();
+      maybeHandleDeepLink(state.lastList);
+      applyValidation(validateSessions(state.lastList));
+    } else if (state.view === "chat") {
+      updateComposerMeta();               // model/role 可能随轮询更新（幂等）
+    }
+    renderSidebarTree();                  // 侧边栏会话树随轮询刷新
+  } else {
+    // ---- 背景 workspace：只刷新聚合视图 ----
+    if (state.view === "list") renderSessionList();
+    renderSidebarTree();
+  }
 }
-
 /* URL 深链：?session=<id>。token 就绪且列表拿到数据后自动打开一次。
    active 会话直接 openSession；inactive（历史）会话走 resumeSession
    （resume 成功后内部会 openSession）。一次性标志防止轮询重复触发。 */
@@ -103,22 +161,52 @@ function maybeHandleDeepLink(list) {
   if (!hit) return;                            // 列表里还没出现：等下一轮轮询
   state.deepLink.handled = true;
   state.deepLink.pending = null;
-  if (hit.active === false) resumeSession(target);
+  // 深链可能从 pollSessions 触发（列表就绪时），与跨服务器打开竞态：
+  // openSession 自身声明新 epoch；resumeSession 携带发起时的工作区 id，
+  // POST 完成后校验（过期深链不打开）。
+  if (hit.active === false) resumeSession(state.workspace.id, target);
   else openSession(target);
 }
 
+/* workspace 的会话列表解析：
+   - 激活 workspace → state.lastList（既有单服务器路径的唯一数据源，
+     pollWorkspaceSessions 每次轮询同步它）
+   - 背景 workspace → state.workspaceLists[ws.id]（各自轮询维护的缓存）
+   单服务器模式（旧行为）下 state.workspaceLists 为空，激活列表 = lastList，
+   所有既有测试/代码路径不变。 */
+function workspaceListFor(ws) {
+  if (ws === state.workspace) return state.lastList || [];
+  const l = state.workspaceLists[ws.id];
+  return Array.isArray(l) ? l : [];
+}
+
+/* 聚合行：所有 workspace 的会话，每行携带所属 ws（row click 用 (wsId, sid)
+   定位；session id 可能跨服务器撞名，绝不能只用 sid）。 */
+function aggregateSessionRows() {
+  const rows = [];
+  for (const ws of state.workspaces) {
+    for (const s of workspaceListFor(ws)) rows.push({ ws, s });
+  }
+  return rows;
+}
+
+/* 列表视图（聚合）：所有 workspace 的会话合并成一个列表，行首带服务器
+   chip（.ws-chip）；搜索跨全部服务器过滤；点击跨服务器会话自动切换
+   workspace 再打开（openSessionIn/resumeSessionIn）。激活 workspace 的
+   会话与单服务器模式完全一致（state.lastList 是它的列表）。 */
 function renderSessionList(list) {
   // 行内重命名进行中：跳过本轮重绘（列表页轮询 1s 一次，会冲掉编辑框）；
   // 保存/取消后由 enterRename 清除标志并自行重绘
   if (state.renameActive) return;
-  state.lastList = Array.isArray(list) ? list : [];
+  if (arguments.length > 0) state.lastList = Array.isArray(list) ? list : [];
   // 排序：后端保证 pinned 置顶在前、组内按 last_active_at 降序；前端按数组
   // 顺序渲染、不自行重排（旧 server / mock 返回什么顺序就渲染什么顺序）。
-  let rows = state.lastList;
+  let rows = aggregateSessionRows();
   if (state.searchQuery) {
     const q = state.searchQuery;
-    rows = rows.filter((s) => {
+    rows = rows.filter((r) => {
       // 对 id / title / model / parent_session_id 子串匹配，大小写不敏感
+      const s = r.s;
       const hay = [s.id, s.title, s.model, s.parent_session_id]
         .map((v) => String(v || "").toLowerCase());
       return hay.some((h) => h.includes(q));
@@ -133,7 +221,7 @@ function renderSessionList(list) {
     return;
   }
   els.listHint.textContent = "";
-  for (const s of rows) {
+  for (const { ws, s } of rows) {
     // Historical (inactive) sessions come from the metadata table: grey
     // row, clicking resumes them instead of opening directly.
     const inactive = s.active === false;
@@ -142,6 +230,8 @@ function renderSessionList(list) {
     row.title = s.id + (s.model ? " · " + s.model : "") +
       (s.parent_session_id ? " · 子会话 ← " + s.parent_session_id : "");
 
+    const chip = el("span", "ws-chip", ws.name);   // 服务器徽章：跨服务器会话可区分
+    chip.title = ws.url || ws.name;                // hover 显示服务器地址
     const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
     // 有标题优先显示：标题一行 + 完整 id 小字一行；无标题单行完整 id
     let sid;
@@ -162,9 +252,9 @@ function renderSessionList(list) {
     pin.setAttribute("aria-pressed", String(s.pinned === true));
     pin.addEventListener("click", (ev) => {
       ev.stopPropagation();                // 不触发打开会话
-      togglePin(s, () => { renderSessionList(state.lastList); renderSidebarTree(true); });
+      togglePin(s, () => { renderSessionList(); renderSidebarTree(true); }, ws);
     });
-    const chip = el("span", "status-chip " + statusChipClass(s.status), statusLabel(s.status));
+    const chip2 = el("span", "status-chip " + statusChipClass(s.status), statusLabel(s.status));
     const model = el("span", "smodel", s.model || "");
     const meta = el("span", "smeta",
       fmtTime(s.created_at) + " · " + (s.entry_count ?? "-") + " 条" +
@@ -175,35 +265,86 @@ function renderSessionList(list) {
       ev.stopPropagation();
       if (!confirm("确认删除会话 " + s.id + " ？")) return;
       try {
-        const res = await api("/api/sessions/" + encodeURIComponent(s.id), { method: "DELETE" });
+        const res = await apiFor(ws, "/api/sessions/" + encodeURIComponent(s.id), { method: "DELETE" });
         if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
         if (!res.ok && res.status !== 204) throw new Error("HTTP " + res.status);
-        delete state.sessionStates[s.id];   // 删除会话：同步清掉视图缓存（切回不再恢复）
+        // 删除路由：只更新所属 workspace 的缓存并重绘（聚合模式下绝不误伤
+        // 其它服务器；session id 可能跨服务器撞名，绝不能只用 sid 定位）。
+        const wl = workspaceListFor(ws);
+        const delIdx = wl.findIndex((x) => x.id === s.id);
+        if (delIdx >= 0) wl.splice(delIdx, 1);
+        // sessionStates 只清激活 workspace 的会话：删除背景服务器的会话
+        // 不能抹掉激活服务器对同名会话的视图缓存。
+        if (ws.id === state.workspace.id) delete state.sessionStates[s.id];
+        renderSessionList();
+        renderSidebarTree(true);
       } catch (e) {
         setBanner("⚠ 删除失败：" + e.message);
       }
     });
     row.addEventListener("click", () => {
-      if (inactive) { resumeSession(s.id); return; }
-      openSession(s.id);
+      if (inactive) { resumeSessionIn(ws.id, s.id); return; }
+      openSessionIn(ws.id, s.id);
     });
-    row.append(dot, sid, pin, chip, model, meta, del);
+    row.append(chip, dot, sid, pin, chip2, model, meta, del);
     els.sessionList.appendChild(row);
   }
 }
-
-/* 恢复（resume）一个历史会话：POST /api/sessions {id} 建回活跃会话后打开 */
-async function resumeSession(id) {
-  if (!state.token) { setBanner("⚠ 请先输入 Token。", true); return; }
+/* 恢复（resume）一个历史会话：POST /api/sessions {id} 建回活跃会话后打开。
+   wsId 是发起恢复的服务器（调用方在发起时捕获，不能是 POST await 期间的
+   实时激活服务器）；POST 成功后必须重新校验 epoch 与 wsId 才打开——否则
+   POST 期间用户切到其它服务器/打开别的会话，过期恢复会在错误服务器上
+   打开（旧 bug：resumeSession 无条件 openSession）。 */
+async function resumeSession(wsId, id, epoch) {
+  const ws = state.workspaces.find((w) => w.id === wsId) || state.workspace;
+  if (!workspaceToken(ws)) { setBanner("⚠ 请先输入 Token。", true); return; }
+  // 恢复也是「打开」：入口（点击/深链）声明一次代次；嵌套调用（resumeSessionIn
+  // → resumeSession → openSession）共享调用方传入的同一代次，绝不二次递增。
+  const claimed = (epoch === undefined) ? ++sessionOpenEpoch : epoch;
   try {
-    const res = await api("/api/sessions", { method: "POST", body: JSON.stringify({ id }) });
+    const res = await apiFor(ws, "/api/sessions", { method: "POST", body: JSON.stringify({ id }) });
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
     if (res.status !== 201) throw new Error("HTTP " + res.status);
     const s = await res.json();
-    openSession(s.id);
+    if (claimed !== sessionOpenEpoch) return;    // 期间有更新的打开/切换/返回列表：过期恢复丢弃
+    if (state.workspace.id !== wsId) return;     // 发起恢复的服务器已不是激活的：不在这里打开
+    openSession(s.id, undefined, claimed);
   } catch (e) {
     setBanner("⚠ 恢复会话失败：" + e.message);
   }
+}
+
+/* 跨 workspace 打开会话：目标 wsId 非激活 → 先 await switchWorkspace(wsId)
+   （切换完成后 next tick 才继续），再 openSession(id)。竞态防护：
+   - 入口点击声明一次 action epoch，嵌套的 switchWorkspace/openSession 共享
+     同一代次（不再各自递增）；任何直接切换/新的打开都会取代代次，使旧
+     的在途打开失效（最新一次操作获胜）；
+   - state.workspace.id 二次校验：切换期间目标又被顶掉（用户直接切了
+     workspace）也丢弃。
+   同 workspace 直接 openSession（同步，无切换开销）。 */
+async function openSessionIn(wsId, id, onReady, epoch) {
+  // 入口点击：整个「（可能切 workspace）+ 打开」是一次动作，声明一次代次，
+  // 嵌套的 switchWorkspace/openSession 共享它——不再各自递增。
+  const claimed = (epoch === undefined) ? ++sessionOpenEpoch : epoch;
+  if (wsId !== state.workspace.id) {
+    await switchWorkspace(wsId, claimed);
+  }
+  if (state.workspace.id !== wsId) return;      // 目标已被顶掉：丢弃
+  openSession(id, onReady, claimed);
+}
+
+/* 跨 workspace 恢复历史会话：先切到目标服务器，再 POST /api/sessions {id}
+   （请求打到目标服务器）建回活跃会话后打开。wsId 透传给 resumeSession 做
+   POST 完成后的二次校验（期间切走则不在错误服务器打开）。 */
+async function resumeSessionIn(wsId, id, epoch) {
+  // 入口点击：整个「（可能切 workspace）+ 恢复」是一次动作，声明一次代次，
+  // 嵌套的 switchWorkspace/resumeSession/openSession 共享它。
+  const claimed = (epoch === undefined) ? ++sessionOpenEpoch : epoch;
+  if (wsId !== state.workspace.id) {
+    await switchWorkspace(wsId, claimed);
+  }
+  if (state.workspace.id !== wsId) return;      // 目标已被顶掉：丢弃
+  await resumeSession(wsId, id, claimed);
 }
 
 async function createSession() {
@@ -233,15 +374,20 @@ async function createSession() {
 /* =====================================================================
  * 对话视图流程
  * ===================================================================*/
-async function loadHistory(id) {
+async function loadHistory(id, wsId, epoch) {
+  const ws = state.workspaces.find((w) => w.id === wsId) || state.workspace;
   try {
     // 只取尾部 HISTORY_PAGE 条：长会话不一次全量渲染（Firefox 等浏览器
     // 对超大 DOM 滚动卡死）；滚动触顶时 loadOlder 增量加载更早。
-    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/history?limit=" + HISTORY_PAGE);
+    const res = await apiFor(ws, "/api/sessions/" + encodeURIComponent(id) + "/history?limit=" + HISTORY_PAGE);
+    // 竞态防护：响应回来时打开/切换/返回列表已发生 → 丢弃，不碰 DOM/state
+    // （陈旧响应绝不渲染到新激活的服务器/会话，也不起 SSE）。
+    if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== id) return "stale";
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return "auth"; }
     if (res.status === 404) { setBanner("⚠ 会话不存在或已被删除。"); return "gone"; }
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
+    if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== id) return "stale";
     const entries = Array.isArray(data) ? data : (data.entries || []);
     state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
     state.olderDone = (state.nextBeforeSeq === null);
@@ -276,6 +422,7 @@ async function loadHistory(id) {
     }
     return "ok";
   } catch (e) {
+    if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== id) return "stale";
     // 网络问题：交给 SSE snapshot 兜底；两者都失败则提示
     if (!state.acc || !els.messages.children.length) {
       setBanner("⚠ 加载历史失败：" + e.message + "（等待 SSE 快照…）", true);
@@ -287,14 +434,19 @@ async function loadHistory(id) {
 /* 滚动到顶部时加载更早历史（分页：一次一个 compaction 段） */
 async function loadOlder() {
   if (state.loadingOlder || state.olderDone || !state.sessionId || state.nextBeforeSeq === null) return;
+  const wsId = state.workspace.id;   // 发起时的 workspace：响应回来校验用
+  const epoch = sessionOpenEpoch;
+  const sid = state.sessionId;
   state.loadingOlder = true;
   const prevHeight = els.messages.scrollHeight;   // 插入前高度
   try {
-    const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId)
+    const res = await api("/api/sessions/" + encodeURIComponent(sid)
       + "/history?before_seq=" + state.nextBeforeSeq + "&limit=" + HISTORY_PAGE);
+    if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== sid) return;
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
     if (!res.ok) return;                          // 静默失败，下次滚动重试
     const data = await res.json();
+    if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== sid) return;
     const entries = Array.isArray(data) ? data : (data.entries || []);
     state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
     if (state.nextBeforeSeq === null) state.olderDone = true;
@@ -310,19 +462,26 @@ async function loadOlder() {
   } catch (e) {
     // 静默失败，下次滚动重试
   } finally {
-    state.loadingOlder = false;
+    // 陈旧响应不碰 state：新会话/新加载可能已接管 loadingOlder
+    if (epoch === sessionOpenEpoch && state.workspace.id === wsId && state.sessionId === sid) {
+      state.loadingOlder = false;
+    }
   }
 }
 
 /* history 加载（可选）+ 连接 SSE；auth/gone 时不再重试连接。
    onReady：视图就绪后的回调（历史渲染完 / 缓存恢复完，消息区可操作时
-   触发一次）。 */
-function openWith(id, withHistory, onReady) {
-  const step = withHistory ? loadHistory(id) : Promise.resolve("ok");
+   触发一次）。
+   wsId/epoch：打开时捕获的发起上下文——响应回来时任何一项不匹配
+   （新的打开/切换/返回列表）→ 丢弃过期回调，不起 SSE。 */
+function openWith(id, withHistory, onReady, wsId, epoch) {
+  const step = withHistory ? loadHistory(id, wsId, epoch) : Promise.resolve("ok");
   step.then((r) => {
-    if (state.sessionId !== id) return;   // 已切换会话：丢弃过期回调
+    if (epoch !== sessionOpenEpoch) return;       // 更新的打开/切换/返回列表已发生
+    if (state.workspace.id !== wsId) return;      // 已被切到其它服务器
+    if (state.sessionId !== id) return;           // 已切换会话：丢弃过期回调
     if (r === "auth" || r === "gone") return;
-    connectSSE(id);
+    connectSSE(id, wsId, epoch);
     if (onReady) onReady();
   });
 }
@@ -404,7 +563,11 @@ function saveSessionState() {
   };
 }
 
-function openSession(id, onReady) {
+function openSession(id, onReady, epoch) {
+  // 打开即声明新代次（入口调用）；嵌套调用（openSessionIn/resumeSession 等
+  // 已声明过）传入共享的代次，不再递增——一次用户动作只有一个 action epoch。
+  const claimed = (epoch === undefined) ? ++sessionOpenEpoch : epoch;
+  const wsId = state.workspace.id;    // 发起时的工作区（history/SSE 校验用）
   saveSessionState();          // 切走：保存当前会话（消息/滚动/分页/草稿）
   state.renameActive = false;  // 切换会话会销毁编辑框：清标志，恢复轮询重绘
   stopSSE();
@@ -449,7 +612,7 @@ function openSession(id, onReady) {
     const atBottom = m.scrollHeight - m.scrollTop - m.clientHeight <= 4;
     userScrolled = !atBottom;      // 恢复到非底部位置：不自动跟随滚动
     els.jumpBottomBtn.hidden = atBottom;
-    openWith(id, true, onReady);   // 拉最新尾部替换过期缓存；onReady 在替换渲染完成后触发
+    openWith(id, true, onReady, wsId, claimed);   // 拉最新尾部替换过期缓存；onReady 在替换渲染完成后触发
   } else {
     // 首次打开：走既有流程（加载历史 + SSE）
     state.initSource = null;
@@ -463,12 +626,13 @@ function openSession(id, onReady) {
     els.promptInput.value = "";    // 输入框草稿跟随会话：新会话从空开始
     autosizeInput();
     userScrolled = false;          // 打开新会话：恢复自动跟随
-    openWith(id, true, onReady);   // onReady 在 loadHistory 渲染完成后触发
+    openWith(id, true, onReady, wsId, claimed);   // onReady 在 loadHistory 渲染完成后触发
   }
   renderSidebarTree();             // 更新 .current 高亮
 }
 
 function backToList() {
+  ++sessionOpenEpoch;          // 返回列表：使一切在途打开/恢复/历史加载失效
   saveSessionState();          // 返回列表也保存视图状态：再次打开该会话时恢复
   state.renameActive = false;  // 同 openSession：视图切换即销毁编辑框
   stopSSE();
@@ -962,13 +1126,16 @@ function restartTransport() {
     const id = state.sessionId;
     stopSSE();
     state.initSource = null;
-    openWith(id, true);
+    openWith(id, true, undefined, state.workspace.id, sessionOpenEpoch);
   }
 }
 
+/* 聚合轮询：单一定时器驱动所有 workspace（激活 + 背景同为 1s；
+   简单起见不区分速率——每 tick 并行拉取，单 tick 内 Promise.allSettled
+   保证一台失败不影响其它）。 */
 function startPolling() {
   stopPolling();
-  state.pollTimer = setInterval(pollSessions, 1000);
+  state.pollTimer = setInterval(pollAllWorkspaces, 1000);
 }
 function stopPolling() {
   if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
@@ -1023,22 +1190,16 @@ function closeSidebar() {
   }, 220);
 }
 
-/* 聊天视图下补拉会话列表（pollSessions 只在列表视图跑）；失败静默保留旧数据 */
+/* 聊天视图下补拉会话列表（聚合：一次拉全所有 workspace，侧边栏分组刷新；
+   背景服务器失败只标记、不打断激活服务器）。失败静默保留旧数据。 */
 async function refreshSessionsForSidebar() {
   if (!state.token) return;
-  try {
-    const res = await api("/api/sessions");
-    if (!res.ok) return;
-    const list = await res.json();
-    if (!Array.isArray(list)) return;
-    state.lastList = list;
-    renderSidebarTree();
-    updateComposerMeta();          // 聊天视图下列表刷新：同步 model/role（幂等）
-    // 同步「← 主会话」按钮：任务面板直连跳转的 subagent 现在已入列表，
-    // 按 parent_session_id 正确显示/隐藏（cur 仍可能查不到——保持现状）。
-    const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
-    if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
-  } catch (e) { /* 静默：保留旧列表 */ }
+  await pollAllWorkspaces();
+  updateComposerMeta();          // 聊天视图下列表刷新：同步 model/role（幂等）
+  // 同步「← 主会话」按钮：任务面板直连跳转的 subagent 现在已入列表，
+  // 按 parent_session_id 正确显示/隐藏（cur 仍可能查不到——保持现状）。
+  const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
+  if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
 }
 /* =====================================================================
  * 会话侧边栏：会话树
@@ -1052,23 +1213,36 @@ async function refreshSessionsForSidebar() {
  * 「+N 个更早的会话」按钮点击显示全部；子会话/孤儿组不计数。
  * 筛选时（state.sidebar.filter 非空）：主会话按 title/id 匹配才显示，
  * 匹配的显示其所有子会话；孤儿按自身 title/id 匹配。
- * 数据来自 state.lastList（pollSessions）。列表未变化时跳过重绘，
- * 保留展开状态与滚动位置。
+ * 数据来自各 workspace 的列表（激活 = state.lastList，背景 =
+ * workspaceLists[ws.id]，由 pollWorkspaceSessions 聚合轮询维护）。
+ * 列表未变化时跳过重绘，保留展开状态与滚动位置。
  * ===================================================================*/
-const MAX_TREE_ROOTS = 8;   // 默认只显示最近 8 个主会话（少滑即见）
+const MAX_TREE_ROOTS = 8;   // 每个 workspace 分组内默认只显示最近 8 个主会话（少滑即见）
 let lastTreeSig = "";
 
+/* 聚合树签名：所有 workspace 的列表（激活 = lastList，背景 = 各自缓存）+
+   激活标记 + 错误标记 + 当前会话 id。任一变化 → 重绘（保留展开/滚动状态）。 */
 function sidebarTreeSig() {
-  const list = state.lastList || [];
-  // 签名含当前会话 id：打开/切换会话后重绘以更新 .current 高亮；
-  // 含 label：subagent 任务标题变化时树要重绘；含 pinned：置顶态变化（轮询/本端）都要反映
-  return state.sessionId + "|" + JSON.stringify(list.map((s) => [
-    s.id, s.title || "", s.label || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
-    s.entry_count ?? 0, s.parent_session_id || "", s.pinned === true ? 1 : 0,
-  ]));
+  const parts = [];
+  for (const ws of state.workspaces) {
+    const list = workspaceListFor(ws);
+    parts.push(ws.id + ":" + (ws === state.workspace ? 1 : 0) + ":"
+      + (state.workspaceErrors[ws.id] || "") + ":"
+      + (state.sidebar.showAllWs.has(ws.id) ? 1 : 0) + ":"
+      + JSON.stringify(list.map((s) => [
+        s.id, s.title || "", s.label || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
+        s.entry_count ?? 0, s.parent_session_id || "", s.pinned === true ? 1 : 0,
+      ])));
+  }
+  return state.sessionId + "|" + parts.join("|");
 }
 
-/* force=true 时无视签名强制重绘（筛选输入、展开全部按钮） */
+/* force=true 时无视签名强制重绘（筛选输入、展开全部按钮、切换 workspace）
+   聚合结构：每个 workspace 一个分组（.tree-ws-section），组头 = 服务器名 +
+   徽章（点击切到该服务器并回列表视图；错误时附加 muted「无法连接」）；
+   组内复用既有树逻辑（renderTreeForList：roots/orphans/MAX_TREE_ROOTS/
+   「未关联」组/历史子会话组）。孤儿按各自 workspace 的列表判定，绝不跨
+   服务器匹配 parent。 */
 function renderSidebarTree(force) {
   const tree = els.sidebarTree;
   if (!tree) return;
@@ -1077,9 +1251,48 @@ function renderSidebarTree(force) {
   lastTreeSig = sig;
   const prevScroll = tree.scrollTop;
   tree.innerHTML = "";
-  const list = state.lastList || [];
+  for (const ws of state.workspaces) {
+    const list = workspaceListFor(ws);
+    const err = state.workspaceErrors[ws.id] || null;
+    const sec = el("div", "tree-ws-section" + (ws === state.workspace ? " active" : ""));
+    // ---- 组头：服务器名 + 徽章；点击切换 workspace（switchWorkspace 回列表视图） ----
+    const header = el("div", "tree-ws-header");
+    header.title = ws.url || ws.name;          // hover 显示服务器地址
+    const chip = el("span", "ws-chip", ws.name);
+    header.appendChild(chip);
+    if (err) {
+      header.appendChild(el("span", "ws-err", "无法连接"));
+      header.title += "（" + err + "）";
+    }
+    if (ws === state.workspace) {
+      header.appendChild(el("span", "ws-cur", "当前"));
+      sec.classList.add("active");
+    }
+    header.addEventListener("click", () => {
+      if (ws !== state.workspace) switchWorkspace(ws.id);   // 已激活则无操作
+    });
+    sec.appendChild(header);
+    // ---- 组体：既有树逻辑（per-workspace） ----
+    const body = el("div", "tree-ws-body");
+    if (!list.length) {
+      body.appendChild(el("div", "tree-empty",
+        err ? "无法连接，等待重试…" : "暂无会话"));
+    } else {
+      renderTreeForList(body, list, ws.id);
+    }
+    sec.appendChild(body);
+    tree.appendChild(sec);
+  }
+  tree.scrollTop = prevScroll;
+}
+
+/* 单个 workspace 的树渲染（原 renderSidebarTree 主体，抽出来按 ws 复用）：
+   roots/orphans/MAX_TREE_ROOTS/hist-groups 全部按本列表判定；wsId 用于
+   expanded 键限定（wsId:sid）与 .current 高亮（只高亮激活 workspace 内
+   当前会话）。 */
+function renderTreeForList(container, list, wsId) {
   if (!list.length) {
-    tree.appendChild(el("div", "tree-empty", "暂无会话"));
+    container.appendChild(el("div", "tree-empty", "暂无会话"));
     return;
   }
   const childrenByParent = new Map();
@@ -1104,36 +1317,36 @@ function renderSidebarTree(force) {
     const matchedRoots = roots.filter(match);
     const matchedOrphans = orphans.filter(match);
     if (!matchedRoots.length && !matchedOrphans.length) {
-      tree.appendChild(el("div", "tree-empty", "无匹配会话"));
+      container.appendChild(el("div", "tree-empty", "无匹配会话"));
     } else {
-      for (const s of matchedRoots) tree.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || []));
-      if (matchedOrphans.length) tree.appendChild(buildTreeGroup("未关联", matchedOrphans));
+      for (const s of matchedRoots) container.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || [], wsId));
+      if (matchedOrphans.length) container.appendChild(buildTreeGroup("未关联", matchedOrphans, wsId));
     }
   } else {
     let shown = roots;
     let moreBtn = null;
-    if (!state.sidebar.showAll && roots.length > MAX_TREE_ROOTS) {
+    if (!state.sidebar.showAllWs.has(wsId) && roots.length > MAX_TREE_ROOTS) {
       shown = roots.slice(0, MAX_TREE_ROOTS);
       const more = roots.length - shown.length;
       moreBtn = el("button", "tree-more", "+" + more + " 个更早的会话");
       moreBtn.type = "button";
       moreBtn.title = "显示全部主会话";
       moreBtn.addEventListener("click", () => {
-        state.sidebar.showAll = true;
+        state.sidebar.showAllWs.add(wsId);   // 只展开本 workspace 分组
         renderSidebarTree(true);
       });
     }
-    for (const s of shown) tree.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || []));
-    if (moreBtn) tree.appendChild(moreBtn);
-    if (orphans.length) tree.appendChild(buildTreeGroup("未关联", orphans));
+    for (const s of shown) container.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || [], wsId));
+    if (moreBtn) container.appendChild(moreBtn);
+    if (orphans.length) container.appendChild(buildTreeGroup("未关联", orphans, wsId));
   }
-  tree.scrollTop = prevScroll;
 }
 
-function buildTreeRoot(s, kids) {
+function buildTreeRoot(s, kids, wsId) {
   const node = el("div", "tree-node");
-  const row = el("div", "tree-row" + (state.sessionId === s.id ? " current" : "") +
-    (s.pinned === true ? " pinned" : ""));
+  const row = el("div", "tree-row"
+    + (state.workspace.id === wsId && state.sessionId === s.id ? " current" : "")
+    + (s.pinned === true ? " pinned" : ""));
   const hasKids = kids.length > 0;
   const toggle = el("button", "tree-toggle");
   toggle.type = "button";
@@ -1142,7 +1355,7 @@ function buildTreeRoot(s, kids) {
     toggle.title = "展开 / 收起子会话";
     toggle.addEventListener("click", (ev) => {
       ev.stopPropagation();          // 点击箭头只展开/收起，不切换会话
-      toggleSidebarNode(s.id, toggle, kids);
+      toggleSidebarNode(wsId + ":" + s.id, toggle, kids, wsId);
     });
   }
   const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
@@ -1169,61 +1382,63 @@ function buildTreeRoot(s, kids) {
   pin.setAttribute("aria-pressed", String(s.pinned === true));
   pin.addEventListener("click", (ev) => {
     ev.stopPropagation();                  // 不触发切换会话
-    togglePin(s, () => { renderSidebarTree(true); renderSessionList(state.lastList); });
+    const ws = state.workspaces.find((w) => w.id === wsId);
+    togglePin(s, () => { renderSidebarTree(true); renderSessionList(); }, ws);
   });
   row.append(toggle, dot, titleEl, count, pin);
   row.title = (s.title || s.id) + (s.model ? " · " + s.model : "") + (s.busy ? "（处理中）" : "");
   row.addEventListener("click", () => {
-    if (s.active === false) { resumeSession(s.id); return; }   // 与列表页一致：历史会话先恢复
-    openSession(s.id);
+    if (s.active === false) { resumeSessionIn(wsId, s.id); return; }   // 与列表页一致：历史会话先恢复
+    openSessionIn(wsId, s.id);
   });
   node.appendChild(row);
   if (hasKids) {
     const children = el("div", "tree-children");
     children.hidden = true;
     // 筛选时匹配的父节点直接展开显示全部子会话；否则按展开状态
-    const showKids = !!state.sidebar.filter || state.sidebar.expanded.has(s.id);
+    // （expanded 键 workspace 限定：wsId:sid，跨服务器不撞名）
+    const showKids = !!state.sidebar.filter || state.sidebar.expanded.has(wsId + ":" + s.id);
     if (showKids) {
       children.hidden = false;
       toggle.classList.add("open");
-      renderTreeChildren(children, kids);
+      renderTreeChildren(children, kids, wsId);
     }
     node.appendChild(children);
   }
   return node;
 }
 
-function toggleSidebarNode(id, toggle, kids) {
+function toggleSidebarNode(key, toggle, kids, wsId) {
   const children = toggle.closest(".tree-node").querySelector(".tree-children");
   if (!children) return;
   if (children.hidden) {
     children.hidden = false;
     toggle.classList.add("open");
-    renderTreeChildren(children, kids);   // 展开时才渲染子节点（400+ 会话不拖慢树）
-    state.sidebar.expanded.add(id);
+    renderTreeChildren(children, kids, wsId);   // 展开时才渲染子节点（400+ 会话不拖慢树）
+    state.sidebar.expanded.add(key);
   } else {
     children.hidden = true;
     toggle.classList.remove("open");
-    state.sidebar.expanded.delete(id);
+    state.sidebar.expanded.delete(key);
   }
 }
 
 /* 父节点 / 「未关联」组的子节点渲染：默认只显示活跃 subagent
    （active !== false，即活跃或 busy），非活跃收进折叠的
    「历史子会话 (N)」分组（buildHistGroup，默认收起、点击展开）。 */
-function renderTreeChildren(container, kids) {
+function renderTreeChildren(container, kids, wsId) {
   container.innerHTML = "";
   const active = [], hist = [];
   for (const k of kids) (k.active === false ? hist : active).push(k);
-  renderSubagentRows(container, active);
-  if (hist.length) container.appendChild(buildHistGroup(hist));
+  renderSubagentRows(container, active, false, wsId);
+  if (hist.length) container.appendChild(buildHistGroup(hist, wsId));
 }
 
 /* 渲染 subagent 行（不做活跃/历史分组）；hist=true 时行灰显小字 */
-function renderSubagentRows(container, kids, hist) {
+function renderSubagentRows(container, kids, hist, wsId) {
   for (const k of kids) {
     const row = el("div", "tree-row tree-row-child" + (hist ? " tree-hist" : "") +
-                   (state.sessionId === k.id ? " current" : ""));
+      (state.workspace.id === wsId && state.sessionId === k.id ? " current" : ""));
     const dot = el("span", "busy-dot" + (k.busy ? " busy" : ""));
     // label 优先：subagent 的任务面板标题最友好；旧 server 无 label → 回退 title/id
     // 有 label/title：两行（label/title 行 + 完整 id 行）；无则一行完整 id。
@@ -1242,8 +1457,8 @@ function renderSubagentRows(container, kids, hist) {
     // busy 的 subagent：title 提示可发送消息（点击行 openSession 是现有行为，保持不变）
     row.title = (k.label || k.title || k.id) + (k.busy ? "（处理中）· 可发送消息" : "");
     row.addEventListener("click", () => {
-      if (k.active === false) { resumeSession(k.id); return; }
-      openSession(k.id);
+      if (k.active === false) { resumeSessionIn(wsId, k.id); return; }
+      openSessionIn(wsId, k.id);
     });
     container.appendChild(row);
   }
@@ -1251,7 +1466,7 @@ function renderSubagentRows(container, kids, hist) {
 
 /* 「历史子会话 (N)」折叠分组：非活跃 subagent 默认收起，点击展开；
    不持久化展开状态（每次重绘默认折叠，简单）。 */
-function buildHistGroup(kids) {
+function buildHistGroup(kids, wsId) {
   const node = el("div", "tree-node");
   const row = el("div", "tree-row tree-hist-row");
   const toggle = el("button", "tree-toggle");
@@ -1263,13 +1478,13 @@ function buildHistGroup(kids) {
   node.appendChild(row);
   const children = el("div", "tree-children");
   children.hidden = true;
-  renderSubagentRows(children, kids, true);
+  renderSubagentRows(children, kids, true, wsId);
   node.appendChild(children);
   return node;
 }
 
 /* 「未关联」分组：孤儿 subagent 的根节点，默认折叠 */
-function buildTreeGroup(label, kids) {
+function buildTreeGroup(label, kids, wsId) {
   const node = el("div", "tree-node");
   const row = el("div", "tree-row");
   const toggle = el("button", "tree-toggle");
@@ -1281,7 +1496,7 @@ function buildTreeGroup(label, kids) {
   node.appendChild(row);
   const children = el("div", "tree-children");
   children.hidden = true;
-  renderTreeChildren(children, kids);
+  renderTreeChildren(children, kids, wsId);
   node.appendChild(children);
   return node;
 }
@@ -1387,15 +1602,18 @@ async function saveTitle(s, newTitle) {
 }
 
 /* PUT 切换置顶（📌 → PUT /api/sessions/{id}/pin {"pinned": bool}）；成功写回
-   传入的会话对象（即 state.lastList 里的对象）并回调调用方重绘（列表行与树主
-   节点共用）。旧服务器没有 pin 端点：404/405 统一提示「服务器不支持置顶」
+   目标 workspace 列表对象（workspaceListFor）并回调调用方重绘（列表行与树
+   主节点共用）。旧服务器没有 pin 端点：404/405 统一提示「服务器不支持置顶」
    （与重命名一致）；pinned 字段缺失（undefined）视为未置顶。
-   列表顺序信任后端（pinned 置顶在前、组内 last_active_at 降序），前端不重排。 */
-async function togglePin(s, afterToggle) {
-  if (!state.token) { setBanner("⚠ 请先输入 Token。", true); return; }
+   列表顺序信任后端（pinned 置顶在前、组内 last_active_at 降序），前端不重排。
+   ws 可选（聚合行/跨服务器树的节点传所属 workspace；缺省 = 激活 workspace，
+   既有调用不变）：请求打到目标服务器，避免背景服务器的置顶打到激活服务器。 */
+async function togglePin(s, afterToggle, ws) {
+  const targetWs = ws || state.workspace;
+  if (!workspaceToken(targetWs)) { setBanner("⚠ 请先输入 Token。", true); return; }
   const target = s.pinned !== true;   // 兼容旧 server 无 pinned 字段：undefined → 置顶
   try {
-    const res = await api("/api/sessions/" + encodeURIComponent(s.id) + "/pin",
+    const res = await apiFor(targetWs, "/api/sessions/" + encodeURIComponent(s.id) + "/pin",
       { method: "PUT", body: JSON.stringify({ pinned: target }) });
     if (res.status === 401 || res.status === 403) {
       setBanner("⚠ 认证失败：请检查 Token。");
@@ -1409,9 +1627,9 @@ async function togglePin(s, afterToggle) {
       }
       return;
     }
-    // 轮询可能已换掉 state.lastList 里的对象引用（列表数据未变时树/列表不重绘，
+    // 轮询可能已换掉列表里的对象引用（列表数据未变时树/列表不重绘，
     // 但数组每轮都是新的）：按 id 重新解析当前对象再写回，确保重绘反映新状态
-    const cur = (state.lastList || []).find((x) => x.id === s.id) || s;
+    const cur = workspaceListFor(targetWs).find((x) => x.id === s.id) || s;
     cur.pinned = target;
     afterToggle();
   } catch (e) {

@@ -1167,6 +1167,40 @@ mmlEqnNo}
   .tree-hist-label { color: var(--base01); font-size: 12px; }
   .tree-row-child.tree-hist .tree-id { color: var(--base01); font-size: 13px; }
 
+  /* ---------- 聚合侧边栏：按 workspace 分组 ---------- */
+  .tree-ws-section { margin-bottom: 4px; }
+  .tree-ws-section.active .tree-ws-header { background: var(--base2); }
+  .tree-ws-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .tree-ws-header:hover { background: var(--base3); }
+  /* 服务器徽章：列表行与侧边栏分组头共用（跨服务器会话可区分） */
+  .ws-chip {
+    font-size: 10px;
+    line-height: 1.6;
+    padding: 0 6px;
+    border: 1px solid var(--base1);
+    border-radius: 8px;
+    color: var(--base01);
+    background: var(--base3);
+    white-space: nowrap;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 0 0 auto;
+  }
+  /* 分组头错误标记：muted 红字（服务器轮询失败，列表保留为 stale） */
+  .ws-err { color: var(--red); font-size: 11px; opacity: 0.8; }
+  /* 「当前」标记：激活 workspace 分组头右侧 */
+  .ws-cur { color: var(--base01); font-size: 10px; margin-left: auto; flex: 0 0 auto; }
+  .tree-ws-body { padding-left: 2px; }
+
   /* ---------- 会话重命名：✎ / ✓ / × 小按钮与编辑态 ---------- */
   /* ✎ 按钮：≥24px 点击区、muted 色、hover 背景；树节点与列表行共用 */
   .tree-edit, .rename-save, .rename-cancel {
