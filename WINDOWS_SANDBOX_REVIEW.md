@@ -182,3 +182,20 @@ Minor 9（Windows 环境变量透传警告位置/策略）与 Minor 10（SPEC �
 1. 在 tip `1931bbf` 验证三项实现修复：Major 4 的 v3 ACE/删除重命名能力、Major 7 的 exact-ACE 条件扫描与无传播快路径、Major 8 的 duplicate-failure 确认终止；
 2. 裁决是否接受当前 accident-prevention MVP 威胁模型，以及将 Blocker 1 TOCTOU 与 Blocker 2 console/desktop 通道降级为已披露风险/未来 hardened mode 的两个请求；
 3. 若不接受，请明确要求的是 **hardened sandbox**，而不是 accident-prevention write-restriction MVP，避免把两种产品承诺混为同一验收标准。
+
+---
+
+## 评审结论（主 agent，2026-08-02）
+
+> 本节由产品负责人（主 agent + 用户）追加，确认威胁模型与关闭项；不改写原 reviewer 报告、分支所有者回应及其 verdict。
+
+1. **威胁模型确认（用户拍板）**：该功能的唯一目的是防止模型不小心读错/写错/删错目录（防模型误操作 / accident-prevention），不是防恶意进程。接受分支所有者在"分支所有者回应"中提出的 accident-prevention 威胁模型（本文件 `:147-149`）。
+2. **Blocker 1（硬链接 TOCTOU）与 Blocker 2（console/desktop 通道）降级接受**：两者都是针对能并发篡改文件系统/注入控制台的主动恶意进程的攻击面；模型（即使被 prompt injection 诱导）只是顺序调用工具，没有在扫描后微秒窗口内替换 hard link 或注入控制台输入的能力。静态 hard link 已被扫描拒绝，exact ACE 安装后不再传播（本文件 `:145`、`README.md:338-340`）→ 之后新建的 hard link 拿不到 capability ACE。故接受这两个 blocker 降级为"已披露风险 / 未来 hardened mode"，不再作为合并 blocker。
+3. **"防读"明确不进范围（用户拍板）**：Windows MVP 不防读、环境变量除 6 个 API key 外全透传，是已知边界，接受。read_file 等文件工具已有 workspace/外部 root capability 边界；bash 读 + 环境变量透传是自由面，靠提示词纪律。Linux bwrap 只在用户配置 `enabled = true` 时限制读。
+4. **Major 5（Job Object）降级为 follow-up**：超时/取消后子孙进程继续存活属生命周期正确性问题，在"模型以为已取消"场景仍是误写来源，但不阻塞合并；必须在分支上列为显式 follow-up（README 已披露只终止顶层进程 `README.md:353-355`）。合并时须保留该披露。
+5. **Minor 9（README Windows 段环境变量警告）与 Minor 10（SPEC 状态头）要求**：合并前应修（小改动），具体改法：
+   - Minor 10：`WINDOWS_SANDBOX_SPEC.md` 状态头（`:3-5`）改为"已实现 restricted-token 写限制 MVP（accident-prevention）"；明确 Job Object 进程树生命周期（Phase A）与 AppContainer（Phase C）尚未实现；`:56`/`:73`/`:192` 的 Phase-A 旧文案（"Windows `enabled = true` 报尚未实现"）标记为历史 Phase-A 过渡约定或改写。
+   - Minor 9：`README.md` 的 Windows MVP 段落（约 `:329-355`）补一句与 Linux 段（`:366-369`）相同的环境变量披露：除剥离名单（`EXA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `KIMI_API_KEY`）外的父进程环境变量对子进程可见。
+6. **下一轮 review 验收标准**：按 accident-prevention MVP 验收（fail-closed 无回退裸 shell + 写根限制 + 静态 hard link/reparse 拒绝 + 已披露风险清单）；未来若要做 hardened mode（AppContainer/Job Object/私有桌面/防读）需单独提案，不以同一标准混评。
+
+**待合并前完成**：Minor 9/10 文档修订 + Major 5 follow-up 登记。
