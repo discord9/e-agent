@@ -1084,6 +1084,13 @@ impl Tool for Delegate {
         }
         let cleanup = DelegateCleanup::new(slot, self.sessions.clone(), None);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        // The sync wrapper races the subagent runner against `done_tx.closed()`
+        // (fires when the main side drops `done_rx` — cancel/timeout/leave of
+        // the turn that is synchronously awaiting this delegate). On
+        // abandonment it aborts the subagent runner instead of leaving it to
+        // orphan and keep running (bash, file edits, session writes) until it
+        // finishes naturally. The abort output is discarded by `spawn_silent`.
+        let cancel_output = format!("subagent session: {session_id}\nsubagent cancelled");
         self.background.spawn_silent(
             label,
             role,
@@ -1106,12 +1113,28 @@ impl Tool for Delegate {
                 );
             },
             move || {
-                let cleanup = cleanup;
+                let mut cleanup = Some(cleanup);
+                let mut done_tx = done_tx;
                 async move {
-                    let result = Self::runner_result(&handle, runner_task).await;
-                    cleanup.finish();
-                    let _ = done_tx.send(result.clone());
-                    result_output(result).1
+                    let mut runner_task = Some(runner_task);
+                    tokio::select! {
+                        _ = done_tx.closed() => {
+                            // 主侧已放弃（取消/超时/离开）：中止子 runner，立即清理。
+                            if let Some(mut task) = runner_task.take() {
+                                task.abort();
+                            }
+                            cleanup.take().expect("cleanup taken once").finish();
+                            cancel_output
+                        }
+                        result = async {
+                            let task = runner_task.take().expect("runner task taken once");
+                            Self::runner_result(&handle, task).await
+                        } => {
+                            cleanup.take().expect("cleanup taken once").finish();
+                            let _ = done_tx.send(result.clone());
+                            result_output(result).1
+                        }
+                    }
                 }
             },
         )?;

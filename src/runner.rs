@@ -284,11 +284,18 @@ pub(crate) fn session_test_channel() -> (
 pub struct SessionTask {
     task: Option<JoinHandle<()>>,
 }
-impl Drop for SessionTask {
-    fn drop(&mut self) {
-        if let Some(task) = &self.task {
+impl SessionTask {
+    /// Abort the underlying runner task (idempotent; the `Drop` impl does
+    /// the same on normal exit paths).
+    pub fn abort(&mut self) {
+        if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+impl Drop for SessionTask {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 impl SessionTask {

@@ -543,6 +543,88 @@ async fn sync_failure_cleans_session_and_registry() {
 }
 
 #[tokio::test]
+async fn sync_abandon_aborts_runner_and_cleans_session() {
+    // 主 agent 取消（POST /api/sessions/{id}/cancel）放弃正在同步等待的
+    // delegate 时（drop 主侧 done_rx），wrapper 必须通过 done_tx.closed()
+    // 感知并 abort 子 runner，且立即清理 registry/sessions。
+    // 历史 bug：主侧放弃后子 subagent 成为孤儿继续运行（跑 bash、改文件、
+    // 写 session）直到自然完成，任务面板还显示运行中（.e-agent/TODO.md
+    // "Sync delegate cancel leaks the subagent"），本测试钉死该路径。
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let (_, mut background) = builtins(workspace, None, false, None);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    background.set_event_sender(sender);
+    let (handle, runner_task, signals) = probe_runner(temp.path(), false);
+    let sessions = Sessions::default();
+    let slot = Arc::new(Mutex::new(None));
+    let cleanup = DelegateCleanup::new(slot.clone(), sessions.clone(), None);
+    let hook_sessions = sessions.clone();
+    let hook_handle = handle.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    background
+        .spawn_silent(
+            "probe".into(),
+            None,
+            None,
+            None,
+            move |id| {
+                *slot.lock().unwrap() = Some(id);
+                hook_sessions.insert(id, probe_entry(hook_handle.clone()));
+            },
+            move || {
+                let mut cleanup = Some(cleanup);
+                let mut done_tx = done_tx;
+                async move {
+                    let mut runner_task = Some(runner_task);
+                    tokio::select! {
+                        _ = done_tx.closed() => {
+                            if let Some(mut task) = runner_task.take() {
+                                task.abort();
+                            }
+                            cleanup.take().expect("cleanup taken once").finish();
+                            "subagent cancelled".to_owned()
+                        }
+                        result = async {
+                            let task = runner_task.take().expect("runner task taken once");
+                            Delegate::runner_result(&handle, task).await
+                        } => {
+                            cleanup.take().expect("cleanup taken once").finish();
+                            let _ = done_tx.send(result.clone());
+                            result_output(result).1
+                        }
+                    }
+                }
+            },
+        )
+        .unwrap();
+
+    // 子 runner 已进入模型调用（卡在 release 上）。
+    signals.entered.notified().await;
+    // 模拟主侧放弃：取消 turn 时 execute_tool future（含 done_rx）被 drop。
+    drop(done_rx);
+    // 子 runner 必须被 abort：模型 complete future 与模型本身都被 drop，
+    // 且模型永远没有跑完（side_effects 保持 0）。
+    signals.future_dropped.notified().await;
+    signals.model_dropped.notified().await;
+    assert_eq!(signals.side_effects.load(Ordering::SeqCst), 0);
+    // wrapper cleanup 已执行：任务面板条目（registry + sessions）清空。
+    let mut tries = 0;
+    loop {
+        if background.running().is_empty() && sessions.sessions.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+        tries += 1;
+        assert!(tries < 1000, "cleanup never completed");
+    }
+    assert!(
+        completions.try_recv().is_err(),
+        "sync delegate sends no completion event"
+    );
+}
+
+#[tokio::test]
 async fn panicking_inner_model_cleans_up_and_sends_one_failure_completion() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
