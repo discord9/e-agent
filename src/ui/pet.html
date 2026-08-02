@@ -208,7 +208,11 @@
 (function () {
   const PET_KEY = "e-agent.pet.hidden";
   const PET_POS_KEY = "e-agent.pet.pos";
-  const PET_CLICK_KEY = "e-agent.pet.clicks";   // 点击计数器（奇数=总结，偶数=梗台词）
+  // 点击节奏：冷却窗口（毫秒）内连续点击 = 闲话；冷却后的第一次点击 = 总结。
+  // 用内存时间戳而非 localStorage：刷新后第一次点击必然是总结。
+  const PET_CLICK_COOLDOWN_MS = 3000;
+  let petLastClickAt = 0;
+  let petSummarySeq = 0;   // 竞态保护：只有最新一次点击的总结响应才会被显示
   const SAYS = [
     "咕噜咕噜～",
     "今天也要加油鸭！",
@@ -313,8 +317,9 @@
     } catch (e) { return ""; }
   }
 
-  /* 点击：奇数点击显示当前会话总结（📊）；偶数点击随机说句梗台词。
-     计数器持久化到 localStorage（跨刷新保持奇偶交替）。 */
+  /* 点击：冷却后的第一次点击显示当前会话总结（📊）；冷却窗口内
+     快速连点随机说句梗台词（闲话）。区别于旧的奇偶交替——现在
+     每次"停下再点"都保证先给你总结。 */
   fish.addEventListener("click", (ev) => {
     if (ev.target === closeBtn || moved) {
       moved = false;
@@ -324,16 +329,17 @@
     startle();
     const st = window.state;
     const sid = st && st.sessionId;
-    // 奇数/偶数交替（1 起）：奇数 → 总结，偶数 → 梗台词
-    let clicks = 0;
-    try { clicks = parseInt(localStorage.getItem(PET_CLICK_KEY) || "0", 10) || 0; } catch (e) {}
-    clicks += 1;
-    try { localStorage.setItem(PET_CLICK_KEY, String(clicks)); } catch (e) {}
-    const wantSummary = (clicks % 2) === 1;
-    if (!wantSummary) {
+    const now = Date.now();
+    const withinCooldown = now - petLastClickAt < PET_CLICK_COOLDOWN_MS;
+    petLastClickAt = now;
+    if (withinCooldown) {
+      // 快速连点（冷却窗口内）：闲话，直接说梗
       sayFor(SAYS[Math.floor(Math.random() * SAYS.length)], 1700);
       return;
     }
+    // 冷却后的第一次点击：总结。旧的异步响应可能晚到覆盖本次内容，
+    // 用序号保护——只显示最新一次点击的结果。
+    const seq = ++petSummarySeq;
     const taskText = runningTaskText();
     if (!sid) {
       sayFor(SAYS[Math.floor(Math.random() * SAYS.length)], 1700);
@@ -343,6 +349,7 @@
     fetch("/api/sessions/" + encodeURIComponent(sid) + "/summary", { headers })
       .then((res) => res.ok ? res.json() : null)
       .then((data) => {
+        if (seq !== petSummarySeq) return;   // 已被更新的点击取代
         if (data && data.summary) {
           sayFor("📊 " + data.summary + (taskText ? " · " + taskText : ""), 3200, true);
         } else if (taskText) {
@@ -352,6 +359,7 @@
         }
       })
       .catch(() => {
+        if (seq !== petSummarySeq) return;
         if (taskText) sayFor("🐳 " + taskText, 2200);
         else sayFor(SAYS[Math.floor(Math.random() * SAYS.length)], 1700);
       });
