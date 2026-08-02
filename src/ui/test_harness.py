@@ -76,7 +76,7 @@ function parseHtml(html){
           const m = /^<\/([a-zA-Z0-9-]+)>/.exec(s.slice(i));
           if (m) { i += m[0].length; if (stopTag && m[1] === stopTag) { pushText(parent, text); return; } continue; }
         }
-        const m = /^<([a-zA-Z0-9-]+)((?:\s+[a-zA-Z-]+="[^"]*")*)\s*\/?>/.exec(s.slice(i));
+        const m = /^<([a-zA-Z0-9-]+)((?:\s+[a-zA-Z-]+=(?:"[^"]*"|'[^']*'))*)\s*\/?>/.exec(s.slice(i));
         if (m) {
           pushText(parent, text); text = "";
           i += m[0].length;
@@ -85,8 +85,8 @@ function parseHtml(html){
           const e = new El(tag);
           const cls = [];
           let am;
-          const attrRe = /\s+([a-zA-Z-]+)="([^"]*)"/g;
-          while ((am = attrRe.exec(m[2]))) { if (am[1] === "class") cls.push(am[2]); }
+          const attrRe = /\s+([a-zA-Z-]+)=("[^"]*"|'[^']*')/g;
+          while ((am = attrRe.exec(m[2]))) { if (am[1] === "class") cls.push(am[2].slice(1, -1)); }
           if (cls.length) e.className = cls.join(" ");
           parent.push(e);
           e._parent = host || null;   // 与程序化 append/insertBefore 一致：closest 依赖父链
@@ -140,7 +140,9 @@ class El {
     if (this._innerHTML) return this._innerHTML;
     if (this.textContent) return escHtml(this.textContent);
     return ""; }
-  set innerHTML(v){ if(String(v)==="") { this._children=[]; this._innerHTML=""; }
+  set innerHTML(v){ /* 与真实 DOM 一致：替换会断开旧子节点（isConnected → false） */
+    for (const c of this._children) { if (c instanceof El) c._parent = null; }
+    if(String(v)==="") { this._children=[]; this._innerHTML=""; }
     else { this._children = parseHtml(v); this._innerHTML=""; } }
   /* 与真实 DOM 一致：textContent 取文本后代拼接；赋值则整体替换（清子节点） */
   get textContent(){ if (this._children.length) {
@@ -186,7 +188,9 @@ for(const id of ["topActions","backBtn","backParentBtn","connState","banner","ba
   "newPrompt","newSessionBtn","sessionList","listMeta","listHint","chatSessionId","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn","searchInput",
   "queueBar","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
-  "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks","forkMenu"]) elsById[id]=new El(id);
+  "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks","forkMenu",
+  "workspaceSelect","workspaceAddBtn","workspaceRemoveBtn","workspaceEditor",
+  "wsNameInput","wsUrlInput","wsTokenInput","wsSaveBtn","wsCancelBtn"]) elsById[id]=new El(id);
 
 const _ls={};
 globalThis.localStorage={ getItem:k=>_ls[k]??null, setItem:(k,v)=>{_ls[k]=v;}, removeItem:k=>{delete _ls[k];} };
@@ -249,6 +253,9 @@ function stream(){
     return {done:true};
   } }; } };
 }
+function streamEmpty(){
+  return { getReader(){ return { read: async()=>({done:true}) } } };
+}
 function resp(status, body){ return Promise.resolve({ ok:status>=200&&status<300, status, body,
   json:async()=>typeof body==="string"?JSON.parse(body):body,
   text:async()=>String(body) }); }
@@ -281,9 +288,15 @@ globalThis.fetch=(url,opts={})=>{
   }
   if(url.startsWith("/api/sessions/s2/history")) return resp(200, historyData);
   if(url.startsWith("/api/sessions/fork-1/history")) return resp(200, {entries:[], next_before_seq:null});
+  // restored 替换回归测试用：缓存过期后切回，history 含新消息（历史数据本身不变）
+  if(url.startsWith("/api/sessions/restored-test/history")) return resp(200, historyData);
+  if(url.startsWith("/api/sessions/restored-test2/history")) return resp(200, historyData);
   if(url==="/api/sessions/s1/events") return resp(200, stream());
   if(url==="/api/sessions/s2/events") return resp(200, stream());
   if(url==="/api/sessions/fork-1/events") return resp(200, stream());
+  // restored 回归测试：空 SSE 流（snapshot 应被 history 替换路径跳过）
+  if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty());
+  if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty());
   if(url==="/api/sessions/s1/fork-candidates") return resp(200, forkCandidatesData);
   if(url==="/api/sessions/s1/fork"&&m==="POST") return forkPostResp;
   if(url==="/api/models") return resp(200, ["chatgpt/sol","chatgpt/terra","deepseek/flash","deepseek/high","deepseek/fast","kimi/k3"]);
@@ -963,6 +976,38 @@ async function main(){
     chk("restored chat view", state.view === "chat" && state.sessionId === "s1",
         "view=" + state.view + " sid=" + state.sessionId);
 
+    // ---- restored 替换回归：切走期间的会话更新必须可见 ----
+    // 场景：用户切走会话（缓存旧快照）→ 会话继续产出新消息 → 切回。
+    // 旧实现恢复缓存 + 跳过 snapshot → 新消息永不显示。现在 restored
+    // 会拉最新 history 替换过期缓存。
+    state.sessionId = null;
+    state.view = "list";
+    state.sessionStates["restored-test"] = {
+      html: "<div class='notice'>旧缓存消息</div>", scrollTop: 0,
+      nextBeforeSeq: 8, olderDone: false, draft: "",
+    };
+    openSession("restored-test");
+    await flush(); await flush();
+    chk("restored replaces stale cache with latest history",
+        elsById["messages"].textContent.includes("完成。")
+        && !elsById["messages"].textContent.includes("旧缓存消息"),
+        "text=" + elsById["messages"].textContent.slice(0, 140));
+    // 进行中的增量块（未落盘、只活在缓存/SSE 里）必须保留并重新绑定：
+    // 替换后 live delta 才能继续续写，而不是丢失或重复。
+    state.sessionId = null;
+    state.view = "list";
+    state.sessionStates["restored-test2"] = {
+      html: "<div class='msg msg-assistant'><div class='msg-body'>正在流式</div></div>",
+      scrollTop: 0, nextBeforeSeq: 8, olderDone: false, draft: "",
+    };
+    openSession("restored-test2");
+    await flush(); await flush();
+    chk("restored keeps in-flight block for delta continuation",
+        !!state.acc && state.acc.assistantEl
+        && state.acc.assistantEl.isConnected
+        && elsById["messages"].textContent.includes("正在流式"),
+        "connected=" + (state.acc && state.acc.assistantEl && state.acc.assistantEl.isConnected));
+
     // ---- A: 长内容「预览 + 展开全文」（maybeTruncateEl） ----
     const longArgsA = JSON.stringify({ cmd: "echo hi", data: "x".repeat(700) });
     const cardA = buildToolCard("bash", longArgsA, "完成", "", "y".repeat(500));
@@ -1074,7 +1119,12 @@ async function main(){
         phB.querySelector(".older-body").textContent.includes("旧通知 #0")
         && phB.querySelector(".older-body").textContent.includes("旧通知 #9"));
     chk("B direct children still bounded", pm.children.length <= 300, "n=" + pm.children.length);
-    // 「加载更早历史」链接：无更早历史（nextBeforeSeq=null）时隐藏；有则可见
+    // 「加载更早历史」链接：无更早历史（nextBeforeSeq=null）时隐藏；有则可见。
+    // 显式前置状态：restored 恢复会话现在会拉 history（next_before_seq 非
+    // null → olderDone=false），不再假设其它测试留下的默认值。
+    state.nextBeforeSeq = null;
+    state.olderDone = true;
+    appendNotice("额外通知");   // 触发一次 prune 刷新链接可见性
     const linkB = phB.querySelector(".older-load");
     chk("B load link hidden when no older",
         linkB !== null && linkB.hidden === true, "hidden=" + (linkB && linkB.hidden));
@@ -1269,6 +1319,131 @@ async function main(){
     state.lastList = _savedList;
     state.sessionId = _savedSid;
     updateComposerMeta();   // 还原
+
+    // ---- 多工作区：默认单实例不变 + 添加/切换/删除 + token 同步 + 持久化 ----
+    // 默认：从未配置 → 只有 "默认" 条目（同源相对请求），行为与单服务器一致
+    chk("ws default single workspace",
+        state.workspaces.length === 1 && state.workspaces[0].id === "default"
+        && state.workspaces[0].name === "默认" && state.workspaces[0].url === ""
+        && state.workspace === state.workspaces[0],
+        "n=" + state.workspaces.length + " name=" + state.workspaces[0].name);
+    chk("ws default token synced",
+        state.token === state.workspace.token && state.token !== "",
+        "token=" + JSON.stringify(state.token));
+    chk("ws default select rendered",
+        elsById["workspaceSelect"].querySelectorAll("option").length === 1
+        && elsById["workspaceSelect"].querySelector("option").textContent === "默认",
+        "opts=" + elsById["workspaceSelect"].querySelectorAll("option").length);
+    chk("ws remove disabled when only one",
+        elsById["workspaceRemoveBtn"].disabled === true,
+        "disabled=" + elsById["workspaceRemoveBtn"].disabled);
+    // url="" 时 api() 仍发相对请求（既有行为不变）
+    await api("/api/sessions");
+    await flush();
+    chk("ws default api stays relative",
+        FETCHES[FETCHES.length - 1] === "/api/sessions",
+        "url=" + FETCHES[FETCHES.length - 1]);
+
+    // 「+」→ 内联面板 → 保存 → 新 workspace 激活，后续 api/SSE 走新 base
+    elsById["workspaceAddBtn"]._listeners["click"][0]();
+    chk("ws add opens editor",
+        elsById["workspaceEditor"].hidden === false,
+        "hidden=" + elsById["workspaceEditor"].hidden);
+    elsById["wsNameInput"].value = "服务器B";
+    elsById["wsUrlInput"].value = "http://localhost:9000/";   // 带尾斜杠 → 应被归一化
+    elsById["wsTokenInput"].value = "tok-b";
+    elsById["wsSaveBtn"]._listeners["click"][0]();
+    // 同步断言：清空立即生效（轮询响应尚未回来，不会污染这些字段）
+    chk("ws switch clears session state",
+        state.sessionId === null && state.view === "list"
+        && state.sessionStates["s1"] === undefined && state.lastList.length === 0
+        && state.tasks.list.length === 0 && state.tasks.pollers.size === 0
+        && elsById["messages"].innerHTML === "",
+        "sid=" + state.sessionId + " view=" + state.view
+        + " lastList=" + state.lastList.length);
+    chk("ws add creates+activates workspace",
+        state.workspaces.length === 2 && state.workspace.id !== "default"
+        && state.workspace.name === "服务器B"
+        && state.workspace.url === "http://localhost:9000"
+        && state.workspace.token === "tok-b",
+        "n=" + state.workspaces.length + " url=" + JSON.stringify(state.workspace.url)
+        + " name=" + state.workspace.name);
+    chk("ws switch syncs token", state.token === "tok-b",
+        "token=" + JSON.stringify(state.token));
+    chk("ws switch syncs legacy token key",
+        localStorage.getItem("eagent_token") === "tok-b",
+        "legacy=" + JSON.stringify(localStorage.getItem("eagent_token")));
+    chk("ws select shows both",
+        elsById["workspaceSelect"].querySelectorAll("option").length === 2,
+        "opts=" + elsById["workspaceSelect"].querySelectorAll("option").length);
+    await flush();
+    await api("/api/sessions");
+    await flush();
+    chk("ws api targets new base",
+        FETCHES[FETCHES.length - 1] === "http://localhost:9000/api/sessions",
+        "url=" + FETCHES[FETCHES.length - 1]);
+    // SSE 连接（sse.js 的 connectSSE）同样前缀新 base
+    state.view = "chat";
+    state.sessionId = "s1";
+    connectSSE("s1");
+    await flush();
+    chk("ws sse targets new base",
+        FETCHES.some(u => u === "http://localhost:9000/api/sessions/s1/events"),
+        "last=" + FETCHES[FETCHES.length - 1]);
+    stopSSE();
+    state.view = "list";
+    state.sessionId = null;
+
+    // 下拉 change → 切回默认
+    elsById["workspaceSelect"].value = "default";
+    elsById["workspaceSelect"]._listeners["change"][0]();
+    await flush();
+    chk("ws switch back to default",
+        state.workspace.id === "default"
+        && state.token === state.workspace.token && state.view === "list",
+        "id=" + state.workspace.id + " token=" + JSON.stringify(state.token));
+    await api("/api/sessions");
+    await flush();
+    chk("ws api relative again",
+        FETCHES[FETCHES.length - 1] === "/api/sessions",
+        "url=" + FETCHES[FETCHES.length - 1]);
+
+    // localStorage 持久化 round-trip：模拟刷新重新 initWorkspaces
+    const _persisted = JSON.parse(localStorage.getItem("eagent.workspaces"));
+    chk("ws persisted list",
+        Array.isArray(_persisted) && _persisted.length === 2
+        && _persisted.some(w => w.id === "default")
+        && _persisted.some(w => w.name === "服务器B" && w.url === "http://localhost:9000" && w.token === "tok-b"),
+        "n=" + (_persisted && _persisted.length));
+    chk("ws persisted active",
+        localStorage.getItem("eagent.activeWorkspace") === "default",
+        "active=" + localStorage.getItem("eagent.activeWorkspace"));
+    state.workspaces = [];
+    state.workspace = null;
+    initWorkspaces();
+    chk("ws reload restores workspaces",
+        state.workspaces.length === 2 && state.workspace.id === "default"
+        && state.workspace.token === _persisted.find(w => w.id === "default").token
+        && state.token === state.workspace.token,
+        "n=" + state.workspaces.length + " active=" + state.workspace.id);
+
+    // 删除：切到服务器B → 删 → 落回 default；仅剩一个时按钮禁用
+    elsById["workspaceSelect"].value = state.workspaces.find(w => w.name === "服务器B").id;
+    elsById["workspaceSelect"]._listeners["change"][0]();
+    await flush();
+    chk("ws switched to B for removal",
+        state.workspace.name === "服务器B", "name=" + state.workspace.name);
+    elsById["workspaceRemoveBtn"]._listeners["click"][0]();
+    await flush();
+    chk("ws remove deletes and falls back",
+        state.workspaces.length === 1 && state.workspace.id === "default",
+        "n=" + state.workspaces.length + " active=" + state.workspace.id);
+    chk("ws remove disabled when only one",
+        elsById["workspaceRemoveBtn"].disabled === true,
+        "disabled=" + elsById["workspaceRemoveBtn"].disabled);
+    chk("ws remove persisted",
+        JSON.parse(localStorage.getItem("eagent.workspaces")).length === 1,
+        "n=" + JSON.parse(localStorage.getItem("eagent.workspaces")).length);
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);

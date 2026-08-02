@@ -246,7 +246,32 @@ async function loadHistory(id) {
     state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
     state.olderDone = (state.nextBeforeSeq === null);
     if (state.initSource !== "snapshot") {
-      renderHistory(entries);
+      if (state.initSource === "restored") {
+        // 缓存的视图可能过期（切走期间会话有新消息）：用最新尾部替换，
+        // 而不是追加（追加会与缓存内容重复）。保留滚动位置（距底部偏移）
+        // 与进行中的增量块（thinking/assistant/tool 卡片，未落盘只活在
+        // 内存/SSE 增量里，history 里没有它们）。
+        const offset = els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight;
+        const inflight = [];
+        if (state.acc) {
+          if (state.acc.assistantEl) inflight.push(state.acc.assistantEl);
+          if (state.acc.thinkingEl) inflight.push(state.acc.thinkingEl);
+          if (state.acc.toolStack) for (const t of state.acc.toolStack) inflight.push(t.el);
+        }
+        state.acc.toolStack = [];   // 防重：替换后 reattachInFlight 重新收集
+        renderHistory(entries);     // 清空 + 渲染最新尾部
+        for (const el of inflight) {
+          if (el && !el.isConnected) els.messages.appendChild(el);
+        }
+        reattachInFlight(state.acc);   // 重新绑定进行中块，增量续写不中断
+        if (offset > 4) {
+          els.messages.scrollTop = els.messages.scrollHeight - offset - els.messages.clientHeight;
+          userScrolled = true;
+          els.jumpBottomBtn.hidden = false;
+        }
+      } else {
+        renderHistory(entries);
+      }
       state.initSource = "history";
     }
     return "ok";
@@ -405,7 +430,9 @@ function openSession(id, onReady) {
   history.replaceState(null, "", "/?session=" + encodeURIComponent(id));
   const cached = state.sessionStates[id];
   if (cached) {
-    // 切回缓存过的会话：恢复视图，不重新加载历史；SSE 重连但跳过 snapshot
+    // 切回缓存过的会话：先恢复视图（立即响应），再拉最新尾部补全——
+    // 切走期间会话可能继续产生消息（缓存已过期），必须用最新 history
+    // 替换渲染，否则那些消息（snapshot 也被跳过）永远不会显示。
     state.initSource = "restored";
     state.nextBeforeSeq = cached.nextBeforeSeq;
     state.loadingOlder = false;
@@ -422,8 +449,7 @@ function openSession(id, onReady) {
     const atBottom = m.scrollHeight - m.scrollTop - m.clientHeight <= 4;
     userScrolled = !atBottom;      // 恢复到非底部位置：不自动跟随滚动
     els.jumpBottomBtn.hidden = atBottom;
-    openWith(id, false, onReady);  // 只重连 SSE，跳过历史加载与 snapshot；
-                                   // onReady 在恢复完成（微任务）后触发
+    openWith(id, true, onReady);   // 拉最新尾部替换过期缓存；onReady 在替换渲染完成后触发
   } else {
     // 首次打开：走既有流程（加载历史 + SSE）
     state.initSource = null;
