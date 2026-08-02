@@ -2578,6 +2578,165 @@ mod tests {
         assert_eq!(total, all.len(), "paged chain must cover the whole session");
     }
 
+    /// Store-level `load_head_page` (the `GET /history` initial-render
+    /// path): the bounded head page must never strand the truncated part
+    /// of the head segment — the returned cursor feeds straight back into
+    /// `load_older` and the whole chain covers every entry exactly once.
+    #[tokio::test]
+    async fn store_load_head_page_pages_without_losing_segments() {
+        use crate::config::SessionBackend;
+        use crate::session_store::SessionStore;
+        use std::path::Path;
+
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let root = Path::new("/tmp/e-agent-test");
+
+        let user = |i: u32| SessionEntry::Message {
+            message: Message::User {
+                content: format!("m{i}"),
+                images: vec![],
+            },
+        };
+        let comp = |summary: &str| SessionEntry::Compaction {
+            summary: summary.into(),
+            retained: vec![],
+        };
+
+        // ---- No compaction: whole session is one head segment. No limit
+        // → whole session + None cursor; bounded page → newest `limit`
+        // entries with a cursor that pages through the rest (nothing
+        // stranded).
+        let session_a = format!("test-gt-head-a-{}", crate::session::new_id());
+        let store_a = SessionStore::connect(
+            &SessionBackend::Greptime { conn: conn.clone() },
+            root,
+            &session_a,
+        )
+        .await
+        .unwrap();
+        let plain = vec![user(1), user(2), user(3)];
+        store_a.append(root, &session_a, &plain).await.unwrap();
+        let (page, cursor) = store_a
+            .load_head_page(root, &session_a, None)
+            .await
+            .expect("load_head_page without limit");
+        assert_eq!(page, plain, "no-compaction session returned whole");
+        assert_eq!(cursor, None, "no compaction → no older cursor");
+        let (page, cursor) = store_a
+            .load_head_page(root, &session_a, Some(2))
+            .await
+            .expect("load_head_page with limit");
+        assert_eq!(page, vec![user(2), user(3)], "newest limit entries");
+        assert_eq!(cursor, Some(1), "cursor = oldest seq of the page");
+        let (rest, cursor) = store_a
+            .load_older(root, &session_a, cursor.unwrap(), Some(2))
+            .await
+            .expect("load_older");
+        assert_eq!(rest, vec![user(1)], "remaining entry reachable");
+        assert_eq!(cursor, None, "seq 0 page → nothing older");
+
+        // ---- Compaction with head ≤ limit: whole head segment + cursor
+        // = the opening compaction's seq.
+        // seqs: 0,1 early; 2 comp1; 3,4 middle; 5 comp2; 6,7 latest.
+        let session_b = format!("test-gt-head-b-{}", crate::session::new_id());
+        let store_b = SessionStore::connect(
+            &SessionBackend::Greptime { conn: conn.clone() },
+            root,
+            &session_b,
+        )
+        .await
+        .unwrap();
+        let mut all = vec![user(1), user(2)];
+        all.push(comp("c1"));
+        all.extend([user(3), user(4)]);
+        all.push(comp("c2"));
+        all.extend([user(5), user(6)]);
+        store_b.append(root, &session_b, &all).await.unwrap();
+        let (page, cursor) = store_b
+            .load_head_page(root, &session_b, Some(3))
+            .await
+            .expect("load_head_page with limit");
+        assert_eq!(
+            page,
+            vec![comp("c2"), user(5), user(6)],
+            "head ≤ limit → whole head segment"
+        );
+        assert_eq!(cursor, Some(5), "cursor = opening compaction seq");
+
+        // ---- Compaction with head > limit: newest `limit` entries, cursor
+        // = oldest seq of the page; paging back with that cursor reaches
+        // the cut-off part, then crosses compaction boundaries — every
+        // entry is covered exactly once.
+        // seqs: 0,1 early; 2 comp1; 3,4 middle; 5 comp2; 6..9 latest.
+        let session_c = format!("test-gt-head-c-{}", crate::session::new_id());
+        let store_c = SessionStore::connect(
+            &SessionBackend::Greptime { conn: conn.clone() },
+            root,
+            &session_c,
+        )
+        .await
+        .unwrap();
+        let mut all = vec![user(1), user(2)];
+        all.push(comp("c1"));
+        all.extend([user(3), user(4)]);
+        all.push(comp("c2"));
+        all.extend([user(5), user(6), user(7), user(8)]);
+        store_c.append(root, &session_c, &all).await.unwrap();
+
+        let mut paged: Vec<SessionEntry> = Vec::new();
+        let mut cursor: Option<i64> = Some(i64::MAX); // head open sentinel
+        loop {
+            let (entries, next) = match cursor {
+                Some(i64::MAX) => store_c
+                    .load_head_page(root, &session_c, Some(2))
+                    .await
+                    .expect("head page"),
+                Some(before) => store_c
+                    .load_older(root, &session_c, before, Some(2))
+                    .await
+                    .expect("older page"),
+                None => break,
+            };
+            paged.extend(entries);
+            cursor = next;
+        }
+        // Verify exactly-once coverage: the paged chain must contain every
+        // session entry, with no gaps and no duplicates. Page boundaries
+        // depend on the compaction layout (the opening compaction rides with
+        // each page), so compare as multisets — the newest-first page order
+        // and per-page chronological order are already spot-checked below.
+        assert_eq!(
+            paged.len(),
+            all.len(),
+            "paged chain must not lose or duplicate entries"
+        );
+        for want in &all {
+            assert!(paged.contains(want), "paged chain missing entry: {want:?}");
+        }
+
+        // Spot-check the boundary page explicitly: the first page is the
+        // newest 2 of the head, and its cursor pages into the cut-off head
+        // part (not past the head into older segments).
+        let (page, cursor) = store_c
+            .load_head_page(root, &session_c, Some(2))
+            .await
+            .expect("head page C");
+        assert_eq!(page, vec![user(7), user(8)], "newest 2 of head");
+        let (next, _) = store_c
+            .load_older(root, &session_c, cursor.unwrap(), Some(2))
+            .await
+            .expect("older page C");
+        assert_eq!(
+            next,
+            vec![user(5), user(6)],
+            "cut-off head part reachable via cursor"
+        );
+    }
+
     #[tokio::test]
     async fn load_oldest_and_load_newer_segmented() {
         let conn = conn_str();

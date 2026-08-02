@@ -757,6 +757,116 @@ async fn load_head_and_load_older_segmented() {
     assert_eq!(total, all.len(), "segments must cover the whole session");
 }
 
+/// Backend side of the `GET /history` initial-render fix: the head
+/// segment is `[last_comp, ∞)`, and `SessionStore::load_head_page`
+/// loads it as `load_older(HEAD_OPEN_SENTINEL /* i64::MAX */, limit)`
+/// (see `session_store.rs`). The bounded head page must never strand the
+/// truncated part of the head segment — the returned cursor feeds
+/// straight back into `load_older` and the whole chain covers every
+/// entry exactly once.
+#[tokio::test]
+async fn load_older_head_open_sentinel_pages_without_losing_segments() {
+    let user = |i: u32| SessionEntry::Message {
+        message: Message::User {
+            content: format!("m{i}"),
+            images: vec![],
+        },
+    };
+    let comp = |summary: &str| SessionEntry::Compaction {
+        summary: summary.into(),
+        retained: vec![],
+    };
+
+    // ---- No compaction: the whole session is one head segment. With no
+    // limit the whole session comes back with a None cursor (nothing
+    // older to page)...
+    let (_dir, session, _sid) = fresh_session().await;
+    let plain = vec![user(1), user(2), user(3)];
+    session.append(&plain).await.unwrap();
+    let (page, cursor) = session.load_older(i64::MAX, None).await.unwrap();
+    assert_eq!(page, plain, "no-compaction session returned whole");
+    assert_eq!(cursor, None, "no compaction → no older cursor");
+    // ...and a bounded page still pages through the rest of the session
+    // (nothing is stranded).
+    let (page, cursor) = session.load_older(i64::MAX, Some(2)).await.unwrap();
+    assert_eq!(page, vec![user(2), user(3)], "newest limit entries");
+    assert_eq!(cursor, Some(1), "cursor = oldest seq of the page");
+    let (rest, cursor) = session.load_older(cursor.unwrap(), Some(2)).await.unwrap();
+    assert_eq!(rest, vec![user(1)], "remaining entry reachable");
+    assert_eq!(cursor, None, "seq 0 page → nothing older");
+
+    // ---- Compaction with head ≤ limit: whole head segment + cursor =
+    // the opening compaction's seq.
+    // seqs: 0,1 early; 2 comp1; 3,4 middle; 5 comp2; 6,7 latest.
+    let (_dir, session_b, _sid) = fresh_session().await;
+    let mut all = vec![user(1), user(2)];
+    all.push(comp("c1"));
+    all.extend([user(3), user(4)]);
+    all.push(comp("c2"));
+    all.extend([user(5), user(6)]);
+    session_b.append(&all).await.unwrap();
+    let (page, cursor) = session_b.load_older(i64::MAX, Some(3)).await.unwrap();
+    assert_eq!(
+        page,
+        vec![comp("c2"), user(5), user(6)],
+        "head ≤ limit → whole head segment"
+    );
+    assert_eq!(cursor, Some(5), "cursor = opening compaction seq");
+
+    // ---- Compaction with head > limit: newest `limit` entries, cursor =
+    // oldest seq of the page; paging back with that cursor reaches the
+    // cut-off part, then crosses compaction boundaries — every entry is
+    // covered exactly once.
+    // seqs: 0,1 early; 2 comp1; 3,4 middle; 5 comp2; 6..9 latest.
+    let (_dir, session_c, _sid) = fresh_session().await;
+    let mut all = vec![user(1), user(2)];
+    all.push(comp("c1"));
+    all.extend([user(3), user(4)]);
+    all.push(comp("c2"));
+    all.extend([user(5), user(6), user(7), user(8)]);
+    session_c.append(&all).await.unwrap();
+
+    let mut paged: Vec<SessionEntry> = Vec::new();
+    let mut cursor: Option<i64> = Some(i64::MAX); // head open sentinel
+    loop {
+        let (entries, next) = match cursor {
+            Some(i64::MAX) => session_c.load_older(i64::MAX, Some(2)).await.unwrap(),
+            Some(before) => session_c.load_older(before, Some(2)).await.unwrap(),
+            None => break,
+        };
+        paged.extend(entries);
+        cursor = next;
+    }
+    // Verify exactly-once coverage: the paged chain must contain every
+    // session entry, with no gaps and no duplicates. Page boundaries
+    // depend on the compaction layout (the opening compaction rides with
+    // each page), so compare as multisets — the newest-first page order
+    // and per-page chronological order are already spot-checked below.
+    assert_eq!(
+        paged.len(),
+        all.len(),
+        "paged chain must not lose or duplicate entries"
+    );
+    for want in &all {
+        assert!(paged.contains(want), "paged chain missing entry: {want:?}");
+    }
+
+    // Spot-check the boundary page explicitly: the first page is the
+    // newest 2 of the head, and its cursor pages into the cut-off head
+    // part (not past the head into older segments).
+    let (page, cursor) = session_c.load_older(i64::MAX, Some(2)).await.unwrap();
+    assert_eq!(page, vec![user(7), user(8)], "newest 2 of head");
+    let (next, _) = session_c
+        .load_older(cursor.unwrap(), Some(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        next,
+        vec![user(5), user(6)],
+        "cut-off head part reachable via cursor"
+    );
+}
+
 #[tokio::test]
 async fn load_older_pages_within_segment() {
     let (_dir, session, _sid) = fresh_session().await;

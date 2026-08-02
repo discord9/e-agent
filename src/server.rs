@@ -1241,9 +1241,11 @@ async fn task_output(
 /// `GET /api/sessions/{id}/history` query parameters, both optional:
 /// omit `before_seq` for the head segment, or pass the previous response's
 /// `next_before_seq` to page further back. `limit` bounds the page: for the
-/// head segment it caps the returned entries (newest kept); for older
-/// pages it is passed to the backend for intra-segment paging (~`limit`
-/// entries per request, cursor = next older page).
+/// head segment it returns the newest `limit` entries with a cursor at the
+/// truncation point (feed it back as `before_seq` to fetch the cut-off
+/// older part of the head); for older pages it is passed to the backend
+/// for intra-segment paging (~`limit` entries per request, cursor = next
+/// older page).
 #[derive(Deserialize)]
 pub struct HistoryParams {
     pub before_seq: Option<i64>,
@@ -1259,19 +1261,6 @@ pub struct HistoryParams {
 pub struct HistoryResponse {
     pub entries: Vec<SessionEntry>,
     pub next_before_seq: Option<i64>,
-}
-
-/// Cap entries to the newest `limit` (oldest dropped); `None` = no cap.
-/// Kept as a separate function so the wire shape and the cap are each
-/// unit-testable without a session backend. With intra-segment paging the
-/// `limit` already bounds every `load_older` page on Greptime, so this cap
-/// is pure defense (it only ever trims the initial head render, which is
-/// not paged server-side).
-fn cap_entries(entries: Vec<SessionEntry>, limit: Option<usize>) -> Vec<SessionEntry> {
-    match limit {
-        Some(limit) if entries.len() > limit => entries[entries.len() - limit..].to_vec(),
-        _ => entries,
-    }
 }
 
 /// `GET /api/sessions/{id}/history` — the frontend's initial-render path.
@@ -1310,17 +1299,19 @@ async fn session_history(
     let store = resolve_session_store(&state, &id).await?;
     let (entries, next_before_seq) = match params.before_seq {
         None => {
-            // Head segment; the cursor is the seq of the compaction that
-            // opens it (None = the whole session is one head segment).
-            let loaded = store
-                .load_head(root, &id)
+            // Head segment, paged: with a `limit` the newest `limit`
+            // entries are returned and the cursor is the seq of the
+            // oldest entry of that page — the truncation point, fed back
+            // as `before_seq` to page into the cut-off part of the head
+            // segment (the frontend's 200-entry initial render never
+            // loses the gap to the older segments). Without a `limit` the
+            // whole head segment is returned and the cursor is the seq of
+            // the compaction that opens it (None = the whole session is
+            // one head segment).
+            store
+                .load_head_page(root, &id, params.limit)
                 .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-            let cursor = store
-                .head_seq(root, &id)
-                .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-            (loaded.entries, cursor)
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
         }
         Some(before_seq) => {
             // Older entries: [prev_comp, before_seq), paged intra-segment
@@ -1334,7 +1325,7 @@ async fn session_history(
         }
     };
     Ok(Json(HistoryResponse {
-        entries: cap_entries(entries, params.limit),
+        entries,
         next_before_seq,
     }))
 }
@@ -1733,9 +1724,8 @@ async fn session_summary(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let session = live(&state, &id).map_err(|(status, message)| {
-        (status, Json(serde_json::json!({ "error": message })))
-    })?;
+    let session = live(&state, &id)
+        .map_err(|(status, message)| (status, Json(serde_json::json!({ "error": message }))))?;
     let Some(entry) = summary_get(&state, &id) else {
         // 冷缓存（server 重启后 / 会话尚无完整 turn）：按需触发一次后台
         // 生成，并返回 generating 标记——桌宠据此提示"稍后再点"，而不是
@@ -3303,28 +3293,6 @@ model = "deepseek-chat"
             .unwrap(),
             serde_json::json!({"entries": [], "next_before_seq": null})
         );
-    }
-
-    #[test]
-    fn history_limit_keeps_newest_entries() {
-        use crate::agent::{Message, SessionEntry};
-        let entry = |i: usize| SessionEntry::Message {
-            message: Message::User {
-                content: format!("m{i}"),
-                images: vec![],
-            },
-        };
-        let entries = vec![entry(1), entry(2), entry(3), entry(4)];
-        assert_eq!(
-            serde_json::to_value(cap_entries(entries.clone(), Some(2))).unwrap(),
-            serde_json::json!([
-                {"type": "message", "message": {"User": {"content": "m3"}}},
-                {"type": "message", "message": {"User": {"content": "m4"}}},
-            ])
-        );
-        // No cap or an oversized cap: unchanged.
-        assert_eq!(cap_entries(entries.clone(), None).len(), 4);
-        assert_eq!(cap_entries(entries, Some(99)).len(), 4);
     }
 
     /// M3: snapshots are capped at the newest `SNAPSHOT_MAX` events so a

@@ -38,6 +38,20 @@ use crate::session::{LoadedSession, Session};
 #[allow(dead_code)]
 const META_STORE_SENTINEL: &str = "_meta";
 
+/// Upper bound for [`SessionStore::load_head_page`]: the head segment is
+/// `[last_comp, ∞)` — the last `Compaction` entry and everything after
+/// it — and `i64::MAX` as the `before_seq` upper bound reuses
+/// [`SessionStore::load_older`]'s intra-segment paging verbatim. With
+/// `limit = Some(n)` it returns the newest `n` entries of the head with
+/// the cursor at the oldest seq of the page (the truncation point; the
+/// frontend feeds it back as `before_seq` to page into the cut-off part
+/// of the head seamlessly). With `limit = None` it returns the whole head
+/// segment with the cursor at the seq of the compaction that opens it
+/// (matching the old `load_head` + `head_seq` pair). Only meaningful on
+/// the Greptime and SQLite backends (JSONL has no seq-based paging).
+#[allow(dead_code)]
+const HEAD_OPEN_SENTINEL: i64 = i64::MAX;
+
 /// One session's metadata snapshot from the `sessions` audit table
 /// (Greptime and SQLite backends only). Every row is a COMPLETE snapshot —
 /// Greptime has no UPDATE and SQLite follows the same append-only audit
@@ -306,6 +320,54 @@ impl SessionStore {
                     legacy: false,
                 })
             }
+        }
+    }
+
+    /// Load the head segment as a bounded history page, returning
+    /// `(entries, cursor)` directly (no [`LoadedSession`] wrapper).
+    ///
+    /// The head segment = `[last_comp, ∞)`: the last `Compaction` entry
+    /// and everything after it. With `limit = Some(n)` only the newest
+    /// `n` entries of the head segment are returned and the cursor is the
+    /// seq of the oldest entry of that page — feeding it back as
+    /// [`Self::load_older`]'s `before_seq` continues paging into the part
+    /// of the head segment that was cut off, so the frontend's initial
+    /// render (bounded to `limit` entries) never loses the gap between the
+    /// truncated head and the older segments. With `limit = None` the
+    /// whole head segment is returned and the cursor is the seq of the
+    /// compaction that opens it (or `None` when the session has no
+    /// compaction — the whole session is one head segment), matching the
+    /// old `load_head` + `head_seq` pair.
+    ///
+    /// For JSONL there is no seq-based paging: the full session is loaded
+    /// (exactly like [`Self::load_head`]) so no history can ever be cut
+    /// off, and the cursor is always `None`.
+    pub async fn load_head_page(
+        &self,
+        root: &Path,
+        name: &str,
+        limit: Option<usize>,
+    ) -> Result<(Vec<SessionEntry>, Option<i64>)> {
+        match self {
+            SessionStore::Jsonl => Ok((Session::load(root, name)?.entries, None)),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                // The head segment is `[last_comp, ∞)`; see the
+                // `HEAD_OPEN_SENTINEL` doc comment for the cursor
+                // contract this reuse of `load_older` implements.
+                session
+                    .lock()
+                    .await
+                    .load_older(HEAD_OPEN_SENTINEL, limit)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .load_older(HEAD_OPEN_SENTINEL, limit)
+                .await
+                .map_err(anyhow::Error::msg),
         }
     }
 
@@ -1010,6 +1072,56 @@ mod tests {
         assert_eq!(cursor, None);
     }
 
+    /// JSONL `load_head_page` must return the whole session (the local
+    /// backend has no seq-based paging, so a bounded head page could
+    /// otherwise lose the truncated middle forever) with a `None` cursor —
+    /// the wire contract `next_before_seq: null` ⇔ nothing older, matching
+    /// the old `load_head` + `head_seq` pair.
+    #[tokio::test]
+    async fn jsonl_load_head_page_returns_full_session_with_no_cursor() {
+        use crate::agent::{AssistantMessage, Message};
+        use crate::session::Session;
+
+        let root = std::env::temp_dir();
+        let name = format!("test-jsonl-head-page-{}", crate::session::new_id());
+        let entries: Vec<SessionEntry> = vec![
+            Message::System {
+                content: "You are an agent".into(),
+            }
+            .into(),
+            Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::Assistant(AssistantMessage {
+                content: Some("answer".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            })
+            .into(),
+        ];
+        Session::append(&root, &name, &entries).unwrap();
+
+        let store = SessionStore::Jsonl;
+        // With a limit: bounded page but still the full session — nothing
+        // may be cut off on a backend without paging.
+        let (page, cursor) = store
+            .load_head_page(&root, &name, Some(2))
+            .await
+            .expect("load_head_page with limit");
+        assert_eq!(page, entries, "JSONL must return the full session");
+        assert_eq!(cursor, None, "JSONL has no seq paging cursor");
+
+        // Without a limit: same result.
+        let (page, cursor) = store
+            .load_head_page(&root, &name, None)
+            .await
+            .expect("load_head_page without limit");
+        assert_eq!(page, entries, "JSONL must return the full session");
+        assert_eq!(cursor, None, "JSONL has no seq paging cursor");
+    }
+
     /// Full-stack SessionStore tests for the SQLite backend: exercise the
     /// store's `Sqlite` variant (connect → append → load round-trips, the
     /// meta ops, the sync background-task facade) against a real tempfile
@@ -1375,6 +1487,158 @@ mod tests {
                 .await
                 .expect("by-session take after subagent consume");
             assert!(labels.is_empty());
+        }
+
+        /// `load_head_page` on the SQLite store: the bounded head page
+        /// must never strand the truncated part of the head segment —
+        /// the returned cursor feeds straight back into `load_older` and
+        /// the whole chain covers every entry exactly once (the
+        /// `GET /history` initial-render bug this fixes).
+        #[tokio::test]
+        async fn sqlite_load_head_page_pages_without_losing_segments() {
+            use crate::agent::Message;
+
+            let (_dir, path) = temp_db();
+            let root = std::env::temp_dir();
+
+            let user = |i: u32| SessionEntry::Message {
+                message: Message::User {
+                    content: format!("m{i}"),
+                    images: vec![],
+                },
+            };
+            let comp = |summary: &str| SessionEntry::Compaction {
+                summary: summary.into(),
+                retained: vec![],
+            };
+
+            // ---- No compaction: the whole session is one head segment.
+            // With no limit the whole session comes back with a None
+            // cursor (nothing older to page)...
+            let session_a = format!("test-store-head-page-a-{}", crate::session::new_id());
+            let store_a = SessionStore::connect(&backend(&path), &root, &session_a)
+                .await
+                .expect("connect sqlite store A");
+            let plain = vec![user(1), user(2), user(3)];
+            store_a
+                .append(&root, &session_a, &plain)
+                .await
+                .expect("append A");
+            let (page, cursor) = store_a
+                .load_head_page(&root, &session_a, None)
+                .await
+                .expect("load_head_page A without limit");
+            assert_eq!(page, plain, "no-compaction session returned whole");
+            assert_eq!(cursor, None, "no compaction → no older cursor");
+            // ...and a bounded page still pages through the rest of the
+            // session (nothing is stranded).
+            let (page, cursor) = store_a
+                .load_head_page(&root, &session_a, Some(2))
+                .await
+                .expect("load_head_page A with limit");
+            assert_eq!(page, vec![user(2), user(3)], "newest limit entries");
+            assert_eq!(cursor, Some(1), "cursor = oldest seq of the page");
+            let (rest, cursor) = store_a
+                .load_older(&root, &session_a, cursor.unwrap(), Some(2))
+                .await
+                .expect("load_older A");
+            assert_eq!(rest, vec![user(1)], "remaining entry reachable");
+            assert_eq!(cursor, None, "seq 0 page → nothing older");
+
+            // ---- Compaction with head ≤ limit: whole head segment +
+            // cursor = the opening compaction's seq.
+            let session_b = format!("test-store-head-page-b-{}", crate::session::new_id());
+            let store_b = SessionStore::connect(&backend(&path), &root, &session_b)
+                .await
+                .expect("connect sqlite store B");
+            // seqs: 0,1 early; 2 comp1; 3,4 middle; 5 comp2; 6,7 latest.
+            let mut all = vec![user(1), user(2)];
+            all.push(comp("c1"));
+            all.extend([user(3), user(4)]);
+            all.push(comp("c2"));
+            all.extend([user(5), user(6)]);
+            store_b
+                .append(&root, &session_b, &all)
+                .await
+                .expect("append B");
+            let (page, cursor) = store_b
+                .load_head_page(&root, &session_b, Some(3))
+                .await
+                .expect("load_head_page B with limit");
+            assert_eq!(
+                page,
+                vec![comp("c2"), user(5), user(6)],
+                "head ≤ limit → whole head segment"
+            );
+            assert_eq!(cursor, Some(5), "cursor = opening compaction seq");
+
+            // ---- Compaction with head > limit: newest `limit` entries,
+            // cursor = oldest seq of the page; paging back with that
+            // cursor reaches the cut-off part, then crosses compaction
+            // boundaries — every entry is covered exactly once.
+            let session_c = format!("test-store-head-page-c-{}", crate::session::new_id());
+            let store_c = SessionStore::connect(&backend(&path), &root, &session_c)
+                .await
+                .expect("connect sqlite store C");
+            // seqs: 0,1 early; 2 comp1; 3,4 middle; 5 comp2; 6..9 latest.
+            let mut all = vec![user(1), user(2)];
+            all.push(comp("c1"));
+            all.extend([user(3), user(4)]);
+            all.push(comp("c2"));
+            all.extend([user(5), user(6), user(7), user(8)]);
+            store_c
+                .append(&root, &session_c, &all)
+                .await
+                .expect("append C");
+
+            let mut paged: Vec<SessionEntry> = Vec::new();
+            let mut cursor: Option<i64> = Some(i64::MAX); // head open sentinel
+            loop {
+                let (entries, next) = match cursor {
+                    Some(i64::MAX) => store_c
+                        .load_head_page(&root, &session_c, Some(2))
+                        .await
+                        .expect("head page"),
+                    Some(before) => store_c
+                        .load_older(&root, &session_c, before, Some(2))
+                        .await
+                        .expect("older page"),
+                    None => break,
+                };
+                paged.extend(entries);
+                cursor = next;
+            }
+            // Verify exactly-once coverage: the paged chain must contain every
+            // session entry, with no gaps and no duplicates. Page boundaries
+            // depend on the compaction layout (the opening compaction rides with
+            // each page), so compare as multisets — the newest-first page order
+            // and per-page chronological order are already spot-checked below.
+            assert_eq!(
+                paged.len(),
+                all.len(),
+                "paged chain must not lose or duplicate entries"
+            );
+            for want in &all {
+                assert!(paged.contains(want), "paged chain missing entry: {want:?}");
+            }
+
+            // Spot-check the boundary page explicitly: the first page is
+            // the newest 2 of the head, and its cursor pages into the
+            // cut-off head part (not past the head into older segments).
+            let (page, cursor) = store_c
+                .load_head_page(&root, &session_c, Some(2))
+                .await
+                .expect("head page C");
+            assert_eq!(page, vec![user(7), user(8)], "newest 2 of head");
+            let (next, _) = store_c
+                .load_older(&root, &session_c, cursor.unwrap(), Some(2))
+                .await
+                .expect("older page C");
+            assert_eq!(
+                next,
+                vec![user(5), user(6)],
+                "cut-off head part reachable via cursor"
+            );
         }
     }
 }
