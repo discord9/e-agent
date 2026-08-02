@@ -64,13 +64,46 @@ struct Spawned {
 }
 
 struct ProcessGuard(Option<Handle>);
+
+fn confirm_duplicate_failure_cleanup(
+    terminate: impl FnOnce() -> Result<(), String>,
+    wait: impl FnOnce(u32) -> Result<bool, String>,
+) -> Result<(), String> {
+    match terminate() {
+        Ok(()) => {
+            if wait(INFINITE)? {
+                Ok(())
+            } else {
+                Err("process termination was not signaled after TerminateProcess succeeded".into())
+            }
+        }
+        Err(termination_error) => match wait(0) {
+            Ok(true) => Ok(()), // The process exited before termination was requested.
+            Ok(false) => Err(format!(
+                "serious cleanup failure: {termination_error}; spawned process is still running"
+            )),
+            Err(wait_error) => Err(format!(
+                "serious cleanup failure: {termination_error}; cannot confirm process exit: {wait_error}"
+            )),
+        },
+    }
+}
+
+fn wait_signaled(process: HANDLE, timeout: u32) -> Result<bool, String> {
+    match unsafe { WaitForSingleObject(process, timeout) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        _ => Err(last_error("WaitForSingleObject(process cleanup) failed")),
+    }
+}
+
 impl ProcessGuard {
-    fn duplicate(process: HANDLE) -> Result<Self, String> {
+    fn duplicate(process: Handle) -> Result<(Self, Handle), String> {
         let mut duplicate = null_mut();
         if unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
-                process,
+                process.0,
                 GetCurrentProcess(),
                 &mut duplicate,
                 0,
@@ -79,15 +112,28 @@ impl ProcessGuard {
             )
         } == 0
         {
-            // Spawn already succeeded, so fail closed before returning the
-            // guard-construction error. This is the exact process handle,
-            // not a PID lookup.
-            unsafe {
-                TerminateProcess(process, 1);
-            }
-            return Err(last_error("DuplicateHandle(process guard) failed"));
+            let duplicate_error = last_error("DuplicateHandle(process guard) failed");
+            // Spawn already succeeded, so fail closed using the original exact
+            // process handle. Keep it open until termination has either been
+            // confirmed or reported as a serious cleanup failure.
+            let cleanup = confirm_duplicate_failure_cleanup(
+                || {
+                    if unsafe { TerminateProcess(process.0, 1) } != 0 {
+                        Ok(())
+                    } else {
+                        Err(last_error(
+                            "TerminateProcess after duplicate failure failed",
+                        ))
+                    }
+                },
+                |timeout| wait_signaled(process.0, timeout),
+            );
+            return match cleanup {
+                Ok(()) => Err(duplicate_error),
+                Err(cleanup_error) => Err(format!("{duplicate_error}; {cleanup_error}")),
+            };
         }
-        Ok(Self(Some(Handle(duplicate))))
+        Ok((Self(Some(Handle(duplicate))), process))
     }
 
     fn disarm(&mut self) {
@@ -115,7 +161,9 @@ fn last_error(context: &str) -> String {
 fn stable_sid_key(path: &Path, class: &str) -> Vec<u8> {
     let path: Vec<u16> = path.as_os_str().encode_wide().collect();
     let class = class.as_bytes();
-    let mut key = b"e-agent/windows-write-capability/v2".to_vec();
+    // v3 adds FILE_DELETE_CHILD to directory capabilities. A new stable SID
+    // makes the one-time ACL upgrade explicit and leaves v2 ACEs inert.
+    let mut key = b"e-agent/windows-write-capability/v3".to_vec();
     key.extend_from_slice(&(class.len() as u64).to_le_bytes());
     key.extend_from_slice(class);
     key.extend_from_slice(&(path.len() as u64).to_le_bytes());
@@ -237,9 +285,18 @@ unsafe fn acl_has_equivalent_ace(
     false
 }
 
+const CAPABILITY_MASK: u32 =
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | FILE_DELETE_CHILD;
+const CAPABILITY_INHERITANCE: ACE_FLAGS = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+
+fn needs_install(acl: *const ACL, sid: PSID) -> bool {
+    !unsafe { acl_has_equivalent_ace(acl, sid, CAPABILITY_MASK, CAPABILITY_INHERITANCE) }
+}
+
 struct RootAcl {
     path: PathBuf,
     old_acl: *mut ACL,
+    needs_install: bool,
     _descriptor: LocalPtr,
 }
 
@@ -317,7 +374,7 @@ fn scan_descendants(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn preflight_root(path: &Path) -> Result<RootAcl, String> {
+fn preflight_root(path: &Path, sid: PSID) -> Result<RootAcl, String> {
     use std::path::{Component, Prefix};
 
     if !matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)))
@@ -441,8 +498,6 @@ fn preflight_root(path: &Path) -> Result<RootAcl, String> {
         ));
     }
 
-    scan_descendants(path)?;
-
     let mut path_w = wide(path.as_os_str());
     let mut old_acl = null_mut();
     let mut descriptor = null_mut();
@@ -466,9 +521,11 @@ fn preflight_root(path: &Path) -> Result<RootAcl, String> {
     }
     let descriptor = LocalPtr(descriptor);
     reject_null_dacl(old_acl, path)?;
+    let needs_install = needs_install(old_acl, sid);
     Ok(RootAcl {
         path: path.to_path_buf(),
         old_acl,
+        needs_install,
         _descriptor: descriptor,
     })
 }
@@ -484,12 +541,15 @@ fn reject_null_dacl(acl: *mut ACL, path: &Path) -> Result<(), String> {
 }
 
 fn set_path_ace(root: &RootAcl, sid: PSID) -> Result<(), String> {
-    let mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
-    let inheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
-    if unsafe { acl_has_equivalent_ace(root.old_acl, sid, mask, inheritance) } {
+    if !root.needs_install {
         return Ok(());
     }
-    let entry = explicit_entry(sid, SET_ACCESS, mask, inheritance);
+    // FILE_DELETE_CHILD is meaningful only on directory objects. Propagating
+    // the same bit to files is harmless (it grants no DELETE access on a file)
+    // and one OBJECT+CONTAINER inheritable ACE is sufficient: every descendant
+    // directory can delete/rename its children, while the root itself never
+    // receives DELETE and therefore cannot be deleted through this capability.
+    let entry = explicit_entry(sid, SET_ACCESS, CAPABILITY_MASK, CAPABILITY_INHERITANCE);
     let mut new_acl = null_mut();
     let status = unsafe { SetEntriesInAclW(1, &entry, root.old_acl, &mut new_acl) };
     if status != ERROR_SUCCESS {
@@ -635,11 +695,32 @@ fn prepare_token(workspace: &Workspace, policy: &Sandbox) -> Result<Handle, Stri
         )
         .collect();
 
-    // Finish validation and ACL reads for every root before changing any ACL.
+    // Derive the versioned SID first so ACL preflight can determine whether
+    // this root actually needs propagation. Keep every root's ACL descriptor
+    // alive through installation.
+    let mut capability_storage = Vec::new();
+    if roots.is_empty() {
+        capability_storage.push(string_sid(&stable_sid(workspace.root(), "inert"))?);
+    } else {
+        for (path, class) in &roots {
+            capability_storage.push(string_sid(&stable_sid(path, class))?);
+        }
+    }
+    let capability_sids: Vec<PSID> = capability_storage.iter().map(|sid| sid.0).collect();
+
+    // Finish validation and ACL reads for every root, then scan only roots
+    // whose complete inheritable ACE must be installed. All required scans
+    // complete before token work or the first ACL write.
     let root_acls: Vec<RootAcl> = roots
         .iter()
-        .map(|(path, _)| preflight_root(path))
+        .zip(&capability_sids)
+        .map(|((path, _), sid)| preflight_root(path, *sid))
         .collect::<Result<_, _>>()?;
+    for root in &root_acls {
+        if root.needs_install {
+            scan_descendants(&root.path)?;
+        }
+    }
 
     let mut source = null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut source) } == 0 {
@@ -650,16 +731,6 @@ fn prepare_token(workspace: &Workspace, policy: &Sandbox) -> Result<Handle, Stri
     let logon = unsafe { find_logon_sid(&groups_data)? };
     let everyone_data = everyone_sid()?;
     let everyone = everyone_data.as_ptr() as PSID;
-
-    let mut capability_storage = Vec::new();
-    if roots.is_empty() {
-        capability_storage.push(string_sid(&stable_sid(workspace.root(), "inert"))?);
-    } else {
-        for (path, class) in &roots {
-            capability_storage.push(string_sid(&stable_sid(path, class))?);
-        }
-    }
-    let capability_sids: Vec<PSID> = capability_storage.iter().map(|sid| sid.0).collect();
 
     let mut restricting: Vec<SID_AND_ATTRIBUTES> = capability_sids
         .iter()
@@ -978,7 +1049,7 @@ pub(super) async fn run(
     // Duplicate the process handle before handing the original to the blocking
     // waiter. This guard remains valid until completion and kills the exact
     // process (never a later process that reused its PID) on future drop/timeout.
-    let mut guard = ProcessGuard::duplicate(spawned.process.0)?;
+    let (mut guard, process) = ProcessGuard::duplicate(spawned.process)?;
     let stdout_task = tokio::task::spawn_blocking({
         let slot = output_slot.clone();
         let spool = spool.clone();
@@ -986,7 +1057,7 @@ pub(super) async fn run(
     });
     let stderr_task =
         tokio::task::spawn_blocking(move || read_pipe(spawned.stderr, output_slot, spool));
-    let wait_task = tokio::task::spawn_blocking(move || wait_process(spawned.process));
+    let wait_task = tokio::task::spawn_blocking(move || wait_process(process));
     let joined = async {
         let (stdout, stderr, code) = tokio::join!(stdout_task, stderr_task, wait_task);
         Ok::<_, String>((
@@ -1070,6 +1141,62 @@ mod tests {
         assert!(entries.iter().zip(supplied).all(|(entry, sid)| {
             entry.grfAccessPermissions == GENERIC_ALL && entry.Trustee.ptstrName == sid.cast()
         }));
+    }
+
+    #[test]
+    fn needs_install_requires_complete_exact_versioned_ace() {
+        let sid = string_sid("S-1-5-21-1-2-3-4").unwrap();
+        let exact = explicit_entry(sid.0, SET_ACCESS, CAPABILITY_MASK, CAPABILITY_INHERITANCE);
+        let mut exact_acl = null_mut();
+        assert_eq!(
+            unsafe { SetEntriesInAclW(1, &exact, null(), &mut exact_acl) },
+            ERROR_SUCCESS
+        );
+        let exact_acl = LocalPtr(exact_acl.cast());
+        assert!(!needs_install(exact_acl.0.cast(), sid.0));
+
+        let old = explicit_entry(
+            sid.0,
+            SET_ACCESS,
+            CAPABILITY_MASK & !FILE_DELETE_CHILD,
+            CAPABILITY_INHERITANCE,
+        );
+        let mut old_acl = null_mut();
+        assert_eq!(
+            unsafe { SetEntriesInAclW(1, &old, null(), &mut old_acl) },
+            ERROR_SUCCESS
+        );
+        let old_acl = LocalPtr(old_acl.cast());
+        assert!(needs_install(old_acl.0.cast(), sid.0));
+    }
+
+    #[test]
+    fn duplicate_failure_cleanup_waits_for_confirmed_termination() {
+        let waited = std::cell::Cell::new(false);
+        confirm_duplicate_failure_cleanup(
+            || Ok(()),
+            |timeout| {
+                assert_eq!(timeout, INFINITE);
+                waited.set(true);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(waited.get());
+    }
+
+    #[test]
+    fn duplicate_failure_cleanup_reports_live_process_after_terminate_failure() {
+        let error = confirm_duplicate_failure_cleanup(
+            || Err("injected termination failure".into()),
+            |timeout| {
+                assert_eq!(timeout, 0);
+                Ok(false)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("termination failure"), "{error}");
+        assert!(error.contains("still running"), "{error}");
     }
 
     #[test]

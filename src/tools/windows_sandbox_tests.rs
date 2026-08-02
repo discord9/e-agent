@@ -94,6 +94,91 @@ async fn restricted_token_enforces_configured_write_roots() {
 }
 
 #[tokio::test]
+async fn capability_supports_rename_delete_and_atomic_replace_but_not_outside() {
+    let parent = tempfile::tempdir().unwrap();
+    let workspace_root = parent.path().join("workspace");
+    let outside = parent.path().join("outside");
+    std::fs::create_dir(&workspace_root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let workspace = Workspace::new(&workspace_root).unwrap();
+    let bash = test_bash(workspace, windows_policy(true, Vec::new()));
+
+    let old_file = workspace_root.join("old.txt");
+    let renamed_file = workspace_root.join("renamed.txt");
+    let old_dir = workspace_root.join("old-dir");
+    let renamed_dir = workspace_root.join("renamed-dir");
+    let target = workspace_root.join("target.txt");
+    let replacement = workspace_root.join("target.tmp");
+    std::fs::write(&old_file, "old").unwrap();
+    std::fs::create_dir(&old_dir).unwrap();
+    std::fs::write(old_dir.join("child.txt"), "child").unwrap();
+    std::fs::write(&target, "original").unwrap();
+    std::fs::write(&replacement, "replacement").unwrap();
+
+    let command = if bash.shell.executable.ends_with("bash.exe") {
+        format!(
+            "mv '{}' '{}'; rm '{}'; mv '{}' '{}'; rm -rf '{}'; mv -f '{}' '{}'",
+            old_file.display(),
+            renamed_file.display(),
+            renamed_file.display(),
+            old_dir.display(),
+            renamed_dir.display(),
+            renamed_dir.display(),
+            replacement.display(),
+            target.display(),
+        )
+    } else {
+        format!(
+            "Move-Item -LiteralPath '{}' -Destination '{}'; Remove-Item -LiteralPath '{}'; Move-Item -LiteralPath '{}' -Destination '{}'; Remove-Item -LiteralPath '{}' -Recurse; Move-Item -LiteralPath '{}' -Destination '{}' -Force",
+            old_file.display(),
+            renamed_file.display(),
+            renamed_file.display(),
+            old_dir.display(),
+            renamed_dir.display(),
+            renamed_dir.display(),
+            replacement.display(),
+            target.display(),
+        )
+    };
+    bash.execute(json!({"command": command})).await.unwrap();
+    assert!(!old_file.exists());
+    assert!(!renamed_file.exists());
+    assert!(!old_dir.exists());
+    assert!(!renamed_dir.exists());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "replacement");
+
+    // Exercise Git's lock-file/rename based updates and checkout replacement.
+    let tracked = workspace_root.join("tracked.txt");
+    let command = if bash.shell.executable.ends_with("bash.exe") {
+        "git init --quiet; git config user.email test@example.invalid; git config user.name test; printf one > tracked.txt; git add tracked.txt; git commit --quiet -m one; printf two > tracked.txt; git add tracked.txt; git commit --quiet -m two; git checkout --quiet HEAD~ -- tracked.txt"
+    } else {
+        "git init --quiet; git config user.email test@example.invalid; git config user.name test; Set-Content -LiteralPath tracked.txt -Value one -NoNewline; git add tracked.txt; git commit --quiet -m one; Set-Content -LiteralPath tracked.txt -Value two -NoNewline; git add tracked.txt; git commit --quiet -m two; git checkout --quiet HEAD~ -- tracked.txt"
+    };
+    bash.execute(json!({"command": command})).await.unwrap();
+    assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "one");
+
+    let outside_file = outside.join("denied.txt");
+    std::fs::write(&outside_file, "outside").unwrap();
+    let outside_renamed = outside.join("renamed.txt");
+    let command = if bash.shell.executable.ends_with("bash.exe") {
+        format!(
+            "mv '{}' '{}'",
+            outside_file.display(),
+            outside_renamed.display()
+        )
+    } else {
+        format!(
+            "Move-Item -LiteralPath '{}' -Destination '{}'",
+            outside_file.display(),
+            outside_renamed.display()
+        )
+    };
+    bash.execute(json!({"command": command})).await.unwrap_err();
+    assert!(outside_file.exists());
+    assert!(!outside_renamed.exists());
+}
+
+#[tokio::test]
 async fn hard_linked_descendant_is_rejected_before_external_file_can_change() {
     let parent = tempfile::tempdir().unwrap();
     let workspace_root = parent.path().join("workspace");
@@ -112,6 +197,38 @@ async fn hard_linked_descendant_is_rejected_before_external_file_can_change() {
 
     assert!(error.contains("hard-linked descendants"), "{error}");
     assert!(error.contains(&linked.display().to_string()), "{error}");
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
+}
+
+#[tokio::test]
+async fn installed_root_skips_rescan_but_hard_link_cannot_modify_outside() {
+    let parent = tempfile::tempdir().unwrap();
+    let workspace_root = parent.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
+    let workspace = Workspace::new(&workspace_root).unwrap();
+    let bash = test_bash(workspace, windows_policy(true, Vec::new()));
+
+    // First launch installs and propagates the complete versioned ACE.
+    bash.execute(json!({"command": "exit 0"})).await.unwrap();
+
+    let outside = parent.path().join("outside.txt");
+    std::fs::write(&outside, "unchanged").unwrap();
+    let linked = workspace_root.join("linked.txt");
+    std::fs::hard_link(&outside, &linked).unwrap();
+
+    // The exact ACE makes this launch a no-op, so it does not rescan/reject.
+    let error = bash
+        .execute(json!({"command": write_command(&bash.shell, &linked, "changed")}))
+        .await
+        .unwrap_err();
+    assert!(!error.contains("hard-linked descendants"), "{error}");
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
+
+    let error = bash
+        .execute(json!({"command": write_command(&bash.shell, &outside, "changed")}))
+        .await
+        .unwrap_err();
+    assert!(!error.contains("hard-linked descendants"), "{error}");
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
 }
 

@@ -332,10 +332,15 @@ Locations already writable through Everyone or the current logon SID, including
 some public locations, may remain writable. Only existing canonical directory paths on
 fixed local NTFS volumes are accepted. UNC/device paths, non-directory roots,
 roots that are symlinks/reparse points, NULL DACLs, and case-sensitive roots
-are rejected. Before any token or ACL modification, every write root is scanned
-without following links; hard-linked file descendants and nested symlink/reparse
-point descendants are unsupported and rejected.
-Concurrent path replacement races (TOCTOU) remain a risk. Windows shell
+are rejected. Before the first installation (or a versioned ACE upgrade), every
+write root that needs its complete inheritable capability ACE is scanned without
+following links; hard-linked file descendants and nested symlink/reparse point
+descendants are unsupported and rejected. Once the exact current-version ACE is
+installed, later commands skip both ACL propagation and that root's full-tree
+scan. The ACE grants create/overwrite plus child rename/delete/atomic replace
+through `FILE_DELETE_CHILD` inherited by directories, without granting `DELETE`
+on the write root itself. Concurrent path replacement races (TOCTOU) remain a
+risk. Windows shell
 execution with protected Git metadata (`protect_git = true`, used by delegated
 subagents/fixers) is unsupported and fails before token or ACL changes with
 `Windows write-sandbox MVP does not support protected-git shell execution`;
