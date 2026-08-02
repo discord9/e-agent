@@ -161,7 +161,8 @@ function renderSessionList(list) {
       ev.stopPropagation();                // 不触发打开会话
       enterRename(sid, s, () => { renderSessionList(state.lastList); });
     });
-    const pin = el("button", "pin-btn" + (s.pinned === true ? " on" : ""), "📌");
+    const pin = el("button", "pin-btn" + (s.pinned === true ? " on" : ""));
+    pin.innerHTML = pinSvg();   // SVG 图钉：状态色跟随 currentColor（emoji 📌 不吃 color）
     pin.type = "button";
     pin.title = "置顶/取消置顶";
     pin.addEventListener("click", (ev) => {
@@ -1094,7 +1095,8 @@ function buildTreeRoot(s, kids) {
   const count = el("span", "tree-count", (s.entry_count ?? 0) + " 条");
   // 📌 置顶按钮（仅主会话根节点）：放行尾 count 后。subagent 子节点不加——
   // pin 是会话级操作，subagent 的置顶语义后续需要时再单独支持。
-  const pin = el("button", "pin-btn" + (s.pinned === true ? " on" : ""), "📌");
+  const pin = el("button", "pin-btn" + (s.pinned === true ? " on" : ""));
+  pin.innerHTML = pinSvg();   // SVG 图钉：状态色跟随 currentColor
   pin.type = "button";
   pin.title = "置顶/取消置顶";
   pin.addEventListener("click", (ev) => {

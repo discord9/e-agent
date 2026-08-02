@@ -316,6 +316,11 @@ async function main(){
     state.token="test-token";
     await pollSessions();
     chk("list rows rendered", elsById["sessionList"].children.length>=1);
+    // pin 按钮用 SVG（emoji 📌 不吃 color，状态色灰⇄金必须 SVG currentColor）
+    const firstPin = elsById["sessionList"].querySelector(".pin-btn");
+    chk("pin button is svg", firstPin && firstPin.querySelector("svg") !== null
+        && firstPin.textContent.trim() === "",
+        "html=" + (firstPin ? firstPin.innerHTML.slice(0, 40) : "none"));
 
     if (MODE === 'direct') {
       const r = await loadHistory("s1");

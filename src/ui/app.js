@@ -112,6 +112,14 @@ function el(tag, cls, text) {
   return e;
 }
 
+/* 图钉 SVG（fill 继承 currentColor——emoji 📌 不吃 color，状态色
+   （灰⇄金）必须用 SVG 才能切换）。返回 innerHTML 字符串。 */
+function pinSvg() {
+  return '<svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true" ' +
+    'style="display:inline-block;vertical-align:-1px;fill:currentColor">' +
+    '<path d="M16 3l5 5-2.5 1.5-1.5 4L13 17l-4.5 5.5L8 22l2.5-4.5L8 13l1-4-1.5-2.5L16 3z"/></svg>';
+}
+
 function truncate(s, n) {
   s = String(s);
   return s.length > n ? s.slice(0, n) + "\n… (省略 " + (s.length - n) + " 字符)" : s;
