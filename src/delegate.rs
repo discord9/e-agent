@@ -668,6 +668,7 @@ pub async fn spawn_btw_subagent(
             background: true,
             workspace: None,
             subagent_session_id: Some(session_id.clone()),
+            resume: None,
         }),
         move |id| {
             match slot_in_hook.lock() {
@@ -851,6 +852,9 @@ impl Tool for Delegate {
             .and_then(|args| args.get("resume"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        // Raw resume id for display metadata: the resolution match below
+        // moves the string, so keep a copy before it is consumed.
+        let resume_display = resume.clone();
         // Resolve the session to continue, if any: load its transcript (the
         // subagent's starting context) and reuse its id so new turns append
         // to the same file. Without persistence configured there is nothing
@@ -966,6 +970,7 @@ impl Tool for Delegate {
             background,
             workspace: explicit_workspace_arg.clone(),
             subagent_session_id: Some(session_id.clone()),
+            resume: resume_display,
         };
         // Sessions metadata (audit table): the subagent's row is written
         // by the PARENT at spawn time — model/role/parent links are all

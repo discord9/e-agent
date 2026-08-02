@@ -307,6 +307,9 @@ pub struct TaskDisplayMeta {
     /// The subagent's session id (delegate tasks only); lets the web task
     /// panel jump straight to the subagent's transcript without label matching.
     pub subagent_session_id: Option<String>,
+    /// The resumed subagent session id (`delegate resume: "<id>"`); `None`
+    /// otherwise. Lets the task panel show that the subagent is a continuation.
+    pub resume: Option<String>,
 }
 
 /// A snapshot of one running background task, for display.

@@ -938,6 +938,7 @@ mod format_task_label_tests {
             background: true,
             workspace: None,
             subagent_session_id: None,
+            resume: None,
         };
         let task = make_task(3, None, "bg task", Some(meta));
         assert_eq!(
@@ -952,6 +953,7 @@ mod format_task_label_tests {
             background: false,
             workspace: Some("/tmp/work".into()),
             subagent_session_id: None,
+            resume: None,
         };
         let task = make_task(4, Some("dev"), "deploy", Some(meta));
         assert_eq!(
@@ -966,6 +968,7 @@ mod format_task_label_tests {
             background: true,
             workspace: Some("/custom/path".into()),
             subagent_session_id: None,
+            resume: None,
         };
         let task = make_task(5, None, "full", Some(meta));
         assert_eq!(

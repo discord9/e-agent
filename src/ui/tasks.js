@@ -324,6 +324,25 @@ function renderTaskList(tasks, container) {
     line.appendChild(badge);
     line.appendChild(el("span", "task-label", shortTaskLabel(t)));
     if (t.role) line.appendChild(el("span", "task-meta trole", t.role));
+    // 参数标签（与 TUI 面板一致）：background / workspace / resume。resume
+    // 表示该子代理是延续会话（delegate resume: "<id>"）。仅在有标签时渲染。
+    const tags = [];
+    if (t.background === true) tags.push(el("span", "task-tag", "background"));
+    if (t.workspace && String(t.workspace).trim() !== "") {
+      const tag = el("span", "task-tag", "workspace: " + truncate(t.workspace, 40));
+      tag.title = String(t.workspace);   // 截断后完整路径放 title
+      tags.push(tag);
+    }
+    if (t.resume && String(t.resume).trim() !== "") {
+      const tag = el("span", "task-tag", "resume: " + t.resume);
+      tag.title = String(t.resume);
+      tags.push(tag);
+    }
+    if (tags.length) {
+      const tagBox = el("span", "task-tags");
+      for (const tag of tags) tagBox.appendChild(tag);
+      line.appendChild(tagBox);
+    }
     // 会话 id 完整显示：delegate 任务显示 subagent 自己的会话（点击跳转的目标），
     // 其余任务显示父会话。不截断——省略的 id 无法区分会话。
     const sidShown = isDelegate ? (t.subagent_session_id || t.session_id) : t.session_id;
