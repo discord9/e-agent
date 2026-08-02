@@ -718,6 +718,14 @@ mmlEqnNo}
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* meta 尾部的会话状态：处理中（橙）、压缩中（蓝）、失败（红） */
+  .composer-meta .composer-status {
+    font-weight: 600;
+    margin-left: 2px;
+  }
+  .composer-status.busy { color: var(--orange); }
+  .composer-status.compacting { color: var(--blue); }
+  .composer-status.error { color: var(--red); }
 
   /* 排队提示条：固定在输入区上方（composer 内、messages 容器外），
      不随消息滚动。浅黄底 + 橙字，与 banner（红/黄带底边）区分。 */

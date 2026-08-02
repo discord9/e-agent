@@ -1182,6 +1182,40 @@ async function main(){
     chk("modeled session shows composer meta",
         elsById["composerMeta"].hidden === false && elsById["composerMeta"].textContent.includes("kimi"),
         "hidden=" + elsById["composerMeta"].hidden + " text=" + elsById["composerMeta"].textContent);
+    // 会话状态追加：Busy → 尾部 "· 处理中"（带 .busy 色）、Compacting → 压缩中、
+    // Failed → 失败；Idle 静默无状态 span
+    state.lastList = [{ id: "noid", model: "flash", role: "main", status: "Busy",
+                        parent_session_id: null, entry_count: 0, active: true }];
+    updateComposerMeta();
+    const _stBusy = elsById["composerMeta"].querySelector(".composer-status");
+    chk("busy status shown after model·role",
+        !elsById["composerMeta"].hidden
+        && elsById["composerMeta"].textContent === "flash · main · 处理中"
+        && !!_stBusy && _stBusy.className === "composer-status busy",
+        "text=" + elsById["composerMeta"].textContent + " cls=" + (_stBusy && _stBusy.className));
+    state.lastList = [{ id: "noid", model: "flash", role: "main", status: "Compacting",
+                        parent_session_id: null, entry_count: 0, active: true }];
+    updateComposerMeta();
+    const _stComp = elsById["composerMeta"].querySelector(".composer-status");
+    chk("compacting status shown",
+        elsById["composerMeta"].textContent === "flash · main · 压缩中"
+        && !!_stComp && _stComp.className === "composer-status compacting",
+        "text=" + elsById["composerMeta"].textContent + " cls=" + (_stComp && _stComp.className));
+    state.lastList = [{ id: "noid", model: "flash", role: "main", status: "Failed: boom",
+                        parent_session_id: null, entry_count: 0, active: true }];
+    updateComposerMeta();
+    const _stErr = elsById["composerMeta"].querySelector(".composer-status");
+    chk("failed status shown as error",
+        elsById["composerMeta"].textContent === "flash · main · 失败"
+        && !!_stErr && _stErr.className === "composer-status error",
+        "text=" + elsById["composerMeta"].textContent + " cls=" + (_stErr && _stErr.className));
+    state.lastList = [{ id: "noid", model: "flash", role: "main", status: "Idle",
+                        parent_session_id: null, entry_count: 0, active: true }];
+    updateComposerMeta();
+    chk("idle keeps no status span",
+        elsById["composerMeta"].textContent === "flash · main"
+        && elsById["composerMeta"].querySelector(".composer-status") === null,
+        "text=" + elsById["composerMeta"].textContent);
     state.lastList = _savedList;
     state.sessionId = _savedSid;
     updateComposerMeta();   // 还原

@@ -346,10 +346,23 @@ function updateComposerMeta() {
     return;
   }
   const text = role ? model + " · " + role : model;
-  if (meta.hidden || meta.textContent !== text) {
+  // 会话状态：非 Idle 时在 model·role 尾部追加状态（Busy→处理中、
+  // Compacting→压缩中、Failed→失败、Finished→已完成）；Idle 静默。
+  // 状态是独立 span（带色 class），不动 meta 自身 class。
+  const st = s && s.status ? String(s.status) : "";
+  const showSt = st !== "" && st !== "Idle";
+  const stCls = !showSt ? "" : (st.startsWith("Failed") ? "error"
+    : st === "Compacting" ? "compacting" : "busy");
+  const full = showSt ? text + " · " + statusLabel(st) : text;
+  const curSt = meta.querySelector(".composer-status");
+  const curCls = curSt ? curSt.className : "";
+  const wantCls = "composer-status" + (stCls ? " " + stCls : "");
+  if (meta.hidden || meta.textContent !== full || curCls !== wantCls) {
     meta.hidden = false;
-    meta.textContent = text;
     meta.title = s.model || "";   // 完整 model 名（可能被省略号截断）
+    meta.textContent = "";        // 清空后重建（文本节点 + 可选状态 span）
+    meta.append(showSt ? text + " · " : text);   // DOM append 接受字符串（自动转文本节点）
+    if (showSt) meta.append(el("span", wantCls, statusLabel(st)));
   }
 }
 
