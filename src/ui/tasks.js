@@ -324,7 +324,10 @@ function renderTaskList(tasks, container) {
     line.appendChild(badge);
     line.appendChild(el("span", "task-label", shortTaskLabel(t)));
     if (t.role) line.appendChild(el("span", "task-meta trole", t.role));
-    if (t.session_id) line.appendChild(el("span", "task-meta tsid", "会话 " + shortId(t.session_id)));
+    // 会话 id 完整显示：delegate 任务显示 subagent 自己的会话（点击跳转的目标），
+    // 其余任务显示父会话。不截断——省略的 id 无法区分会话。
+    const sidShown = isDelegate ? (t.subagent_session_id || t.session_id) : t.session_id;
+    if (sidShown) line.appendChild(el("span", "task-meta tsid", "会话 " + sidShown));
     const status = el("span", "task-stream-status", "● 流式输出中…");
     status.hidden = true;   // 仅轮询/流进行中显示（轻量视觉提示）
     line.appendChild(status);
