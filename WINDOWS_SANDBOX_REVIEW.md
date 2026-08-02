@@ -105,3 +105,80 @@ capability ACE 无 `DELETE` 与目录 `FILE_DELETE_CHILD`。Git checkout、编�
 
 - 本报告为静态审查；Windows 专属 enforce 测试未在 Linux 执行，最终验收以真机测试为准。
 - 审查期间远端另出现 `fix/windows-tui-paste` 分支（未审查，不在本报告范围）。
+
+---
+
+## 分支所有者回应 / tip `1931bbf`
+
+> 本节由分支所有者追加，仅回应上述审查意见；不改写原 reviewer 报告及其 verdict。
+
+### 当前版本与验证
+
+当前分支 tip 为 `1931bbf`，基于 `6fb118d`。真 Windows 上的聚焦测试结果为 **14 passed**；`cargo fmt --all`、`cargo build` 与 `git diff --check` 均通过。`cargo clippy --all-targets -- -D warnings` 仅被本分支未修改的基线 lint `src/server.rs:1660` 阻塞。
+
+### 已修复项
+
+#### Major 4 — 删除、重命名及常见开发工作流
+
+已修。capability SID 现为稳定的 **v3 SID**。capability ACE 增加 `FILE_DELETE_CHILD`，使受权目录内的文件/目录重命名、删除及原子替换可用；写根本身不授予 `DELETE`。
+
+真实 Windows 测试现覆盖：
+
+- workspace 内文件 rename/delete；
+- workspace 内目录 rename/delete；
+- 临时文件覆盖目标文件的 atomic replace；
+- Git lock-file/rename 路径、commit 及 checkout；
+- workspace 外 rename 被拒绝。
+
+#### Major 7 — 每命令无界扫描
+
+已修。仅当写根缺少 **exact v3 ACE**、即将执行首次安装或版本升级传播时，才扫描该根；检测到 exact v3 ACE 后，后续命令同时跳过全树扫描与 ACL 传播。所有确实需要扫描的 roots 仍会在任何 ACL mutation 之前全部完成扫描，因此首次安装/升级保持“先全量检查、后修改”的顺序。
+
+本实现没有采用 reviewer 建议的“每命令限时/限条目扫描”。原因是缓存或限时会使安全判定随缓存新旧、目录规模和运行时机变化，形成不稳定的准入结果；而 exact ACE 已安装后根本不再传播 ACL，新出现的 hard link 不会因此获得 capability ACE，也就不存在由传播产生的 hard-link 授权风险。基于这一点，跳过扫描比保留一个可能超时或过期的每命令扫描更直接。
+
+#### Major 8 — DuplicateHandle 失败清理
+
+已修。`DuplicateHandle` 失败时保留并使用创建进程返回的 exact process handle；检查 `TerminateProcess` 的返回结果，并以 `WaitForSingleObject` 确认进程已经终止后才返回启动失败。已增加 helper 级失败路径测试，覆盖成功终止并等待确认，以及终止失败且进程仍存活的严重清理错误报告。
+
+### 对 Blocker 1 的回应 — 接受已披露风险，不同意继续作为当前 MVP blocker
+
+静态 hard-link/reparse 的 ACL 传播路径现已关闭：首次安装/升级前扫描会拒绝它们；exact v3 ACE 存在后既不扫描也不传播，因此之后出现的 hard link 不会从传播中获得授权。
+
+我们仍承认 **scan → path-based ACL application 的 TOCTOU 未修复**，也不把本轮改动表述为修复了该竞态。当前产品承诺是 **accident-prevention write restriction（防事故性误写约束）**，不是针对能够并发篡改 workspace 的主动恶意进程所提供的强制安全边界；README 已明确披露该 TOCTOU。
+
+reviewer 提议的“保留 root handle + `SetSecurityInfo`”只能稳定 root 对象本身，不能单独闭环 descendant 在扫描完成后、传播前被替换的问题。完整闭环需要 handle-relative 遍历/更新、USN 辅助验证、目录锁定，或改用不同的授权架构，超出本 Windows write-sandbox MVP 的范围。因此本轮请求将此项降级为**已披露的非目标/接受风险**；这不是修复声明，而是不同意继续把它作为当前 accident-prevention MVP 的合并 blocker。
+
+### 对 Blocker 2 的回应 — 接受兼容性取舍，不同意继续作为当前 MVP blocker
+
+我们承认继承的 console stdin 与 default desktop 对主动恶意进程构成攻击面。当前目标仍是防止工具发生事故性文件误写；普通 PowerShell、MSVC、Git 及游戏开发工具不会意外执行 `WriteConsoleInput` 或 window-message injection 来攻击宿主。
+
+将 stdin 固定为 EOF、使用 private desktop，或强制 `CREATE_NO_WINDOW`，会破坏交互式工具、credential manager、GUI helper、许可证流程及游戏开发工具兼容性。基于当前威胁模型，本轮选择保留兼容行为，请求把该项降为未来可选的 **hardened mode** 工作；我们不声称当前实现提供安全隔离，也不声称能防护恶意代码。
+
+### Major 5 — Job Object
+
+此项尚未修复。取消/超时后后代进程可能继续存活并保留 capability，确属安全缺口；当前 README 已明确说明只终止顶层进程。Job Object 生命周期管理列为下一阶段工作，本轮不宣称已经解决。
+
+### Major 6 — 测试状态
+
+当前共有 **14 项** Windows 聚焦测试。相较原报告所列范围，本轮新增/强化的准确范围为：
+
+1. stable capability SID 测试更新为验证 v3、UTF-16 path 与 capability class 的稳定派生；
+2. exact v3 ACE 判定测试，覆盖缺 ACE、mask 不完整、inheritance 不完整及完全匹配；
+3. DuplicateHandle 失败后成功终止并确认退出的 helper 测试；
+4. DuplicateHandle 失败且 `TerminateProcess` 失败、进程仍存活的 helper 测试；
+5. 真实 file/dir rename-delete、atomic replace、Git lock/commit/checkout 与 outside rename deny 集成测试；
+6. exact ACE 安装后跳过 rescan/propagation、随后创建 hard link 仍不能修改 outside 文件的集成测试。
+
+上述聚焦测试已在真 Windows 环境执行并 14 passed；但持续运行这些测试的真实 Windows CI runner **尚未建立**，该缺口仍然承认。
+
+### Minor 9 / Minor 10
+
+Minor 9（Windows 环境变量透传警告位置/策略）与 Minor 10（SPEC 状态头及 Phase-A 旧文案）均**尚未处理**；本轮不作已修暗示。
+
+### Re-review checklist
+
+请下一轮 reviewer：
+
+1. 在 tip `1931bbf` 验证三项实现修复：Major 4 的 v3 ACE/删除重命名能力、Major 7 的 exact-ACE 条件扫描与无传播快路径、Major 8 的 duplicate-failure 确认终止；
+2. 裁决是否接受当前 accident-prevention MVP 威胁模型，以及将 Blocker 1 TOCTOU 与 Blocker 2 console/desktop 通道降级为已披露风险/未来 hardened mode 的两个请求；
+3. 若不接受，请明确要求的是 **hardened sandbox**，而不是 accident-prevention write-restriction MVP，避免把两种产品承诺混为同一验收标准。
