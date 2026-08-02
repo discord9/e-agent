@@ -243,6 +243,80 @@ struct RootAcl {
     _descriptor: LocalPtr,
 }
 
+fn file_link_count(path: &Path) -> Result<u32, String> {
+    let path_w = wide(path.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            path_w.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(last_error(&format!(
+            "cannot inspect link count for descendant {}",
+            path.display()
+        )));
+    }
+    let handle = Handle(handle);
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    if unsafe { GetFileInformationByHandle(handle.0, &mut information) } == 0 {
+        return Err(last_error(&format!(
+            "cannot inspect link count for descendant {}",
+            path.display()
+        )));
+    }
+    Ok(information.nNumberOfLinks)
+}
+
+fn scan_descendants(root: &Path) -> Result<(), String> {
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let entries = std::fs::read_dir(&directory).map_err(|error| {
+            format!(
+                "cannot read write-root directory {} while scanning descendants: {error}",
+                directory.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot enumerate descendants of write-root directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "cannot inspect write-root descendant {}: {error}",
+                    path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink()
+                || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(format!(
+                    "Windows write-sandbox does not support symlink/reparse-point descendants: {}",
+                    path.display()
+                ));
+            }
+            if metadata.is_dir() {
+                directories.push(path);
+            } else if metadata.is_file() && file_link_count(&path)? > 1 {
+                return Err(format!(
+                    "Windows write-sandbox does not support hard-linked descendants: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn preflight_root(path: &Path) -> Result<RootAcl, String> {
     use std::path::{Component, Prefix};
 
@@ -366,6 +440,8 @@ fn preflight_root(path: &Path) -> Result<RootAcl, String> {
             path.display()
         ));
     }
+
+    scan_descendants(path)?;
 
     let mut path_w = wide(path.as_os_str());
     let mut old_acl = null_mut();

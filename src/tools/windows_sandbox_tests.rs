@@ -94,6 +94,28 @@ async fn restricted_token_enforces_configured_write_roots() {
 }
 
 #[tokio::test]
+async fn hard_linked_descendant_is_rejected_before_external_file_can_change() {
+    let parent = tempfile::tempdir().unwrap();
+    let workspace_root = parent.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
+    let outside = parent.path().join("outside.txt");
+    std::fs::write(&outside, "unchanged").unwrap();
+    let linked = workspace_root.join("linked.txt");
+    std::fs::hard_link(&outside, &linked).unwrap();
+
+    let workspace = Workspace::new(&workspace_root).unwrap();
+    let bash = test_bash(workspace, windows_policy(true, Vec::new()));
+    let error = bash
+        .execute(json!({"command": write_command(&bash.shell, &linked, "changed")}))
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("hard-linked descendants"), "{error}");
+    assert!(error.contains(&linked.display().to_string()), "{error}");
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
+}
+
+#[tokio::test]
 async fn restricted_token_preserves_output_and_nonzero_exit() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();

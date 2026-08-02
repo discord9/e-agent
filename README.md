@@ -332,8 +332,10 @@ Locations already writable through Everyone or the current logon SID, including
 some public locations, may remain writable. Only existing canonical directory paths on
 fixed local NTFS volumes are accepted. UNC/device paths, non-directory roots,
 roots that are symlinks/reparse points, NULL DACLs, and case-sensitive roots
-are rejected.
-Nested reparse points and path replacement races remain risks. Windows shell
+are rejected. Before any token or ACL modification, every write root is scanned
+without following links; hard-linked file descendants and nested symlink/reparse
+point descendants are unsupported and rejected.
+Concurrent path replacement races (TOCTOU) remain a risk. Windows shell
 execution with protected Git metadata (`protect_git = true`, used by delegated
 subagents/fixers) is unsupported and fails before token or ACL changes with
 `Windows write-sandbox MVP does not support protected-git shell execution`;
