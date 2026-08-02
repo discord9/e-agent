@@ -284,6 +284,7 @@ globalThis.fetch=(url,opts={})=>{
   if(url==="/api/sessions/fork-1/events") return resp(200, stream());
   if(url==="/api/sessions/s1/fork-candidates") return resp(200, forkCandidatesData);
   if(url==="/api/sessions/s1/fork"&&m==="POST") return forkPostResp;
+  if(url==="/api/models") return resp(200, ["chatgpt/sol","chatgpt/terra","deepseek/flash","deepseek/high","deepseek/fast","kimi/k3"]);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/model")&&m==="POST") return resp(200,{ok:true,model:"sol"});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{});
@@ -578,6 +579,77 @@ async function main(){
         "cleared=" + (pin.value === ""));
     chk("/model success banner", elsById["bannerText"].textContent.includes("已切换到 sol"),
         "banner=" + elsById["bannerText"].textContent);
+
+    // ---- /model profile 自动补全：/model <参数> 弹出 profile 候选 ----
+    // 首次 /model 参数输入触发 GET /api/models 懒加载（mock 返回 6 个 profile）
+    pin.value = "/model c";
+    pin.selectionStart = pin.selectionEnd = "/model c".length;
+    inp();
+    chk("model menu closes while loading", slashMenu.open === false,
+        "open=" + slashMenu.open);
+    await flush();   // /api/models 返回后按当前输入重开
+    chk("model menu opens with profiles", slashMenu.open === true && sm.hidden === false
+        && slashMenu.mode === "profile" && slashMenu.items.length === 2,
+        "open=" + slashMenu.open + " mode=" + slashMenu.mode
+        + " n=" + slashMenu.items.length);
+    chk("model menu filters by prefix", slashMenu.items[0] === "chatgpt/sol"
+        && slashMenu.items[1] === "chatgpt/terra",
+        "items=" + JSON.stringify(slashMenu.items));
+    chk("model menu rows rendered", sm.querySelectorAll(".slash-item").length === 2
+        && sm.querySelectorAll(".slash-name")[0].textContent === "chatgpt/sol"
+        && sm.querySelectorAll(".slash-desc").length === 0,
+        "rows=" + sm.querySelectorAll(".slash-item").length);
+    chk("model menu loads once", FETCHES.filter(u => u === "/api/models").length === 1,
+        "n=" + FETCHES.filter(u => u === "/api/models").length);
+    // ↑↓ 移动选中（循环）
+    kd("ArrowDown");
+    chk("model menu arrow down moves", slashMenu.selected === 1
+        && slashMenu.items[slashMenu.selected] === "chatgpt/terra",
+        "sel=" + slashMenu.selected);
+    kd("ArrowUp");
+    chk("model menu arrow up wraps", slashMenu.selected === 0, "sel=" + slashMenu.selected);
+    // Enter → 填入 "/model <profile>" 并直接 POST /model（一步到位）
+    const modelFetchBefore = FETCHES.filter(u => u.endsWith("/model")).length;
+    kd("Enter");
+    await flush();
+    chk("model enter fills and sends",
+        pin.value === "" && FETCHES.filter(u => u.endsWith("/model")).length === modelFetchBefore + 1,
+        "cleared=" + (pin.value === "") + " posted="
+        + (FETCHES.filter(u => u.endsWith("/model")).length - modelFetchBefore));
+    chk("model enter banner", elsById["bannerText"].textContent.includes("已切换到 sol"),
+        "banner=" + elsById["bannerText"].textContent);
+    // /model（无空格）→ 命令模式：/model 命令项仍在（命令菜单不破坏）
+    pin.value = "/model";
+    pin.selectionStart = pin.selectionEnd = "/model".length;
+    inp();
+    chk("model bare keeps command menu", slashMenu.open === true
+        && slashMenu.mode === "command" && slashMenu.items.length === 1
+        && slashMenu.items[0].name === "/model",
+        "open=" + slashMenu.open + " mode=" + slashMenu.mode
+        + " n=" + slashMenu.items.length);
+    // /model + 空格（无参数）→ 全部 profile 候选
+    pin.value = "/model ";
+    pin.selectionStart = pin.selectionEnd = "/model ".length;
+    inp();
+    chk("model space shows all profiles", slashMenu.open === true
+        && slashMenu.mode === "profile" && slashMenu.items.length === 6,
+        "open=" + slashMenu.open + " mode=" + slashMenu.mode
+        + " n=" + slashMenu.items.length);
+    // 无匹配前缀 → 关闭
+    pin.value = "/model zz";
+    pin.selectionStart = pin.selectionEnd = "/model zz".length;
+    inp();
+    chk("model no match closes", slashMenu.open === false && sm.hidden === true,
+        "open=" + slashMenu.open);
+    // Esc 关闭
+    pin.value = "/model ";
+    pin.selectionStart = pin.selectionEnd = "/model ".length;
+    inp();
+    chk("model esc open", slashMenu.open === true);
+    kd("Escape");
+    chk("model esc closes", slashMenu.open === false && sm.hidden === true);
+    pin.value = "";
+    inp();
 
     // 断线重连：销毁当前流后应重新走 history+SSE
     const oldInit = state.initSource;

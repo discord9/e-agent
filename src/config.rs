@@ -281,6 +281,21 @@ impl Config {
         Ok(resolved)
     }
 
+    /// Every switchable model profile name: `[models]` keys plus `[roles]`
+    /// values (roles route to profiles, so they are switchable too),
+    /// deduplicated and sorted for a stable display. Feeds the web `/model`
+    /// autocomplete (`GET /api/models`).
+    pub fn model_profiles(&self) -> Vec<String> {
+        let mut profiles: Vec<String> = self.models.keys().cloned().collect();
+        for role_profile in self.roles.values() {
+            if !profiles.iter().any(|p| p == role_profile) {
+                profiles.push(role_profile.clone());
+            }
+        }
+        profiles.sort();
+        profiles
+    }
+
     /// The Exa web-search API key from `[web_search]`, or None when the
     /// section is absent. Process env `EXA_API_KEY` always wins over this
     /// (callers check it first). Exactly one of `api_key_file` / `api_key_env`

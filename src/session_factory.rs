@@ -287,6 +287,16 @@ impl SessionFactory {
         )
     }
 
+    /// Every switchable model profile name (`[models]` keys + `[roles]`
+    /// values, deduplicated and sorted), for the web `/model` autocomplete
+    /// (`GET /api/models`). Empty when there is no config.
+    pub fn model_profiles(&self) -> Vec<String> {
+        self.config
+            .as_ref()
+            .map(crate::config::Config::model_profiles)
+            .unwrap_or_default()
+    }
+
     /// The summarizer model for cheap per-turn session summaries (desktop
     /// pet). Routed via `[roles] summarizer` (e.g. deepseek/flash with
     /// thinking off); falls back to the main model when not configured.

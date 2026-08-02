@@ -445,7 +445,60 @@ const slashMenu = {
   open: false,     // 菜单是否显示
   items: [],       // 当前过滤后的候选（与渲染行一一对应）
   selected: 0,     // 当前选中索引
+  mode: "command", // "command" = 命令候选；"profile" = /model 参数补全（profile 候选）
 };
+
+/* /model profile 候选缓存：GET /api/models 懒加载一次（Web 端 /model 自动补全）。
+   null = 未加载；[] = 已加载（含加载失败退化为空）。 */
+let modelProfileCache = null;
+let modelProfilePromise = null;
+
+function loadModelProfiles() {
+  if (modelProfilePromise) return modelProfilePromise;
+  modelProfilePromise = (async () => {
+    try {
+      const res = await api("/api/models");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      modelProfileCache = Array.isArray(data) ? data : [];
+    } catch (e) {
+      modelProfileCache = [];   // 加载失败：退化为空列表（菜单不弹，不影响输入）
+    }
+    return modelProfileCache;
+  })();
+  return modelProfilePromise;
+}
+
+/* 光标前是 "/model <参数>"（/model 后至少一个空格）→ 返回已输入的前缀
+   （可为空串）；否则返回 null（保持命令菜单逻辑）。"/model"（无空格）返回
+   null → 命令菜单（/model 命令项）；"/model " 与 "/model c" 都走 profile 补全。 */
+function slashModelArg() {
+  const v = els.promptInput.value;
+  const caret = (els.promptInput.selectionStart == null)
+    ? v.length : els.promptInput.selectionStart;
+  const before = v.slice(0, caret);
+  const m = /^\/model[ \t]+(\S*)$/.exec(before);
+  return m ? m[1] : null;
+}
+
+/* /model 参数补全：菜单显示 profile 候选（按已输入前缀过滤）。
+   候选未加载时先关菜单，加载完成后再按当前输入重开。 */
+function updateModelMenu(filter) {
+  if (modelProfileCache === null) {
+    closeSlashMenu();
+    loadModelProfiles().then(() => {
+      if (slashModelArg() !== null) updateSlashMenu();
+    });
+    return;
+  }
+  const items = modelProfileCache.filter((p) => p.startsWith(filter));
+  if (!items.length) { closeSlashMenu(); return; }   // 无匹配：关闭
+  slashMenu.mode = "profile";
+  slashMenu.items = items;
+  if (slashMenu.selected >= items.length) slashMenu.selected = 0;
+  slashMenu.open = true;
+  renderSlashMenu();
+}
 
 /* 光标前的「当前词」：以 / 开头且前面是输入框开头或空白 → 返回该词（如 "/com"）；
    否则返回 null（不是命令起始，菜单不应出现）。 */
@@ -458,12 +511,17 @@ function currentSlashWord() {
   return m ? m[2] : null;
 }
 
-/* input 事件驱动：更新菜单（显示/过滤/关闭）。输入、删除都走这里。 */
+/* input 事件驱动：更新菜单（显示/过滤/关闭）。输入、删除都走这里。
+   "/model <参数>"（含 "/model " 尾随空格——currentSlashWord 匹配不到）优先
+   走 profile 补全；其余 / 命令走命令候选。 */
 function updateSlashMenu() {
+  const modelArg = slashModelArg();
+  if (modelArg !== null) { updateModelMenu(modelArg); return; }
   const word = currentSlashWord();
   if (word === null) { closeSlashMenu(); return; }
   const items = SLASH_COMMANDS.filter((c) => c.name.startsWith(word));
   if (!items.length) { closeSlashMenu(); return; }   // 无匹配：关闭
+  slashMenu.mode = "command";
   slashMenu.items = items;
   if (slashMenu.selected >= items.length) slashMenu.selected = 0;
   slashMenu.open = true;
@@ -476,8 +534,12 @@ function renderSlashMenu() {
   menu.innerHTML = "";
   slashMenu.items.forEach((c, i) => {
     const row = el("div", "slash-item" + (i === slashMenu.selected ? " selected" : ""));
-    row.append(el("span", "slash-name", c.name), el("span", "slash-desc", c.desc));
-    if (c.args) row.append(el("span", "slash-args", c.args));
+    if (slashMenu.mode === "profile") {
+      row.append(el("span", "slash-name", c));   // profile 候选：只显示 profile 名
+    } else {
+      row.append(el("span", "slash-name", c.name), el("span", "slash-desc", c.desc));
+      if (c.args) row.append(el("span", "slash-args", c.args));
+    }
     // mousedown 阻止默认：菜单项点击不抢走输入框焦点（否则 blur 先关菜单，click 落空）
     row.addEventListener("mousedown", (e) => { if (e.preventDefault) e.preventDefault(); });
     row.addEventListener("click", () => selectSlashItem(i));
@@ -491,6 +553,7 @@ function closeSlashMenu() {
   slashMenu.open = false;
   slashMenu.items = [];
   slashMenu.selected = 0;
+  slashMenu.mode = "command";
   if (els.slashMenu) els.slashMenu.hidden = true;
 }
 
@@ -513,6 +576,16 @@ function selectSlashItem(i) {
   const c = slashMenu.items[i];
   if (!c) return;
   const inp = els.promptInput;
+  if (slashMenu.mode === "profile") {
+    // /model 参数补全：填入完整 "/model <profile>" 并直接发送（一步到位，
+    // 与命令模式 Enter 执行一致；走 sendPrompt 的 /model 分支 POST）。
+    inp.value = "/model " + c;
+    inp.selectionStart = inp.selectionEnd = inp.value.length;
+    closeSlashMenu();
+    autosizeInput();
+    sendPrompt();
+    return;
+  }
   inp.value = c.args ? c.name + " " + c.args : c.name;
   if (c.args) {
     const at = (c.name + " ").length;   // 光标落在参数占位起始处

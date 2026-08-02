@@ -17,6 +17,7 @@
 //! | POST   | `/api/sessions/{id}/fork`          | fork at a turn boundary into a `fork-…` session |
 //! | POST   | `/api/sessions/{id}/cancel`       | cancel the in-flight turn          |
 //! | POST   | `/api/sessions/{id}/compact`      | request compaction                 |
+//! | GET    | `/api/models`                     | switchable model profile names (web `/model` autocomplete) |
 //! | POST   | `/api/sessions/{id}/model`         | switch the session's model at runtime |
 //! | POST   | `/api/sessions/{id}/undo`         | undo the most recent file operation |
 //! | PUT    | `/api/sessions/{id}/title`        | rename a session (Greptime only)   |
@@ -183,6 +184,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/fork", post(session_fork))
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/compact", post(session_compact))
+        .route("/api/models", get(list_models))
         .route("/api/sessions/{id}/model", post(session_model))
         .route("/api/sessions/{id}/undo", post(session_undo))
         .route("/api/sessions/{id}/title", put(session_title))
@@ -930,6 +932,14 @@ async fn session_compact(
 #[derive(Deserialize)]
 struct ModelBody {
     profile: String,
+}
+
+/// `GET /api/models` — every switchable model profile name (`[models]` keys
+/// plus `[roles]` values from the same config the factory was built with),
+/// sorted, for the web `/model <profile>` autocomplete. JSON array of
+/// strings; `[]` when there is no config.
+async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
+    Json(state.factory.model_profiles())
 }
 
 /// `POST /api/sessions/{id}/model` — switch the session's model at runtime
@@ -2509,6 +2519,117 @@ mod tests {
         )
         .await;
         assert_eq!(ghost.status(), StatusCode::NOT_FOUND, "unknown session");
+    }
+
+    /// `GET /api/models` — 200 + every switchable profile name from the
+    /// factory config (`[models]` keys + `[roles]` values, deduplicated and
+    /// sorted); empty array when there is no config; 401 without a token.
+    #[tokio::test]
+    async fn models_endpoint_lists_switchable_profiles() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let key = temp.path().join("key");
+        std::fs::write(&key, "test-key").unwrap();
+        let config: crate::config::Config = toml::from_str(&format!(
+            r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "{}"
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_file = "{}"
+[models."kimi/k3"]
+model = "k3"
+[models."deepseek/flash"]
+model = "deepseek-chat"
+[models."deepseek/high"]
+model = "deepseek-reasoner"
+[roles]
+subagent = "deepseek/high"
+"#,
+            key.display(),
+            key.display(),
+        ))
+        .unwrap();
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory_with_config(
+                temp.path().to_path_buf(),
+                Some(config),
+            ),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/models")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let profiles: Vec<&str> = value
+            .as_array()
+            .expect("json array")
+            .iter()
+            .map(|v| v.as_str().expect("string profile"))
+            .collect();
+        assert_eq!(
+            profiles,
+            vec!["deepseek/flash", "deepseek/high", "kimi/k3"],
+            "models keys + roles values, deduped and sorted"
+        );
+
+        // No config → empty list.
+        let no_config_app = router(Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(std::env::temp_dir()),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+        }));
+        let empty = no_config_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/models")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(empty.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"[]", "no config → empty list");
+
+        // Auth still applies to the new endpoint.
+        let unauthorized = no_config_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// `POST /api/sessions/{id}/model` — 200 + updated registry metadata for
