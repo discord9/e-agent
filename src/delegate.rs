@@ -600,6 +600,12 @@ pub async fn spawn_btw_subagent(
             .append(&persist.root, &session_id, &fork_entries)
             .await
             .map_err(|e| format!("btw fork failed: {e:#}"))?,
+        // SQLite: same append-only semantics as Greptime (a fresh session
+        // has no rows, so append writes contiguous seqs from 0).
+        SessionBackend::Sqlite { .. } => fork_store
+            .append(&persist.root, &session_id, &fork_entries)
+            .await
+            .map_err(|e| format!("btw fork failed: {e:#}"))?,
     }
     let (handle, runner_task) = Delegate::start_runner(
         model,

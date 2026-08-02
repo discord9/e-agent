@@ -13,6 +13,8 @@ pub mod session;
 pub mod session_factory;
 #[cfg(feature = "greptime")]
 pub mod session_greptime;
+#[cfg(feature = "sqlite")]
+pub mod session_sqlite;
 pub mod session_store;
 pub mod tools;
 pub mod tui;
