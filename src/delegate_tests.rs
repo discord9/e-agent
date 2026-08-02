@@ -480,6 +480,69 @@ async fn sync_cancel_cleans_session_and_closes_result_channel() {
 }
 
 #[tokio::test]
+async fn sync_failure_cleans_session_and_registry() {
+    // 同步 delegate（spawn_silent）的 runner 失败（模型拒绝/panic）也必须
+    // 清理：任务面板条目（sessions + registry）不得残留到进程重启。
+    // 历史上 sync-failure 分支出现过 ghost 条目（.e-agent/TODO.md
+    // "Sync-delegate failure cleanup leak"），本测试钉死该路径。
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let (_, mut background) = builtins(workspace, None, false, None);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    background.set_event_sender(sender);
+    // panicking model → runner task join 返回 Err → SessionResult::Failed
+    let (handle, runner_task, signals) = probe_runner(temp.path(), true);
+    let sessions = Sessions::default();
+    let slot = Arc::new(Mutex::new(None));
+    let cleanup = DelegateCleanup::new(slot.clone(), sessions.clone(), None);
+    let hook_sessions = sessions.clone();
+    let hook_handle = handle.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    background
+        .spawn_silent(
+            "probe".into(),
+            None,
+            None,
+            None,
+            move |id| {
+                *slot.lock().unwrap() = Some(id);
+                hook_sessions.insert(id, probe_entry(hook_handle.clone()));
+            },
+            move || {
+                let cleanup = cleanup;
+                async move {
+                    let result = Delegate::runner_result(&handle, runner_task).await;
+                    cleanup.finish();
+                    let _ = done_tx.send(result.clone());
+                    result_output(result).1
+                }
+            },
+        )
+        .unwrap();
+
+    signals.entered.notified().await;
+    let result = done_rx.await.expect("sync delegate must deliver a result");
+    assert!(
+        matches!(result, SessionResult::Failed(_)),
+        "panicking model must fail the runner, got: {result:?}"
+    );
+    // 失败后：任务面板条目（registry + sessions）必须全部清理
+    let mut tries = 0;
+    loop {
+        if background.running().is_empty() && sessions.sessions.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+        tries += 1;
+        assert!(tries < 1000, "cleanup never completed");
+    }
+    assert!(
+        completions.try_recv().is_err(),
+        "sync delegate sends no completion event"
+    );
+}
+
+#[tokio::test]
 async fn panicking_inner_model_cleans_up_and_sends_one_failure_completion() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
