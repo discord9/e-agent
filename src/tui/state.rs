@@ -826,13 +826,105 @@ impl TuiState {
     }
 
     /// Paste into whichever input is currently active, normalizing terminal
-    /// line endings exactly as ordinary main-input paste did.
+    /// line endings exactly as ordinary main-input paste did. The complete
+    /// string is inserted in one operation so a large bracketed paste needs
+    /// only one state update and one redraw.
     pub(crate) fn handle_paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if let Some(attached) = &mut self.attached {
             attached.input.insert(&text);
         } else {
             self.input.insert(&text);
+        }
+    }
+
+    /// Apply an event-layer batch to a temporary buffer, then replace the
+    /// live input once. Cancellation simply discards the untouched batch.
+    /// Only the drain's reliable Enter-followed-by-edit signal enables paste
+    /// fallback; a fast `abc` plus trailing Enter therefore still submits.
+    pub(crate) fn handle_text_burst(
+        &mut self,
+        keys: &[KeyEvent],
+        cancelled: bool,
+        fallback: bool,
+    ) -> Option<String> {
+        if cancelled {
+            return None;
+        }
+        let mut input = self
+            .attached
+            .as_ref()
+            .map_or_else(|| self.input.clone(), |attached| attached.input.clone());
+        let mut pending_insert = String::new();
+        let mut prompt = None;
+        for key in keys {
+            match key.code {
+                KeyCode::Char(character)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    pending_insert.push(character);
+                }
+                KeyCode::Backspace if key.modifiers.is_empty() => {
+                    // A backspace immediately after pending characters can
+                    // edit the pending run without touching the live String.
+                    if pending_insert.pop().is_none() {
+                        input.backspace();
+                    }
+                }
+                KeyCode::Delete if key.modifiers.is_empty() => {
+                    input.insert(&pending_insert);
+                    pending_insert.clear();
+                    input.delete();
+                }
+                KeyCode::Enter if fallback || key.modifiers == KeyModifiers::ALT => {
+                    pending_insert.push('\n');
+                }
+                KeyCode::Enter if prompt.is_none() => {
+                    input.insert(&pending_insert);
+                    pending_insert.clear();
+                    let text = std::mem::take(&mut input.text);
+                    input.cursor = 0;
+                    if !text.trim().is_empty() {
+                        prompt = Some(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        input.insert(&pending_insert);
+
+        if let Some(attached) = &mut self.attached {
+            attached.input = input;
+            if let Some(prompt) = prompt.take() {
+                if attached.finished
+                    || matches!(&*attached.status.borrow(), SessionStatus::Finished(_))
+                {
+                    // Match handle_attached_key: finished sessions retain
+                    // unsent text and explain why it was not accepted.
+                    attached.input.insert(&prompt);
+                    attached.state.push_line(
+                        "subagent finished — prompt not sent, press Esc to detach".into(),
+                        LineKind::Dim,
+                    );
+                } else {
+                    attached.handle.prompt(prompt);
+                }
+            }
+        } else {
+            self.input = input;
+        }
+        prompt
+    }
+
+    /// Idle main-view Ctrl-C follows attached-view semantics: clear a
+    /// non-empty input first, and only let an empty prompt exit the TUI.
+    pub(crate) fn clear_input_on_idle_cancel(&mut self, key: KeyEvent) -> bool {
+        if is_cancel(key) && !self.input.text.is_empty() {
+            self.input.text.clear();
+            self.input.cursor = 0;
+            true
+        } else {
+            false
         }
     }
 
@@ -1995,7 +2087,7 @@ mod format_tool_call_tests {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct InputBuffer {
     pub(crate) text: String,
     pub(crate) cursor: usize,

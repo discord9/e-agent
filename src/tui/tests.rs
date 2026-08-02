@@ -100,6 +100,171 @@ fn paste_routes_to_active_input_and_normalizes_line_endings() {
     assert_eq!(state.input.text, "one\ntwo\nthree main");
 }
 
+fn multiline_keys() -> [KeyEvent; 7] {
+    [
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+    ]
+}
+
+#[test]
+fn confirmed_fallback_keeps_multiline_text_without_submitting() {
+    let mut state = TuiState::default();
+    assert_eq!(
+        state.handle_text_burst(&multiline_keys(), false, true),
+        None
+    );
+    assert_eq!(state.input.text, "one\ntwo");
+}
+
+#[test]
+fn fast_chars_and_trailing_enter_submit_normally() {
+    let mut state = TuiState::default();
+    let keys = [
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    ];
+    assert_eq!(
+        state.handle_text_burst(&keys, false, false),
+        Some("abc".to_string())
+    );
+    assert!(state.input.text.is_empty());
+}
+
+#[test]
+fn cancelled_confirmed_batch_never_changes_main_or_attached_input() {
+    let keys = multiline_keys();
+    let mut state = TuiState::default();
+    state.input.insert("main prefix");
+    assert_eq!(state.handle_text_burst(&keys, true, true), None);
+    assert_eq!(state.input.text, "main prefix");
+
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    attach_test(&mut state, 7, "demo", handle);
+    state
+        .attached
+        .as_mut()
+        .unwrap()
+        .input
+        .insert("attached prefix");
+    assert_eq!(state.handle_text_burst(&keys, true, true), None);
+    assert_eq!(
+        state.attached.as_ref().unwrap().input.text,
+        "attached prefix"
+    );
+}
+
+#[test]
+fn main_and_attached_apply_confirmed_batch_the_same_way() {
+    let keys = multiline_keys();
+    let mut state = TuiState::default();
+    state.handle_text_burst(&keys, false, true);
+    assert_eq!(state.input.text, "one\ntwo");
+
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    attach_test(&mut state, 7, "demo", handle);
+    state.handle_text_burst(&keys, false, true);
+    assert_eq!(state.attached.as_ref().unwrap().input.text, "one\ntwo");
+}
+
+#[test]
+fn idle_main_ctrl_c_clears_nonempty_input_before_exit() {
+    let mut state = TuiState::default();
+    state.input.insert("keep the tui open");
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    assert!(state.clear_input_on_idle_cancel(ctrl_c));
+    assert!(state.input.text.is_empty());
+    assert_eq!(state.input.cursor, 0);
+    assert!(!state.clear_input_on_idle_cancel(ctrl_c));
+    assert!(is_exit(ctrl_c), "an empty idle input may still exit");
+}
+
+#[tokio::test]
+async fn text_burst_drain_coalesces_repeat_and_consumes_cancel() {
+    let first = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+    let repeat = KeyEvent::new_with_kind(
+        KeyCode::Char('b'),
+        KeyModifiers::NONE,
+        crossterm::event::KeyEventKind::Repeat,
+    );
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    let trailing = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+    let mut events = futures_util::stream::iter(vec![
+        Ok::<_, io::Error>(Event::Key(repeat)),
+        Ok(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        ))),
+        Ok(Event::Key(ctrl_c)),
+        Ok(Event::Key(trailing)),
+    ])
+    .peekable();
+
+    let burst = drain_text_burst(first, &mut events).await;
+    assert!(burst.cancelled);
+    assert!(!burst.fallback);
+    assert_eq!(burst.keys.len(), 3);
+    assert!(matches!(
+        events.next().await,
+        Some(Ok(Event::Key(key))) if key == trailing
+    ));
+}
+
+#[tokio::test]
+async fn enter_first_followed_by_text_confirms_fallback() {
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let text = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+    let mut events =
+        futures_util::stream::iter(vec![Ok::<_, io::Error>(Event::Key(text))]).peekable();
+
+    let burst = drain_text_burst(enter, &mut events).await;
+    assert!(burst.fallback);
+    assert!(!burst.cancelled);
+    assert_eq!(burst.keys, vec![enter, text]);
+    let mut state = TuiState::default();
+    assert_eq!(
+        state.handle_text_burst(&burst.keys, burst.cancelled, burst.fallback),
+        None
+    );
+    assert_eq!(state.input.text, "\nx");
+}
+
+#[tokio::test]
+async fn enter_alone_stays_a_submit() {
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let mut events = futures_util::stream::empty::<io::Result<Event>>().peekable();
+    let burst = drain_text_burst(enter, &mut events).await;
+    assert!(!burst.fallback);
+    let mut state = TuiState::default();
+    state.input.insert("prompt");
+    assert_eq!(
+        state.handle_text_burst(&burst.keys, burst.cancelled, burst.fallback),
+        Some("prompt".to_string())
+    );
+}
+
+#[tokio::test]
+async fn one_character_candidate_can_be_cancelled() {
+    let first = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    let mut events =
+        futures_util::stream::iter(vec![Ok::<_, io::Error>(Event::Key(ctrl_c))]).peekable();
+    let burst = drain_text_burst(first, &mut events).await;
+    assert!(burst.cancelled);
+    let mut state = TuiState::default();
+    state.input.insert("before");
+    state.handle_text_burst(&burst.keys, burst.cancelled, burst.fallback);
+    assert_eq!(state.input.text, "before");
+}
+
 #[test]
 fn f2_toggles_tasks_panel() {
     let mut state = TuiState::default();

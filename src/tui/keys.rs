@@ -7,6 +7,103 @@ use futures_util::StreamExt;
 
 use super::*;
 
+const TEXT_BURST_GAP: Duration = Duration::from_millis(4);
+/// Enter waits a little longer for a following edit event. That is the
+/// reliable signal that a terminal delivered a pasted newline as key events;
+/// once seen, the wider window remains active for the rest of the batch.
+const PASTE_FALLBACK_GAP: Duration = Duration::from_millis(30);
+
+fn is_text_edit_kind(kind: crossterm::event::KeyEventKind) -> bool {
+    matches!(
+        kind,
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+    )
+}
+
+pub(crate) fn is_text_burst_start(key: KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::Enter
+    ) && is_text_burst_key(key)
+}
+
+pub(crate) fn is_text_burst_key(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char(_) => key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT,
+        KeyCode::Backspace | KeyCode::Delete => key.modifiers.is_empty(),
+        // Alt+Enter is already newline. CONTROL Enter is included because
+        // Windows terminals can add CONTROL spuriously during a paste; it is
+        // converted only after Enter is followed by another text edit event.
+        KeyCode::Enter => matches!(
+            key.modifiers,
+            KeyModifiers::NONE | KeyModifiers::ALT | KeyModifiers::CONTROL
+        ),
+        _ => false,
+    }
+}
+
+pub(crate) struct TextBurst {
+    pub(crate) keys: Vec<KeyEvent>,
+    pub(crate) cancelled: bool,
+    /// True only when an Enter is followed by another text-edit event.
+    pub(crate) fallback: bool,
+}
+
+/// Drain one text-edit batch before mutating live input. Ordinary characters
+/// use the 4 ms coalescing window. An Enter (including the first event) waits
+/// up to 30 ms for a following edit; that ordering confirms paste fallback
+/// and switches the remainder of the batch to the same wider idle window.
+/// Esc/Ctrl-C cancels and consumes any candidate batch, even one character.
+pub(crate) async fn drain_text_burst<S>(
+    first: KeyEvent,
+    events: &mut futures_util::stream::Peekable<S>,
+) -> TextBurst
+where
+    S: futures_util::Stream<Item = io::Result<Event>> + Unpin,
+{
+    let mut burst = TextBurst {
+        keys: vec![first],
+        cancelled: false,
+        fallback: false,
+    };
+    loop {
+        let after_enter = matches!(burst.keys.last().map(|key| key.code), Some(KeyCode::Enter));
+        let gap = if burst.fallback || after_enter {
+            PASTE_FALLBACK_GAP
+        } else {
+            TEXT_BURST_GAP
+        };
+        let Ok(next) = tokio::time::timeout(gap, std::pin::Pin::new(&mut *events).peek()).await
+        else {
+            break;
+        };
+        let Some(Ok(Event::Key(key))) = next else {
+            break;
+        };
+        if !is_text_edit_kind(key.kind) {
+            break;
+        }
+        if is_cancel(*key) || key.code == KeyCode::Esc {
+            let _ = events.next().await;
+            burst.cancelled = true;
+            break;
+        }
+        if !is_text_burst_key(*key) {
+            break;
+        }
+        let Some(Ok(Event::Key(key))) = events.next().await else {
+            unreachable!("peeked text key must remain available")
+        };
+        // Enter followed by any accepted edit event is the reliable paste
+        // signal. A trailing Enter therefore remains a normal submit.
+        if after_enter {
+            burst.fallback = true;
+        }
+        burst.keys.push(key);
+    }
+    burst
+}
+
 pub(crate) fn is_scroll_key(key: KeyEvent) -> bool {
     matches!(
         key.code,

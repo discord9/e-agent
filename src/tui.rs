@@ -474,7 +474,9 @@ async fn run_inner(
             }
             Some(first) = inbox.recv() => route_idle_events(&mut state, first, &mut inbox),
             event = events.next() => match event {
-                Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
+                Some(Ok(Event::Key(key)))
+                    if key.kind == crossterm::event::KeyEventKind::Press =>
+                {
                     match handle_pressed_key(&mut state, key, &handle, &status, &sessions, &sender, terminal, &mut events).await? {
                         KeyHandled::Continue => continue,
                         KeyHandled::Exit => return Ok(None),
@@ -575,6 +577,9 @@ async fn handle_pressed_key(
             state.detach();
         } else if is_scroll_key(key) {
             state.attached.as_mut().unwrap().state.handle_scroll(key);
+        } else if is_text_burst_start(key) {
+            let burst = drain_text_burst(key, events).await;
+            state.handle_text_burst(&burst.keys, burst.cancelled, burst.fallback);
         } else {
             let width = attached_input_width(terminal)?;
             state.handle_attached_key(key, width);
@@ -589,6 +594,9 @@ async fn handle_pressed_key(
         handle.cancel();
         return Ok(KeyHandled::Continue);
     }
+    if !active && state.clear_input_on_idle_cancel(key) {
+        return Ok(KeyHandled::Continue);
+    }
     if !active && is_exit(key) {
         return Ok(KeyHandled::Exit);
     }
@@ -601,30 +609,40 @@ async fn handle_pressed_key(
         if state.newer_pending {
             state.load_newer_history().await;
         }
-    } else if let Some(prompt) = state.handle_key(key) {
-        if prompt == "/compact" {
-            handle.compact();
-        } else if prompt == "/undo" {
-            handle_undo(state);
-        } else if prompt == "/help" {
-            state.push_agent_event(AgentEvent::Notice(HELP_TEXT.to_string()));
-        } else if let Some(command) = parse_model(&prompt) {
-            handle_model(command, state, handle);
-        } else if let Some(command) = parse_rename(&prompt) {
-            handle_rename(command, state).await;
-        } else if let Some(command) = parse_btw(&prompt) {
-            handle_btw(command, state).await;
-        } else if let Some(command) = parse_fork(&prompt) {
-            handle_fork(command, state).await;
-        } else {
-            if !state.session_title_set {
-                set_terminal_title(&sanitize_title(&prompt));
-                state.session_title_set = true;
-            }
-            handle.prompt(prompt);
+    } else if is_text_burst_start(key) {
+        let burst = drain_text_burst(key, events).await;
+        if let Some(prompt) = state.handle_text_burst(&burst.keys, burst.cancelled, burst.fallback)
+        {
+            dispatch_prompt(state, prompt, handle).await;
         }
+    } else if let Some(prompt) = state.handle_key(key) {
+        dispatch_prompt(state, prompt, handle).await;
     }
     Ok(KeyHandled::Continue)
+}
+
+async fn dispatch_prompt(state: &mut TuiState, prompt: String, handle: &RunnerHandle) {
+    if prompt == "/compact" {
+        handle.compact();
+    } else if prompt == "/undo" {
+        handle_undo(state);
+    } else if prompt == "/help" {
+        state.push_agent_event(AgentEvent::Notice(HELP_TEXT.to_string()));
+    } else if let Some(command) = parse_model(&prompt) {
+        handle_model(command, state, handle);
+    } else if let Some(command) = parse_rename(&prompt) {
+        handle_rename(command, state).await;
+    } else if let Some(command) = parse_btw(&prompt) {
+        handle_btw(command, state).await;
+    } else if let Some(command) = parse_fork(&prompt) {
+        handle_fork(command, state).await;
+    } else {
+        if !state.session_title_set {
+            set_terminal_title(&sanitize_title(&prompt));
+            state.session_title_set = true;
+        }
+        handle.prompt(prompt);
+    }
 }
 
 /// `/help` output: the supported slash commands (kept in sync with the web
