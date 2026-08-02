@@ -1185,6 +1185,56 @@ async function main(){
     state.lastList = _savedList;
     state.sessionId = _savedSid;
     updateComposerMeta();   // 还原
+
+    // ---- 孤儿 subagent 前端保险：无 parent 的 sub-/btw- 前缀会话不算主会话 ----
+    // 历史脏数据里 sub-20260729-* 等会话 parent/model 丢失，被误判为主会话
+    // （占主会话位 + composer 显示 "flash · main"）。前缀保险：归入「未关联」组。
+    state.lastList = [
+      { id: "s1", parent_session_id: null, model: "kimi", role: "main", status: "Idle", entry_count: 8, active: true },
+      { id: "sub-2", parent_session_id: "s1", label: "子任务Y", status: "Idle", entry_count: 0, active: true },
+      { id: "sub-20260729-200006-ienq", parent_session_id: null, model: "flash", role: "main",
+        status: "Idle", entry_count: 1, active: true },
+      { id: "btw-20260729-200006-abc", parent_session_id: null, model: null, role: null,
+        status: "Idle", entry_count: 0, active: true },
+    ];
+    state.sidebar.filter = "";
+    state.sidebar.showAll = true;
+    renderSidebarTree(true);
+    const _allTreeRows = elsById["sidebarTree"].querySelectorAll(".tree-row");
+    const _rootRows = _allTreeRows.filter((r) =>
+      !r.classList.contains("tree-row-child") && !r.classList.contains("tree-hist-row"));
+    chk("orphan subagent not a tree root",
+        !_rootRows.some((r) => r.textContent.includes("sub-20260729-200006-ienq")
+                             || r.textContent.includes("btw-20260729-200006-abc")),
+        "roots=" + _rootRows.map((r) => r.textContent).join(" | "));
+    const _orphanGroup = elsById["sidebarTree"].querySelectorAll(".tree-group")
+      .find((g) => g.textContent.includes("未关联"));
+    chk("orphan subagents grouped under 未关联",
+        !!_orphanGroup,
+        "groups=" + elsById["sidebarTree"].querySelectorAll(".tree-group").map((g) => g.textContent).join(" | "));
+    const _orphanRow = _allTreeRows.find((r) => r.textContent.includes("sub-20260729-200006-ienq"));
+    chk("orphan rendered as child row in group",
+        !!_orphanRow && _orphanRow.classList.contains("tree-row-child"),
+        "cls=" + (_orphanRow && _orphanRow.className));
+    const _subRow = _allTreeRows.find((r) => r.textContent.includes("sub-2"));
+    chk("linked subagent still child row",
+        !!_subRow && _subRow.classList.contains("tree-row-child"),
+        "cls=" + (_subRow && _subRow.className));
+    // composer meta：孤儿 role=main（脏数据）不显示 "· main"；真主会话照常
+    state.sessionId = "sub-20260729-200006-ienq";
+    updateComposerMeta();
+    chk("orphan hides fake main role",
+        elsById["composerMeta"].hidden === false
+        && elsById["composerMeta"].textContent === "flash",
+        "text=" + elsById["composerMeta"].textContent + " hidden=" + elsById["composerMeta"].hidden);
+    state.sessionId = "s1";
+    updateComposerMeta();
+    chk("real main keeps role label",
+        elsById["composerMeta"].textContent === "kimi · main",
+        "text=" + elsById["composerMeta"].textContent);
+    state.lastList = _savedList;
+    state.sessionId = _savedSid;
+    updateComposerMeta();   // 还原
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);

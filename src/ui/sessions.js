@@ -331,7 +331,12 @@ function updateComposerMeta() {
   if (!meta) return;
   const s = (state.lastList || []).find((x) => x.id === state.sessionId);
   const model = s && s.model ? String(s.model) : "";
-  const role = s && s.role ? String(s.role) : "";
+  let role = s && s.role ? String(s.role) : "";
+  // 前缀保险：无 parent 的 sub-/btw- 前缀会话不是主会话，脏数据里
+  // 可能带着 role="main"（孤儿 subagent）——不显示误导性的 "· main"。
+  if (role === "main" && s && !s.parent_session_id && /^(sub|btw)-/i.test(String(s.id || ""))) {
+    role = "";
+  }
   if (!model && !role) {
     if (!meta.hidden || meta.textContent !== "") {   // 幂等：仅在变化时触碰 DOM
       meta.hidden = true;
@@ -1044,10 +1049,16 @@ function renderSidebarTree(force) {
     if (!childrenByParent.has(s.parent_session_id)) childrenByParent.set(s.parent_session_id, []);
     childrenByParent.get(s.parent_session_id).push(s);
   }
-  const rootIds = new Set(list.filter((s) => !s.parent_session_id).map((s) => s.id));
-  const orphans = list.filter((s) => s.parent_session_id && !rootIds.has(s.parent_session_id));
+  // 主会话判定：无 parent 且 id 不以 sub-/btw- 开头。历史脏数据里存在
+  // parent 丢失的孤儿 subagent（sub-20260729-* 等），无 parent 会被误判
+  // 为主会话 → 前缀保险：这类会话归入「未关联」组，不占主会话位。
+  const isMainSession = (s) => !s.parent_session_id && !/^(sub|btw)-/i.test(String(s.id || ""));
+  const rootIds = new Set(list.filter(isMainSession).map((s) => s.id));
+  const orphans = list.filter((s) => s.parent_session_id
+    ? !rootIds.has(s.parent_session_id)
+    : !isMainSession(s));
   const filter = state.sidebar.filter;
-  const roots = list.filter((s) => !s.parent_session_id);
+  const roots = list.filter(isMainSession);
   if (filter) {
     // 筛选：主会话匹配 title（无 title 回退 id），大小写不敏感；子会话随父显示
     const match = (s) => (s.title || s.id).toLowerCase().includes(filter);
