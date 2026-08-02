@@ -327,8 +327,12 @@ and `readable_paths` never grants write access. TEMP/TMP, HOME, Cargo/NuGet, and
 engine caches are not implicitly writable.
 
 The Windows MVP is not complete filesystem isolation: it does not restrict
-reads or network access, and `network = false` is rejected before launch.
-Locations already writable through Everyone or the current logon SID, including
+reads or network access, and `network = false` is rejected before launch. Except
+for the explicitly stripped credential variables (`EXA_API_KEY`,
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
+and `KIMI_API_KEY`), parent-process environment variables remain visible to the
+child process; this is not read or secret isolation. Locations already writable
+through Everyone or the current logon SID, including
 some public locations, may remain writable. Only existing canonical directory paths on
 fixed local NTFS volumes are accepted. UNC/device paths, non-directory roots,
 roots that are symlinks/reparse points, NULL DACLs, and case-sensitive roots
@@ -350,9 +354,12 @@ Synthetic capability allow ACEs persist after successful execution. If adding
 an ACE to a later root fails, ACEs already added to earlier roots may also
 remain; the process is not started and no whole-DACL rollback is attempted.
 These synthetic SID ACEs are inert for ordinary tokens that do not contain the
-SID, but administrators may need to remove them manually. Cancellation and
-timeout terminate only the top-level process; Job Object process-tree cleanup
-is a future lifecycle enhancement.
+SID, but administrators may need to remove them manually. Cancellation,
+timeout, and running-task registry teardown currently terminate only the
+top-level process. Descendants may keep running with the capability and continue
+writing the allowed roots. Atomic assignment to a Job Object, with process-tree
+termination on cancellation, timeout, and registry teardown, is a future
+lifecycle enhancement.
 
 On Linux/macOS every `bash` call—main agent and subagents alike—is wrapped in
 `bwrap`: system directories are mounted read-only, the workspace is mounted
