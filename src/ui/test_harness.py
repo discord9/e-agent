@@ -1138,6 +1138,45 @@ async function main(){
         orow.querySelector(".task-stream").hidden === false,
         "hidden=" + orow.querySelector(".task-stream").hidden);
 
+    // ---- 任务参数标签：background / workspace / resume（与 TUI 面板一致） ----
+    // delegate 任务带全部三个参数 → 渲染三个标签，顺序固定
+    renderTaskList([{ session_id: "s1", id: 70, kind: "delegate", label: "延续子代理",
+      full_command: null, output: null, role: "coder", background: true,
+      workspace: "/custom/path", resume: "sub-123" }], elsById["composerTasks"]);
+    let tagRow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    let tagEls = tagRow.querySelectorAll(".task-tag");
+    chk("delegate renders three tags in order",
+        tagEls.length === 3
+        && tagEls[0].textContent === "background"
+        && tagEls[1].textContent === "workspace: /custom/path"
+        && tagEls[2].textContent === "resume: sub-123",
+        "tags=" + tagEls.map((t) => t.textContent).join("|"));
+    chk("tags live in .task-tags container",
+        tagRow.querySelector(".task-tags") !== null
+        && tagRow.querySelector(".task-tags")._children.length === 3);
+    chk("resume tag title carries full id",
+        tagEls[2].title === "sub-123", "title=" + tagEls[2].title);
+    // bash 任务没有这些字段 → 不渲染 .task-tags
+    renderTaskList([{ session_id: "s1", id: 71, kind: "bash", label: "ls",
+      full_command: "ls", output: "", role: null }], elsById["composerTasks"]);
+    tagRow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    chk("bash task without fields renders no tags",
+        tagRow.querySelector(".task-tags") === null,
+        "tags=" + String(tagRow.querySelector(".task-tags")));
+    // 长 workspace 路径：文本截断到 ~40 字符，title 保留完整路径
+    const longPath = "/very/long/workspace/path/" + "x".repeat(60);
+    renderTaskList([{ session_id: "s1", id: 72, kind: "delegate", label: "长路径任务",
+      full_command: null, output: null, role: null, background: false,
+      workspace: longPath, resume: null }], elsById["composerTasks"]);
+    tagRow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    const wsTag = tagRow.querySelector(".task-tag");
+    chk("long workspace truncated keeps full title",
+        wsTag.title === longPath
+        && wsTag.textContent.startsWith("workspace: " + longPath.slice(0, 40))
+        && wsTag.textContent.indexOf(longPath) === -1,
+        "title-ok=" + (wsTag.title === longPath)
+        + " text=" + wsTag.textContent.slice(0, 50));
+
     // ---- Token 折叠：默认收起 → 点击展开 → 输入后按钮「已设置」 → 再点收起 ----
     const tokBtn = elsById["tokenToggle"];
     const tokInp = elsById["tokenInput"];

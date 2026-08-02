@@ -541,6 +541,8 @@ pub struct TaskMeta {
     /// without label matching (labels vanish once the `running_tasks` row is
     /// cleared at task completion).
     pub subagent_session_id: Option<String>,
+    /// The resumed subagent session id (delegate tasks); `None` otherwise.
+    pub resume: Option<String>,
 }
 
 /// Cap for `TaskMeta.output`. The per-task output tail is already capped at
@@ -575,6 +577,10 @@ fn task_meta(session_id: &str, info: BackgroundTaskInfo) -> TaskMeta {
             .display_meta
             .as_ref()
             .and_then(|meta| meta.subagent_session_id.clone()),
+        resume: info
+            .display_meta
+            .as_ref()
+            .and_then(|meta| meta.resume.clone()),
         workspace: info.display_meta.and_then(|meta| meta.workspace),
     }
 }
@@ -4063,7 +4069,7 @@ model = "deepseek-chat"
     /// The `task_meta` field mapping: bash output becomes lossy UTF-8
     /// truncated at `TASK_OUTPUT_LIMIT` chars, and delegate display metadata
     /// is flattened into `background` + `workspace` + `subagent_session_id`
-    /// (all empty for non-delegate tasks).
+    /// + `resume` (all empty for non-delegate tasks).
     #[test]
     fn task_meta_maps_fields_and_truncates_output() {
         let long = task_meta(
@@ -4088,6 +4094,7 @@ model = "deepseek-chat"
         assert!(!long.background, "non-delegate tasks have no display meta");
         assert_eq!(long.workspace, None);
         assert_eq!(long.subagent_session_id, None);
+        assert_eq!(long.resume, None);
         // Invalid UTF-8 becomes the lossy replacement character; short
         // output passes through untruncated.
         let lossy = task_meta(
@@ -4118,6 +4125,7 @@ model = "deepseek-chat"
                     background: true,
                     workspace: Some("/tmp/w".into()),
                     subagent_session_id: Some("sub-abc".into()),
+                    resume: Some("sub-resume-1".into()),
                 }),
             },
         );
@@ -4125,6 +4133,7 @@ model = "deepseek-chat"
         assert!(delegate.background);
         assert_eq!(delegate.workspace.as_deref(), Some("/tmp/w"));
         assert_eq!(delegate.subagent_session_id.as_deref(), Some("sub-abc"));
+        assert_eq!(delegate.resume.as_deref(), Some("sub-resume-1"));
     }
 
     /// `GET /api/tasks` on an empty registry (and on sessions with no
@@ -4396,6 +4405,7 @@ model = "deepseek-chat"
                     background: true,
                     workspace: Some("/tmp/dw".into()),
                     subagent_session_id: None,
+                    resume: None,
                 }),
                 |_| {},
                 || async {
@@ -4446,6 +4456,7 @@ model = "deepseek-chat"
         assert_eq!(delegate["role"], "coder");
         assert_eq!(delegate["background"], true);
         assert_eq!(delegate["workspace"], "/tmp/dw");
+        assert_eq!(delegate["resume"], serde_json::Value::Null);
 
         // Cancel the bash task via the endpoint: 204, task gone, and a
         // second cancel 404s.
