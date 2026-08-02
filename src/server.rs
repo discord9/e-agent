@@ -31,7 +31,7 @@
 //! mode 0600) is required on every `/api/*` request as
 //! `Authorization: Bearer <token>` or `?token=<token>`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -107,6 +107,7 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
         token,
         meta_store,
         summaries: Arc::new(Mutex::new(HashMap::new())),
+        summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
     });
     eprintln!(
         "e-agent: serving on http://{host}:{port} (token: {}; also at {})",
@@ -155,6 +156,12 @@ pub struct SummaryEntry {
     pub at: std::time::SystemTime,
 }
 
+/// Per-session "summary generation in flight" set: the desktop pet's
+/// on-demand path triggers one background generation when the cache is
+/// cold; this set prevents a click storm from piling up duplicate
+/// generation calls.
+pub struct SummaryPending(pub std::sync::Mutex<std::collections::HashSet<String>>);
+
 /// Everything the handlers need: the shared factory, the live-session
 /// registry, the startup token, and the per-session summary cache.
 pub struct AppState {
@@ -170,6 +177,9 @@ pub struct AppState {
     /// `GET /api/sessions/{id}/summary`. Read-mostly, so a plain
     /// `Mutex<HashMap>` suffices.
     pub summaries: Arc<Mutex<HashMap<String, SummaryEntry>>>,
+    /// session_id -> in-flight on-demand generation (desktop pet click on a
+    /// cold cache): prevents duplicate generation calls.
+    pub summary_pending: Arc<SummaryPending>,
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -1722,12 +1732,45 @@ fn spawn_summary_listener(state: Arc<AppState>, id: String, session: Arc<LiveSes
 async fn session_summary(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let _ = live(&state, &id)?;
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let session = live(&state, &id).map_err(|(status, message)| {
+        (status, Json(serde_json::json!({ "error": message })))
+    })?;
     let Some(entry) = summary_get(&state, &id) else {
-        return Err(error(
+        // 冷缓存（server 重启后 / 会话尚无完整 turn）：按需触发一次后台
+        // 生成，并返回 generating 标记——桌宠据此提示"稍后再点"，而不是
+        // 静默降级成随机台词。防抖：同一会话同时只允许一个生成在跑。
+        let (snapshot, _, _) = session.handle().attach();
+        let digest = digest_recent(&snapshot, SUMMARY_MAX_EVENTS);
+        if digest.is_empty() {
+            // 会话还没有任何实质活动：无可总结，提示而不是生成。
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(
+                    serde_json::json!({ "error": format!("session {id} has no activity yet"), "no_activity": true }),
+                ),
+            ));
+        }
+        let mut pending = state.summary_pending.0.lock().unwrap();
+        let generating = if !pending.contains(&id) {
+            pending.insert(id.clone());
+            drop(pending);
+            let state = state.clone();
+            let id2 = id.clone();
+            tokio::spawn(async move {
+                generate_summary(&state, &id2, &digest).await;
+                state.summary_pending.0.lock().unwrap().remove(&id2);
+            });
+            true
+        } else {
+            drop(pending);
+            true // 已有生成在跑：同样按 generating 提示
+        };
+        return Err((
             StatusCode::NOT_FOUND,
-            format!("session {id} has no summary yet"),
+            Json(
+                serde_json::json!({ "error": format!("session {id} has no summary yet"), "generating": generating }),
+            ),
         ));
     };
     let at = chrono::DateTime::<chrono::Utc>::from(entry.at).to_rfc3339();
@@ -2570,6 +2613,7 @@ subagent = "deepseek/high"
             token: "sekrit".to_owned(),
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
         });
         let app = router(state);
         let response = app
@@ -2607,6 +2651,7 @@ subagent = "deepseek/high"
             token: "sekrit".to_owned(),
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
         }));
         let empty = no_config_app
             .clone()
@@ -2682,6 +2727,7 @@ model = "deepseek-chat"
             token: "sekrit".to_owned(),
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
         });
         let app = router(state);
         let request = |uri: String, body: String| {
@@ -2904,6 +2950,7 @@ model = "deepseek-chat"
             token: token.to_owned(),
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
         })
     }
 
@@ -3420,6 +3467,7 @@ model = "deepseek-chat"
             token: "sekrit".to_owned(),
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
         });
         let app = router(state);
         let response = app
@@ -3511,6 +3559,7 @@ model = "deepseek-chat"
             token: "sekrit".to_owned(),
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
         });
         (state, root)
     }

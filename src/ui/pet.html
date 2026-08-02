@@ -348,11 +348,16 @@
     const headers = st && st.token ? { "Authorization": "Bearer " + st.token } : {};
     // 多工作区：同文档内 app.js 的 fullUrl() 把相对路径前缀到激活实例的 base url
     fetch(fullUrl("/api/sessions/" + encodeURIComponent(sid) + "/summary"), { headers })
-      .then((res) => res.ok ? res.json() : null)
+      .then((res) => res.status === 404 ? res.json().catch(() => ({})) : (res.ok ? res.json() : null))
       .then((data) => {
         if (seq !== petSummarySeq) return;   // 已被更新的点击取代
         if (data && data.summary) {
           sayFor("📊 " + data.summary + (taskText ? " · " + taskText : ""), 3200, true);
+        } else if (data && data.generating) {
+          // 冷缓存：服务端已触发后台生成，提示稍后再点（不静默说随机话）
+          sayFor("🔄 总结生成中，稍后再点我～", 2000);
+        } else if (data && data.no_activity) {
+          sayFor("（本会话还没有对话内容，跑完一轮再点我）", 2200);
         } else if (taskText) {
           sayFor("🐳 " + taskText, 2200);
         } else {
