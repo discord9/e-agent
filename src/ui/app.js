@@ -115,9 +115,10 @@ function el(tag, cls, text) {
 /* 图钉 SVG（fill 继承 currentColor——emoji 📌 不吃 color，状态色
    （灰⇄金）必须用 SVG 才能切换）。返回 innerHTML 字符串。 */
 function pinSvg() {
-  return '<svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true" ' +
-    'style="display:inline-block;vertical-align:-1px;fill:currentColor">' +
-    '<path d="M16 3l5 5-2.5 1.5-1.5 4L13 17l-4.5 5.5L8 22l2.5-4.5L8 13l1-4-1.5-2.5L16 3z"/></svg>';
+  return '<svg class="pin-icon" viewBox="0 0 24 24" width="16" height="16" ' +
+    'aria-hidden="true" focusable="false" fill="currentColor">' +
+    '<path d="M8 2h8a1 1 0 0 1 .7 1.7l-1.2 1.2v4.35c0 .8.32 1.56.88 2.12l1.54 1.54A1.22 1.22 0 0 1 17.06 15H12.8L12 22.25 11.2 15H6.94a1.22 1.22 0 0 1-.86-2.09l1.54-1.54a3 3 0 0 0 .88-2.12V4.9L7.3 3.7A1 1 0 0 1 8 2Z"/>' +
+    '</svg>';
 }
 
 function truncate(s, n) {
