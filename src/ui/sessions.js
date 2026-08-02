@@ -154,17 +154,12 @@ function renderSessionList(list) {
     } else {
       sid = el("span", "sid", s.id);
     }
-    const edit = el("button", "tree-edit", "✎");
-    edit.type = "button";
-    edit.title = "重命名";
-    edit.addEventListener("click", (ev) => {
-      ev.stopPropagation();                // 不触发打开会话
-      enterRename(sid, s, () => { renderSessionList(state.lastList); });
-    });
     const pin = el("button", "pin-btn" + (s.pinned === true ? " on" : ""));
     pin.innerHTML = pinSvg();   // SVG 图钉：状态色跟随 currentColor（emoji 📌 不吃 color）
     pin.type = "button";
-    pin.title = "置顶/取消置顶";
+    pin.title = s.pinned === true ? "取消置顶" : "置顶";
+    pin.setAttribute("aria-label", pin.title);
+    pin.setAttribute("aria-pressed", String(s.pinned === true));
     pin.addEventListener("click", (ev) => {
       ev.stopPropagation();                // 不触发打开会话
       togglePin(s, () => { renderSessionList(state.lastList); renderSidebarTree(true); });
@@ -192,7 +187,7 @@ function renderSessionList(list) {
       if (inactive) { resumeSession(s.id); return; }
       openSession(s.id);
     });
-    row.append(dot, sid, edit, pin, chip, model, meta, del);
+    row.append(dot, sid, pin, chip, model, meta, del);
     els.sessionList.appendChild(row);
   }
 }
@@ -310,6 +305,27 @@ function openWith(id, withHistory, onReady) {
 /* 输入框左下角元信息：当前会话的 model · role（对齐 TUI 输入框左下角）。
    数据来自 state.lastList（/api/sessions 已含 model/role 字段）；幂等：
    内容没变就不动 DOM。两者都空 → hidden。 */
+/* 顶部会话标识：有标题 → 标题（可点击重命名）+ id 小字；无标题 → 完整 id。
+   数据来自 state.lastList；标题点击复用 enterRename（同侧边栏编辑）。 */
+function renderChatSessionId(id) {
+  const el0 = els.chatSessionId;
+  if (!el0) return;
+  const s = (state.lastList || []).find((x) => x.id === id);
+  const title = s && s.title ? String(s.title) : "";
+  el0.innerHTML = "";
+  const t = el("span", "chat-sid-title", title || id);
+  t.title = "点击重命名";
+  t.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    enterRename(t, s || { id, title: null }, () => { renderChatSessionId(id); });
+  });
+  el0.append(t);
+  if (title) {
+    const idline = el("span", "chat-sid-id", id);
+    el0.append(idline);
+  }
+}
+
 function updateComposerMeta() {
   const meta = els.composerMeta;
   if (!meta) return;
@@ -360,7 +376,7 @@ function openSession(id, onReady) {
   // subagent 会话：显示「← 主会话」快速返回父会话（主会话/无父则隐藏）
   const cur = (state.lastList || []).find((s) => s.id === id);
   els.backParentBtn.hidden = !(cur && cur.parent_session_id);
-  els.chatSessionId.textContent = "会话 " + id;
+  renderChatSessionId(id);
   updateComposerMeta();          // 显示当前会话 model · role（缓存/首开/恢复共用）
   els.usageInfo.textContent = "";
   applyStatus("Idle");
@@ -1085,25 +1101,20 @@ function buildTreeRoot(s, kids) {
       el("span", "tree-idline", s.id),
     );
   }
-  const edit = el("button", "tree-edit", "✎");
-  edit.type = "button";
-  edit.title = "重命名";
-  edit.addEventListener("click", (ev) => {
-    ev.stopPropagation();                  // 不触发切换会话
-    enterRename(titleEl, s, () => { renderSidebarTree(true); });
-  });
   const count = el("span", "tree-count", (s.entry_count ?? 0) + " 条");
   // 📌 置顶按钮（仅主会话根节点）：放行尾 count 后。subagent 子节点不加——
   // pin 是会话级操作，subagent 的置顶语义后续需要时再单独支持。
   const pin = el("button", "pin-btn" + (s.pinned === true ? " on" : ""));
   pin.innerHTML = pinSvg();   // SVG 图钉：状态色跟随 currentColor
   pin.type = "button";
-  pin.title = "置顶/取消置顶";
+  pin.title = s.pinned === true ? "取消置顶" : "置顶";
+  pin.setAttribute("aria-label", pin.title);
+  pin.setAttribute("aria-pressed", String(s.pinned === true));
   pin.addEventListener("click", (ev) => {
     ev.stopPropagation();                  // 不触发切换会话
     togglePin(s, () => { renderSidebarTree(true); renderSessionList(state.lastList); });
   });
-  row.append(toggle, dot, titleEl, edit, count, pin);
+  row.append(toggle, dot, titleEl, count, pin);
   row.title = (s.title || s.id) + (s.model ? " · " + s.model : "") + (s.busy ? "（处理中）" : "");
   row.addEventListener("click", () => {
     if (s.active === false) { resumeSession(s.id); return; }   // 与列表页一致：历史会话先恢复
@@ -1169,15 +1180,8 @@ function renderSubagentRows(container, kids, hist) {
         el("span", "tree-idline", k.id),
       );
     }
-    const edit = el("button", "tree-edit", "✎");
-    edit.type = "button";
-    edit.title = "重命名";
-    edit.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      enterRename(titleEl, k, () => { renderSidebarTree(true); });
-    });
     const badge = el("span", "child-badge", "子");
-    row.append(dot, titleEl, edit, badge);
+    row.append(dot, titleEl, badge);
     // busy 的 subagent：title 提示可发送消息（点击行 openSession 是现有行为，保持不变）
     row.title = (k.label || k.title || k.id) + (k.busy ? "（处理中）· 可发送消息" : "");
     row.addEventListener("click", () => {

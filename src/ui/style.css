@@ -290,6 +290,33 @@ mmlEqnNo}
     flex: 0 0 auto;
   }
   .chat-head .dim { font-size: 13px; }
+  /* 顶部会话标识：标题（可点击重命名）+ id 小字两行；无标题只显示完整 id */
+  .chat-session-id {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    line-height: 1.3;
+    cursor: default;
+  }
+  .chat-session-id .chat-sid-title {
+    font-size: 14px;
+    color: var(--base02);
+    font-weight: 600;
+    max-width: 40vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chat-session-id .chat-sid-title:hover { color: var(--blue); cursor: pointer; text-decoration: underline dotted; }
+  .chat-session-id .chat-sid-id {
+    font-size: 10px;
+    color: var(--base01);
+    max-width: 40vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   #usageInfo { margin-left: auto; }
   #usageInfo.usage-high { color: var(--red); font-weight: bold; }
 
@@ -1075,24 +1102,30 @@ mmlEqnNo}
     background: var(--base1);
     color: var(--base02);
   }
-  /* 📌 置顶按钮：默认 muted，置顶时金色高亮（Solarized yellow #b58900）；
+  /* 置顶按钮：默认 muted，置顶时金色高亮（Solarized yellow #b58900）；
      列表行与侧边栏主会话节点共用（subagent 子节点不渲染）。 */
   .pin-btn {
     flex: 0 0 auto;
-    min-width: 24px;
-    min-height: 24px;
-    padding: 0 4px;
+    width: 24px;
+    height: 24px;
+    padding: 0;
     border: none;
     border-radius: 3px;
     background: transparent;
     color: var(--base01);
-    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     line-height: 1;
     cursor: pointer;
     user-select: none;
+    transition: background 0.15s, color 0.15s;
   }
+  .pin-btn .pin-icon { display: block; flex: 0 0 auto; fill: currentColor; }
   .pin-btn:hover { background: var(--base1); color: var(--base02); }
   .pin-btn.on { color: var(--yellow); }
+  .pin-btn.on:hover { background: var(--base3); color: var(--yellow); }
+  .pin-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
   /* 编辑态：input 内嵌行内（原位替换标题文本） */
   .rename-box {
     display: inline-flex;
