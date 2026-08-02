@@ -953,6 +953,10 @@ async fn handle_fork(command: ForkCommand, state: &mut TuiState) {
         crate::config::SessionBackend::Greptime { .. } => {
             fork_store.append(&root, &new_id, &fork_entries).await
         }
+        // SQLite: same append-only semantics as Greptime.
+        crate::config::SessionBackend::Sqlite { .. } => {
+            fork_store.append(&root, &new_id, &fork_entries).await
+        }
     };
     match result {
         Ok(()) => state.push_agent_event(AgentEvent::Notice(format!(

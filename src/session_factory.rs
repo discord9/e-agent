@@ -392,6 +392,10 @@ impl SessionFactory {
                 crate::config::SessionBackend::Greptime { .. } => {
                     store.append(&self.root, &new_id, &fork_entries).await?
                 }
+                // SQLite: same append-only semantics as Greptime.
+                crate::config::SessionBackend::Sqlite { .. } => {
+                    store.append(&self.root, &new_id, &fork_entries).await?
+                }
             }
             eprintln!("e-agent: forked session: {new_id}");
             session = new_id;

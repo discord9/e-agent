@@ -111,12 +111,16 @@ pub enum SessionBackend {
     /// GreptimeDB backend. `conn` is a tokio-postgres connection string
     /// (e.g. "host=127.0.0.1 port=4002 dbname=public"). Requires the `greptime` feature.
     Greptime { conn: String },
+    /// Local SQLite/turso database file backend. `path` is a path to a
+    /// SQLite-compatible database file (e.g. "~/.local/share/e-agent/sessions.db";
+    /// ":memory:" works for tests). Requires the `sqlite` feature.
+    Sqlite { path: String },
 }
 
 /// The `[session]` config section.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct SessionConfig {
-    /// Backend type: `"jsonl"` (default) or `"greptime"`.
+    /// Backend type: `"jsonl"` (default), `"greptime"` or `"sqlite"`.
     #[serde(flatten)]
     pub backend: SessionBackend,
 }
