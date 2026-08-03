@@ -276,6 +276,9 @@ function resp(status, body){ return Promise.resolve({ ok:status>=200&&status<300
 // 任务输出块测试用：/api/tasks 响应与 output 端点文本（测试中可变）
 let tasksData = [];
 let taskOutputText = "";
+// perf 回归测试：output 端点延迟（手动 resolve）——验证 500ms 轮询防重入
+let taskOutputDelayed = false;
+let taskOutputResolve = null;
 // 会话列表响应（测试中可变）：默认 s1；Bug C 测试会替换成含 subagent 的列表
 let sessionsData = [{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}];
 // 聚合模式：第二台服务器（url "http://b.local"）的独立列表 + 故障开关
@@ -284,6 +287,10 @@ let sessionsDataB = [
   {id:"b-orphan",parent_session_id:"missing-b",status:"Idle",entry_count:1,active:true},
 ];
 let sessionsBFail = false;
+// perf 回归测试：B 的 /api/sessions GET 延迟（手动 resolve）——验证整轮
+// 渲染一次 + 轮询 setTimeout 链防重入（慢响应期间不叠加、完成后才续调度）
+let sessionsPDelayed = false;
+let sessionsPResolve = null;
 // 竞态/格式测试开关：B 的 resume POST 延迟（手动 resolve）、A 的 history 延迟、
 // B 返回非数组 JSON（{}）
 let bPostDelayed = false;
@@ -306,11 +313,14 @@ globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
   const m=(opts.method||"GET").toUpperCase();
   if(url==="/api/tasks") return resp(200, tasksData);
-  if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output"))
+  if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output")) {
+    if (taskOutputDelayed) return new Promise((resolve) => { taskOutputResolve = resolve; });
     return resp(200, taskOutputText);
+  }
   if(url==="/api/sessions"&&m==="GET") return resp(200, sessionsData);
   // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
   if(url==="http://b.local/api/sessions"&&m==="GET") {
+    if (sessionsPDelayed) return new Promise((resolve) => { sessionsPResolve = resolve; });
     if (sessionsBFail) return resp(500, {});
     return resp(200, sessionsBFormat ? {} : sessionsDataB);
   }
@@ -2003,6 +2013,192 @@ async function main(){
         && FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length === bEventsBefore14 + 1,
         "events=" + FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length);
     a1StreamManual = false;
+
+    // =====================================================================
+    // perf 修复回归：聚合轮询整轮一次渲染 + 签名去重 + setTimeout 链防重入
+    // + 聊天视图停轮询 + 侧边栏 hidden 跳过树渲染 + 任务面板签名去重
+    // + 500ms output 轮询防重入
+    // =====================================================================
+    let renderSessionListCalls = 0;
+    const _origRSL = renderSessionList;
+    renderSessionList = function (...a) { renderSessionListCalls++; return _origRSL.apply(this, a); };
+    let renderSidebarTreeCalls = 0;
+    const _origRST = renderSidebarTree;
+    renderSidebarTree = function (...a) { renderSidebarTreeCalls++; return _origRST.apply(this, a); };
+    chk("perf poll interval is 2s", POLL_INTERVAL_MS === 2000, "=" + POLL_INTERVAL_MS);
+
+    // 双 workspace 整轮：两个响应只触发一次列表渲染 + 一次树渲染（旧实现
+    // 每 workspace 响应各自 renderSessionList/renderSidebarTree → 各 2 次）
+    sessionsData = [{ id: "p1", status: "Idle", title: "P 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    sessionsDataB = [{ id: "p2", status: "Busy", title: "P2 会话", created_at: "2024-02-02T00:00:00Z", entry_count: 2, busy: true, active: true }];
+    sessionsBFail = false;
+    sessionsBFormat = false;
+    state.workspaces = [
+      { id: "wsP1", name: "服务器P1", url: "", token: "tok-p1" },
+      { id: "wsP2", name: "服务器P2", url: "http://b.local", token: "tok-p2" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-p1";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    elsById["sidebar"].hidden = false;   // 侧边栏可见（默认态）
+    renderWorkspaceSelect();
+    renderSessionListCalls = 0;
+    renderSidebarTreeCalls = 0;
+    await pollAllWorkspaces();
+    await flush();
+    chk("perf whole round renders list once", renderSessionListCalls === 1,
+        "calls=" + renderSessionListCalls);
+    chk("perf whole round renders tree once", renderSidebarTreeCalls === 1,
+        "calls=" + renderSidebarTreeCalls);
+    chk("perf round rendered aggregate rows",
+        elsById["sessionList"].querySelectorAll(".session-row").length >= 2,
+        "n=" + elsById["sessionList"].querySelectorAll(".session-row").length);
+    // 数据未变：第二轮整轮 → 列表/树签名去重，不重建 DOM（元素同一性保持）
+    const rowRefP = elsById["sessionList"].querySelectorAll(".session-row")[0];
+    const treeRefP = elsById["sidebarTree"].querySelectorAll(".tree-ws-section")[0];
+    renderSessionListCalls = 0;
+    renderSidebarTreeCalls = 0;
+    await pollAllWorkspaces();
+    await flush();
+    chk("perf unchanged round skips DOM rebuild",
+        elsById["sessionList"].querySelectorAll(".session-row")[0] === rowRefP
+        && elsById["sidebarTree"].querySelectorAll(".tree-ws-section")[0] === treeRefP,
+        "rowSame=" + (elsById["sessionList"].querySelectorAll(".session-row")[0] === rowRefP)
+        + " treeSame=" + (elsById["sidebarTree"].querySelectorAll(".tree-ws-section")[0] === treeRefP));
+    // 数据变化（busy 翻转）→ 重绘
+    sessionsData = [{ id: "p1", status: "Busy", title: "P 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: true, active: true }];
+    await pollAllWorkspaces();
+    await flush();
+    chk("perf busy flip rebuilds list",
+        elsById["sessionList"].querySelectorAll(".session-row")[0] !== rowRefP
+        && elsById["sessionList"].querySelector(".busy-dot.busy") !== null,
+        "same=" + (elsById["sessionList"].querySelectorAll(".session-row")[0] === rowRefP));
+
+    // setTimeout 链防重入：慢响应期间不调度下一轮、不渲染；完成后才续调度
+    sessionsPDelayed = true;
+    sessionsPResolve = null;
+    renderSessionListCalls = 0;
+    const pollRoundPromise = pollRound();
+    await flush();
+    chk("perf in-flight round schedules no next round",
+        state.pollTimer === null && renderSessionListCalls === 0,
+        "timer=" + String(state.pollTimer) + " renders=" + renderSessionListCalls);
+    sessionsPResolve(resp(200, sessionsDataB));   // 手动 resolve 慢响应
+    await pollRoundPromise;
+    await flush();
+    chk("perf slow round renders once after settle", renderSessionListCalls === 1,
+        "calls=" + renderSessionListCalls);
+    chk("perf round completion schedules next round",
+        state.pollTimer !== null, "timer=" + String(state.pollTimer));
+    stopPolling();
+    sessionsPDelayed = false;
+
+    // 侧边栏不可见：轮询整轮跳过 renderSidebarTree（打开时 force 同步）
+    elsById["sidebar"].hidden = true;
+    renderSidebarTreeCalls = 0;
+    await pollAllWorkspaces();
+    await flush();
+    chk("perf hidden sidebar skips tree render", renderSidebarTreeCalls === 0,
+        "calls=" + renderSidebarTreeCalls);
+    elsById["sidebar"].hidden = false;
+
+    // 聊天视图停聚合轮询：openSession（侧边栏关）→ 停；openSidebar → 恢复；
+    // closeSidebar → 再停；backToList → 恢复
+    stopPolling();
+    state.sidebar.open = false;
+    state.view = "list";
+    startPolling();
+    chk("perf list view polls", state.pollTimer !== null, "timer=" + String(state.pollTimer));
+    state.sessionId = null;
+    openSession("p1");   // 聊天 + 侧边栏关 → 停聚合轮询
+    chk("perf openSession stops polling in chat",
+        state.pollTimer === null && state.view === "chat",
+        "timer=" + String(state.pollTimer) + " view=" + state.view);
+    stopSSE();
+    openSidebar();       // 聊天 + 侧边栏开 → 恢复轮询（树保持 busy/current 新鲜）
+    chk("perf openSidebar resumes polling in chat",
+        state.pollTimer !== null && state.sidebar.open,
+        "timer=" + String(state.pollTimer));
+    closeSidebar();      // 聊天 + 侧边栏关 → 再停
+    chk("perf closeSidebar stops polling in chat",
+        state.pollTimer === null && !state.sidebar.open,
+        "timer=" + String(state.pollTimer));
+    backToList();        // 回列表 → 恢复
+    chk("perf backToList resumes polling",
+        state.pollTimer !== null && state.view === "list",
+        "timer=" + String(state.pollTimer));
+    stopPolling();
+
+    // 任务面板签名去重：元数据未变 → 第二轮 pollTasks 不重建（计数 renderTaskList）
+    let renderTaskListCalls = 0;
+    const _origRTL = renderTaskList;
+    renderTaskList = function (...a) { renderTaskListCalls++; return _origRTL.apply(this, a); };
+    state.tasks.composerOpen = true;
+    state.tasks.list = [];
+    lastTasksSig = "";   // 强制首轮渲染
+    tasksData = [{ session_id: "s1", id: 300, kind: "bash", label: "sig test",
+      full_command: "sig test", output: "x", role: null }];
+    renderTaskListCalls = 0;
+    await pollTasks();
+    await flush();
+    chk("perf task first poll renders", renderTaskListCalls === 1,
+        "calls=" + renderTaskListCalls);
+    const taskRowRef = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    await pollTasks();   // 同一数据再来一轮：签名相同 → 跳过重建
+    await flush();
+    chk("perf task unchanged skips rebuild",
+        renderTaskListCalls === 1
+        && elsById["composerTasks"].querySelectorAll(".task-row")[0] === taskRowRef,
+        "calls=" + renderTaskListCalls
+        + " same=" + (elsById["composerTasks"].querySelectorAll(".task-row")[0] === taskRowRef));
+    tasksData = [{ session_id: "s1", id: 300, kind: "bash", label: "sig test 2",
+      full_command: "sig test 2", output: "x", role: null }];
+    await pollTasks();   // 元数据变化（label+full_command）→ 重建该行
+    await flush();
+    chk("perf task metadata change rebuilds row",
+        renderTaskListCalls === 2
+        && elsById["composerTasks"].querySelectorAll(".task-row")[0].textContent.includes("sig test 2"),
+        "calls=" + renderTaskListCalls
+        + " text=" + elsById["composerTasks"].querySelectorAll(".task-row")[0].textContent.slice(0, 40));
+
+    // 500ms output 轮询防重入：慢响应在途时只发一次请求（不叠加），
+    // resolve 后输出更新；收起/重展开后旧 tick 收尾不误停新轮询
+    tasksData = [{ session_id: "s1", id: 400, kind: "bash", label: "reentry",
+      full_command: "reentry", output: "", role: null }];
+    state.tasks.composerOpen = true;
+    state.tasks.list = [];
+    lastTasksSig = "";
+    await pollTasks();
+    await flush();
+    const rrow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    taskOutputDelayed = true;
+    taskOutputResolve = null;
+    const outFetchBefore = FETCHES.filter((u) => u.endsWith("/output")).length;
+    rrow._listeners["click"][0]();   // 展开 → 启动轮询，首个 tick 挂起
+    await flush();
+    chk("perf output poller single in-flight fetch",
+        state.tasks.pollers.has("s1:400")
+        && FETCHES.filter((u) => u.endsWith("/output")).length === outFetchBefore + 1,
+        "fetches=" + (FETCHES.filter((u) => u.endsWith("/output")).length - outFetchBefore));
+    taskOutputResolve(resp(200, "reentry-done"));
+    await flush();
+    chk("perf output poller updates after settle",
+        rrow.querySelector(".task-output").textContent.includes("reentry-done"),
+        "text=" + rrow.querySelector(".task-output").textContent.slice(0, 40));
+    taskOutputDelayed = false;
+    rrow._listeners["click"][0]();   // 收起，清理轮询
+    chk("perf output poller cleaned on collapse",
+        !state.tasks.pollers.has("s1:400"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);

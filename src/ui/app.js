@@ -76,7 +76,7 @@ const state = {
     streamText: new Map(),   // 展开中 delegate 行的已累积流式文本（key → string，重绘恢复用）
     degraded: new Set(),     // bash 行 output 端点 404/不可用 → 降级静态尾部（key；重绘不再重启轮询）
   },
-  renameActive: false,       // 行内重命名进行中：列表页 1s 轮询重绘跳过，防编辑框被冲掉
+  renameActive: false,       // 行内重命名进行中：列表页 2s 轮询重绘跳过，防编辑框被冲掉
 };
 
 /* 常用 DOM 引用 */
@@ -328,7 +328,7 @@ async function switchWorkspace(id, epoch) {
   updateTokenToggle();
   history.replaceState(null, "", "/");   // 丢弃可能指向旧工作区会话的 ?session= 深链
   // ---- 聚合视图立即重绘（用各 workspace 缓存列表，不等轮询） ----
-  renderSessionList();
+  renderSessionList(undefined, true);   // force：切换后清空过 DOM，必须重绘
   renderSidebarTree(true);
   // ---- 重跑启动加载序列（与 init() 的加载部分一致） ----
   startPolling();

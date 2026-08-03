@@ -44,13 +44,39 @@ async function pollTasks() {
   renderComposerTasks();
 }
 
+/* 任务元数据签名（整列表/单行两级去重用）：决定任务列表/卡片是否需要重建。
+   排除 t.output——展开行的输出由 500ms output 轮询实时刷新，折叠行展开时
+   才拉取，output 变化不构成重建理由（否则 /api/tasks 每轮都重建卡片）。 */
+function taskKeySig(t) {
+  return JSON.stringify([
+    t.session_id || "", t.id != null ? t.id : "", t.kind || "", t.label || "",
+    t.role || "", t.full_command || "", t.subagent_session_id || "",
+    t.background === true ? 1 : 0, t.workspace || "", t.resume || "",
+  ]);
+}
+
+/* 单个任务 key（session_id:id，与行 data-task 一致） */
+function taskKey(t) {
+  return (t.session_id || "") + ":" + (t.id != null ? t.id : "");
+}
+
+function tasksListSig(list) {
+  return JSON.stringify((list || []).map((t) => taskKeySig(t)));
+}
+
+let lastTasksSig = "";
+
 /* composer 上方折叠条 + 面板：计数即徽标；有任务时高亮，无任务整条隐藏。
-   面板内容仅在展开时渲染（收起时只更新计数/箭头/高亮）。 */
+   面板内容仅在展开时渲染（收起时只更新计数/箭头/高亮）。
+   元数据签名去重：列表未变且面板已渲染 → 跳过 renderTaskList，保留已展开
+   的卡片 DOM 与进行中的 output 轮询/SSE 流（2s 轮询不再每轮销毁重建）。 */
 function renderComposerTasks() {
   const bar = els.tasksToggleBar;
   if (!bar) return;
   const panel = els.composerTasks;
-  const n = (state.tasks.list || []).length;
+  const list = state.tasks.list || [];
+  const n = list.length;
+  const sig = tasksListSig(list);
   bar.hidden = n === 0;
   bar.classList.toggle("active", n > 0);
   // 任务清空时整个组件（折叠条+面板）完全消失：强制收起面板，避免
@@ -68,7 +94,13 @@ function renderComposerTasks() {
   if (panel) {
     panel.hidden = !state.tasks.composerOpen;
     if (state.tasks.composerOpen) {
-      renderTaskList(state.tasks.list || [], panel);
+      const rendered = panel.querySelectorAll(".task-row").length > 0;
+      if (sig !== lastTasksSig || !rendered) {
+        lastTasksSig = sig;
+        renderTaskList(list, panel);
+      }
+    } else {
+      lastTasksSig = sig;   // 收起时也记录签名：重新打开且数据未变 → 跳过重建
     }
   }
 }
@@ -103,8 +135,11 @@ function startOutputPoller(key, t, pre, onPhase) {
     if (degraded) state.tasks.degraded.add(key);
     if (onPhase) onPhase(degraded ? "degraded" : "stop");
   };
+  let tickInFlight = false;   // 防重入：上一轮未完成则跳过本轮（慢响应不叠加）
   const tick = async () => {
     if (!state.token) { stop(false); return; }
+    if (tickInFlight) return;
+    tickInFlight = true;
     try {
       const res = await api("/api/sessions/" + encodeURIComponent(t.session_id || "")
         + "/tasks/" + encodeURIComponent(t.id) + "/output");
@@ -124,6 +159,8 @@ function startOutputPoller(key, t, pre, onPhase) {
       pre.scrollTop = pre.scrollHeight;
     } catch (e) {
       stop(false);   // 网络失败：停轮询，保留已有内容
+    } finally {
+      tickInFlight = false;
     }
   };
   tick();   // 启动即拉一次
@@ -277,46 +314,75 @@ function handleTaskStreamBlock(block, streamEl, key) {
    流式更新；旧后端 404 → 停轮询，降级为静态尾部）。delegate：行点击 →
    openSession(该 subagent 的会话)，那边有完整消息/工具卡片/思考块渲染；
    解析不到 subagent 会话时回退为就地展开内嵌 SSE 流式区 .task-stream。
-   重绘前记录已展开的行并按任务 key（session_id:id）恢复——2s 轮询重绘
-   不打断正在查看的输出/流；消失的任务在此停掉轮询/流并清理文本缓冲。 */
+   keyed 就地更新：元数据未变的行原样保留（展开态/轮询/流不打断），只重建
+   变化/新增的行（按 prevExpanded 恢复展开）、移除消失的行；行顺序跟随
+   tasks 数组。整列表未变时由 renderComposerTasks 的签名提前跳过。 */
 function renderTaskList(tasks, container) {
   const list = container;
   if (!list) return;
-  // 记录「已展开」的行（输出区或流式区），重建后按展开状态重启；
-  // 只停这些行的轮询/流（见函数头注释）。
-  const prevExpanded = new Set();
-  for (const row of list.querySelectorAll(".task-row")) {
+  const rows = [...list.querySelectorAll(".task-row")];
+  const byKey = new Map();
+  for (const row of rows) {
     const key = row.getAttribute("data-task");
-    if (!key) continue;
+    if (key) byKey.set(key, row);
+  }
+  // 记录「已展开」的行（输出区或流式区），供变化/新增行重建后恢复展开；
+  // 未变的行保持原样，它们的轮询/流继续运行、不被停掉。
+  const prevExpanded = new Set();
+  for (const [key, row] of byKey) {
     const pre = row.querySelector(".task-output");
     const streamEl = row.querySelector(".task-stream");
-    const expanded = (pre && !pre.hidden) || (streamEl && !streamEl.hidden);
-    if (expanded) {
-      prevExpanded.add(key);
-      stopTaskPoller(key);
-      stopTaskStream(key);
-    }
+    if ((pre && !pre.hidden) || (streamEl && !streamEl.hidden)) prevExpanded.add(key);
   }
-  // 消失的任务：清理已累积的流式文本缓冲与降级标记（轮询/流已在上方停掉）。
-  // 放在空列表早退之前：任务全部结束时也要清理，防泄漏。
+  // 消失的任务：清理已累积的流式文本缓冲与降级标记（轮询/流在下方移除
+  // 循环里停掉）。放在空列表早退之前：任务全部结束时也要清理，防泄漏。
   const activeKeys = new Set();
-  for (const t of tasks) {
-    activeKeys.add((t.session_id || "") + ":" + (t.id != null ? t.id : ""));
-  }
+  for (const t of tasks) activeKeys.add(taskKey(t));
   for (const k of Array.from(state.tasks.streamText.keys())) {
     if (!activeKeys.has(k)) state.tasks.streamText.delete(k);
   }
   for (const k of Array.from(state.tasks.degraded.keys())) {
     if (!activeKeys.has(k)) state.tasks.degraded.delete(k);
   }
-  list.innerHTML = "";
   if (!tasks.length) {
+    for (const [key, row] of byKey) { stopTaskPoller(key); stopTaskStream(key); row.remove(); }
     return;   // 组件已由 renderComposerTasks 在 n===0 时整体隐藏，不再渲染空态
   }
+  let prev = null;   // 前一个已处理的行（插入锚点，保持 tasks 数组顺序）
   for (const t of tasks) {
-    const row = el("div", "task-row");
-    const key = (t.session_id || "") + ":" + (t.id != null ? t.id : "");
-    row.setAttribute("data-task", key);
+    const key = taskKey(t);
+    const sig = taskKeySig(t);
+    let row = byKey.get(key) || null;
+    if (row) byKey.delete(key);
+    if (row && row.getAttribute("data-key-sig") === sig) {
+      prev = row;   // 元数据未变：保留原行（展开态/轮询/流原样）
+      continue;
+    }
+    if (row) {      // 元数据变了：停旧轮询/流后重建该行
+      stopTaskPoller(key);
+      stopTaskStream(key);
+      row.remove();
+    }
+    const nrow = buildTaskRow(t, key, prevExpanded.has(key));
+    if (prev && prev.nextSibling) list.insertBefore(nrow, prev.nextSibling);
+    else list.appendChild(nrow);
+    prev = nrow;
+  }
+  // 消失的任务：移除行并停其轮询/流
+  for (const [key, row] of byKey) {
+    stopTaskPoller(key);
+    stopTaskStream(key);
+    row.remove();
+  }
+}
+
+/* 单个任务卡片行（keyed 更新用）：data-task = key、data-key-sig = 元数据
+   签名。restoreExpanded=true 时按展开态启动 500ms output 轮询 / delegate
+   SSE 流（与旧 renderTaskList 的「重绘恢复展开态」语义一致）。 */
+function buildTaskRow(t, key, restoreExpanded) {
+  const row = el("div", "task-row");
+  row.setAttribute("data-task", key);
+  row.setAttribute("data-key-sig", taskKeySig(t));
     const isDelegate = t.kind === "delegate";
     row.title = isDelegate ? "点击切换到该子代理的会话" : "点击展开/收起输出（流式更新）";
     const line = el("div", "task-line");
@@ -440,7 +506,7 @@ function renderTaskList(tasks, container) {
       // 尾部）。命令输出放卡片里，流式保持。
       toggleRow();
     });
-    if (prevExpanded.has(key)) {     // 轮询重绘恢复展开态：重启轮询/流
+    if (restoreExpanded) {     // 重建恢复展开态：重启轮询/流（与旧重绘语义一致）
       if (isDelegate) {
         streamEl.hidden = false;
         startTaskStream(t, key, streamEl, status);
@@ -452,8 +518,7 @@ function renderTaskList(tasks, container) {
       }
       cancel.hidden = false;
     }
-    list.appendChild(row);
-  }
+    return row;
 }
 
 async function cancelTask(t) {

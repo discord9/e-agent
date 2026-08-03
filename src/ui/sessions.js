@@ -62,6 +62,26 @@ function applyValidation(problems) {
 async function pollAllWorkspaces() {
   const wss = (state.workspaces || []).slice();
   await Promise.allSettled(wss.map((ws) => pollWorkspaceSessions(ws)));
+  // 整轮完成后统一渲染一次：各 workspace 响应只更新缓存（workspaceLists），
+  // 不再各自触发渲染——多 workspace 聚合下避免每响应全量重建列表/树。
+  afterPollRound();
+}
+
+/* 聚合轮询整轮收尾：列表视图重绘一次 + 深链 + 字段校验 banner；聊天视图
+   只同步 composer meta / 「← 主会话」按钮；侧边栏不可见时跳过树渲染（打开
+   时由 openSidebar 的 renderSidebarTree(true) 强制同步）。渲染本身带数据
+   签名（sessionListSig/sidebarTreeSig），内容未变时跳过 DOM 重建。 */
+function afterPollRound() {
+  if (state.view === "list") {
+    renderSessionList();
+    maybeHandleDeepLink(state.lastList || []);
+    applyValidation(validateSessions(state.lastList || []));
+  } else if (state.view === "chat") {
+    updateComposerMeta();               // model/role 可能随轮询更新（幂等）
+    const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
+    if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
+  }
+  if (!els.sidebar.hidden) renderSidebarTree();
 }
 
 /* 兼容别名：既有调用点（switchWorkspace/backToList/restartTransport/init）
@@ -70,13 +90,13 @@ function pollSessions() {
   return pollAllWorkspaces();
 }
 
-/* 拉取单个 workspace 的会话列表：
+/* 拉取单个 workspace 的会话列表（只更新缓存，不渲染）：
    - 成功 → state.workspaceLists[ws.id] = list（并清错误标记）
    - 失败（HTTP/网络/格式/认证）→ 保留旧列表（stale），标记
      state.workspaceErrors[ws.id]（侧边栏显示「无法连接」分组头）
-   激活 workspace 额外承担既有单服务器职责：更新 state.lastList、
-   列表视图渲染、composer meta、深链、字段校验 banner（全部保持原行为）；
-   背景 workspace 只更新聚合缓存并重绘聚合视图。 */
+   激活 workspace 额外同步 state.lastList（既有单服务器路径的唯一数据源）；
+   渲染/深链/校验 banner 由 pollAllWorkspaces 整轮完成后统一执行一次
+   （afterPollRound）——各 workspace 响应不再各自全量重建列表/树。 */
 async function pollWorkspaceSessions(ws) {
   if (!workspaceToken(ws)) return;        // 未配置 token 的服务器：跳过（不显示错误）
   let list = null;
@@ -134,20 +154,9 @@ async function pollWorkspaceSessions(ws) {
     state.workspaceErrors[ws.id] = err;   // 保留旧列表（stale），标记错误
   }
   if (ws === state.workspace) {
-    // ---- 激活 workspace：既有单服务器职责全部保留 ----
+    // 激活 workspace 的列表缓存 → lastList（既有单服务器路径的唯一数据源）；
+    // 渲染/深链/校验统一由 pollAllWorkspaces 整轮完成后执行（afterPollRound）
     state.lastList = state.workspaceLists[ws.id];
-    if (state.view === "list") {
-      renderSessionList();
-      maybeHandleDeepLink(state.lastList);
-      applyValidation(validateSessions(state.lastList));
-    } else if (state.view === "chat") {
-      updateComposerMeta();               // model/role 可能随轮询更新（幂等）
-    }
-    renderSidebarTree();                  // 侧边栏会话树随轮询刷新
-  } else {
-    // ---- 背景 workspace：只刷新聚合视图 ----
-    if (state.view === "list") renderSessionList();
-    renderSidebarTree();
   }
 }
 /* URL 深链：?session=<id>。token 就绪且列表拿到数据后自动打开一次。
@@ -194,11 +203,36 @@ function aggregateSessionRows() {
    chip（.ws-chip）；搜索跨全部服务器过滤；点击跨服务器会话自动切换
    workspace 再打开（openSessionIn/resumeSessionIn）。激活 workspace 的
    会话与单服务器模式完全一致（state.lastList 是它的列表）。 */
-function renderSessionList(list) {
-  // 行内重命名进行中：跳过本轮重绘（列表页轮询 1s 一次，会冲掉编辑框）；
+/* 聚合列表签名：所有 workspace 列表（激活 = lastList，背景 = 各自缓存）+
+   行渲染字段 + 数组顺序（信任后端排序）+ 激活态 + 搜索词。内容未变 →
+   跳过 DOM 重建（轮询整轮一次渲染时，无变化不触碰活 DOM/滚动位置）。 */
+let lastListSig = "";
+
+function sessionListSig() {
+  const parts = [];
+  for (const ws of state.workspaces) {
+    const list = workspaceListFor(ws);
+    parts.push(ws.id + ":" + (ws === state.workspace ? 1 : 0) + ":"
+      + JSON.stringify(list.map((s) => [
+        s.id, s.title || "", s.model || "", s.status, s.busy ? 1 : 0,
+        s.active === false ? 0 : 1, s.entry_count ?? 0,
+        s.parent_session_id || "", s.pinned === true ? 1 : 0, s.created_at || "",
+      ])));
+  }
+  return state.searchQuery + "|" + parts.join("|");
+}
+
+function renderSessionList(list, force) {
+  // 行内重命名进行中：跳过本轮重绘（列表页轮询 2s 一次，会冲掉编辑框）；
   // 保存/取消后由 enterRename 清除标志并自行重绘
   if (state.renameActive) return;
-  if (arguments.length > 0) state.lastList = Array.isArray(list) ? list : [];
+  if (list !== undefined) state.lastList = Array.isArray(list) ? list : [];
+  // 数据签名：列表内容/顺序/激活态/搜索词未变 → 不重建 DOM。签名在
+  // renameActive 早退之后计算——编辑期间既不渲染也不更新签名，保存后
+  // 由调用方 renderSessionList() 重绘。
+  const sig = sessionListSig();
+  if (!force && sig === lastListSig) return;
+  lastListSig = sig;
   // 排序：后端保证 pinned 置顶在前、组内按 last_active_at 降序；前端按数组
   // 顺序渲染、不自行重排（旧 server / mock 返回什么顺序就渲染什么顺序）。
   let rows = aggregateSessionRows();
@@ -573,6 +607,9 @@ function openSession(id, onReady, epoch) {
   stopSSE();
   state.sessionId = id;
   state.view = "chat";
+  // 聊天视图：聚合轮询停（避免与 SSE 并行轰炸）；侧边栏开着时不停——
+  // 由 shouldPollSessions 续调度维持（openSidebar 也会 startPolling 恢复）
+  if (!state.sidebar.open) stopPolling();
   // 任何手动打开都会取代/完成 URL 深链，避免返回列表后深链再次触发
   state.deepLink.handled = true;
   state.deepLink.pending = null;
@@ -628,7 +665,7 @@ function openSession(id, onReady, epoch) {
     userScrolled = false;          // 打开新会话：恢复自动跟随
     openWith(id, true, onReady, wsId, claimed);   // onReady 在 loadHistory 渲染完成后触发
   }
-  renderSidebarTree();             // 更新 .current 高亮
+  if (!els.sidebar.hidden) renderSidebarTree();   // 更新 .current 高亮（侧边栏可见时）
 }
 
 function backToList() {
@@ -648,6 +685,7 @@ function backToList() {
   els.backParentBtn.hidden = true;
   refreshBanner();
   history.replaceState(null, "", "/");
+  startPolling();   // 回列表视图：恢复聚合轮询（openSession 时已停）
   pollSessions();
 }
 
@@ -1130,15 +1168,33 @@ function restartTransport() {
   }
 }
 
-/* 聚合轮询：单一定时器驱动所有 workspace（激活 + 背景同为 1s；
-   简单起见不区分速率——每 tick 并行拉取，单 tick 内 Promise.allSettled
-   保证一台失败不影响其它）。 */
+/* 聚合轮询：setTimeout 链（2s）驱动所有 workspace——一轮（并行拉取全部 +
+   Promise.allSettled）完成才调度下一轮，天然防重入：慢响应不叠加、不并发
+   轰炸。stopPolling 或条件不满足（聊天视图 + 侧边栏关闭）时不再续调度。 */
+const POLL_INTERVAL_MS = 2000;
+
+/* 聊天视图 + 侧边栏关闭 → 停聚合轮询（避免与 SSE 并行轰炸）；
+   列表视图 / 聊天视图侧边栏开着 → 继续轮询（侧边栏要保持 busy/current
+   状态新鲜，openSession 时也不停）。 */
+function shouldPollSessions() {
+  return state.view !== "chat" || state.sidebar.open;
+}
+
 function startPolling() {
   stopPolling();
-  state.pollTimer = setInterval(pollAllWorkspaces, 1000);
+  state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
 }
 function stopPolling() {
-  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+}
+async function pollRound() {
+  state.pollTimer = null;
+  await pollAllWorkspaces();
+  // 一轮完成后再调度下一轮；期间 stopPolling（state.pollTimer 被清空/换新）
+  // 或条件不满足（聊天视图关侧边栏）→ 不续调度
+  if (state.pollTimer === null && shouldPollSessions()) {
+    state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
+  }
 }
 /* delegate 任务 → 对应 subagent 会话 id。
    /api/tasks 的 delegate 条目 session_id 是父会话（任务注册在父的
@@ -1168,15 +1224,19 @@ function openSidebar() {
   if (state.sidebar.open) return;
   state.sidebar.open = true;
   persistSidebarOpen();                // 跨刷新保持打开状态
-  renderSidebarTree();                 // 树可能已随轮询刷新；打开时确保渲染
+  renderSidebarTree(true);             // force：hidden 期间可能错过了轮询更新
   els.sidebarOverlay.hidden = false;
   els.sidebar.hidden = false;
   // 双 rAF：先让浏览器以收起位姿渲染一帧，再加 .open 触发过渡
   // （桌面：width 0→280px；手机：translateX(-100%)→0）
   requestAnimationFrame(() => requestAnimationFrame(() => els.sidebar.classList.add("open")));
   pollTasks();   // 打开时立即刷新树内任务分组（统一轮询常驻，这里只求即时性）
-  // 聊天视图下会话轮询已停：补拉一次列表，树与 busy/current 状态保持新鲜
-  if (state.view === "chat") refreshSessionsForSidebar();
+  if (state.view === "chat") {
+    // 聊天视图：侧边栏可见 → 恢复聚合轮询（树与 busy/current 状态保持
+    // 新鲜；closeSidebar 时会再停）
+    startPolling();
+    refreshSessionsForSidebar();
+  }
 }
 
 function closeSidebar() {
@@ -1188,18 +1248,15 @@ function closeSidebar() {
   window.setTimeout(() => {
     if (!state.sidebar.open) els.sidebar.hidden = true;
   }, 220);
+  if (state.view === "chat") stopPolling();   // 聊天视图：侧边栏关了停聚合轮询
 }
 
 /* 聊天视图下补拉会话列表（聚合：一次拉全所有 workspace，侧边栏分组刷新；
-   背景服务器失败只标记、不打断激活服务器）。失败静默保留旧数据。 */
+   背景服务器失败只标记、不打断激活服务器）。失败静默保留旧数据。整轮
+   完成后 afterPollRound 统一做聊天视图的同步（composer meta / 返回按钮）。 */
 async function refreshSessionsForSidebar() {
   if (!state.token) return;
   await pollAllWorkspaces();
-  updateComposerMeta();          // 聊天视图下列表刷新：同步 model/role（幂等）
-  // 同步「← 主会话」按钮：任务面板直连跳转的 subagent 现在已入列表，
-  // 按 parent_session_id 正确显示/隐藏（cur 仍可能查不到——保持现状）。
-  const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
-  if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
 }
 /* =====================================================================
  * 会话侧边栏：会话树
