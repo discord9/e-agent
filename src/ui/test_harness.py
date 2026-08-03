@@ -1279,27 +1279,81 @@ async function main(){
         "title-ok=" + (wsTag.title === longPath)
         + " text=" + wsTag.textContent.slice(0, 50));
 
-    // ---- 任务行父会话标签：delegate 任务显示「父: <t.session_id>」----
-    // 简单方案：后端 TaskMeta.session_id 对 delegate 任务就是父会话（发起
-    // 它的会话），直接显示，无需查 session 列表；非 delegate 任务
+    // ---- 任务行父会话标签：delegate 任务显示父会话；有 title 显示标题，否则回退 id ----
+    // 查父会话 title 的列表：state.workspaceLists[state.workspace.id]
+    // （激活 workspace 缓存），回退 state.lastList。找到且 title 非空 →
+    // 「父: <title>」（截断 ~40 字符，悬停 title 放「<id>: 完整标题」）；
+    // 无 title / 查不到 → 回退「父: <session_id>」。非 delegate 任务
     // session_id 即父且「会话 <id>」已显示，不重复加父标签。
+    const parentListKey = state.workspace ? state.workspace.id : null;
+    const savedParentList = (parentListKey && state.workspaceLists[parentListKey] !== undefined)
+      ? state.workspaceLists[parentListKey] : state.lastList;
+    // (a) 父会话在列表里有 title → 显示「父: <title>」，悬停 title 带完整标题 + 会话 id
+    state.workspaceLists[parentListKey] = [
+      { id: "s1", title: "主会话标题", status: "Idle", active: true },
+    ];
     renderTaskList([{ session_id: "s1", id: 80, kind: "delegate", label: "子任务Z",
       full_command: null, output: null, role: null, subagent_session_id: "sub-9" }],
       elsById["composerTasks"]);
     let prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
     let pmeta = prow.querySelectorAll(".tparent");
-    chk("delegate row shows parent label from session_id",
+    chk("delegate row shows parent title when parent in list has title",
+        pmeta.length === 1 && pmeta[0].textContent === "父: 主会话标题",
+        "parent=" + pmeta.map((e) => e.textContent).join("|"));
+    chk("parent title tag hover carries full title + id",
+        pmeta.length === 1 && pmeta[0].title === "s1: 主会话标题",
+        "title=" + (pmeta[0] ? pmeta[0].title : ""));
+    // (b) 长父标题：文本截断到 ~40 字符，悬停 title 保留完整标题 + 会话 id
+    const longParentTitle = "这是一个非常长的父会话标题用于测试截断行为" + "长".repeat(50);
+    state.workspaceLists[parentListKey] = [
+      { id: "s1", title: longParentTitle, status: "Idle", active: true },
+    ];
+    renderTaskList([{ session_id: "s1", id: 83, kind: "delegate", label: "长标题任务",
+      full_command: null, output: null, role: null, subagent_session_id: "sub-8" }],
+      elsById["composerTasks"]);
+    prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    pmeta = prow.querySelectorAll(".tparent");
+    chk("long parent title truncated keeps full hover title",
+        pmeta.length === 1
+        && pmeta[0].textContent.startsWith("父: " + longParentTitle.slice(0, 40))
+        && pmeta[0].textContent.indexOf(longParentTitle) === -1
+        && pmeta[0].title === "s1: " + longParentTitle,
+        "title-ok=" + (pmeta[0] ? pmeta[0].title === "s1: " + longParentTitle : false)
+        + " text=" + (pmeta[0] ? pmeta[0].textContent.slice(0, 50) : ""));
+    // (c) 父会话在列表里但无 title → 回退「父: <id>」
+    state.workspaceLists[parentListKey] = [
+      { id: "s1", title: null, status: "Idle", active: true },
+    ];
+    renderTaskList([{ session_id: "s1", id: 81, kind: "delegate", label: "子任务Y",
+      full_command: null, output: null, role: null, subagent_session_id: "sub-7" }],
+      elsById["composerTasks"]);
+    prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    pmeta = prow.querySelectorAll(".tparent");
+    chk("delegate row falls back to id when parent has no title",
         pmeta.length === 1 && pmeta[0].textContent === "父: s1",
         "parent=" + pmeta.map((e) => e.textContent).join("|"));
+    // (d) 父会话不在列表里（列表未刷新 / 已删）→ 回退「父: <id>」
+    state.workspaceLists[parentListKey] = [
+      { id: "other-1", title: "别的会话", status: "Idle", active: true },
+    ];
+    renderTaskList([{ session_id: "s1", id: 85, kind: "delegate", label: "子任务X",
+      full_command: null, output: null, role: null, subagent_session_id: "sub-6" }],
+      elsById["composerTasks"]);
+    prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    pmeta = prow.querySelectorAll(".tparent");
+    chk("delegate row falls back to id when parent missing from list",
+        pmeta.length === 1 && pmeta[0].textContent === "父: s1",
+        "parent=" + pmeta.map((e) => e.textContent).join("|"));
+    state.workspaceLists[parentListKey] = savedParentList;   // 还原
     // 非 delegate 任务：不显示父标签（session_id 即父，「会话 <id>」已显示）
-    renderTaskList([{ session_id: "s1", id: 81, kind: "bash", label: "ls",
+    renderTaskList([{ session_id: "s1", id: 86, kind: "bash", label: "ls",
       full_command: "ls", output: "", role: null }], elsById["composerTasks"]);
     prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
     chk("bash row shows no parent label",
         prow.querySelector(".tparent") === null,
         "parent=" + String(prow.querySelector(".tparent")));
     // delegate 无 session_id（异常数据）→ 安静降级
-    renderTaskList([{ id: 82, kind: "delegate", label: "幽灵任务",
+    renderTaskList([{ id: 87, kind: "delegate", label: "幽灵任务",
       full_command: null, output: null, role: null, subagent_session_id: "ghost-1" }],
       elsById["composerTasks"]);
     prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
@@ -1307,7 +1361,7 @@ async function main(){
         prow.querySelector(".tparent") === null,
         "parent=" + String(prow.querySelector(".tparent")));
     // 极端 resume：session_id === subagent_session_id → 省略父标签（避免「会话 X / 父: X」重复）
-    renderTaskList([{ session_id: "sub-9", id: 84, kind: "delegate", label: "自指任务",
+    renderTaskList([{ session_id: "sub-9", id: 88, kind: "delegate", label: "自指任务",
       full_command: null, output: null, role: null, subagent_session_id: "sub-9" }],
       elsById["composerTasks"]);
     prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
