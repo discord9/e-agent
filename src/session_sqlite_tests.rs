@@ -130,6 +130,66 @@ async fn connect_memory_creates_tables_idempotently() {
 }
 
 #[tokio::test]
+async fn connect_creates_missing_parent_dir() {
+    // db_path points into a directory chain that does not exist yet:
+    // connect must create the parent directories instead of failing
+    // (the Windows `D:/.e-agent/sessions.db` case).
+    let base = tempfile::tempdir().expect("tempdir");
+    let path = base
+        .path()
+        .join("nested")
+        .join("deeper")
+        .join("sessions.db");
+    assert!(
+        !path.parent().unwrap().exists(),
+        "precondition: no parent dir"
+    );
+    let wid = workspace_id();
+    let sid = format!("test-sql-mkdir-{}", crate::session::new_id());
+
+    let session = SqliteSession::connect(path.to_str().unwrap(), &wid, &sid)
+        .await
+        .expect("connect creates missing parent dirs");
+    assert!(
+        path.parent().unwrap().is_dir(),
+        "parent directory was created: {}",
+        path.parent().unwrap().display()
+    );
+
+    // The created database is fully usable, and a second workspace sharing
+    // the same file (create_dir_all must be idempotent) connects too.
+    let entry = Message::User {
+        content: "mkdir".into(),
+        images: vec![],
+    }
+    .into();
+    session.append(&[entry]).await.unwrap();
+    let shared = SqliteSession::connect(path.to_str().unwrap(), &workspace_id(), &sid)
+        .await
+        .expect("reconnect with existing parent dir");
+    assert_eq!(shared.load().await.unwrap().len(), 1);
+    drop((base, session, shared));
+}
+
+#[tokio::test]
+async fn connect_memory_ignores_missing_parent_dir() {
+    // `:memory:` has no filesystem parent — the parent-dir creation must
+    // be skipped, not attempted against an empty path.
+    let wid = workspace_id();
+    let sid = format!("test-sql-mem-mkdir-{}", crate::session::new_id());
+    let session = SqliteSession::connect(":memory:", &wid, &sid)
+        .await
+        .expect(":memory: connect unaffected by parent-dir creation");
+    let entry = Message::User {
+        content: "mem-mkdir".into(),
+        images: vec![],
+    }
+    .into();
+    session.append(&[entry]).await.unwrap();
+    assert_eq!(session.load().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn connect_twice_on_file_is_idempotent_and_persists() {
     let (dir, path) = temp_db();
     let wid = workspace_id();

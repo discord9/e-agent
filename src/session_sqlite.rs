@@ -236,6 +236,30 @@ pub struct SqliteSession {
     cached_meta: std::sync::Mutex<Option<SessionMeta>>,
 }
 
+/// Ensure the parent directory of the database file exists before turso
+/// opens it, so a configured `path = "~/.local/share/e-agent/sessions.db"`-style
+/// location works even when the directory has never been created (e.g. on
+/// a fresh Windows install where `D:/.e-agent/` does not exist yet).
+///
+/// Idempotent: `create_dir_all` is a no-op once the directory exists, so
+/// multiple workspaces sharing one database file each calling this at
+/// connect time is fine — nothing is re-created. `:memory:` and bare file
+/// names (`sessions.db` with no parent) are skipped.
+fn ensure_db_parent_dir(db_path: &str) -> Result<(), String> {
+    let path = Path::new(db_path);
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "cannot create parent directory '{}' for SQLite database '{db_path}': {e}",
+                    parent.display()
+                )
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 impl SqliteSession {
     /// Connect to the SQLite/turso database file and ensure the tables
     /// exist. `db_path` is a path to a SQLite-compatible database file
@@ -253,6 +277,7 @@ impl SqliteSession {
         workspace_id: &str,
         session_id: &str,
     ) -> Result<Self, String> {
+        ensure_db_parent_dir(db_path)?;
         let db = turso::Builder::new_local(db_path)
             .build()
             .await
