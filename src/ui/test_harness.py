@@ -966,6 +966,19 @@ async function main(){
     chk("resync replayed deltas", t3.includes("重放-") && t3.includes("增量"));
     chk("resync rerenders", elsById["messages"]._children.length >= 2,
         "n=" + elsById["messages"]._children.length);
+    // resync 用离屏 temp 重放再以 innerHTML 提交；提交后 accumulator 不得
+    // 继续引用 temp 的旧节点。紧随其后的 delta 必须落入真实 messages。
+    handleSSEBlock("event: AssistantDelta\ndata: {\"delta\":\"-同步后续写\"}\n\n",
+      state.sessionId, state.workspace.id, sessionOpenEpoch);
+    const postResyncEl = elsById["messages"].querySelectorAll(".msg-assistant")
+      .find((m) => (m.textContent || "").includes("同步后续写"));
+    chk("resync following delta renders in real messages",
+        !!postResyncEl
+        && elsById["messages"].textContent.includes("同步后续写")
+        && state.acc.assistantEl === postResyncEl
+        && state.acc.assistantEl.isConnected,
+        "text=" + JSON.stringify(elsById["messages"].textContent)
+        + " connected=" + !!(state.acc.assistantEl && state.acc.assistantEl.isConnected));
 
     // ---- 滚动分页：滚动到顶部加载更早历史 ----
     const msgEl = elsById["messages"];
@@ -3402,6 +3415,42 @@ async function main(){
 
     // ---- 归档：唯一导航中的归档分组 ----
     const _noopEv = { stopPropagation(){} };
+    // 签名完整性隔离测试：固定同一列表/对象，期间只翻转 archived。
+    // 直接比较签名，并用非 force 渲染证明该字段本身足以触发 DOM 重绘。
+    state.workspace = state.workspaces[0];
+    const _archiveSigSession = {
+      id: "archive-sig-only", parent_session_id: null, model: "kimi", role: "main",
+      status: "Idle", entry_count: 1, active: true, pinned: false, archived: false,
+      last_active_at: "2024-03-01T00:00:00Z",
+    };
+    state.lastList = [_archiveSigSession];
+    state.workspaceLists[state.workspace.id] = state.lastList;
+    const _archiveSigBefore = sidebarTreeSig();
+    renderSidebarTree(true);
+    const _activeArchiveSigRow = () => elsById["sidebarTree"].querySelectorAll(".tree-row")
+      .find((r) => (r.textContent || "").includes("archive-sig-only")
+        && !r.classList.contains("archived"));
+    chk("archive signature: unarchived row initially visible",
+        !!_activeArchiveSigRow());
+    _archiveSigSession.archived = true;   // 唯一变化
+    const _archiveSigAfter = sidebarTreeSig();
+    chk("archive signature: archived-only change alters signature",
+        _archiveSigAfter !== _archiveSigBefore,
+        "before=" + _archiveSigBefore + " after=" + _archiveSigAfter);
+    renderSidebarTree();                  // 不 force：必须靠签名变化通过去重
+    chk("archive signature: archived-only change removes active row",
+        !_activeArchiveSigRow()
+        && !!elsById["sidebarTree"].querySelector(".tree-row.archived"));
+    _archiveSigSession.archived = false;  // 仍只翻转 archived
+    const _archiveSigRestored = sidebarTreeSig();
+    chk("archive signature: restore changes signature back",
+        _archiveSigRestored !== _archiveSigAfter
+        && _archiveSigRestored === _archiveSigBefore);
+    renderSidebarTree();
+    chk("archive signature: restore shows active row again",
+        !!_activeArchiveSigRow()
+        && elsById["sidebarTree"].querySelector(".tree-row.archived") === null);
+
     // 侧边栏：归档会话收进折叠的「归档 (N)」分组，点击分组内会话可打开
     state.workspace = state.workspaces[0];   // 切回 wsA：lastList 直接喂归档列表
     state.lastList = [

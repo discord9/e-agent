@@ -272,10 +272,15 @@ function handleSSEBlock(block, id, wsId, epoch) {
       }
       real.innerHTML = temp.innerHTML;
       els.messages = real;
+      // innerHTML 会在 real 下创建全新的节点；重放时 acc 绑定的是离屏 temp
+      // 的旧节点，不能让后续 delta 继续写入孤儿 DOM。
+      state.acc = newAccumulator();
       state.initSource = "snapshot";
     } catch (e) {
       els.messages = real;
       real.innerHTML = backup;
+      // 回滚同样通过 innerHTML 重建节点，不能保留离屏重放期间的引用。
+      state.acc = newAccumulator();
       appendNotice("⚠ 会话同步失败，已保留原内容");
     }
     return;
