@@ -78,7 +78,7 @@ function pollSessions() {
    列表视图渲染、composer meta、深链、字段校验 banner（全部保持原行为）；
    背景 workspace 只更新聚合缓存并重绘聚合视图。 */
 async function pollWorkspaceSessions(ws) {
-  if (!workspaceToken(ws)) return;        // 未配置 token 的服务器：跳过（不显示错误）
+  if (!workspaceToken(ws)) return;   // 全局 token 也未配置：跳过（不显示错误）
   let list = null;
   let err = null;
   try {

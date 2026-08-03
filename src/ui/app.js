@@ -457,9 +457,12 @@ function refreshBanner() {
    配置时回退全局 state.token（历史行为：token 输入框直接写 state.token，
    再同步进 workspace.token）。聚合模式下各服务器 token 彼此独立。 */
 function workspaceToken(ws) {
+  // 同一 e-agent 部署的多个 server 实例共用同一个 server.token——
+  // workspace 未单独配置 token 时回退全局 state.token（历史行为：
+  // token 输入框直接写 state.token）。聚合模式下仍允许 per-workspace
+  // token 覆盖（ws.token 优先），但默认不再要求每个实例单独填。
   if (ws && ws.token) return ws.token;
-  if (!ws || ws === state.workspace) return state.token || "";
-  return "";
+  return state.token || "";
 }
 
 /* 指定 workspace 的请求入口：base url 与 token 各自独立
