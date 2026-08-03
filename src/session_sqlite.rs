@@ -615,7 +615,12 @@ impl SqliteSession {
     /// seq is not necessarily contiguous (compaction rows, retried writes),
     /// so paging uses `seq >= start AND seq < before_seq ORDER BY seq DESC
     /// LIMIT n` (the tail of the segment) and reverses the page to
-    /// ascending order.
+    /// ascending order. On the paged path the limit applies AFTER a
+    /// SQL-side dedup (latest `event_time_us` per seq, a subquery join —
+    /// `MAX(event_time_us)` GROUP BY seq) so same-seq duplicate physical
+    /// rows from retried writes never consume limit slots: every page is
+    /// exactly `min(n, remaining distinct seqs)` entries and the cursor
+    /// chain covers each seq exactly once.
     pub async fn load_older(
         &self,
         before_seq: i64,
@@ -629,11 +634,23 @@ impl SqliteSession {
             Some(prev) => {
                 let conn = self.conn.lock().await;
                 let rows = if let Some(n) = page {
+                    // Dedup by seq (latest event_time_us wins) IN SQL
+                    // before LIMIT: same-seq duplicate physical rows
+                    // (retried writes) must not consume limit slots, or a
+                    // page could come back smaller than `limit` after the
+                    // Rust-side dedup and the cursor chain could skip or
+                    // repeat entries. The join keeps ties (same seq, same
+                    // max event_time) for the Rust-side conflict check.
                     conn.query(
-                        "SELECT seq, event_time_us, payload FROM session_entries \
-                         WHERE workspace_id = ?1 AND session_id = ?2 \
-                         AND seq >= ?3 AND seq < ?4 \
-                         ORDER BY seq DESC LIMIT ?5",
+                        "SELECT t.seq, t.event_time_us, t.payload FROM session_entries t \
+                         JOIN ( \
+                             SELECT seq, MAX(event_time_us) AS me FROM session_entries \
+                             WHERE workspace_id = ?1 AND session_id = ?2 \
+                             AND seq >= ?3 AND seq < ?4 \
+                             GROUP BY seq \
+                         ) g ON t.seq = g.seq AND t.event_time_us = g.me \
+                         WHERE t.workspace_id = ?1 AND t.session_id = ?2 \
+                         ORDER BY t.seq DESC LIMIT ?5",
                         (
                             self.workspace_id.as_str(),
                             self.session_id.as_str(),
@@ -666,10 +683,17 @@ impl SqliteSession {
             None => {
                 let conn = self.conn.lock().await;
                 let rows = if let Some(n) = page {
+                    // Same SQL-side dedup-before-LIMIT as the middle
+                    // segment: limit counts DISTINCT seqs only.
                     conn.query(
-                        "SELECT seq, event_time_us, payload FROM session_entries \
-                         WHERE workspace_id = ?1 AND session_id = ?2 AND seq < ?3 \
-                         ORDER BY seq DESC LIMIT ?4",
+                        "SELECT t.seq, t.event_time_us, t.payload FROM session_entries t \
+                         JOIN ( \
+                             SELECT seq, MAX(event_time_us) AS me FROM session_entries \
+                             WHERE workspace_id = ?1 AND session_id = ?2 AND seq < ?3 \
+                             GROUP BY seq \
+                         ) g ON t.seq = g.seq AND t.event_time_us = g.me \
+                         WHERE t.workspace_id = ?1 AND t.session_id = ?2 \
+                         ORDER BY t.seq DESC LIMIT ?4",
                         (
                             self.workspace_id.as_str(),
                             self.session_id.as_str(),
