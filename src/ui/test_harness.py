@@ -3307,6 +3307,55 @@ async function main(){
     // 恢复状态后清理：开关复位、sessionsData 复原（后续无其它断言依赖）
     state.showArchived = false;
     sessionsData = sessionsData.filter((s) => s.id !== "arch-1");
+    // ---- 侧边栏窗口槽位法：归档不顶替（Fix）----
+    // 服务端把 archived 沉底排序（server.rs），旧窗口 slice(0,8) 会让归档
+    // 腾出的位被更早会话顶上（「归档后侧边栏不变短、冒出别的会话」）。
+    // 前端按 last_active_at 重排（含归档恢复原槽位），窗口取槽位、归档
+    // 的空着：归档窗口内 1 个 → 主树根真实从 8 减到 7，且不显示更早的
+    // w1/w0，more 计数 = 非归档总数 - 已显示 = 9 - 7 = 2。
+    const _winSessions = [];
+    for (let i = 0; i < 10; i++) {
+      _winSessions.push({ id: "w" + i, parent_session_id: null, status: "Idle",
+        entry_count: 1, active: true, archived: i === 3,
+        last_active_at: "2024-01-" + String(i + 1).padStart(2, "0") + "T00:00:00Z" });
+    }
+    state.workspace = state.workspaces[0];
+    state.lastList = _winSessions;
+    state.workspaceLists[state.workspace.id] = _winSessions;
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.filter = "";
+    renderSidebarTree(true);
+    // 桩的 querySelectorAll 只支持简单 class 选择器（无后代组合器）：
+    // 全取 .tree-row 再按 DOM 关系过滤主树根行。
+    const _winRoots = [...elsById["sidebarTree"].querySelectorAll(".tree-row")]
+      .filter((r) => r.closest(".tree-ws-section.active") !== null  // 只数 wsA
+                && !r.closest(".tree-children")          // 归档组/子树内行
+                && !(r.textContent || "").includes("归档")  // 归档组标题行
+                && !r.classList.contains("tree-archive-row"));
+    chk("archive window: archived slot not refilled (7 roots, not 8)",
+        _winRoots.length === 7,
+        "n=" + _winRoots.length
+        + " rows=" + _winRoots.map((r) => (r.textContent || "").slice(0, 8)).join(","));
+    const _winTexts = _winRoots.map((r) => (r.textContent || "").slice(0, 8));
+    chk("archive window: no older session leaked into window",
+        !_winTexts.some((t) => t.includes("w1") || t.includes("w0")),
+        "texts=" + _winTexts.join("|"));
+    const _winMore = elsById["sidebarTree"].querySelector(".tree-more");
+    chk("archive window: more button counts remaining (2)",
+        _winMore !== null && _winMore.textContent.includes("2"),
+        "more=" + (_winMore && _winMore.textContent));
+    // 对照组：同一列表但 w3 未归档 → 窗口满 8 根 + more 计数 2（9 非归档 - 8）
+    _winSessions[3].archived = false;
+    renderSidebarTree(true);
+    const _winRoots2 = [...elsById["sidebarTree"].querySelectorAll(".tree-row")]
+      .filter((r) => r.closest(".tree-ws-section.active") !== null
+                && !r.closest(".tree-children")
+                && !(r.textContent || "").includes("归档")
+                && !r.classList.contains("tree-archive-row"));
+    chk("archive window: unarchived same list shows 8 roots",
+        _winRoots2.length === 8,
+        "n=" + _winRoots2.length);
+    _winSessions[3].archived = true;   // 还原
     // =====================================================================
     // perf 修复回归：聚合轮询整轮一次渲染 + 签名去重 + setTimeout 链防重入
     // + 聊天视图停轮询 + 侧边栏 hidden 跳过树渲染 + 任务面板签名去重

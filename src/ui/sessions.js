@@ -1594,19 +1594,25 @@ function renderTreeForList(container, list, wsId) {
     container.appendChild(el("div", "tree-empty", "暂无会话"));
     return;
   }
+  // 服务端把 archived 沉底排序（server.rs 排序：pinned → unarchived →
+  // archived），若直接按数组顺序取窗口，归档腾出的位会被更早的会话顶上
+  // （「归档后侧边栏不变短反而冒出别的会话」）。这里按最近活跃重排（含
+  // 归档），让归档会话保留在原时间槽位；窗口取槽位时归档的不顶替。
+  const sorted = [...list].sort((a, b) =>
+    String(b.last_active_at || b.created_at || "").localeCompare(String(a.last_active_at || a.created_at || "")));
   const childrenByParent = new Map();
-  for (const s of list) {
+  for (const s of sorted) {
     if (!s.parent_session_id) continue;
     if (!childrenByParent.has(s.parent_session_id)) childrenByParent.set(s.parent_session_id, []);
     childrenByParent.get(s.parent_session_id).push(s);
   }
   // 归档分组：归档会话（archived === true）连同其子会话一起收进折叠的
   // 「归档」分组，不参与主会话/未关联/MAX_TREE_ROOTS 的常规渲染。
-  const archivedIds = new Set(list.filter((s) => s.archived === true).map((s) => s.id));
+  const archivedIds = new Set(sorted.filter((s) => s.archived === true).map((s) => s.id));
   const inArchive = (s) => s.archived === true
     || (s.parent_session_id && archivedIds.has(s.parent_session_id));
-  const archivedSessions = list.filter(inArchive);
-  const rest = list.filter((s) => !inArchive(s));
+  const archivedSessions = sorted.filter(inArchive);
+  const rest = sorted.filter((s) => !inArchive(s));
   // pinned 根节点已在置顶分组渲染，这里从 workspace 内剔除（其子会话
   // 跟随剔除——置顶分组里 buildTreeRoot 会带出它们的子会话）。
   const pinnedRootIds = new Set(rest.filter((s) => s.pinned === true && isMainSession(s)).map((s) => s.id));
@@ -1639,7 +1645,12 @@ function renderTreeForList(container, list, wsId) {
     let shown = roots;
     let moreBtn = null;
     if (!state.sidebar.showAllWs.has(wsId) && roots.length > MAX_TREE_ROOTS) {
-      shown = roots.slice(0, MAX_TREE_ROOTS);
+      // 槽位法窗口：取最近 MAX_TREE_ROOTS 个主会话槽位（含归档，sorted
+      // 已按时间重排），归档会话的槽位空着、不顶替——归档后侧边栏真实
+      // 变短，不会冒出更早的会话。
+      const slots = sorted.filter((s) => isMainSession(s) && !inPinnedSubtree(s))
+        .slice(0, MAX_TREE_ROOTS);
+      shown = slots.filter((s) => !inArchive(s));
       const more = roots.length - shown.length;
       moreBtn = el("button", "tree-more", "+" + more + " 个更早的会话");
       moreBtn.type = "button";
