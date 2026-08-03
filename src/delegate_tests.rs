@@ -545,70 +545,72 @@ async fn sync_failure_cleans_session_and_registry() {
 #[tokio::test]
 async fn sync_abandon_aborts_runner_and_cleans_session() {
     // 主 agent 取消（POST /api/sessions/{id}/cancel）放弃正在同步等待的
-    // delegate 时（drop 主侧 done_rx），wrapper 必须通过 done_tx.closed()
-    // 感知并 abort 子 runner，且立即清理 registry/sessions。
+    // delegate 时（drop 主侧 done_rx），生产 sync wrapper 必须通过
+    // done_tx.closed() 感知并 abort 子 runner，且立即清理 registry/sessions。
     // 历史 bug：主侧放弃后子 subagent 成为孤儿继续运行（跑 bash、改文件、
     // 写 session）直到自然完成，任务面板还显示运行中（.e-agent/TODO.md
     // "Sync delegate cancel leaks the subagent"），本测试钉死该路径。
+    //
+    // 与 sync_cancel/sync_failure 直接构造 spawn_silent 不同，本测试走真实
+    // 的 Delegate::execute(background:false)：Delegate 的子模型指向一个
+    // 读完整请求后永不响应的阻塞 stub。stub 收到请求 = 子 runner 已进入
+    // 模型调用（且 execute 已走到 done_rx.await、wrapper 已 spawn），以此
+    // 作为"已开始"信号；然后 abort 持有 execute future 的 task（等价于主
+    // runner 取消 turn 时 drop execute future → 主侧 done_rx 被 drop），
+    // 断言生产 wrapper 通过 done_tx.closed() 感知放弃并 abort 子 runner
+    // （stub 观察到 in-flight 连接被掐断），且 registry/sessions 清理干净。
     let temp = tempfile::tempdir().unwrap();
-    let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None, false, None);
+    let (base_url, stub) = blocking_model().await;
+    let mut tool = delegate_with_url(temp.path(), base_url);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
-    background.set_event_sender(sender);
-    let (handle, runner_task, signals) = probe_runner(temp.path(), false);
-    let sessions = Sessions::default();
-    let slot = Arc::new(Mutex::new(None));
-    let cleanup = DelegateCleanup::new(slot.clone(), sessions.clone(), None);
-    let hook_sessions = sessions.clone();
-    let hook_handle = handle.clone();
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    background
-        .spawn_silent(
-            "probe".into(),
-            None,
-            None,
-            None,
-            move |id| {
-                *slot.lock().unwrap() = Some(id);
-                hook_sessions.insert(id, probe_entry(hook_handle.clone()));
-            },
-            move || {
-                let mut cleanup = Some(cleanup);
-                let mut done_tx = done_tx;
-                async move {
-                    let mut runner_task = Some(runner_task);
-                    tokio::select! {
-                        _ = done_tx.closed() => {
-                            if let Some(mut task) = runner_task.take() {
-                                task.abort();
-                            }
-                            cleanup.take().expect("cleanup taken once").finish();
-                            "subagent cancelled".to_owned()
-                        }
-                        result = async {
-                            let task = runner_task.take().expect("runner task taken once");
-                            Delegate::runner_result(&handle, task).await
-                        } => {
-                            cleanup.take().expect("cleanup taken once").finish();
-                            let _ = done_tx.send(result.clone());
-                            result_output(result).1
-                        }
-                    }
-                }
-            },
-        )
-        .unwrap();
+    tool.set_event_sender(sender);
+    // 断言阶段需要的 registry/sessions 观测句柄（tool 本体随后移入 task）。
+    let background = tool.background.clone();
+    let sessions = tool.sessions();
 
-    // 子 runner 已进入模型调用（卡在 release 上）。
-    signals.entered.notified().await;
-    // 模拟主侧放弃：取消 turn 时 execute_tool future（含 done_rx）被 drop。
-    drop(done_rx);
-    // 子 runner 必须被 abort：模型 complete future 与模型本身都被 drop，
-    // 且模型永远没有跑完（side_effects 保持 0）。
-    signals.future_dropped.notified().await;
-    signals.model_dropped.notified().await;
-    assert_eq!(signals.side_effects.load(Ordering::SeqCst), 0);
-    // wrapper cleanup 已执行：任务面板条目（registry + sessions）清空。
+    // 真实 execute（background:false）：spawn 后主侧持有的是 execute
+    // future（其内部 await done_rx，持有主侧 done_rx 的一端）。
+    let execute = tokio::spawn(async move {
+        tool.execute(json!({"task": "block forever", "background": false}))
+            .await
+    });
+
+    // 已开始信号：子 runner 的模型请求已被 stub 完整读取（runner 卡在
+    // 永不响应的 SSE 读取上）；再确认 sync wrapper 已注册进 background
+    // registry，保证 execute 一定已走到 done_rx.await，之后才模拟放弃。
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stub.request_received.notified(),
+    )
+    .await
+    .expect("subagent runner must reach its model call");
+    let mut tries = 0;
+    while background.running().is_empty() {
+        tokio::task::yield_now().await;
+        tries += 1;
+        assert!(tries < 1000, "sync wrapper was never spawned");
+    }
+    assert_eq!(
+        sessions.sessions.lock().unwrap().len(),
+        1,
+        "sync delegate registers its subagent in the task panel"
+    );
+
+    // 模拟主侧放弃：abort 持有 execute future 的 task（主 runner 取消时
+    // execute future 被 drop，其持有的 done_rx 一并被 drop → 生产 wrapper
+    // 的 done_tx.closed() 分支触发）。
+    execute.abort();
+
+    // 子 runner 必须被 abort：其 in-flight 模型请求的连接被掐断（stub 的
+    // 后续 read 返回 EOF/错误），而不是自然完成（stub 从不响应）。
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stub.connection_closed.notified(),
+    )
+    .await
+    .expect("abandoned sync delegate must abort the subagent runner mid-call");
+    // wrapper cleanup 已执行：任务面板条目（background registry + sessions）
+    // 清空（sync 路径的 recovery record 为 None，清理对象就是 registry）。
     let mut tries = 0;
     loop {
         if background.running().is_empty() && sessions.sessions.lock().unwrap().is_empty() {
@@ -618,6 +620,13 @@ async fn sync_abandon_aborts_runner_and_cleans_session() {
         tries += 1;
         assert!(tries < 1000, "cleanup never completed");
     }
+    // execute future 确实是被主侧放弃中止的（abort 的 JoinHandle 报
+    // cancelled），而不是自然返回了结果。
+    let joined = execute.await;
+    assert!(
+        matches!(&joined, Err(error) if error.is_cancelled()),
+        "execute future must be cancelled by the main-side abandon, got: {joined:?}"
+    );
     assert!(
         completions.try_recv().is_err(),
         "sync delegate sends no completion event"
@@ -755,6 +764,75 @@ async fn capturing_model() -> (String, Arc<Mutex<Vec<u8>>>) {
         stream.write_all(response.as_bytes()).await.unwrap();
     });
     (format!("http://{address}"), captured)
+}
+
+struct BlockingStub {
+    /// Fired once the subagent runner's HTTP request has been fully read
+    /// (the runner is in-flight, blocked awaiting the never-sent response).
+    request_received: Arc<Notify>,
+    /// Fired when the connection is torn down after the request (EOF or
+    /// reset) — the runner's in-flight model future was dropped/aborted.
+    connection_closed: Arc<Notify>,
+}
+
+/// A local model endpoint that reads the runner's request and then never
+/// responds. Doubles as the probe for the sync-abandon test:
+/// `request_received` proves the subagent runner reached its model call
+/// (execute has spawned the sync wrapper and is awaiting `done_rx`), and
+/// `connection_closed` proves the runner was aborted — dropping the
+/// in-flight reqwest future closes the TCP connection, which the stub's
+/// post-request read observes as EOF or a reset error.
+async fn blocking_model() -> (String, BlockingStub) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let request_received = Arc::new(Notify::new());
+    let connection_closed = Arc::new(Notify::new());
+    let hook_received = request_received.clone();
+    let hook_closed = connection_closed.clone();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let received_body = request.len() - header_end;
+        let mut rest = vec![0; content_length - received_body];
+        stream.read_exact(&mut rest).await.unwrap();
+        // Runner is in-flight and blocked awaiting the response we never send.
+        hook_received.notify_one();
+        // After the request the runner never writes again, so the next read
+        // returns only when the connection is torn down (clean EOF on socket
+        // close, or a reset error) — i.e. the in-flight future was aborted.
+        let mut buf = [0; 1024];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        hook_closed.notify_one();
+    });
+    (
+        format!("http://{address}"),
+        BlockingStub {
+            request_received,
+            connection_closed,
+        },
+    )
 }
 
 #[tokio::test]

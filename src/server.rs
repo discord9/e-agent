@@ -1733,9 +1733,8 @@ async fn session_summary(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let session = live(&state, &id).map_err(|(status, message)| {
-        (status, Json(serde_json::json!({ "error": message })))
-    })?;
+    let session = live(&state, &id)
+        .map_err(|(status, message)| (status, Json(serde_json::json!({ "error": message }))))?;
     let Some(entry) = summary_get(&state, &id) else {
         // 冷缓存（server 重启后 / 会话尚无完整 turn）：按需触发一次后台
         // 生成，并返回 generating 标记——桌宠据此提示"稍后再点"，而不是
