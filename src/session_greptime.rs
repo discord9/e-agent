@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use tokio_postgres::NoTls;
 
 use crate::agent::{Message, SessionEntry};
-use crate::session_store::SessionMeta;
+use crate::session_store::{SessionMeta, process_identity};
 
 /// DDL for the session table. Idempotent.
 const CREATE_TABLE: &str = r#"
@@ -114,43 +114,6 @@ CREATE TABLE IF NOT EXISTS sessions (
 /// namespace (different workspaces get different on-disk directories).
 pub fn derive_workspace_id(root: &Path) -> String {
     root.to_string_lossy().to_string()
-}
-
-/// Process identity for the `sessions.writer` audit column, formatted as
-/// `pid@hostname#nonce`. Computed once per process (module-level
-/// `OnceLock`); every metadata snapshot row is stamped with it at
-/// `insert_meta` time so the sessions audit table records which process
-/// wrote each row, and concurrent-write conflict errors can name the
-/// likely adversary.
-///
-/// Why not just `pid`? A pid alone is ambiguous: the OS reuses pids across
-/// restarts, so two snapshots written by *different* processes could carry
-/// the same pid. Why not rely on `hostname`? `HOSTNAME` is not guaranteed
-/// to be set (hence the `COMPUTERNAME` fallback for Windows, then
-/// `"unknown"`). The `nonce` disambiguates pid reuse: a simple hash of the
-/// boot-time `SystemTime` nanos XORed with the pid — no new dependency,
-/// and different processes (or restarts with a reused pid) get different
-/// values with overwhelming probability.
-static PROCESS_IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// The current process's identity string (see [`PROCESS_IDENTITY`]).
-fn process_identity() -> &'static str {
-    PROCESS_IDENTITY.get_or_init(|| {
-        let pid = std::process::id();
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "unknown".to_owned());
-        let nonce = {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            // Simple mixing of the timestamp and pid; hex keeps the string
-            // short. Same pid at a different boot time → different nonce.
-            format!("{:x}", (nanos as u64) ^ (pid as u64))
-        };
-        format!("{pid}@{hostname}#{nonce}")
-    })
 }
 
 /// Monotonic real-time microsecond timestamp. Uses wall clock but guarantees

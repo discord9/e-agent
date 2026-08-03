@@ -20,7 +20,7 @@
 //! | GET    | `/api/models`                     | switchable model profile names (web `/model` autocomplete) |
 //! | POST   | `/api/sessions/{id}/model`         | switch the session's model at runtime |
 //! | POST   | `/api/sessions/{id}/undo`         | undo the most recent file operation |
-//! | PUT    | `/api/sessions/{id}/title`        | rename a session (Greptime only)   |
+//! | PUT    | `/api/sessions/{id}/title`        | rename a session                  |
 //! | DELETE | `/api/sessions/{id}`              | cancel + remove from the registry  |
 //! | GET    | `/api/tasks`                        | running background tasks, all sessions |
 //! | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task          |
@@ -93,10 +93,11 @@ fn tail_snapshot(mut events: Vec<AgentEvent>) -> Vec<AgentEvent> {
 /// here and reused by every session `build()`.
 pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Result<()> {
     let token = load_or_create_token()?;
-    // Sessions-metadata store, connected once at bootstrap. Greptime:
-    // create the audit table and run the one-time backfill of sessions
-    // that predate it (L3: never inside connect). Jsonl: registry-only
-    // listing marker (list_meta is empty).
+    // Sessions-metadata store, connected once at bootstrap. Greptime/
+    // SQLite: create the audit table and run the one-time backfill of
+    // sessions that predate it (L3: never inside connect). Jsonl: the
+    // backfill writes first-line `.meta.jsonl` sidecars for transcripts
+    // that predate the sidecar format.
     let meta_store = SessionStore::connect_meta(factory.backend(), factory.root()).await?;
     meta_store
         .backfill_sessions(factory.root())
@@ -170,8 +171,8 @@ pub struct AppState {
     pub registry: Arc<SessionRegistry>,
     pub token: String,
     /// Workspace-scoped sessions-metadata store: historical sessions for
-    /// `GET /api/sessions` (Greptime) and `delete_meta` hiding. The Jsonl
-    /// variant is the registry-only marker (list is always empty).
+    /// `GET /api/sessions` (Greptime/SQLite audit table, JSONL sidecar)
+    /// and `delete_meta` hiding.
     pub meta_store: SessionStore,
     /// session_id -> (总结文本, 生成时间戳): written at the end of every
     /// turn with real activity, read by the desktop pet via
@@ -780,8 +781,8 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
     for (id, session) in state.registry.list() {
         active.push(session_meta(&id, &session, root).await);
     }
-    // Historical sessions from the metadata table (Greptime). The Jsonl
-    // backend lists nothing — the registry is the whole list (M4).
+    // Historical sessions from the metadata table (Greptime/SQLite audit
+    // table; JSONL `.meta.jsonl` sidecars).
     let historical = match state.meta_store.list_meta(root).await {
         Ok(list) => list,
         Err(error) => {
@@ -1119,9 +1120,7 @@ struct TitleBody {
 /// session always has a metadata row, `build` → `create_meta`) and
 /// historical sessions (via the workspace-scoped `meta_store`, so a rename
 /// survives the session leaving the registry). 404 when the id is neither
-/// live nor present in the metadata table. The JSONL backend has no meta
-/// table: renaming a live session is a silent no-op (title is
-/// Greptime-only).
+/// live nor present in the metadata table.
 async fn session_title(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1173,8 +1172,7 @@ struct PinBody {
 /// a built session always has a metadata row, `build` → `create_meta`) and
 /// historical sessions (via the workspace-scoped `meta_store`, so a pin
 /// survives the session leaving the registry). 404 when the id is neither
-/// live nor present in the metadata table. The JSONL backend has no meta
-/// table: pinning a live session is a silent no-op (pins are Greptime-only).
+/// live nor present in the metadata table.
 async fn session_pin(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1218,9 +1216,7 @@ struct ArchiveBody {
 /// a built session always has a metadata row, `build` → `create_meta`) and
 /// historical sessions (via the workspace-scoped `meta_store`, so an
 /// archive survives the session leaving the registry). 404 when the id is
-/// neither live nor present in the metadata table. The JSONL backend has
-/// no meta table: archiving a live session is a silent no-op (archives
-/// are Greptime/SQLite-only).
+/// neither live nor present in the metadata table.
 async fn session_archive(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1285,8 +1281,8 @@ async fn delete_session(
         }
     }
     // Hide from the sessions list: delete the session's metadata rows
-    // (Greptime audit table; JSONL no-op). The transcript stays, so a
-    // later resume still works.
+    // (Greptime/SQLite audit table; JSONL sidecar file). The transcript
+    // stays, so a later resume still works.
     let root = state.factory.root();
     state
         .meta_store
@@ -3133,8 +3129,8 @@ model = "deepseek-chat"
 
     /// An `AppState` for handler tests. `test_factory` skips config/model env
     /// resolution; the tested paths (auth middleware, registry-miss 404)
-    /// never reach `factory.build()`. The meta store is the Jsonl marker
-    /// (registry-only listing).
+    /// never reach `factory.build()`. The meta store is the Jsonl backend;
+    /// listing scans `<root>/.e-agent/sessions` (empty for a fresh temp dir).
     fn test_app_state(token: &str) -> Arc<AppState> {
         Arc::new(AppState {
             factory: crate::session_factory::SessionFactory::test_factory(std::env::temp_dir()),
