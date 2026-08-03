@@ -325,6 +325,8 @@ function renderTaskList(tasks, container) {
     const badge = el("span", "kind-badge " + (isDelegate ? "delegate" : shellKind),
       isDelegate ? (t.role || "子代理") : shellKind);
     line.appendChild(badge);
+    // 任务序号（后端 TaskMeta.id）：有 id 才显示，否则安静省略
+    if (t.id != null) line.appendChild(el("span", "task-meta tid", "#" + t.id));
     line.appendChild(el("span", "task-label", shortTaskLabel(t)));
     if (t.role) line.appendChild(el("span", "task-meta trole", t.role));
     // 参数标签（与 TUI 面板一致）：background / workspace / resume。resume
