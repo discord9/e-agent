@@ -490,7 +490,7 @@ impl SessionRunner {
         // awaited, so losing the final touch at process exit is acceptable
         // (the audit table keeps the last committed snapshot).
         if matches!(status, SessionStatus::Idle) {
-            self.store.touch_meta();
+            self.store.touch_meta(&self.root, &self.session);
         }
         self.shared.lock().unwrap().status.send_replace(status);
     }

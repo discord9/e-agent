@@ -24,9 +24,11 @@ use std::sync::Arc;
 #[cfg(any(feature = "greptime", feature = "sqlite"))]
 use tokio::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::agent::SessionEntry;
+use std::io::{BufRead, Write};
+
 use crate::config::SessionBackend;
 use crate::session::{LoadedSession, Session};
 
@@ -37,6 +39,43 @@ use crate::session::{LoadedSession, Session};
 /// backends.
 #[allow(dead_code)]
 const META_STORE_SENTINEL: &str = "_meta";
+
+/// Process identity for the `sessions.writer` audit column, formatted as
+/// `pid@hostname#nonce`. Computed once per process (module-level
+/// `OnceLock`); every metadata snapshot row is stamped with it at write
+/// time so the sessions audit table (and the JSONL `.meta.jsonl` sidecar)
+/// records which process wrote each row, and concurrent-write conflict
+/// errors can name the likely adversary.
+///
+/// Why not just `pid`? A pid alone is ambiguous: the OS reuses pids across
+/// restarts, so two snapshots written by *different* processes could carry
+/// the same pid. Why not rely on `hostname`? `HOSTNAME` is not guaranteed
+/// to be set (hence the `COMPUTERNAME` fallback for Windows, then
+/// `"unknown"`). The `nonce` disambiguates pid reuse: a simple hash of the
+/// boot-time `SystemTime` nanos XORed with the pid — no new dependency,
+/// and different processes (or restarts with a reused pid) get different
+/// values with overwhelming probability.
+static PROCESS_IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The current process's identity string (see [`PROCESS_IDENTITY`]).
+pub(crate) fn process_identity() -> &'static str {
+    PROCESS_IDENTITY.get_or_init(|| {
+        let pid = std::process::id();
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "unknown".to_owned());
+        let nonce = {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            // Simple mixing of the timestamp and pid; hex keeps the string
+            // short. Same pid at a different boot time → different nonce.
+            format!("{:x}", (nanos as u64) ^ (pid as u64))
+        };
+        format!("{pid}@{hostname}#{nonce}")
+    })
+}
 
 /// Upper bound for [`SessionStore::load_head_page`]: the head segment is
 /// `[last_comp, ∞)` — the last `Compaction` entry and everything after
@@ -58,9 +97,14 @@ const HEAD_OPEN_SENTINEL: i64 = i64::MAX;
 /// shape, so the latest row per session wins by the TIME INDEX
 /// (`last_active_at`); `list_meta` deduplicates per session accordingly.
 /// The `workspace_id` is implied by the store/connection and never carried
-/// here. The JSONL backend has no meta table and never produces these
-/// values.
-#[derive(Clone, Debug, PartialEq)]
+/// here. The JSONL backend stores the same snapshots in a per-session
+/// sidecar file (`.meta.jsonl`), one line per snapshot.
+///
+/// `Serialize`/`Deserialize` exist for the JSONL backend's per-session
+/// sidecar (`.meta.jsonl`): one complete snapshot per line, mirroring one
+/// audit-table row. The field layout is exactly the table columns, so a
+/// sidecar snapshot and a DB row are interchangeable at `list_meta` time.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionMeta {
     pub session_id: String,
     pub created_at: chrono::NaiveDateTime,
@@ -71,29 +115,23 @@ pub struct SessionMeta {
     pub parent_session_id: Option<String>,
     pub parent_task_id: Option<i64>,
     /// User-assigned session name (manual, never auto-generated). `None`
-    /// = unnamed (the frontend shows the session id). Greptime/SQLite only —
-    /// the JSONL backend has no meta table and never produces values.
+    /// = unnamed (the frontend shows the session id).
     pub title: Option<String>,
     /// User pin flag: `Some(true)` = pinned (sorted first in the list),
     /// `Some(false)` = explicitly unpinned, `None` = never touched (reads
-    /// as unpinned). Greptime/SQLite only — the JSONL backend has no meta
-    /// table and never produces values.
+    /// as unpinned).
     pub pinned: Option<bool>,
     /// User archive flag: `Some(true)` = archived (hidden from the default
     /// session list, folded into the sidebar's collapsed "归档" group),
     /// `Some(false)` = explicitly restored, `None` = never touched (reads
-    /// as unarchived). Greptime/SQLite only — the JSONL backend has no meta
-    /// table and never produces values.
+    /// as unarchived).
     pub archived: Option<bool>,
     /// Writer process identity of this snapshot row
-    /// (`pid@hostname#nonce`, see `session_greptime::process_identity`):
-    /// the process whose `insert_meta` stamped the row (the most recent
-    /// insert_meta for this snapshot — the audit table records every
+    /// (`pid@hostname#nonce`, see [`process_identity`]): the process whose
+    /// insert appended the row (the audit table / sidecar records every
     /// snapshot's writer, and the latest one doubles as a best-effort hint
     /// in concurrent-write conflict errors). `None` for rows written
     /// before the column existed (the migration reads them back as NULL).
-    /// Greptime/SQLite only — the JSONL backend has no meta table and never
-    /// produces values.
     pub writer: Option<String>,
     /// Task-panel label of the delegate task that spawned this session
     /// (see [`SessionStore::label_for_subagent`]). Never stored in the
@@ -198,8 +236,8 @@ impl SessionStore {
     /// Connect a workspace-scoped store for sessions-metadata operations
     /// (`list_meta` / `backfill_sessions` / `delete_meta`). The session id
     /// is a sentinel: Greptime/SQLite operations are keyed by the
-    /// `workspace_id` bound at connect time. JSONL: the registry-only
-    /// marker store.
+    /// `workspace_id` bound at connect time. JSONL: stateless — every
+    /// operation takes `root` explicitly.
     #[allow(unused_variables)]
     pub async fn connect_meta(backend: &SessionBackend, root: &Path) -> Result<Self> {
         match backend {
@@ -505,19 +543,19 @@ impl SessionStore {
         &self,
         _root: &Path,
         _name: &str,
-        after_seq: i64,
+        _after_seq: i64,
     ) -> Result<(Vec<SessionEntry>, Option<i64>)> {
         match self {
             SessionStore::Jsonl => Ok((Vec::new(), None)),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
-                session.lock().await.load_newer(after_seq).await
+                session.lock().await.load_newer(_after_seq).await
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
                 .await
-                .load_newer(after_seq)
+                .load_newer(_after_seq)
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -618,22 +656,38 @@ impl SessionStore {
     }
 
     // ------------------------------------------------------------------
-    // Sessions metadata — the `sessions` audit table (Greptime/SQLite only)
+    // Sessions metadata — the `sessions` audit table (Greptime/SQLite)
+    // and the `.meta.jsonl` per-session sidecar (JSONL)
     // ------------------------------------------------------------------
     //
-    // The JSONL backend has no meta table: create/touch/delete are no-ops
-    // and `list_meta` is always empty (registry-only listing, M4).
+    // JSONL mirror: one complete snapshot per line in
+    // `<root>/.e-agent/sessions/<id>.meta.jsonl` (aligned with the
+    // `<id>.background.jsonl` record-file precedent), appended by every
+    // create/touch/rename/pin/archive exactly like a DB audit row. The
+    // file tail is the latest snapshot. No flock: appends are
+    // last-writer-wins (unlike the DB's PK-conflict detection, a
+    // deliberate trade-off of the file format), and a delete racing an
+    // append simply rebuilds the file from the next snapshot.
 
-    /// Fire-and-forget activity touch on the sessions metadata table
-    /// (Greptime/SQLite only): appends one full snapshot row with a fresh
-    /// `last_active_at` and `entry_count = next_seq`. The write is spawned
-    /// onto the current tokio runtime and never awaited — turn-boundary
-    /// activity is best-effort and losing the final touch at process exit
-    /// is acceptable (the audit table keeps the last committed snapshot).
-    /// JSONL: no-op.
-    pub fn touch_meta(&self) {
+    /// Fire-and-forget activity touch on the sessions metadata
+    /// (Greptime/SQLite: appends one full snapshot row with a fresh
+    /// `last_active_at` and `entry_count = next_seq`; JSONL: appends one
+    /// sidecar snapshot line with `last_active_at = now` and
+    /// `entry_count` = the current transcript line count). Greptime/
+    /// SQLite spawn the write onto the current tokio runtime and never
+    /// await it — turn-boundary activity is best-effort and losing the
+    /// final touch at process exit is acceptable (the audit table keeps
+    /// the last committed snapshot). JSONL writes synchronously (the file
+    /// I/O is small; matching the sync facade of
+    /// `record_background_start`). Never self-creates on any backend
+    /// (R3): a session with no metadata row / sidecar is a no-op.
+    pub fn touch_meta(&self, root: &Path, session: &str) {
         match self {
-            SessionStore::Jsonl => {}
+            SessionStore::Jsonl => {
+                if let Err(error) = jsonl_touch_meta(root, session) {
+                    eprintln!("e-agent: cannot touch session metadata: {error:#}");
+                }
+            }
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
                 session: greptime_session,
@@ -676,16 +730,17 @@ impl SessionStore {
     }
 
     /// Create the first `sessions` metadata snapshot for a session
-    /// (Greptime/SQLite only). Idempotent per session: a session that
-    /// already has a row is a resume, not a creation, so no second creation
-    /// snapshot is appended (that would rewrite `created_at`). `model`/
-    /// `role` come from the caller's configuration; `parent_session_id`/
-    /// `parent_task_id` link subagent rows to their spawning delegate
-    /// (main sessions pass `None`). JSONL: no-op.
+    /// (Greptime/SQLite: first audit row; JSONL: first sidecar line).
+    /// Idempotent per session: a session that already has a row is a
+    /// resume, not a creation, so no second creation snapshot is appended
+    /// (that would rewrite `created_at`). `model`/`role` come from the
+    /// caller's configuration; `parent_session_id`/`parent_task_id` link
+    /// subagent rows to their spawning delegate (main sessions pass
+    /// `None`).
     #[allow(unused_variables)]
     pub async fn create_meta(
         &self,
-        _root: &Path,
+        root: &Path,
         session: &str,
         model: Option<&str>,
         role: Option<&str>,
@@ -693,7 +748,14 @@ impl SessionStore {
         parent_task_id: Option<i64>,
     ) -> Result<()> {
         match self {
-            SessionStore::Jsonl => Ok(()),
+            SessionStore::Jsonl => jsonl_create_meta(
+                root,
+                session,
+                model,
+                role,
+                parent_session_id,
+                parent_task_id,
+            ),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
                 session: greptime_session,
@@ -718,12 +780,12 @@ impl SessionStore {
         }
     }
 
-    /// List the latest metadata snapshot per session (Greptime/SQLite
-    /// only), newest activity first. JSONL: always empty (registry-only
-    /// listing).
-    pub async fn list_meta(&self, _root: &Path) -> Result<Vec<SessionMeta>> {
+    /// List the latest metadata snapshot per session (Greptime/SQLite:
+    /// newest activity first from the audit table; JSONL: one tail-read of
+    /// each transcript's sidecar), newest activity first.
+    pub async fn list_meta(&self, root: &Path) -> Result<Vec<SessionMeta>> {
         match self {
-            SessionStore::Jsonl => Ok(Vec::new()),
+            SessionStore::Jsonl => jsonl_list_meta(root),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => session.lock().await.list_meta().await,
             #[cfg(feature = "sqlite")]
@@ -737,12 +799,12 @@ impl SessionStore {
     }
 
     /// Hide a session from the sessions list by deleting ALL of its
-    /// metadata rows (Greptime/SQLite only). The transcript in
-    /// `session_entries` is untouched, so resume still works. JSONL: no-op.
+    /// metadata rows (Greptime/SQLite) or the whole sidecar file (JSONL).
+    /// The transcript is untouched, so resume still works.
     #[allow(unused_variables)]
-    pub async fn delete_meta(&self, _root: &Path, session: &str) -> Result<()> {
+    pub async fn delete_meta(&self, root: &Path, session: &str) -> Result<()> {
         match self {
-            SessionStore::Jsonl => Ok(()),
+            SessionStore::Jsonl => jsonl_delete_meta(root, session),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
                 session: greptime_session,
@@ -761,16 +823,17 @@ impl SessionStore {
         }
     }
 
-    /// Rename a session in the sessions metadata table (Greptime/SQLite
-    /// only): appends one full snapshot row with the new `title` and a
-    /// fresh `last_active_at`. `title = None` clears the name (stored as
-    /// NULL). Never self-creates (R3): a session with no metadata row is a
-    /// no-op `Ok`, mirroring `touch_meta`. JSONL: no-op `Ok` — the JSONL
-    /// backend has no meta table, so titles exist only on Greptime/SQLite.
+    /// Rename a session in the sessions metadata table (Greptime/SQLite)
+    /// or sidecar (JSONL): appends one full snapshot row with the new
+    /// `title` and a fresh `last_active_at`. `title = None` clears the
+    /// name (stored as NULL). Never self-creates (R3): a session with no
+    /// metadata row is a no-op `Ok`, mirroring `touch_meta`.
     #[allow(unused_variables)]
-    pub async fn set_title(&self, _root: &Path, session: &str, title: Option<&str>) -> Result<()> {
+    pub async fn set_title(&self, root: &Path, session: &str, title: Option<&str>) -> Result<()> {
         match self {
-            SessionStore::Jsonl => Ok(()),
+            SessionStore::Jsonl => {
+                jsonl_update_meta(root, session, |meta| meta.title = title.map(str::to_owned))
+            }
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
                 session: greptime_session,
@@ -796,15 +859,16 @@ impl SessionStore {
     }
 
     /// Pin or unpin a session in the sessions metadata table
-    /// (Greptime/SQLite only): appends one full snapshot row with the new
-    /// `pinned` flag and a fresh `last_active_at`. Never self-creates (R3):
-    /// a session with no metadata row is a no-op `Ok`, mirroring
-    /// `set_title`. JSONL: no-op `Ok` — the JSONL backend has no meta
-    /// table, so pins exist only on Greptime/SQLite.
+    /// (Greptime/SQLite) or sidecar (JSONL): appends one full snapshot
+    /// row with the new `pinned` flag and a fresh `last_active_at`. Never
+    /// self-creates (R3): a session with no metadata row is a no-op `Ok`,
+    /// mirroring `set_title`.
     #[allow(unused_variables)]
-    pub async fn set_pinned(&self, _root: &Path, session: &str, pinned: bool) -> Result<()> {
+    pub async fn set_pinned(&self, root: &Path, session: &str, pinned: bool) -> Result<()> {
         match self {
-            SessionStore::Jsonl => Ok(()),
+            SessionStore::Jsonl => {
+                jsonl_update_meta(root, session, |meta| meta.pinned = Some(pinned))
+            }
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
                 session: greptime_session,
@@ -830,15 +894,16 @@ impl SessionStore {
     }
 
     /// Archive or restore a session in the sessions metadata table
-    /// (Greptime/SQLite only): appends one full snapshot row with the new
-    /// `archived` flag and a fresh `last_active_at`. Never self-creates
-    /// (R3): a session with no metadata row is a no-op `Ok`, mirroring
-    /// `set_pinned`. JSONL: no-op `Ok` — the JSONL backend has no meta
-    /// table, so archives exist only on Greptime/SQLite.
+    /// (Greptime/SQLite) or sidecar (JSONL): appends one full snapshot row
+    /// with the new `archived` flag and a fresh `last_active_at`. Never
+    /// self-creates (R3): a session with no metadata row is a no-op `Ok`,
+    /// mirroring `set_pinned`.
     #[allow(unused_variables)]
-    pub async fn set_archived(&self, _root: &Path, session: &str, archived: bool) -> Result<()> {
+    pub async fn set_archived(&self, root: &Path, session: &str, archived: bool) -> Result<()> {
         match self {
-            SessionStore::Jsonl => Ok(()),
+            SessionStore::Jsonl => {
+                jsonl_update_meta(root, session, |meta| meta.archived = Some(archived))
+            }
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
                 session: greptime_session,
@@ -868,10 +933,11 @@ impl SessionStore {
     /// no metadata row). Idempotent: sessions that already have a row are
     /// skipped, so running it twice yields identical results. Only the
     /// server bootstrap calls this — never `connect` (L3) and never gated
-    /// on table emptiness (M1). JSONL: no-op.
-    pub async fn backfill_sessions(&self, _root: &Path) -> Result<()> {
+    /// on table emptiness (M1). JSONL: writes first-line snapshots for
+    /// transcripts that have no `.meta.jsonl` sidecar.
+    pub async fn backfill_sessions(&self, root: &Path) -> Result<()> {
         match self {
-            SessionStore::Jsonl => Ok(()),
+            SessionStore::Jsonl => jsonl_backfill_sessions(root),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
                 session.lock().await.backfill_sessions().await
@@ -1072,7 +1138,7 @@ impl SessionStore {
     pub async fn take_unfinished_background_for_subagent(
         &self,
         _root: &Path,
-        subagent_session_id: &str,
+        _subagent_session_id: &str,
     ) -> Result<Vec<String>> {
         match self {
             SessionStore::Jsonl => Ok(Vec::new()),
@@ -1081,14 +1147,14 @@ impl SessionStore {
                 session
                     .lock()
                     .await
-                    .take_unfinished_tasks_for_subagent(subagent_session_id)
+                    .take_unfinished_tasks_for_subagent(_subagent_session_id)
                     .await
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
                 .await
-                .take_unfinished_tasks_for_subagent(subagent_session_id)
+                .take_unfinished_tasks_for_subagent(_subagent_session_id)
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -1098,32 +1164,413 @@ impl SessionStore {
     /// surviving `running_tasks` row whose `subagent_session_id` matches
     /// (rows are deleted when the delegate task completes, so `None` means
     /// "no live delegate task carries this session" and the frontend falls
-    /// back to the session id). Greptime/SQLite only — the JSONL backend
-    /// has no global task table and always reports `None`.
+    /// back to the session id). JSONL: scans every `<id>.background.jsonl`
+    /// record file for a surviving delegate line whose `session_id`
+    /// matches — record lines are removed on task completion
+    /// (`clear_background_task`), so a surviving line means the delegate is
+    /// still live, mirroring `running_tasks`.
     pub async fn label_for_subagent(
         &self,
-        _root: &Path,
-        subagent_session_id: &str,
+        root: &Path,
+        _subagent_session_id: &str,
     ) -> Result<Option<String>> {
         match self {
-            SessionStore::Jsonl => Ok(None),
+            SessionStore::Jsonl => Ok(jsonl_label_for_subagent(root, _subagent_session_id)),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
                 session
                     .lock()
                     .await
-                    .label_for_subagent(subagent_session_id)
+                    .label_for_subagent(_subagent_session_id)
                     .await
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
                 .await
-                .label_for_subagent(subagent_session_id)
+                .label_for_subagent(_subagent_session_id)
                 .await
                 .map_err(anyhow::Error::msg),
         }
     }
+}
+
+// ----------------------------------------------------------------------
+// JSONL metadata sidecar helpers — `.meta.jsonl`
+// ----------------------------------------------------------------------
+
+/// Path of one session's metadata sidecar: `<root>/.e-agent/sessions/
+/// <id>.meta.jsonl`, mirroring the `<id>.background.jsonl` record files
+/// and the `<id>.jsonl` transcripts. The name validation matches
+/// `session::session_path` / `background_record_path`, so an id can never
+/// escape the sessions directory.
+fn jsonl_meta_sidecar_path(root: &Path, session: &str) -> anyhow::Result<PathBuf> {
+    if session.is_empty()
+        || !session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        anyhow::bail!("invalid session name for metadata sidecar: {session:?}");
+    }
+    Ok(root
+        .join(".e-agent/sessions")
+        .join(format!("{session}.meta.jsonl")))
+}
+
+/// Append one complete snapshot line to a session's metadata sidecar:
+/// O_APPEND + `sync_all`, 0600 on creation — the append discipline of
+/// `Session::append`, applied to metadata snapshots. Each line mirrors one
+/// `sessions` audit-table row.
+///
+/// The `writer` column is stamped HERE at append time, not at construction
+/// (matching the DB backends' `insert_meta`): every snapshot line records
+/// the process that actually wrote it, so a touch/set/backfill that
+/// carries a snapshot forward never replays a stale identity from an
+/// earlier line. Callers construct with `writer: None`; the stamped value
+/// is what lands in the file.
+fn jsonl_append_meta_snapshot(
+    root: &Path,
+    session: &str,
+    meta: &mut SessionMeta,
+) -> anyhow::Result<()> {
+    meta.writer = Some(process_identity().to_owned());
+    let path = jsonl_meta_sidecar_path(root, session)?;
+    let directory = path.parent().expect("sidecar path always has a parent");
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("cannot create session directory {}", directory.display()))?;
+    #[cfg(unix)]
+    let created = !path.exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("cannot append session metadata {}", path.display()))?;
+    file.write_all(&serde_json::to_vec(meta)?)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    if created {
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// The newest snapshot of a session's metadata sidecar, or `None` when the
+/// sidecar does not exist or holds no parseable line. Corrupt lines are
+/// skipped: the file is append-only and only the tail matters (a corrupt
+/// tail is treated as "no newer snapshot").
+fn jsonl_read_meta_snapshot(root: &Path, session: &str) -> anyhow::Result<Option<SessionMeta>> {
+    let path = jsonl_meta_sidecar_path(root, session)?;
+    let Ok(file) = std::fs::File::open(&path) else {
+        return Ok(None);
+    };
+    let mut latest: Option<SessionMeta> = None;
+    for line in std::io::BufReader::new(file)
+        .lines()
+        .map_while(|line| line.ok())
+    {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(meta) = serde_json::from_str::<SessionMeta>(&line) {
+            latest = Some(meta);
+        }
+    }
+    Ok(latest)
+}
+
+/// Count a session's transcript entries by counting the non-empty lines of
+/// `<id>.jsonl` (one serde-JSON entry per line, so no embedded raw
+/// newlines). Missing transcript = 0. This is the JSONL equivalent of the
+/// DB backends' `next_seq`: seqs are dense per append, so the line count
+/// equals `max(seq)+1` — never a physical overcount.
+fn jsonl_count_transcript_entries(root: &Path, session: &str) -> anyhow::Result<i64> {
+    let sidecar = jsonl_meta_sidecar_path(root, session)?; // validates the name
+    let transcript = sidecar.with_file_name(format!("{session}.jsonl"));
+    let Ok(file) = std::fs::File::open(&transcript) else {
+        return Ok(0);
+    };
+    let mut count: i64 = 0;
+    for line in std::io::BufReader::new(file)
+        .lines()
+        .map_while(|line| line.ok())
+    {
+        if !line.trim().is_empty() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// `create_meta` for the JSONL backend: write the first snapshot line, or
+/// backfill what is missing when a sidecar already exists. Mirrors the DB
+/// backends exactly:
+///
+/// - No sidecar → write the creation snapshot (`entry_count` = current
+///   transcript line count, 0 for a brand-new session whose transcript
+///   does not exist yet).
+/// - Sidecar exists and the caller supplies a `model` or
+///   `parent_session_id` the existing snapshot lacks (a backfill-created
+///   first line has `model = NULL`; a subagent row written by the parent
+///   at spawn time may lack the link the builder later learns) → append
+///   ONE fresh snapshot carrying the missing fields in, preserving every
+///   existing field and `created_at`, with a fresh `last_active_at` —
+///   the DB's `backfill_meta_snapshot` semantics. A second call finds the
+///   field already set and appends nothing (backfill once).
+/// - Sidecar exists and nothing is missing → no-op (an idempotent
+///   resume — a second creation line would rewrite `created_at` and
+///   pollute the audit file).
+///
+/// `entry_count` mirrors the DB backends' `next_seq` at creation: the
+/// transcript's current line count.
+fn jsonl_create_meta(
+    root: &Path,
+    session: &str,
+    model: Option<&str>,
+    role: Option<&str>,
+    parent_session_id: Option<&str>,
+    parent_task_id: Option<i64>,
+) -> anyhow::Result<()> {
+    if let Some(existing) = jsonl_read_meta_snapshot(root, session)? {
+        // Row already exists (resume, or a backfill/btw/subagent row whose
+        // model or parent link was unknown at write time): only ever
+        // backfill what is MISSING — never overwrite an existing model or
+        // link, and never append without something to record (R3-adjacent:
+        // exactly the DB's `backfill_parent || backfill_model` gate).
+        let backfill_parent = parent_session_id.is_some() && existing.parent_session_id.is_none();
+        let backfill_model = model.is_some() && existing.model.is_none();
+        if backfill_parent || backfill_model {
+            let mut meta = SessionMeta {
+                session_id: existing.session_id.clone(),
+                created_at: existing.created_at,
+                last_active_at: chrono::Utc::now().naive_utc(),
+                // Caller-supplied fields win over the existing values; the
+                // rest is carried over untouched (DB backfill_meta_snapshot).
+                model: model.map(str::to_owned).or_else(|| existing.model.clone()),
+                role: role.map(str::to_owned).or_else(|| existing.role.clone()),
+                entry_count: existing.entry_count,
+                parent_session_id: parent_session_id
+                    .map(str::to_owned)
+                    .or_else(|| existing.parent_session_id.clone()),
+                parent_task_id: parent_task_id.or(existing.parent_task_id),
+                title: existing.title.clone(),
+                pinned: existing.pinned,
+                archived: existing.archived,
+                writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
+                label: None, // label lives in running_tasks / background records, resolved at list time
+            };
+            return jsonl_append_meta_snapshot(root, session, &mut meta);
+        }
+        return Ok(()); // resume: nothing missing, never rewrite created_at
+    }
+    let now = chrono::Utc::now().naive_utc();
+    let mut meta = SessionMeta {
+        session_id: session.to_owned(),
+        created_at: now,
+        last_active_at: now,
+        model: model.map(str::to_owned),
+        role: role.map(str::to_owned),
+        entry_count: jsonl_count_transcript_entries(root, session)?,
+        parent_session_id: parent_session_id.map(str::to_owned),
+        parent_task_id,
+        title: None,    // a fresh session is unnamed until the user names it
+        pinned: None,   // a fresh session is unpinned until the user pins it
+        archived: None, // a fresh session is unarchived until the user archives it
+        writer: None,   // stamped by jsonl_append_meta_snapshot with the writing process
+        label: None,    // label lives in running_tasks / background records, resolved at list time
+    };
+    jsonl_append_meta_snapshot(root, session, &mut meta)
+}
+
+/// Shared read-tail → mutate → append for the flag setters (title, pin,
+/// archive). Never self-creates (R3): a missing sidecar is a no-op `Ok`,
+/// mirroring the DB backends. A fresh `last_active_at` is stamped here and
+/// `entry_count` is carried from the tail snapshot (the DB backends bump
+/// only `last_active_at` on these writes — the touch additionally
+/// refreshes `entry_count`, which is why it has its own function).
+fn jsonl_update_meta(
+    root: &Path,
+    session: &str,
+    mutate: impl FnOnce(&mut SessionMeta),
+) -> anyhow::Result<()> {
+    let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
+        return Ok(()); // R3: never self-create
+    };
+    mutate(&mut meta);
+    meta.last_active_at = chrono::Utc::now().naive_utc();
+    jsonl_append_meta_snapshot(root, session, &mut meta)
+}
+
+/// `touch_meta` for the JSONL backend: append one fresh snapshot line with
+/// `last_active_at = now` and `entry_count` = the current transcript line
+/// count, or no-op when no sidecar exists (R3 — a sidecar-less session
+/// must not fabricate its own row). The transcript is re-counted on every
+/// call: the store is stateless, and the count is the exact JSONL analogue
+/// of the DB's `next_seq`. Called synchronously at turn boundaries (like
+/// `record_background_start`); the read is a few hundred KB at worst.
+fn jsonl_touch_meta(root: &Path, session: &str) -> anyhow::Result<()> {
+    let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
+        return Ok(()); // R3: never self-create
+    };
+    meta.last_active_at = chrono::Utc::now().naive_utc();
+    meta.entry_count = jsonl_count_transcript_entries(root, session)?;
+    jsonl_append_meta_snapshot(root, session, &mut meta)
+}
+
+/// `list_meta` for the JSONL backend: scan `.e-agent/sessions/` for every
+/// metadata sidecar (`<id>.meta.jsonl` — the sessions-table mirror, so a
+/// freshly created zero-turn session is listed exactly like a DB row whose
+/// `session_entries` are still empty) and tail-read the newest snapshot of
+/// each. Transcripts without a sidecar are skipped: listing stays
+/// read-only, and the server bootstrap's `backfill_sessions` is the
+/// dedicated migration that gives them first lines (mirroring the DB
+/// backends, whose `list_meta` never self-creates rows either).
+/// `.background.jsonl` record files and transcripts are not sidecars, so
+/// they can never be mistaken for sessions. Sorted
+/// newest-activity-first, matching the SQLite query's ORDER BY.
+fn jsonl_list_meta(root: &Path) -> anyhow::Result<Vec<SessionMeta>> {
+    let directory = root.join(".e-agent/sessions");
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return Ok(Vec::new()); // no sessions directory yet
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Session ids cannot contain `.`, so `<id>.meta.jsonl` is
+        // unambiguous: the only files with this suffix are sidecars.
+        let Some(session_id) = name.strip_suffix(".meta.jsonl") else {
+            continue;
+        };
+        if let Some(meta) = jsonl_read_meta_snapshot(root, session_id)? {
+            out.push(meta);
+        }
+    }
+    out.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
+    Ok(out)
+}
+
+/// `delete_meta` for the JSONL backend: remove the session's sidecar file.
+/// The transcript stays, so resume still works. A missing sidecar is `Ok`
+/// (idempotent, matching the DB's zero-row DELETE). Known limitation
+/// (mirroring the audit-log design without tombstones): the next
+/// `backfill_sessions` bootstrap run re-creates the file from the
+/// transcript, so hiding is scoped to the current server lifetime.
+fn jsonl_delete_meta(root: &Path, session: &str) -> anyhow::Result<()> {
+    let path = jsonl_meta_sidecar_path(root, session)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// `backfill_sessions` for the JSONL backend: for every transcript without
+/// a `.meta.jsonl` sidecar, write a first snapshot line so historical
+/// sessions become visible in the list (the JSONL analogue of the DB
+/// backfill that aggregates `session_entries`). Idempotent: sessions that
+/// already have a sidecar are untouched, so running it twice yields
+/// identical results. Called once by the server bootstrap; never from
+/// `connect` (L3).
+///
+/// The transcript format carries no entry timestamps (unlike the DB's
+/// `event_time_us`), so both `created_at` and `last_active_at` are taken
+/// from the transcript file's mtime — the only recoverable activity signal
+/// for a pre-sidecar session. `entry_count` is the transcript line count.
+/// Legacy `.json` transcripts are excluded (they are rewritten to `.jsonl`
+/// on their next resume).
+fn jsonl_backfill_sessions(root: &Path) -> anyhow::Result<()> {
+    let directory = root.join(".e-agent/sessions");
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return Ok(()); // no sessions directory yet
+    };
+    let mut sessions: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let id = name.strip_suffix(".jsonl")?.to_owned();
+            if id.ends_with(".meta") || id.ends_with(".background") {
+                return None; // sidecar / background record, not a transcript
+            }
+            Some(id)
+        })
+        .collect();
+    sessions.sort();
+    for session in sessions {
+        if jsonl_read_meta_snapshot(root, &session)?.is_some() {
+            continue; // already has a snapshot (idempotent)
+        }
+        let mtime = std::fs::metadata(directory.join(format!("{session}.jsonl")))
+            .and_then(|meta| meta.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let at = chrono::DateTime::<chrono::Utc>::from(mtime).naive_utc();
+        let mut meta = SessionMeta {
+            session_id: session.clone(),
+            created_at: at,
+            last_active_at: at,
+            model: None,
+            role: None,
+            entry_count: jsonl_count_transcript_entries(root, &session)?,
+            parent_session_id: None,
+            parent_task_id: None,
+            title: None,    // pre-sidecar sessions have no user-assigned name
+            pinned: None,   // pre-sidecar sessions are unpinned
+            archived: None, // pre-sidecar sessions are unarchived
+            writer: None,   // stamped by jsonl_append_meta_snapshot with the writing process
+            label: None, // label lives in running_tasks / background records, resolved at list time
+        };
+        jsonl_append_meta_snapshot(root, &session, &mut meta)?;
+    }
+    Ok(())
+}
+
+/// `label_for_subagent` for the JSONL backend: scan every surviving
+/// `<id>.background.jsonl` record file for a delegate line whose
+/// `session_id` matches the subagent, and return the last (newest)
+/// matching label. Record lines are removed when the delegate task
+/// completes (`clear_background_task`), so a surviving line means the
+/// delegate is still live — exactly the `running_tasks` contract. Files
+/// are scanned in sorted name order and lines in append order, so "newest"
+/// is deterministic; a subagent with several live delegates reports the
+/// most recently recorded one. Non-destructive (called from the sessions
+/// list, like the DB lookup).
+fn jsonl_label_for_subagent(root: &Path, subagent_session_id: &str) -> Option<String> {
+    let directory = root.join(".e-agent/sessions");
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return None;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().ends_with(".background.jsonl"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    let mut label: Option<String> = None;
+    for file in files {
+        let Ok(reader) = std::fs::File::open(&file) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(reader)
+            .lines()
+            .map_while(|line| line.ok())
+        {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if record["session_id"].as_str() == Some(subagent_session_id)
+                && let Some(text) = record["label"].as_str()
+            {
+                label = Some(text.to_owned());
+            }
+        }
+    }
+    label
 }
 
 #[cfg(test)]
@@ -1912,3 +2359,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "session_jsonl_meta_tests.rs"]
+mod jsonl_meta_tests;
