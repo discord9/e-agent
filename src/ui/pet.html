@@ -233,10 +233,19 @@
   const fish = document.getElementById("petWhale");
   if (!fish) return;
   try { if (localStorage.getItem(PET_KEY) === "1") fish.hidden = true; } catch (e) {}
-  // 恢复上次拖拽位置（right/bottom → left/top 转换）
+  // 恢复上次拖拽位置（right/bottom → left/top 转换）。最多允许 10px
+  // 贴边溢出，保证 90px 的蓝鲸仍有大部分留在当前视口内。
   try {
     const pos = JSON.parse(localStorage.getItem(PET_POS_KEY) || "null");
-    if (pos && typeof pos.x === "number" && typeof pos.y === "number") {
+    const edgeOverhang = 10;
+    const fishWidth = fish.offsetWidth || 90;
+    const fishHeight = fish.offsetHeight || 90;
+    const isInViewport = pos
+      && Number.isFinite(pos.x) && Number.isFinite(pos.y)
+      && pos.x >= -edgeOverhang && pos.y >= -edgeOverhang
+      && pos.x <= window.innerWidth - fishWidth + edgeOverhang
+      && pos.y <= window.innerHeight - fishHeight + edgeOverhang;
+    if (isInViewport) {
       fish.style.left = pos.x + "px";
       fish.style.top = pos.y + "px";
       fish.style.right = "auto";
