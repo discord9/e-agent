@@ -1717,6 +1717,304 @@ async fn run_loop_skips_image_attachment_on_non_vision_models() {
     );
 }
 
+/// `ScriptedModel` that reports vision support (compact/round requests keep
+/// image parts — no stripping).
+struct VisionScriptedModel(ScriptedModel);
+
+#[async_trait]
+impl Model for VisionScriptedModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.0.complete(messages, tools, on_delta).await
+    }
+
+    fn supports_vision(&self) -> bool {
+        true
+    }
+}
+
+/// Scripted model that simulates the wire vision gate: when `vision` is
+/// false, any request carrying a `Message::User` image fails — exactly like
+/// `ensure_vision_supported`. Proves a poisoned history would surface as a
+/// failed call, so tests can assert recovery.
+struct GateSimModel {
+    replies: Vec<AssistantMessage>,
+    requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    vision: bool,
+}
+
+#[async_trait]
+impl Model for GateSimModel {
+    fn supports_vision(&self) -> bool {
+        self.vision
+    }
+
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        if !self.vision
+            && messages
+                .iter()
+                .any(|m| matches!(m, Message::User { images, .. } if !images.is_empty()))
+        {
+            anyhow::bail!("model does not support image input");
+        }
+        Ok((self.replies.remove(0), None))
+    }
+}
+
+#[tokio::test]
+async fn non_vision_round_recovers_legacy_image_history() {
+    // Legacy poisoned session: history carries an old image-bearing User
+    // message and nothing else — split==0, so compaction cannot run. The
+    // send-time cleanup in complete_round must still let the next round
+    // succeed on a non-vision model (which simulates the wire gate by
+    // erroring on image-bearing requests), while history keeps the image.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(GateSimModel {
+            replies: vec![AssistantMessage {
+                content: Some("ok".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            vision: false,
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "old image".into(),
+            images: vec![ImagePart {
+                hash: "deadbeef".into(),
+                mime: "image/png".into(),
+            }],
+        }
+        .into(),
+    ]);
+    // Compaction refuses (nothing to compact)…
+    assert!(
+        agent
+            .compact()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("nothing to compact")
+    );
+    // …but a normal round succeeds: the request is stripped at send time.
+    let answer = agent.run("look".into()).await.unwrap();
+    assert_eq!(answer, "ok");
+    let calls = requests.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].iter().all(|message| !matches!(
+        message,
+        Message::User { images, .. } if !images.is_empty()
+    )));
+    // History still holds the image — never permanently deleted.
+    assert!(agent.history().iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::User { images, .. }
+        } if !images.is_empty()
+    )));
+}
+
+#[tokio::test]
+async fn non_vision_compaction_strips_request_but_keeps_retained_images() {
+    // Non-vision compaction: the summary request must be stripped (the wire
+    // gate would otherwise reject it), but the persisted retained tail keeps
+    // its images so a later vision model regains them.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(GateSimModel {
+            replies: vec![AssistantMessage {
+                content: Some("summary".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            vision: false,
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "old with image".into(),
+            images: vec![ImagePart {
+                hash: "beef".into(),
+                mime: "image/png".into(),
+            }],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("early answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: "current with image".into(),
+            images: vec![ImagePart {
+                hash: "cafe".into(),
+                mime: "image/jpeg".into(),
+            }],
+        }
+        .into(),
+    ]);
+    assert_eq!(agent.compact().await.unwrap(), "summary");
+    // The compaction request carried no images (the gate would have failed).
+    let calls = requests.lock().unwrap();
+    assert!(calls[0].iter().all(|message| !matches!(
+        message,
+        Message::User { images, .. } if !images.is_empty()
+    )));
+    // The retained tail kept its image reference.
+    let compaction = agent
+        .history()
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Compaction { retained, .. } => Some(retained),
+            _ => None,
+        })
+        .expect("compaction entry");
+    assert!(compaction.iter().any(|message| matches!(
+        message,
+        Message::User { content, images } if content == "current with image" && !images.is_empty()
+    )));
+}
+
+#[tokio::test]
+async fn vision_compaction_keeps_images_in_request_and_retained_tail() {
+    // Vision compaction is lossless both ways: the summary request keeps the
+    // image parts, and the retained tail keeps the latest User's image.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(VisionScriptedModel(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some("summary".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        })),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "old with image".into(),
+            images: vec![ImagePart {
+                hash: "beef".into(),
+                mime: "image/png".into(),
+            }],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("early answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: "current with image".into(),
+            images: vec![ImagePart {
+                hash: "cafe".into(),
+                mime: "image/jpeg".into(),
+            }],
+        }
+        .into(),
+    ]);
+    assert_eq!(agent.compact().await.unwrap(), "summary");
+    // The vision compaction request kept the image in the compacted prefix.
+    let calls = requests.lock().unwrap();
+    assert!(calls[0].iter().any(|message| matches!(
+        message,
+        Message::User { content, images } if content == "old with image" && !images.is_empty()
+    )));
+    // The retained tail kept the latest User's image reference.
+    let compaction = agent
+        .history()
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Compaction { retained, .. } => Some(retained),
+            _ => None,
+        })
+        .expect("compaction entry");
+    assert!(compaction.iter().any(|message| matches!(
+        message,
+        Message::User { content, images } if content == "current with image" && !images.is_empty()
+    )));
+}
+
+#[tokio::test]
+async fn switching_back_to_vision_restores_images_in_requests() {
+    // A non-vision round strips the image from the request only; history
+    // keeps it, and after switching back to a vision model the image reaches
+    // the next request again.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some("first".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "look at this".into(),
+            images: vec![ImagePart {
+                hash: "cafe".into(),
+                mime: "image/webp".into(),
+            }],
+        }
+        .into(),
+    ]);
+    agent.complete_round(&[]).await.unwrap();
+    {
+        let calls = requests.lock().unwrap();
+        assert!(calls[0].iter().all(|message| !matches!(
+            message,
+            Message::User { images, .. } if !images.is_empty()
+        )));
+    }
+    assert!(agent.history().iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::User { images, .. }
+        } if !images.is_empty()
+    )));
+    // Switch back to a vision model: the image is restored on the wire.
+    agent.set_model(Box::new(VisionScriptedModel(ScriptedModel {
+        replies: vec![AssistantMessage {
+            content: Some("second".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        }],
+        requests: requests.clone(),
+        delays: Default::default(),
+    })));
+    agent.complete_round(&[]).await.unwrap();
+    let calls = requests.lock().unwrap();
+    assert!(calls[1].iter().any(|message| matches!(
+        message,
+        Message::User { images, .. } if !images.is_empty()
+    )));
+}
+
 #[test]
 fn context_includes_user_images() {
     let mut agent = Agent::new(

@@ -630,6 +630,15 @@ impl Agent {
         self.model = model;
     }
 
+    /// Whether the session's current model accepts image input. Non-vision
+    /// models cannot consume `Message::User` image parts — the vision gate
+    /// (`ensure_vision_supported`) would reject every later model call and
+    /// lock the session — so the runner skips read_image attachments and
+    /// rejects explicit `/image` prompts on such models.
+    pub(crate) fn supports_vision(&self) -> bool {
+        self.model.supports_vision()
+    }
+
     pub fn set_event_handler(&mut self, handler: Box<dyn FnMut(AgentEvent) + Send>) {
         self.event_handler = Some(handler);
     }
@@ -875,10 +884,15 @@ impl Agent {
             anyhow::bail!("nothing to compact");
         }
         let mut request = context[..split].to_vec();
-        // Non-vision models cannot consume image parts; strip them so
-        // compaction still works on sessions that attached images (the
-        // vision gate would otherwise reject the compaction request too).
-        strip_images(&mut request);
+        // Only non-vision models need image stripping on the compaction
+        // request itself (the wire gate would otherwise reject it). The
+        // persisted history and the retained tail keep images untouched:
+        // `complete_round` strips them from the request at send time under
+        // a non-vision model, and a vision model regains them on switch
+        // back — stripping retained here would be lossy for vision models.
+        if !self.model.supports_vision() {
+            strip_images(&mut request);
+        }
         request.push(Message::User {
             content: "Summarize the earlier conversation. Preserve the user's goals, decisions made, files changed, and unfinished work. Be concise and use Chinese or English to match the conversation language.".into(),
             images: vec![],
@@ -995,7 +1009,17 @@ impl Agent {
         specs: &[ToolSpec],
     ) -> anyhow::Result<RoundOutput> {
         let mut produced_content_delta = false;
-        let context = self.context();
+        let mut context = self.context();
+        // Non-vision models cannot consume image parts. Strip them from the
+        // *request* only, so the wire gate never rejects the whole history
+        // and the session is not locked (this is the fallback that lets
+        // sessions with legacy image-bearing history — e.g. split==0 where
+        // compaction cannot run — keep working). The persisted history is
+        // untouched: switching back to a vision model restores the images
+        // on the next request.
+        if !self.model.supports_vision() {
+            strip_images(&mut context);
+        }
         let model = &mut self.model;
         let event_handler = &mut self.event_handler;
         let mut on_delta = |kind: ModelDeltaKind, delta: &str| {

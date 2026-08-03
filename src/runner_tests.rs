@@ -231,6 +231,106 @@ impl Model for ScriptedContextCaptureModel {
     }
 }
 
+/// `ScriptedContextCaptureModel` that reports vision support, so tests can
+/// exercise the image-attachment paths that require a vision-capable model
+/// (the runner skips read_image attachments and rejects explicit `/image`
+/// prompts on non-vision models).
+struct VisionScriptedContextCaptureModel(ScriptedContextCaptureModel);
+
+#[async_trait]
+impl Model for VisionScriptedContextCaptureModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.0.complete(messages, tools, on_delta).await
+    }
+
+    fn supports_vision(&self) -> bool {
+        true
+    }
+}
+
+/// Emits a read_image result carrying the structured image marker; shared by
+/// the runner tests covering marker splitting and synthetic attachment.
+struct MarkerTool;
+
+#[async_trait]
+impl Tool for MarkerTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "read_image".into(),
+            description: "test".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<String, String> {
+        Ok("__EA_IMAGE__hash123,image/png__EA_IMAGE_END__[image read: pic.png] (hash hash123, image/png, 3 bytes)".into())
+    }
+}
+
+/// Scripted model with a `vision` flag and an optional simulation of the
+/// wire vision gate: when `error_on_images` is set, any request carrying a
+/// `Message::User` image fails — exactly like `ensure_vision_supported` on
+/// the real wires. Used to prove a poisoned history would surface as a
+/// failed model call, so tests can assert the session was NOT poisoned.
+struct GateScriptedModel {
+    replies: VecDeque<(AssistantMessage, Option<Usage>)>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+    vision: bool,
+    error_on_images: bool,
+}
+
+#[async_trait]
+impl Model for GateScriptedModel {
+    fn supports_vision(&self) -> bool {
+        self.vision
+    }
+
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        if self.error_on_images
+            && messages
+                .iter()
+                .any(|m| matches!(m, Message::User { images, .. } if !images.is_empty()))
+        {
+            anyhow::bail!("model does not support image input");
+        }
+        Ok(self.replies.pop_front().expect("unexpected model call"))
+    }
+}
+
+/// Marker-emitting read_image that blocks until released, so a test can
+/// queue a `SwitchModel` command while the tool is still executing (the
+/// command lands in `wait_for_operation`'s pending cache).
+struct BlockingMarkerTool {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Tool for BlockingMarkerTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "read_image".into(),
+            description: "test".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<String, String> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok("__EA_IMAGE__hash123,image/png__EA_IMAGE_END__[image read: pic.png] (hash hash123, image/png, 3 bytes)".into())
+    }
+}
+
 struct CompletingWithCancelTool {
     commands: Arc<Mutex<Option<mpsc::UnboundedSender<SessionCommand>>>>,
 }
@@ -1777,21 +1877,7 @@ async fn natural_completion_of_finish_when_idle_still_finalizes() {
 }
 
 #[tokio::test]
-async fn runner_strips_image_marker_and_attaches_synthetic_user() {
-    struct MarkerTool;
-    #[async_trait]
-    impl Tool for MarkerTool {
-        fn spec(&self) -> ToolSpec {
-            ToolSpec {
-                name: "read_image".into(),
-                description: "test".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            }
-        }
-        async fn execute(&self, _: Value) -> Result<String, String> {
-            Ok("__EA_IMAGE__hash123,image/png__EA_IMAGE_END__[image read: pic.png] (hash hash123, image/png, 3 bytes)".into())
-        }
-    }
+async fn runner_strips_image_marker_and_skips_attachment_without_vision() {
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let agent = Agent::new(
@@ -1827,7 +1913,101 @@ async fn runner_strips_image_marker_and_attaches_synthetic_user() {
         agent,
         SessionStore::Jsonl,
         temp.path().into(),
-        "marker".into(),
+        "marker-novision".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("look".into()));
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
+    );
+    task.join().await.unwrap();
+
+    // Persisted tool entry has the summary only, annotated that the image
+    // attachment was skipped (the vision gate would otherwise lock the
+    // session); no synthetic user message carries the image.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "marker-novision")
+        .await
+        .unwrap();
+    let tool = loaded
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Message {
+                message: Message::Tool { content, .. },
+            } => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(tool.starts_with("[image read: pic.png]"));
+    assert!(tool.contains("已跳过附加"));
+    assert!(!tool.contains("__EA_IMAGE__"));
+    let synthetic = loaded
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Message {
+                message: Message::User { content, images },
+            } => Some((content.clone(), images.clone())),
+            _ => None,
+        })
+        .find(|(content, _)| content.starts_with("[image attached:"));
+    assert!(
+        synthetic.is_none(),
+        "no synthetic image user message on a non-vision model"
+    );
+    // The second model call saw no images.
+    let calls = calls.lock().unwrap();
+    assert!(
+        calls[1]
+            .iter()
+            .all(|message| !matches!(message, Message::User { images, .. } if !images.is_empty()))
+    );
+}
+
+#[tokio::test]
+async fn runner_attaches_image_marker_with_vision_model() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(VisionScriptedContextCaptureModel(
+            ScriptedContextCaptureModel {
+                replies: vec![
+                    (
+                        AssistantMessage {
+                            content: None,
+                            tool_calls: vec![ToolCall {
+                                id: "call-img".into(),
+                                name: "read_image".into(),
+                                arguments: r#"{"path":"pic.png"}"#.into(),
+                            }],
+                            reasoning: None,
+                        },
+                        None,
+                    ),
+                    (
+                        AssistantMessage {
+                            content: Some("done".into()),
+                            tool_calls: vec![],
+                            reasoning: None,
+                        },
+                        None,
+                    ),
+                ]
+                .into(),
+                calls: calls.clone(),
+            },
+        )),
+        vec![Box::new(MarkerTool)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "marker-vision".into(),
         IdlePolicy::FinishWhenIdle,
     );
     let task = runner.start(Some("look".into()));
@@ -1842,7 +2022,7 @@ async fn runner_strips_image_marker_and_attaches_synthetic_user() {
     // Persisted tool entry has the summary only; the synthetic user message
     // carrying the image reference follows it.
     let loaded = SessionStore::Jsonl
-        .load(temp.path(), "marker")
+        .load(temp.path(), "marker-vision")
         .await
         .unwrap();
     let tool = loaded
@@ -1857,6 +2037,7 @@ async fn runner_strips_image_marker_and_attaches_synthetic_user() {
         .unwrap();
     assert!(tool.starts_with("[image read: pic.png]"));
     assert!(!tool.contains("__EA_IMAGE__"));
+    assert!(!tool.contains("已跳过附加"));
     let synthetic = loaded
         .entries
         .iter()
@@ -1885,22 +2066,230 @@ async fn runner_strips_image_marker_and_attaches_synthetic_user() {
 }
 
 #[tokio::test]
+async fn switch_to_non_vision_during_read_image_skips_attachment() {
+    // Race: the session starts on a vision model, calls read_image, and the
+    // user switches to a non-vision model WHILE the tool is executing. The
+    // switch must take effect before the marker is interpreted: the image
+    // must NOT be attached, and the next (non-vision) model call — which
+    // simulates the wire vision gate by erroring on image-bearing requests
+    // — must succeed.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let vision = GateScriptedModel {
+        replies: vec![(
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-img".into(),
+                    name: "read_image".into(),
+                    arguments: r#"{"path":"pic.png"}"#.into(),
+                }],
+                reasoning: None,
+            },
+            None,
+        )]
+        .into(),
+        calls: calls.clone(),
+        vision: true,
+        error_on_images: false,
+    };
+    let non_vision = GateScriptedModel {
+        replies: vec![(
+            AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            None,
+        )]
+        .into(),
+        calls: calls.clone(),
+        vision: false,
+        error_on_images: true,
+    };
+    let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let agent = Agent::new(
+        Box::new(vision),
+        vec![Box::new(BlockingMarkerTool {
+            entered: entered.clone(),
+            release: release.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "switch-v2nv".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("look".into()));
+    entered.notified().await;
+    handle.switch_model(Box::new(non_vision));
+    release.notify_one();
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
+    );
+    task.join().await.unwrap();
+
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "switch-v2nv")
+        .await
+        .unwrap();
+    // No synthetic image user message was committed under the new model.
+    let synthetic = loaded.entries.iter().any(|entry| match entry {
+        SessionEntry::Message {
+            message: Message::User { content, images },
+        } => content.starts_with("[image attached:") && !images.is_empty(),
+        _ => false,
+    });
+    assert!(
+        !synthetic,
+        "image must not be attached after switch to non-vision"
+    );
+    // The tool summary carries the skip annotation.
+    let tool = loaded
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Message {
+                message: Message::Tool { content, .. },
+            } => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(tool.contains("已跳过附加"));
+    // The non-vision model's request was clean (it would have errored on an
+    // image-bearing request — the session was not poisoned).
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].iter().all(|message| !matches!(
+        message,
+        Message::User { images, .. } if !images.is_empty()
+    )));
+}
+
+#[tokio::test]
+async fn switch_to_vision_during_read_image_attaches() {
+    // Inverse race: session starts on a non-vision model, calls read_image,
+    // and the user switches to a vision model WHILE the tool is executing.
+    // The image must be attached (the guard must see the NEW model) and
+    // reach the next model call.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let non_vision = GateScriptedModel {
+        replies: vec![(
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-img".into(),
+                    name: "read_image".into(),
+                    arguments: r#"{"path":"pic.png"}"#.into(),
+                }],
+                reasoning: None,
+            },
+            None,
+        )]
+        .into(),
+        calls: calls.clone(),
+        vision: false,
+        error_on_images: false,
+    };
+    let vision = GateScriptedModel {
+        replies: vec![(
+            AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            None,
+        )]
+        .into(),
+        calls: calls.clone(),
+        vision: true,
+        error_on_images: false,
+    };
+    let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let agent = Agent::new(
+        Box::new(non_vision),
+        vec![Box::new(BlockingMarkerTool {
+            entered: entered.clone(),
+            release: release.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "switch-nv2v".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("look".into()));
+    entered.notified().await;
+    handle.switch_model(Box::new(vision));
+    release.notify_one();
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
+    );
+    task.join().await.unwrap();
+
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "switch-nv2v")
+        .await
+        .unwrap();
+    // The synthetic image user message was committed and carries the image.
+    let synthetic = loaded
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Message {
+                message: Message::User { content, images },
+            } => Some((content.clone(), images.clone())),
+            _ => None,
+        })
+        .find(|(content, _)| content.starts_with("[image attached:"));
+    let (content, images) = synthetic.expect("synthetic image user message");
+    assert_eq!(content, "[image attached: pic.png]");
+    assert_eq!(
+        images,
+        vec![crate::agent::ImagePart {
+            hash: "hash123".into(),
+            mime: "image/png".into(),
+        }]
+    );
+    // The vision model's next request saw the image.
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].iter().any(|message| matches!(
+        message,
+        Message::User { images, .. } if !images.is_empty()
+    )));
+}
+
+#[tokio::test]
 async fn prompt_with_image_rides_on_the_committed_user_message() {
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let agent = Agent::new(
-        Box::new(ScriptedContextCaptureModel {
-            replies: vec![(
-                AssistantMessage {
-                    content: Some("answered".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                None,
-            )]
-            .into(),
-            calls: calls.clone(),
-        }),
+        Box::new(VisionScriptedContextCaptureModel(
+            ScriptedContextCaptureModel {
+                replies: vec![(
+                    AssistantMessage {
+                        content: Some("answered".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                )]
+                .into(),
+                calls: calls.clone(),
+            },
+        )),
         vec![],
     );
     let (runner, handle) = SessionRunner::new(
@@ -1940,5 +2329,157 @@ async fn prompt_with_image_rides_on_the_committed_user_message() {
             hash: "abc".into(),
             mime: "image/jpeg".into(),
         }]
+    );
+}
+
+#[tokio::test]
+async fn prompt_with_image_rejected_on_non_vision_model() {
+    // Explicit `/image` entrance on a non-vision model is rejected loudly:
+    // an Error event is surfaced, nothing is committed (no poisoned User
+    // message), and the session survives instead of terminating as Failed.
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("answered".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+        vec![],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "reject-image".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(None);
+    handle.prompt_with_image(
+        "what is this?",
+        crate::agent::ImagePart {
+            hash: "abc".into(),
+            mime: "image/jpeg".into(),
+        },
+    );
+    loop {
+        if let AgentEvent::Error(text) = live.recv().await.unwrap() {
+            assert!(text.contains("不支持图片"));
+            break;
+        }
+    }
+    // The session was not killed by the rejection: it returns to Idle and
+    // finalizes normally (Completed, not Failed).
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(None))
+    );
+    task.join().await.unwrap();
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "reject-image")
+        .await
+        .unwrap();
+    assert!(
+        loaded.entries.iter().all(|entry| !matches!(
+            entry,
+            SessionEntry::Message {
+                message: Message::User { content, images }
+            } if content == "what is this?" || !images.is_empty()
+        )),
+        "rejected prompt with image must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn prompt_with_image_rejected_then_plain_prompt_succeeds() {
+    // WaitForInput variant: after the `/image` rejection the session returns
+    // to Idle and keeps accepting input — a follow-up plain prompt is
+    // answered normally, and the rejected image never lands in history.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("answered".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        // KeepAliveTool holds a background-channel sender, so the
+        // WaitForInput session survives the idle select after the rejection
+        // (with no sender-storing tool the session would terminate Closed
+        // at idle — the runner treats a closed background channel as
+        // "no more background work").
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "reject-then-plain".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(None);
+    handle.prompt_with_image(
+        "what is this?",
+        crate::agent::ImagePart {
+            hash: "abc".into(),
+            mime: "image/jpeg".into(),
+        },
+    );
+    loop {
+        let ev = live.recv().await.unwrap();
+        if let AgentEvent::Error(text) = ev {
+            assert!(text.contains("不支持图片"));
+            break;
+        }
+    }
+    // Back to Idle after the rejection.
+    let idle = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert_eq!(idle, SessionStatus::Idle);
+    // A plain follow-up prompt is answered normally.
+    handle.prompt("plain question");
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "answered" => break,
+            AgentEvent::Error(text) => panic!("follow-up turn failed: {text}"),
+            _ => {}
+        }
+    }
+    drop(handle);
+    task.join().await.unwrap();
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "reject-then-plain")
+        .await
+        .unwrap();
+    // The plain prompt was persisted; no image-bearing message ever was.
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::User { content, .. }
+        } if content == "plain question"
+    )));
+    assert!(
+        loaded.entries.iter().all(|entry| !matches!(
+            entry,
+            SessionEntry::Message {
+                message: Message::User { images, .. }
+            } if !images.is_empty()
+        )),
+        "rejected image must never be persisted"
     );
 }

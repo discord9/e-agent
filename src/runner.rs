@@ -68,6 +68,16 @@ where
         tokio::select! {
             biased;
             value = operation.as_mut() => {
+                // Drain any command that arrived in the same scheduling turn
+                // as the completion: the biased select polls the operation
+                // branch first, so a command can still be sitting in the
+                // channel even though the operation is already ready.
+                // Callers decide what to do with them (the runner must apply
+                // a SwitchModel before interpreting a tool result, so the
+                // vision guard sees the *new* model).
+                while let Ok(command) = commands.try_recv() {
+                    pending.push(command);
+                }
                 return WaitResult { outcome: WaitOutcome::Completed(value), pending };
             }
             command = commands.recv() => match command {
@@ -464,6 +474,13 @@ impl SessionRunner {
         image: Option<ImagePart>,
         consumed: Vec<(bool, String)>,
     ) -> anyhow::Result<()> {
+        // Explicit `/image` entrance: a non-vision model cannot consume the
+        // image, and committing it would poison every later model call via
+        // the vision gate. Reject loudly — the caller surfaces the error to
+        // the user and keeps the session alive.
+        if image.is_some() && !self.agent.supports_vision() {
+            anyhow::bail!("当前模型不支持图片输入");
+        }
         let entry: SessionEntry = Message::User {
             content,
             images: image.map_or_else(Vec::new, |image| vec![image]),
@@ -615,6 +632,29 @@ impl SessionRunner {
             cancelled |= self.queue(command);
         }
         self.drain_ready_commands() || cancelled
+    }
+
+    /// Apply `SwitchModel` commands cached while an operation was in flight,
+    /// returning the remaining commands in their original order for the
+    /// regular intake. `wait_for_operation` collects commands received
+    /// during e.g. a tool execution into `pending`; a model switch must take
+    /// effect BEFORE the tool's result is interpreted, because the vision
+    /// guard on read_image results decides with the *new* model. Otherwise a
+    /// vision→non-vision switch made mid-execution would still commit the
+    /// image (poisoning every later model call through the wire gate), and a
+    /// non-vision→vision switch would wrongly drop it.
+    fn apply_pending_model_switches(
+        &mut self,
+        pending: Vec<SessionCommand>,
+    ) -> Vec<SessionCommand> {
+        let mut deferred = Vec::with_capacity(pending.len());
+        for command in pending {
+            match command {
+                SessionCommand::SwitchModel(model) => self.agent.set_model(model),
+                other => deferred.push(other),
+            }
+        }
+        deferred
     }
 
     fn has_work(&self) -> bool {
@@ -826,12 +866,26 @@ impl SessionRunner {
             // idle point).
             self.cancelled = false;
             self.status(SessionStatus::Busy);
-            if !prompt.is_empty()
-                && let Err(error) = self.commit_user_batch(prompt, image, consumed).await
-            {
-                self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
-                    .await;
-                return;
+            if !prompt.is_empty() {
+                let image_rejected = image.is_some() && !self.agent.supports_vision();
+                if let Err(error) = self.commit_user_batch(prompt, image, consumed).await {
+                    if image_rejected {
+                        // Explicit `/image` on a non-vision model is a
+                        // user-facing rejection, not a session failure:
+                        // surface the error and return to Idle so the user
+                        // can retry without the image. Nothing was committed
+                        // (a poisoned User message would lock every later
+                        // model call behind the vision gate).
+                        self.shared
+                            .lock()
+                            .unwrap()
+                            .emit(AgentEvent::Error(format!("{error:#}")));
+                        continue;
+                    }
+                    self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                        .await;
+                    return;
+                }
             }
             let specs = self.agent.tool_specs();
             'turn: loop {
@@ -941,15 +995,32 @@ impl SessionRunner {
                             return;
                         }
                     };
+                    // A model switch queued while the tool ran must apply
+                    // BEFORE the result is interpreted: the vision guard
+                    // below decides with the *new* model (see
+                    // apply_pending_model_switches). Other cached commands
+                    // keep their order and are intaken after the commit.
+                    let pending = self.apply_pending_model_switches(waited.pending);
                     // A read_image result carries a structured image marker;
                     // strip it so the committed Tool entry and the ToolResult
                     // event keep only the text summary (base64 never reaches
                     // the scrollback), then attach the image as a synthetic
                     // User message right after the tool result (images ride
-                    // only on user role).
-                    let (tool_text, image) = match &result {
+                    // only on user role). Non-vision models cannot consume
+                    // image parts: keep the text summary but skip the
+                    // attachment, so the session is not locked out of every
+                    // later model call by the vision gate (compaction would
+                    // fail the same way).
+                    let (mut tool_text, image) = match &result {
                         Ok(content) => crate::agent::split_image_marker(content),
                         Err(error) => (error.clone(), None),
+                    };
+                    let supports_vision = self.agent.supports_vision();
+                    let image = if image.is_some() && !supports_vision {
+                        tool_text.push_str("（当前模型不支持图片，已跳过附加）");
+                        None
+                    } else {
+                        image
                     };
                     let entry = Message::Tool {
                         call_id: call.id.clone(),
@@ -960,7 +1031,7 @@ impl SessionRunner {
                     }
                     .into();
                     if let Err(error) = self.commit(entry).await {
-                        self.terminate(SessionResult::Failed(format!("{error:#}")), waited.pending)
+                        self.terminate(SessionResult::Failed(format!("{error:#}")), pending)
                             .await;
                         return;
                     }
@@ -978,15 +1049,12 @@ impl SessionRunner {
                         }
                         .into();
                         if let Err(error) = self.commit(user_entry).await {
-                            self.terminate(
-                                SessionResult::Failed(format!("{error:#}")),
-                                waited.pending,
-                            )
-                            .await;
+                            self.terminate(SessionResult::Failed(format!("{error:#}")), pending)
+                                .await;
                             return;
                         }
                     }
-                    self.intake_after_operation(waited.pending);
+                    self.intake_after_operation(pending);
                     if self.stop_turn_for_cancel() {
                         break 'turn;
                     }
