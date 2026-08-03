@@ -292,6 +292,10 @@ let bPostResolve = null;
 let aHistoryDelayed = false;
 let aHistoryResolve = null;
 let sessionsBFormat = false;
+// SSE 404 竞态测试：/api/sessions GET 延迟（手动 resolve）——模拟「任务面板
+// 直连刚结束的 subagent」时列表刷新未完成（旧缓存仍 active:true）
+let sessionsDelayed = false;
+let sessionsResolve = null;
 // SSE 生命周期测试：a1 的 events 流手动控制（首个 read 挂起，测试切走后
 // 再 resolve 陈旧块；验证陈旧流不渲染到当前会话/workspace）
 let a1StreamManual = false;
@@ -314,7 +318,10 @@ globalThis.fetch=(url,opts={})=>{
   // SSE 404 语义测试：命中这些 id 的 /events 返回 404（优先于下方具体会话路由）
   const _m404 = /^\/api\/sessions\/([^/]+)\/events$/.exec(url);
   if (_m404 && sse404Ids.has(_m404[1])) return resp(404, {});
-  if(url==="/api/sessions"&&m==="GET") return resp(200, sessionsData);
+  if(url==="/api/sessions"&&m==="GET") {
+    if (sessionsDelayed) return new Promise((resolve) => { sessionsResolve = resolve; });
+    return resp(200, sessionsData);
+  }
   // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
   if(url==="http://b.local/api/sessions"&&m==="GET") {
     if (sessionsBFail) return resp(500, {});
@@ -2153,8 +2160,15 @@ async function main(){
     //     点进已结束的子会话时不得误报。按 sessionKnownState 判定：
     //     - active===false（已知历史）→ 静默降级 + 「会话已结束」轻提示，
     //       不弹「不存在」、不重连
-    //     - active!==false（已知应存活）→ 保持「不存在」报错，但也不重连
+    //     - active!==false（缓存判定应存活）→ 先刷新对应 workspace 的会话
+    //       列表再分类（Fix 2 竞态：任务面板 openSession 先于列表刷新，旧
+    //       缓存可能仍是 active:true 而服务端已结束）：
+    //       刷新后仍 active → 真 live，弹「不存在」报错（也不重连）
+    //       刷新后 active===false → 历史已结束：静默 + 轻提示（同历史路径）
+    //       刷新后仍查不到 → unknown：完全静默
     //     - 不在任何列表（任务面板直连刚结束的子会话）→ 完全静默，不重连
+    //     404 一律停止重连（stopped 语义不变）；重开后 openSession 重置
+    //     stopped 并可重新连接。
     // =====================================================================
     const _savedList404 = state.lastList;
     const _savedWsLists404 = Object.assign({}, state.workspaceLists);
@@ -2189,12 +2203,16 @@ async function main(){
         && scheduledTimeouts.length === _to404a,
         "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
     sse404Ids.delete("s1");
-    // (b) 已知应存活（active===true）：保持「不存在」报错，但不重连
+    // (b) 真 live（刷新后仍 active）：live 的 404 先刷新列表再分类——
+    //     刷新（立即返回的 sessionsData 仍 active:true）后重分类仍为 live
+    //     → 保持「不存在」报错，但不重连
+    sessionsData = [{ id: "s1", status: "Idle", entry_count: 8, busy: false, active: true }];
     _open404("s1", [{ id: "s1", status: "Idle", entry_count: 8, busy: false, active: true }]);
     sse404Ids.add("s1");
     const _to404b = scheduledTimeouts.length;
     connectSSE("s1", state.workspace.id, sessionOpenEpoch);
     await flush();
+    await flush();   // 等列表刷新（立即返回）完成后的重分类
     chk("sse404 live: gone banner still shown",
         elsById["banner"].hidden === false
         && elsById["bannerText"].textContent.indexOf("不存在") !== -1,
@@ -2219,6 +2237,60 @@ async function main(){
         && scheduledTimeouts.length === _to404c,
         "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
     sse404Ids.delete("sub-finished");
+    // (d) 竞态（Fix 2 核心）：缓存标 live 但实际已结束的 subagent——任务
+    //     面板点击时 openSession 先于列表刷新（异步），旧缓存 active:true，
+    //     服务端 live 注册已清理 → /events 404 先于刷新完成。live 的 404
+    //     先停重连、刷新对应 workspace 列表（挂起）再分类：刷新后
+    //     active===false → 静默 + 「会话已结束」轻提示，不弹「不存在」。
+    sessionsDelayed = true;   // 列表刷新挂起（模拟刷新未完成）
+    sessionsData = [{ id: "sub-race", status: "Idle", entry_count: 1, busy: false, active: true }];
+    _open404("sub-race", [{ id: "sub-race", status: "Idle", entry_count: 1, busy: false, active: true }]);
+    sse404Ids.add("sub-race");
+    const _to404d = scheduledTimeouts.length;
+    const _listFetchesD = FETCHES.filter((u) => u === "/api/sessions").length;
+    connectSSE("sub-race", state.workspace.id, sessionOpenEpoch);
+    await flush();
+    chk("sse404 race: refresh pending, no banner yet",
+        elsById["banner"].hidden === true
+        && elsById["bannerText"].textContent.indexOf("不存在") === -1,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    chk("sse404 race: stopped immediately (no reconnect while refreshing)",
+        state.sse.stopped === true && state.sse.retryTimer === null,
+        "stopped=" + state.sse.stopped);
+    chk("sse404 race: list refresh issued for workspace",
+        FETCHES.filter((u) => u === "/api/sessions").length === _listFetchesD + 1,
+        "n=" + (FETCHES.filter((u) => u === "/api/sessions").length - _listFetchesD));
+    // 模拟刷新完成：服务端列表已把该 subagent 标记为结束（active:false）
+    sessionsData = [{ id: "sub-race", status: "Idle", entry_count: 1, busy: false, active: false }];
+    sessionsResolve(resp(200, sessionsData));
+    await flush();
+    await flush();
+    chk("sse404 race: no gone banner after refresh (ended subagent)",
+        elsById["banner"].hidden === true
+        && elsById["bannerText"].textContent.indexOf("不存在") === -1,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    chk("sse404 race: ended hint after refresh",
+        elsById["connState"].textContent === "会话已结束"
+        && elsById["connState"].className === "conn-state ended",
+        "conn=" + JSON.stringify(elsById["connState"].textContent));
+    chk("sse404 race: stopped, no reconnect",
+        state.sse.stopped === true && state.sse.retryTimer === null
+        && scheduledTimeouts.length === _to404d,
+        "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
+    sse404Ids.delete("sub-race");
+    sessionsDelayed = false;
+    // (e) 404 后同会话重开：openSession → connectSSE 重置 stopped（stopSSE
+    //     清旧流 → stopped=false → 新 /events fetch）——确认既有实现，能
+    //     重新连接
+    const _s1EventsBeforeE = FETCHES.filter((u) => u === "/api/sessions/s1/events").length;
+    openSession("s1");
+    await flush();
+    await flush();
+    chk("sse404 reopen: stopped reset + events stream re-fetched",
+        state.sse.stopped === false
+        && FETCHES.filter((u) => u === "/api/sessions/s1/events").length === _s1EventsBeforeE + 1,
+        "stopped=" + state.sse.stopped
+        + " events=" + FETCHES.filter((u) => u === "/api/sessions/s1/events").length);
     // 还原（本段之后无其它测试，仍保持整洁）
     state.lastList = _savedList404;
     state.workspaceLists = _savedWsLists404;

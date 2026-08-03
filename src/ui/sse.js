@@ -46,6 +46,43 @@ function sessionKnownState(id, wsId) {
   return "unknown";
 }
 
+/* 404 分类后处理（复用）：historical/unknown/live 三态的收尾行为。404 一律
+   已停（state.sse.stopped=true，不重连）；调用方保证当前上下文仍是
+   stillCurrent(id, wsId, epoch)——缓存直判路径同步调用，live 刷新重分类
+   路径在 await 刷新后再校验一次。上下文已变（用户切走/开了别的会话）→
+   什么都不做：不弹 banner、不动连接状态。
+   - "historical"（active===false）：历史/已结束会话无实时流属预期 →
+     静默 + 「会话已结束」轻提示（conn-state ended）
+   - "unknown"（不在任何列表）：任务面板直连刚结束的子会话 → 完全静默
+   - "live"（应存活却 404）：会话真不存在 → 弹「不存在」banner
+   三种状态都不重连（stopped 已由 404 处理置位）。 */
+function handleSse404Classified(known, id, wsId, epoch) {
+  if (!stillCurrent(id, wsId, epoch)) return;
+  if (known === "live") {
+    setBanner("⚠ 会话不存在或已被删除。");
+  } else if (known === "historical") {
+    setConn("ended", "会话已结束");
+  }
+  // unknown：完全静默（无 banner、无连接状态提示）
+}
+
+/* 缓存判定为 live 的 404：刷新对应 workspace 的会话列表后再分类（防竞态）。
+   场景：任务面板点击 subagent → openSession（列表刷新异步触发）→ subagent
+   已在服务端结束而浏览器上一轮列表仍是 active:true → /events 404 先于刷新
+   完成。刷新后：
+   - active===false → 历史已结束：静默 + 轻提示（同 historical 路径）
+   - 仍查不到 → unknown：静默
+   - 仍 active → 真 live：才弹「不存在」banner
+   刷新失败（HTTP/网络）→ pollWorkspaceSessions 保留旧列表（stale），分类
+   按旧缓存走（live → banner），不吞真错误。
+   await 完成后经 handleSse404Classified 的 stillCurrent 守卫：期间用户
+   切走/开了别的会话 → 不弹、不动状态。 */
+async function handleLive404Refresh(id, wsId, epoch) {
+  const ws = (state.workspaces || []).find((w) => w.id === wsId);
+  if (ws) await pollWorkspaceSessions(ws);
+  handleSse404Classified(sessionKnownState(id, wsId), id, wsId, epoch);
+}
+
 function connectSSE(id, wsId, epoch) {
   // 起流前三重校验：陈旧 history 响应绝不能对刚激活的服务器/会话起 SSE。
   if (!stillCurrent(id, wsId, epoch)) return;
@@ -71,18 +108,28 @@ function connectSSE(id, wsId, epoch) {
       //   刚结束的子会话）：SSE 端点只服务 live 会话，404 = 没有实时流，
       //   会话本身存在（history 刚加载成功，transcript 可读）。静默降级：
       //   不弹「不存在」、不重连（重连只会再次 404）；历史会话给轻量提示。
-      // - 已知应存活（active!==false）却 404：会话真的不存在，保持报错。
+      // - 缓存判定为 live（active!==false）却 404：可能是会话真不存在，
+      //   也可能是缓存过期——任务面板点击 subagent 时 openSession 先于
+      //   列表刷新（异步触发），subagent 已在服务端结束（live 注册被清理）
+      //   而浏览器上一轮列表仍是 active:true，/events 404 先于刷新完成。
+      //   处理：先停重连（404 一律停），live 时刷新对应 workspace 的会话
+      //   列表后重分类——刷新后 active===false → 静默 + 「会话已结束」轻
+      //   提示（同 historical 路径）；仍查不到 → 静默；仍 active → 才弹
+      //   原「不存在」banner。
       // 先校验上下文：陈旧请求的 404 不得弹提示、不得停新会话的流。
       if (!stillCurrent(id, wsId, epoch)) { try { ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
+      state.sse.stopped = true;                         // 404 = 无流：一律停，不重连
       const known = sessionKnownState(id, wsId);
-      if (known !== "live") {
-        state.sse.stopped = true;                       // 无流可连：停，不重连
-        if (known === "historical") setConn("ended", "会话已结束");
-        throw new Error("silent-gone");
+      if (known === "live") {
+        // 缓存可能过期（任务面板直连刚结束的 subagent）：异步刷新列表后
+        // 在 stillCurrent 守卫下重分类；期间用户切走/开了别的会话 → 不弹、
+        // 不动状态（守卫在 handleSse404Classified 内）。
+        handleLive404Refresh(id, wsId, epoch);
+      } else {
+        // 历史/未知：缓存判定已足够，同步分类即可（无需刷新）
+        handleSse404Classified(known, id, wsId, epoch);
       }
-      setBanner("⚠ 会话不存在或已被删除。");
-      state.sse.stopped = true;                         // 404 = 无流：重连也 404
-      throw new Error("gone");
+      throw new Error("silent-gone");
     }
     if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
     // 响应回来时上下文可能已被取代（新打开/切换）：不起流、不画连接状态
