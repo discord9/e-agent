@@ -586,12 +586,17 @@ impl GreptimeSession {
     /// so paging uses `seq >= start AND seq < before_seq ORDER BY seq DESC
     /// LIMIT n` (the tail of the segment) and reverses the page to
     /// ascending order. On the paged path the limit applies AFTER a
-    /// SQL-side dedup (latest `event_time` per seq, a subquery join —
-    /// `MAX(event_time)` GROUP BY seq, the same pattern `list_meta` uses)
-    /// so same-seq duplicate physical rows from retried writes never
-    /// consume limit slots: every page is exactly
-    /// `min(n, remaining distinct seqs)` entries and the cursor chain
-    /// covers each seq exactly once.
+    /// two-phase SQL-side dedup (latest `event_time` per seq — the same
+    /// `MAX(event_time)` GROUP BY seq pattern `list_meta` uses): the inner
+    /// subquery limits the DISTINCT seqs to the segment-tail `n`, and the
+    /// outer join returns every winner tie (all rows at a seq's max
+    /// event_time) for exactly those seqs without an outer LIMIT. Same-seq
+    /// duplicate physical rows from retried writes therefore never consume
+    /// limit slots — every page is exactly `min(n, remaining distinct
+    /// seqs)` logical entries and the cursor chain covers each seq exactly
+    /// once — while identical ties fold and divergent ties still reach the
+    /// `dedup_raw_entries` conflict check even at the newest seq's maximum
+    /// event_time.
     pub async fn load_older(
         &self,
         before_seq: i64,
@@ -614,13 +619,20 @@ impl GreptimeSession {
             // Middle segment: [prev_comp, before).
             Some(prev) => {
                 let rows = if let Some(n) = page {
-                    // Dedup by seq (latest event_time wins) IN SQL before
-                    // LIMIT: same-seq duplicate physical rows (retried
-                    // writes) must not consume limit slots, or a page
-                    // could come back smaller than `limit` after the
-                    // Rust-side dedup and the cursor chain could skip or
-                    // repeat entries. The join keeps ties (same seq, same
-                    // max event_time) for the Rust-side conflict check.
+                    // Two-phase dedup-before-LIMIT. The INNER subquery
+                    // selects the `n` DISTINCT seqs closest to the segment
+                    // tail — `MAX(event_time)` per seq (GROUP BY seq),
+                    // ordered seq DESC, LIMIT n — so same-seq duplicate
+                    // physical rows (retried writes) never consume limit
+                    // slots and each page holds exactly `n` distinct seqs.
+                    // The OUTER JOIN then fetches ALL winner ties (every
+                    // physical row whose event_time equals that seq's max)
+                    // for exactly those seqs, with NO outer LIMIT: the
+                    // tied rows can no longer crowd a page boundary and a
+                    // divergent duplicate at the maximum event_time of the
+                    // newest seq (the A/A/B case) is still delivered to
+                    // the Rust-side `dedup_raw_entries` conflict check
+                    // instead of being silently cut off by LIMIT.
                     self.client
                         .query(
                             "SELECT t.seq, t.event_time, t.payload FROM session_entries t \
@@ -629,9 +641,10 @@ impl GreptimeSession {
                                  WHERE workspace_id = $1 AND session_id = $2 \
                                  AND seq >= $3 AND seq < $4 \
                                  GROUP BY seq \
-                             ) g ON t.seq = g.seq AND t.event_time = g.me \
+                                 ORDER BY seq DESC LIMIT $5 \
+                             ) w ON t.seq = w.seq AND t.event_time = w.me \
                              WHERE t.workspace_id = $1 AND t.session_id = $2 \
-                             ORDER BY t.seq DESC LIMIT $5",
+                             ORDER BY t.seq DESC",
                             &[
                                 &self.workspace_id,
                                 &self.session_id,
@@ -666,8 +679,12 @@ impl GreptimeSession {
             // Oldest segment: [0, before). Nothing older follows.
             None => {
                 let rows = if let Some(n) = page {
-                    // Same SQL-side dedup-before-LIMIT as the middle
-                    // segment: limit counts DISTINCT seqs only.
+                    // Same two-phase dedup-before-LIMIT as the middle
+                    // segment: the inner subquery picks the `n` DISTINCT
+                    // seqs closest to the segment tail, the outer JOIN
+                    // returns all of their winner ties with no outer
+                    // LIMIT — limit counts DISTINCT seqs only, and ties
+                    // reach the Rust-side conflict check intact.
                     self.client
                         .query(
                             "SELECT t.seq, t.event_time, t.payload FROM session_entries t \
@@ -675,9 +692,10 @@ impl GreptimeSession {
                                  SELECT seq, MAX(event_time) AS me FROM session_entries \
                                  WHERE workspace_id = $1 AND session_id = $2 AND seq < $3 \
                                  GROUP BY seq \
-                             ) g ON t.seq = g.seq AND t.event_time = g.me \
+                                 ORDER BY seq DESC LIMIT $4 \
+                             ) w ON t.seq = w.seq AND t.event_time = w.me \
                              WHERE t.workspace_id = $1 AND t.session_id = $2 \
-                             ORDER BY t.seq DESC LIMIT $4",
+                             ORDER BY t.seq DESC",
                             &[
                                 &self.workspace_id,
                                 &self.session_id,
@@ -2737,6 +2755,178 @@ mod tests {
             .unwrap();
         assert_eq!(page, vec![user(0), user(1)]);
         assert_eq!(cursor, None);
+    }
+
+    /// Major C (tie variant of the dedup-before-limit fix): IDENTICAL
+    /// winner ties must not shrink a limited page. Same-seq rows sharing
+    /// the same MAX event_time and the same payload (idempotent retry at
+    /// the same microsecond — the A/A/A shape) used to consume `LIMIT`
+    /// slots in the old JOIN-then-LIMIT query, so a page could come back
+    /// with fewer distinct entries than `limit` and the cursor chain could
+    /// drift. The two-phase query LIMITs DISTINCT seqs in the inner
+    /// subquery and fetches all ties in the outer join, so each page holds
+    /// exactly `limit` distinct entries and the chain pages through every
+    /// seq exactly once.
+    #[tokio::test]
+    async fn load_older_limited_pages_identical_ties_do_not_shrink() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-tie-page-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        let user = |i: u32| SessionEntry::Message {
+            message: Message::User {
+                content: format!("m{i}"),
+                images: vec![],
+            },
+        };
+        let comp = |summary: &str| SessionEntry::Compaction {
+            summary: summary.into(),
+            retained: vec![],
+        };
+
+        // seqs: 0,1 early; 2 comp1; 3..7 latest (comp1_seq = 2). 8
+        // distinct entries, 12 physical rows after the tie inserts.
+        let mut all = vec![user(1), user(2)];
+        all.push(comp("c1"));
+        all.extend([user(3), user(4), user(5), user(6), user(7)]);
+        session.append(&all).await.unwrap();
+
+        // Identical winner ties: for seqs 6 and 7, two extra physical rows
+        // sharing the SAME (newest) event_time and the SAME payload as the
+        // original row. These sit at the max event_time — exactly where
+        // the old JOIN-then-LIMIT could let ties crowd a page.
+        let mut prepped: Vec<(i64, chrono::NaiveDateTime, String, String, bool)> = Vec::new();
+        for seq in [6i64, 7i64] {
+            let entry = user(seq as u32);
+            let ts = us_to_datetime(next_event_time_us());
+            for _ in 0..2 {
+                prepped.push((
+                    seq,
+                    ts,
+                    entry_kind(&entry).to_string(),
+                    serde_json::to_string(&entry).unwrap(),
+                    is_error(&entry),
+                ));
+            }
+        }
+        session.insert_prepped(&prepped).await.unwrap();
+
+        // Page 1 (head open sentinel, limit 2): newest 2 DISTINCT seqs =
+        // 7,6 — one logical entry each despite the tied physical rows.
+        let (page1, cursor1) = session.load_older(i64::MAX, Some(2)).await.unwrap();
+        assert_eq!(
+            page1,
+            vec![user(6), user(7)],
+            "page 1 = newest 2 distinct seqs, ties folded, not shrunk"
+        );
+        assert_eq!(cursor1, Some(6), "cursor = oldest seq of page 1");
+
+        // Page 2: [2,6) — seqs 5,4.
+        let (page2, cursor2) = session.load_older(cursor1.unwrap(), Some(2)).await.unwrap();
+        assert_eq!(page2, vec![user(4), user(5)], "page 2 = next 2 distinct");
+        assert_eq!(cursor2, Some(4));
+
+        // Page 3: [2,4) — seqs 3,2; reaches the segment's opening
+        // compaction row, cursor stays Some(2).
+        let (page3, cursor3) = session.load_older(cursor2.unwrap(), Some(2)).await.unwrap();
+        assert_eq!(page3, vec![comp("c1"), user(3)], "page 3 crosses to comp");
+        assert_eq!(cursor3, Some(2));
+
+        // Page 4 (oldest segment [0,2)): seqs 1,0, cursor None.
+        let (page4, cursor4) = session.load_older(cursor3.unwrap(), Some(2)).await.unwrap();
+        assert_eq!(page4, vec![user(1), user(2)], "page 4 = oldest segment");
+        assert_eq!(cursor4, None, "cursor None at the true start");
+
+        // Exactly-once coverage across the paged chain: 8 distinct
+        // entries, every appended entry in exactly one page.
+        let mut paged: Vec<SessionEntry> = Vec::new();
+        paged.extend(page1);
+        paged.extend(page2);
+        paged.extend(page3);
+        paged.extend(page4);
+        assert_eq!(
+            paged.len(),
+            all.len(),
+            "paged chain must not lose or duplicate entries"
+        );
+        for want in &all {
+            assert!(paged.contains(want), "paged chain missing entry: {want:?}");
+        }
+    }
+
+    /// Major C (divergent-tie variant): a divergent duplicate at the
+    /// maximum event_time of the NEWEST seq must still reach the
+    /// `dedup_raw_entries` conflict check on a limited page. The old
+    /// JOIN-then-LIMIT query could return only the identical prefix of the
+    /// tie group (A/A of A/A/B), fold it silently, advance the cursor past
+    /// the seq, and never report the divergent B — violating the conflict
+    /// contract. The two-phase query fetches ALL winner ties for the
+    /// limited distinct seqs, so the A/A/B group is delivered whole and
+    /// the divergent duplicate errors out.
+    #[tokio::test]
+    async fn load_older_limited_pages_divergent_tie_rejected() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-tie-conflict-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        let user = |content: &str| SessionEntry::Message {
+            message: Message::User {
+                content: content.into(),
+                images: vec![],
+            },
+        };
+        let comp = |summary: &str| SessionEntry::Compaction {
+            summary: summary.into(),
+            retained: vec![],
+        };
+
+        // seqs: 0,1 early; 2 comp1; 3..6 middle/latest (comp1_seq = 2).
+        // seq 7 is NOT appended: it is inserted below entirely as the
+        // A/A/B tie group at one shared max event_time.
+        let mut all = vec![user("m1"), user("m2")];
+        all.push(comp("c1"));
+        all.extend([user("m3"), user("m4"), user("m5"), user("m6")]);
+        session.append(&all).await.unwrap();
+
+        // Divergent winner tie on the NEWEST seq (7): three physical rows
+        // at the SAME max event_time — payloads A, A, B. A limit-1 page
+        // picks seq 7 as its only distinct seq; the outer join must return
+        // the whole A/A/B group so dedup reports the conflict instead of
+        // folding A/A and silently dropping B.
+        let ts = us_to_datetime(next_event_time_us());
+        let a = user("m7");
+        let b = user("m7-DIVERGENT");
+        let prepped: Vec<(i64, chrono::NaiveDateTime, String, String, bool)> = [&a, &a, &b]
+            .into_iter()
+            .map(|entry| {
+                (
+                    7i64,
+                    ts,
+                    entry_kind(entry).to_string(),
+                    serde_json::to_string(entry).unwrap(),
+                    is_error(entry),
+                )
+            })
+            .collect();
+        session.insert_prepped(&prepped).await.unwrap();
+
+        let err = session
+            .load_older(i64::MAX, Some(1))
+            .await
+            .expect_err("divergent tie on the newest seq must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("divergent physical duplicates"), "got: {msg}");
+        assert!(msg.contains("seq 7"), "got: {msg}");
     }
 
     /// Store-level `load_head_page` (the `GET /history` initial-render
