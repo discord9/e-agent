@@ -2403,13 +2403,13 @@ async function main(){
       { id: "c1-child-busy-2", parent_session_id: "c1", label: "C 子任务忙二", status: "Busy", entry_count: 1, busy: true, active: true },
       { id: "c2", status: "Idle", title: "C2 主会话", created_at: "2024-03-02T00:00:00Z", entry_count: 1, busy: false, active: true },
       { id: "c2-child-busy", parent_session_id: "c2", label: "C2 子任务忙", status: "Busy", entry_count: 1, busy: true, active: true },
-      { id: "c2-child-idle", parent_session_id: "c2", label: "C2 子任务闲", status: "Idle", entry_count: 1, busy: false, active: true },
+      { id: "c2-child-idle", parent_session_id: "c2", label: "C2 子任务闲", status: "Idle", entry_count: 1, busy: false, active: false },
       { id: "e1", status: "Idle", title: "E 主会话", created_at: "2024-03-03T00:00:00Z", entry_count: 1, busy: false, active: true },
-      { id: "e1-child-idle", parent_session_id: "e1", label: "E 子任务闲", status: "Idle", entry_count: 1, busy: false, active: true },
+      { id: "e1-child-idle", parent_session_id: "e1", label: "E 子任务闲", status: "Idle", entry_count: 1, busy: false, active: false },
     ];
     sessionsDataB = [
       { id: "d1", status: "Busy", title: "D 主会话", created_at: "2024-04-01T00:00:00Z", entry_count: 1, busy: true, active: true, pinned: true },
-      { id: "d1-child-idle", parent_session_id: "d1", label: "D 子任务闲", status: "Idle", entry_count: 1, busy: false, active: true },
+      { id: "d1-child-idle", parent_session_id: "d1", label: "D 子任务闲", status: "Idle", entry_count: 1, busy: false, active: false },
       { id: "f1", status: "Busy", title: "F 主会话", created_at: "2024-04-02T00:00:00Z", entry_count: 1, busy: true, active: true },
       { id: "f1-child-busy", parent_session_id: "f1", label: "F 子任务忙", status: "Busy", entry_count: 1, busy: true, active: true },
     ];
@@ -2467,7 +2467,7 @@ async function main(){
     chk("busy badge shows two busy direct children",
         c1Dot.classList.contains("busy-count") && c1Dot.textContent === "2",
         "class=" + c1Dot.className + " text=" + c1Dot.textContent);
-    chk("busy badge counts busy child, not idle child",
+    chk("busy badge counts active child, not inactive child",
         c2Dot.classList.contains("busy-count") && c2Dot.textContent === "1",
         "class=" + c2Dot.className + " text=" + c2Dot.textContent);
     chk("parent-only busy keeps pulsing dot, not count",

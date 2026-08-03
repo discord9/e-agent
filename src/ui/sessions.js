@@ -1969,10 +1969,12 @@ function buildTreeRoot(s, kids, wsId) {
       toggleSidebarNode(wsId + ":" + s.id, toggle, kids, wsId);
     });
   }
-  // busy 状态聚合只看直接子会话（subagent 通常一层，孙会话不计）：
-  // 有 busy 子会话时用数字徽标显示数量；否则父会话自身 busy 时仍用原有
-  // 脉动点。数字优先于父节点的点，因为它提供了更具体的并发任务信息。
-  const busyKidCount = kids.filter((k) => k.busy).length;
+  // 活跃子会话聚合只看直接子会话（subagent 通常一层，孙会话不计）：
+  // 后端 running_tasks 分不清 Idle/Busy——live subagent（label 在）只有
+  // active=true、busy 恒为 false（apply_subagent_label 只设 active）。
+  // 所以用 active===true 统计"存活/运行中的子 agent 数"（包括等待输入的
+  // Idle subagent——它们确实在工作流里活着）。数字优先于父节点的点。
+  const busyKidCount = kids.filter((k) => k.active === true).length;
   const kidsBusy = busyKidCount > 0;
   const dot = busyKidCount > 0
     ? el("span", "busy-dot busy-count", String(busyKidCount))
