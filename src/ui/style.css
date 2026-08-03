@@ -1441,8 +1441,6 @@ mmlEqnNo}
     }
     .token-toggle { padding: 3px 8px; font-size: 11px; }
     #tokenInput { width: 108px; min-width: 0; font-size: 12px; padding: 3px 6px; }
-    /* 子会话导航（← 主会话）：手机顶栏一行放不下，隐藏；侧边栏树仍可回到主会话 */
-    #backParentBtn { display: none; }
     /* 添加面板窄屏换行，不横向溢出 */
     .ws-editor { flex-wrap: wrap; max-width: calc(100vw - 20px); right: 10px; }
     .ws-editor input { flex: 1 1 100px; width: auto; }
