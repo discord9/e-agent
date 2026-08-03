@@ -352,12 +352,26 @@ function renderTaskList(tasks, container) {
     // 其余任务显示父会话。不截断——省略的 id 无法区分会话。
     const sidShown = isDelegate ? (t.subagent_session_id || t.session_id) : t.session_id;
     if (sidShown) line.appendChild(el("span", "task-meta tsid", "会话 " + sidShown));
-    // 父会话标签：delegate 任务显示其父会话 = t.session_id（发起它的会话，
-    // 后端 TaskMeta 自带，无需查列表）；非 delegate 任务 session_id 即父，
+    // 父会话标签：delegate 任务显示其父会话 = t.session_id（发起它的会话）。
+    // 先查激活 workspace 的 session 列表（state.workspaceLists，回退
+    // state.lastList）拿父会话 title：有 title 显示「父: <title>」（截断到
+    // ~40 字符，悬停 title 放完整标题 + 会话 id），无 title / 查不到 →
+    // 回退「父: <session_id>」。非 delegate 任务 session_id 即父，
     // 且「会话 <id>」已显示，不重复。查不到 / 无父 / 与子会话 id 相同 →
     // 安静降级不显示。
     if (isDelegate && t.session_id && t.session_id !== sidShown) {
-      line.appendChild(el("span", "task-meta tparent", "父: " + t.session_id));
+      const wsId = state.workspace ? state.workspace.id : null;
+      const plist = (wsId && state.workspaceLists[wsId] !== undefined)
+        ? state.workspaceLists[wsId] : state.lastList;
+      const parent = (plist || []).find((s) => s && s.id === t.session_id) || null;
+      const parentTitle = parent && parent.title != null ? String(parent.title) : "";
+      if (parentTitle.trim() !== "") {
+        const tag = el("span", "task-meta tparent", "父: " + truncate(parentTitle, 40));
+        tag.title = t.session_id + ": " + parentTitle;   // 悬停显示完整标题 + 会话 id
+        line.appendChild(tag);
+      } else {
+        line.appendChild(el("span", "task-meta tparent", "父: " + t.session_id));
+      }
     }
     const status = el("span", "task-stream-status", "● 流式输出中…");
     status.hidden = true;   // 仅轮询/流进行中显示（轻量视觉提示）
