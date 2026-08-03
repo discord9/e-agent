@@ -26,9 +26,12 @@ async def run_smoke(c):
         raise common.SkipCase("server 不可达：%s" % e)
 
     page = c.page
+    # 同 start()：init script 在任何页面脚本运行前种 token —— 首次加载时
+    # initWorkspaces 会把带 token 的默认 workspace 落盘，刷新后 state.token
+    # 才不会被空 token 的旧默认 workspace 覆盖。
+    await page.add_init_script(
+        "localStorage.setItem('eagent_token', %s)" % json.dumps(token))
     await page.goto(common.BASE + "/", wait_until="load")
-    await page.wait_for_timeout(400)
-    await page.evaluate("localStorage.setItem('eagent_token', %s)" % json.dumps(token))
     await page.reload(wait_until="load")
     # 等首轮真实轮询渲染完成（有行或空态提示）
     await page.wait_for_function(

@@ -47,6 +47,7 @@ const state = {
   status: "Idle",
   initSource: null,          // "history" | "snapshot" | null —— 初始渲染来源
   pollTimer: null,
+  pollGen: 0,              // 轮询代次：stopPolling 递增，使在途轮询的续调度失效
   lastValidateSig: null,     // 上一轮校验问题签名（相同则不再刷 banner）
   validateBannerUp: false,   // 当前 banner 是否由校验提示占用（恢复数据后只清自己的）
   sse: { ctrl: null, retryTimer: null, stopped: false },
@@ -55,6 +56,7 @@ const state = {
   loadingOlder: false,       // 是否正在加载更早历史（防重入）
   olderDone: false,          // 更早历史已全部加载（next_before_seq 为 null）
   searchQuery: "",           // 会话列表搜索词（已小写化）；轮询重绘后过滤依然生效
+  showArchived: false,       // 列表页是否显示归档会话（默认折叠隐藏；开关在列表头部）
   lastList: [],              // 最近一次轮询拿到的完整列表，供搜索框重绘
                              //（聚合模式下 = 激活 workspace 的列表；所有既有单服务器路径不变）
   workspaceLists: {},        // workspaceId -> session[]：每台服务器各自的 /api/sessions 缓存
@@ -81,7 +83,7 @@ const state = {
     streamText: new Map(),   // 展开中 delegate 行的已累积流式文本（key → string，重绘恢复用）
     degraded: new Set(),     // bash 行 output 端点 404/不可用 → 降级静态尾部（key；重绘不再重启轮询）
   },
-  renameActive: false,       // 行内重命名进行中：列表页 1s 轮询重绘跳过，防编辑框被冲掉
+  renameActive: false,       // 行内重命名进行中：列表页 2s 轮询重绘跳过，防编辑框被冲掉
   wsCreatePending: new Set(),// 侧边栏组头「+」在途新建（wsId 集合）：请求期间按钮禁用/忽略重复点击
 };
 
@@ -94,7 +96,7 @@ const els = {
   listView: $("listView"), chatView: $("chatView"),
   newPrompt: $("newPrompt"), newSessionBtn: $("newSessionBtn"),
   sessionList: $("sessionList"), listMeta: $("listMeta"), listHint: $("listHint"),
-  searchInput: $("searchInput"),
+  searchInput: $("searchInput"), showArchiveBtn: $("showArchiveBtn"),
   chatSessionId: $("chatSessionId"), chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
   messages: $("messages"), promptInput: $("promptInput"), queueBar: $("queueBar"),
   slashMenu: $("slashMenu"), forkMenu: $("forkMenu"),
@@ -134,6 +136,15 @@ function pinSvg() {
   return '<svg class="pin-icon" viewBox="0 0 24 24" width="16" height="16" ' +
     'aria-hidden="true" focusable="false" fill="currentColor">' +
     '<path d="M8 2h8a1 1 0 0 1 .7 1.7l-1.2 1.2v4.35c0 .8.32 1.56.88 2.12l1.54 1.54A1.22 1.22 0 0 1 17.06 15H12.8L12 22.25 11.2 15H6.94a1.22 1.22 0 0 1-.86-2.09l1.54-1.54a3 3 0 0 0 .88-2.12V4.9L7.3 3.7A1 1 0 0 1 8 2Z"/>' +
+    '</svg>';
+}
+
+/* 归档盒 SVG（fill 继承 currentColor，状态色灰⇄暗红跟随 .on）。
+   返回 innerHTML 字符串。 */
+function archiveSvg() {
+  return '<svg class="archive-icon" viewBox="0 0 24 24" width="16" height="16" ' +
+    'aria-hidden="true" focusable="false" fill="currentColor">' +
+    '<path d="M3 4.5A1.5 1.5 0 0 1 4.5 3h15A1.5 1.5 0 0 1 21 4.5V6a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 6V4.5ZM4.5 9h15l-1.1 10.2a2 2 0 0 1-2 1.8h-8.8a2 2 0 0 1-2-1.8L4.5 9Zm7.5 3a1 1 0 0 0-1 1v1h-1a1 1 0 0 0 0 2h4a1 1 0 0 0 0-2h-1v-1a1 1 0 0 0-1-1Z"/>' +
     '</svg>';
 }
 
@@ -308,6 +319,8 @@ async function switchWorkspace(id, epoch) {
   state.tasks.streamText = new Map();
   state.tasks.degraded = new Set();
   state.tasks.composerOpen = false;
+  lastTasksSig = "";              // 任务面板签名跟随 workspace 重置（DOM 已清空）
+  lastTasksRenderedSig = "";
   state.sidebar.expanded = new Set();
   state.sidebar.filter = "";
   state.sidebar.showAllWs = new Set();
@@ -347,11 +360,11 @@ async function switchWorkspace(id, epoch) {
   updateTokenToggle();
   history.replaceState(null, "", "/");   // 丢弃可能指向旧工作区会话的 ?session= 深链
   // ---- 聚合视图立即重绘（用各 workspace 缓存列表，不等轮询） ----
-  renderSessionList();
+  renderSessionList(undefined, true);   // force：切换后清空过 DOM，必须重绘
   renderSidebarTree(true);
   // ---- 重跑启动加载序列（与 init() 的加载部分一致） ----
   startPolling();
-  pollAllWorkspaces();
+  pollSessions();   // 立即轮询经 runPollRound 与定时轮询共用 in-flight 守卫
   startTasksPolling();
   pollTasks();
 }

@@ -277,6 +277,23 @@ mmlEqnNo}
     font-size: 12px;
   }
   #searchInput:focus { outline: 1px solid var(--blue); }
+  /* 「显示归档」开关：小按钮，灰化；打开时高亮（暗红，同归档按钮 .on） */
+  .archive-show-btn {
+    flex: 0 0 auto;
+    padding: 3px 10px;
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 10px;
+    color: var(--base01);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .archive-show-btn:hover { background: var(--base2); color: var(--base02); }
+  .archive-show-btn.on { color: var(--red); border-color: var(--red); }
+  .archive-show-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
   .session-list { display: flex; flex-direction: column; gap: 6px; }
   .session-row {
     display: flex;
@@ -305,6 +322,10 @@ mmlEqnNo}
   }
   /* 置顶会话行：金色左边条（inset，不挤占布局）+ 浅底色，Solarized 协调 */
   .session-row.pinned { box-shadow: inset 3px 0 0 var(--yellow); background: var(--base2); }
+  /* 归档会话行（仅「显示归档」开启时渲染）：muted 灰化 + 低透明度 */
+  .session-row.archived { opacity: 0.5; }
+  .session-row.archived .sid { color: var(--base01); }
+  .session-row.archived:hover { opacity: 0.75; }
   .busy-dot {
     width: 8px; height: 8px;
     border-radius: 50%;
@@ -1071,6 +1092,9 @@ mmlEqnNo}
   .tree-row:hover { background: var(--base3); }
   /* 置顶主会话节点：金色左边条；与 .current 同现时 current 的蓝色优先（蓝色 = 当前打开） */
   .tree-row.pinned { border-left-color: var(--yellow); }
+  /* 归档主会话节点（侧边栏「归档」分组内）：muted 灰化 + 低透明度 */
+  .tree-row.archived { opacity: 0.55; color: var(--base01); }
+  .tree-row.archived:hover { opacity: 0.8; }
   .tree-row.current { border-left-color: var(--blue); background: var(--base3); }
   /* 折叠按钮：真正的 <button>，≥24px 点击区、hover 背景；
      箭头由 ::before CSS 三角绘制（不依赖 Unicode 字符），
@@ -1290,6 +1314,32 @@ mmlEqnNo}
   .pin-btn.on { color: var(--yellow); }
   .pin-btn.on:hover { background: var(--base3); color: var(--yellow); }
   .pin-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  /* 归档按钮：与置顶按钮同形（24px、透明底、SVG currentColor）；
+     默认 muted，已归档时暗红高亮（Solarized red #dc322f） */
+  .archive-btn {
+    flex: 0 0 auto;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--base01);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s, color 0.15s;
+  }
+  .archive-btn .archive-icon { display: block; flex: 0 0 auto; fill: currentColor; }
+  .archive-btn:hover { background: var(--base1); color: var(--base02); }
+  .archive-btn.on { color: var(--red); }
+  .archive-btn.on:hover { background: var(--base3); color: var(--red); }
+  .archive-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  /* 「归档 (N)」分组头（侧边栏）：muted 灰化 */
+  .tree-archive-label { color: var(--base01); }
   /* 编辑态：input 内嵌行内（原位替换标题文本） */
   .rename-box {
     display: inline-flex;
@@ -1344,8 +1394,8 @@ mmlEqnNo}
   .task-meta.tid { color: var(--base00); }
   .task-meta.tsid { color: var(--cyan); }
   .task-meta.tparent { color: var(--base00); }
-  .task-tags { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: middle; }
-  .task-tag { font-size: 10px; padding: 0 5px; border: 1px solid var(--base1); border-radius: 8px; color: var(--base01); background: var(--base3); white-space: nowrap; }
+  .task-tags { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: middle; min-width: 0; flex-wrap: wrap; }
+  .task-tag { font-size: 10px; padding: 0 5px; border: 1px solid var(--base1); border-radius: 8px; color: var(--base01); background: var(--base3); word-break: break-all; }
   .task-cancel {
     padding: 1px 10px;
     font-size: 12px;
@@ -1417,18 +1467,50 @@ mmlEqnNo}
   }
   /* 手机宽度（390px）：顶栏挤进汉堡按钮后收紧间距/字号，保证不横向溢出 */
   @media (max-width: 480px) {
-    #topbar { gap: 8px; padding: 8px 10px; }
+    #topbar { gap: 6px; padding: 6px 8px; }
     #sidebarBtn { padding: 2px 8px; }
-    .top-actions { gap: 5px; min-width: 0; }
+    .brand { font-size: 13px; }
+    .top-actions { gap: 5px; min-width: 0; flex-wrap: nowrap; }
+    /* 返回按钮文字禁止换行（否则窄 flex 里被挤成多行，把顶栏撑到 100px+）；
+       收紧内边距/字号，让一行放得下 */
+    #backBtn, #backParentBtn { white-space: nowrap; padding: 3px 6px; font-size: 12px; }
+    #workspaceSelect { max-width: 96px; min-width: 55px; padding: 3px 4px; font-size: 11px; }
+    .ws-btn { padding: 2px 5px; font-size: 11px; }
     .conn-state {
       font-size: 11px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
       max-width: 34vw;
+      min-width: 0;   /* 允许 flex 收缩：长状态文本省略号截断，不撑高/溢出 */
     }
-    #tokenInput { width: 108px; min-width: 0; }
+    .token-toggle { padding: 3px 8px; font-size: 11px; }
+    #tokenInput { width: 108px; min-width: 0; font-size: 12px; padding: 3px 6px; }
     /* 添加面板窄屏换行，不横向溢出 */
     .ws-editor { flex-wrap: wrap; max-width: calc(100vw - 20px); right: 10px; }
     .ws-editor input { flex: 1 1 100px; width: auto; }
+    /* 对话头部（.chat-head）窄屏收紧：一行放不下时换行，各子项可收缩，
+       保证 390px 下单行（或最多两行）不横向溢出。与 mobile-topbar 同模式：
+       仅移动端媒体查询内收紧，桌面端（>480px）零改动。 */
+    .chat-head { gap: 6px; flex-wrap: wrap; }
+    .chat-session-id { min-width: 0; max-width: 34vw; }
+    .chat-session-id .chat-sid-title { font-size: 12px; max-width: 34vw; }
+    .chat-session-id .chat-sid-id { max-width: 34vw; }
+    .status-chip { font-size: 10px; padding: 1px 6px; }
+    #usageInfo {
+      font-size: 12px;
+      max-width: 30vw;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex-shrink: 1;
+      min-width: 0;   /* 允许 flex 收缩：长用量文本省略号截断，不撑宽/溢出 */
+    }
+    .compact-head { font-size: 10px; padding: 0 6px; }
+  }
+  /* 更窄的手机（≤360px，如 320px 的 iPhone SE）：再藏品牌名，保证单行不溢出 */
+  @media (max-width: 360px) {
+    .brand { display: none; }
+    .token-toggle { padding: 2px 6px; }
+    #workspaceSelect { max-width: 80px; }
   }

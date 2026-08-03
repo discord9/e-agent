@@ -79,6 +79,12 @@ pub struct SessionMeta {
     /// as unpinned). Greptime/SQLite only — the JSONL backend has no meta
     /// table and never produces values.
     pub pinned: Option<bool>,
+    /// User archive flag: `Some(true)` = archived (hidden from the default
+    /// session list, folded into the sidebar's collapsed "归档" group),
+    /// `Some(false)` = explicitly restored, `None` = never touched (reads
+    /// as unarchived). Greptime/SQLite only — the JSONL backend has no meta
+    /// table and never produces values.
+    pub archived: Option<bool>,
     /// Writer process identity of this snapshot row
     /// (`pid@hostname#nonce`, see `session_greptime::process_identity`):
     /// the process whose `insert_meta` stamped the row (the most recent
@@ -818,6 +824,40 @@ impl SessionStore {
                 .lock()
                 .await
                 .set_pinned(session, pinned)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Archive or restore a session in the sessions metadata table
+    /// (Greptime/SQLite only): appends one full snapshot row with the new
+    /// `archived` flag and a fresh `last_active_at`. Never self-creates
+    /// (R3): a session with no metadata row is a no-op `Ok`, mirroring
+    /// `set_pinned`. JSONL: no-op `Ok` — the JSONL backend has no meta
+    /// table, so archives exist only on Greptime/SQLite.
+    #[allow(unused_variables)]
+    pub async fn set_archived(&self, _root: &Path, session: &str, archived: bool) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => Ok(()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                greptime_session
+                    .lock()
+                    .await
+                    .set_archived(session, archived)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: sqlite_session,
+                ..
+            } => sqlite_session
+                .lock()
+                .await
+                .set_archived(session, archived)
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -1569,7 +1609,7 @@ mod tests {
             assert_eq!(meta_b.role, None);
             assert_eq!(meta_b.entry_count, entries.len() as i64);
 
-            // set_title / set_pinned land as new snapshots.
+            // set_title / set_pinned / set_archived land as new snapshots.
             meta_store
                 .set_title(&root, &session_a, Some("my title"))
                 .await
@@ -1578,6 +1618,10 @@ mod tests {
                 .set_pinned(&root, &session_a, true)
                 .await
                 .expect("set_pinned through store");
+            meta_store
+                .set_archived(&root, &session_a, true)
+                .await
+                .expect("set_archived through store");
             let list = meta_store
                 .list_meta(&root)
                 .await
@@ -1588,6 +1632,7 @@ mod tests {
                 .expect("session A relisted");
             assert_eq!(meta_a.title.as_deref(), Some("my title"));
             assert_eq!(meta_a.pinned, Some(true));
+            assert_eq!(meta_a.archived, Some(true));
 
             // delete_meta hides only session A; B stays.
             meta_store

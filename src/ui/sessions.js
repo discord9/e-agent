@@ -27,6 +27,7 @@ function validateSession(s) {
   if (s.title !== undefined && s.title !== null && typeof s.title !== "string") problems.push("title 非字符串");
   if (s.label !== undefined && s.label !== null && typeof s.label !== "string") problems.push("label 非字符串");
   if (s.pinned !== undefined && s.pinned !== null && typeof s.pinned !== "boolean") problems.push("pinned 非布尔");
+  if (s.archived !== undefined && s.archived !== null && typeof s.archived !== "boolean") problems.push("archived 非布尔");
   return problems;
 }
 
@@ -59,30 +60,66 @@ function applyValidation(problems) {
   }
 }
 
+/* 轮询请求超时：任一 workspace 请求永久 pending 会卡住整轮（渲染/深链/
+   校验/后续调度全部停摆）。每个请求挂 AbortController + 10s 超时，超时
+   按失败处理（保留旧列表 stale，标记 workspaceErrors）。 */
+const POLL_TIMEOUT_MS = 10000;
+
+async function fetchWithTimeout(ws, path, opts = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), POLL_TIMEOUT_MS);
+  try {
+    return await apiFor(ws, path, Object.assign({}, opts, { signal: ctrl.signal }));
+  } finally {
+    clearTimeout(timer);   // 请求先完成：撤掉超时定时器（防迟到 abort）
+  }
+}
+
 async function pollAllWorkspaces() {
   const wss = (state.workspaces || []).slice();
   await Promise.allSettled(wss.map((ws) => pollWorkspaceSessions(ws)));
+  // 整轮完成后统一渲染一次：各 workspace 响应只更新缓存（workspaceLists），
+  // 不再各自触发渲染——多 workspace 聚合下避免每响应全量重建列表/树。
+  afterPollRound();
+}
+
+/* 聚合轮询整轮收尾：列表视图重绘一次 + 深链 + 字段校验 banner；聊天视图
+   只同步 composer meta / 「← 主会话」按钮；侧边栏不可见时跳过树渲染（打开
+   时由 openSidebar 的 renderSidebarTree(true) 强制同步）。渲染本身带数据
+   签名（sessionListSig/sidebarTreeSig），内容未变时跳过 DOM 重建。 */
+function afterPollRound() {
+  if (state.view === "list") {
+    renderSessionList();
+    maybeHandleDeepLink(state.lastList || []);
+    applyValidation(validateSessions(state.lastList || []));
+  } else if (state.view === "chat") {
+    updateComposerMeta();               // model/role 可能随轮询更新（幂等）
+    const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
+    if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
+  }
+  if (!els.sidebar.hidden) renderSidebarTree();
 }
 
 /* 兼容别名：既有调用点（switchWorkspace/backToList/restartTransport/init）
-   语义不变——现在等于聚合轮询全部 workspace。 */
+   语义不变——现在等于聚合轮询全部 workspace；经 runPollRound 与定时轮询
+   （setTimeout 链）共用同一个 in-flight 守卫，同一时刻只有一轮在途。 */
 function pollSessions() {
-  return pollAllWorkspaces();
+  return runPollRound();
 }
 
-/* 拉取单个 workspace 的会话列表：
+/* 拉取单个 workspace 的会话列表（只更新缓存，不渲染）：
    - 成功 → state.workspaceLists[ws.id] = list（并清错误标记）
    - 失败（HTTP/网络/格式/认证）→ 保留旧列表（stale），标记
      state.workspaceErrors[ws.id]（侧边栏显示「无法连接」分组头）
-   激活 workspace 额外承担既有单服务器职责：更新 state.lastList、
-   列表视图渲染、composer meta、深链、字段校验 banner（全部保持原行为）；
-   背景 workspace 只更新聚合缓存并重绘聚合视图。 */
+   激活 workspace 额外同步 state.lastList（既有单服务器路径的唯一数据源）；
+   渲染/深链/校验 banner 由 pollAllWorkspaces 整轮完成后统一执行一次
+   （afterPollRound）——各 workspace 响应不再各自全量重建列表/树。 */
 async function pollWorkspaceSessions(ws) {
   if (!workspaceToken(ws)) return;   // 全局 token 也未配置：跳过（不显示错误）
   let list = null;
   let err = null;
   try {
-    const res = await apiFor(ws, "/api/sessions");
+    const res = await fetchWithTimeout(ws, "/api/sessions");
     if (res.status === 401 || res.status === 403) {
       err = "auth";
       if (ws === state.workspace && state.view === "list") setBanner("⚠ 认证失败：请检查 Token。");
@@ -120,7 +157,8 @@ async function pollWorkspaceSessions(ws) {
       }
     }
   } catch (e) {
-    err = "network";
+    // 超时（AbortError）按失败处理：保留旧列表 stale、标记错误，不弹 banner
+    err = (e && e.name === "AbortError") ? "timeout" : "network";
     if (ws === state.workspace && state.view === "list"
         && (!navigator.onLine || e instanceof TypeError)) {
       setBanner("⚠ 无法连接服务器（网络错误）。", true);
@@ -138,20 +176,9 @@ async function pollWorkspaceSessions(ws) {
     state.workspaceErrors[ws.id] = err;   // 保留旧列表（stale），标记错误
   }
   if (ws === state.workspace) {
-    // ---- 激活 workspace：既有单服务器职责全部保留 ----
+    // 激活 workspace 的列表缓存 → lastList（既有单服务器路径的唯一数据源）；
+    // 渲染/深链/校验统一由 pollAllWorkspaces 整轮完成后执行（afterPollRound）
     state.lastList = state.workspaceLists[ws.id];
-    if (state.view === "list") {
-      renderSessionList();
-      maybeHandleDeepLink(state.lastList);
-      applyValidation(validateSessions(state.lastList));
-    } else if (state.view === "chat") {
-      updateComposerMeta();               // model/role 可能随轮询更新（幂等）
-    }
-    renderSidebarTree();                  // 侧边栏会话树随轮询刷新
-  } else {
-    // ---- 背景 workspace：只刷新聚合视图 ----
-    if (state.view === "list") renderSessionList();
-    renderSidebarTree();
   }
 }
 /* URL 深链：?session=<id>。token 就绪且列表拿到数据后自动打开一次。
@@ -208,11 +235,38 @@ function aggregateSessionRows() {
    chip（.ws-chip）；搜索跨全部服务器过滤；点击跨服务器会话自动切换
    workspace 再打开（openSessionIn/resumeSessionIn）。激活 workspace 的
    会话与单服务器模式完全一致（state.lastList 是它的列表）。 */
-function renderSessionList(list) {
-  // 行内重命名进行中：跳过本轮重绘（列表页轮询 1s 一次，会冲掉编辑框）；
+/* 聚合列表签名：所有 workspace 列表（激活 = lastList，背景 = 各自缓存）+
+   行渲染字段 + 数组顺序（信任后端排序）+ 激活态 + 搜索词 + 归档开关
+   （showArchived 不参与行内容但决定行是否显示：不加进签名，轮询渲染后
+   点「显示归档」会被签名去重跳过，归档行不出现）。内容未变 → 跳过 DOM
+   重建（轮询整轮一次渲染时，无变化不触碰活 DOM/滚动位置）。 */
+let lastListSig = "";
+
+function sessionListSig() {
+  const parts = [];
+  for (const ws of state.workspaces) {
+    const list = workspaceListFor(ws);
+    parts.push(ws.id + ":" + (ws === state.workspace ? 1 : 0) + ":"
+      + JSON.stringify(list.map((s) => [
+        s.id, s.title || "", s.model || "", s.status, s.busy ? 1 : 0,
+        s.active === false ? 0 : 1, s.entry_count ?? null,
+        s.parent_session_id || "", s.pinned === true ? 1 : 0, s.created_at || "",
+      ])));
+  }
+  return state.searchQuery + "|" + (state.showArchived ? 1 : 0) + "|" + parts.join("|");
+}
+
+function renderSessionList(list, force) {
+  // 行内重命名进行中：跳过本轮重绘（列表页轮询 2s 一次，会冲掉编辑框）；
   // 保存/取消后由 enterRename 清除标志并自行重绘
   if (state.renameActive) return;
-  if (arguments.length > 0) state.lastList = Array.isArray(list) ? list : [];
+  if (list !== undefined) state.lastList = Array.isArray(list) ? list : [];
+  // 数据签名：列表内容/顺序/激活态/搜索词未变 → 不重建 DOM。签名在
+  // renameActive 早退之后计算——编辑期间既不渲染也不更新签名，保存后
+  // 由调用方 renderSessionList() 重绘。
+  const sig = sessionListSig();
+  if (!force && sig === lastListSig) return;
+  lastListSig = sig;
   // 排序：后端保证 pinned 置顶在前、组内按 last_active_at 降序；前端按数组
   // 顺序渲染、不自行重排（旧 server / mock 返回什么顺序就渲染什么顺序）。
   let rows = aggregateSessionRows();
@@ -226,6 +280,16 @@ function renderSessionList(list) {
       return hay.some((h) => h.includes(q));
     });
   }
+  // 归档折叠：默认不显示归档会话（核心需求）；「显示归档」开关打开后才
+  // 显示（灰化行）。搜索时同样先过滤归档——除非开关已打开。
+  if (!state.showArchived) rows = rows.filter((r) => r.s.archived !== true);
+  // 「显示归档」开关状态反映当前视图：打开时按钮高亮、文案「隐藏归档」
+  const archiveToggle = els.showArchiveBtn;
+  if (archiveToggle) {
+    archiveToggle.classList.toggle("on", !!state.showArchived);
+    archiveToggle.textContent = state.showArchived ? "隐藏归档" : "显示归档";
+    archiveToggle.title = state.showArchived ? "隐藏归档会话" : "显示归档会话";
+  }
   els.listMeta.textContent = "共 " + rows.length + " 个";
   els.sessionList.innerHTML = "";
   if (!rows.length) {
@@ -237,10 +301,12 @@ function renderSessionList(list) {
   els.listHint.textContent = "";
   for (const { ws, s } of rows) {
     // Historical (inactive) sessions come from the metadata table: grey
-    // row, clicking resumes them instead of opening directly.
+    // row, clicking resumes them instead of opening directly. Archived
+    // rows (only rendered when「显示归档」is on) are greyed too.
     const inactive = s.active === false;
     const row = el("div", "session-row" + (inactive ? " inactive" : "") +
-      (s.pinned === true ? " pinned" : ""));
+      (s.pinned === true ? " pinned" : "") +
+      (s.archived === true ? " archived" : ""));
     row.title = s.id + (s.model ? " · " + s.model : "") +
       (s.parent_session_id ? " · 子会话 ← " + s.parent_session_id : "");
 
@@ -267,6 +333,18 @@ function renderSessionList(list) {
     pin.addEventListener("click", (ev) => {
       ev.stopPropagation();                // 不触发打开会话
       togglePin(s, () => { renderSessionList(); renderSidebarTree(true); }, ws);
+    });
+    // 🗄 归档按钮：归档会话收进侧边栏「归档」分组、列表页默认折叠隐藏；
+    // 已归档行（显示归档开启时可见）点按钮 = 恢复。
+    const archive = el("button", "archive-btn" + (s.archived === true ? " on" : ""));
+    archive.innerHTML = archiveSvg();   // SVG 归档盒：状态色跟随 currentColor
+    archive.type = "button";
+    archive.title = s.archived === true ? "恢复（取消归档）" : "归档";
+    archive.setAttribute("aria-label", archive.title);
+    archive.setAttribute("aria-pressed", String(s.archived === true));
+    archive.addEventListener("click", (ev) => {
+      ev.stopPropagation();                // 不触发打开会话
+      toggleArchived(s, () => { renderSessionList(); renderSidebarTree(true); }, ws);
     });
     const chip2 = el("span", "status-chip " + statusChipClass(s.status), statusLabel(s.status));
     const model = el("span", "smodel", s.model || "");
@@ -300,7 +378,7 @@ function renderSessionList(list) {
       if (inactive) { resumeSessionIn(ws.id, s.id); return; }
       openSessionIn(ws.id, s.id);
     });
-    row.append(chip, dot, sid, pin, chip2, model, meta, del);
+    row.append(chip, dot, sid, pin, archive, chip2, model, meta, del);
     els.sessionList.appendChild(row);
   }
 }
@@ -402,10 +480,15 @@ async function createSessionIn(ws) {
   const captured = sessionOpenEpoch;
   try {
     const res = await apiFor(ws, "/api/sessions", { method: "POST", body: JSON.stringify({}) });
+    // 响应到达先校验发起上下文（review：迟到失败污染新视图——POST 挂起期间
+    // 用户已导航（打开/切换/返回列表）或 workspace 被删，迟到的 401/500/格式
+    // 错误必须整体丢弃，不刷 banner、不改新视图的任何状态）。
+    if (captured !== sessionOpenEpoch) return;    // 期间有更新导航：过期创建不打开
+    if (!state.workspaces.includes(ws)) return;  // 目标 workspace 已被删除
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
     if (res.status !== 201) throw new Error("HTTP " + res.status);
     const s = await res.json();
-    if (captured !== sessionOpenEpoch) return;    // 期间有更新导航：过期创建不打开
+    if (captured !== sessionOpenEpoch) return;    // 解析期间又有更新导航：过期创建不打开
     if (!state.workspaces.includes(ws)) return;  // 目标 workspace 已被删除
     const wl = workspaceListFor(ws);
     if (Array.isArray(wl)) {
@@ -415,6 +498,10 @@ async function createSessionIn(ws) {
     }
     await openSessionIn(ws.id, s.id);   // 成功路径：入口声明新 epoch（++/claim）
   } catch (e) {
+    // catch 刷 banner 前同样守卫发起上下文：导航发生在请求/解析期间的迟到
+    // 失败不覆盖新视图的提示（review：迟到失败污染新视图）。
+    if (captured !== sessionOpenEpoch) return;
+    if (!state.workspaces.includes(ws)) return;
     setBanner("⚠ 创建会话失败：" + e.message);
   }
 }
@@ -621,6 +708,9 @@ function openSession(id, onReady, epoch) {
   stopSSE();
   state.sessionId = id;
   state.view = "chat";
+  // 聊天视图：聚合轮询停（避免与 SSE 并行轰炸）；侧边栏开着时不停——
+  // 由 shouldPollSessions 续调度维持（openSidebar 也会 startPolling 恢复）
+  if (!state.sidebar.open) stopPolling();
   // 任何手动打开都会取代/完成 URL 深链，避免返回列表后深链再次触发
   state.deepLink.handled = true;
   state.deepLink.pending = null;
@@ -676,7 +766,7 @@ function openSession(id, onReady, epoch) {
     userScrolled = false;          // 打开新会话：恢复自动跟随
     openWith(id, true, onReady, wsId, claimed);   // onReady 在 loadHistory 渲染完成后触发
   }
-  renderSidebarTree();             // 更新 .current 高亮
+  if (!els.sidebar.hidden) renderSidebarTree();   // 更新 .current 高亮（侧边栏可见时）
 }
 
 function backToList() {
@@ -696,6 +786,7 @@ function backToList() {
   els.backParentBtn.hidden = true;
   refreshBanner();
   history.replaceState(null, "", "/");
+  startPolling();   // 回列表视图：恢复聚合轮询（openSession 时已停）
   pollSessions();
 }
 
@@ -1178,15 +1269,85 @@ function restartTransport() {
   }
 }
 
-/* 聚合轮询：单一定时器驱动所有 workspace（激活 + 背景同为 1s；
-   简单起见不区分速率——每 tick 并行拉取，单 tick 内 Promise.allSettled
-   保证一台失败不影响其它）。 */
+/* 聚合轮询：setTimeout 链（2s）驱动所有 workspace——一轮（并行拉取全部 +
+   Promise.allSettled）完成才调度下一轮，天然防重入：慢响应不叠加、不并发
+   轰炸。stopPolling 或条件不满足（聊天视图 + 侧边栏关闭）时不再续调度。
+   立即轮询（pollSessions：backToList/restartTransport/switchWorkspace/
+   refreshSessionsForSidebar/init 的即时刷新）与定时轮询共用同一个 in-flight
+   守卫（runPollRound 串行链）：在途轮询未完成时，新请求不并发叠加——把
+   「新鲜一轮」排队到在途轮询之后，多个并发请求合并为同一轮。 */
+const POLL_INTERVAL_MS = 2000;
+
+/* 聊天视图 + 侧边栏关闭 → 停聚合轮询（避免与 SSE 并行轰炸）；
+   列表视图 / 聊天视图侧边栏开着 → 继续轮询（侧边栏要保持 busy/current
+   状态新鲜，openSession 时也不停）。 */
+function shouldPollSessions() {
+  return state.view !== "chat" || state.sidebar.open;
+}
+
+/* 单一 in-flight 守卫（promise 串行链）：同一时刻只有一轮轮询在途。
+   无在途轮询 → 立即启动一轮；有在途轮询 → 把「新鲜一轮」排队到其后
+   （调用方要的是当下数据，不能共享一个可能已过时的在途轮询），多个并发
+   请求合并为同一轮（同代排队复用）。排队 intent 携带 generation：在途
+   结束后启动前校验 gen 仍有效——stopPolling（gen 递增）后旧 intent 作废
+   被丢弃（不启动）；换代后的即时刷新（pollSessions）用新 gen 替换旧
+   intent（仍保持全局 single-flight，不并发叠加）。 */
+let pollRoundInFlight = null;   // 当前在途轮询的 Promise
+let pollRoundQueued = null;     // 已排队的「新鲜一轮」Promise（在途结束后立即跑）
+let pollRoundQueuedGen = -1;    // 排队 intent 的 generation（换代后替换而非复用）
+
+function runPollRound() {
+  if (pollRoundInFlight) {
+    const gen = state.pollGen;
+    if (!pollRoundQueued || pollRoundQueuedGen !== gen) {
+      pollRoundQueuedGen = gen;
+      pollRoundQueued = pollRoundInFlight.then(
+        () => startPollRound(gen),
+        () => startPollRound(gen)
+      );
+    }
+    return pollRoundQueued;
+  }
+  return startPollRound(state.pollGen);
+}
+
+function startPollRound(gen) {
+  pollRoundQueued = null;
+  pollRoundQueuedGen = -1;
+  if (gen !== state.pollGen) return;   // 过期 intent（stopPolling/换代后）→ 丢弃
+  pollRoundInFlight = (async () => {
+    try {
+      await pollAllWorkspaces();
+    } catch (e) {
+      // 一轮内的渲染/校验异常（afterPollRound 抛错等）不外泄：轮询链继续，
+      // 不产生未处理 rejection（断链防护在 pollRound 的 finally 兜底）
+    } finally {
+      pollRoundInFlight = null;
+    }
+  })();
+  return pollRoundInFlight;
+}
+
 function startPolling() {
   stopPolling();
-  state.pollTimer = setInterval(pollAllWorkspaces, 1000);
+  state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
 }
 function stopPolling() {
-  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  state.pollGen++;   // 使在途轮询的 finally 续调度失效（stop 后不再续）
+  if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+}
+async function pollRound() {
+  const gen = state.pollGen;
+  state.pollTimer = null;
+  try {
+    await runPollRound();
+  } finally {
+    // 无论成功/异常都续调度下一轮——防断链；期间 stopPolling（gen 变化）
+    // 或条件不满足（聊天视图关侧边栏）→ 不续调度
+    if (gen === state.pollGen && state.pollTimer === null && shouldPollSessions()) {
+      state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
+    }
+  }
 }
 /* delegate 任务 → 对应 subagent 会话 id。
    /api/tasks 的 delegate 条目 session_id 是父会话（任务注册在父的
@@ -1216,15 +1377,19 @@ function openSidebar() {
   if (state.sidebar.open) return;
   state.sidebar.open = true;
   persistSidebarOpen();                // 跨刷新保持打开状态
-  renderSidebarTree();                 // 树可能已随轮询刷新；打开时确保渲染
+  renderSidebarTree(true);             // force：hidden 期间可能错过了轮询更新
   els.sidebarOverlay.hidden = false;
   els.sidebar.hidden = false;
   // 双 rAF：先让浏览器以收起位姿渲染一帧，再加 .open 触发过渡
   // （桌面：width 0→280px；手机：translateX(-100%)→0）
   requestAnimationFrame(() => requestAnimationFrame(() => els.sidebar.classList.add("open")));
   pollTasks();   // 打开时立即刷新树内任务分组（统一轮询常驻，这里只求即时性）
-  // 聊天视图下会话轮询已停：补拉一次列表，树与 busy/current 状态保持新鲜
-  if (state.view === "chat") refreshSessionsForSidebar();
+  if (state.view === "chat") {
+    // 聊天视图：侧边栏可见 → 恢复聚合轮询（树与 busy/current 状态保持
+    // 新鲜；closeSidebar 时会再停）
+    startPolling();
+    refreshSessionsForSidebar();
+  }
 }
 
 function closeSidebar() {
@@ -1236,18 +1401,17 @@ function closeSidebar() {
   window.setTimeout(() => {
     if (!state.sidebar.open) els.sidebar.hidden = true;
   }, 220);
+  if (state.view === "chat") stopPolling();   // 聊天视图：侧边栏关了停聚合轮询
 }
 
 /* 聊天视图下补拉会话列表（聚合：一次拉全所有 workspace，侧边栏分组刷新；
-   背景服务器失败只标记、不打断激活服务器）。失败静默保留旧数据。 */
+   背景服务器失败只标记、不打断激活服务器）。失败静默保留旧数据。整轮
+   完成后 afterPollRound 统一做聊天视图的同步（composer meta / 返回按钮）。
+   经 runPollRound 与定时轮询共用 in-flight 守卫：在途轮询未完成时共享
+   同一轮，不并发叠加。 */
 async function refreshSessionsForSidebar() {
   if (!state.token) return;
-  await pollAllWorkspaces();
-  updateComposerMeta();          // 聊天视图下列表刷新：同步 model/role（幂等）
-  // 同步「← 主会话」按钮：任务面板直连跳转的 subagent 现在已入列表，
-  // 按 parent_session_id 正确显示/隐藏（cur 仍可能查不到——保持现状）。
-  const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
-  if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
+  await runPollRound();
 }
 /* =====================================================================
  * 会话侧边栏：会话树
@@ -1276,7 +1440,9 @@ function treeSessionMatches(s, filter) {
 }
 
 /* 聚合树签名：所有 workspace 的列表（激活 = lastList，背景 = 各自缓存）+
-   激活标记 + 错误标记 + 当前会话 id。任一变化 → 重绘（保留展开/滚动状态）。 */
+   激活标记 + 错误标记 + 当前会话 id + 树行渲染字段（含 model——树行
+   tooltip 渲染 model，缺了它 model 变化不会触发重绘）。任一变化 → 重绘
+   （保留展开/滚动状态）。 */
 function sidebarTreeSig() {
   const parts = [];
   for (const ws of state.workspaces) {
@@ -1286,7 +1452,8 @@ function sidebarTreeSig() {
       + (state.sidebar.showAllWs.has(ws.id) ? 1 : 0) + ":"
       + JSON.stringify(list.map((s) => [
         s.id, s.title || "", s.label || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
-        s.entry_count ?? 0, s.parent_session_id || "", s.pinned === true ? 1 : 0,
+        s.entry_count ?? null, s.parent_session_id || "", s.pinned === true ? 1 : 0,
+        s.archived === true ? 1 : 0, s.model || "",
       ])));
   }
   return state.sessionId + "|" + parts.join("|");
@@ -1433,28 +1600,40 @@ function renderTreeForList(container, list, wsId) {
     if (!childrenByParent.has(s.parent_session_id)) childrenByParent.set(s.parent_session_id, []);
     childrenByParent.get(s.parent_session_id).push(s);
   }
-  const rootIds = new Set(list.filter(isMainSession).map((s) => s.id));
+  // 归档分组：归档会话（archived === true）连同其子会话一起收进折叠的
+  // 「归档」分组，不参与主会话/未关联/MAX_TREE_ROOTS 的常规渲染。
+  const archivedIds = new Set(list.filter((s) => s.archived === true).map((s) => s.id));
+  const inArchive = (s) => s.archived === true
+    || (s.parent_session_id && archivedIds.has(s.parent_session_id));
+  const archivedSessions = list.filter(inArchive);
+  const rest = list.filter((s) => !inArchive(s));
   // pinned 根节点已在置顶分组渲染，这里从 workspace 内剔除（其子会话
   // 跟随剔除——置顶分组里 buildTreeRoot 会带出它们的子会话）。
-  const pinnedRootIds = new Set(list.filter((s) => s.pinned === true && isMainSession(s)).map((s) => s.id));
+  const pinnedRootIds = new Set(rest.filter((s) => s.pinned === true && isMainSession(s)).map((s) => s.id));
   const inPinnedSubtree = (s) => pinnedRootIds.has(s.id)
     || (s.parent_session_id && pinnedRootIds.has(s.parent_session_id));
-  const listForWorkspace = list.filter((s) => !inPinnedSubtree(s));
+  const listForWorkspace = rest.filter((s) => !inPinnedSubtree(s));
+  const rootIds = new Set(listForWorkspace.filter(isMainSession).map((s) => s.id));
   const orphans = listForWorkspace.filter((s) => s.parent_session_id
     ? !rootIds.has(s.parent_session_id)
     : !isMainSession(s));
   const filter = state.sidebar.filter;
   const roots = listForWorkspace.filter(isMainSession);
+  // 普通主根的子会话排除已归档的（它们收进「归档」分组；否则会同时出现在
+  // 父节点子树和归档分组里，重复渲染）。
+  const kidsFor = (s) => (childrenByParent.get(s.id) || []).filter((k) => !inArchive(k));
   if (filter) {
     // 筛选：主会话匹配 title（无 title 回退 id），大小写不敏感；子会话随父显示
     const match = (s) => treeSessionMatches(s, filter);
     const matchedRoots = roots.filter(match);
     const matchedOrphans = orphans.filter(match);
-    if (!matchedRoots.length && !matchedOrphans.length) {
+    const matchedArchived = archivedSessions.filter(match);
+    if (!matchedRoots.length && !matchedOrphans.length && !matchedArchived.length) {
       container.appendChild(el("div", "tree-empty", "无匹配会话"));
     } else {
-      for (const s of matchedRoots) container.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || [], wsId));
+      for (const s of matchedRoots) container.appendChild(buildTreeRoot(s, kidsFor(s), wsId));
       if (matchedOrphans.length) container.appendChild(buildTreeGroup("未关联", matchedOrphans, wsId));
+      if (matchedArchived.length) container.appendChild(buildArchiveGroup(matchedArchived, wsId, childrenByParent));
     }
   } else {
     let shown = roots;
@@ -1470,9 +1649,10 @@ function renderTreeForList(container, list, wsId) {
         renderSidebarTree(true);
       });
     }
-    for (const s of shown) container.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || [], wsId));
+    for (const s of shown) container.appendChild(buildTreeRoot(s, kidsFor(s), wsId));
     if (moreBtn) container.appendChild(moreBtn);
     if (orphans.length) container.appendChild(buildTreeGroup("未关联", orphans, wsId));
+    if (archivedSessions.length) container.appendChild(buildArchiveGroup(archivedSessions, wsId, childrenByParent));
   }
 }
 
@@ -1480,7 +1660,8 @@ function buildTreeRoot(s, kids, wsId) {
   const node = el("div", "tree-node");
   const row = el("div", "tree-row"
     + (state.workspace.id === wsId && state.sessionId === s.id ? " current" : "")
-    + (s.pinned === true ? " pinned" : ""));
+    + (s.pinned === true ? " pinned" : "")
+    + (s.archived === true ? " archived" : ""));
   const hasKids = kids.length > 0;
   const toggle = el("button", "tree-toggle");
   toggle.type = "button";
@@ -1523,7 +1704,20 @@ function buildTreeRoot(s, kids, wsId) {
     const ws = state.workspaces.find((w) => w.id === wsId);
     togglePin(s, () => { renderSidebarTree(true); renderSessionList(); }, ws);
   });
-  row.append(toggle, dot, titleEl, count, pin);
+  // 🗄 归档按钮（仅主会话根节点，与 pin 同规则）：归档会话收进「归档」
+  // 分组；在分组里点按钮 = 恢复。
+  const archive = el("button", "archive-btn" + (s.archived === true ? " on" : ""));
+  archive.innerHTML = archiveSvg();   // SVG 归档盒：状态色跟随 currentColor
+  archive.type = "button";
+  archive.title = s.archived === true ? "恢复（取消归档）" : "归档";
+  archive.setAttribute("aria-label", archive.title);
+  archive.setAttribute("aria-pressed", String(s.archived === true));
+  archive.addEventListener("click", (ev) => {
+    ev.stopPropagation();                  // 不触发切换会话
+    const ws = state.workspaces.find((w) => w.id === wsId);
+    toggleArchived(s, () => { renderSidebarTree(true); renderSessionList(); }, ws);
+  });
+  row.append(toggle, dot, titleEl, count, pin, archive);
   row.title = (s.title || s.id) + (s.model ? " · " + s.model : "")
     + (s.busy ? "（处理中）" : (kidsBusy ? "（子任务处理中）" : ""));
   row.addEventListener("click", () => {
@@ -1636,6 +1830,43 @@ function buildTreeGroup(label, kids, wsId) {
   const children = el("div", "tree-children");
   children.hidden = true;   // 「未关联」分组默认折叠，点击展开（不持久化）
   renderTreeChildren(children, kids, wsId);
+  node.appendChild(children);
+  return node;
+}
+
+/* 「归档 (N)」折叠分组：归档会话（主会话 + 其子会话 + 归档孤儿）默认
+   收起，点击展开；分组内主会话行保留 buildTreeRoot（含 pin/归档按钮，
+   可直接恢复），孤儿子会话用 renderSubagentRows 渲染。点击分组内会话
+   行可正常打开（与普通树行一致）。不持久化展开状态（每次重绘默认折叠）。 */
+function buildArchiveGroup(archivedSessions, wsId, childrenByParent) {
+  const archivedIds = new Set(archivedSessions.map((s) => s.id));
+  const isMain = (s) => !s.parent_session_id && !/^(sub|btw)-/i.test(String(s.id || ""));
+  // 根：无 parent 或 parent 不在归档集合内（归档孤儿）。主会话根用
+  // buildTreeRoot 渲染（子会话随父显示在根的子树里）；非主根用 subagent 行。
+  const roots = archivedSessions.filter((s) => !s.parent_session_id || !archivedIds.has(s.parent_session_id));
+  const mainRootIds = new Set(roots.filter(isMain).map((s) => s.id));
+  // 其余：parent 在归档集合内且父不是 buildTreeRoot 渲染的主根——否则会
+  // 与根节点子树里的子会话重复渲染。
+  const subRows = archivedSessions.filter((s) => s.parent_session_id
+    && archivedIds.has(s.parent_session_id)
+    && !mainRootIds.has(s.parent_session_id));
+  const node = el("div", "tree-node");
+  const row = el("div", "tree-row tree-archive-row");
+  const toggle = el("button", "tree-toggle");
+  toggle.type = "button";
+  toggle.title = "展开 / 收起";
+  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle));
+  const idEl = el("span", "tree-id tree-group tree-archive-label",
+    "归档 (" + archivedSessions.length + ")");
+  row.append(toggle, idEl);
+  node.appendChild(row);
+  const children = el("div", "tree-children");
+  children.hidden = true;
+  for (const s of roots) {
+    if (!isMain(s)) { renderSubagentRows(children, [s], true, wsId); continue; }
+    children.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || [], wsId));
+  }
+  if (subRows.length) renderSubagentRows(children, subRows, true, wsId);
   node.appendChild(children);
   return node;
 }
@@ -1773,5 +2004,42 @@ async function togglePin(s, afterToggle, ws) {
     afterToggle();
   } catch (e) {
     setBanner("⚠ 置顶失败：" + e.message, true);
+  }
+}
+
+/* PUT 切换归档（🗄 → PUT /api/sessions/{id}/archive {"archived": bool}）；
+   成功写回目标 workspace 列表对象（workspaceListFor）并回调调用方重绘
+   （列表行与树主节点共用）。旧服务器没有 archive 端点：404/405 统一提示
+   「服务器不支持归档」（与置顶/重命名一致）；archived 字段缺失
+   （undefined）视为未归档。列表顺序信任后端（未归档在前、归档最后），
+   前端不重排。
+   ws 可选（聚合行/跨服务器树的节点传所属 workspace；缺省 = 激活 workspace，
+   既有调用不变）：请求打到目标服务器。 */
+async function toggleArchived(s, afterToggle, ws) {
+  const targetWs = ws || state.workspace;
+  if (!workspaceToken(targetWs)) { setBanner("⚠ 请先输入 Token。", true); return; }
+  const target = s.archived !== true;   // 兼容旧 server 无 archived 字段：undefined → 归档
+  try {
+    const res = await apiFor(targetWs, "/api/sessions/" + encodeURIComponent(s.id) + "/archive",
+      { method: "PUT", body: JSON.stringify({ archived: target }) });
+    if (res.status === 401 || res.status === 403) {
+      setBanner("⚠ 认证失败：请检查 Token。");
+      return;
+    }
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 405) {
+        setBanner("⚠ 服务器不支持归档。", true);
+      } else {
+        setBanner("⚠ 归档失败：HTTP " + res.status, true);
+      }
+      return;
+    }
+    // 轮询可能已换掉列表里的对象引用（列表数据未变时树/列表不重绘，
+    // 但数组每轮都是新的）：按 id 重新解析当前对象再写回，确保重绘反映新状态
+    const cur = workspaceListFor(targetWs).find((x) => x.id === s.id) || s;
+    cur.archived = target;
+    afterToggle();
+  } catch (e) {
+    setBanner("⚠ 归档失败：" + e.message, true);
   }
 }

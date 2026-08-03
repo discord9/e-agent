@@ -200,6 +200,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/undo", post(session_undo))
         .route("/api/sessions/{id}/title", put(session_title))
         .route("/api/sessions/{id}/pin", put(session_pin))
+        .route("/api/sessions/{id}/archive", put(session_archive))
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/tasks", get(list_tasks))
         .route("/api/sessions/{id}/tasks/{task_id}", delete(cancel_task))
@@ -525,6 +526,13 @@ pub struct SessionMeta {
     /// the metadata table via [`merge_session_metas`] (the registry DTO
     /// itself carries no pin), so live pins show up on the next list.
     pub pinned: Option<bool>,
+    /// User archive flag: `Some(true)` = archived (hidden from the default
+    /// session list, folded into the sidebar's collapsed "归档" group),
+    /// `Some(false)` / `None` = unarchived. Registry sessions are built
+    /// from the metadata table via [`merge_session_metas`] (the registry
+    /// DTO itself carries no archive flag), so live archives show up on
+    /// the next list.
+    pub archived: Option<bool>,
     /// Task-panel label of the delegate task that spawned this subagent
     /// (`running_tasks.label`, newest surviving row — the sessions metadata
     /// table does not store it). `None` = no live delegate task carries
@@ -562,6 +570,9 @@ async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -
         // The registry DTO has no pin; the merge fills it from the
         // session's metadata-table snapshot like the title.
         pinned: None,
+        // The registry DTO has no archive flag; the merge fills it from
+        // the session's metadata-table snapshot like the pin.
+        archived: None,
         // The label lives in running_tasks; `list_sessions` fills it for
         // subagent items after the merge.
         label: None,
@@ -677,6 +688,12 @@ fn merge_session_metas(
                 if occupied.get().pinned.is_none() {
                     occupied.get_mut().pinned = meta.pinned;
                 }
+                // Same for the archive flag: the registry DTO has none, so
+                // a live session's archived state comes from its
+                // metadata-table snapshot.
+                if occupied.get().archived.is_none() {
+                    occupied.get_mut().archived = meta.archived;
+                }
                 // Same for the parent link: a resumed subagent's live entry
                 // must stay recognizable as a subagent so `list_sessions`
                 // can fill its label from `running_tasks`.
@@ -706,6 +723,7 @@ fn merge_session_metas(
                     parent_session_id: meta.parent_session_id,
                     title: meta.title,
                     pinned: meta.pinned,
+                    archived: meta.archived,
                     // Label lives in running_tasks; `list_sessions` fills it.
                     label: None,
                 });
@@ -714,12 +732,21 @@ fn merge_session_metas(
     }
     let mut metas: Vec<SessionMeta> = by_id.into_values().collect();
     // Backend sort (the frontend renders the array order as-is): pinned
-    // sessions first (`pinned = Some(true)`), then newest activity first
-    // within each group.
+    // sessions first (`pinned = Some(true)`), then unarchived sessions
+    // before archived ones (`archived = Some(true)` sorts last), then
+    // newest activity first within each group. Note the two flag
+    // comparators run in OPPOSITE directions: pinned sorts descending
+    // (true first), archived sorts ascending (true LAST — unarchived
+    // sessions must stay in the default list).
     metas.sort_by(|a, b| {
         b.pinned
             .unwrap_or(false)
             .cmp(&a.pinned.unwrap_or(false))
+            .then_with(|| {
+                a.archived
+                    .unwrap_or(false)
+                    .cmp(&b.archived.unwrap_or(false))
+            })
             .then_with(|| b.last_active_at.cmp(&a.last_active_at))
     });
     metas
@@ -1161,6 +1188,52 @@ async fn session_pin(
     };
     store
         .set_pinned(root, &id, body.pinned)
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ArchiveBody {
+    /// The frontend sends `JSON.stringify({ archived })`.
+    archived: bool,
+}
+
+/// `PUT /api/sessions/{id}/archive` — archive or restore a session. Body
+/// `{"archived": true|false}`; one endpoint toggles both directions. Works
+/// for live sessions and live subagents (via their session-bound store —
+/// a built session always has a metadata row, `build` → `create_meta`) and
+/// historical sessions (via the workspace-scoped `meta_store`, so an
+/// archive survives the session leaving the registry). 404 when the id is
+/// neither live nor present in the metadata table. The JSONL backend has
+/// no meta table: archiving a live session is a silent no-op (archives
+/// are Greptime/SQLite-only).
+async fn session_archive(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ArchiveBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let root = state.factory.root();
+    let store = match live(&state, &id) {
+        Ok(SessionRef::Live(session)) => session.store.clone(),
+        Ok(SessionRef::Subagent(entry)) => entry.store.clone(),
+        Err(_) => {
+            let historical = state
+                .meta_store
+                .list_meta(root)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            if !historical.iter().any(|m| m.session_id == id) {
+                return Err(error(
+                    StatusCode::NOT_FOUND,
+                    format!("session {id} not found"),
+                ));
+            }
+            state.meta_store.clone()
+        }
+    };
+    store
+        .set_archived(root, &id, body.archived)
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
@@ -3118,6 +3191,7 @@ model = "deepseek-chat"
             "parent_session_id",
             "title",
             "pinned",
+            "archived",
             "label",
         ] {
             assert!(value.get(key).is_some(), "missing field {key}");
@@ -3153,6 +3227,7 @@ model = "deepseek-chat"
             parent_session_id: None,
             title: None,
             pinned: None,
+            archived: None,
             label: None,
         };
         let history = |id: &str, created: i64, count: i64, title: Option<&str>| HistoryMeta {
@@ -3166,6 +3241,7 @@ model = "deepseek-chat"
             parent_task_id: None,
             title: title.map(str::to_owned),
             pinned: None,
+            archived: None,
             writer: None,
             label: None,
         };
@@ -3223,6 +3299,123 @@ model = "deepseek-chat"
         );
         let tui1 = merged.iter().find(|m| m.id == "tui-1").unwrap();
         assert_eq!(tui1.pinned, Some(true), "historical pin passes through");
+
+        // Archived sorting: an archived session (even a recent one) moves
+        // to the back of the list; pinned still wins over both, and the
+        // archive flag backfills a live entry too.
+        let mut archived_web = history("web-1", 200, 3, None);
+        archived_web.archived = Some(true);
+        let mut archived_pinned = history("tui-1", 50, 7, None);
+        archived_pinned.pinned = Some(true);
+        archived_pinned.archived = Some(true);
+        let merged = merge_session_metas(
+            vec![wire("web-1", 200)],
+            vec![archived_pinned, archived_web],
+        );
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["tui-1", "web-1"],
+            "pinned first (even when archived), archived sorts last"
+        );
+        let web1 = merged.iter().find(|m| m.id == "web-1").unwrap();
+        assert_eq!(
+            web1.archived,
+            Some(true),
+            "historical archive passes through to the live entry"
+        );
+    }
+
+    /// Archive sort DIRECTION: unarchived sessions sort BEFORE archived
+    /// ones, even when the archived session is more recently active — the
+    /// comparator ascends on `archived` (unlike `pinned`, which descends),
+    /// so archived sessions sink to the bottom of the default list.
+    #[test]
+    fn merge_session_metas_archived_sorts_after_unarchived() {
+        use crate::session_store::SessionMeta as HistoryMeta;
+        let dt = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let naive = |secs: i64| {
+            chrono::DateTime::from_timestamp(secs, 0)
+                .unwrap()
+                .naive_utc()
+        };
+        let wire = |id: &str, created: i64| SessionMeta {
+            id: id.to_owned(),
+            model: "web-model".into(),
+            role: None,
+            created_at: dt(created),
+            last_active_at: dt(created),
+            status: "Idle".into(),
+            entry_count: 1,
+            busy: false,
+            active: false,
+            parent_session_id: None,
+            title: None,
+            pinned: None,
+            archived: None,
+            label: None,
+        };
+        let history = |id: &str, created: i64, count: i64, archived: Option<bool>| HistoryMeta {
+            session_id: id.to_owned(),
+            created_at: naive(created),
+            last_active_at: naive(created + 10),
+            model: None,
+            role: None,
+            entry_count: count,
+            parent_session_id: None,
+            parent_task_id: None,
+            title: None,
+            pinned: None,
+            archived,
+            writer: None,
+            label: None,
+        };
+        // The archived session is MORE recently active (last_active 510 vs
+        // 110); it must still sort AFTER the unarchived one — recency only
+        // breaks ties within the same archived bucket.
+        let archived_recent = history("arch-1", 500, 3, Some(true));
+        let unarchived_old = history("plain", 100, 1, None);
+        let merged = merge_session_metas(vec![], vec![archived_recent, unarchived_old]);
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["plain", "arch-1"],
+            "unarchived sorts before archived regardless of recency"
+        );
+        assert_eq!(merged[0].archived, None);
+        assert_eq!(merged[1].archived, Some(true));
+        // Same recency, different flags: still unarchived first.
+        let merged = merge_session_metas(
+            vec![],
+            vec![
+                history("arch-2", 300, 1, Some(true)),
+                history("plain-2", 300, 1, None),
+            ],
+        );
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["plain-2", "arch-2"]);
+        // Both archived: recency breaks the tie (newest first).
+        let merged = merge_session_metas(
+            vec![],
+            vec![
+                history("arch-old", 100, 1, Some(true)),
+                history("arch-new", 500, 1, Some(true)),
+            ],
+        );
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["arch-new", "arch-old"],
+            "recency sorts within archived"
+        );
+        // A live registry session is never archived by default; it must
+        // beat the archived history session too.
+        let merged = merge_session_metas(
+            vec![wire("live-1", 900)],
+            vec![history("arch-live", 800, 3, Some(true))],
+        );
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["live-1", "arch-live"]);
     }
 
     /// The active rule for subagent list entries: a surviving running_tasks
@@ -3245,6 +3438,7 @@ model = "deepseek-chat"
             parent_session_id: Some("web-1".into()),
             title: None,
             pinned: None,
+            archived: None,
             label: None,
         };
         let mut live = meta(false);

@@ -70,8 +70,8 @@ CREATE TABLE IF NOT EXISTS running_tasks (
 ///
 /// Semantics: an append-only lifecycle AUDIT log, not a one-row-per-session
 /// upsert table. Every create/touch appends a COMPLETE snapshot row
-/// (created_at/model/role/parent/entry_count/title/pinned/writer all
-/// carried on every row) at a fresh `last_active_at`; the list view
+/// (created_at/model/role/parent/entry_count/title/pinned/archived/writer
+/// all carried on every row) at a fresh `last_active_at`; the list view
 /// deduplicates per session taking the latest `last_active_at` (explicitly
 /// in SQL — the query is correct whether or not the engine auto-dedups
 /// same-PK rows). Because each row is a full snapshot, a touch can never
@@ -80,10 +80,13 @@ CREATE TABLE IF NOT EXISTS running_tasks (
 /// `title` is the user-assigned session name (manual, never auto-generated;
 /// `NULL` = unnamed, the frontend shows the id). `pinned` is the user pin
 /// flag (`NULL` = never touched, reads as unpinned; the list sorts pinned
-/// sessions first). `writer` is the process identity of the process that
-/// wrote this snapshot row (`pid@hostname#nonce`, see
-/// [`process_identity`]): an audit trail of who wrote each snapshot, and a
-/// best-effort hint in concurrent-write conflict errors.
+/// sessions first). `archived` is the user archive flag (`NULL` = never
+/// touched, reads as unarchived; archived sessions are hidden from the
+/// default list and folded into the sidebar's archived group). `writer` is
+/// the process identity of the process that wrote this snapshot row
+/// (`pid@hostname#nonce`, see [`process_identity`]): an audit trail of who
+/// wrote each snapshot, and a best-effort hint in concurrent-write
+/// conflict errors.
 ///
 /// Unlike Greptime's `TIME INDEX (last_active_at)`, the SQLite primary key
 /// carries `last_active_at` as well, so two snapshots of the same session
@@ -104,6 +107,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     parent_task_id INTEGER NULL,
     title TEXT NULL,
     pinned INTEGER NULL,
+    archived INTEGER NULL,
     writer TEXT NULL,
     PRIMARY KEY (workspace_id, session_id, last_active_at)
 )
@@ -287,31 +291,121 @@ impl SqliteSession {
             .await
             .map_err(|e| format!("cannot create sessions table: {e}"))?;
 
+        // Idempotent schema migration for the `title`, `pinned`,
+        // `archived` and `writer` columns — a table-structure evolution:
+        // the `sessions` table shipped without them, so pre-existing
+        // databases need an ALTER (fresh databases already have them via
+        // CREATE_TABLE_SESSIONS above; `CREATE TABLE IF NOT EXISTS` never
+        // adds columns, so without this the shared column-bearing SELECTs
+        // would hard-error on an old database file — the same failure
+        // mode `pinned` would have hit, and which `archived` — a newer
+        // column — definitely hits). There are no historical rows to
+        // backfill: old rows simply read the columns back as NULL (the
+        // read path treats them as `Option`).
+        //
+        // Mirrors the Greptime backend's probe-then-ALTER pattern
+        // (session_greptime.rs): probe `PRAGMA table_info(sessions)` for
+        // each column, `ALTER TABLE sessions ADD COLUMN` when missing
+        // (the ALTER deliberately omits an explicit NULL constraint —
+        // see the turso quirk note below). A failed migration must NOT
+        // block the connection — if ALTER errors anyway we keep running
+        // with the feature degraded: the meta-row cache below is skipped
+        // and later column-bearing queries fail loudly with context;
+        // transcript operations are unaffected.
+        let mut title_available = true;
+        let mut pinned_available = true;
+        let mut archived_available = true;
+        let mut writer_available = true;
+        {
+            let mut rows = conn
+                .query("PRAGMA table_info(sessions)", ())
+                .await
+                .map_err(|e| format!("cannot inspect sessions table schema: {e}"))?;
+            let mut columns: Vec<String> = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| format!("cannot inspect sessions table schema: {e}"))?
+            {
+                // PRAGMA table_info columns: cid, name, type, notnull,
+                // dflt_value, pk — the name is index 1.
+                if let Some(name) = row
+                    .get_value(1)
+                    .map_err(|e| format!("cannot inspect sessions table schema: {e}"))?
+                    .as_text()
+                {
+                    columns.push(name.clone());
+                }
+            }
+            // Keep the added column types identical to CREATE_TABLE_SESSIONS
+            // (TEXT for title/writer, INTEGER for the boolean flags) so a
+            // migrated old database and a fresh database share one schema.
+            // NOTE: turso's ALTER TABLE ADD COLUMN mis-parses an explicit
+            // trailing `NULL` as NOT NULL (CREATE TABLE is unaffected —
+            // fresh DBs keep nullable columns), so the ALTER must OMIT the
+            // constraint; ADD COLUMN defaults to nullable anyway.
+            let migrations: [(&str, &str, &str, &mut bool); 4] = [
+                ("title", "TEXT", "session titles", &mut title_available),
+                (
+                    "pinned",
+                    "INTEGER",
+                    "session pinning",
+                    &mut pinned_available,
+                ),
+                (
+                    "archived",
+                    "INTEGER",
+                    "session archiving",
+                    &mut archived_available,
+                ),
+                ("writer", "TEXT", "writer audit", &mut writer_available),
+            ];
+            for (name, sql_type, feature, available) in migrations {
+                if columns.iter().any(|c| c == name) {
+                    continue; // column already present (fresh DB or migrated)
+                }
+                let sql = format!("ALTER TABLE sessions ADD COLUMN {name} {sql_type}");
+                if let Err(error) = conn.execute(&sql, ()).await {
+                    *available = false;
+                    eprintln!(
+                        "e-agent: cannot add sessions.{name} column ({feature} unavailable): \
+                         {error}"
+                    );
+                }
+            }
+        }
+
         // Cache the session's latest metadata snapshot (if any) so later
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
-        // wins (ORDER BY last_active_at DESC LIMIT 1).
-        let cached_meta = {
-            let mut rows = conn
-                .query(
-                    "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                            parent_session_id, parent_task_id, title, pinned, writer \
-                     FROM sessions \
-                     WHERE workspace_id = ?1 AND session_id = ?2 \
-                     ORDER BY last_active_at DESC LIMIT 1",
-                    (workspace_id, session_id),
-                )
-                .await
-                .map_err(|e| format!("cannot query session metadata: {e}"))?;
-            match rows
-                .next()
-                .await
-                .map_err(|e| format!("cannot query session metadata: {e}"))?
-            {
-                Some(row) => Some(row_to_meta(&row, session_id)?),
-                None => None,
-            }
-        };
+        // wins (ORDER BY last_active_at DESC LIMIT 1). Skipped when a
+        // feature column is unavailable (failed migration): the cache
+        // query references the columns and would error on an unmigrated
+        // table, exactly like Greptime's degraded mode.
+        let cached_meta =
+            if title_available && pinned_available && archived_available && writer_available {
+                let mut rows = conn
+                    .query(
+                        "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                                parent_session_id, parent_task_id, title, pinned, archived, writer \
+                         FROM sessions \
+                         WHERE workspace_id = ?1 AND session_id = ?2 \
+                         ORDER BY last_active_at DESC LIMIT 1",
+                        (workspace_id, session_id),
+                    )
+                    .await
+                    .map_err(|e| format!("cannot query session metadata: {e}"))?;
+                match rows
+                    .next()
+                    .await
+                    .map_err(|e| format!("cannot query session metadata: {e}"))?
+                {
+                    Some(row) => Some(row_to_meta(&row, session_id)?),
+                    None => None,
+                }
+            } else {
+                None
+            };
 
         let session = Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
@@ -1178,10 +1272,10 @@ impl SqliteSession {
     // SQLite supports UPDATE, but the sessions table deliberately mirrors
     // Greptime's append-only lifecycle audit log: every create/touch
     // appends a COMPLETE snapshot row (created_at/model/role/parent/
-    // entry_count/title/pinned/writer all carried on every row), and the
-    // list view deduplicates per session taking the latest last_active_at.
-    // There is no partial-row rewrite, so a touch can never wipe immutable
-    // columns.
+    // entry_count/title/pinned/archived/writer all carried on every row),
+    // and the list view deduplicates per session taking the latest
+    // last_active_at. There is no partial-row rewrite, so a touch can
+    // never wipe immutable columns.
 
     /// Latest metadata snapshot for one session, or `None` when the
     /// session has no row yet (brand-new session, or a subagent whose
@@ -1191,7 +1285,7 @@ impl SqliteSession {
         let mut rows = conn
             .query(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, writer \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer \
                  FROM sessions \
                  WHERE workspace_id = ?1 AND session_id = ?2 \
                  ORDER BY last_active_at DESC LIMIT 1",
@@ -1220,8 +1314,8 @@ impl SqliteSession {
         conn.execute(
             "INSERT INTO sessions \
              (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-              entry_count, parent_session_id, parent_task_id, title, pinned, writer) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             (
                 self.workspace_id.as_str(),
                 meta.session_id.as_str(),
@@ -1234,6 +1328,7 @@ impl SqliteSession {
                 meta.parent_task_id,
                 meta.title.as_deref(),
                 meta.pinned.map(|p| if p { 1 } else { 0 }),
+                meta.archived.map(|a| if a { 1 } else { 0 }),
                 meta.writer.as_deref(),
             ),
         )
@@ -1292,6 +1387,7 @@ impl SqliteSession {
             parent_task_id: parent_task_id.or(existing.parent_task_id),
             title: existing.title.clone(),
             pinned: existing.pinned,
+            archived: existing.archived,
             writer: None, // stamped by insert_meta with the writing process
             label: None,  // label lives in running_tasks, resolved at list time
         }
@@ -1357,10 +1453,11 @@ impl SqliteSession {
             entry_count: *self.next_seq.lock().unwrap(),
             parent_session_id: parent_session_id.map(str::to_owned),
             parent_task_id,
-            title: None,  // a fresh session is unnamed until the user names it
-            pinned: None, // a fresh session is unpinned until the user pins it
-            writer: None, // stamped by insert_meta with the writing process
-            label: None,  // label lives in running_tasks, resolved at list time
+            title: None,    // a fresh session is unnamed until the user names it
+            pinned: None,   // a fresh session is unpinned until the user pins it
+            archived: None, // a fresh session is unarchived until the user archives it
+            writer: None,   // stamped by insert_meta with the writing process
+            label: None,    // label lives in running_tasks, resolved at list time
         };
         self.insert_meta(&mut meta).await?;
         *self.cached_meta.lock().unwrap() = Some(meta);
@@ -1455,6 +1552,41 @@ impl SqliteSession {
         Ok(())
     }
 
+    /// Archive or restore a session: append one full snapshot row carrying
+    /// the new `archived` flag and a fresh `last_active_at` (the audit log
+    /// keeps the previous state in earlier rows; the list view shows the
+    /// newest and sorts unarchived sessions before archived ones).
+    /// `archived = false` stores `Some(false)` — explicitly restored,
+    /// distinct from the `None` of a never-touched session (both read as
+    /// unarchived).
+    ///
+    /// Never self-creates (R3, mirroring `set_pinned` / `set_title` /
+    /// `touch_meta`): when the session has no metadata row yet, returns
+    /// `Ok` and writes nothing.
+    ///
+    /// `session_id` is explicit (like [`Self::set_pinned`]) so a
+    /// workspace-scoped meta store can archive/restore historical sessions
+    /// it is not bound to; for the bound session the cached snapshot is
+    /// used (and refreshed) so the change is immediately visible to later
+    /// touches.
+    pub async fn set_archived(&self, session_id: &str, archived: bool) -> Result<(), String> {
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            return Ok(());
+        };
+        meta.archived = Some(archived);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&mut meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta);
+        }
+        Ok(())
+    }
+
     /// Latest metadata snapshot per session, newest activity first.
     ///
     /// The table is append-only, so one session has many rows; the list
@@ -1467,7 +1599,7 @@ impl SqliteSession {
             .query(
                 "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
                         s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned, \
-                        s.writer \
+                        s.archived, s.writer \
                  FROM sessions s \
                  INNER JOIN ( \
                      SELECT session_id, MAX(last_active_at) AS max_ts \
@@ -1507,7 +1639,7 @@ impl SqliteSession {
         let mut rows = conn
             .query(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, writer \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer \
                  FROM sessions \
                  WHERE workspace_id = ?1 AND session_id = ?2 \
                  ORDER BY last_active_at ASC",
@@ -1660,10 +1792,11 @@ impl SqliteSession {
                 entry_count,
                 parent_session_id: None,
                 parent_task_id: None,
-                title: None,  // pre-table sessions have no user-assigned name
-                pinned: None, // pre-table sessions are unpinned
-                writer: None, // stamped by insert_meta with the writing process
-                label: None,  // label lives in running_tasks, resolved at list time
+                title: None,    // pre-table sessions have no user-assigned name
+                pinned: None,   // pre-table sessions are unpinned
+                archived: None, // pre-table sessions are unarchived
+                writer: None,   // stamped by insert_meta with the writing process
+                label: None,    // label lives in running_tasks, resolved at list time
             })
             .await?;
         }
@@ -1908,7 +2041,7 @@ impl SqliteSession {
 /// Map a `sessions` table row (all columns except `session_id`, which is
 /// passed in) to a [`SessionMeta`]. Column layout of the shared SELECT:
 /// `created_at, last_active_at, model, "role", entry_count,
-/// parent_session_id, parent_task_id, title, pinned, writer`.
+/// parent_session_id, parent_task_id, title, pinned, archived, writer`.
 fn row_to_meta(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String> {
     let created_at = us_to_datetime(
         row.get_value(0)
@@ -1959,6 +2092,19 @@ fn row_to_meta(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String
         }
         None => None,
     };
+    let archived = match row
+        .get_value(9)
+        .map_err(|e| format!("cannot query session metadata: {e}"))?
+        .as_integer()
+        .copied()
+    {
+        Some(1) => Some(true),
+        Some(0) => Some(false),
+        Some(_) => {
+            return Err("cannot query session metadata: archived is not 0 or 1".to_string());
+        }
+        None => None,
+    };
     Ok(SessionMeta {
         session_id: session_id.to_owned(),
         created_at,
@@ -1982,8 +2128,9 @@ fn row_to_meta(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String
         parent_task_id,
         title,
         pinned,
+        archived,
         writer: row
-            .get_value(9)
+            .get_value(10)
             .map_err(|e| format!("cannot query session metadata: {e}"))?
             .as_text()
             .cloned(),
@@ -1994,7 +2141,7 @@ fn row_to_meta(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String
 /// Map a `list_meta` row (session_id already extracted as column 0) to a
 /// [`SessionMeta`]. Column layout of the list SELECT: `session_id,
 /// created_at, last_active_at, model, "role", entry_count,
-/// parent_session_id, parent_task_id, title, pinned, writer`.
+/// parent_session_id, parent_task_id, title, pinned, archived, writer`.
 fn meta_from_row_values(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String> {
     let created_at = us_to_datetime(
         row.get_value(1)
@@ -2043,6 +2190,19 @@ fn meta_from_row_values(row: &turso::Row, session_id: &str) -> Result<SessionMet
         }
         None => None,
     };
+    let archived = match row
+        .get_value(10)
+        .map_err(|e| format!("cannot list session metadata: {e}"))?
+        .as_integer()
+        .copied()
+    {
+        Some(1) => Some(true),
+        Some(0) => Some(false),
+        Some(_) => {
+            return Err("cannot list session metadata: archived is not 0 or 1".to_string());
+        }
+        None => None,
+    };
     Ok(SessionMeta {
         session_id: session_id.to_owned(),
         created_at,
@@ -2066,8 +2226,9 @@ fn meta_from_row_values(row: &turso::Row, session_id: &str) -> Result<SessionMet
         parent_task_id,
         title,
         pinned,
+        archived,
         writer: row
-            .get_value(10)
+            .get_value(11)
             .map_err(|e| format!("cannot list session metadata: {e}"))?
             .as_text()
             .cloned(),

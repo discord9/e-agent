@@ -261,6 +261,10 @@ els.searchInput.addEventListener("input", () => {
   state.searchQuery = els.searchInput.value.trim().toLowerCase();
   renderSessionList(state.lastList);   // 轮询仍会全量重绘，但搜索词留在 state 里，过滤持续生效
 });
+els.showArchiveBtn.addEventListener("click", () => {
+  state.showArchived = !state.showArchived;
+  renderSessionList();                 // 只重绘列表；侧边栏归档分组独立于该开关
+});
 els.backBtn.addEventListener("click", backToList);
 // 「← 主会话」：从 subagent 会话快速返回其父会话（无父则不显示按钮）
 els.backParentBtn.addEventListener("click", () => {
