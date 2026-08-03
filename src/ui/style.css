@@ -42,8 +42,7 @@ mmlEqnNo}
   @supports (height: 100dvh) {
     html, body { height: var(--app-height, 100dvh); }
   }
-  /* 滚动条：Solarized Light 细滚动条，替代浏览器原生粗条（侧边栏、消息
-     列表、列表视图、pre/tool 结果等所有滚动容器统一风格）。
+  /* 滚动条：Solarized Light 细滚动条，替代浏览器原生粗条（侧边栏、消息列表、侧边栏、pre/tool 结果等所有滚动容器统一风格）。
      - webkit (Chrome/Edge/Safari)：8px 宽、圆角、thumb 用 base1（hover
        base0 / active base01），track 透明——不抢内容视觉
      - Firefox：scrollbar-width: thin + scrollbar-color 同色
@@ -228,36 +227,24 @@ mmlEqnNo}
   }
   .view.hidden { display: none; }
 
-  /* ---------- 卡片 / 表单 ---------- */
-  .card {
-    background: var(--base3);
-    border: 1px solid var(--base1);
-    border-radius: 6px;
-    padding: 12px 14px;
+  /* ---------- 聊天空状态 ---------- */
+  .chat-empty {
+    margin: auto;
+    max-width: 420px;
+    padding: 28px;
+    text-align: center;
+    color: var(--base01);
+    border: 1px dashed var(--base1);
+    border-radius: 8px;
+    background: var(--base2);
   }
-  .card h2 {
-    margin: 0 0 10px;
-    font-size: 14px;
-    color: var(--base02);
-    border-bottom: 1px dotted var(--base1);
-    padding-bottom: 6px;
-  }
-  .dim { color: var(--base01); font-size: 12px; }
-
-  .new-session { display: flex; gap: 8px; align-items: stretch; }
-  .new-session textarea {
-    flex: 1;
-    resize: vertical;
-    min-height: 40px;
-    background: var(--base3);
-    border: 1px solid var(--base1);
-    border-radius: 4px;
-    padding: 6px 8px;
-    color: var(--base02);
-    font-family: inherit;
-    font-size: 13px;
-  }
-  textarea:focus { outline: 1px solid var(--blue); }
+  .chat-empty strong { display: block; margin-bottom: 8px; color: var(--base02); font-size: 16px; }
+  .chat-empty span { display: block; line-height: 1.6; }
+  #chatView:not(.no-session) .chat-empty { display: none; }
+  #chatView.no-session .chat-head,
+  #chatView.no-session .messages,
+  #chatView.no-session .composer,
+  #chatView.no-session .jump-bottom { display: none; }
 
   button {
     background: var(--base2);
@@ -275,76 +262,6 @@ mmlEqnNo}
   button.primary:hover:not(:disabled) { background: var(--cyan); border-color: var(--cyan); color: var(--base3); }
   button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
 
-  /* ---------- 会话列表 ---------- */
-  .list-head {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;      /* 小屏下搜索框换行，不横向溢出 */
-    gap: 4px 10px;
-  }
-  #searchInput {
-    flex: 1 1 150px;
-    min-width: 120px;
-    max-width: 260px;
-    margin-left: auto;    /* 宽屏下靠右，与 listMeta 同行 */
-    padding: 3px 8px;
-    background: var(--base3);
-    border: 1px solid var(--base1);
-    border-radius: 4px;
-    color: var(--base02);
-    font-family: inherit;
-    font-size: 12px;
-  }
-  #searchInput:focus { outline: 1px solid var(--blue); }
-  /* 「显示归档」开关：小按钮，灰化；打开时高亮（暗红，同归档按钮 .on） */
-  .archive-show-btn {
-    flex: 0 0 auto;
-    padding: 3px 10px;
-    background: var(--base3);
-    border: 1px solid var(--base1);
-    border-radius: 10px;
-    color: var(--base01);
-    font-family: inherit;
-    font-size: 12px;
-    cursor: pointer;
-    user-select: none;
-    transition: background 0.15s, color 0.15s, border-color 0.15s;
-  }
-  .archive-show-btn:hover { background: var(--base2); color: var(--base02); }
-  .archive-show-btn.on { color: var(--red); border-color: var(--red); }
-  .archive-show-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
-  .session-list { display: flex; flex-direction: column; gap: 6px; }
-  .session-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 8px 10px;
-    border: 1px solid var(--base1);
-    border-radius: 4px;
-    cursor: pointer;
-    background: var(--base3);
-  }
-  .session-row:hover { border-color: var(--blue); background: var(--base2); }
-  .session-row.inactive { opacity: 0.55; }
-  .session-row.inactive .sid { color: var(--base01); }
-  .session-row.inactive:hover { opacity: 0.8; }
-  .session-row .sid { color: var(--blue); font-size: 12px; min-width: 110px; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .session-row .sid.has-title { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; white-space: normal; }
-  .session-row .sid-title { font-size: 13px; color: var(--base02); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .session-row .sid-id { font-size: 10px; color: var(--base01); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .session-row .smodel { color: var(--base00); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .session-row .smeta { color: var(--base01); font-size: 12px; text-align: right; }
-  .session-row .del {
-    padding: 2px 8px;
-    font-size: 12px;
-    color: var(--base01);
-  }
-  /* 置顶会话行：金色左边条（inset，不挤占布局）+ 浅底色，Solarized 协调 */
-  .session-row.pinned { box-shadow: inset 3px 0 0 var(--yellow); background: var(--base2); }
-  /* 归档会话行（仅「显示归档」开启时渲染）：muted 灰化 + 低透明度 */
-  .session-row.archived { opacity: 0.5; }
-  .session-row.archived .sid { color: var(--base01); }
-  .session-row.archived:hover { opacity: 0.75; }
   .busy-dot {
     width: 8px; height: 8px;
     border-radius: 50%;
@@ -1265,7 +1182,7 @@ mmlEqnNo}
     user-select: none;
   }
   .tree-ws-header:hover { background: var(--base3); }
-  /* 服务器徽章：列表行与侧边栏分组头共用（跨服务器会话可区分） */
+  /* 服务器徽章：侧边栏分组头与置顶行共用（跨服务器会话可区分） */
   .ws-chip {
     font-size: 10px;
     line-height: 1.6;
@@ -1343,7 +1260,7 @@ mmlEqnNo}
   .tree-ws-body { padding-left: 2px; }
 
   /* ---------- 会话重命名：✎ / ✓ / × 小按钮与编辑态 ---------- */
-  /* ✎ 按钮：≥24px 点击区、muted 色、hover 背景；树节点与列表行共用 */
+  /* ✎ 按钮：≥24px 点击区、muted 色、hover 背景；树节点与聊天标题共用 */
   .tree-edit, .rename-save, .rename-cancel {
     flex: 0 0 auto;
     min-width: 24px;
@@ -1363,7 +1280,7 @@ mmlEqnNo}
     color: var(--base02);
   }
   /* 置顶按钮：默认 muted，置顶时金色高亮（Solarized yellow #b58900）；
-     列表行与侧边栏主会话节点共用（subagent 子节点不渲染）。 */
+     侧边栏主会话节点使用。 */
   .pin-btn {
     flex: 0 0 auto;
     width: 24px;
@@ -1410,6 +1327,19 @@ mmlEqnNo}
   .archive-btn.on { color: var(--red); }
   .archive-btn.on:hover { background: var(--base3); color: var(--red); }
   .archive-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  .tree-del {
+    flex: 0 0 auto;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--base01);
+    font-size: 17px;
+    line-height: 1;
+  }
+  .tree-del:hover:not(:disabled) { background: #fbe3e4; color: var(--red); }
+  .tree-del:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
   /* 「归档 (N)」分组头（侧边栏）：muted 灰化 */
   .tree-archive-label { color: var(--base01); }
   /* 编辑态：input 内嵌行内（原位替换标题文本） */
@@ -1533,9 +1463,6 @@ mmlEqnNo}
   /* 小屏适配 */
   @media (max-width: 640px) {
     #tokenInput { width: 150px; }
-    #searchInput { max-width: 100%; }   /* 小屏换行后占满整行，不溢出 */
-    .session-row .smodel { display: none; }
-    .session-row .smeta { display: none; }
   }
   /* 手机宽度（390px）：顶栏挤进汉堡按钮后收紧间距/字号，保证不横向溢出 */
   @media (max-width: 480px) {
@@ -1545,7 +1472,7 @@ mmlEqnNo}
     .top-actions { gap: 5px; min-width: 0; flex-wrap: nowrap; }
     /* 返回按钮文字禁止换行（否则窄 flex 里被挤成多行，把顶栏撑到 100px+）；
        收紧内边距/字号，让一行放得下 */
-    #backBtn, #backParentBtn { white-space: nowrap; padding: 3px 6px; font-size: 12px; }
+    #backParentBtn { white-space: nowrap; padding: 3px 6px; font-size: 12px; }
     #workspaceSelect { max-width: 96px; min-width: 55px; padding: 3px 4px; font-size: 11px; }
     .ws-btn { padding: 2px 5px; font-size: 11px; }
     .conn-state {

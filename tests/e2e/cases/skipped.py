@@ -4,7 +4,7 @@
 曾登记 4 个 TODO（sidebar_squeeze / sidebar_persist / pin_button / conflict_card），
 现已全部合入 main 并转正为正式用例：
   * sidebar_squeeze / sidebar_persist -> cases/sidebar.py
-  * pin_button                        -> cases/listview.py（list_pin）
+  * pin_button                        -> cases/sidebar.py（sidebar_actions）
   * conflict_card                     -> cases/chat.py（按现状：仅 statusLabel
     Failed->失败 合入，无 .msg-error.conflict 友好卡片）
 

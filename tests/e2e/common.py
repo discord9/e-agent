@@ -124,9 +124,10 @@ class Case:
         return self.page.evaluate(js)
 
     async def start(self, wait_rows=1):
-        """加载主页、注入 token、等待会话列表首次渲染完成。
+        """加载主页、注入 token，并等待会话缓存首轮轮询完成。
 
-        wait_rows: 期望的列表行数；0 表示允许空列表（只等首轮轮询渲染）。
+        wait_rows: 期望的会话缓存条数；0 表示允许空列表。侧边栏是唯一导航，
+        因此就绪条件读 state.lastList，而不依赖抽屉是否打开或树 DOM 是否已渲染。
         """
         page = self.page
         # 必须在页面任何脚本运行前把 token 种进 localStorage（add_init_script
@@ -139,9 +140,9 @@ class Case:
         await page.goto(BASE + "/", wait_until="load")
         await page.reload(wait_until="load")
         await page.wait_for_function(
-            "() => document.querySelectorAll('.session-row').length >= %d || "
-            "(els.listHint && els.listHint.textContent.trim() !== '')" % wait_rows,
-            timeout=10000)
+            "n => Array.isArray(state.lastList) && "
+            "(state.lastList.length >= n || (n === 0 && state.workspaceErrors[state.workspace.id] !== undefined))",
+            arg=wait_rows, timeout=10000)
 
     async def open_sidebar(self):
         await self.page.click("#sidebarBtn")
@@ -254,15 +255,16 @@ async def snapshot(c):
                           cls: el.className } : null; };
           let st = {};
           try {
-            st = { view: state.view, sessionId: state.sessionId, status: state.status,
+            st = { sessionId: state.sessionId, status: state.status,
+                   noSession: els.chatView.classList.contains("no-session"),
                    token: !!state.token, sidebarOpen: state.sidebar.open,
                    sidebarFilter: state.sidebar.filter,
                    promptValue: els.promptInput ? els.promptInput.value : null };
           } catch (e) { st = { eval_err: String(e) }; }
           return Object.assign(st, {
             url: location.href,
-            banner: g("banner"), sessionList: g("sessionList"),
-            listHint: g("listHint"), sidebarTree: g("sidebarTree"),
+            banner: g("banner"), chatEmpty: g("chatEmpty"),
+            sidebarTree: g("sidebarTree"),
             messages: g("messages"),
             scrollW: document.documentElement.scrollWidth,
             clientW: document.documentElement.clientWidth,

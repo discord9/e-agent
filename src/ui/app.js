@@ -42,7 +42,6 @@ const state = {
   token: "",
   workspaces: [],            // [{id,name,url,token}] 多服务器实例（initWorkspaces 填充）
   workspace: null,           // 当前激活的 workspace 对象（state.token 是其派生字段）
-  view: "list",              // "list" | "chat"
   sessionId: null,           // 当前打开的会话
   status: "Idle",
   initSource: null,          // "history" | "snapshot" | null —— 初始渲染来源
@@ -55,12 +54,10 @@ const state = {
   nextBeforeSeq: null,       // 历史分页游标：下一段更早历史的 before_seq（loadHistory 响应里取；null=没有更多）
   loadingOlder: false,       // 是否正在加载更早历史（防重入）
   olderDone: false,          // 更早历史已全部加载（next_before_seq 为 null）
-  searchQuery: "",           // 会话列表搜索词（已小写化）；轮询重绘后过滤依然生效
-  showArchived: false,       // 列表页是否显示归档会话（默认折叠隐藏；开关在列表头部）
-  lastList: [],              // 最近一次轮询拿到的完整列表，供搜索框重绘
+  lastList: [],              // 最近一次轮询拿到的激活 workspace 会话缓存
                              //（聚合模式下 = 激活 workspace 的列表；所有既有单服务器路径不变）
   workspaceLists: {},        // workspaceId -> session[]：每台服务器各自的 /api/sessions 缓存
-                             //（聚合侧边栏/聚合列表视图的数据源；由各自 pollWorkspaceSessions 刷新）
+                             //（聚合侧边栏的数据源；由各自 pollWorkspaceSessions 刷新）
   workspaceErrors: {},       // workspaceId -> error string|null：轮询失败标记（侧边栏显示「无法连接」）
   queue: [],                 // 排队提示（FIFO；最多显示 3 条 + "+N"）
   queueExpanded: false,      // 排队条是否展开显示全部（默认收起）
@@ -85,20 +82,17 @@ const state = {
     streamText: new Map(),   // 展开中 delegate 行的已累积流式文本（key → string，重绘恢复用）
     degraded: new Set(),     // bash 行 output 端点 404/不可用 → 降级静态尾部（key；重绘不再重启轮询）
   },
-  renameActive: false,       // 行内重命名进行中：列表页 2s 轮询重绘跳过，防编辑框被冲掉
+  renameActive: false,       // 行内重命名进行中：轮询期间跳过树重绘，防编辑框被冲掉
   wsCreatePending: new Set(),// 侧边栏组头「+」在途新建（wsId 集合）：请求期间按钮禁用/忽略重复点击
 };
 
 /* 常用 DOM 引用 */
 const $ = (id) => document.getElementById(id);
 const els = {
-  topActions: $("topActions"), backBtn: $("backBtn"), backParentBtn: $("backParentBtn"), connState: $("connState"),
+  topActions: $("topActions"), backParentBtn: $("backParentBtn"), connState: $("connState"),
   banner: $("banner"), bannerText: $("bannerText"), bannerClose: $("bannerClose"),
   tokenInput: $("tokenInput"), tokenToggle: $("tokenToggle"),
-  listView: $("listView"), chatView: $("chatView"),
-  newPrompt: $("newPrompt"), newSessionBtn: $("newSessionBtn"),
-  sessionList: $("sessionList"), listMeta: $("listMeta"), listHint: $("listHint"),
-  searchInput: $("searchInput"), showArchiveBtn: $("showArchiveBtn"),
+  chatView: $("chatView"), chatEmpty: $("chatEmpty"),
   chatSessionId: $("chatSessionId"), chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
   messages: $("messages"), promptInput: $("promptInput"), queueBar: $("queueBar"),
   slashMenu: $("slashMenu"), forkMenu: $("forkMenu"),
@@ -285,10 +279,9 @@ function renderWorkspaceSelect() {
    防止「快速点击两个不同服务器的会话」时过期续开覆盖新打开。 */
 let sessionOpenEpoch = 0;
 
-/* 切换工作区：清空当前工作区的会话/聊天/任务状态，视图回到列表，重跑启动
-   加载序列。async：聚合模式下 cross-server 打开先 await 它再 openSession
-   （切换完成的 next tick 才开目标会话）。聚合侧边栏/列表里其它 workspace
-   的缓存列表（state.workspaceLists）保留，切换后立即渲染、不等轮询。 */
+/* 切换工作区：清空当前会话并回到聊天空状态，重跑启动加载序列。
+   async：聚合模式下 cross-server 打开先 await 它再 openSession。其它
+   workspace 的侧边栏缓存保留，切换后立即渲染、不等轮询。 */
 async function switchWorkspace(id, epoch) {
   const ws = state.workspaces.find((w) => w.id === id);
   if (!ws || ws === state.workspace) return;
@@ -301,7 +294,6 @@ async function switchWorkspace(id, epoch) {
   stopSSE();
   // ---- 清空当前工作区的会话/聊天状态（其它 workspace 的聚合缓存保留） ----
   state.sessionId = null;
-  state.view = "list";
   state.sessionStates = {};
   state.lastList = (state.workspaceLists[ws.id] !== undefined) ? state.workspaceLists[ws.id] : [];
   state.queue.length = 0;
@@ -310,7 +302,6 @@ async function switchWorkspace(id, epoch) {
   state.nextBeforeSeq = null;
   state.loadingOlder = false;
   state.olderDone = false;
-  state.searchQuery = "";
   state.initSource = null;           // 旧工作区的历史/快照来源标志不跨工作区保留
   state.deepLink.pending = null;
   state.deepLink.handled = true;
@@ -337,17 +328,15 @@ async function switchWorkspace(id, epoch) {
   // B 留空时 B 的后台轮询误用 A 的 token（workspaceToken 回退到激活派生值）；
   // 一旦切到 B，state.token 变空，B 的 history/SSE/任务又全失去认证。
   // 全局回退必须独立稳定（review：token 全局回退设计缺陷）。
-  // ---- 视图重置到列表页（清空 DOM） ----
-  els.chatView.classList.add("hidden");
-  els.listView.classList.remove("hidden");
-  els.topActions.hidden = true;
+  // ---- 清空当前会话，保留唯一的聊天内容区 ----
+  els.chatView.classList.remove("hidden");
+  els.chatView.classList.add("no-session");
+  els.topActions.hidden = false;
   els.backParentBtn.hidden = true;
   els.messages.innerHTML = "";
   els.promptInput.value = "";
   els.promptInput.placeholder = PROMPT_PLACEHOLDER;
-  els.sessionList.innerHTML = "";
   els.sidebarTree.innerHTML = "";
-  els.searchInput.value = "";
   els.sidebarFilter.value = "";
   els.queueBar.hidden = true;
   els.tasksToggleBar.hidden = true;
@@ -363,8 +352,7 @@ async function switchWorkspace(id, epoch) {
   refreshBanner();
   updateTokenToggle();
   history.replaceState(null, "", "/");   // 丢弃可能指向旧工作区会话的 ?session= 深链
-  // ---- 聚合视图立即重绘（用各 workspace 缓存列表，不等轮询） ----
-  renderSessionList(undefined, true);   // force：切换后清空过 DOM，必须重绘
+  // ---- 侧边栏立即重绘（用各 workspace 缓存列表，不等轮询） ----
   renderSidebarTree(true);
   // ---- 重跑启动加载序列（与 init() 的加载部分一致） ----
   startPolling();
@@ -422,9 +410,6 @@ function removeWorkspace(ws) {
   } else {
     renderSidebarTree(true);   // 侧边栏立即移除该分组
     renderWorkspaceSelect();
-    // 聚合列表视图由 state.workspaces 遍历聚合（aggregateSessionRows）：
-    // 不重绘的话旧 DOM 仍显示被删服务器的会话（review 发现 1）。
-    if (state.view === "list") renderSessionList();
   }
 }
 
@@ -521,7 +506,7 @@ async function api(path, opts = {}) {
 }
 
 /* =====================================================================
- * 会话列表视图
+ * 会话状态标签
  * ===================================================================*/
 const STATUS_LABEL = {
   Idle: "空闲", Busy: "处理中", Compacting: "压缩中", Finished: "已完成",

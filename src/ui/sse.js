@@ -235,7 +235,7 @@ function handleSSEBlock(block, id, wsId, epoch) {
     try { applyStatus(JSON.parse(data).status); } catch (e) { /* 忽略 */ }
     return;
   }
-  if (id !== state.sessionId || state.view !== "chat") return;  // 已切换会话
+  if (id !== state.sessionId) return;  // 已切换会话
   if (eventName === "resync") {
     // Lag 追平：后端重发完整事件日志（AgentEvent 数组，{type,data} 形状）。
     // 与 snapshot 不同，无论初始渲染来源都强制整体替换 transcript。
@@ -352,13 +352,13 @@ function applyLiveEvent(name, payload) {
 
 /* 断线重连：3 秒后重新加载 history + SSE。必须携带断线流的三元组
    (id, wsId, epoch)——调度时与触发时都校验「仍是同一上下文」：期间任何
-   打开/切换/返回列表都会取代代次，陈旧流的重连绝不执行（否则会把已过期
+   打开会话/切换 workspace 都会取代代次，陈旧流的重连绝不执行（否则会把已过期
    的会话重新加载/重画到新激活的上下文上）。 */
 function scheduleReconnect(id, wsId, epoch) {
   if (state.sse.stopped || !stillCurrent(id, wsId, epoch)) return;
   setConn("retrying", "↻ 连接断开，3 秒后重连…");
   state.sse.retryTimer = setTimeout(() => {
-    if (state.sse.stopped || state.view !== "chat" || !stillCurrent(id, wsId, epoch)) return;
+    if (state.sse.stopped || !stillCurrent(id, wsId, epoch)) return;
     state.initSource = null;             // 允许 snapshot 兜底
     openWith(id, true, undefined, wsId, epoch);
   }, 3000);
@@ -374,19 +374,6 @@ function stopSSE() {
 /* =====================================================================
  * 事件绑定与启动
  * ===================================================================*/
-els.newSessionBtn.addEventListener("click", createSession);
-els.newPrompt.addEventListener("keydown", (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); createSession(); }
-});
-els.searchInput.addEventListener("input", () => {
-  state.searchQuery = els.searchInput.value.trim().toLowerCase();
-  renderSessionList(state.lastList);   // 轮询仍会全量重绘，但搜索词留在 state 里，过滤持续生效
-});
-els.showArchiveBtn.addEventListener("click", () => {
-  state.showArchived = !state.showArchived;
-  renderSessionList();                 // 只重绘列表；侧边栏归档分组独立于该开关
-});
-els.backBtn.addEventListener("click", backToList);
 // 「← 主会话」：从 subagent 会话快速返回其父会话（无父则不显示按钮）
 els.backParentBtn.addEventListener("click", () => {
   const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
@@ -530,8 +517,9 @@ function init() {
   const vv = window.visualViewport;
   if (vv && vv.addEventListener) vv.addEventListener("resize", syncAppHeight);
   window.addEventListener("resize", syncAppHeight);
-  els.chatView.classList.add("hidden");
-  els.topActions.hidden = true;
+  els.chatView.classList.remove("hidden");
+  els.chatView.classList.toggle("no-session", !state.sessionId);
+  els.topActions.hidden = false;
   // URL 深链：?session=<id>。token 就绪后立即尝试（与轮询并行），不再等
   // 列表轮询整轮——列表缺失/失败/超时/过期时直接按 id probe history 打开；
   // token 为空时先记录，用户填 token 触发 restartTransport 再处理。
@@ -540,7 +528,7 @@ function init() {
   startPolling();
   pollSessions();
   maybeHandleDeepLink();
-  // 侧边栏跨刷新恢复：上次开着就继续开（切会话/返回列表都不关，仅手动关）
+  // 侧边栏跨刷新恢复：上次开着就继续开（切会话不关，仅手动关）
   try {
     if (localStorage.getItem("e-agent.sidebar.open") === "1") openSidebar();
   } catch (e) { /* 静默 */ }
