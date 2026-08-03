@@ -585,7 +585,13 @@ impl GreptimeSession {
     /// seq is not necessarily contiguous (compaction rows, retried writes),
     /// so paging uses `seq >= start AND seq < before_seq ORDER BY seq DESC
     /// LIMIT n` (the tail of the segment) and reverses the page to
-    /// ascending order.
+    /// ascending order. On the paged path the limit applies AFTER a
+    /// SQL-side dedup (latest `event_time` per seq, a subquery join —
+    /// `MAX(event_time)` GROUP BY seq, the same pattern `list_meta` uses)
+    /// so same-seq duplicate physical rows from retried writes never
+    /// consume limit slots: every page is exactly
+    /// `min(n, remaining distinct seqs)` entries and the cursor chain
+    /// covers each seq exactly once.
     pub async fn load_older(
         &self,
         before_seq: i64,
@@ -608,12 +614,24 @@ impl GreptimeSession {
             // Middle segment: [prev_comp, before).
             Some(prev) => {
                 let rows = if let Some(n) = page {
+                    // Dedup by seq (latest event_time wins) IN SQL before
+                    // LIMIT: same-seq duplicate physical rows (retried
+                    // writes) must not consume limit slots, or a page
+                    // could come back smaller than `limit` after the
+                    // Rust-side dedup and the cursor chain could skip or
+                    // repeat entries. The join keeps ties (same seq, same
+                    // max event_time) for the Rust-side conflict check.
                     self.client
                         .query(
-                            "SELECT seq, event_time, payload FROM session_entries \
-                             WHERE workspace_id = $1 AND session_id = $2 \
-                             AND seq >= $3 AND seq < $4 \
-                             ORDER BY seq DESC LIMIT $5",
+                            "SELECT t.seq, t.event_time, t.payload FROM session_entries t \
+                             JOIN ( \
+                                 SELECT seq, MAX(event_time) AS me FROM session_entries \
+                                 WHERE workspace_id = $1 AND session_id = $2 \
+                                 AND seq >= $3 AND seq < $4 \
+                                 GROUP BY seq \
+                             ) g ON t.seq = g.seq AND t.event_time = g.me \
+                             WHERE t.workspace_id = $1 AND t.session_id = $2 \
+                             ORDER BY t.seq DESC LIMIT $5",
                             &[
                                 &self.workspace_id,
                                 &self.session_id,
@@ -648,11 +666,18 @@ impl GreptimeSession {
             // Oldest segment: [0, before). Nothing older follows.
             None => {
                 let rows = if let Some(n) = page {
+                    // Same SQL-side dedup-before-LIMIT as the middle
+                    // segment: limit counts DISTINCT seqs only.
                     self.client
                         .query(
-                            "SELECT seq, event_time, payload FROM session_entries \
-                             WHERE workspace_id = $1 AND session_id = $2 AND seq < $3 \
-                             ORDER BY seq DESC LIMIT $4",
+                            "SELECT t.seq, t.event_time, t.payload FROM session_entries t \
+                             JOIN ( \
+                                 SELECT seq, MAX(event_time) AS me FROM session_entries \
+                                 WHERE workspace_id = $1 AND session_id = $2 AND seq < $3 \
+                                 GROUP BY seq \
+                             ) g ON t.seq = g.seq AND t.event_time = g.me \
+                             WHERE t.workspace_id = $1 AND t.session_id = $2 \
+                             ORDER BY t.seq DESC LIMIT $4",
                             &[
                                 &self.workspace_id,
                                 &self.session_id,
@@ -2576,6 +2601,142 @@ mod tests {
         let total: usize =
             head.len() + page1.len() + page2.len() + page3.len() + page4.len() + page5.len();
         assert_eq!(total, all.len(), "paged chain must cover the whole session");
+    }
+
+    /// Major B: limited `load_older` pages must be sized on DISTINCT seqs,
+    /// not physical rows. Same-seq duplicate rows (retried writes with
+    /// newer event_times) previously consumed `LIMIT` slots before the
+    /// Rust-side dedup, so pages could come back smaller than `limit` and
+    /// the cursor chain could skip or repeat entries. With the SQL-side
+    /// dedup (`MAX(event_time)` per seq) before `LIMIT`, each page holds
+    /// exactly `limit` distinct entries and the chain pages through every
+    /// seq exactly once.
+    #[tokio::test]
+    async fn load_older_limited_pages_dedup_before_limit() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-dup-page-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        let user = |i: u32| SessionEntry::Message {
+            message: Message::User {
+                content: format!("m{i}"),
+                images: vec![],
+            },
+        };
+        let comp = |summary: &str| SessionEntry::Compaction {
+            summary: summary.into(),
+            retained: vec![],
+        };
+
+        // seqs: 0,1 early; 2 comp1; 3..7 latest (comp1_seq = 2).
+        let mut all = vec![user(1), user(2)];
+        all.push(comp("c1"));
+        all.extend([user(3), user(4), user(5), user(6), user(7)]);
+        session.append(&all).await.unwrap();
+
+        // Retried writes: extra physical rows for seqs 6 and 7 with
+        // strictly newer event_times (identical payloads — exactly what a
+        // committed-then-retried append produces). 8 distinct seqs, 10
+        // physical rows.
+        let prepped: Vec<(i64, chrono::NaiveDateTime, String, String, bool)> = [6i64, 7i64]
+            .into_iter()
+            .map(|seq| {
+                let entry = user(seq as u32);
+                (
+                    seq,
+                    us_to_datetime(next_event_time_us()),
+                    entry_kind(&entry).to_string(),
+                    serde_json::to_string(&entry).unwrap(),
+                    is_error(&entry),
+                )
+            })
+            .collect();
+        session.insert_prepped(&prepped).await.unwrap();
+
+        // Page 1 (head open sentinel, limit 2): newest 2 DISTINCT seqs =
+        // 7,6 — one entry each, the duplicate physical rows must NOT
+        // consume limit slots.
+        let (page1, cursor1) = session.load_older(i64::MAX, Some(2)).await.unwrap();
+        assert_eq!(page1, vec![user(6), user(7)], "page 1 = newest 2 distinct");
+        assert_eq!(cursor1, Some(6), "cursor = oldest seq of page 1");
+
+        // Page 2: [2,6) — seqs 5,4.
+        let (page2, cursor2) = session.load_older(cursor1.unwrap(), Some(2)).await.unwrap();
+        assert_eq!(page2, vec![user(4), user(5)], "page 2 = next 2 distinct");
+        assert_eq!(cursor2, Some(4));
+
+        // Page 3: [2,4) — seqs 3,2; the page reaches the segment's opening
+        // compaction row (seq 2 = prev_comp), cursor stays Some(2).
+        let (page3, cursor3) = session.load_older(cursor2.unwrap(), Some(2)).await.unwrap();
+        assert_eq!(page3, vec![comp("c1"), user(3)], "page 3 crosses to comp");
+        assert_eq!(cursor3, Some(2));
+
+        // Page 4 (oldest segment [0,2)): seqs 1,0, cursor None.
+        let (page4, cursor4) = session.load_older(cursor3.unwrap(), Some(2)).await.unwrap();
+        assert_eq!(page4, vec![user(1), user(2)], "page 4 = oldest segment");
+        assert_eq!(cursor4, None, "cursor None at the true start");
+
+        // Exactly-once coverage across the paged chain (multiset style).
+        let mut paged: Vec<SessionEntry> = Vec::new();
+        paged.extend(page1);
+        paged.extend(page2);
+        paged.extend(page3);
+        paged.extend(page4);
+        assert_eq!(
+            paged.len(),
+            all.len(),
+            "paged chain must not lose or duplicate entries"
+        );
+        for want in &all {
+            assert!(paged.contains(want), "paged chain missing entry: {want:?}");
+        }
+
+        // Same guarantee without a compaction (whole session is one head
+        // segment): dup rows on seqs 4,5; limit-2 pages of the oldest
+        // branch.
+        let sid_b = format!("test-gt-dup-page-b-{}", crate::session::new_id());
+        let mut session_b = GreptimeSession::connect(&conn, &wid, &sid_b).await.unwrap();
+        let plain: Vec<SessionEntry> = (0..6).map(user).collect();
+        session_b.append(&plain).await.unwrap();
+        let prepped: Vec<(i64, chrono::NaiveDateTime, String, String, bool)> = [4i64, 5i64]
+            .into_iter()
+            .map(|seq| {
+                let entry = user(seq as u32);
+                (
+                    seq,
+                    us_to_datetime(next_event_time_us()),
+                    entry_kind(&entry).to_string(),
+                    serde_json::to_string(&entry).unwrap(),
+                    is_error(&entry),
+                )
+            })
+            .collect();
+        session_b.insert_prepped(&prepped).await.unwrap();
+
+        let (page, cursor) = session_b.load_older(i64::MAX, Some(2)).await.unwrap();
+        assert_eq!(
+            page,
+            vec![user(4), user(5)],
+            "oldest branch: newest 2 distinct"
+        );
+        assert_eq!(cursor, Some(4));
+        let (page, cursor) = session_b
+            .load_older(cursor.unwrap(), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(page, vec![user(2), user(3)]);
+        assert_eq!(cursor, Some(2));
+        let (page, cursor) = session_b
+            .load_older(cursor.unwrap(), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(page, vec![user(0), user(1)]);
+        assert_eq!(cursor, None);
     }
 
     /// Store-level `load_head_page` (the `GET /history` initial-render

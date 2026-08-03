@@ -867,6 +867,145 @@ async fn load_older_head_open_sentinel_pages_without_losing_segments() {
     );
 }
 
+/// Major B: limited `load_older` pages must be sized on DISTINCT seqs,
+/// not physical rows. Same-seq duplicate rows (retried writes with newer
+/// event_times) previously consumed `LIMIT` slots before the Rust-side
+/// dedup, so pages could come back smaller than `limit` and the cursor
+/// chain could skip or repeat entries. With the SQL-side dedup
+/// (`MAX(event_time_us)` per seq) before `LIMIT`, each page holds exactly
+/// `limit` distinct entries and the chain pages through every seq exactly
+/// once.
+#[tokio::test]
+async fn load_older_limited_pages_dedup_before_limit() {
+    let (_dir, session, _sid) = fresh_session().await;
+
+    let user = |i: u32| SessionEntry::Message {
+        message: Message::User {
+            content: format!("m{i}"),
+            images: vec![],
+        },
+    };
+    let comp = |summary: &str| SessionEntry::Compaction {
+        summary: summary.into(),
+        retained: vec![],
+    };
+
+    // seqs: 0,1 early; 2 comp1; 3..7 latest (comp1_seq = 2).
+    let mut all = vec![user(1), user(2)];
+    all.push(comp("c1"));
+    all.extend([user(3), user(4), user(5), user(6), user(7)]);
+    session.append(&all).await.unwrap();
+
+    // Retried writes: extra physical rows for seqs 6 and 7 with strictly
+    // newer event_times (identical payloads — exactly what a
+    // committed-then-retried append produces). 8 distinct seqs, 10
+    // physical rows.
+    let conn = session.conn.lock().await;
+    for seq in [6i64, 7i64] {
+        let entry = user(seq as u32);
+        conn.execute(
+            "INSERT INTO session_entries \
+             (workspace_id, session_id, seq, event_time_us, entry_kind, payload, \
+              schema_version, is_error) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0)",
+            (
+                session.workspace_id.as_str(),
+                session.session_id.as_str(),
+                seq,
+                next_event_time_us(),
+                entry_kind(&entry),
+                serde_json::to_string(&entry).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    drop(conn);
+
+    // Page 1 (head open sentinel, limit 2): newest 2 DISTINCT seqs = 7,6
+    // — one entry each, the duplicate physical rows must NOT consume
+    // limit slots.
+    let (page1, cursor1) = session.load_older(i64::MAX, Some(2)).await.unwrap();
+    assert_eq!(page1, vec![user(6), user(7)], "page 1 = newest 2 distinct");
+    assert_eq!(cursor1, Some(6), "cursor = oldest seq of page 1");
+
+    // Page 2: [2,6) — seqs 5,4.
+    let (page2, cursor2) = session.load_older(cursor1.unwrap(), Some(2)).await.unwrap();
+    assert_eq!(page2, vec![user(4), user(5)], "page 2 = next 2 distinct");
+    assert_eq!(cursor2, Some(4));
+
+    // Page 3: [2,4) — seqs 3,2; the page reaches the segment's opening
+    // compaction row (seq 2 = prev_comp), cursor stays Some(2).
+    let (page3, cursor3) = session.load_older(cursor2.unwrap(), Some(2)).await.unwrap();
+    assert_eq!(page3, vec![comp("c1"), user(3)], "page 3 crosses to comp");
+    assert_eq!(cursor3, Some(2));
+
+    // Page 4 (oldest segment [0,2)): seqs 1,0, cursor None.
+    let (page4, cursor4) = session.load_older(cursor3.unwrap(), Some(2)).await.unwrap();
+    assert_eq!(page4, vec![user(1), user(2)], "page 4 = oldest segment");
+    assert_eq!(cursor4, None, "cursor None at the true start");
+
+    // Exactly-once coverage across the paged chain (multiset style).
+    let mut paged: Vec<SessionEntry> = Vec::new();
+    paged.extend(page1);
+    paged.extend(page2);
+    paged.extend(page3);
+    paged.extend(page4);
+    assert_eq!(
+        paged.len(),
+        all.len(),
+        "paged chain must not lose or duplicate entries"
+    );
+    for want in &all {
+        assert!(paged.contains(want), "paged chain missing entry: {want:?}");
+    }
+
+    // Same guarantee without a compaction (whole session is one head
+    // segment): dup rows on seqs 4,5; limit 2 pages of the oldest branch.
+    let (_dir, session_b, _sid) = fresh_session().await;
+    let plain: Vec<SessionEntry> = (0..6).map(user).collect();
+    session_b.append(&plain).await.unwrap();
+    let conn = session_b.conn.lock().await;
+    for seq in [4i64, 5i64] {
+        let entry = user(seq as u32);
+        conn.execute(
+            "INSERT INTO session_entries \
+             (workspace_id, session_id, seq, event_time_us, entry_kind, payload, \
+              schema_version, is_error) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0)",
+            (
+                session_b.workspace_id.as_str(),
+                session_b.session_id.as_str(),
+                seq,
+                next_event_time_us(),
+                entry_kind(&entry),
+                serde_json::to_string(&entry).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    drop(conn);
+
+    let (page, cursor) = session_b.load_older(i64::MAX, Some(2)).await.unwrap();
+    assert_eq!(
+        page,
+        vec![user(4), user(5)],
+        "oldest branch: newest 2 distinct"
+    );
+    assert_eq!(cursor, Some(4));
+    let (page, cursor) = session_b
+        .load_older(cursor.unwrap(), Some(2))
+        .await
+        .unwrap();
+    assert_eq!(page, vec![user(2), user(3)]);
+    assert_eq!(cursor, Some(2));
+    let (page, cursor) = session_b
+        .load_older(cursor.unwrap(), Some(2))
+        .await
+        .unwrap();
+    assert_eq!(page, vec![user(0), user(1)]);
+    assert_eq!(cursor, None);
+}
+
 #[tokio::test]
 async fn load_older_pages_within_segment() {
     let (_dir, session, _sid) = fresh_session().await;

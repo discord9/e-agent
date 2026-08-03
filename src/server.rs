@@ -3854,10 +3854,11 @@ model = "deepseek-chat"
 
     /// M5: `session_history` with a `before_seq` cursor must forward
     /// `limit` to `load_older` and surface the returned cursor. Exercised
-    /// with the JSONL store, whose `load_older` always answers empty +
-    /// `None` — the endpoint must still accept `before_seq` + `limit`
-    /// together and serialize the page (the Greptime paging itself is
-    /// covered by `session_greptime`'s integration tests).
+    /// with the JSONL store on a session with no persisted entries, whose
+    /// `load_older` answers empty + `None` — the endpoint must still
+    /// accept `before_seq` + `limit` together and serialize the page (the
+    /// paging itself is covered by `session_sqlite`'s tests and the
+    /// JSONL positional-paging tests in `session_store`).
     #[tokio::test]
     async fn session_history_pages_older_with_limit() {
         use axum::body::Body;

@@ -339,9 +339,16 @@ impl SessionStore {
     /// compaction — the whole session is one head segment), matching the
     /// old `load_head` + `head_seq` pair.
     ///
-    /// For JSONL there is no seq-based paging: the full session is loaded
-    /// (exactly like [`Self::load_head`]) so no history can ever be cut
-    /// off, and the cursor is always `None`.
+    /// For JSONL there is no seq column, so paging is positional instead:
+    /// the whole file is loaded (JSONL can only be parsed in full) but a
+    /// bounded `limit` returns only the newest `limit` entries plus a
+    /// cursor = the 0-based position of the slice start (the oldest entry
+    /// of the page; `None` when the whole session fits — position 0).
+    /// The position is an ABSOLUTE index into the append-only file, so
+    /// feeding it back as [`Self::load_older`]'s `before_seq` pages into
+    /// `[0, before)` and later appends (which only extend the head) never
+    /// shift it. `limit = None` keeps the whole session + `None`, exactly
+    /// like [`Self::load_head`].
     pub async fn load_head_page(
         &self,
         root: &Path,
@@ -349,7 +356,21 @@ impl SessionStore {
         limit: Option<usize>,
     ) -> Result<(Vec<SessionEntry>, Option<i64>)> {
         match self {
-            SessionStore::Jsonl => Ok((Session::load(root, name)?.entries, None)),
+            SessionStore::Jsonl => {
+                let entries = Session::load(root, name)?.entries;
+                match limit.filter(|&n| n > 0) {
+                    // Head larger than the page: newest `limit` entries +
+                    // positional cursor at the slice start (always > 0
+                    // here, mirroring "cursor = page's oldest seq, seq>0
+                    // ⇔ more history" on the seq backends).
+                    Some(n) if entries.len() > n => {
+                        let start = entries.len() - n;
+                        Ok((entries[start..].to_vec(), Some(start as i64)))
+                    }
+                    // Whole session fits (or no limit): full + None.
+                    _ => Ok((entries, None)),
+                }
+            }
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
                 // The head segment is `[last_comp, ∞)`; see the
@@ -384,19 +405,40 @@ impl SessionStore {
     /// of the page), so long sessions can be loaded in bounded pages
     /// instead of whole compaction segments.
     ///
-    /// For JSONL the whole session was already loaded by [`Self::load`] /
-    /// [`Self::load_head`], so there is nothing older to fetch: returns
-    /// `(vec![], None)` regardless of `limit`. For Greptime/SQLite it
-    /// delegates to the backend's `load_older`.
+    /// For JSONL there is no seq-based paging, so `before_seq` is treated
+    /// as an ABSOLUTE position into the append-only file: the slice
+    /// `[max(0, before-limit), before)` is returned with a positional
+    /// cursor `= max(0, before-limit)` (`None` when that is 0 — nothing
+    /// older), and `before_seq <= 0` returns empty + `None`. Because the
+    /// position is absolute, appends after the head page only extend the
+    /// newer end and never shift `[0, before)`, so an in-flight paging
+    /// chain stays gap-free. With `limit = None` the whole `[0, before)`
+    /// remainder is returned with a `None` cursor (the JSONL analogue of
+    /// the whole-segment behavior on Greptime/SQLite). For Greptime/SQLite
+    /// it delegates to the backend's `load_older`.
     pub async fn load_older(
         &self,
-        _root: &Path,
-        _name: &str,
+        root: &Path,
+        name: &str,
         before_seq: i64,
         limit: Option<usize>,
     ) -> Result<(Vec<SessionEntry>, Option<i64>)> {
         match self {
-            SessionStore::Jsonl => Ok((Vec::new(), None)),
+            SessionStore::Jsonl => {
+                if before_seq <= 0 {
+                    return Ok((Vec::new(), None));
+                }
+                let entries = Session::load(root, name)?.entries;
+                let before = (before_seq as usize).min(entries.len());
+                match limit.filter(|&n| n > 0) {
+                    Some(n) => {
+                        let start = before.saturating_sub(n);
+                        let cursor = (start > 0).then_some(start as i64);
+                        Ok((entries[start..before].to_vec(), cursor))
+                    }
+                    None => Ok((entries[..before].to_vec(), None)),
+                }
+            }
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
                 session.lock().await.load_older(before_seq, limit).await
@@ -1048,37 +1090,76 @@ impl SessionStore {
 mod tests {
     use super::*;
 
-    /// The JSONL backend has no older pages (the whole session was already
-    /// loaded by `load`/`load_head`): `load_older` must return empty + a
-    /// `None` cursor for any `before_seq`/`limit` — the wire contract the
-    /// frontend relies on (`next_before_seq: null` ⇔ nothing older).
+    /// JSONL `load_older` pages by ABSOLUTE position (there is no seq
+    /// column): `before_seq` is the 0-based file position, the returned
+    /// slice is `[max(0, before-limit), before)`, and the cursor is the
+    /// slice start (`None` at position 0 / `before_seq <= 0`).
     #[tokio::test]
-    async fn jsonl_load_older_ignores_limit_and_returns_nothing() {
+    async fn jsonl_load_older_pages_by_absolute_position() {
+        use crate::agent::Message;
+        use crate::session::Session;
+
         let root = std::env::temp_dir();
+        let name = format!("test-jsonl-older-{}", crate::session::new_id());
+        let entries: Vec<SessionEntry> = (0..5)
+            .map(|i| SessionEntry::Message {
+                message: Message::User {
+                    content: format!("m{i}"),
+                    images: vec![],
+                },
+            })
+            .collect();
+        Session::append(&root, &name, &entries).unwrap();
         let store = SessionStore::Jsonl;
-        let (entries, cursor) = store
+
+        // before_seq <= 0: nothing older.
+        let (page, cursor) = store.load_older(&root, &name, 0, Some(200)).await.unwrap();
+        assert!(page.is_empty());
+        assert_eq!(cursor, None);
+
+        // before=5, limit=2 → [3,5) = the two oldest-of-the-page entries,
+        // cursor 3 (>0 → Some).
+        let (page, cursor) = store.load_older(&root, &name, 5, Some(2)).await.unwrap();
+        assert_eq!(page, vec![entries[3].clone(), entries[4].clone()]);
+        assert_eq!(cursor, Some(3));
+
+        // before=3, limit=2 → [1,3); cursor 1.
+        let (page, cursor) = store.load_older(&root, &name, 3, Some(2)).await.unwrap();
+        assert_eq!(page, vec![entries[1].clone(), entries[2].clone()]);
+        assert_eq!(cursor, Some(1));
+
+        // before=1, limit=2 → [0,1); the slice start is 0 → cursor None.
+        let (page, cursor) = store.load_older(&root, &name, 1, Some(2)).await.unwrap();
+        assert_eq!(page, vec![entries[0].clone()]);
+        assert_eq!(cursor, None);
+
+        // before > file length is clamped to the file length.
+        let (page, cursor) = store.load_older(&root, &name, 42, Some(200)).await.unwrap();
+        assert_eq!(page, entries, "before beyond EOF returns everything");
+        assert_eq!(cursor, None);
+
+        // limit = None: whole [0, before) remainder + None.
+        let (page, cursor) = store.load_older(&root, &name, 3, None).await.unwrap();
+        assert_eq!(page, entries[..3].to_vec());
+        assert_eq!(cursor, None);
+
+        // Unknown session: empty + None.
+        let (page, cursor) = store
             .load_older(&root, "some-session", 42, Some(200))
             .await
             .unwrap();
-        assert!(entries.is_empty());
-        assert_eq!(cursor, None);
-
-        // Same without a limit, and with a cursor pointing at seq 0.
-        let (entries, cursor) = store
-            .load_older(&root, "some-session", 0, None)
-            .await
-            .unwrap();
-        assert!(entries.is_empty());
+        assert!(page.is_empty());
         assert_eq!(cursor, None);
     }
 
-    /// JSONL `load_head_page` must return the whole session (the local
-    /// backend has no seq-based paging, so a bounded head page could
-    /// otherwise lose the truncated middle forever) with a `None` cursor —
-    /// the wire contract `next_before_seq: null` ⇔ nothing older, matching
-    /// the old `load_head` + `head_seq` pair.
+    /// JSONL `load_head_page` pages the head by position: when the whole
+    /// session fits in the limit the full session + `None` cursor is
+    /// returned (nothing is ever cut off on the local backend); when the
+    /// head is larger than the limit, only the newest `limit` entries are
+    /// returned with a positional cursor that pages back into the cut-off
+    /// part via [`Self::load_older`].
     #[tokio::test]
-    async fn jsonl_load_head_page_returns_full_session_with_no_cursor() {
+    async fn jsonl_load_head_page_bounded_by_position_with_cursor() {
         use crate::agent::{AssistantMessage, Message};
         use crate::session::Session;
 
@@ -1104,22 +1185,166 @@ mod tests {
         Session::append(&root, &name, &entries).unwrap();
 
         let store = SessionStore::Jsonl;
-        // With a limit: bounded page but still the full session — nothing
-        // may be cut off on a backend without paging.
+        // Head ≤ limit: bounded page but still the full session + None.
+        let (page, cursor) = store
+            .load_head_page(&root, &name, Some(3))
+            .await
+            .expect("load_head_page with limit >= len");
+        assert_eq!(page, entries, "whole session fits → full session");
+        assert_eq!(cursor, None, "position 0 → no older cursor");
+
+        // Head > limit: newest `limit` entries + positional cursor at the
+        // slice start (position 1 here — the 2 newest of a 3-entry file).
         let (page, cursor) = store
             .load_head_page(&root, &name, Some(2))
             .await
-            .expect("load_head_page with limit");
-        assert_eq!(page, entries, "JSONL must return the full session");
-        assert_eq!(cursor, None, "JSONL has no seq paging cursor");
+            .expect("load_head_page with limit < len");
+        assert_eq!(
+            page,
+            entries[1..].to_vec(),
+            "head > limit → newest limit entries"
+        );
+        assert_eq!(cursor, Some(1), "cursor = position of the slice start");
 
-        // Without a limit: same result.
+        // Without a limit: full session + None.
         let (page, cursor) = store
             .load_head_page(&root, &name, None)
             .await
             .expect("load_head_page without limit");
         assert_eq!(page, entries, "JSONL must return the full session");
-        assert_eq!(cursor, None, "JSONL has no seq paging cursor");
+        assert_eq!(cursor, None, "no limit → no cursor");
+    }
+
+    /// JSONL positional paging chain: `load_head_page` with a head larger
+    /// than the limit returns the newest `limit` entries + a cursor; the
+    /// cursor fed back into `load_older` completes the older part — the
+    /// whole chain covers every entry exactly once (no gaps, no
+    /// duplicates), matching the `load_older_head_open_sentinel_pages_...`
+    /// contract of the seq backends.
+    #[tokio::test]
+    async fn jsonl_head_page_positional_chain_completes_without_gaps() {
+        use crate::agent::Message;
+        use crate::session::Session;
+
+        let root = std::env::temp_dir();
+        let name = format!("test-jsonl-chain-{}", crate::session::new_id());
+        let entries: Vec<SessionEntry> = (0..7)
+            .map(|i| SessionEntry::Message {
+                message: Message::User {
+                    content: format!("m{i}"),
+                    images: vec![],
+                },
+            })
+            .collect();
+        Session::append(&root, &name, &entries).unwrap();
+
+        let store = SessionStore::Jsonl;
+        let mut paged: Vec<SessionEntry> = Vec::new();
+        let mut cursor: Option<i64> = Some(i64::MAX); // head open sentinel
+        loop {
+            let (page, next) = match cursor {
+                Some(i64::MAX) => store
+                    .load_head_page(&root, &name, Some(2))
+                    .await
+                    .expect("head page"),
+                Some(before) => store
+                    .load_older(&root, &name, before, Some(2))
+                    .await
+                    .expect("older page"),
+                None => break,
+            };
+            paged.extend(page);
+            cursor = next;
+        }
+        // Exactly-once coverage (multiset, like the seq-backend chain
+        // tests): same length as the file and every entry present.
+        assert_eq!(
+            paged.len(),
+            entries.len(),
+            "paged chain must not lose or duplicate entries"
+        );
+        for want in &entries {
+            assert!(paged.contains(want), "paged chain missing entry: {want:?}");
+        }
+
+        // Spot-check the first page + the cut-off part.
+        let (page, cursor) = store
+            .load_head_page(&root, &name, Some(2))
+            .await
+            .expect("head page");
+        assert_eq!(page, entries[5..].to_vec(), "newest 2 of the head");
+        let (next, _) = store
+            .load_older(&root, &name, cursor.unwrap(), Some(2))
+            .await
+            .expect("older page");
+        assert_eq!(next, entries[3..5].to_vec(), "cut-off head part via cursor");
+    }
+
+    /// JSONL append stability: the positional cursor is an absolute index
+    /// into the append-only file, so appending new entries after a head
+    /// page must not shift `[0, before)` — the old cursor still pages the
+    /// exact same older slice, and a fresh head page reflects the new head.
+    #[tokio::test]
+    async fn jsonl_head_page_cursor_stable_across_append() {
+        use crate::agent::Message;
+        use crate::session::Session;
+
+        let root = std::env::temp_dir();
+        let name = format!("test-jsonl-stable-{}", crate::session::new_id());
+        let entries: Vec<SessionEntry> = (0..5)
+            .map(|i| SessionEntry::Message {
+                message: Message::User {
+                    content: format!("m{i}"),
+                    images: vec![],
+                },
+            })
+            .collect();
+        Session::append(&root, &name, &entries).unwrap();
+
+        let store = SessionStore::Jsonl;
+        // Head page over a 5-entry file with limit 3: newest 3, cursor 2.
+        let (page, cursor) = store
+            .load_head_page(&root, &name, Some(3))
+            .await
+            .expect("head page before append");
+        assert_eq!(page, entries[2..].to_vec());
+        assert_eq!(cursor, Some(2));
+
+        // Append two more entries; the file now has 7 entries.
+        let more: Vec<SessionEntry> = (5..7)
+            .map(|i| SessionEntry::Message {
+                message: Message::User {
+                    content: format!("m{i}"),
+                    images: vec![],
+                },
+            })
+            .collect();
+        Session::append(&root, &name, &more).unwrap();
+
+        // The old cursor (position 2) still pages exactly [0,2) — appends
+        // only extended the newer end, the absolute position did not drift.
+        let (older, next) = store
+            .load_older(&root, &name, cursor.unwrap(), Some(3))
+            .await
+            .expect("older page after append");
+        assert_eq!(older, entries[..2].to_vec(), "old cursor must not drift");
+        assert_eq!(next, None, "position 0 → nothing older");
+
+        // A fresh head page sees the appended head: newest 3 = entries 4,5,6,
+        // cursor = position 4 (still absolute).
+        let (page, cursor) = store
+            .load_head_page(&root, &name, Some(3))
+            .await
+            .expect("head page after append");
+        assert_eq!(
+            page,
+            entries[4..]
+                .iter()
+                .cloned()
+                .chain(more.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(cursor, Some(4));
     }
 
     /// Full-stack SessionStore tests for the SQLite backend: exercise the
