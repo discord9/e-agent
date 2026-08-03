@@ -1181,7 +1181,7 @@ impl TuiState {
                             (line.kind == LineKind::Thinking && self.collapse_thinking.0).then(
                                 || {
                                     line.collapsed_summary.clone().unwrap_or_else(|| {
-                                        collapsed_summary_for(&line.text, self.inner_width.max(1))
+                                        CollapsedSummary::new(&line.text, self.inner_width.max(1))
                                     })
                                 },
                             )
@@ -1236,7 +1236,7 @@ impl TuiState {
                             (line.kind == LineKind::Thinking && self.collapse_thinking.0).then(
                                 || {
                                     line.collapsed_summary.clone().unwrap_or_else(|| {
-                                        collapsed_summary_for(&line.text, self.inner_width.max(1))
+                                        CollapsedSummary::new(&line.text, self.inner_width.max(1))
                                     })
                                 },
                             )
@@ -1561,12 +1561,82 @@ impl TuiState {
     /// Refresh the cached collapsed summary of a `Thinking` line whose text
     /// just changed, using the current render width. Before the first draw
     /// the width is unknown (`inner_width == 0`), so the cache is left
-    /// `None` and the renderer computes the summary on demand — in
-    /// production the TUI draws before any delta can arrive, so streaming
-    /// lines always carry a fresh cache and rendering stays O(1).
+    /// `None`; the draw entry then recomputes it from the complete source
+    /// line (`refresh_window_collapsed_summaries`).
     fn refresh_collapsed_summary(line: &mut DisplayLine, width: usize) {
         if line.kind == LineKind::Thinking && width > 0 {
-            line.collapsed_summary = Some(collapsed_summary_for(&line.text, width));
+            line.collapsed_summary = Some(CollapsedSummary::new(&line.text, width));
+        }
+    }
+
+    /// Incrementally extend the cached collapsed summary of a `Thinking`
+    /// line after `delta` was appended to its text. A cache bound to the
+    /// current width is extended by wrapping only the delta
+    /// (`CollapsedSummary::append_delta`) — streaming N small deltas costs
+    /// O(total text), not O(N × total). A missing cache (width unknown at
+    /// append time — attach/snapshot replay, history loads) or one computed
+    /// at a stale width (terminal resized since the last append) falls back
+    /// to a full recompute from the complete source text.
+    fn update_collapsed_summary(line: &mut DisplayLine, delta: &str, width: usize) {
+        if line.kind != LineKind::Thinking || width == 0 {
+            return;
+        }
+        match &mut line.collapsed_summary {
+            Some(cache) if cache.width == width => cache.append_delta(delta, width),
+            _ => line.collapsed_summary = Some(CollapsedSummary::new(&line.text, width)),
+        }
+    }
+
+    /// Recompute the cached collapsed summary of every `Thinking` line in
+    /// the current render window whose cache is absent or was computed at a
+    /// different width. Called on every draw AFTER the terminal width is
+    /// known and the window is anchored but BEFORE `local_window_lines`
+    /// truncates the text, so the `(N 行)` count is computed from the
+    /// COMPLETE source line — fixing attach/snapshot replay (width unknown
+    /// at append time, cache never populated) and terminal resizes (cache
+    /// bound to the old width). Only caches whose width mismatches are
+    /// recomputed, so steady-state drawing stays O(window) with no
+    /// hard-wraps. A frozen tail summary is re-wrapped at the current width
+    /// from the freeze-time text (the tail up to the frozen cursor), so a
+    /// resize cannot pin a stale count while the pin still excludes
+    /// post-freeze deltas.
+    pub(crate) fn refresh_window_collapsed_summaries(&mut self, width: usize) {
+        if width == 0 || !self.collapse_thinking.0 {
+            return;
+        }
+        let start = self.window.source_start.min(self.lines.len());
+        let end = self.window.source_end.min(self.lines.len());
+        for line in &mut self.lines[start..end] {
+            if line.kind == LineKind::Thinking
+                && line
+                    .collapsed_summary
+                    .as_ref()
+                    .is_none_or(|cache| cache.width != width)
+            {
+                line.collapsed_summary = Some(CollapsedSummary::new(&line.text, width));
+            }
+        }
+        // Frozen tail summary: keep the freeze-time text (up to the frozen
+        // cursor) but re-wrap it at the current width.
+        let stale_frozen = self
+            .window
+            .frozen_tail_summary
+            .as_ref()
+            .is_some_and(|summary| summary.width != width);
+        if stale_frozen
+            && self.window.source_end > 0
+            && let Some(cursor) = self.window.frozen_tail_cursor
+        {
+            let tail_index = self.window.source_end - 1;
+            let recomputed = self.lines.get(tail_index).and_then(|line| {
+                (line.kind == LineKind::Thinking).then(|| {
+                    let end = utf8_floor_boundary(&line.text, cursor.min(line.text.len()));
+                    CollapsedSummary::new(&line.text[..end], width)
+                })
+            });
+            if recomputed.is_some() {
+                self.window.frozen_tail_summary = recomputed;
+            }
         }
     }
 
@@ -1611,12 +1681,12 @@ impl TuiState {
                 if self.active_lane == Some(ActiveStreamLane::Reasoning) {
                     let line = self.lines.last_mut().unwrap();
                     line.text.push_str(&text);
-                    // The text changed: refresh the cached collapsed summary
-                    // once per delta instead of hard-wrapping the (possibly
-                    // MB-sized) full text on every render frame. Width
-                    // unknown (never drawn) leaves the cache empty and the
-                    // renderer computes the summary on demand.
-                    Self::refresh_collapsed_summary(line, self.inner_width);
+                    // The text changed: extend the cached collapsed summary
+                    // incrementally (wrap only the delta) instead of
+                    // hard-wrapping the (possibly MB-sized) accumulated text
+                    // once per delta. Width unknown (never drawn) or stale
+                    // (resized) falls back to a full recompute.
+                    Self::update_collapsed_summary(line, &text, self.inner_width);
                 } else {
                     self.push_line(format!("thinking: {text}"), LineKind::Thinking);
                     self.active_lane = Some(ActiveStreamLane::Reasoning);

@@ -236,6 +236,13 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
                 );
             }
         }
+        // Recompute absent or width-stale collapsed-summary caches at the
+        // CURRENT width from the COMPLETE source lines, before
+        // local_window_lines truncates them: attach/snapshot replay appends
+        // with width 0 (cache None) and a terminal resize leaves caches
+        // bound to the old width — both land here on the first draw after
+        // the width is known.
+        scroll_state.refresh_window_collapsed_summaries(inner_width);
         // Render a bounded local tail. The cursor captured when scrolling
         // away from a streaming tail keeps later deltas out of this view.
         let local_lines = local_window_lines(
@@ -855,11 +862,12 @@ pub(crate) fn render_task_detail(
 /// instead of the full wrapped text — and `line_visual_rows` counts exactly
 /// one row for it, keeping render and scroll accounting in agreement. The
 /// summary is read from `DisplayLine::collapsed_summary`, which the state
-/// refreshes whenever the line's text changes: rendering never hard-wraps
-/// the (possibly MB-sized) full text per frame. The fallback below only
-/// runs for a line whose cache was never computed (render width unknown at
-/// append time, i.e. tests or a Thinking line created before the first
-/// draw), and for those the local text is the full untruncated text.
+/// maintains when the line's text changes and the draw entry re-binds to
+/// the current width (`TuiState::refresh_window_collapsed_summaries`):
+/// rendering never hard-wraps the (possibly MB-sized) full text per frame.
+/// The fallback below only runs for a line whose cache was never computed
+/// (direct callers that bypass the draw entry, e.g. tests), and for those
+/// the local text is the full untruncated text.
 pub(crate) fn render_window(
     lines: &[DisplayLine],
     source_start: usize,
@@ -897,8 +905,8 @@ pub(crate) fn render_window(
                     .collect::<Vec<_>>()
             } else if line.kind == LineKind::Thinking && collapse_thinking {
                 let fallback;
-                let summary: &str = match line.collapsed_summary.as_deref() {
-                    Some(cached) => cached,
+                let summary: &str = match line.collapsed_summary.as_ref() {
+                    Some(cached) => &cached.text,
                     None => {
                         fallback = collapsed_summary_for(&line.text, width);
                         &fallback

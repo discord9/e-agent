@@ -483,13 +483,14 @@ fn frozen_collapsed_thinking_summary_pins_count_at_freeze_point() {
     };
     assert_eq!(
         count(&summary_row),
-        count(&frozen_summary),
+        count(&frozen_summary.text),
         "frozen view shows the freeze-point count, not the live count"
     );
     assert_ne!(
         count(&summary_row),
-        count(&live_summary),
-        "frozen view must not show the live count {live_summary:?}"
+        count(&live_summary.text),
+        "frozen view must not show the live count {:?}",
+        live_summary.text
     );
 
     // End resumes follow: the live count appears.
@@ -502,7 +503,7 @@ fn frozen_collapsed_thinking_summary_pins_count_at_freeze_point() {
         .unwrap_or_else(|| panic!("no collapsed summary row rendered after End"));
     assert_eq!(
         count(&summary_row),
-        count(&live_summary),
+        count(&live_summary.text),
         "live count after unfreezing"
     );
 }

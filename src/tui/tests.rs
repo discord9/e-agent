@@ -2677,7 +2677,10 @@ fn collapsed_thinking_summary_count_survives_local_window_truncation() {
     // The source line carries the cache computed from its full text.
     let expected_summary = collapsed_summary_for(&state.lines[0].text, width);
     assert_eq!(
-        state.lines[0].collapsed_summary.as_deref(),
+        state.lines[0]
+            .collapsed_summary
+            .as_ref()
+            .map(|c| c.text.as_str()),
         Some(expected_summary.as_str()),
         "delta append must cache the full-text summary"
     );
@@ -2692,7 +2695,7 @@ fn collapsed_thinking_summary_count_survives_local_window_truncation() {
     );
     assert_eq!(local[0].text.len(), MAX_RENDER_BYTES);
     assert_eq!(
-        local[0].collapsed_summary.as_deref(),
+        local[0].collapsed_summary.as_ref().map(|c| c.text.as_str()),
         Some(expected_summary.as_str()),
         "the cache is cloned into the local copy"
     );
@@ -2732,7 +2735,8 @@ fn collapsed_thinking_render_reads_cache_and_stays_bounded() {
     assert!(state.lines[0].text.len() > MAX_RENDER_BYTES);
     let summary = state.lines[0]
         .collapsed_summary
-        .clone()
+        .as_ref()
+        .map(|c| c.text.clone())
         .expect("cache is populated at append time once the width is known");
     let window = ScrollWindow {
         source_start: 0,
@@ -2743,7 +2747,7 @@ fn collapsed_thinking_render_reads_cache_and_stays_bounded() {
     let local = local_window_lines(&state.lines, &window, true);
     assert_eq!(local[0].text.len(), MAX_RENDER_BYTES);
     assert_eq!(
-        local[0].collapsed_summary.as_deref(),
+        local[0].collapsed_summary.as_ref().map(|c| c.text.as_str()),
         Some(summary.as_str()),
         "cache is carried through the truncating local window"
     );
@@ -2754,6 +2758,321 @@ fn collapsed_thinking_render_reads_cache_and_stays_bounded() {
     assert!(
         text.len() < MAX_RENDER_BYTES && !text.contains("word"),
         "rendered output is the small summary, not the wrapped body"
+    );
+}
+
+#[test]
+fn incremental_rows_matches_full_wrap_on_edge_cases() {
+    // Every (old, delta) pair must extend the wrapped state exactly as
+    // hard_wrap of the concatenated text would: partial-last-row merge,
+    // exactly-full last row, empty text / trailing-newline empty row, wide
+    // chars (exact fit and overflow), newlines inside and at the head of
+    // the delta. Swept across many widths so the boundary conditions
+    // (last_width == 0, last_width == width, wide-char fits) all fire.
+    let cases: &[(&str, &str)] = &[
+        ("ab", "cd"),
+        ("ab", "cdef"),
+        ("ab", "中"),
+        ("ab", "中a"),
+        ("a", "中"),        // wide char fits exactly in the free space
+        ("ab中", "x"),      // wide char inside the old last row
+        ("abcd", "e"),      // last row exactly full
+        ("abcd", "\nrest"), // full last row + newline-headed delta
+        ("abcd", "\n"),
+        ("abcd\nwxyz", "\nrest"),
+        ("", "hello"),    // empty text
+        ("", "中中"),     // empty text + wide chars
+        ("ab\n", "x"),    // trailing newline: empty last row
+        ("ab\n", "\n"),   // trailing newline + newline delta
+        ("ab", "\nrest"), // partial last row + newline-headed delta
+        ("ab", "\n"),     // delta is only a newline
+        ("ab", "\n\nrest"),
+    ];
+    for width in 1..=8usize {
+        for &(old, delta) in cases {
+            let (old_rows, old_last) = wrap_state(old, width);
+            let got = incremental_rows(delta, width, old_rows, old_last);
+            assert_eq!(
+                got,
+                wrap_state(&format!("{old}{delta}"), width),
+                "old={old:?} delta={delta:?} width={width}"
+            );
+        }
+    }
+}
+
+#[test]
+fn collapsed_summary_incremental_deltas_match_full_wrap() {
+    // Streaming many small ReasoningDeltas must maintain the cached
+    // (N 行) count incrementally; at every step it must equal a full
+    // hard_wrap of the accumulated text, including wide chars, newlines
+    // and a delta that exactly fills the last row.
+    let mut state = TuiState::default();
+    let width = 23;
+    state.inner_width = width;
+    let deltas = [
+        "word ".repeat(5),
+        "中中中".to_string(),
+        "narrow tail".to_string(),
+        "\nnewline head".to_string(),
+        "  pad  ".to_string(),
+        "\n".to_string(),
+        "final".to_string(),
+    ];
+    let mut full = String::new();
+    for (i, delta) in deltas.iter().enumerate() {
+        state.push_agent_event(AgentEvent::ReasoningDelta(delta.clone()));
+        if i == 0 {
+            full.push_str("thinking: ");
+        }
+        full.push_str(delta);
+        let cache = state
+            .lines
+            .last()
+            .unwrap()
+            .collapsed_summary
+            .as_ref()
+            .expect("cache exists once the width is known");
+        assert_eq!(cache.width, width);
+        assert_eq!(
+            cache.rows,
+            wrap_state(&full, width).0,
+            "incremental rows diverge after {i} deltas (text {} bytes)",
+            full.len()
+        );
+        assert_eq!(
+            cache.last_width,
+            wrap_state(&full, width).1,
+            "incremental last_width diverges after {i} deltas"
+        );
+    }
+    // The rendered summary carries the same incremental count.
+    let visual = render_window(&state.lines, 0, 1, width, true);
+    assert_eq!(summary_row_count(&visual[0]), wrap_state(&full, width).0);
+
+    // Resize: the full recompute at the new width must agree with a fresh
+    // hard_wrap (and with the next incremental delta after the resize).
+    state.refresh_window_collapsed_summaries(width + 7);
+    let cache = state
+        .lines
+        .last()
+        .unwrap()
+        .collapsed_summary
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        cache.rows,
+        wrap_state(&full, width + 7).0,
+        "resize recompute must agree with a fresh full wrap"
+    );
+    state.inner_width = width + 7;
+    state.push_agent_event(AgentEvent::ReasoningDelta("post-resize".into()));
+    full.push_str("post-resize");
+    let cache = state
+        .lines
+        .last()
+        .unwrap()
+        .collapsed_summary
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        cache.rows,
+        wrap_state(&full, width + 7).0,
+        "incremental delta after resize must stay exact"
+    );
+}
+
+#[test]
+fn attached_snapshot_replay_recomputes_summary_on_first_draw() {
+    // Attach replay (problem: width unknown at append time): a fresh
+    // TuiState (inner_width == 0, no draw yet) replays the snapshot
+    // events, so append-time caching is skipped and every replayed
+    // thinking line has NO cache. The first draw must recompute the
+    // collapsed summary from the COMPLETE source line before
+    // local_window_lines truncates it — the (N 行) count must not be
+    // underestimated from the truncated tail.
+    let (handle, emitter, _commands) = crate::runner::session_test_channel();
+    let huge = "word ".repeat(MAX_RENDER_BYTES);
+    emitter.emit(AgentEvent::ReasoningDelta(huge));
+    let snapshot = handle.snapshot();
+    let status = handle.status();
+    let mut parent = TuiState::default();
+    parent.attach(
+        1,
+        "task".into(),
+        handle,
+        String::new(),
+        None,
+        String::new(),
+        String::new(),
+        None,
+        snapshot,
+        status,
+    );
+    {
+        let attached = parent.attached.as_mut().unwrap();
+        assert_eq!(attached.state.lines.len(), 1);
+        assert_eq!(
+            attached.state.inner_width, 0,
+            "attach replays before any draw"
+        );
+        assert!(
+            attached.state.lines[0].collapsed_summary.is_none(),
+            "no cache may be computed while the width is unknown"
+        );
+        assert!(attached.state.lines[0].text.len() > MAX_RENDER_BYTES);
+    }
+    let full_rows = hard_wrap(&parent.attached.as_ref().unwrap().state.lines[0].text, 44).len();
+
+    // First draw at a real terminal width: the draw entry refreshes the
+    // cache from the full source line before truncation.
+    let backend = ratatui::backend::TestBackend::new(44, 10);
+    let mut term = Terminal::new(backend).unwrap();
+    draw(&mut term, &mut parent).unwrap();
+    let attached = parent.attached.as_mut().unwrap();
+    let cache = attached
+        .state
+        .lines
+        .first()
+        .unwrap()
+        .collapsed_summary
+        .as_ref()
+        .expect("first draw populates the cache from the complete source line");
+    assert_eq!(cache.width, 44, "cache bound to the real inner width");
+    assert_eq!(
+        cache.rows, full_rows,
+        "count from the FULL pre-truncation text"
+    );
+    // And the truncated-tail fallback would have underestimated: prove the
+    // rendered row shows the full count, not the tail's.
+    let buffer = term.backend().buffer();
+    let row = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+        })
+        .find(|r| r.contains("Tab"))
+        .unwrap_or_else(|| panic!("no collapsed summary row rendered"));
+    let shown: usize = row
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split("行").next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no (N 行) count in {row:?}"));
+    assert_eq!(shown, full_rows);
+    let tail = {
+        let text = &attached.state.lines[0].text;
+        &text[text.len() - MAX_RENDER_BYTES..]
+    };
+    assert!(
+        hard_wrap(tail, 44).len() < full_rows,
+        "the truncated tail alone would underestimate — the test must be meaningful"
+    );
+}
+
+#[test]
+fn collapsed_summary_recomputes_on_terminal_resize() {
+    // Problem: the cache is bound to the width it was computed at, and a
+    // resize only re-anchored the window — an ended reasoning line kept
+    // its old-width (N 行) forever. The draw entry must re-bind the cache
+    // to the current width from the complete source line.
+    let mut state = TuiState {
+        inner_width: 20,
+        ..Default::default()
+    };
+    state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(200)));
+    let cache = state.lines[0].collapsed_summary.as_ref().unwrap();
+    assert_eq!(cache.width, 20);
+    let w20 = wrap_state(&state.lines[0].text, 20).0;
+    assert_eq!(cache.rows, w20);
+
+    // A draw at a wider terminal re-wraps the cache at the new width.
+    // The scrollback area spans the full terminal width, so the draw
+    // inner width is 44.
+    let backend = ratatui::backend::TestBackend::new(44, 10);
+    let mut term = Terminal::new(backend).unwrap();
+    draw(&mut term, &mut state).unwrap();
+    let w44 = wrap_state(&state.lines[0].text, 44).0;
+    assert_ne!(w44, w20, "width change must change the count");
+    let cache = state.lines[0].collapsed_summary.as_ref().unwrap();
+    assert_eq!(cache.width, 44);
+    assert_eq!(cache.rows, w44);
+    let buffer = term.backend().buffer();
+    let row = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+        })
+        .find(|r| r.contains("Tab"))
+        .unwrap_or_else(|| panic!("no collapsed summary row rendered"));
+    // The buffer splits wide glyphs across cells, so parse the count
+    // tolerantly instead of matching the exact summary text.
+    let shown: usize = row
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split("行").next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no (N 行) count in {row:?}"));
+    assert_eq!(shown, w44);
+    assert_ne!(shown, w20);
+
+    // And the NEXT delta after the resize continues incrementally from the
+    // new width (a stale-width cache would fall back to a full recompute —
+    // correct, but the width-bound path must not regress to the old count).
+    state.inner_width = 44;
+    state.push_agent_event(AgentEvent::ReasoningDelta("more ".repeat(10)));
+    let cache = state.lines[0].collapsed_summary.as_ref().unwrap();
+    assert_eq!(
+        cache.rows,
+        wrap_state(&state.lines[0].text, 44).0,
+        "delta after resize extends the width-fresh cache"
+    );
+}
+
+#[test]
+fn frozen_summary_rewraps_at_new_width_but_keeps_freeze_point() {
+    // A frozen tail summary is pinned to the freeze-time text (deltas that
+    // stream after the freeze must not grow its count), but a terminal
+    // resize must re-wrap that freeze-time text at the new width instead of
+    // pinning a stale old-width count forever.
+    let mut state = TuiState {
+        inner_width: 40,
+        ..Default::default()
+    };
+    state.push_agent_event(AgentEvent::ReasoningDelta("alpha ".repeat(30)));
+    state.handle_scroll(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    let frozen = state
+        .window
+        .frozen_tail_summary
+        .clone()
+        .expect("freeze pins the summary");
+    assert_eq!(frozen.width, 40);
+    let freeze_len = state.window.frozen_tail_cursor.unwrap();
+
+    // Post-freeze deltas keep growing the live source line.
+    state.push_agent_event(AgentEvent::ReasoningDelta("beta ".repeat(60)));
+    assert!(state.lines.last().unwrap().text.len() > freeze_len);
+
+    // Resize refresh: the frozen summary is re-wrapped from the text up to
+    // the frozen cursor at the new width.
+    state.refresh_window_collapsed_summaries(60);
+    let re = state
+        .window
+        .frozen_tail_summary
+        .as_ref()
+        .expect("frozen summary survives the refresh");
+    assert_eq!(re.width, 60);
+    let freeze_text = &state.lines.last().unwrap().text[..freeze_len];
+    assert_eq!(re.rows, wrap_state(freeze_text, 60).0);
+    assert_ne!(
+        re.rows,
+        wrap_state(freeze_text, 40).0,
+        "the re-wrap must change the count so the test is meaningful"
+    );
+    assert_ne!(
+        re.rows,
+        wrap_state(&state.lines.last().unwrap().text, 60).0,
+        "post-freeze deltas must stay excluded from the frozen count"
     );
 }
 

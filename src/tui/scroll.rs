@@ -1,8 +1,8 @@
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::*;
 
-/// Hard-wrap text at `width` terminal cells (char-boundary safe, CJK-aware).
+/// Wrap `text` at `width` terminal cells (char-boundary safe, CJK-aware).
 /// Rendering and scroll accounting share this function so bottom-following
 /// is exact instead of estimated.
 pub(crate) fn hard_wrap(text: &str, width: usize) -> Vec<&str> {
@@ -25,6 +25,102 @@ pub(crate) fn hard_wrap(text: &str, width: usize) -> Vec<&str> {
     rows
 }
 
+/// Wrap `text` at `width` as if it were appended to a row that already
+/// consumes `initial` cells on the first line — the old last row's cell
+/// width in `incremental_rows`. The first row breaks when
+/// `initial + char_width > width`, which matches `hard_wrap` on the
+/// concatenated text exactly (the break decision only depends on the cell
+/// counts, not the glyphs). When `initial >= width` the old row was full
+/// and `text` starts a fresh row with no phantom empty row. Segments after
+/// the first newline start with zero cells used, like `hard_wrap`.
+fn hard_wrap_continuation(text: &str, width: usize, initial: usize) -> Vec<&str> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for (segment_index, logical) in text.split('\n').enumerate() {
+        let mut start = 0;
+        let mut used = if segment_index == 0 && initial < width {
+            initial
+        } else {
+            0
+        };
+        for (index, character) in logical.char_indices() {
+            let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if used > 0 && used + char_width > width {
+                rows.push(&logical[start..index]);
+                start = index;
+                used = 0;
+            }
+            used += char_width;
+        }
+        rows.push(&logical[start..]);
+    }
+    rows
+}
+
+/// Extend a wrapped-text state `(rows, last_width)` at `width` when `delta`
+/// is appended to the text; returns the new `(rows, last_width)`.
+///
+/// Only the delta is wrapped, never the accumulated text, so streaming N
+/// small deltas costs O(total text) instead of O(N × total) — this is what
+/// keeps reasoning streaming cheap (`CollapsedSummary::append_delta`).
+///
+/// The old last row merges with the head of the delta unless it is exactly
+/// full (`last_width >= width`: the delta starts a fresh row and the old
+/// row is kept) or empty (`last_width == 0`, i.e. the text was empty or
+/// ended with a newline: the delta fills that row and the old row is
+/// replaced). In the merge case `hard_wrap_continuation` pre-consumes the
+/// old row's cells on the first line, which produces exactly the rows
+/// `hard_wrap` would for the concatenated text. A delta that starts with a
+/// newline closes the old last row without creating an extra segment, so
+/// the fresh-wrap branch strips that one boundary newline before wrapping.
+/// An empty delta is a no-op.
+pub(crate) fn incremental_rows(
+    delta: &str,
+    width: usize,
+    old_rows: usize,
+    last_width: usize,
+) -> (usize, usize) {
+    let width = width.max(1);
+    if delta.is_empty() {
+        return (old_rows, last_width);
+    }
+    let (wrapped, consume_last) = if last_width >= width {
+        // Old last row exactly full: the delta starts a fresh row. A
+        // leading '\n' only terminates the old row — no extra segment.
+        let delta = delta.strip_prefix('\n').unwrap_or(delta);
+        (hard_wrap(delta, width), false)
+    } else {
+        (hard_wrap_continuation(delta, width, last_width), true)
+    };
+    let rows = if consume_last {
+        old_rows.saturating_sub(1) + wrapped.len()
+    } else {
+        old_rows + wrapped.len()
+    };
+    // The last row of a single-row merge is the old last row with `initial`
+    // cells already consumed — its occupied width is initial + row width,
+    // not the row string's width alone. Multi-row continuations end on a
+    // plain row, so only their last row's string width counts.
+    let last_width = if consume_last && wrapped.len() == 1 {
+        last_width + UnicodeWidthStr::width(wrapped[0])
+    } else {
+        wrapped.last().map_or(0, |row| UnicodeWidthStr::width(*row))
+    };
+    (rows, last_width)
+}
+
+/// `(row count, last-row cell width)` of `text` wrapped at `width` — the
+/// wrapped-state pair `CollapsedSummary` maintains incrementally and
+/// `refresh` recomputes in full. Exposed for tests to compare against.
+pub(crate) fn wrap_state(text: &str, width: usize) -> (usize, usize) {
+    let width = width.max(1);
+    let rows = hard_wrap(text, width);
+    (
+        rows.len(),
+        rows.last().map_or(0, |row| UnicodeWidthStr::width(*row)),
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn wrapped_rows(lines: &[DisplayLine], width: u16, collapse_thinking: bool) -> usize {
     let width = usize::from(width.max(1));
@@ -39,25 +135,77 @@ pub(crate) struct DisplayLine {
     pub(crate) text: String,
     pub(crate) kind: LineKind,
     /// Cached collapsed-summary row for `Thinking` lines
-    /// (`▸ thinking… (N 行) [Tab 展开]`, see `collapsed_summary_for`).
-    /// Refreshed on the source line whenever its text changes and the
-    /// render width is known (`TuiState::push_agent_event_inner` /
-    /// `push_line`); `None` for every other line kind and for Thinking
-    /// lines whose cache was never computed (render width unknown at
-    /// append time). The renderer reads this cache instead of hard-wrapping
-    /// the (possibly MB-sized) full text every frame, falling back to a
-    /// one-shot computation only when it is absent. `Clone` carries the
+    /// (`▸ thinking… (N 行) [Tab 展开]`, see `CollapsedSummary`). Maintained
+    /// on the source line whenever its text changes and the render width is
+    /// known (`TuiState::push_agent_event_inner` / `push_line`); `None` for
+    /// every other line kind and for Thinking lines whose cache was never
+    /// computed (render width unknown at append time — attach/snapshot
+    /// replay, history loads). The renderer reads this cache instead of
+    /// hard-wrapping the (possibly MB-sized) full text every frame, and the
+    /// draw entry recomputes any cache that is absent or bound to a stale
+    /// width BEFORE `local_window_lines` truncates the text (see
+    /// `TuiState::refresh_window_collapsed_summaries`). `Clone` carries the
     /// cache into the bounded local window unchanged.
-    pub(crate) collapsed_summary: Option<String>,
+    pub(crate) collapsed_summary: Option<CollapsedSummary>,
+}
+
+/// Cached collapsed summary of a `Thinking` line, bound to the terminal
+/// width it was computed at. `rows` is the visual row count of the FULL
+/// source text at `width` (same `hard_wrap` the expanded path uses), so the
+/// count stays exact even after `local_window_lines` truncates the text it
+/// carries. `last_width` (cell width of the last wrapped row) drives the
+/// incremental maintenance in `append_delta`, which wraps only each new
+/// delta instead of re-wrapping the accumulated text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollapsedSummary {
+    /// The rendered summary row: `▸ thinking… (N 行) [Tab 展开]`.
+    pub(crate) text: String,
+    /// Terminal width (cells) `rows` was computed at.
+    pub(crate) width: usize,
+    /// Visual row count of the full source text at `width` (the `N`).
+    pub(crate) rows: usize,
+    /// Cell width of the last wrapped row at `width`; 0 when the text is
+    /// empty or ends with a newline, `width` when the last row is exactly
+    /// full.
+    pub(crate) last_width: usize,
+}
+
+impl CollapsedSummary {
+    /// Full recompute from the complete source text.
+    pub(crate) fn new(text: &str, width: usize) -> Self {
+        let width = width.max(1);
+        let (rows, last_width) = wrap_state(text, width);
+        Self {
+            rows,
+            last_width,
+            text: summary_text(rows),
+            width,
+        }
+    }
+
+    /// Extend the wrapped state after `delta` was appended to the source
+    /// text, wrapping ONLY the delta against the old last row
+    /// (`incremental_rows`) instead of re-wrapping the accumulated text —
+    /// streaming N small deltas stays O(total text), not O(N × total). The
+    /// caller must have verified this cache is bound to `width`.
+    pub(crate) fn append_delta(&mut self, delta: &str, width: usize) {
+        let (rows, last_width) = incremental_rows(delta, width, self.rows, self.last_width);
+        self.rows = rows;
+        self.last_width = last_width;
+        self.text = summary_text(rows);
+    }
+}
+
+/// The collapsed summary row text for a `(N 行)` count.
+fn summary_text(rows: usize) -> String {
+    format!("▸ thinking… ({rows} 行) [Tab 展开]")
 }
 
 /// Build the collapsed summary row a `Thinking` line renders instead of its
-/// full wrapped text. `N` is the visual row count of the FULL text at
-/// `width` (same `hard_wrap` the expanded path uses), so the count stays
-/// exact even after `local_window_lines` truncates the text it carries.
+/// full wrapped text (full recompute). Kept for the renderer's fallback
+/// path and tests; production draw paths prefer the width-checked cache.
 pub(crate) fn collapsed_summary_for(text: &str, width: usize) -> String {
-    let rows = hard_wrap(text, width).len();
-    format!("▸ thinking… ({rows} 行) [Tab 展开]")
+    summary_text(hard_wrap(text, width).len())
 }
 
 /// Rendering never materializes more than this much scrollback. Limits are
@@ -105,8 +253,9 @@ pub(crate) fn utf8_tail(text: &str, end: usize, bytes: usize) -> &str {
 /// result: a `Thinking` line renders only its cached collapsed summary
 /// (`DisplayLine::collapsed_summary`), so its text is truncated like any
 /// other over-budget line — the summary's `(N 行)` count comes from the
-/// cache, which was computed from the complete pre-truncation text when the
-/// line last changed.
+/// cache, which the draw entry keeps bound to the current width and
+/// computed from the complete pre-truncation text
+/// (`TuiState::refresh_window_collapsed_summaries` runs before this call).
 pub(crate) fn local_window_lines(
     lines: &[DisplayLine],
     window: &ScrollWindow,
@@ -123,25 +272,26 @@ pub(crate) fn local_window_lines(
     // bounded tail, so the byte cap stays in force for anything actually
     // drawn as body text. Returns false once the budget is exhausted (the
     // line was still emitted).
-    let mut emit = |line: &DisplayLine, cursor: usize, frozen_summary: Option<&str>| -> bool {
-        let tail = utf8_tail(&line.text, cursor, remaining);
-        remaining = remaining.saturating_sub(tail.len());
-        let collapsed_summary = if collapse_thinking && line.kind == LineKind::Thinking {
-            // Frozen view: pin the count to the value captured at the freeze
-            // point so post-freeze deltas cannot mutate the visible summary.
-            frozen_summary
-                .map(str::to_owned)
-                .or_else(|| line.collapsed_summary.clone())
-        } else {
-            None
+    let mut emit =
+        |line: &DisplayLine, cursor: usize, frozen_summary: Option<&CollapsedSummary>| -> bool {
+            let tail = utf8_tail(&line.text, cursor, remaining);
+            remaining = remaining.saturating_sub(tail.len());
+            let collapsed_summary = if collapse_thinking && line.kind == LineKind::Thinking {
+                // Frozen view: pin the count to the value captured at the freeze
+                // point so post-freeze deltas cannot mutate the visible summary.
+                frozen_summary
+                    .cloned()
+                    .or_else(|| line.collapsed_summary.clone())
+            } else {
+                None
+            };
+            local.push(DisplayLine {
+                text: tail.to_owned(),
+                kind: line.kind,
+                collapsed_summary,
+            });
+            remaining > 0
         };
-        local.push(DisplayLine {
-            text: tail.to_owned(),
-            kind: line.kind,
-            collapsed_summary,
-        });
-        remaining > 0
-    };
     // Viewport at the absolute top of the scrollback (Home / PageUp at the
     // top): budget from the START of the window. The tail-biased reverse
     // walk below would consume the byte budget on the window's tail and
@@ -170,7 +320,7 @@ pub(crate) fn local_window_lines(
             line.text.len()
         };
         let frozen_summary = if is_frozen_tail {
-            window.frozen_tail_summary.as_deref()
+            window.frozen_tail_summary.as_ref()
         } else {
             None
         };
@@ -213,9 +363,12 @@ pub(crate) struct ScrollWindow {
     pub(crate) frozen_source_end: usize,
     /// Collapsed summary of the frozen tail line captured at the freeze
     /// point, so the frozen view's `(N 行)` count reflects the text at
-    /// freeze time instead of the live post-freeze text. `None` unless the
+    /// freeze time instead of the live post-freeze text. Width-bound like
+    /// the live cache: the draw entry re-wraps it from the freeze-time text
+    /// when the terminal width changes (see
+    /// `TuiState::refresh_window_collapsed_summaries`). `None` unless the
     /// frozen tail line was a collapsed `Thinking` line.
-    pub(crate) frozen_tail_summary: Option<String>,
+    pub(crate) frozen_tail_summary: Option<CollapsedSummary>,
 }
 
 impl Default for ScrollWindow {
