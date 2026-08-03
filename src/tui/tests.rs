@@ -1271,6 +1271,28 @@ fn attached_view_scrolls_independently() {
 }
 
 #[test]
+fn attached_tab_toggles_thinking_collapse_in_the_attached_view() {
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    attach_test(&mut state, 1, "task", handle);
+    assert!(
+        state.attached.as_ref().unwrap().state.collapse_thinking.0,
+        "attached views default to collapsed"
+    );
+    // Tab in the attached view flips the ATTACHED view's collapse flag
+    // (the main view's flag is a per-view toggle and must stay untouched).
+    state.handle_attached_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), 80);
+    assert!(!state.attached.as_ref().unwrap().state.collapse_thinking.0);
+    assert!(
+        state.collapse_thinking.0,
+        "main view collapse state must be independent"
+    );
+    // Tab again collapses back to the summary.
+    state.handle_attached_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), 80);
+    assert!(state.attached.as_ref().unwrap().state.collapse_thinking.0);
+}
+
+#[test]
 fn input_autoheight_and_wrapped_cursor_track_visual_rows() {
     let mut input = InputBuffer::default();
     input.insert("ab\ncdef");
@@ -2604,6 +2626,59 @@ fn collapsed_thinking_summary_count_tracks_streaming_deltas() {
         n_after > n_before,
         "summary count grew {n_before} -> {n_after}"
     );
+}
+
+#[test]
+fn collapsed_thinking_summary_count_survives_local_window_truncation() {
+    // Production rendering goes through local_window_lines, which caps the
+    // window at MAX_RENDER_BYTES. A thinking block larger than the cap is
+    // truncated there; the collapsed summary's (N 行) count must still
+    // reflect the FULL pre-truncation text, not the truncated tail
+    // (regression: the streamed summary count was computed after the cap).
+    let mut state = TuiState::default();
+    assert!(state.collapse_thinking.0);
+    state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(MAX_RENDER_BYTES)));
+    assert_eq!(state.lines.len(), 1);
+    assert!(
+        state.lines[0].text.len() > MAX_RENDER_BYTES,
+        "test text must exceed the local-window byte cap"
+    );
+    let width = 20;
+    let full_rows = hard_wrap(&state.lines[0].text, width).len();
+    let window = ScrollWindow {
+        source_start: 0,
+        source_end: 1,
+        ..ScrollWindow::new()
+    };
+
+    // Collapsed: the truncated thinking line keeps its full text so the
+    // summary count is exact.
+    let local = local_window_lines(&state.lines, &window, true);
+    assert_eq!(local.len(), 1);
+    assert_eq!(
+        local[0].text, state.lines[0].text,
+        "collapsed truncated thinking must keep its full text"
+    );
+    let visual = render_window(&local, 0, 1, width, true);
+    assert_eq!(visual.len(), 1, "still a single collapsed summary row");
+    assert_eq!(
+        summary_row_count(&visual[0]),
+        full_rows,
+        "summary count must reflect the full pre-truncation text"
+    );
+    // Sanity: the truncated tail alone would underestimate the count.
+    let tail = &state.lines[0].text[state.lines[0].text.len() - MAX_RENDER_BYTES..];
+    assert!(hard_wrap(tail, width).len() < full_rows);
+
+    // Expanded (or non-thinking lines): the byte cap stays in force and
+    // only the bounded tail is carried into the renderer.
+    let local_expanded = local_window_lines(&state.lines, &window, false);
+    assert_eq!(local_expanded.len(), 1);
+    assert!(
+        local_expanded[0].text.len() < state.lines[0].text.len(),
+        "expanded path must keep the bounded tail"
+    );
+    assert!(local_expanded[0].text.len() <= MAX_RENDER_BYTES);
 }
 
 #[test]

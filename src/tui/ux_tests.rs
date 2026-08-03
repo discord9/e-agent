@@ -141,7 +141,7 @@ fn home_budgets_from_start_when_head_segment_exceeds_byte_cap() {
     }
     state.handle_scroll(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
     // Direct check of the local window (bypasses draw, isolates the bug).
-    let local = local_window_lines(&state.lines, &state.window);
+    let local = local_window_lines(&state.lines, &state.window, false);
     assert_eq!(
         local.first().map(|l| l.text.as_str()),
         Some("FIRST_LINE_START"),
@@ -661,6 +661,108 @@ fn collapsed_thinking_hides_body_until_tab_expands_it() {
 }
 
 #[test]
+fn attached_tab_collapses_and_expands_thinking_in_rendered_output() {
+    // The attached (subagent) view renders through the same shared
+    // pipeline; Tab must collapse/expand its thinking blocks exactly like
+    // the main view's Tab.
+    let backend = ratatui::backend::TestBackend::new(40, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    let snapshot = handle.snapshot();
+    let status = handle.status();
+    state.attach(
+        1,
+        "task".into(),
+        handle,
+        String::new(),
+        None,
+        String::new(),
+        String::new(),
+        None,
+        snapshot,
+        status,
+    );
+    {
+        let attached = state.attached.as_mut().unwrap();
+        assert!(
+            attached.state.collapse_thinking.0,
+            "attached defaults to collapsed"
+        );
+        attached
+            .state
+            .push_agent_event(AgentEvent::ReasoningDelta("secret ".repeat(60)));
+    }
+    draw(&mut terminal, &mut state).unwrap();
+    let rows = |term: &Terminal<ratatui::backend::TestBackend>| {
+        (0..term.backend().buffer().area.height)
+            .map(|y| row_text(term.backend().buffer(), y))
+            .collect::<Vec<_>>()
+    };
+    // Collapsed: one summary row, no thinking body.
+    let collapsed = rows(&terminal);
+    assert!(
+        collapsed.iter().any(|r| r.contains("Tab")),
+        "attached view must show the collapsed summary: {collapsed:?}"
+    );
+    assert!(
+        !collapsed.iter().any(|r| r.contains("secret")),
+        "attached thinking body hidden while collapsed: {collapsed:?}"
+    );
+
+    // Tab expands: the full body renders instead of the summary.
+    state.handle_attached_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), 80);
+    draw(&mut terminal, &mut state).unwrap();
+    let expanded = rows(&terminal);
+    assert!(
+        expanded.iter().any(|r| r.contains("secret")),
+        "attached thinking body visible after Tab: {expanded:?}"
+    );
+    assert!(
+        !expanded.iter().any(|r| r.contains("Tab")),
+        "no summary row while expanded: {expanded:?}"
+    );
+
+    // Tab collapses again: back to a single summary row.
+    state.handle_attached_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), 80);
+    draw(&mut terminal, &mut state).unwrap();
+    let recollapsed = rows(&terminal);
+    assert!(
+        recollapsed.iter().any(|r| r.contains("Tab")),
+        "attached view must collapse again: {recollapsed:?}"
+    );
+    assert!(!recollapsed.iter().any(|r| r.contains("secret")));
+}
+
+#[test]
+fn collapsed_huge_thinking_summary_shows_full_row_count_after_truncation() {
+    // Production path: draw → local_window_lines (64 KiB cap) →
+    // render_window. A thinking block larger than the cap must still show
+    // the FULL text's wrapped row count in the collapsed summary, not the
+    // truncated tail's (under)estimate.
+    let backend = ratatui::backend::TestBackend::new(40, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    assert!(state.collapse_thinking.0);
+    state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(MAX_RENDER_BYTES)));
+    assert!(state.lines[0].text.len() > MAX_RENDER_BYTES);
+    draw(&mut terminal, &mut state).unwrap();
+    let width = state.inner_width.max(1);
+    let full_rows = hard_wrap(&state.lines[0].text, width).len();
+    let rendered = (0..terminal.backend().buffer().area.height)
+        .map(|y| row_text(terminal.backend().buffer(), y))
+        .collect::<Vec<_>>();
+    let summary = rendered
+        .iter()
+        .find(|r| r.contains("Tab"))
+        .unwrap_or_else(|| panic!("no collapsed summary row in: {rendered:?}"));
+    assert!(
+        summary.contains(&format!("({full_rows} 行")),
+        "summary must show the full row count {full_rows}, got: {summary:?}"
+    );
+}
+
+#[test]
 fn local_window_obeys_all_limits_without_splitting_utf8() {
     let mut lines: Vec<_> = (0..300)
         .map(|index| DisplayLine {
@@ -677,7 +779,7 @@ fn local_window_obeys_all_limits_without_splitting_utf8() {
         source_end: lines.len(),
         ..ScrollWindow::new()
     };
-    let local = local_window_lines(&lines, &window);
+    let local = local_window_lines(&lines, &window, false);
     assert!(local.len() <= MAX_RENDER_SOURCE_LINES);
     assert!(local.iter().map(|line| line.text.len()).sum::<usize>() <= MAX_RENDER_BYTES);
     assert!(local.last().unwrap().text.is_char_boundary(0));
@@ -903,7 +1005,7 @@ fn resize_matrix_cjk_long_and_compaction_no_panic() {
     for (w, h) in [(20u16, 12u16), (120, 12), (40, 12)] {
         term.backend_mut().resize(w, h);
         draw(&mut term, &mut state).unwrap();
-        let local = local_window_lines(&state.lines, &state.window);
+        let local = local_window_lines(&state.lines, &state.window, false);
         let visual = render_bounded_window(&local, state.inner_width, false, false);
         let total = visual.len();
         assert!(

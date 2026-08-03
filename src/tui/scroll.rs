@@ -80,11 +80,45 @@ pub(crate) fn utf8_tail(text: &str, end: usize, bytes: usize) -> &str {
 /// Copy only the bounded part of the current source window. A frozen cursor
 /// is an offset into the final source line, rather than a cloned tail string:
 /// this is both bounded and stable while that line receives streaming deltas.
-pub(crate) fn local_window_lines(lines: &[DisplayLine], window: &ScrollWindow) -> Vec<DisplayLine> {
+///
+/// `collapse_thinking` must match the flag the renderer will use on the
+/// result: a `Thinking` line whose text exceeds the byte budget keeps its
+/// FULL text while collapsed, so the collapsed summary's `(N 行)` count
+/// reflects the complete pre-truncation text instead of underestimating it
+/// from the truncated tail (see `render_window`).
+pub(crate) fn local_window_lines(
+    lines: &[DisplayLine],
+    window: &ScrollWindow,
+    collapse_thinking: bool,
+) -> Vec<DisplayLine> {
     let end = window.source_end.min(lines.len());
     let start = window.source_start.min(end);
     let mut remaining = MAX_RENDER_BYTES;
     let mut local = Vec::new();
+    // Copy one line into the bounded window. The byte budget is charged for
+    // the (possibly truncated) tail, so sibling lines keep their share.
+    // Exception: a `Thinking` line that exceeds the budget keeps its full
+    // text while collapsed — the collapsed render path draws only the
+    // summary row, whose row count is computed from this text, and the
+    // expanded path still renders the bounded tail (so the byte cap stays
+    // in force for anything actually drawn as body text). Returns false
+    // once the budget is exhausted (the line was still emitted).
+    let mut emit = |line: &DisplayLine, cursor: usize| -> bool {
+        let tail = utf8_tail(&line.text, cursor, remaining);
+        remaining = remaining.saturating_sub(tail.len());
+        let text =
+            if collapse_thinking && line.kind == LineKind::Thinking && tail.len() < line.text.len()
+            {
+                line.text.clone()
+            } else {
+                tail.to_owned()
+            };
+        local.push(DisplayLine {
+            text,
+            kind: line.kind,
+        });
+        remaining > 0
+    };
     // Viewport at the absolute top of the scrollback (Home / PageUp at the
     // top): budget from the START of the window. The tail-biased reverse
     // walk below would consume the byte budget on the window's tail and
@@ -98,34 +132,22 @@ pub(crate) fn local_window_lines(lines: &[DisplayLine], window: &ScrollWindow) -
         && window.frozen_tail_cursor.is_none();
     if from_start {
         for line in lines[start..end].iter().take(MAX_RENDER_SOURCE_LINES) {
-            if remaining == 0 {
+            if !emit(line, line.text.len()) {
                 break;
             }
-            let text = utf8_tail(&line.text, line.text.len(), remaining);
-            remaining = remaining.saturating_sub(text.len());
-            local.push(DisplayLine {
-                text: text.to_owned(),
-                kind: line.kind,
-            });
         }
         return local;
     }
     for index in (start..end).rev().take(MAX_RENDER_SOURCE_LINES) {
-        if remaining == 0 {
-            break;
-        }
         let line = &lines[index];
         let cursor = if index + 1 == end {
             window.frozen_tail_cursor.unwrap_or(line.text.len())
         } else {
             line.text.len()
         };
-        let text = utf8_tail(&line.text, cursor, remaining);
-        remaining = remaining.saturating_sub(text.len());
-        local.push(DisplayLine {
-            text: text.to_owned(),
-            kind: line.kind,
-        });
+        if !emit(line, cursor) {
+            break;
+        }
     }
     local.reverse();
     local
@@ -259,7 +281,7 @@ pub(crate) fn reanchor_window_on_resize(
     let old_width = old_width.max(1);
     let new_width = new_width.max(1);
     let height = height.max(1);
-    let local_old = local_window_lines(lines, window);
+    let local_old = local_window_lines(lines, window, collapse_thinking);
     if local_old.is_empty() {
         return;
     }
@@ -442,7 +464,7 @@ pub(crate) fn extend_window_down(
     // Count the same bounded local copy that draw renders. Live deltas may
     // have made the source tail taller without changing the frozen cursor.
     let mut total_visual = render_bounded_window(
-        &local_window_lines(&state.lines, &state.window),
+        &local_window_lines(&state.lines, &state.window, state.collapse_thinking.0),
         w,
         false,
         state.collapse_thinking.0,

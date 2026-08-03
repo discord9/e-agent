@@ -238,7 +238,11 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
         }
         // Render a bounded local tail. The cursor captured when scrolling
         // away from a streaming tail keeps later deltas out of this view.
-        let local_lines = local_window_lines(&scroll_state.lines, &scroll_state.window);
+        let local_lines = local_window_lines(
+            &scroll_state.lines,
+            &scroll_state.window,
+            scroll_state.collapse_thinking.0,
+        );
         let at_top = scroll_state.window.source_start == 0
             && scroll_state.window.source_end <= MAX_RENDER_SOURCE_LINES
             && scroll_state.window.frozen_tail_cursor.is_none();
@@ -769,7 +773,7 @@ pub(crate) fn render_task_detail(
     let block = SOLARIZED_LIGHT.block(header);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let local = local_window_lines(&detail.lines, &detail.window);
+    let local = local_window_lines(&detail.lines, &detail.window, false);
     // Per-frame wrap budget: follow mode re-wraps the page every frame
     // (even without a reload), so bound the wrap to the viewport's own
     // cell count instead of the full 64 KiB page — a cargo build dumping

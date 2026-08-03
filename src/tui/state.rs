@@ -383,7 +383,7 @@ impl TaskDetail {
         self.window.local_offset = 0;
         if anchor_bottom {
             let total = render_bounded_window(
-                &local_window_lines(&self.lines, &self.window),
+                &local_window_lines(&self.lines, &self.window, false),
                 width,
                 false,
                 false,
@@ -443,7 +443,7 @@ impl TaskDetail {
             return;
         }
         let total = render_bounded_window(
-            &local_window_lines(&self.lines, &self.window),
+            &local_window_lines(&self.lines, &self.window, false),
             width,
             false,
             false,
@@ -485,7 +485,7 @@ impl TaskDetail {
             return;
         }
         let total = render_bounded_window(
-            &local_window_lines(&self.lines, &self.window),
+            &local_window_lines(&self.lines, &self.window, false),
             width,
             false,
             false,
@@ -738,8 +738,10 @@ impl TuiState {
 
     /// Keys pressed while attached: F2 toggles the tasks panel (so another
     /// session can be selected), scroll keys move the attached scrollback,
-    /// Enter steers the session (queues a prompt for its next turn), Ctrl-C
-    /// cancels its in-flight turn, everything else edits the steering input.
+    /// Tab collapses/expands model reasoning (same flag and tail re-anchor
+    /// as the main view), Enter steers the session (queues a prompt for its
+    /// next turn), Ctrl-C cancels its in-flight turn, everything else edits
+    /// the steering input.
     pub(crate) fn handle_attached_key(&mut self, key: KeyEvent, input_width: usize) {
         if key.code == KeyCode::F(2) {
             self.show_tasks = !self.show_tasks;
@@ -756,6 +758,17 @@ impl TuiState {
             | KeyCode::PageDown
             | KeyCode::Home
             | KeyCode::End => attached.state.handle_scroll(key),
+            KeyCode::Tab => {
+                // Collapse/expand the attached scrollback's thinking blocks,
+                // mirroring the main view. Tab has no input-editing use in
+                // the attached buffer (see AttachedView::edit_input), so the
+                // key is free. The attached render path already forwards
+                // collapse_thinking to the shared renderer; re-anchor at the
+                // tail because the visual geometry changes (each thinking
+                // block shrinks to one summary row).
+                attached.state.collapse_thinking.0 = !attached.state.collapse_thinking.0;
+                attached.state.follow();
+            }
             KeyCode::Enter if key.modifiers == KeyModifiers::ALT => {
                 attached.input.insert_char('\n');
             }
