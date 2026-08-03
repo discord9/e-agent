@@ -385,6 +385,9 @@ function removeWorkspace(ws) {
   } else {
     renderSidebarTree(true);   // 侧边栏立即移除该分组
     renderWorkspaceSelect();
+    // 聚合列表视图由 state.workspaces 遍历聚合（aggregateSessionRows）：
+    // 不重绘的话旧 DOM 仍显示被删服务器的会话（review 发现 1）。
+    if (state.view === "list") renderSessionList();
   }
 }
 

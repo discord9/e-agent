@@ -1199,6 +1199,24 @@ mmlEqnNo}
   .ws-err { color: var(--red); font-size: 11px; opacity: 0.8; }
   /* 「当前」标记：激活 workspace 分组头右侧 */
   .ws-cur { color: var(--base01); font-size: 10px; margin-left: auto; flex: 0 0 auto; }
+  /* 组头右侧控件组（当前标记 / + / ×）相邻时不再各自推挤：margin-left:auto
+     只保留给组内最左一个（.ws-cur 或 .ws-add），其余归零——两个 auto margin
+     会把「当前」和 × 从中间拆开（review 发现 3） */
+  .ws-cur + .ws-add, .ws-cur + .ws-del, .ws-add + .ws-del { margin-left: 0; }
+  /* 组头新建按钮：在该 workspace 新建会话（正常色，hover 高亮不警示） */
+  .ws-add {
+    margin-left: auto;        /* 无「当前」标记时也推到右侧 */
+    flex: 0 0 auto;
+    border: none;
+    background: transparent;
+    color: var(--base01);
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .ws-add:hover { background: var(--base3); color: var(--violet); }
   /* 分组头删除按钮：出错/无法连接的服务器也能移除（逃生口） */
   .ws-del {
     margin-left: auto;        /* 无「当前」标记时也推到右侧 */

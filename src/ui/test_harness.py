@@ -290,12 +290,16 @@ let sessionsDataB = [
 ];
 let sessionsBFail = false;
 // 竞态/格式测试开关：B 的 resume POST 延迟（手动 resolve）、A 的 history 延迟、
-// B 返回非数组 JSON（{}）
+// B 返回非数组 JSON（{}）、B 的 GET /api/sessions 延迟（在途轮询守卫）、
+// B 的「新建会话」POST 失败（组头 + 按钮失败路径）
 let bPostDelayed = false;
 let bPostResolve = null;
 let aHistoryDelayed = false;
 let aHistoryResolve = null;
 let sessionsBFormat = false;
+let bGetDelayed = false;
+let bGetResolve = null;
+let sessionsBCreateFail = false;
 // SSE 生命周期测试：a1 的 events 流手动控制（首个 read 挂起，测试切走后
 // 再 resolve 陈旧块；验证陈旧流不渲染到当前会话/workspace）
 let a1StreamManual = false;
@@ -316,10 +320,17 @@ globalThis.fetch=(url,opts={})=>{
   if(url==="/api/sessions"&&m==="GET") return resp(200, sessionsData);
   // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
   if(url==="http://b.local/api/sessions"&&m==="GET") {
+    if (bGetDelayed) return new Promise((resolve) => { bGetResolve = resolve; });
     if (sessionsBFail) return resp(500, {});
     return resp(200, sessionsBFormat ? {} : sessionsDataB);
   }
   if(url==="http://b.local/api/sessions"&&m==="POST") {
+    // 组头「+」新建会话：body {}（无 initial_prompt）→ 独立响应/失败开关；
+    // resume 恢复（body {"id":...}）走下方既有延迟/固定响应路径
+    if (opts.body === "{}") {
+      if (sessionsBCreateFail) return resp(500, {});
+      return resp(201, { id: "b-new", status: "Idle", active: true });
+    }
     if (bPostDelayed) return new Promise((resolve) => { bPostResolve = resolve; });
     return resp(201, { id: "b-hist", status: "Idle", active: true });
   }
@@ -342,12 +353,16 @@ globalThis.fetch=(url,opts={})=>{
     return resp(200, historyData);   // 含 ?limit=…（loadHistory 尾部翻页）
   }
   if(url.startsWith("/api/sessions/s2/history")) return resp(200, historyData);
+  if(url.startsWith("/api/sessions/sess-new/history")) return resp(200, {entries:[], next_before_seq:null});
+  if(url.startsWith("/api/sessions/b-new/history")) return resp(200, {entries:[], next_before_seq:null});
   if(url.startsWith("/api/sessions/fork-1/history")) return resp(200, {entries:[], next_before_seq:null});
   // restored 替换回归测试用：缓存过期后切回，history 含新消息（历史数据本身不变）
   if(url.startsWith("/api/sessions/restored-test/history")) return resp(200, historyData);
   if(url.startsWith("/api/sessions/restored-test2/history")) return resp(200, historyData);
   if(url==="/api/sessions/s1/events") return resp(200, stream());
   if(url==="/api/sessions/s2/events") return resp(200, stream());
+  if(url==="/api/sessions/sess-new/events") return resp(200, streamEmpty());
+  if(url==="http://b.local/api/sessions/b-new/events") return resp(200, streamEmpty());
   if(url==="/api/sessions/fork-1/events") return resp(200, stream());
   // restored 回归测试：空 SSE 流（snapshot 应被 history 替换路径跳过）
   if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty());
@@ -2139,6 +2154,286 @@ async function main(){
     state.sidebar.filter = saveWs.filter; state.sidebar.showAllWs = saveWs.showAll; state.sidebar.expanded = saveWs.expanded;
     state.renameActive = false;
     sessionsData = saveWs.dataA; sessionsDataB = saveWs.dataB;
+
+    // =====================================================================
+    // 16) 删除 review 修复验证：后台删除（不切换/不重置视图 + 聚合列表同步
+    //     移除被删服务器会话）、confirm 取消、在途轮询写回守卫、首/中/末
+    //     active 删除回退。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSidebarTree(true);
+    let delSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("ws-del on both group headers",
+        delSec.length === 2
+        && delSec[0].querySelector(".ws-del") !== null
+        && delSec[1].querySelector(".ws-del") !== null,
+        "n=" + delSec.length);
+    // confirm 取消：点 B 的 × 但取消 → 不删除、不切换、列表/侧边栏原样
+    globalThis.confirm = () => false; window.confirm = () => false;
+    delSec[1].querySelector(".ws-del")._listeners["click"][0]({ stopPropagation(){} });
+    globalThis.confirm = () => true; window.confirm = () => true;
+    chk("ws-del cancel keeps workspace and list",
+        state.workspaces.length === 2 && state.workspace.id === "wsA"
+        && state.workspaceLists["wsB"] !== undefined
+        && elsById["sessionList"].textContent.includes("b1"),
+        "n=" + state.workspaces.length + " ws=" + state.workspace.id
+        + " listHasB=" + elsById["sessionList"].textContent.includes("b1"));
+    // 后台删除不重置视图：chat 视图下删 B → 仍停留 A 的 a1
+    openSessionIn("wsA", "a1");
+    await flush();
+    await flush();
+    chk("ws-del bg delete setup: chat on a1",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    renderSidebarTree(true);
+    delSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    delSec[1].querySelector(".ws-del")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("ws-del bg delete in chat keeps view/session",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat"
+        && state.workspaces.length === 1,
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view
+        + " n=" + state.workspaces.length);
+    renderSidebarTree(true);
+    chk("ws-del bg delete removes B group from sidebar",
+        elsById["sidebarTree"].querySelectorAll(".tree-ws-section").length === 1
+        && !elsById["sidebarTree"].textContent.includes("服务器B"),
+        "txt=" + elsById["sidebarTree"].textContent.slice(0, 60));
+    // 后台删除 + 聚合列表：list 视图下删 B → 聚合列表同步移除 B 的会话
+    //（review 发现 1：旧 DOM 不再残留被删服务器的行）
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSessionList();
+    chk("ws-del bg delete setup: B row in aggregate list",
+        elsById["sessionList"].textContent.includes("b1"),
+        "list=" + elsById["sessionList"].textContent.slice(0, 60));
+    renderSidebarTree(true);
+    delSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    delSec[1].querySelector(".ws-del")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("ws-del bg delete in list: stays on A, view unchanged",
+        state.workspace.id === "wsA" && state.view === "list" && state.workspaces.length === 1,
+        "ws=" + state.workspace.id + " view=" + state.view + " n=" + state.workspaces.length);
+    chk("ws-del bg delete in list: B cache cleared",
+        state.workspaceLists["wsB"] === undefined && state.workspaceErrors["wsB"] === undefined,
+        "lists=" + String(state.workspaceLists["wsB"] !== undefined)
+        + " errs=" + String(state.workspaceErrors["wsB"] !== undefined));
+    chk("ws-del bg delete in list: B rows gone from aggregate list",
+        !elsById["sessionList"].textContent.includes("b1")
+        && elsById["sessionList"].textContent.includes("a1"),
+        "list=" + elsById["sessionList"].textContent.slice(0, 60));
+    // 在途轮询写回守卫：B 的 GET /api/sessions 挂起期间删除 B → 延迟响应
+    // 到达后不得写回 workspaceLists/workspaceErrors（review 发现 2）
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    bGetDelayed = true;
+    bGetResolve = null;
+    pollWorkspaceSessions(state.workspaces[1]);   // B 的 GET 挂起（不 await）
+    await flush();
+    chk("ws-del in-flight poll: B GET pending",
+        bGetResolve !== null && state.workspaceLists["wsB"] === undefined,
+        "pending=" + (bGetResolve !== null));
+    removeWorkspace(state.workspaces[1]);         // 在途期间后台删除 B
+    await flush();
+    bGetResolve(resp(200, sessionsDataB));        // 延迟响应此刻才到达
+    await flush();
+    await flush();
+    chk("ws-del in-flight poll: stale GET does not resurrect B",
+        !state.workspaces.some((w) => w.id === "wsB")
+        && state.workspaceLists["wsB"] === undefined
+        && state.workspaceErrors["wsB"] === undefined,
+        "hasB=" + state.workspaces.some((w) => w.id === "wsB")
+        + " lists=" + String(state.workspaceLists["wsB"] !== undefined)
+        + " errs=" + String(state.workspaceErrors["wsB"] !== undefined));
+    bGetDelayed = false;
+    bGetResolve = null;
+    // 首/中/末 active 删除回退：idx=0 → 后一个；其余 → 前一个
+    const mkWs = (id, name) => ({ id, name, url: "", token: "tok-" + id });
+    state.workspaces = [mkWs("w1", "一"), mkWs("w2", "二"), mkWs("w3", "三")];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-w1";
+    state.workspaceLists = {}; state.workspaceErrors = {};
+    state.lastList = []; state.sessionId = null; state.view = "list";
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    removeActiveWorkspace();
+    await flush();
+    chk("ws-del delete first active falls to next",
+        state.workspaces.length === 2 && state.workspace.id === "w2",
+        "n=" + state.workspaces.length + " ws=" + state.workspace.id);
+    state.workspaces = [mkWs("w1", "一"), mkWs("w2", "二"), mkWs("w3", "三")];
+    state.workspace = state.workspaces[1];
+    state.token = "tok-w2";
+    state.workspaceLists = {}; state.workspaceErrors = {};
+    state.lastList = []; state.sessionId = null; state.view = "list";
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    removeActiveWorkspace();
+    await flush();
+    chk("ws-del delete middle active falls to previous",
+        state.workspaces.length === 2 && state.workspace.id === "w1",
+        "n=" + state.workspaces.length + " ws=" + state.workspace.id);
+    state.workspaces = [mkWs("w1", "一"), mkWs("w2", "二"), mkWs("w3", "三")];
+    state.workspace = state.workspaces[2];
+    state.token = "tok-w3";
+    state.workspaceLists = {}; state.workspaceErrors = {};
+    state.lastList = []; state.sessionId = null; state.view = "list";
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    removeActiveWorkspace();
+    await flush();
+    chk("ws-del delete last active falls to previous",
+        state.workspaces.length === 2 && state.workspace.id === "w2",
+        "n=" + state.workspaces.length + " ws=" + state.workspace.id);
+
+    // =====================================================================
+    // 17) 侧边栏组头「+」新建 session（B 任务）：每个分组头都有 +；点击 →
+    //     对该 workspace POST /api/sessions（body {}）→ 切到该 workspace 并
+    //     打开新会话；激活 workspace 直接打开不切换；失败 → banner。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSidebarTree(true);
+    let addSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const addA = addSec[0].querySelector(".ws-add");
+    const addB = addSec[1].querySelector(".ws-add");
+    chk("ws-add button on every group header",
+        addA !== null && addB !== null && addA.textContent === "+" && addB.textContent === "+",
+        "a=" + (addA ? addA.textContent : "none") + " b=" + (addB ? addB.textContent : "none"));
+    // 点 B 组头的 +：POST http://b.local/api/sessions body {} → 切到 B 打开 b-new
+    const fetchBeforeAddB = FETCHES.length;
+    let addStopped = false;
+    addB._listeners["click"][0]({ stopPropagation(){ addStopped = true; } });
+    await flush();
+    await flush();
+    await flush();
+    await flush();
+    chk("ws-add click stops header propagation",
+        addStopped === true, "stopped=" + addStopped);
+    chk("ws-add posts to target workspace",
+        FETCHES.slice(fetchBeforeAddB).includes("http://b.local/api/sessions"),
+        "new=" + JSON.stringify(FETCHES.slice(fetchBeforeAddB)));
+    chk("ws-add switches to target workspace and opens new session",
+        state.workspace.id === "wsB" && state.sessionId === "b-new" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    // 激活 workspace（A）的组头 +：不切换，直接打开新会话
+    switchWorkspace("wsA");
+    await flush();
+    renderSidebarTree(true);
+    addSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const fetchBeforeAddA = FETCHES.length;
+    addSec[0].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    await flush();
+    await flush();
+    await flush();
+    chk("ws-add on active workspace opens without switch",
+        state.workspace.id === "wsA" && state.sessionId === "sess-new" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    chk("ws-add on active posts to same-origin",
+        FETCHES.slice(fetchBeforeAddA).includes("/api/sessions"),
+        "new=" + JSON.stringify(FETCHES.slice(fetchBeforeAddA)));
+    // 失败路径：B 的 + 返回 500 → banner 报错、不切换、不打开
+    switchWorkspace("wsB");     // 当前在 wsA chat（刚打开 sess-new）→ 切到 B 回列表
+    await flush();
+    sessionsBCreateFail = true;
+    renderSidebarTree(true);
+    addSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    addSec[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    await flush();
+    chk("ws-add failure: banner error, no switch",
+        elsById["banner"].hidden === false
+        && elsById["bannerText"].textContent.includes("创建会话失败")
+        && state.workspace.id === "wsB" && state.view === "list" && state.sessionId === null,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " ws=" + state.workspace.id + " view=" + state.view);
+    sessionsBCreateFail = false;
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);

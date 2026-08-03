@@ -126,6 +126,10 @@ async function pollWorkspaceSessions(ws) {
       setBanner("⚠ 无法连接服务器（网络错误）。", true);
     }
   }
+  // 在途请求守卫：请求发出后 workspace 被删除（removeWorkspace）→ 直接丢弃，
+  // 绝不写回已删 workspace 的缓存/错误标记，也不重绘（聚合视图已随删除重绘，
+  // 写回会让被删服务器"复活"在侧边栏/列表里；review 发现 2）。
+  if (!state.workspaces.includes(ws)) return;
   if (list) {
     state.workspaceLists[ws.id] = list;
     state.workspaceErrors[ws.id] = null;
@@ -368,6 +372,31 @@ async function createSession() {
     setBanner("⚠ 创建会话失败：" + e.message);
   } finally {
     els.newSessionBtn.disabled = false;
+  }
+}
+
+/* 在指定 workspace 新建会话（侧边栏组头「+」按钮；区别于 createSession 的
+   激活 workspace + initial_prompt 路径）：无 initial_prompt，请求打到目标
+   workspace（apiFor(ws) 而非 api()）；成功后把新会话 meta 塞进该 workspace
+   的列表缓存（与 createSession 对 lastList 的处理一致；背景 workspace 的
+   缓存 = workspaceLists[ws.id]，switchWorkspace 会把它接为 lastList，composer
+   meta 立即可用），再走跨 workspace 打开模式（openSessionIn：非激活先切）。 */
+async function createSessionIn(ws) {
+  if (!workspaceToken(ws)) { setBanner("⚠ 请先输入 Token。", true); return; }
+  try {
+    const res = await apiFor(ws, "/api/sessions", { method: "POST", body: JSON.stringify({}) });
+    if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
+    if (res.status !== 201) throw new Error("HTTP " + res.status);
+    const s = await res.json();
+    const wl = workspaceListFor(ws);
+    if (Array.isArray(wl)) {
+      const i = wl.findIndex((x) => x.id === s.id);
+      if (i >= 0) wl.splice(i, 1);
+      wl.push(s);
+    }
+    await openSessionIn(ws.id, s.id);
+  } catch (e) {
+    setBanner("⚠ 创建会话失败：" + e.message);
   }
 }
 
@@ -1302,6 +1331,15 @@ function renderSidebarTree(force) {
       header.appendChild(el("span", "ws-cur", "当前"));
       sec.classList.add("active");
     }
+    // 组头「+」：在该 workspace 新建会话（无 initial_prompt；请求打到该
+    // workspace 而非激活的——聚合模式下「在某台服务器上新建」必须打给那台）。
+    const addBtn = el("button", "ws-add", "+");
+    addBtn.title = "在 " + (ws.name || ws.url) + " 新建会话";
+    addBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();                 // 不触发组头切换
+      createSessionIn(ws);
+    });
+    header.appendChild(addBtn);
     if (state.workspaces.length > 1) {
       // 组头删除按钮：出错/无法连接的服务器也能在侧边栏直接移除
       //（顶部 × 只删当前激活的，切不过去就删不掉——这是它的逃生口）。
