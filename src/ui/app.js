@@ -42,6 +42,7 @@ const state = {
   status: "Idle",
   initSource: null,          // "history" | "snapshot" | null —— 初始渲染来源
   pollTimer: null,
+  pollGen: 0,              // 轮询代次：stopPolling 递增，使在途轮询的续调度失效
   lastValidateSig: null,     // 上一轮校验问题签名（相同则不再刷 banner）
   validateBannerUp: false,   // 当前 banner 是否由校验提示占用（恢复数据后只清自己的）
   sse: { ctrl: null, retryTimer: null, stopped: false },
@@ -292,6 +293,8 @@ async function switchWorkspace(id, epoch) {
   state.tasks.streamText = new Map();
   state.tasks.degraded = new Set();
   state.tasks.composerOpen = false;
+  lastTasksSig = "";              // 任务面板签名跟随 workspace 重置（DOM 已清空）
+  lastTasksRenderedSig = "";
   state.sidebar.expanded = new Set();
   state.sidebar.filter = "";
   state.sidebar.showAllWs = new Set();
@@ -332,7 +335,7 @@ async function switchWorkspace(id, epoch) {
   renderSidebarTree(true);
   // ---- 重跑启动加载序列（与 init() 的加载部分一致） ----
   startPolling();
-  pollAllWorkspaces();
+  pollSessions();   // 立即轮询经 runPollRound 与定时轮询共用 in-flight 守卫
   startTasksPolling();
   pollTasks();
 }

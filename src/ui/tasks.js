@@ -66,17 +66,36 @@ function tasksListSig(list) {
 
 let lastTasksSig = "";
 
+/* 渲染签名：数据签名 + 降级行的静态输出。普通行的 output 由 500ms output
+   轮询 / delegate SSE 实时刷新，计入签名只会每轮重建卡片（排除）；但降级行
+   （旧后端 output 端点 404，重绘不再重启轮询）的文本 = /api/tasks 尾部
+   output 快照，变化必须触发 renderTaskList 的保留行就地更新。 */
+function tasksRenderSig(list) {
+  const base = tasksListSig(list);
+  const degradedOut = [];
+  for (const t of list || []) {
+    if (state.tasks.degraded.has(taskKey(t))) {
+      degradedOut.push([taskKey(t), String(t.output != null ? t.output : "")]);
+    }
+  }
+  return base + "|d" + JSON.stringify(degradedOut);
+}
+
+/* 已渲染签名：只在 renderTaskList 实际完成后更新（与 lastTasksSig 分开——
+   收起期间数据变化时，重开必须按「数据 ≠ 已渲染 DOM」重建，不能跳过）。 */
+let lastTasksRenderedSig = "";
+
 /* composer 上方折叠条 + 面板：计数即徽标；有任务时高亮，无任务整条隐藏。
-   面板内容仅在展开时渲染（收起时只更新计数/箭头/高亮）。
-   元数据签名去重：列表未变且面板已渲染 → 跳过 renderTaskList，保留已展开
-   的卡片 DOM 与进行中的 output 轮询/SSE 流（2s 轮询不再每轮销毁重建）。 */
+   面板内容仅在展开时渲染（收起时只更新计数/箭头/高亮，不触碰 DOM）。
+   签名去重：数据未变且面板已渲染 → 跳过 renderTaskList，保留已展开的卡片
+   DOM 与进行中的 output 轮询/SSE 流（2s 轮询不再每轮销毁重建）。 */
 function renderComposerTasks() {
   const bar = els.tasksToggleBar;
   if (!bar) return;
   const panel = els.composerTasks;
   const list = state.tasks.list || [];
   const n = list.length;
-  const sig = tasksListSig(list);
+  const sig = tasksRenderSig(list);
   bar.hidden = n === 0;
   bar.classList.toggle("active", n > 0);
   // 任务清空时整个组件（折叠条+面板）完全消失：强制收起面板，避免
@@ -87,6 +106,7 @@ function renderComposerTasks() {
     for (const k of [...state.tasks.pollers.keys()]) stopTaskPoller(k);
     for (const k of [...state.tasks.streams.keys()]) stopTaskStream(k);
     if (panel) panel.innerHTML = "";
+    lastTasksRenderedSig = sig;   // DOM 已清空：与空列表一致
   }
   bar.classList.toggle("open", state.tasks.composerOpen);
   const label = bar.querySelector(".tasks-toggle-label");
@@ -94,13 +114,17 @@ function renderComposerTasks() {
   if (panel) {
     panel.hidden = !state.tasks.composerOpen;
     if (state.tasks.composerOpen) {
+      // 数据签名与已渲染签名分开：收起期间数据变化 → 重开时 sig ≠ 已渲染
+      // 签名 → 重建（不显示旧行/旧闭包）；数据未变 → 跳过（DOM 仍最新）。
+      // !rendered 兜底 DOM 被外部清空（switchWorkspace 等）但签名未变的场景。
       const rendered = panel.querySelectorAll(".task-row").length > 0;
-      if (sig !== lastTasksSig || !rendered) {
+      if (sig !== lastTasksRenderedSig || sig !== lastTasksSig || !rendered) {
         lastTasksSig = sig;
+        lastTasksRenderedSig = sig;
         renderTaskList(list, panel);
       }
     } else {
-      lastTasksSig = sig;   // 收起时也记录签名：重新打开且数据未变 → 跳过重建
+      lastTasksSig = sig;   // 收起：只记录 data 签名，不更新已渲染签名
     }
   }
 }
@@ -355,7 +379,15 @@ function renderTaskList(tasks, container) {
     let row = byKey.get(key) || null;
     if (row) byKey.delete(key);
     if (row && row.getAttribute("data-key-sig") === sig) {
-      prev = row;   // 元数据未变：保留原行（展开态/轮询/流原样）
+      // 元数据未变：保留原行（展开态/轮询/流原样），但按当前锚点移动——
+      // DOM 行序必须跟随 tasks 数组顺序（复用节点 move，不重建）
+      const anchor = prev ? prev.nextSibling : list.firstChild;
+      if (row !== anchor) {
+        if (anchor) list.insertBefore(row, anchor);
+        else list.appendChild(row);
+      }
+      updateRetainedTaskRow(row, t, key);   // 静态输出就地更新（不重建）
+      prev = row;
       continue;
     }
     if (row) {      // 元数据变了：停旧轮询/流后重建该行
@@ -374,6 +406,22 @@ function renderTaskList(tasks, container) {
     stopTaskStream(key);
     row.remove();
   }
+}
+
+/* 保留行的就地更新（元数据未变时重建会打断展开态/轮询/流，这里只补静态
+   输出）：旧后端 output 端点 404（降级）时行文本 = 建行时的 t.output 快照，
+   之后 /api/tasks 尾部 output 变化不再可见——对处于「无活跃轮询」静态状态
+   （折叠/降级）的行用新 t.output 更新 .task-output 文本；有活跃轮询的行
+   文本由 500ms output 轮询实时刷新，跳过以免闪断。delegate 行走 SSE 流，
+   无静态输出。 */
+function updateRetainedTaskRow(row, t, key) {
+  if (t.kind === "delegate") return;
+  const pre = row.querySelector(".task-output");
+  if (!pre) return;
+  if (state.tasks.pollers.has(key)) return;
+  const out = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
+  pre.classList.toggle("empty", out === "");
+  pre.textContent = out || "(无输出)";
 }
 
 /* 单个任务卡片行（keyed 更新用）：data-task = key、data-key-sig = 元数据

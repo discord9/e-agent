@@ -59,6 +59,21 @@ function applyValidation(problems) {
   }
 }
 
+/* 轮询请求超时：任一 workspace 请求永久 pending 会卡住整轮（渲染/深链/
+   校验/后续调度全部停摆）。每个请求挂 AbortController + 10s 超时，超时
+   按失败处理（保留旧列表 stale，标记 workspaceErrors）。 */
+const POLL_TIMEOUT_MS = 10000;
+
+async function fetchWithTimeout(ws, path, opts = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), POLL_TIMEOUT_MS);
+  try {
+    return await apiFor(ws, path, Object.assign({}, opts, { signal: ctrl.signal }));
+  } finally {
+    clearTimeout(timer);   // 请求先完成：撤掉超时定时器（防迟到 abort）
+  }
+}
+
 async function pollAllWorkspaces() {
   const wss = (state.workspaces || []).slice();
   await Promise.allSettled(wss.map((ws) => pollWorkspaceSessions(ws)));
@@ -85,9 +100,10 @@ function afterPollRound() {
 }
 
 /* 兼容别名：既有调用点（switchWorkspace/backToList/restartTransport/init）
-   语义不变——现在等于聚合轮询全部 workspace。 */
+   语义不变——现在等于聚合轮询全部 workspace；经 runPollRound 与定时轮询
+   （setTimeout 链）共用同一个 in-flight 守卫，同一时刻只有一轮在途。 */
 function pollSessions() {
-  return pollAllWorkspaces();
+  return runPollRound();
 }
 
 /* 拉取单个 workspace 的会话列表（只更新缓存，不渲染）：
@@ -102,7 +118,7 @@ async function pollWorkspaceSessions(ws) {
   let list = null;
   let err = null;
   try {
-    const res = await apiFor(ws, "/api/sessions");
+    const res = await fetchWithTimeout(ws, "/api/sessions");
     if (res.status === 401 || res.status === 403) {
       err = "auth";
       if (ws === state.workspace && state.view === "list") setBanner("⚠ 认证失败：请检查 Token。");
@@ -140,7 +156,8 @@ async function pollWorkspaceSessions(ws) {
       }
     }
   } catch (e) {
-    err = "network";
+    // 超时（AbortError）按失败处理：保留旧列表 stale、标记错误，不弹 banner
+    err = (e && e.name === "AbortError") ? "timeout" : "network";
     if (ws === state.workspace && state.view === "list"
         && (!navigator.onLine || e instanceof TypeError)) {
       setBanner("⚠ 无法连接服务器（网络错误）。", true);
@@ -215,7 +232,7 @@ function sessionListSig() {
     parts.push(ws.id + ":" + (ws === state.workspace ? 1 : 0) + ":"
       + JSON.stringify(list.map((s) => [
         s.id, s.title || "", s.model || "", s.status, s.busy ? 1 : 0,
-        s.active === false ? 0 : 1, s.entry_count ?? 0,
+        s.active === false ? 0 : 1, s.entry_count ?? null,
         s.parent_session_id || "", s.pinned === true ? 1 : 0, s.created_at || "",
       ])));
   }
@@ -1170,7 +1187,11 @@ function restartTransport() {
 
 /* 聚合轮询：setTimeout 链（2s）驱动所有 workspace——一轮（并行拉取全部 +
    Promise.allSettled）完成才调度下一轮，天然防重入：慢响应不叠加、不并发
-   轰炸。stopPolling 或条件不满足（聊天视图 + 侧边栏关闭）时不再续调度。 */
+   轰炸。stopPolling 或条件不满足（聊天视图 + 侧边栏关闭）时不再续调度。
+   立即轮询（pollSessions：backToList/restartTransport/switchWorkspace/
+   refreshSessionsForSidebar/init 的即时刷新）与定时轮询共用同一个 in-flight
+   守卫（runPollRound 串行链）：在途轮询未完成时，新请求不并发叠加——把
+   「新鲜一轮」排队到在途轮询之后，多个并发请求合并为同一轮。 */
 const POLL_INTERVAL_MS = 2000;
 
 /* 聊天视图 + 侧边栏关闭 → 停聚合轮询（避免与 SSE 并行轰炸）；
@@ -1180,20 +1201,57 @@ function shouldPollSessions() {
   return state.view !== "chat" || state.sidebar.open;
 }
 
+/* 单一 in-flight 守卫（promise 串行链）：同一时刻只有一轮轮询在途。
+   无在途轮询 → 立即启动一轮；有在途轮询 → 把「新鲜一轮」排队到其后
+   （调用方要的是当下数据，不能共享一个可能已过时的在途轮询），多个并发
+   请求合并为同一轮（pollRoundQueued 复用）。 */
+let pollRoundInFlight = null;   // 当前在途轮询的 Promise
+let pollRoundQueued = null;     // 已排队的「新鲜一轮」Promise（在途结束后立即跑）
+
+function runPollRound() {
+  if (pollRoundInFlight) {
+    if (!pollRoundQueued) {
+      pollRoundQueued = pollRoundInFlight.then(startPollRound, startPollRound);
+    }
+    return pollRoundQueued;
+  }
+  return startPollRound();
+}
+
+function startPollRound() {
+  pollRoundQueued = null;
+  pollRoundInFlight = (async () => {
+    try {
+      await pollAllWorkspaces();
+    } catch (e) {
+      // 一轮内的渲染/校验异常（afterPollRound 抛错等）不外泄：轮询链继续，
+      // 不产生未处理 rejection（断链防护在 pollRound 的 finally 兜底）
+    } finally {
+      pollRoundInFlight = null;
+    }
+  })();
+  return pollRoundInFlight;
+}
+
 function startPolling() {
   stopPolling();
   state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
 }
 function stopPolling() {
+  state.pollGen++;   // 使在途轮询的 finally 续调度失效（stop 后不再续）
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
 }
 async function pollRound() {
+  const gen = state.pollGen;
   state.pollTimer = null;
-  await pollAllWorkspaces();
-  // 一轮完成后再调度下一轮；期间 stopPolling（state.pollTimer 被清空/换新）
-  // 或条件不满足（聊天视图关侧边栏）→ 不续调度
-  if (state.pollTimer === null && shouldPollSessions()) {
-    state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
+  try {
+    await runPollRound();
+  } finally {
+    // 无论成功/异常都续调度下一轮——防断链；期间 stopPolling（gen 变化）
+    // 或条件不满足（聊天视图关侧边栏）→ 不续调度
+    if (gen === state.pollGen && state.pollTimer === null && shouldPollSessions()) {
+      state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
+    }
   }
 }
 /* delegate 任务 → 对应 subagent 会话 id。
@@ -1253,10 +1311,12 @@ function closeSidebar() {
 
 /* 聊天视图下补拉会话列表（聚合：一次拉全所有 workspace，侧边栏分组刷新；
    背景服务器失败只标记、不打断激活服务器）。失败静默保留旧数据。整轮
-   完成后 afterPollRound 统一做聊天视图的同步（composer meta / 返回按钮）。 */
+   完成后 afterPollRound 统一做聊天视图的同步（composer meta / 返回按钮）。
+   经 runPollRound 与定时轮询共用 in-flight 守卫：在途轮询未完成时共享
+   同一轮，不并发叠加。 */
 async function refreshSessionsForSidebar() {
   if (!state.token) return;
-  await pollAllWorkspaces();
+  await runPollRound();
 }
 /* =====================================================================
  * 会话侧边栏：会话树
@@ -1278,7 +1338,9 @@ const MAX_TREE_ROOTS = 8;   // 每个 workspace 分组内默认只显示最近 8
 let lastTreeSig = "";
 
 /* 聚合树签名：所有 workspace 的列表（激活 = lastList，背景 = 各自缓存）+
-   激活标记 + 错误标记 + 当前会话 id。任一变化 → 重绘（保留展开/滚动状态）。 */
+   激活标记 + 错误标记 + 当前会话 id + 树行渲染字段（含 model——树行
+   tooltip 渲染 model，缺了它 model 变化不会触发重绘）。任一变化 → 重绘
+   （保留展开/滚动状态）。 */
 function sidebarTreeSig() {
   const parts = [];
   for (const ws of state.workspaces) {
@@ -1288,7 +1350,7 @@ function sidebarTreeSig() {
       + (state.sidebar.showAllWs.has(ws.id) ? 1 : 0) + ":"
       + JSON.stringify(list.map((s) => [
         s.id, s.title || "", s.label || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
-        s.entry_count ?? 0, s.parent_session_id || "", s.pinned === true ? 1 : 0,
+        s.entry_count ?? 0, s.parent_session_id || "", s.pinned === true ? 1 : 0, s.model || "",
       ])));
   }
   return state.sessionId + "|" + parts.join("|");

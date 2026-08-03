@@ -279,6 +279,10 @@ let taskOutputText = "";
 // perf 回归测试：output 端点延迟（手动 resolve）——验证 500ms 轮询防重入
 let taskOutputDelayed = false;
 let taskOutputResolve = null;
+// 旧后端降级测试：output 端点 404（静态输出兜底）
+let taskOutput404 = false;
+// 轮询超时测试：workspace 轮询请求是否带了 AbortSignal
+let pollSignalSeen = false;
 // 会话列表响应（测试中可变）：默认 s1；Bug C 测试会替换成含 subagent 的列表
 let sessionsData = [{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}];
 // 聚合模式：第二台服务器（url "http://b.local"）的独立列表 + 故障开关
@@ -314,10 +318,14 @@ globalThis.fetch=(url,opts={})=>{
   const m=(opts.method||"GET").toUpperCase();
   if(url==="/api/tasks") return resp(200, tasksData);
   if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output")) {
+    if (taskOutput404) return resp(404, {});
     if (taskOutputDelayed) return new Promise((resolve) => { taskOutputResolve = resolve; });
     return resp(200, taskOutputText);
   }
-  if(url==="/api/sessions"&&m==="GET") return resp(200, sessionsData);
+  if(url==="/api/sessions"&&m==="GET") {
+    if (opts && opts.signal) pollSignalSeen = true;
+    return resp(200, sessionsData);
+  }
   // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
   if(url==="http://b.local/api/sessions"&&m==="GET") {
     if (sessionsPDelayed) return new Promise((resolve) => { sessionsPResolve = resolve; });
@@ -2199,6 +2207,229 @@ async function main(){
     chk("perf output poller cleaned on collapse",
         !state.tasks.pollers.has("s1:400"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+
+    // =====================================================================
+    // Issue 1 (高): 轮询重入 + 永久阻塞 + 异常断链
+    //   - 立即轮询与定时轮询共用 in-flight 守卫（同一时刻只有一轮）
+    //   - 每个 workspace 请求带 AbortController + 10s 超时（超时按失败处理）
+    //   - pollRound 的 finally 保证异常后仍续调度（防断链）
+    // =====================================================================
+    sessionsData = [{ id: "g1", status: "Idle", title: "G 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    sessionsDataB = [{ id: "g2", status: "Busy", title: "G2 会话", created_at: "2024-02-02T00:00:00Z", entry_count: 2, busy: true, active: true }];
+    sessionsBFail = false;
+    sessionsBFormat = false;
+    state.workspaces = [
+      { id: "wsG1", name: "服务器G1", url: "", token: "tok-g1" },
+      { id: "wsG2", name: "服务器G2", url: "http://b.local", token: "tok-g2" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-g1";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    elsById["sidebar"].hidden = false;
+    renderWorkspaceSelect();
+    renderSessionListCalls = 0;
+    renderSidebarTreeCalls = 0;
+    stopPolling();
+    chk("perf poll timeout constant is 10s", POLL_TIMEOUT_MS === 10000,
+        "=" + POLL_TIMEOUT_MS);
+    // 慢响应在途时连续两次立即轮询 → 不并发叠加：第一次启动在途轮询，
+    // 第二次排队一轮新鲜的（合并为同一轮）；在途轮询完成后才补跑
+    sessionsPDelayed = true;
+    sessionsPResolve = null;
+    const i1f = FETCHES.filter((u) => u === "/api/sessions").length;
+    const i1t = scheduledTimeouts.length;
+    const i1p1 = pollSessions();
+    const i1p2 = pollSessions();   // 立即轮询：必须排队（不并发），合并为同一轮
+    await flush();
+    chk("perf immediate polls no concurrent round",
+        FETCHES.filter((u) => u === "/api/sessions").length === i1f + 1,
+        "delta=" + (FETCHES.filter((u) => u === "/api/sessions").length - i1f));
+    chk("perf workspace poll arms abort timeout",
+        scheduledTimeouts.length === i1t + 2,   // 两个 workspace 各一个 abort 定时器
+        "delta=" + (scheduledTimeouts.length - i1t));
+    chk("perf in-flight round not rendered yet", renderSessionListCalls === 0,
+        "calls=" + renderSessionListCalls);
+    sessionsPResolve(resp(200, sessionsDataB));   // 在途轮询完成
+    await flush();
+    chk("perf shared round renders once after settle", renderSessionListCalls === 1,
+        "calls=" + renderSessionListCalls);
+    chk("perf workspace poll uses abort signal", pollSignalSeen === true,
+        "seen=" + pollSignalSeen);
+    sessionsPResolve(resp(200, sessionsDataB));   // 排队补跑的新鲜一轮（串行）
+    await Promise.all([i1p1, i1p2]);
+    await flush();
+    chk("perf queued fresh round renders after first", renderSessionListCalls === 2,
+        "calls=" + renderSessionListCalls);
+    sessionsPDelayed = false;
+    // afterPollRound 抛错 → pollRound 的 finally 仍续调度（不永久断链）
+    const i1apr = afterPollRound;
+    afterPollRound = function () { throw new Error("boom"); };
+    stopPolling();
+    const i1gen = state.pollGen;
+    const i1throw = pollRound();
+    await i1throw.catch(() => {});
+    await flush();
+    chk("perf poll round throw still reschedules",
+        state.pollTimer !== null && state.pollGen === i1gen,
+        "timer=" + String(state.pollTimer) + " gen=" + state.pollGen);
+    afterPollRound = i1apr;
+    stopPolling();
+
+    // =====================================================================
+    // Issue 2 (高): 任务面板收起期间数据变化 → 重开必须重建（不显示旧行/旧闭包）
+    // =====================================================================
+    state.tasks.composerOpen = true;
+    state.tasks.list = [];
+    lastTasksSig = "";
+    lastTasksRenderedSig = "";
+    tasksData = [{ session_id: "s1", id: 500, kind: "bash", label: "v1",
+      full_command: "v1", output: "", role: null }];
+    await pollTasks();
+    await flush();
+    const i2row = elsById["composerTasks"].querySelector(".task-row");
+    chk("issue2 panel renders open", i2row !== null && i2row.textContent.includes("v1"),
+        "text=" + (i2row ? i2row.textContent.slice(0, 30) : "none"));
+    state.tasks.composerOpen = false;   // 收起面板
+    renderComposerTasks();
+    chk("issue2 panel hidden when collapsed", elsById["composerTasks"].hidden === true,
+        "hidden=" + elsById["composerTasks"].hidden);
+    tasksData = [{ session_id: "s1", id: 500, kind: "bash", label: "v2",
+      full_command: "v2", output: "", role: null }];
+    await pollTasks();                  // 收起期间数据变化：只记录 data 签名，不碰 DOM
+    await flush();
+    chk("issue2 collapsed round leaves old DOM",
+        elsById["composerTasks"].querySelector(".task-row").textContent.includes("v1"),
+        "text=" + elsById["composerTasks"].querySelector(".task-row").textContent.slice(0, 30));
+    state.tasks.composerOpen = true;    // 重开：数据与已渲染 DOM 不符 → 重建
+    renderComposerTasks();
+    const i2row2 = elsById["composerTasks"].querySelector(".task-row");
+    chk("issue2 reopen rebuilds with new data",
+        i2row2 !== null && i2row2 !== i2row && i2row2.textContent.includes("v2")
+        && i2row2.getAttribute("data-key-sig") !== i2row.getAttribute("data-key-sig"),
+        "same=" + (i2row2 === i2row) + " text=" + (i2row2 ? i2row2.textContent.slice(0, 30) : "none"));
+
+    // =====================================================================
+    // Issue 3 (中): keyed 更新移动复用行——DOM 行序跟随 tasks 数组（纯重排不重建）
+    // =====================================================================
+    const i3panel = elsById["composerTasks"];
+    i3panel.innerHTML = "";
+    const i3task = (id, label) => ({ session_id: "s1", id, kind: "bash", label,
+      full_command: label, output: "", role: null });
+    renderTaskList([i3task(1, "A"), i3task(2, "B"), i3task(3, "C")], i3panel);
+    const i3rowA = i3panel.querySelectorAll(".task-row")[0];
+    const i3rowB = i3panel.querySelectorAll(".task-row")[1];
+    const i3rowC = i3panel.querySelectorAll(".task-row")[2];
+    chk("issue3 initial order",
+        [i3rowA, i3rowB, i3rowC].map((r) => r.getAttribute("data-task")).join(",") === "s1:1,s1:2,s1:3",
+        "order=" + [i3rowA, i3rowB, i3rowC].map((r) => r.getAttribute("data-task")).join(","));
+    renderTaskList([i3task(3, "C"), i3task(2, "B"), i3task(1, "A")], i3panel);   // 纯重排
+    const i3rows = i3panel.querySelectorAll(".task-row");
+    chk("issue3 reorder moves reused rows",
+        [...i3rows].map((r) => r.getAttribute("data-task")).join(",") === "s1:3,s1:2,s1:1",
+        "order=" + [...i3rows].map((r) => r.getAttribute("data-task")).join(","));
+    chk("issue3 reorder reuses nodes",
+        i3rows[0] === i3rowC && i3rows[1] === i3rowB && i3rows[2] === i3rowA,
+        "same=" + (i3rows[0] === i3rowC) + "," + (i3rows[1] === i3rowB) + "," + (i3rows[2] === i3rowA));
+
+    // =====================================================================
+    // Issue 4 (中): 旧后端静态输出兜底——output 端点 404（降级）时，/api/tasks
+    //   尾部 output 变化 → 保留行 .task-output 就地更新（不重建、不重启轮询）
+    // =====================================================================
+    i3panel.innerHTML = "";
+    state.tasks.composerOpen = true;
+    state.tasks.list = [];
+    state.tasks.degraded = new Set();
+    lastTasksSig = "";
+    lastTasksRenderedSig = "";
+    tasksData = [{ session_id: "s1", id: 600, kind: "bash", label: "degraded",
+      full_command: "degraded", output: "tail-old", role: null }];
+    taskOutput404 = true;
+    await pollTasks();
+    await flush();
+    const i4row = elsById["composerTasks"].querySelector(".task-row");
+    const i4pre = i4row.querySelector(".task-output");
+    i4row._listeners["click"][0]();   // 展开 → 启动轮询 → 404 → 降级静态
+    await flush();
+    chk("issue4 degraded on 404",
+        state.tasks.degraded.has("s1:600") && i4pre.hidden === false
+        && i4pre.textContent.includes("tail-old"),
+        "degraded=" + state.tasks.degraded.has("s1:600")
+        + " text=" + i4pre.textContent.slice(0, 20));
+    tasksData = [{ session_id: "s1", id: 600, kind: "bash", label: "degraded",
+      full_command: "degraded", output: "tail-new", role: null }];   // 元数据不变，仅 output 变
+    await pollTasks();   // 降级行的 output 计入渲染签名 → 触发保留行就地更新
+    await flush();
+    const i4row2 = elsById["composerTasks"].querySelector(".task-row");
+    chk("issue4 static output updated in place",
+        i4row2 === i4row && i4pre.textContent.includes("tail-new")
+        && !i4pre.textContent.includes("tail-old"),
+        "same=" + (i4row2 === i4row) + " text=" + i4pre.textContent.slice(0, 20));
+    chk("issue4 degraded row keeps degraded / poller not restarted",
+        state.tasks.degraded.has("s1:600") && !state.tasks.pollers.has("s1:600"),
+        "degraded=" + state.tasks.degraded.has("s1:600")
+        + " pollers=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    taskOutput404 = false;
+
+    // =====================================================================
+    // Issue 5 (低): 签名与渲染归一化完全一致
+    //   - 列表签名 entry_count 缺失 → null（页面显示 -，与 0 区分）
+    //   - 树签名含 model（树行 tooltip 渲染 model）
+    // =====================================================================
+    sessionsData = [{ id: "sig5a", status: "Idle", title: "Sig5",
+      created_at: "2024-01-01T00:00:00Z", busy: false, active: true }];   // entry_count 缺失
+    state.workspaces = [{ id: "ws5", name: "服务器5", url: "", token: "tok-5" }];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-5";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.view = "list";
+    state.sessionId = null;
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    elsById["sidebar"].hidden = false;
+    await pollAllWorkspaces();
+    await flush();
+    let smeta5 = elsById["sessionList"].querySelector(".smeta");
+    chk("issue5 entry_count missing shows dash",
+        smeta5.textContent.includes("- 条"),
+        "meta=" + JSON.stringify(smeta5.textContent.slice(-20)));
+    sessionsData = [{ id: "sig5a", status: "Idle", title: "Sig5",
+      created_at: "2024-01-01T00:00:00Z", entry_count: 0, busy: false, active: true }];   // 0 ≠ 缺失
+    await pollAllWorkspaces();   // 签名 null vs 0 → 必须重绘
+    await flush();
+    smeta5 = elsById["sessionList"].querySelector(".smeta");
+    chk("issue5 entry_count 0 re-renders as 0",
+        smeta5.textContent.includes("0 条") && !smeta5.textContent.includes("- 条"),
+        "meta=" + JSON.stringify(smeta5.textContent.slice(-20)));
+    // 树签名含 model：model 变化 → 树重绘 → tooltip 更新
+    sessionsData = [{ id: "sig5a", status: "Idle", title: "Sig5", model: "kimi",
+      created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    await pollAllWorkspaces();
+    await flush();
+    let trow5 = elsById["sidebarTree"].querySelector(".tree-row");
+    chk("issue5 tree tooltip shows model",
+        trow5.title.includes("· kimi"),
+        "title=" + JSON.stringify(trow5.title));
+    sessionsData = [{ id: "sig5a", status: "Idle", title: "Sig5", model: "gpt",
+      created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    await pollAllWorkspaces();   // 树签名含 model → 重绘
+    await flush();
+    trow5 = elsById["sidebarTree"].querySelector(".tree-row");
+    chk("issue5 tree model change re-renders tooltip",
+        trow5.title.includes("· gpt") && !trow5.title.includes("· kimi"),
+        "title=" + JSON.stringify(trow5.title));
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);
