@@ -42,6 +42,25 @@ mmlEqnNo}
   @supports (height: 100dvh) {
     html, body { height: var(--app-height, 100dvh); }
   }
+  /* 滚动条：Solarized Light 细滚动条，替代浏览器原生粗条（侧边栏、消息
+     列表、列表视图、pre/tool 结果等所有滚动容器统一风格）。
+     - webkit (Chrome/Edge/Safari)：8px 宽、圆角、thumb 用 base1（hover
+       base0 / active base01），track 透明——不抢内容视觉
+     - Firefox：scrollbar-width: thin + scrollbar-color 同色
+     容器自身已设 overflow-y:auto 时才会出现滚动条；此处只定义外观。 */
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: var(--base1);
+    border-radius: 4px;
+  }
+  *::-webkit-scrollbar-thumb:hover { background: var(--base0); }
+  *::-webkit-scrollbar-thumb:active { background: var(--base01); }
+  *::-webkit-scrollbar-corner { background: transparent; }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--base1) transparent;
+  }
   body {
     overflow: hidden;
     overscroll-behavior: none;
