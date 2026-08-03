@@ -326,6 +326,49 @@ async fn retries_once_after_a_send_failure() {
     assert_eq!(message.content.as_deref(), Some("recovered"));
 }
 
+#[tokio::test]
+async fn transient_connect_errors_are_retried_then_fail_with_context() {
+    // A port with no listener: every attempt fails with ECONNREFUSED, which
+    // reqwest reports as an is_connect() error (same family as the
+    // "tls handshake eof" users hit). The chat-wire loop must exhaust all 6
+    // attempts (shared with the codex wire) before the error surfaces.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "test-model".into(),
+        None,
+        false,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+    // 6 attempts => the sum of all retry backoffs (tests run with a 50ms
+    // base, so 50+100+200+400+800ms); this proves all retries ran.
+    let expected_sleep: u64 = (1..CONNECT_RETRY_ATTEMPTS)
+        .map(|attempt| retry_backoff_ms(CONNECT_RETRY_BASE_BACKOFF_MS, attempt))
+        .sum();
+    assert!(
+        started.elapsed() >= Duration::from_millis(expected_sleep),
+        "expected at least {expected_sleep}ms of backoff"
+    );
+    let text = format!("{error:#}");
+    assert!(text.contains("provider request failed"), "{text}");
+}
+
 struct FailingTool;
 
 #[async_trait::async_trait]

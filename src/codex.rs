@@ -14,6 +14,26 @@ use crate::codex_auth::CodexAuth;
 
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
+/// Shared transient connect/timeout retry policy for model requests (both the
+/// codex wire here and the chat wire in src/model.rs). 6 attempts with
+/// exponential backoff `base * 2^(attempt-1)` — in production 0.5/1/2/4/8s, a
+/// ~15.5s recovery window — so multi-second network jitter (e.g. "tls handshake
+/// eof") self-heals before a turn fails. Only errors where no bytes were
+/// exchanged qualify (`is_timeout() || is_connect()`); HTTP status errors are
+/// left to the callers (401 refresh, 403 retry in the chat wire).
+pub(crate) const CONNECT_RETRY_ATTEMPTS: u32 = 6;
+#[cfg(not(test))]
+pub(crate) const CONNECT_RETRY_BASE_BACKOFF_MS: u64 = 500;
+/// Tests scale the base down (50ms) so exhaustive-retry tests stay fast while
+/// still exercising the attempt count and the exponential doubling schedule.
+#[cfg(test)]
+pub(crate) const CONNECT_RETRY_BASE_BACKOFF_MS: u64 = 50;
+
+/// Exponential backoff before retry `attempt` (1-based): `base * 2^(attempt-1)`.
+pub(crate) fn retry_backoff_ms(base_ms: u64, attempt: u32) -> u64 {
+    base_ms * 2u64.pow(attempt - 1)
+}
+
 #[derive(Clone)]
 pub struct CodexModel {
     client: reqwest::Client,
@@ -82,10 +102,11 @@ impl CodexModel {
         };
         // Transient connectivity hiccups (e.g. "tls handshake eof") recover on
         // retry; only connection/timeout errors qualify, HTTP status errors are
-        // handled by the caller (401 refresh). Mirrors src/model.rs's chat-wire
-        // retry with a couple more attempts.
+        // handled by the caller (401 refresh). 6 attempts with exponential
+        // backoff (0.5s/1s/2s/4s/8s, ~15.5s window) so network jitter lasting
+        // tens of seconds self-heals; shared with src/model.rs's chat wire.
         let mut last_error = None;
-        for attempt in 1..=3 {
+        for attempt in 1..=CONNECT_RETRY_ATTEMPTS {
             match self
                 .client
                 .post(&self.endpoint)
@@ -99,9 +120,16 @@ impl CodexModel {
                 .await
             {
                 Ok(response) => return Ok((response, access_token)),
-                Err(error) if attempt < 3 && (error.is_timeout() || error.is_connect()) => {
+                Err(error)
+                    if attempt < CONNECT_RETRY_ATTEMPTS
+                        && (error.is_timeout() || error.is_connect()) =>
+                {
                     last_error = Some(error);
-                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                    tokio::time::sleep(Duration::from_millis(retry_backoff_ms(
+                        CONNECT_RETRY_BASE_BACKOFF_MS,
+                        attempt,
+                    )))
+                    .await;
                 }
                 Err(error) => return Err(error).context("ChatGPT Responses request failed"),
             }
