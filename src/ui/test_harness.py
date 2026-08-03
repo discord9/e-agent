@@ -164,6 +164,11 @@ class El {
   appendChild(n){ const p=n._parent;   /* 真实 DOM 语义：移动=先从旧父节点移除 */
     if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
     this._children.push(n); n._parent=this; return n; }
+  prepend(...nodes){ let i=0;           /* 真实 DOM 语义：头部插入（已有父节点先移除） */
+    for(const n of nodes){ if(n==null) continue;
+      const c=typeof n==="string"?{text:n}:n; const p=c._parent;
+      if(p){ const j=p._children.indexOf(c); if(j>=0) p._children.splice(j,1); }
+      this._children.splice(i++,0,c); c._parent=this; } }
   get isConnected(){ return this._parent != null; }
   insertBefore(n, ref){ const p=n._parent; if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
     const i=this._children.indexOf(ref);
@@ -2057,6 +2062,83 @@ async function main(){
         && FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length === bEventsBefore14 + 1,
         "events=" + FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length);
     a1StreamManual = false;
+
+    // =====================================================================
+    // 15) 置顶分组：所有 workspace 的 pinned 主会话集中到侧边栏最顶分组
+    //     （跨 workspace 徽章 + workspace 内剔除 + 子会话跟随 + pinned
+    //     子会话不重复渲染：只收主会话，pinned 子会话留在父节点下）
+    // =====================================================================
+    sessionsData = [
+      { id: "pa1", status: "Idle", title: "A 置顶", created_at: "2024-01-01T00:00:00Z", entry_count: 3, busy: false, active: true, pinned: true },
+      { id: "pa1-child", parent_session_id: "pa1", label: "A 置顶子任务", status: "Idle", entry_count: 1, active: true },
+      { id: "a-np", status: "Idle", title: "A 普通", created_at: "2024-01-02T00:00:00Z", entry_count: 1, active: true },
+      { id: "a-np-child", parent_session_id: "a-np", label: "A 普通子任务", status: "Idle", entry_count: 1, active: true, pinned: true },
+    ];
+    sessionsDataB = [
+      { id: "pb1", status: "Idle", title: "B 置顶", created_at: "2024-02-01T00:00:00Z", entry_count: 2, active: true, pinned: true },
+      { id: "b-np", status: "Idle", title: "B 普通", created_at: "2024-02-02T00:00:00Z", entry_count: 1, active: true },
+    ];
+    // 还原快照：测试末尾把聚合状态原样放回（workspaces/workspaceLists/
+    // workspaceErrors/sidebar/列表源数据）
+    const saveWs = { workspaces: state.workspaces, workspace: state.workspace, token: state.token,
+      lists: state.workspaceLists, errors: state.workspaceErrors, lastList: state.lastList,
+      sessionId: state.sessionId, view: state.view, query: state.searchQuery,
+      filter: state.sidebar.filter, showAll: state.sidebar.showAllWs, expanded: state.sidebar.expanded,
+      dataA: sessionsData, dataB: sessionsDataB };
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set(["wsA:pa1", "wsA:a-np"]);   // 展开以渲染子会话行
+    state.renameActive = false;
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSidebarTree(true);
+    const pinSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const pinTop = pinSections[0];
+    const pinA = pinSections[1];
+    const pinB = pinSections[2];
+    chk("pinned group is first .tree-ws-section",
+        pinTop.classList.contains("pinned"), "cls=" + pinTop.className);
+    chk("pinned group carries two server chips",
+        pinTop.querySelectorAll(".ws-chip").length === 2
+        && pinTop.textContent.includes("服务器A") && pinTop.textContent.includes("服务器B"),
+        "chips=" + pinTop.querySelectorAll(".ws-chip").length
+        + " txt=" + pinTop.textContent.slice(0, 60));
+    chk("pinned roots all in pinned group",
+        pinTop.textContent.includes("pa1") && pinTop.textContent.includes("pb1"),
+        "txt=" + pinTop.textContent.slice(0, 80));
+    chk("pinned roots not duplicated in their workspace sections",
+        !pinA.textContent.includes("pa1") && !pinB.textContent.includes("pb1"),
+        "aHas=" + pinA.textContent.includes("pa1") + " bHas=" + pinB.textContent.includes("pb1"));
+    chk("pinned root children follow into pinned group",
+        pinTop.textContent.includes("pa1-child") && !pinA.textContent.includes("pa1-child"),
+        "topHas=" + pinTop.textContent.includes("pa1-child"));
+    chk("non-pinned sessions stay in workspace sections",
+        pinA.textContent.includes("a-np") && pinB.textContent.includes("b-np"),
+        "aHas=" + pinA.textContent.includes("a-np") + " bHas=" + pinB.textContent.includes("b-np"));
+    chk("pinned subagent not hoisted to pinned group, stays under parent",
+        !pinTop.textContent.includes("a-np-child") && pinA.textContent.includes("a-np-child"),
+        "topHas=" + pinTop.textContent.includes("a-np-child")
+        + " aHas=" + pinA.textContent.includes("a-np-child"));
+    // 还原聚合状态（workspaces/workspaceLists/workspaceErrors/sidebar/数据源）
+    state.workspaces = saveWs.workspaces; state.workspace = saveWs.workspace; state.token = saveWs.token;
+    state.workspaceLists = saveWs.lists; state.workspaceErrors = saveWs.errors; state.lastList = saveWs.lastList;
+    state.sessionId = saveWs.sessionId; state.view = saveWs.view; state.searchQuery = saveWs.query;
+    state.sidebar.filter = saveWs.filter; state.sidebar.showAllWs = saveWs.showAll; state.sidebar.expanded = saveWs.expanded;
+    state.renameActive = false;
+    sessionsData = saveWs.dataA; sessionsDataB = saveWs.dataB;
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);

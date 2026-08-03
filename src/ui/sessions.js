@@ -1251,6 +1251,40 @@ function renderSidebarTree(force) {
   lastTreeSig = sig;
   const prevScroll = tree.scrollTop;
   tree.innerHTML = "";
+  // ---- 置顶分组：所有 workspace 的 pinned 会话集中到最顶上 ----
+  // （跨 workspace 聚合；点击自动切到所属 server 并打开。workspace 内
+  //  不再重复渲染 pinned——buildTreeRoot 的 .pinned 样式标记仍保留。）
+  const pinned = [];
+  for (const ws of state.workspaces) {
+    const list = workspaceListFor(ws);
+    for (const s of list) {
+      // 只收主会话：pinned 子会话留在其父节点下（见 isMainSession 注释），
+      // 避免既进置顶分组又留在 workspace 内重复渲染。
+      if (s.pinned === true && isMainSession(s)) {
+        pinned.push({ ws, s });
+      }
+    }
+  }
+  if (pinned.length) {
+    const pinnedSec = el("div", "tree-ws-section pinned");
+    const pinnedBody = el("div", "tree-ws-body");
+    for (const { ws, s } of pinned) {
+      // 按所属 workspace 构建子会话映射（pinned 根的子会话跟随置顶分组）
+      const wsList = workspaceListFor(ws);
+      const kidsByParent = new Map();
+      for (const x of wsList) {
+        if (!x.parent_session_id) continue;
+        if (!kidsByParent.has(x.parent_session_id)) kidsByParent.set(x.parent_session_id, []);
+        kidsByParent.get(x.parent_session_id).push(x);
+      }
+      const node = buildTreeRoot(s, kidsByParent.get(s.id) || [], ws.id);
+      // 行前加 server 徽章，跨 workspace 一眼可辨
+      node.querySelector(".tree-row")?.prepend(el("span", "ws-chip", ws.name));
+      pinnedBody.appendChild(node);
+    }
+    pinnedSec.appendChild(pinnedBody);
+    tree.appendChild(pinnedSec);
+  }
   for (const ws of state.workspaces) {
     const list = workspaceListFor(ws);
     const err = state.workspaceErrors[ws.id] || null;
@@ -1298,6 +1332,15 @@ function renderSidebarTree(force) {
   tree.scrollTop = prevScroll;
 }
 
+/* 主会话判定：无 parent 且 id 不以 sub-/btw- 开头。历史脏数据里存在
+   parent 丢失的孤儿 subagent（sub-20260729-* 等），无 parent 会被误判
+   为主会话 → 前缀保险：这类会话归入「未关联」组，不占主会话位。
+   置顶分组与 workspace 内剔除共用同一判定：pinned 子会话留在其父节点
+   下，不会既进置顶分组（当根渲染）又留在 workspace 内（重复）。 */
+function isMainSession(s) {
+  return !s.parent_session_id && !/^(sub|btw)-/i.test(String(s.id || ""));
+}
+
 /* 单个 workspace 的树渲染（原 renderSidebarTree 主体，抽出来按 ws 复用）：
    roots/orphans/MAX_TREE_ROOTS/hist-groups 全部按本列表判定；wsId 用于
    expanded 键限定（wsId:sid）与 .current 高亮（只高亮激活 workspace 内
@@ -1313,16 +1356,18 @@ function renderTreeForList(container, list, wsId) {
     if (!childrenByParent.has(s.parent_session_id)) childrenByParent.set(s.parent_session_id, []);
     childrenByParent.get(s.parent_session_id).push(s);
   }
-  // 主会话判定：无 parent 且 id 不以 sub-/btw- 开头。历史脏数据里存在
-  // parent 丢失的孤儿 subagent（sub-20260729-* 等），无 parent 会被误判
-  // 为主会话 → 前缀保险：这类会话归入「未关联」组，不占主会话位。
-  const isMainSession = (s) => !s.parent_session_id && !/^(sub|btw)-/i.test(String(s.id || ""));
   const rootIds = new Set(list.filter(isMainSession).map((s) => s.id));
-  const orphans = list.filter((s) => s.parent_session_id
+  // pinned 根节点已在置顶分组渲染，这里从 workspace 内剔除（其子会话
+  // 跟随剔除——置顶分组里 buildTreeRoot 会带出它们的子会话）。
+  const pinnedRootIds = new Set(list.filter((s) => s.pinned === true && isMainSession(s)).map((s) => s.id));
+  const inPinnedSubtree = (s) => pinnedRootIds.has(s.id)
+    || (s.parent_session_id && pinnedRootIds.has(s.parent_session_id));
+  const listForWorkspace = list.filter((s) => !inPinnedSubtree(s));
+  const orphans = listForWorkspace.filter((s) => s.parent_session_id
     ? !rootIds.has(s.parent_session_id)
     : !isMainSession(s));
   const filter = state.sidebar.filter;
-  const roots = list.filter(isMainSession);
+  const roots = listForWorkspace.filter(isMainSession);
   if (filter) {
     // 筛选：主会话匹配 title（无 title 回退 id），大小写不敏感；子会话随父显示
     const match = (s) => (s.title || s.id).toLowerCase().includes(filter);
@@ -1507,7 +1552,7 @@ function buildTreeGroup(label, kids, wsId) {
   row.append(toggle, idEl);
   node.appendChild(row);
   const children = el("div", "tree-children");
-  children.hidden = true;
+  children.hidden = true;   // 「未关联」分组默认折叠，点击展开（不持久化）
   renderTreeChildren(children, kids, wsId);
   node.appendChild(children);
   return node;
