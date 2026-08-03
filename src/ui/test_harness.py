@@ -1483,6 +1483,9 @@ async function main(){
         editRes.classList.contains("tool-diff")
         && editRes.querySelector(".diff-head").textContent === "file edited (line 2)",
         "cls=" + editRes.className + " head=" + JSON.stringify(editRes.querySelector(".diff-head") && editRes.querySelector(".diff-head").textContent));
+    chk("edit_file placeholder cleared before diff",
+        !editRes.textContent.includes("等待结果…"),
+        "text=" + JSON.stringify(editRes.textContent.slice(0, 40)));
     chk("edit_file - rows numbered from edited line",
         delRows.length === 3 && addRows.length === 4
         && delRows[0].querySelector(".diff-sign").textContent === "− "
@@ -1564,6 +1567,13 @@ async function main(){
         && longRes.querySelector(".diff-full").querySelectorAll(".diff-row").length === 10
         && longRes.querySelector(".diff-more").textContent === "… (10 more lines)",
         "total=" + longCard.querySelectorAll(".diff-row").length);
+    // 展开按钮可发现性：紧跟预览区（截断标记之后）、全文之前——不依赖滚动到底
+    const _kids = longRes._children.filter((c) => c instanceof El);
+    const _kidIdx = (cls) => _kids.findIndex((c) => c._classes && c._classes.has(cls));
+    chk("read_file expand button after preview, before full",
+        _kidIdx("diff-more") !== -1 && _kidIdx("expand-toggle") !== -1 && _kidIdx("diff-full") !== -1
+        && _kidIdx("diff-more") < _kidIdx("expand-toggle") && _kidIdx("expand-toggle") < _kidIdx("diff-full"),
+        "more=" + _kidIdx("diff-more") + " btn=" + _kidIdx("expand-toggle") + " full=" + _kidIdx("diff-full"));
     const readBtn = longRes.querySelector(".expand-toggle");
     for (const fn of clicksA) fn({ target: readBtn });
     chk("read_file expand shows all rows",
@@ -1590,6 +1600,39 @@ async function main(){
         && diffRowsOf(wCard, "diff-add")[0].querySelector(".diff-ln").textContent === "1"
         && diffRowsOf(wCard, "diff-add")[0].querySelector(".diff-text").textContent === "hello",
         "rows=" + wCard.querySelectorAll(".diff-row").length);
+    // 空 old/new/content：不产生空红/绿 diff 行（纯新增/纯删除/空写入）
+    appendToolCall("edit_file", JSON.stringify({ path: "add.txt", old: "", new: "hello\nworld" }),
+      state.acc, null);
+    const addCard = lastCard();
+    appendToolResult(false, "file edited (line 1)", state.acc, null);
+    chk("edit_file empty old renders add-only",
+        diffRowsOf(addCard, "diff-del").length === 0
+        && diffRowsOf(addCard, "diff-add").length === 2,
+        "del=" + diffRowsOf(addCard, "diff-del").length + " add=" + diffRowsOf(addCard, "diff-add").length);
+    appendToolCall("edit_file", JSON.stringify({ path: "del.txt", old: "bye", new: "" }),
+      state.acc, null);
+    const delCard = lastCard();
+    appendToolResult(false, "file edited (line 5)", state.acc, null);
+    chk("edit_file empty new renders del-only",
+        diffRowsOf(delCard, "diff-del").length === 1
+        && diffRowsOf(delCard, "diff-add").length === 0,
+        "del=" + diffRowsOf(delCard, "diff-del").length + " add=" + diffRowsOf(delCard, "diff-add").length);
+    appendToolCall("write_file", JSON.stringify({ path: "empty.txt", content: "" }),
+      state.acc, null);
+    const wEmptyCard = lastCard();
+    appendToolResult(false, "file written", state.acc, null);
+    chk("write_file empty content renders no add rows",
+        wEmptyCard.querySelector(".tool-result").classList.contains("tool-diff")
+        && wEmptyCard.querySelector(".diff-head").textContent === "file written"
+        && wEmptyCard.querySelectorAll(".diff-row").length === 0,
+        "rows=" + wEmptyCard.querySelectorAll(".diff-row").length);
+    appendToolCall("read_file", JSON.stringify({ path: "blank.txt" }), state.acc, null);
+    const rEmptyCard = lastCard();
+    appendToolResult(false, "", state.acc, null);
+    chk("read_file empty content falls back to status",
+        !rEmptyCard.querySelector(".tool-result").classList.contains("tool-diff")
+        && rEmptyCard.querySelector(".tool-result").textContent === "[empty file]",
+        "cls=" + rEmptyCard.querySelector(".tool-result").className);
     // history 路径：renderMessage 按 tc.id ↔ call_id 配对后同样渲染 diff
     elsById["messages"].innerHTML = "";
     state.acc = newAccumulator();
@@ -4968,4 +5011,39 @@ _diff_rules_ok = bool(
     and re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-row\.diff-del\s*\{[^}]*background:\s*#fbe3e4', _css)
     and re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-ln\s*\{[^}]*text-align:\s*right', _css))
 print(("PASS" if _diff_rules_ok else "FAIL") + " file-tool diff styles (add/del/ln) in style.css")
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _empty_ok and _chip_ok and _diff_rules_ok else 1)
+# 窄屏防溢出：.diff-text 必须可收缩（min-width:0）且允许任意位置断行
+# （overflow-wrap: anywhere，长 URL/长行不撑破卡片）
+_txt_rule = re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-text\s*\{([^}]*)\}', _css)
+_txt_ok = bool(_txt_rule
+               and re.search(r'min-width:\s*0', _txt_rule.group(1))
+               and re.search(r'overflow-wrap:\s*(anywhere|break-word)', _txt_rule.group(1)))
+print(("PASS" if _txt_ok else "FAIL") + " diff-text min-width:0 + overflow-wrap in style.css")
+# 对比度：diff 辅助文字（行号列 / 确认行 / 截断标记）在各自底色上 ≥ 4.5:1（WCAG AA）。
+# 解析 :root 变量 + 规则里的 var() 引用后复用上面的 _contrast 计算。
+_root = re.search(r':root\s*\{([^}]*)\}', _css)
+def _var_hex(name):
+    m = re.search(r'--%s:\s*(#[0-9a-fA-F]{6})' % name, _root.group(1)) if _root else None
+    return m.group(1) if m else None
+def _rule_color(selector):
+    m = re.search(re.escape(selector) + r'\s*\{([^}]*)\}', _css)
+    if not m:
+        return None
+    c = re.search(r'color:\s*var\((--[a-z0-9]+)\)', m.group(1))
+    return _var_hex(c.group(1)[2:]) if c else None
+_contrast_ok = True
+for _sel, _bgvar in [
+    (r'.tool-card .tool-result.tool-diff .diff-ln', 'base2'),
+    (r'.tool-card .tool-result.tool-diff .diff-head', 'base2'),
+    (r'.tool-card .tool-result.tool-diff .diff-more', 'base3'),
+]:
+    _fg = _rule_color(_sel)
+    _bgh = _var_hex(_bgvar)
+    if not _fg or not _bgh:
+        _contrast_ok = False
+        print("FAIL contrast: %s missing color/bg" % _sel)
+        continue
+    _cr = _contrast(_fg, _bgh)
+    if _cr < 4.5:
+        _contrast_ok = False
+    print(("PASS" if _cr >= 4.5 else "FAIL") + " contrast %.2f:1 %s" % (_cr, _sel))
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _empty_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok else 1)

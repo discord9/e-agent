@@ -100,7 +100,9 @@ function diffRow(sign, lineNo, text, extraCls) {
    "… (N more lines)" 标记（带同侧符号）。startLine null → 行不编号 */
 function diffSideRows(text, sign, startLine) {
   const rows = [];
-  const lines = String(text == null ? "" : text).split("\n");
+  const s = String(text == null ? "" : text);
+  if (s === "") return rows;   // 空 old/new/content：不生成空红/绿 diff 行（纯新增/纯删除）
+  const lines = s.split("\n");
   // Rust str::lines() 丢弃结尾单个空段：文本以 \n 结尾时不产生空 diff 行
   if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
   const shown = Math.min(lines.length, DIFF_LINE_LIMIT);
@@ -141,6 +143,10 @@ const READ_STATUS_RE = /^\[(empty file|offset \d+ is past end of file \(\d+ line
 const READ_FOOTER_RE = /^\[showing lines \d+-\d+ of \d+[^\]]*\]$/;
 function renderFileView(resEl, args, content) {
   const s = String(content == null ? "" : content);
+  if (s === "") {   // 空内容与后端 "[empty file]" 语义一致：状态输出，不生成空行号行
+    maybeTruncateEl(resEl, "[empty file]", LONG_TEXT_THRESHOLD, null);
+    return;
+  }
   if (READ_STATUS_RE.test(s.trim())) {          // 状态输出不是文件行：不编号
     maybeTruncateEl(resEl, s, LONG_TEXT_THRESHOLD, null);
     return;
@@ -161,18 +167,23 @@ function renderFileView(resEl, args, content) {
   resEl.classList.add("expandable");
   for (const r of rows.slice(0, DIFF_LINE_LIMIT)) resEl.appendChild(r);
   resEl.appendChild(el("div", "diff-more", "… (" + (rows.length - DIFF_LINE_LIMIT) + " more lines)"));
-  const full = el("div", "diff-full");
-  for (const r of rows.slice(DIFF_LINE_LIMIT)) full.appendChild(r);
-  resEl.appendChild(full);
+  // 展开按钮紧跟预览区（截断标记之后、全文之前）：不依赖滚动到内容底部即可发现
   const btn = el("button", "expand-toggle", "展开全文（内容）");
   btn.type = "button";
   btn._target = resEl;      // 事件委托精确定位（与 maybeTruncateEl 同机制）
   resEl.appendChild(btn);
+  const full = el("div", "diff-full");
+  for (const r of rows.slice(DIFF_LINE_LIMIT)) full.appendChild(r);
+  resEl.appendChild(full);
 }
 
 /* 文件工具结果渲染入口：edit_file → diff、read_file → 行号视图、write_file →
-   单侧新增；参数/结果格式不符时退回普通文本截断。isError 由调用方排除。 */
+   单侧新增；参数/结果格式不符时退回普通文本截断。isError 由调用方排除。
+   渲染前清空结果容器：pending 期间的 "等待结果…" 占位文本（maybeTruncateEl
+   写入的 textContent）与可能残留的展开态不能混进结构化 diff 内容。 */
 function renderFileToolResult(resEl, name, args, content) {
+  resEl.textContent = "";
+  resEl.classList.remove("expandable", "expanded");
   if (name === "edit_file" && args && typeof args.old === "string" && typeof args.new === "string") {
     renderEditDiff(resEl, args, content);
     return;
