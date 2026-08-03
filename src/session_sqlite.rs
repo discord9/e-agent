@@ -291,31 +291,121 @@ impl SqliteSession {
             .await
             .map_err(|e| format!("cannot create sessions table: {e}"))?;
 
+        // Idempotent schema migration for the `title`, `pinned`,
+        // `archived` and `writer` columns — a table-structure evolution:
+        // the `sessions` table shipped without them, so pre-existing
+        // databases need an ALTER (fresh databases already have them via
+        // CREATE_TABLE_SESSIONS above; `CREATE TABLE IF NOT EXISTS` never
+        // adds columns, so without this the shared column-bearing SELECTs
+        // would hard-error on an old database file — the same failure
+        // mode `pinned` would have hit, and which `archived` — a newer
+        // column — definitely hits). There are no historical rows to
+        // backfill: old rows simply read the columns back as NULL (the
+        // read path treats them as `Option`).
+        //
+        // Mirrors the Greptime backend's probe-then-ALTER pattern
+        // (session_greptime.rs): probe `PRAGMA table_info(sessions)` for
+        // each column, `ALTER TABLE sessions ADD COLUMN` when missing
+        // (the ALTER deliberately omits an explicit NULL constraint —
+        // see the turso quirk note below). A failed migration must NOT
+        // block the connection — if ALTER errors anyway we keep running
+        // with the feature degraded: the meta-row cache below is skipped
+        // and later column-bearing queries fail loudly with context;
+        // transcript operations are unaffected.
+        let mut title_available = true;
+        let mut pinned_available = true;
+        let mut archived_available = true;
+        let mut writer_available = true;
+        {
+            let mut rows = conn
+                .query("PRAGMA table_info(sessions)", ())
+                .await
+                .map_err(|e| format!("cannot inspect sessions table schema: {e}"))?;
+            let mut columns: Vec<String> = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| format!("cannot inspect sessions table schema: {e}"))?
+            {
+                // PRAGMA table_info columns: cid, name, type, notnull,
+                // dflt_value, pk — the name is index 1.
+                if let Some(name) = row
+                    .get_value(1)
+                    .map_err(|e| format!("cannot inspect sessions table schema: {e}"))?
+                    .as_text()
+                {
+                    columns.push(name.clone());
+                }
+            }
+            // Keep the added column types identical to CREATE_TABLE_SESSIONS
+            // (TEXT for title/writer, INTEGER for the boolean flags) so a
+            // migrated old database and a fresh database share one schema.
+            // NOTE: turso's ALTER TABLE ADD COLUMN mis-parses an explicit
+            // trailing `NULL` as NOT NULL (CREATE TABLE is unaffected —
+            // fresh DBs keep nullable columns), so the ALTER must OMIT the
+            // constraint; ADD COLUMN defaults to nullable anyway.
+            let migrations: [(&str, &str, &str, &mut bool); 4] = [
+                ("title", "TEXT", "session titles", &mut title_available),
+                (
+                    "pinned",
+                    "INTEGER",
+                    "session pinning",
+                    &mut pinned_available,
+                ),
+                (
+                    "archived",
+                    "INTEGER",
+                    "session archiving",
+                    &mut archived_available,
+                ),
+                ("writer", "TEXT", "writer audit", &mut writer_available),
+            ];
+            for (name, sql_type, feature, available) in migrations {
+                if columns.iter().any(|c| c == name) {
+                    continue; // column already present (fresh DB or migrated)
+                }
+                let sql = format!("ALTER TABLE sessions ADD COLUMN {name} {sql_type}");
+                if let Err(error) = conn.execute(&sql, ()).await {
+                    *available = false;
+                    eprintln!(
+                        "e-agent: cannot add sessions.{name} column ({feature} unavailable): \
+                         {error}"
+                    );
+                }
+            }
+        }
+
         // Cache the session's latest metadata snapshot (if any) so later
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
-        // wins (ORDER BY last_active_at DESC LIMIT 1).
-        let cached_meta = {
-            let mut rows = conn
-                .query(
-                    "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                            parent_session_id, parent_task_id, title, pinned, archived, writer \
-                     FROM sessions \
-                     WHERE workspace_id = ?1 AND session_id = ?2 \
-                     ORDER BY last_active_at DESC LIMIT 1",
-                    (workspace_id, session_id),
-                )
-                .await
-                .map_err(|e| format!("cannot query session metadata: {e}"))?;
-            match rows
-                .next()
-                .await
-                .map_err(|e| format!("cannot query session metadata: {e}"))?
-            {
-                Some(row) => Some(row_to_meta(&row, session_id)?),
-                None => None,
-            }
-        };
+        // wins (ORDER BY last_active_at DESC LIMIT 1). Skipped when a
+        // feature column is unavailable (failed migration): the cache
+        // query references the columns and would error on an unmigrated
+        // table, exactly like Greptime's degraded mode.
+        let cached_meta =
+            if title_available && pinned_available && archived_available && writer_available {
+                let mut rows = conn
+                    .query(
+                        "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                                parent_session_id, parent_task_id, title, pinned, archived, writer \
+                         FROM sessions \
+                         WHERE workspace_id = ?1 AND session_id = ?2 \
+                         ORDER BY last_active_at DESC LIMIT 1",
+                        (workspace_id, session_id),
+                    )
+                    .await
+                    .map_err(|e| format!("cannot query session metadata: {e}"))?;
+                match rows
+                    .next()
+                    .await
+                    .map_err(|e| format!("cannot query session metadata: {e}"))?
+                {
+                    Some(row) => Some(row_to_meta(&row, session_id)?),
+                    None => None,
+                }
+            } else {
+                None
+            };
 
         let session = Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),

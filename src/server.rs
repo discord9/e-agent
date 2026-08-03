@@ -734,15 +734,18 @@ fn merge_session_metas(
     // Backend sort (the frontend renders the array order as-is): pinned
     // sessions first (`pinned = Some(true)`), then unarchived sessions
     // before archived ones (`archived = Some(true)` sorts last), then
-    // newest activity first within each group.
+    // newest activity first within each group. Note the two flag
+    // comparators run in OPPOSITE directions: pinned sorts descending
+    // (true first), archived sorts ascending (true LAST — unarchived
+    // sessions must stay in the default list).
     metas.sort_by(|a, b| {
         b.pinned
             .unwrap_or(false)
             .cmp(&a.pinned.unwrap_or(false))
             .then_with(|| {
-                b.archived
+                a.archived
                     .unwrap_or(false)
-                    .cmp(&a.archived.unwrap_or(false))
+                    .cmp(&b.archived.unwrap_or(false))
             })
             .then_with(|| b.last_active_at.cmp(&a.last_active_at))
     });
@@ -3321,6 +3324,98 @@ model = "deepseek-chat"
             Some(true),
             "historical archive passes through to the live entry"
         );
+    }
+
+    /// Archive sort DIRECTION: unarchived sessions sort BEFORE archived
+    /// ones, even when the archived session is more recently active — the
+    /// comparator ascends on `archived` (unlike `pinned`, which descends),
+    /// so archived sessions sink to the bottom of the default list.
+    #[test]
+    fn merge_session_metas_archived_sorts_after_unarchived() {
+        use crate::session_store::SessionMeta as HistoryMeta;
+        let dt = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let naive = |secs: i64| {
+            chrono::DateTime::from_timestamp(secs, 0)
+                .unwrap()
+                .naive_utc()
+        };
+        let wire = |id: &str, created: i64| SessionMeta {
+            id: id.to_owned(),
+            model: "web-model".into(),
+            role: None,
+            created_at: dt(created),
+            last_active_at: dt(created),
+            status: "Idle".into(),
+            entry_count: 1,
+            busy: false,
+            active: false,
+            parent_session_id: None,
+            title: None,
+            pinned: None,
+            archived: None,
+            label: None,
+        };
+        let history = |id: &str, created: i64, count: i64, archived: Option<bool>| HistoryMeta {
+            session_id: id.to_owned(),
+            created_at: naive(created),
+            last_active_at: naive(created + 10),
+            model: None,
+            role: None,
+            entry_count: count,
+            parent_session_id: None,
+            parent_task_id: None,
+            title: None,
+            pinned: None,
+            archived,
+            writer: None,
+            label: None,
+        };
+        // The archived session is MORE recently active (last_active 510 vs
+        // 110); it must still sort AFTER the unarchived one — recency only
+        // breaks ties within the same archived bucket.
+        let archived_recent = history("arch-1", 500, 3, Some(true));
+        let unarchived_old = history("plain", 100, 1, None);
+        let merged = merge_session_metas(vec![], vec![archived_recent, unarchived_old]);
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["plain", "arch-1"],
+            "unarchived sorts before archived regardless of recency"
+        );
+        assert_eq!(merged[0].archived, None);
+        assert_eq!(merged[1].archived, Some(true));
+        // Same recency, different flags: still unarchived first.
+        let merged = merge_session_metas(
+            vec![],
+            vec![
+                history("arch-2", 300, 1, Some(true)),
+                history("plain-2", 300, 1, None),
+            ],
+        );
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["plain-2", "arch-2"]);
+        // Both archived: recency breaks the tie (newest first).
+        let merged = merge_session_metas(
+            vec![],
+            vec![
+                history("arch-old", 100, 1, Some(true)),
+                history("arch-new", 500, 1, Some(true)),
+            ],
+        );
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["arch-new", "arch-old"],
+            "recency sorts within archived"
+        );
+        // A live registry session is never archived by default; it must
+        // beat the archived history session too.
+        let merged = merge_session_metas(
+            vec![wire("live-1", 900)],
+            vec![history("arch-live", 800, 3, Some(true))],
+        );
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["live-1", "arch-live"]);
     }
 
     /// The active rule for subagent list entries: a surviving running_tasks

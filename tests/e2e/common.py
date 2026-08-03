@@ -129,10 +129,14 @@ class Case:
         wait_rows: 期望的列表行数；0 表示允许空列表（只等首轮轮询渲染）。
         """
         page = self.page
+        # 必须在页面任何脚本运行前把 token 种进 localStorage（add_init_script
+        # 对每次导航/刷新都生效）：多工作区功能之后，initWorkspaces 会在首次
+        # 加载时把「默认 workspace（空 token）」落盘，刷新后它覆盖
+        # eagent_token —— 原来的 goto→setItem→reload 顺序不再可靠（全部
+        # mock 用例在 start() 处空列表超时）。
+        await page.add_init_script(
+            "localStorage.setItem('eagent_token', %s)" % json.dumps(self.token))
         await page.goto(BASE + "/", wait_until="load")
-        await page.wait_for_timeout(400)
-        await page.evaluate("localStorage.setItem('eagent_token', %s)"
-                            % json.dumps(self.token))
         await page.reload(wait_until="load")
         await page.wait_for_function(
             "() => document.querySelectorAll('.session-row').length >= %d || "

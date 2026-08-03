@@ -218,9 +218,13 @@ async def run_list_pin(c):
     async def on_pin(route, url, method):
         sid = url.split("/api/sessions/")[1].split("/pin")[0]
         body = json.loads(route.request.post_data or "{}")
-        pinned[sid] = bool(body.get("pinned"))
         c.records["pin"].append((url, route.request.post_data))
-        await route.fulfill(status=c.pin_status, content_type="application/json", body="{}")
+        # 只有成功（2xx）才让 mock 状态跟随 PUT（与 on_archive 一致）：
+        # 404/405 时状态不变，否则「失败后行状态不变」会被轮询污染。
+        status = c.pin_status
+        if 200 <= status < 300:
+            pinned[sid] = bool(body.get("pinned"))
+        await route.fulfill(status=status, content_type="application/json", body="{}")
     c.extra_handlers.append(
         (lambda url, method: method == "PUT" and url.endswith("/pin"), on_pin))
 
@@ -321,9 +325,14 @@ async def run_list_archive(c):
     async def on_archive(route, url, method):
         sid = url.split("/api/sessions/")[1].split("/archive")[0]
         body = json.loads(route.request.post_data or "{}")
-        archived[sid] = bool(body.get("archived"))
         c.records["archive"].append((url, route.request.post_data))
-        await route.fulfill(status=c.archive_status, content_type="application/json", body="{}")
+        # 只有成功（2xx）才让 mock 状态跟随 PUT —— 404/405 时状态必须保持
+        # 不变（真实 server 不会在失败时改状态），否则「失败后行状态不变」
+        # 断言会被下一轮轮询污染。
+        status = c.archive_status
+        if 200 <= status < 300:
+            archived[sid] = bool(body.get("archived"))
+        await route.fulfill(status=status, content_type="application/json", body="{}")
     c.extra_handlers.append(
         (lambda url, method: method == "PUT" and url.endswith("/archive"), on_archive))
 
@@ -351,11 +360,13 @@ async def run_list_archive(c):
     c.check("archive：归档后列表只剩 1 行（普通会话也隐藏）",
             await c.page.locator(".session-row").count() == 1, "")
 
-    # 「显示归档」开关：打开后归档行灰化显示 + 🗄 高亮(.on)
+    # 「显示归档」开关：打开后所有会话可见（3 行 = 2 个已归档 + 1 个未归档
+    # 的旧 server 行；旧 server 行没有 archived 字段、视为未归档，开关打开
+    # 时同样显示）。
     await c.page.locator("#showArchiveBtn").click()
     await c.page.wait_for_timeout(500)
-    c.check("archive：开关打开后归档行可见（2 行）",
-            await c.page.locator(".session-row").count() == 2, "")
+    c.check("archive：开关打开后全部会话可见（3 行）",
+            await c.page.locator(".session-row").count() == 3, "")
     a_row = c.page.locator("#sessionList .session-row", has_text="main-archived").first
     c.check("archive：归档行带 .archived 灰化 + 🗄 高亮(.on)",
             "archived" in (await a_row.get_attribute("class"))
@@ -373,9 +384,8 @@ async def run_list_archive(c):
             and await a_row.locator(".archive-btn.on").count() == 0, "")
 
     # 侧边栏：归档会话收进折叠的「归档 (N)」分组；未归档会话不在分组里
-    # （重新归档 main-normal 以便断言分组）
-    await n_row.locator(".archive-btn").click()
-    await c.page.wait_for_timeout(500)
+    # （main-normal 此时仍处于归档状态，直接开侧边栏断言；不能再点它的 🗄
+    # —— toggle 语义会把已归档行恢复，归档分组反而消失）
     await c.open_sidebar()
     await c.page.wait_for_selector("#sidebarTree .tree-row:not(.tasks-group-head)", timeout=5000)
     ag = c.page.locator("#sidebarTree .tree-group", has_text="归档")
@@ -383,8 +393,9 @@ async def run_list_archive(c):
             await ag.count() == 1, "groups=" +
             " | ".join(await c.page.locator("#sidebarTree .tree-group").all_text_contents()))
     c.check("archive：分组默认折叠（归档行不可见）",
-            await c.page.locator("#sidebarTree .tree-row.archived").count() == 0, "")
-    await ag.first.click()
+            await c.page.locator("#sidebarTree .tree-row.archived:visible").count() == 0, "")
+    # 展开分组：toggle 只挂在行内 .tree-toggle 按钮上（点 label 不切换）
+    await c.page.locator("#sidebarTree .tree-row.tree-archive-row .tree-toggle").click()
     await c.page.wait_for_timeout(300)
     c.check("archive：展开后归档行可见（带 .archived + 🗄）",
             await c.page.locator("#sidebarTree .tree-row.archived").count() == 1
@@ -400,8 +411,13 @@ async def run_list_archive(c):
 
     # 旧 server：无 archive 端点（404）-> 提示「服务器不支持归档」不崩
     c.archive_status = 404
-    await c.page.goto(c.page.url)      # 刷新：回列表视图（mock 状态保持）
+    # 刷新必须回到列表视图：不能 goto(c.page.url) —— 点开归档会话后 URL 是
+    # /?session=main-normal，刷新会触发深链重新打开聊天视图，#showArchiveBtn
+    # 不在 DOM 里。裸 URL 无深链参数，刷新后回列表（mock 状态保持）。
+    await c.page.goto(common.BASE + "/")
     await c.page.wait_for_timeout(500)
+    c.check("archive：刷新后回到列表视图（?session= 深链不残留）",
+            await c.ev("state.view") == "list", "view=" + await c.ev("state.view"))
     # 打开「显示归档」以拿到旧 server 行
     await c.page.locator("#showArchiveBtn").click()
     await c.page.wait_for_timeout(300)
