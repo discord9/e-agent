@@ -112,6 +112,7 @@ function freezeAssistant(acc) {
   // 使下一回合的 delta 从新的消息块开始
   // 流式期间是纯文本（快）；冻结时用完整文本重算一次 markdown，
   // 让表格/代码块/公式在回合结束时正确渲染。
+  if (!acc) return;   // 累积器未就绪（切工作区等）时直接返回，尾段赋值不能解引用 null
   if (acc && acc.assistantBody && acc.assistantText) {
     acc.assistantBody.innerHTML = renderMarkdown(acc.assistantText);
   }
@@ -370,6 +371,10 @@ function reattachInFlight(acc) {
 
 /* 提示行（Notice / 排队等） */
 function appendNotice(text) {
+  // 与 TUI 对 Notice 的「结束流式 lane」语义一致：通知穿插在流式回复中时
+  // 结束当前助手/思考累积，使后续 delta 从新气泡开始（否则回合 N+1 的
+  // 正文会续写进通知条上方的旧气泡，顺序反转）。
+  freezeAssistant(state.acc);
   const n = el("div", "notice", text);
   els.messages.appendChild(n);
   scrollBottom(false);
@@ -379,6 +384,7 @@ function appendNotice(text) {
 /* notice 变体：前缀 + 可能很长的正文（后台任务输出 / 未知条目 JSON）。
    正文走 maybeTruncateEl：短直出，长则预览 + 展开全文。 */
 function appendNoticeLong(prefix, text) {
+  freezeAssistant(state.acc);
   const n = el("div", "notice");
   if (prefix) n.append(prefix);
   const pre = maybeTruncateEl(el("pre", "notice-output"), text, LONG_TEXT_THRESHOLD, null);

@@ -1411,6 +1411,48 @@ async function main(){
         linkB.hidden === false, "hidden=" + linkB.hidden);
     chk("B prune keeps bound", pm.children.length <= 300, "n=" + pm.children.length);
 
+    // ---- 回归：后台完成通知冻结流式气泡（渲染顺序反转） ----
+    // 流式回复中（acc.assistantEl 已绑定气泡 A）收到 BackgroundCompletionNotice：
+    // 通知条插入后当前助手累积必须被 freeze（assistantEl=null），否则空 prompt
+    // 自动触发的新回合没有 UserPrompt 事件可 freeze，回合 N+1 的 AssistantDelta
+    // 会续写进通知条上方的旧气泡 A（正文跑到提醒条上面，顺序反了）。修复后：
+    // 通知条渲染在旧气泡下方，新回合 delta 另起新气泡，DOM 顺序为
+    // 旧正文 → 通知条 → 新正文。
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    appendAssistantDelta("第一轮回复正文", state.acc);   // 流式中：绑定气泡 A
+    const bubbleA = state.acc.assistantEl;
+    const bodyA = state.acc.assistantBody;
+    handleSSEBlock("event: BackgroundCompletionNotice\ndata: {\"type\":\"background_completion_notice\",\"session_id\":\"" + state.sessionId + "\",\"seq\":200,\"id\":9,\"label\":\"cargo\",\"output\":\"build ok\"}\n\n",
+      state.sessionId, state.workspace.id, sessionOpenEpoch);
+    chk("bg notice freezes assistant", state.acc.assistantEl === null
+        && state.acc.assistantBody === null && state.acc.assistantText === "",
+        "el=" + String(state.acc.assistantEl));
+    const noticesN = elsById["messages"].querySelectorAll(".notice");
+    chk("bg notice rendered after old bubble", noticesN.length === 1
+        && noticesN[0].textContent.includes("后台任务 #9")
+        && noticesN[0].textContent.includes("build ok"),
+        "n=" + noticesN.length + " text=" + noticesN[0].textContent.slice(0, 60));
+    // 新回合的 AssistantDelta → 新气泡（不在旧气泡 A 里续写）
+    handleSSEBlock("event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"" + state.sessionId + "\",\"seq\":201,\"delta\":\"第二轮回复正文\"}\n\n",
+      state.sessionId, state.workspace.id, sessionOpenEpoch);
+    const asN = elsById["messages"].querySelectorAll(".msg-assistant");
+    chk("bg notice next delta new bubble", asN.length === 2
+        && asN[1] !== bubbleA && state.acc.assistantEl === asN[1],
+        "n=" + asN.length + " acc=" + (state.acc.assistantEl === bubbleA ? "old" : "new"));
+    // DOM 顺序断言：旧正文气泡 → 通知条 → 新正文气泡
+    const kidsN = elsById["messages"].children;
+    const iA = kidsN.indexOf(bubbleA);
+    const iN = kidsN.indexOf(noticesN[0]);
+    const iB = kidsN.indexOf(asN[1]);
+    chk("bg notice DOM order old→notice→new",
+        iA !== -1 && iN !== -1 && iB !== -1 && iA < iN && iN < iB,
+        "idx=" + iA + "," + iN + "," + iB);
+    chk("bg notice old bubble intact",
+        bodyA.textContent.includes("第一轮回复正文")
+        && !bodyA.textContent.includes("第二轮回复正文"),
+        "=" + JSON.stringify(bodyA.textContent));
+
     // ---- bash 卡片点击：就地展开卡片输出 + 流式轮询，不切会话 ----
     // （放在 B 测试之后：fresh 打开 s2 会把 nextBeforeSeq 置 100，而 B 的
     // 「加载更早历史」链接断言依赖 nextBeforeSeq=null，避免互相污染）
