@@ -245,8 +245,9 @@ globalThis.AbortController=class{
 function makeTextDecoder(){ return { decode(v){ return typeof v==="string"?v:""; } }; }
 // gjs timers don't fire here; keep them inert. setTimeout 记录回调，测试可手动触发
 // （scheduleReconnect 的重连定时器需要验证触发时的三重校验）。
-globalThis.setInterval=()=>0;
-globalThis.clearInterval=()=>{};
+const scheduledIntervals=[];
+globalThis.setInterval=(fn)=>{ scheduledIntervals.push(fn); return scheduledIntervals.length; };
+globalThis.clearInterval=(id)=>{ if (id>0) scheduledIntervals[id-1]=null; };
 const scheduledTimeouts=[];
 globalThis.setTimeout=(fn)=>{ scheduledTimeouts.push(fn); return scheduledTimeouts.length; };
 globalThis.clearTimeout=(id)=>{ if (id>0) scheduledTimeouts[id-1]=null; };
@@ -419,6 +420,10 @@ let forkCandidatesData = [
   {at:8, seq:10, preview:"系统提示行"},
 ];
 let forkPostResp = resp(201,{id:"fork-1"});
+let forkCandidatesDelayed = false;
+let forkCandidatesResolve = null;
+let forkPostDelayed = false;
+let forkPostResolve = null;
 globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
   FETCH_HEADERS.push({ url, method: (opts.method||"GET").toUpperCase(), headers: opts.headers || {} });
@@ -514,8 +519,14 @@ globalThis.fetch=(url,opts={})=>{
   // restored 回归测试：空 SSE 流（snapshot 应被 history 替换路径跳过）
   if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty(), signal);
-  if(url==="/api/sessions/s1/fork-candidates") return resp(200, forkCandidatesData, signal);
-  if(url==="/api/sessions/s1/fork"&&m==="POST") return forkPostResp;
+  if(url==="/api/sessions/s1/fork-candidates") {
+    if (forkCandidatesDelayed) return new Promise((resolve) => { forkCandidatesResolve = resolve; });
+    return resp(200, forkCandidatesData, signal);
+  }
+  if(url==="/api/sessions/s1/fork"&&m==="POST") {
+    if (forkPostDelayed) return new Promise((resolve) => { forkPostResolve = resolve; });
+    return forkPostResp;
+  }
   if(url==="/api/models") return resp(200, ["chatgpt/sol","chatgpt/terra","deepseek/flash","deepseek/high","deepseek/fast","kimi/k3"], signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/model")&&m==="POST") return resp(200,{ok:true,model:"sol"},signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{},signal);
@@ -856,6 +867,71 @@ async function main(){
     chk("fork back to s1 restores paging", state.sessionId === "s1"
         && state.nextBeforeSeq === 100 && state.olderDone === false,
         "sid=" + state.sessionId + " next=" + state.nextBeforeSeq);
+
+    // 迟到 fork-candidates：加载期间切换会话，旧响应不得重开/写入面板。
+    forkCandidatesDelayed = true;
+    forkCandidatesResolve = null;
+    const staleCandidates = openForkMenu();
+    await flush();
+    chk("fork candidates race starts pending", forkCandidatesResolve !== null && forkMenu.loading === true);
+    openSession("s2");
+    await flush();
+    forkCandidatesResolve(await resp(200, [{at:99, seq:99, preview:"STALE-CANDIDATE"}]));
+    await staleCandidates;
+    await flush();
+    chk("fork candidates late response discarded after session switch",
+        state.sessionId === "s2" && forkMenu.open === false && forkMenu.items.length === 0
+        && !fm.textContent.includes("STALE-CANDIDATE"),
+        "sid=" + state.sessionId + " open=" + forkMenu.open + " items=" + forkMenu.items.length);
+    forkCandidatesDelayed = false;
+
+    // 迟到 fork POST：用户选中后切到其它会话，旧成功响应不得打开 fork 会话、
+    // 清输入或刷新成功 banner。
+    openSession("s1");
+    await flush(); await flush();
+    forkPostDelayed = true;
+    forkPostResolve = null;
+    pin.value = "/fork";
+    await sendPrompt();
+    await flush();
+    const staleForkPost = selectForkItem(0);
+    await flush();
+    chk("fork POST race starts pending", forkPostResolve !== null);
+    openSession("s2");
+    pin.value = "new-session-draft";
+    const bannerBeforeStaleFork = elsById["bannerText"].textContent;
+    forkPostResolve(await resp(201, {id:"fork-1"}));
+    await staleForkPost;
+    await flush();
+    chk("fork POST late response does not navigate or mutate current view",
+        state.sessionId === "s2" && pin.value === "new-session-draft"
+        && elsById["bannerText"].textContent === bannerBeforeStaleFork,
+        "sid=" + state.sessionId + " draft=" + JSON.stringify(pin.value));
+    forkPostDelayed = false;
+    openSession("s1");
+    await flush(); await flush();
+
+    // token 连续重连：第一次 history 迟到时，第二次重连已成为当前代次；
+    // 旧 token 的响应不得覆盖第二次重连完成后的 transcript/state。
+    historyOverrides.set("s1", { delay: true });
+    historyResolve = null;
+    const restartEpochBefore = sessionOpenEpoch;
+    restartTransport();
+    await flush();
+    const staleRestartResolve = historyResolve;
+    chk("restartTransport race first history pending",
+        staleRestartResolve !== null && sessionOpenEpoch > restartEpochBefore,
+        "epoch=" + sessionOpenEpoch + " before=" + restartEpochBefore);
+    historyOverrides.delete("s1");
+    restartTransport();
+    await flush(); await flush();
+    const textAfterFreshRestart = allText();
+    staleRestartResolve(await resp(200, {entries:[{type:"notice", text:"STALE-TOKEN-RESTART"}], next_before_seq:null}));
+    await flush(); await flush();
+    chk("restartTransport late response discarded after newer reconnect",
+        state.sessionId === "s1" && !allText().includes("STALE-TOKEN-RESTART")
+        && allText() === textAfterFreshRestart,
+        "sid=" + state.sessionId + " stale=" + allText().includes("STALE-TOKEN-RESTART"));
 
     // ---- /model：运行时切换当前会话模型 ----
     pin.value = "/model";
@@ -1230,7 +1306,7 @@ async function main(){
     chk("ended pollers stopped",
         !state.tasks.pollers.has("s1:7") && !state.tasks.pollers.has("s1:8"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
-    // 切走（clearCurrentSession）→ 切回：卡片轮询独立于会话缓存，clearCurrentSession 不停轮询
+    // 切走（clearCurrentSession）→ 切回：统一停止旧会话的卡片行轮询，聊天缓存仍恢复
     tasksData = [{ session_id: "s1", id: 9, kind: "bash", label: "cargo run",
       full_command: "cargo run", output: "building", role: null }];
     await pollTasks();
@@ -1244,7 +1320,7 @@ async function main(){
     chk("card poller before switch", state.tasks.pollers.has("s1:9"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
     clearCurrentSession();
-    chk("clearCurrentSession keeps card poller", state.tasks.pollers.has("s1:9"),
+    chk("clearCurrentSession stops card poller", !state.tasks.pollers.has("s1:9"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
     chk("cached html saved", !!state.sessionStates["s1"]
         && state.sessionStates["s1"].html.length > 0,
@@ -1820,6 +1896,22 @@ async function main(){
         FETCHES[FETCHES.length - 1] === "/api/sessions",
         "url=" + FETCHES[FETCHES.length - 1]);
 
+    // workspace 切换统一停止展开任务行资源：旧 output interval 从 map 和
+    // timer registry 清除，已排队的旧 tick 也不能继续请求旧任务端点。
+    tasksData = [{ session_id: "s1", id: 910, kind: "bash", label: "old workspace",
+      full_command: "old workspace", output: "running", role: null }];
+    state.tasks.composerOpen = true;
+    await pollTasks(); await flush();
+    const wsOldRow = elsById["composerTasks"].querySelector(".task-row");
+    wsOldRow._listeners["click"][0]();
+    await flush();
+    const wsOldInterval = state.tasks.pollers.get("s1:910");
+    const wsOldTick = scheduledIntervals[wsOldInterval - 1];
+    const wsOldFetches = FETCHES.filter((u) => u.includes("/tasks/910/output")).length;
+    chk("workspace lifecycle output poller started",
+        wsOldInterval != null && scheduledIntervals[wsOldInterval - 1] !== null,
+        "key=" + state.tasks.pollers.has("s1:910") + " timer=" + wsOldInterval);
+
     // 「+」→ 内联面板 → 保存 → 新 workspace 激活，后续 api/SSE 走新 base
     elsById["workspaceAddBtn"]._listeners["click"][0]();
     chk("ws add opens editor",
@@ -1837,6 +1929,15 @@ async function main(){
         && elsById["messages"].innerHTML === "",
         "sid=" + state.sessionId
         + " lastList=" + state.lastList.length);
+    chk("workspace switch clears old row interval",
+        !state.tasks.pollers.has("s1:910") && scheduledIntervals[wsOldInterval - 1] === null,
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    if (wsOldTick) wsOldTick();   // 模拟切换前已排队、clearInterval 无法撤回的回调
+    await flush();
+    chk("workspace switch old output poller sends no more requests",
+        FETCHES.filter((u) => u.includes("/tasks/910/output")).length === wsOldFetches,
+        "before=" + wsOldFetches + " after="
+          + FETCHES.filter((u) => u.includes("/tasks/910/output")).length);
     chk("ws add creates+activates workspace",
         state.workspaces.length === 2 && state.workspace.id !== "default"
         && state.workspace.name === "服务器B"
