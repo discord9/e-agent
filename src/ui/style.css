@@ -276,6 +276,23 @@ mmlEqnNo}
     font-size: 12px;
   }
   #searchInput:focus { outline: 1px solid var(--blue); }
+  /* 「显示归档」开关：小按钮，灰化；打开时高亮（暗红，同归档按钮 .on） */
+  .archive-show-btn {
+    flex: 0 0 auto;
+    padding: 3px 10px;
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 10px;
+    color: var(--base01);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .archive-show-btn:hover { background: var(--base2); color: var(--base02); }
+  .archive-show-btn.on { color: var(--red); border-color: var(--red); }
+  .archive-show-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
   .session-list { display: flex; flex-direction: column; gap: 6px; }
   .session-row {
     display: flex;
@@ -304,6 +321,10 @@ mmlEqnNo}
   }
   /* 置顶会话行：金色左边条（inset，不挤占布局）+ 浅底色，Solarized 协调 */
   .session-row.pinned { box-shadow: inset 3px 0 0 var(--yellow); background: var(--base2); }
+  /* 归档会话行（仅「显示归档」开启时渲染）：muted 灰化 + 低透明度 */
+  .session-row.archived { opacity: 0.5; }
+  .session-row.archived .sid { color: var(--base01); }
+  .session-row.archived:hover { opacity: 0.75; }
   .busy-dot {
     width: 8px; height: 8px;
     border-radius: 50%;
@@ -1070,6 +1091,9 @@ mmlEqnNo}
   .tree-row:hover { background: var(--base3); }
   /* 置顶主会话节点：金色左边条；与 .current 同现时 current 的蓝色优先（蓝色 = 当前打开） */
   .tree-row.pinned { border-left-color: var(--yellow); }
+  /* 归档主会话节点（侧边栏「归档」分组内）：muted 灰化 + 低透明度 */
+  .tree-row.archived { opacity: 0.55; color: var(--base01); }
+  .tree-row.archived:hover { opacity: 0.8; }
   .tree-row.current { border-left-color: var(--blue); background: var(--base3); }
   /* 折叠按钮：真正的 <button>，≥24px 点击区、hover 背景；
      箭头由 ::before CSS 三角绘制（不依赖 Unicode 字符），
@@ -1245,6 +1269,32 @@ mmlEqnNo}
   .pin-btn.on { color: var(--yellow); }
   .pin-btn.on:hover { background: var(--base3); color: var(--yellow); }
   .pin-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  /* 归档按钮：与置顶按钮同形（24px、透明底、SVG currentColor）；
+     默认 muted，已归档时暗红高亮（Solarized red #dc322f） */
+  .archive-btn {
+    flex: 0 0 auto;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--base01);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s, color 0.15s;
+  }
+  .archive-btn .archive-icon { display: block; flex: 0 0 auto; fill: currentColor; }
+  .archive-btn:hover { background: var(--base1); color: var(--base02); }
+  .archive-btn.on { color: var(--red); }
+  .archive-btn.on:hover { background: var(--base3); color: var(--red); }
+  .archive-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  /* 「归档 (N)」分组头（侧边栏）：muted 灰化 */
+  .tree-archive-label { color: var(--base01); }
   /* 编辑态：input 内嵌行内（原位替换标题文本） */
   .rename-box {
     display: inline-flex;

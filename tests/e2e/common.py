@@ -88,9 +88,10 @@ class Case:
         self.sse_body = "retry: 3000\n\n"
         self.title_status = 204              # PUT /title 的 mock 状态码
         self.pin_status = 200                # PUT /pin 的 mock 状态码
+        self.archive_status = 200            # PUT /archive 的 mock 状态码
         self.btw_status = 201                # POST /btw 的 mock 状态码
         self.records = {
-            "prompt": [], "title": [], "pin": [], "btw": [],
+            "prompt": [], "title": [], "pin": [], "archive": [], "btw": [],
             "compact": [], "history": [], "create": [], "delete": [],
         }
         self.extra_handlers = []             # [(predicate(url, method), async handler(route,url,method))]
@@ -185,6 +186,10 @@ def make_intercept(c):
         if method == "PUT" and url.endswith("/pin"):
             c.records["pin"].append((url, route.request.post_data))
             return await route.fulfill(status=c.pin_status, content_type="application/json",
+                                       body="{}")
+        if method == "PUT" and url.endswith("/archive"):
+            c.records["archive"].append((url, route.request.post_data))
+            return await route.fulfill(status=c.archive_status, content_type="application/json",
                                        body="{}")
         if method == "POST" and url.endswith("/prompt"):
             c.records["prompt"].append((url, route.request.post_data))

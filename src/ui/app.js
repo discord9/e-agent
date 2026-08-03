@@ -50,6 +50,7 @@ const state = {
   loadingOlder: false,       // 是否正在加载更早历史（防重入）
   olderDone: false,          // 更早历史已全部加载（next_before_seq 为 null）
   searchQuery: "",           // 会话列表搜索词（已小写化）；轮询重绘后过滤依然生效
+  showArchived: false,       // 列表页是否显示归档会话（默认折叠隐藏；开关在列表头部）
   lastList: [],              // 最近一次轮询拿到的完整列表，供搜索框重绘
                              //（聚合模式下 = 激活 workspace 的列表；所有既有单服务器路径不变）
   workspaceLists: {},        // workspaceId -> session[]：每台服务器各自的 /api/sessions 缓存
@@ -88,7 +89,7 @@ const els = {
   listView: $("listView"), chatView: $("chatView"),
   newPrompt: $("newPrompt"), newSessionBtn: $("newSessionBtn"),
   sessionList: $("sessionList"), listMeta: $("listMeta"), listHint: $("listHint"),
-  searchInput: $("searchInput"),
+  searchInput: $("searchInput"), showArchiveBtn: $("showArchiveBtn"),
   chatSessionId: $("chatSessionId"), chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
   messages: $("messages"), promptInput: $("promptInput"), queueBar: $("queueBar"),
   slashMenu: $("slashMenu"), forkMenu: $("forkMenu"),
@@ -128,6 +129,15 @@ function pinSvg() {
   return '<svg class="pin-icon" viewBox="0 0 24 24" width="16" height="16" ' +
     'aria-hidden="true" focusable="false" fill="currentColor">' +
     '<path d="M8 2h8a1 1 0 0 1 .7 1.7l-1.2 1.2v4.35c0 .8.32 1.56.88 2.12l1.54 1.54A1.22 1.22 0 0 1 17.06 15H12.8L12 22.25 11.2 15H6.94a1.22 1.22 0 0 1-.86-2.09l1.54-1.54a3 3 0 0 0 .88-2.12V4.9L7.3 3.7A1 1 0 0 1 8 2Z"/>' +
+    '</svg>';
+}
+
+/* 归档盒 SVG（fill 继承 currentColor，状态色灰⇄暗红跟随 .on）。
+   返回 innerHTML 字符串。 */
+function archiveSvg() {
+  return '<svg class="archive-icon" viewBox="0 0 24 24" width="16" height="16" ' +
+    'aria-hidden="true" focusable="false" fill="currentColor">' +
+    '<path d="M3 4.5A1.5 1.5 0 0 1 4.5 3h15A1.5 1.5 0 0 1 21 4.5V6a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 6V4.5ZM4.5 9h15l-1.1 10.2a2 2 0 0 1-2 1.8h-8.8a2 2 0 0 1-2-1.8L4.5 9Zm7.5 3a1 1 0 0 0-1 1v1h-1a1 1 0 0 0 0 2h4a1 1 0 0 0 0-2h-1v-1a1 1 0 0 0-1-1Z"/>' +
     '</svg>';
 }
 

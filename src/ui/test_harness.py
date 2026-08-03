@@ -187,6 +187,7 @@ const elsById={};
 for(const id of ["topActions","backBtn","backParentBtn","connState","banner","bannerText","bannerClose","tokenInput","tokenToggle","listView","chatView",
   "newPrompt","newSessionBtn","sessionList","listMeta","listHint","chatSessionId","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn","searchInput",
+  "showArchiveBtn",
   "queueBar","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
   "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks","forkMenu",
   "workspaceSelect","workspaceAddBtn","workspaceRemoveBtn","workspaceEditor",
@@ -354,6 +355,7 @@ globalThis.fetch=(url,opts={})=>{
   if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{});
   if(url.startsWith("/api/sessions/")&&url.endsWith("/compact")) return resp(202,{});
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/archive")&&m==="PUT") return resp(204,null);
   if(url.startsWith("/api/sessions/")&&m==="DELETE") return resp(204,null);
   return resp(404,{});
 };
@@ -2058,6 +2060,87 @@ async function main(){
         && FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length === bEventsBefore14 + 1,
         "events=" + FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length);
     a1StreamManual = false;
+
+    // ---- 归档（🗄 archive）----
+    // 归档按钮渲染：列表行内 SVG 按钮（同 pin 模式）
+    const firstArchive = elsById["sessionList"].querySelector(".archive-btn");
+    chk("archive: 按钮是 SVG", firstArchive && firstArchive.querySelector("svg") !== null
+        && firstArchive.textContent.trim() === "",
+        "html=" + (firstArchive ? firstArchive.innerHTML.slice(0, 40) : "none"));
+    const archiveToggle = elsById["showArchiveBtn"];
+    chk("archive: 开关渲染为「显示归档」",
+        archiveToggle != null && archiveToggle.textContent === "显示归档",
+        "txt=" + (archiveToggle && archiveToggle.textContent));
+    // 造一条已归档会话 → 列表默认折叠隐藏（核心需求）
+    sessionsData.push({id:"arch-1",status:"Idle",model:"kimi",role:"main",
+      created_at:"2024-03-01T00:00:00Z",entry_count:3,busy:false,active:true,archived:true});
+    await pollSessions();
+    await flush();
+    const rowsHidden = elsById["sessionList"].querySelectorAll(".session-row");
+    chk("archive: 归档会话默认不显示",
+        !Array.from(rowsHidden).some((r) => (r.textContent || "").includes("arch-1")),
+        "rows=" + rowsHidden.length);
+    // 「显示归档」开关：打开后归档行灰化显示 + 按钮 .on
+    for (const fn of archiveToggle._listeners["click"] || []) fn();
+    await flush();
+    const archRow = elsById["sessionList"].querySelector(".session-row.archived");
+    chk("archive: 开关打开后归档行可见且 .archived 灰化",
+        !!archRow && (archRow.textContent || "").includes("arch-1")
+        && archRow.querySelector(".archive-btn.on") !== null,
+        "cls=" + (archRow && archRow.className));
+    // 点恢复按钮 → PUT /api/sessions/arch-1/archive {archived:false}
+    const archivePutsBefore = FETCHES.filter((u) => u.endsWith("/archive")).length;
+    const _noopEv = { stopPropagation(){} };
+    for (const fn of (archRow.querySelector(".archive-btn")._listeners["click"] || [])) fn(_noopEv);
+    await flush();
+    chk("archive: 恢复 PUT {archived:false} 发出",
+        FETCHES.filter((u) => u.endsWith("/archive")).length === archivePutsBefore + 1
+        && FETCHES.filter((u) => u.endsWith("/archive")).at(-1)
+           === "/api/sessions/arch-1/archive",
+        "puts=" + FETCHES.filter((u) => u.endsWith("/archive")).join(","));
+    // 侧边栏：归档会话收进折叠的「归档 (N)」分组，点击分组内会话可打开
+    state.workspace = state.workspaces[0];   // 切回 wsA：lastList 直接喂归档列表
+    state.lastList = [
+      { id: "s1", parent_session_id: null, model: "kimi", role: "main", status: "Idle", entry_count: 8, active: true },
+      { id: "sub-arch", parent_session_id: "s1", label: "已归档子任务", status: "Idle", entry_count: 1, active: true, archived: true },
+      { id: "arch-1", parent_session_id: null, model: "kimi", role: "main", status: "Idle", entry_count: 3, active: true, archived: true },
+    ];
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    renderSidebarTree(true);
+    const archiveGroup = elsById["sidebarTree"].querySelectorAll(".tree-group")
+      .find((g) => g.textContent.includes("归档"));
+    chk("archive: 侧边栏有「归档」分组",
+        !!archiveGroup, "groups=" +
+        elsById["sidebarTree"].querySelectorAll(".tree-group").map((g) => g.textContent).join(" | "));
+    // 已归档子会话不重复出现在普通父节点子树里（只在归档分组内一次）
+    const _allArchiveRows = elsById["sidebarTree"].querySelectorAll(".tree-row")
+      .filter((r) => (r.textContent || "").includes("sub-arch"));
+    chk("archive: 归档子会话不重复渲染",
+        _allArchiveRows.length === 1,
+        "n=" + _allArchiveRows.length);
+    const groupNode = archiveGroup && archiveGroup.closest(".tree-node");
+    const kidsBox = groupNode && groupNode.querySelector(".tree-children");
+    chk("archive: 分组默认折叠",
+        !!kidsBox && kidsBox.hidden === true, "hidden=" + (kidsBox && kidsBox.hidden));
+    // 展开分组 → 归档行可见（buildTreeRoot 保留，点击可打开）
+    const gToggle = groupNode && groupNode.querySelector(".tree-toggle");
+    for (const fn of (gToggle && gToggle._listeners["click"]) || []) fn(_noopEv);
+    await flush();
+    const archRow2 = elsById["sidebarTree"].querySelector(".tree-row.archived");
+    chk("archive: 展开分组后归档行可见 + .archived",
+        !!archRow2 && (archRow2.textContent || "").includes("arch-1")
+        && archRow2.querySelector(".archive-btn") !== null,
+        "cls=" + (archRow2 && archRow2.className));
+    for (const fn of (archRow2 && archRow2._listeners["click"]) || []) fn(_noopEv);
+    await flush();
+    chk("archive: 点击归档分组内会话可打开",
+        state.sessionId === "arch-1" && state.view === "chat",
+        "sid=" + state.sessionId + " view=" + state.view);
+    // 恢复状态后清理：开关复位、sessionsData 复原（后续无其它断言依赖）
+    state.showArchived = false;
+    sessionsData = sessionsData.filter((s) => s.id !== "arch-1");
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);
