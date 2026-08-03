@@ -206,7 +206,17 @@ globalThis.history={ replaceState(){} };
 globalThis.location={ search:"" };
 globalThis.URLSearchParams=class{ constructor(){} get(){ return null; } };
 globalThis.requestAnimationFrame=()=>0;
-globalThis.AbortController=class{ constructor(){this.signal={};} abort(){} };
+/* abort 桩（真实语义）：abort() 置 signal.aborted 并触发 abort 监听器；
+   fetch 侧对未 settle 的请求 reject AbortError（见 resp 的 signal 参数与
+   abortable），模拟真实 fetch 的 AbortController——10s 超时
+   （fetchWithTimeout）与主动取消（stopTaskStream）都能打断 pending 请求。 */
+globalThis.AbortController=class{
+  constructor(){ this.signal={ aborted:false, _abortListeners:[],
+    addEventListener:(t,fn)=>{ if(t==="abort") this.signal._abortListeners.push(fn); },
+    removeEventListener:(t,fn)=>{ if(t==="abort"){ const i=this.signal._abortListeners.indexOf(fn); if(i>=0) this.signal._abortListeners.splice(i,1); } } }; }
+  abort(){ if(this.signal.aborted) return; this.signal.aborted=true;
+    for(const fn of this.signal._abortListeners.slice()) fn(); }
+};
 // gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；用工厂替换页面里的 new TextDecoder()
 function makeTextDecoder(){ return { decode(v){ return typeof v==="string"?v:""; } }; }
 // gjs timers don't fire here; keep them inert. setTimeout 记录回调，测试可手动触发
@@ -270,9 +280,34 @@ function streamManual(){
     return { done: true };
   } }; } };
 }
-function resp(status, body){ return Promise.resolve({ ok:status>=200&&status<300, status, body,
-  json:async()=>typeof body==="string"?JSON.parse(body):body,
-  text:async()=>String(body) }); }
+/* 带 abort 感知的响应 Promise：signal 已 abort → 立即 reject AbortError；
+   pending 期间 abort → reject AbortError（resolve 后迟到 abort 是 no-op，
+   与真实 fetch 一致）。 */
+function resp(status, body, signal){
+  return new Promise((resolve, reject) => {
+    const ok = status>=200 && status<300;
+    const done = () => resolve({ ok, status, body,
+      json:async()=>typeof body==="string"?JSON.parse(body):body,
+      text:async()=>String(body) });
+    if (signal && signal.aborted) { const e=new Error("The operation was aborted."); e.name="AbortError"; reject(e); return; }
+    if (signal) signal.addEventListener("abort", () => {
+      const e=new Error("The operation was aborted."); e.name="AbortError"; reject(e);
+    });
+    done();
+  });
+}
+/* 挂 abort 的延迟响应：手动 resolve 的 Promise（慢响应桩）在 signal abort
+   时 reject AbortError（不再永久 pending）。 */
+function abortable(promise, signal){
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { const e=new Error("The operation was aborted."); e.name="AbortError"; reject(e); return; }
+    const onAbort = () => { const e=new Error("The operation was aborted."); e.name="AbortError"; reject(e); };
+    signal.addEventListener("abort", onAbort);
+    promise.then((v)=>{ signal.removeEventListener("abort", onAbort); resolve(v); },
+                 (e)=>{ signal.removeEventListener("abort", onAbort); reject(e); });
+  });
+}
 // 任务输出块测试用：/api/tasks 响应与 output 端点文本（测试中可变）
 let tasksData = [];
 let taskOutputText = "";
@@ -281,6 +316,8 @@ let taskOutputDelayed = false;
 let taskOutputResolve = null;
 // 旧后端降级测试：output 端点 404（静态输出兜底）
 let taskOutput404 = false;
+// 网络失败测试：output 端点 fetch reject（模拟断网）→ 轮询停止、不降级
+let taskOutputNetFail = false;
 // 轮询超时测试：workspace 轮询请求是否带了 AbortSignal
 let pollSignalSeen = false;
 // 会话列表响应（测试中可变）：默认 s1；Bug C 测试会替换成含 subagent 的列表
@@ -315,65 +352,67 @@ let forkCandidatesData = [
 let forkPostResp = resp(201,{id:"fork-1"});
 globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
+  const signal = opts && opts.signal;   // 传给 abort 感知的响应桩
   const m=(opts.method||"GET").toUpperCase();
-  if(url==="/api/tasks") return resp(200, tasksData);
+  if(url==="/api/tasks") return resp(200, tasksData, signal);
   if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output")) {
-    if (taskOutput404) return resp(404, {});
-    if (taskOutputDelayed) return new Promise((resolve) => { taskOutputResolve = resolve; });
-    return resp(200, taskOutputText);
+    if (taskOutput404) return resp(404, {}, signal);
+    if (taskOutputDelayed) return abortable(new Promise((resolve) => { taskOutputResolve = resolve; }), signal);
+    if (taskOutputNetFail) return Promise.reject(new TypeError("network error"));
+    return resp(200, taskOutputText, signal);
   }
   if(url==="/api/sessions"&&m==="GET") {
     if (opts && opts.signal) pollSignalSeen = true;
-    return resp(200, sessionsData);
+    return resp(200, sessionsData, signal);
   }
   // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
   if(url==="http://b.local/api/sessions"&&m==="GET") {
-    if (sessionsPDelayed) return new Promise((resolve) => { sessionsPResolve = resolve; });
-    if (sessionsBFail) return resp(500, {});
-    return resp(200, sessionsBFormat ? {} : sessionsDataB);
+    if (sessionsPDelayed) return abortable(new Promise((resolve) => { sessionsPResolve = resolve; }), signal);
+    if (sessionsBFail) return resp(500, {}, signal);
+    return resp(200, sessionsBFormat ? {} : sessionsDataB, signal);
   }
   if(url==="http://b.local/api/sessions"&&m==="POST") {
-    if (bPostDelayed) return new Promise((resolve) => { bPostResolve = resolve; });
-    return resp(201, { id: "b-hist", status: "Idle", active: true });
+    if (bPostDelayed) return abortable(new Promise((resolve) => { bPostResolve = resolve; }), signal);
+    return resp(201, { id: "b-hist", status: "Idle", active: true }, signal);
   }
-  if(url.startsWith("http://b.local/api/sessions/")&&m==="DELETE") return resp(204,null);
-  if(url==="/api/sessions"&&m==="POST") return resp(201,{id:"sess-new",status:"Idle"});
+  if(url.startsWith("http://b.local/api/sessions/")&&m==="DELETE") return resp(204,null,signal);
+  if(url==="/api/sessions"&&m==="POST") return resp(201,{id:"sess-new",status:"Idle"},signal);
   if(url.startsWith("/api/sessions/a1/history")) {
-    if (aHistoryDelayed) return new Promise((resolve) => { aHistoryResolve = resolve; });
-    return resp(200,{entries:[{type:"message",message:{Assistant:{content:"A 会话内容"}}}], next_before_seq:null});
+    if (aHistoryDelayed) return abortable(new Promise((resolve) => { aHistoryResolve = resolve; }), signal);
+    return resp(200,{entries:[{type:"message",message:{Assistant:{content:"A 会话内容"}}}], next_before_seq:null},signal);
   }
   if(url==="/api/sessions/a1/events")
-    return resp(200, a1StreamManual ? streamManual() : streamEmpty());
+    return resp(200, a1StreamManual ? streamManual() : streamEmpty(), signal);
   if(url.startsWith("http://b.local/api/sessions/b1/history"))
-    return resp(200,{entries:[{type:"message",message:{Assistant:{content:"B 会话内容"}}}], next_before_seq:null});
-  if(url==="http://b.local/api/sessions/b1/events") return resp(200, streamEmpty());
+    return resp(200,{entries:[{type:"message",message:{Assistant:{content:"B 会话内容"}}}], next_before_seq:null},signal);
+  if(url==="http://b.local/api/sessions/b1/events") return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/s1/history")) {
     if (url.includes("before_seq=")) {
       const seq=url.split("before_seq=")[1].split("&")[0];
-      return resp(200, seq==="100" ? historyOlderData : {entries:[], next_before_seq:null});
+      return resp(200, seq==="100" ? historyOlderData : {entries:[], next_before_seq:null}, signal);
     }
     return resp(200, historyData);   // 含 ?limit=…（loadHistory 尾部翻页）
   }
-  if(url.startsWith("/api/sessions/s2/history")) return resp(200, historyData);
-  if(url.startsWith("/api/sessions/fork-1/history")) return resp(200, {entries:[], next_before_seq:null});
+  if(url.startsWith("/api/sessions/s2/history")) return resp(200, historyData, signal);
+  if(url.startsWith("/api/sessions/fork-1/history")) return resp(200, {entries:[], next_before_seq:null}, signal);
   // restored 替换回归测试用：缓存过期后切回，history 含新消息（历史数据本身不变）
-  if(url.startsWith("/api/sessions/restored-test/history")) return resp(200, historyData);
-  if(url.startsWith("/api/sessions/restored-test2/history")) return resp(200, historyData);
-  if(url==="/api/sessions/s1/events") return resp(200, stream());
-  if(url==="/api/sessions/s2/events") return resp(200, stream());
-  if(url==="/api/sessions/fork-1/events") return resp(200, stream());
+  if(url.startsWith("/api/sessions/restored-test/history")) return resp(200, historyData, signal);
+  if(url.startsWith("/api/sessions/restored-test2/history")) return resp(200, historyData, signal);
+  if(url==="/api/sessions/s1/events") return resp(200, stream(), signal);
+  if(url==="/api/sessions/s2/events") return resp(200, stream(), signal);
+  if(url==="/api/sessions/fork-1/events") return resp(200, stream(), signal);
   // restored 回归测试：空 SSE 流（snapshot 应被 history 替换路径跳过）
-  if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty());
-  if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty());
-  if(url==="/api/sessions/s1/fork-candidates") return resp(200, forkCandidatesData);
+  if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty(), signal);
+  if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty(), signal);
+  if(url==="/api/sessions/s1/fork-candidates") return resp(200, forkCandidatesData, signal);
   if(url==="/api/sessions/s1/fork"&&m==="POST") return forkPostResp;
-  if(url==="/api/models") return resp(200, ["chatgpt/sol","chatgpt/terra","deepseek/flash","deepseek/high","deepseek/fast","kimi/k3"]);
-  if(url.startsWith("/api/sessions/")&&url.endsWith("/model")&&m==="POST") return resp(200,{ok:true,model:"sol"});
-  if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{});
-  if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{});
-  if(url.startsWith("/api/sessions/")&&url.endsWith("/compact")) return resp(202,{});
-  if(url.startsWith("/api/sessions/")&&m==="DELETE") return resp(204,null);
-  return resp(404,{});
+  if(url==="/api/models") return resp(200, ["chatgpt/sol","chatgpt/terra","deepseek/flash","deepseek/high","deepseek/fast","kimi/k3"], signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/model")&&m==="POST") return resp(200,{ok:true,model:"sol"},signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{},signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{},signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/compact")) return resp(202,{},signal);
+  if(url.startsWith("/api/sessions/")&&m==="DELETE") return resp(204,null,signal);
+  return resp(404,{},signal);
 };
 '''
 
@@ -2430,6 +2469,214 @@ async function main(){
     chk("issue5 tree model change re-renders tooltip",
         trow5.title.includes("· gpt") && !trow5.title.includes("· kimi"),
         "title=" + JSON.stringify(trow5.title));
+
+    // =====================================================================
+    // Issue 6 (中): stopPolling 取消已排队的下一轮——queued round 携带
+    //   generation，在途结束后启动前校验失效 → 丢弃；换代后的即时刷新
+    //   （pollSessions）替换旧 intent，仍保持全局 single-flight
+    // =====================================================================
+    sessionsData = [{ id: "p6", status: "Idle", title: "P6", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    sessionsDataB = [{ id: "p6b", status: "Busy", title: "P6B", created_at: "2024-02-02T00:00:00Z", entry_count: 1, busy: true, active: true }];
+    sessionsBFail = false;
+    sessionsBFormat = false;
+    sessionsPDelayed = true;    // B 慢响应：初始立即轮询在途（>2s 场景）
+    sessionsPResolve = null;
+    state.workspaces = [
+      { id: "wsP6", name: "服务器P6", url: "", token: "tok-p6" },
+      { id: "wsP6b", name: "服务器P6B", url: "http://b.local", token: "tok-p6b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-p6";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [{ id: "p6", parent_session_id: null, label: null, status: "Idle", entry_count: 1, active: true }];
+    state.view = "list";
+    state.sessionId = null;
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.sidebar.open = false;
+    elsById["sidebar"].hidden = false;
+    renderWorkspaceSelect();
+    stopPolling();
+    const i6f0 = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
+    const i6p1 = pollSessions();   // 初始立即轮询：在途（B 慢）
+    await flush();
+    const i6p2 = pollRound();      // 2s 定时器已排队第二轮（挂在在途 Promise 上）
+    await flush();
+    chk("issue6 second round queued while in-flight",
+        pollRoundQueued !== null
+        && FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1,
+        "queued=" + (pollRoundQueued !== null)
+        + " delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f0));
+    // openSession（聊天 + 侧边栏关）→ stopPolling：gen 递增，排队 intent 作废
+    openSession("p6");
+    await flush();
+    chk("issue6 openSession stops polling in chat",
+        state.pollTimer === null && state.view === "chat",
+        "timer=" + String(state.pollTimer) + " view=" + state.view);
+    stopSSE();
+    chk("issue6 queued round carries old generation",
+        pollRoundQueuedGen < state.pollGen,
+        "queued=" + pollRoundQueuedGen + " cur=" + state.pollGen);
+    sessionsPResolve(resp(200, sessionsDataB));   // 首轮完成
+    await i6p1;
+    await i6p2;
+    await flush();
+    chk("issue6 stopped round does not run after first settles",
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1
+        && pollRoundInFlight === null && pollRoundQueued === null,
+        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f0));
+    // 换代后的即时刷新：替换（重建）排队 intent，在途结束后按新 gen 补跑，
+    // 仍保持 single-flight（同代并发合并为同一轮）
+    sessionsPDelayed = true;
+    sessionsPResolve = null;
+    const i6f1 = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
+    const i6p3 = pollSessions();   // 新 generation 即时刷新：在途（B 慢）
+    await flush();
+    stopPolling();                 // 再停：gen 递增，使排队 intent 过期
+    const i6p4 = pollSessions();   // 换代即时刷新：替换旧 intent 为新 gen
+    await flush();
+    chk("issue6 regen refresh replaces queued intent",
+        pollRoundQueued !== null && pollRoundQueuedGen === state.pollGen,
+        "queuedGen=" + pollRoundQueuedGen + " cur=" + state.pollGen);
+    sessionsPResolve(resp(200, sessionsDataB));   // 首轮（在途）完成 → 排队 intent 以新 gen 补跑
+    await i6p3;                                    // 首轮完成（排队轮次由链补跑启动）
+    await flush();                                 // 补跑轮次启动（B 再次慢响应，sessionsPResolve 更新）
+    chk("issue6 regen queued round runs after settle",
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f1 + 2
+        && pollRoundInFlight !== null && pollRoundQueued === null,
+        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f1));
+    sessionsPResolve(resp(200, sessionsDataB));   // 补跑轮次的 B 也完成（串行收尾）
+    await i6p4;
+    await flush();
+    sessionsPDelayed = false;
+
+    // =====================================================================
+    // Issue 7 (中): 无活跃 output poller 的 bash 行——折叠普通行 / 轮询因
+    //   网络失败停止的展开行——output 变化计入渲染签名 → 保留行 <pre> 就地
+    //   更新（不重建行、不重启轮询）
+    // =====================================================================
+    elsById["composerTasks"].innerHTML = "";
+    state.tasks.composerOpen = true;
+    state.tasks.list = [];
+    state.tasks.degraded = new Set();
+    state.tasks.pollers = new Map();
+    lastTasksSig = "";
+    lastTasksRenderedSig = "";
+    taskOutput404 = false;
+    taskOutputDelayed = false;
+    taskOutputNetFail = false;
+    // (a) 折叠普通行（无 poller、非 degraded）：output 变化 → 就地更新
+    tasksData = [{ session_id: "s1", id: 700, kind: "bash", label: "collapsed",
+      full_command: "collapsed", output: "out-old", role: null }];
+    await pollTasks();
+    await flush();
+    const i7row = elsById["composerTasks"].querySelector(".task-row");
+    const i7pre = i7row.querySelector(".task-output");
+    chk("issue7 collapsed row starts hidden",
+        i7pre.hidden === true && !state.tasks.pollers.has("s1:700"),
+        "hidden=" + i7pre.hidden
+        + " pollers=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    tasksData = [{ session_id: "s1", id: 700, kind: "bash", label: "collapsed",
+      full_command: "collapsed", output: "out-new", role: null }];   // 元数据不变，仅 output 变
+    await pollTasks();
+    await flush();
+    const i7row2 = elsById["composerTasks"].querySelector(".task-row");
+    chk("issue7 collapsed static output updated in place",
+        i7row2 === i7row && i7pre.textContent.includes("out-new")
+        && !i7pre.textContent.includes("out-old") && i7pre.hidden === true,
+        "same=" + (i7row2 === i7row) + " text=" + i7pre.textContent.slice(0, 20));
+    // (b) 展开行轮询因网络失败停止（非 degraded）：/api/tasks 尾部 output
+    //     变化 → 就地更新
+    tasksData = [{ session_id: "s1", id: 701, kind: "bash", label: "netfail",
+      full_command: "netfail", output: "net-old", role: null }];
+    await pollTasks();
+    await flush();
+    const i7brow = elsById["composerTasks"].querySelector(".task-row");
+    const i7bpre = i7brow.querySelector(".task-output");
+    taskOutputNetFail = true;
+    i7brow._listeners["click"][0]();   // 展开 → 启动轮询 → 首 tick fetch 网络失败
+    await flush();
+    chk("issue7 net-fail stops poller without degraded",
+        !state.tasks.pollers.has("s1:701") && !state.tasks.degraded.has("s1:701")
+        && i7bpre.hidden === false,
+        "pollers=" + JSON.stringify([...state.tasks.pollers.keys()])
+        + " degraded=" + state.tasks.degraded.has("s1:701"));
+    taskOutputNetFail = false;
+    tasksData = [{ session_id: "s1", id: 701, kind: "bash", label: "netfail",
+      full_command: "netfail", output: "net-new", role: null }];   // 元数据不变，仅 output 变
+    await pollTasks();
+    await flush();
+    const i7brow2 = elsById["composerTasks"].querySelector(".task-row");
+    chk("issue7 net-fail stopped row output updated in place",
+        i7brow2 === i7brow && i7bpre.textContent.includes("net-new")
+        && !i7bpre.textContent.includes("net-old"),
+        "same=" + (i7brow2 === i7brow) + " text=" + i7bpre.textContent.slice(0, 20));
+
+    // =====================================================================
+    // Issue 8 (中): 10s 超时 → AbortError → 标记 timeout → 下一轮恢复成功
+    //   （AbortController 桩真实化：abort 后 pending fetch 的 signal reject
+    //   AbortError，pollWorkspaceSessions 按超时失败处理，保留 stale 列表）
+    // =====================================================================
+    sessionsData = [{ id: "t1", status: "Idle", title: "T1", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    sessionsDataB = [{ id: "t2", status: "Busy", title: "T2", created_at: "2024-02-02T00:00:00Z", entry_count: 1, busy: true, active: true }];
+    sessionsBFail = false;
+    sessionsBFormat = false;
+    sessionsPDelayed = false;
+    state.workspaces = [
+      { id: "wsT1", name: "服务器T1", url: "", token: "tok-t1" },
+      { id: "wsT2", name: "服务器T2", url: "http://b.local", token: "tok-t2" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-t1";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.view = "list";
+    state.sessionId = null;
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    elsById["sidebar"].hidden = false;
+    renderWorkspaceSelect();
+    stopPolling();
+    await pollSessions();   // 预置一轮成功：B 正常返回，workspaceErrors 干净
+    await flush();
+    chk("issue8 baseline errors clean",
+        state.workspaceErrors["wsT1"] === null && state.workspaceErrors["wsT2"] === null,
+        JSON.stringify(state.workspaceErrors));
+    // B 慢响应在途：触发其 abort 定时器（10s 超时）→ abort → AbortError → timeout
+    sessionsPDelayed = true;
+    sessionsPResolve = null;
+    const i8t0 = scheduledTimeouts.length;
+    const i8p = pollSessions();
+    await flush();
+    let i8abort = null;   // 两个 workspace 各 arm 一个 abort 定时器：A 立即完成
+    for (let i = scheduledTimeouts.length - 1; i >= i8t0; i--) {   // 并 clear，B 的保留
+      if (scheduledTimeouts[i]) { i8abort = scheduledTimeouts[i]; break; }
+    }
+    chk("issue8 timeout abort timer armed", i8abort !== null,
+        "none");
+    const i8fB = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
+    i8abort();   // 触发 10s 超时 → ctrl.abort() → B 的 pending fetch reject AbortError
+    await i8p;
+    await flush();
+    chk("issue8 abort marks timeout",
+        state.workspaceErrors["wsT2"] === "timeout" && state.workspaceErrors["wsT1"] === null,
+        JSON.stringify(state.workspaceErrors));
+    chk("issue8 no new fetch on aborted round",
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i8fB,
+        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i8fB));
+    // 下一轮恢复成功：B 正常 → 错误标记清除
+    sessionsPDelayed = false;
+    await pollSessions();
+    await flush();
+    chk("issue8 next round recovers",
+        state.workspaceErrors["wsT2"] === null && state.workspaceErrors["wsT1"] === null,
+        JSON.stringify(state.workspaceErrors));
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);

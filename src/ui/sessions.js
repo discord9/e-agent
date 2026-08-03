@@ -1204,22 +1204,33 @@ function shouldPollSessions() {
 /* 单一 in-flight 守卫（promise 串行链）：同一时刻只有一轮轮询在途。
    无在途轮询 → 立即启动一轮；有在途轮询 → 把「新鲜一轮」排队到其后
    （调用方要的是当下数据，不能共享一个可能已过时的在途轮询），多个并发
-   请求合并为同一轮（pollRoundQueued 复用）。 */
+   请求合并为同一轮（同代排队复用）。排队 intent 携带 generation：在途
+   结束后启动前校验 gen 仍有效——stopPolling（gen 递增）后旧 intent 作废
+   被丢弃（不启动）；换代后的即时刷新（pollSessions）用新 gen 替换旧
+   intent（仍保持全局 single-flight，不并发叠加）。 */
 let pollRoundInFlight = null;   // 当前在途轮询的 Promise
 let pollRoundQueued = null;     // 已排队的「新鲜一轮」Promise（在途结束后立即跑）
+let pollRoundQueuedGen = -1;    // 排队 intent 的 generation（换代后替换而非复用）
 
 function runPollRound() {
   if (pollRoundInFlight) {
-    if (!pollRoundQueued) {
-      pollRoundQueued = pollRoundInFlight.then(startPollRound, startPollRound);
+    const gen = state.pollGen;
+    if (!pollRoundQueued || pollRoundQueuedGen !== gen) {
+      pollRoundQueuedGen = gen;
+      pollRoundQueued = pollRoundInFlight.then(
+        () => startPollRound(gen),
+        () => startPollRound(gen)
+      );
     }
     return pollRoundQueued;
   }
-  return startPollRound();
+  return startPollRound(state.pollGen);
 }
 
-function startPollRound() {
+function startPollRound(gen) {
   pollRoundQueued = null;
+  pollRoundQueuedGen = -1;
+  if (gen !== state.pollGen) return;   // 过期 intent（stopPolling/换代后）→ 丢弃
   pollRoundInFlight = (async () => {
     try {
       await pollAllWorkspaces();

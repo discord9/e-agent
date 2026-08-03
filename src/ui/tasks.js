@@ -45,8 +45,9 @@ async function pollTasks() {
 }
 
 /* 任务元数据签名（整列表/单行两级去重用）：决定任务列表/卡片是否需要重建。
-   排除 t.output——展开行的输出由 500ms output 轮询实时刷新，折叠行展开时
-   才拉取，output 变化不构成重建理由（否则 /api/tasks 每轮都重建卡片）。 */
+   排除 t.output——输出变化走 renderTaskList 的保留行就地更新
+   （updateRetainedTaskRow 只动 <pre>），不构成重建理由；无活跃 poller 的
+   bash 行 output 由 tasksRenderSig 纳入渲染签名触发就地更新。 */
 function taskKeySig(t) {
   return JSON.stringify([
     t.session_id || "", t.id != null ? t.id : "", t.kind || "", t.label || "",
@@ -66,19 +67,22 @@ function tasksListSig(list) {
 
 let lastTasksSig = "";
 
-/* 渲染签名：数据签名 + 降级行的静态输出。普通行的 output 由 500ms output
-   轮询 / delegate SSE 实时刷新，计入签名只会每轮重建卡片（排除）；但降级行
-   （旧后端 output 端点 404，重绘不再重启轮询）的文本 = /api/tasks 尾部
-   output 快照，变化必须触发 renderTaskList 的保留行就地更新。 */
+/* 渲染签名：数据签名 + 无活跃 output poller 的 bash 行静态 output。
+   有活跃 poller 的行文本由 500ms output 轮询实时刷新，计入签名只会每轮
+   重建卡片（排除）；但「无 poller 的 bash 行」的文本 = /api/tasks 尾部
+   output 快照——折叠行（展开才启动轮询）、降级行（旧后端 404 不再重启）、
+   网络失败已停轮询的展开行——output 变化必须触发 renderTaskList 的保留行
+   就地更新（updateRetainedTaskRow 只动 <pre>，不重建、不打断轮询/流）。 */
 function tasksRenderSig(list) {
   const base = tasksListSig(list);
-  const degradedOut = [];
+  const staticOut = [];
   for (const t of list || []) {
-    if (state.tasks.degraded.has(taskKey(t))) {
-      degradedOut.push([taskKey(t), String(t.output != null ? t.output : "")]);
+    const key = taskKey(t);
+    if (t.kind !== "delegate" && !state.tasks.pollers.has(key)) {
+      staticOut.push([key, String(t.output != null ? t.output : "")]);
     }
   }
-  return base + "|d" + JSON.stringify(degradedOut);
+  return base + "|s" + JSON.stringify(staticOut);
 }
 
 /* 已渲染签名：只在 renderTaskList 实际完成后更新（与 lastTasksSig 分开——
@@ -409,11 +413,11 @@ function renderTaskList(tasks, container) {
 }
 
 /* 保留行的就地更新（元数据未变时重建会打断展开态/轮询/流，这里只补静态
-   输出）：旧后端 output 端点 404（降级）时行文本 = 建行时的 t.output 快照，
-   之后 /api/tasks 尾部 output 变化不再可见——对处于「无活跃轮询」静态状态
-   （折叠/降级）的行用新 t.output 更新 .task-output 文本；有活跃轮询的行
-   文本由 500ms output 轮询实时刷新，跳过以免闪断。delegate 行走 SSE 流，
-   无静态输出。 */
+   输出）：对「无活跃 output poller」的 bash 行——折叠行、降级行（旧后端
+   output 端点 404）、网络失败已停轮询的展开行——用新 t.output 更新
+   .task-output 文本（仅就地 <pre>，不重建行）；有活跃轮询的行文本由
+   500ms output 轮询实时刷新，跳过以免闪断。delegate 行走 SSE 流，无静态
+   输出。 */
 function updateRetainedTaskRow(row, t, key) {
   if (t.kind === "delegate") return;
   const pre = row.querySelector(".task-output");
