@@ -38,9 +38,10 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context as AnyhowContext, anyhow};
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
-use axum::middleware::{Next, from_fn_with_state};
+use axum::http::{Method, Request, StatusCode, header};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -211,6 +212,52 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/", get(index))
         .merge(api)
         .with_state(state)
+        .layer(from_fn(cors_middleware))
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// CORS
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// CORS middleware: lets the browser UI served by one server reach the API
+/// of another server (multi-workspace mode). `*` origin is acceptable here
+/// because the API token is never auto-attached cross-origin by the browser
+/// (fetch defaults to same-origin credentials) — only a client that
+/// presents the Bearer token can read a response, and that gate is
+/// untouched. Preflight (`OPTIONS`) is answered with the headers the
+/// frontend needs (`Authorization` / `Content-Type`); all other requests
+/// pass through and get `Access-Control-Allow-Origin` on their response so
+/// the browser surfaces real status codes (401 etc.) instead of a generic
+/// CORS failure.
+async fn cors_middleware(request: Request<Body>, next: Next) -> Response {
+    if request.method() == Method::OPTIONS {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NO_CONTENT;
+        let headers = response.headers_mut();
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            header::HeaderValue::from_static("*"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            header::HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            header::HeaderValue::from_static("Authorization, Content-Type"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            header::HeaderValue::from_static("86400"),
+        );
+        return response;
+    }
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+    response
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1733,9 +1780,8 @@ async fn session_summary(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let session = live(&state, &id).map_err(|(status, message)| {
-        (status, Json(serde_json::json!({ "error": message })))
-    })?;
+    let session = live(&state, &id)
+        .map_err(|(status, message)| (status, Json(serde_json::json!({ "error": message }))))?;
     let Some(entry) = summary_get(&state, &id) else {
         // 冷缓存（server 重启后 / 会话尚无完整 turn）：按需触发一次后台
         // 生成，并返回 generating 标记——桌宠据此提示"稍后再点"，而不是
@@ -2177,6 +2223,61 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert!(!authorized(token, &none));
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_and_response_headers() {
+        use tower::util::ServiceExt;
+        let app = router(Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(std::env::temp_dir()),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+        }));
+        // Preflight: answered without auth, 204 + CORS headers.
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/sessions")
+                    .header(header::ORIGIN, "http://127.0.0.1:18766")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+        // Authed GET: normal response + CORS header so the browser surfaces
+        // real status codes instead of a generic CORS failure.
+        let get = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(
+            get.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
     }
 
     #[test]
