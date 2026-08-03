@@ -158,6 +158,108 @@ async fn connect_twice_on_file_is_idempotent_and_persists() {
     drop((dir, s2));
 }
 
+/// 老库迁移：一个在 archive/title/pinned/writer 特性之前创建的 sessions
+/// 表（没有这四个列）在 connect 时自动 ALTER 补列，随后共享的
+/// archived/pinned/title/writer 列查询与写入全部正常 —— 覆盖
+/// "老库无 archived 列 → connect 后 SELECT 正常"（pinned 当初同样缺列，
+/// 只是 archive 是新加列，老库文件必然触发）。
+#[tokio::test]
+async fn connect_migrates_legacy_sessions_table_missing_feature_columns() {
+    let (dir, path) = temp_db();
+    let wid = workspace_id();
+    let p = path.to_str().unwrap();
+
+    // 手工建一个「旧版」sessions 表：只有基础列，没有 title/pinned/
+    // archived/writer，并写入一条旧元数据行（时间戳为微秒）。
+    let legacy_ddl = r#"
+        CREATE TABLE sessions (
+            workspace_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_active_at INTEGER NOT NULL,
+            model TEXT NULL,
+            "role" TEXT NULL,
+            entry_count INTEGER NOT NULL DEFAULT 0,
+            parent_session_id TEXT NULL,
+            parent_task_id INTEGER NULL
+        )
+    "#;
+    {
+        let db = turso::Builder::new_local(p)
+            .build()
+            .await
+            .expect("open legacy db");
+        let conn = db.connect().expect("connect legacy db");
+        conn.execute(legacy_ddl, ())
+            .await
+            .expect("create legacy sessions table");
+        conn.execute(
+            "INSERT INTO sessions \
+             (workspace_id, session_id, created_at, last_active_at, entry_count) \
+             VALUES (?1, ?2, ?3, ?4, 2)",
+            (
+                wid.as_str(),
+                "legacy-1",
+                1_700_000_000_000_000i64,
+                1_700_000_000_100_000i64,
+            ),
+        )
+        .await
+        .expect("insert legacy meta row");
+    }
+
+    // connect 应自动探测 + ALTER：老行读回 archived/pinned/title = NULL，
+    // 写入路径（archive 一个老会话）落新列，list_meta 的共享 SELECT 正常。
+    let session = SqliteSession::connect(p, &wid, "legacy-1")
+        .await
+        .expect("connect migrates the legacy table");
+    let meta = session
+        .load_meta_row("legacy-1")
+        .await
+        .expect("query migrated meta")
+        .expect("legacy row readable after migration");
+    assert_eq!(meta.session_id, "legacy-1");
+    assert_eq!(meta.entry_count, 2);
+    assert_eq!(meta.archived, None, "old rows read archived back as NULL");
+    assert_eq!(meta.pinned, None, "old rows read pinned back as NULL");
+    assert_eq!(meta.title, None, "old rows read title back as NULL");
+    assert_eq!(meta.writer, None, "old rows read writer back as NULL");
+
+    session
+        .set_archived("legacy-1", true)
+        .await
+        .expect("archive legacy session");
+    let meta = session
+        .load_meta_row("legacy-1")
+        .await
+        .expect("query after archive")
+        .expect("row after archive");
+    assert_eq!(
+        meta.archived,
+        Some(true),
+        "new snapshot row carries archived"
+    );
+    let list = session
+        .list_meta()
+        .await
+        .expect("list_meta after migration");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].archived, Some(true));
+
+    // 迁移幂等：再 connect 一次，探测发现列已存在、不重复 ALTER，一切正常。
+    drop(session);
+    let session2 = SqliteSession::connect(p, &wid, "legacy-1")
+        .await
+        .expect("reconnect on migrated db");
+    let list = session2
+        .list_meta()
+        .await
+        .expect("list_meta after reconnect");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].archived, Some(true));
+    drop((dir, session2));
+}
+
 // ----------------------------------------------------------------------
 // append / load round-trips
 // ----------------------------------------------------------------------
@@ -1479,6 +1581,7 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
         parent_task_id: None,
         title: Some("a title".into()),
         pinned: Some(true),
+        archived: Some(true),
         writer: None,
         label: None,
     };
@@ -1512,6 +1615,7 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
     assert_eq!(backfilled.parent_task_id, Some(7));
     assert_eq!(backfilled.title.as_deref(), Some("a title"));
     assert_eq!(backfilled.pinned, Some(true));
+    assert_eq!(backfilled.archived, Some(true));
     assert_eq!(backfilled.writer, None, "writer is stamped by insert_meta");
 
     // Model-only backfill leaves the (absent) links untouched.
@@ -1526,6 +1630,7 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
         parent_task_id: None,
         title: None,
         pinned: None,
+        archived: None,
         writer: None,
         label: None,
     };
@@ -2272,6 +2377,81 @@ async fn sessions_meta_set_pinned_persists_and_survives_touch() {
         .find(|m| m.session_id == sid)
         .expect("session listed after unpin");
     assert_eq!(latest.pinned, Some(false), "unpin stores Some(false)");
+}
+
+#[tokio::test]
+async fn sessions_meta_set_archived_persists_and_survives_touch() {
+    let (_dir, session, sid) = fresh_session().await;
+
+    session.set_archived(&sid, true).await.unwrap();
+    assert!(session.audit_meta(&sid).await.unwrap().is_empty());
+
+    session
+        .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+        .await
+        .unwrap();
+    let created = session
+        .list_meta()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.session_id == sid)
+        .expect("created session must be listed");
+    assert_eq!(
+        created.archived, None,
+        "a fresh session reads as never-touched"
+    );
+
+    // Archive → the list shows archived=true, the audit trail appends one
+    // snapshot, created_at survives.
+    session.set_archived(&sid, true).await.unwrap();
+    let list = session.list_meta().await.unwrap();
+    let archived = list
+        .iter()
+        .find(|m| m.session_id == sid)
+        .expect("session still listed after archive");
+    assert_eq!(archived.archived, Some(true));
+    assert_eq!(
+        archived.model.as_deref(),
+        Some("model-x"),
+        "archive preserves columns"
+    );
+    assert_eq!(
+        session.audit_meta(&sid).await.unwrap().len(),
+        2,
+        "create + archive"
+    );
+
+    // touch carries the archived flag.
+    session.touch_meta().await.unwrap();
+    let latest = session
+        .list_meta()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.session_id == sid)
+        .expect("session listed after touch");
+    assert_eq!(
+        latest.archived,
+        Some(true),
+        "touch preserves the archived flag"
+    );
+    assert_eq!(
+        latest.created_at, archived.created_at,
+        "touch preserves created_at"
+    );
+
+    // Restore stores Some(false) — distinct from the None of a
+    // never-touched session, both read as unarchived.
+    session.set_archived(&sid, false).await.unwrap();
+    let latest = session
+        .list_meta()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.session_id == sid)
+        .expect("session listed after restore");
+    assert_eq!(latest.archived, Some(false), "restore stores Some(false)");
 }
 
 #[tokio::test]

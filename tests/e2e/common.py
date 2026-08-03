@@ -88,9 +88,10 @@ class Case:
         self.sse_body = "retry: 3000\n\n"
         self.title_status = 204              # PUT /title 的 mock 状态码
         self.pin_status = 200                # PUT /pin 的 mock 状态码
+        self.archive_status = 200            # PUT /archive 的 mock 状态码
         self.btw_status = 201                # POST /btw 的 mock 状态码
         self.records = {
-            "prompt": [], "title": [], "pin": [], "btw": [],
+            "prompt": [], "title": [], "pin": [], "archive": [], "btw": [],
             "compact": [], "history": [], "create": [], "delete": [],
         }
         self.extra_handlers = []             # [(predicate(url, method), async handler(route,url,method))]
@@ -128,10 +129,14 @@ class Case:
         wait_rows: 期望的列表行数；0 表示允许空列表（只等首轮轮询渲染）。
         """
         page = self.page
+        # 必须在页面任何脚本运行前把 token 种进 localStorage（add_init_script
+        # 对每次导航/刷新都生效）：多工作区功能之后，initWorkspaces 会在首次
+        # 加载时把「默认 workspace（空 token）」落盘，刷新后它覆盖
+        # eagent_token —— 原来的 goto→setItem→reload 顺序不再可靠（全部
+        # mock 用例在 start() 处空列表超时）。
+        await page.add_init_script(
+            "localStorage.setItem('eagent_token', %s)" % json.dumps(self.token))
         await page.goto(BASE + "/", wait_until="load")
-        await page.wait_for_timeout(400)
-        await page.evaluate("localStorage.setItem('eagent_token', %s)"
-                            % json.dumps(self.token))
         await page.reload(wait_until="load")
         await page.wait_for_function(
             "() => document.querySelectorAll('.session-row').length >= %d || "
@@ -185,6 +190,10 @@ def make_intercept(c):
         if method == "PUT" and url.endswith("/pin"):
             c.records["pin"].append((url, route.request.post_data))
             return await route.fulfill(status=c.pin_status, content_type="application/json",
+                                       body="{}")
+        if method == "PUT" and url.endswith("/archive"):
+            c.records["archive"].append((url, route.request.post_data))
+            return await route.fulfill(status=c.archive_status, content_type="application/json",
                                        body="{}")
         if method == "POST" and url.endswith("/prompt"):
             c.records["prompt"].append((url, route.request.post_data))
