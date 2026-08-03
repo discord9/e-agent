@@ -1306,6 +1306,15 @@ async function main(){
     chk("delegate row without session_id shows no parent label",
         prow.querySelector(".tparent") === null,
         "parent=" + String(prow.querySelector(".tparent")));
+    // 极端 resume：session_id === subagent_session_id → 省略父标签（避免「会话 X / 父: X」重复）
+    renderTaskList([{ session_id: "sub-9", id: 84, kind: "delegate", label: "自指任务",
+      full_command: null, output: null, role: null, subagent_session_id: "sub-9" }],
+      elsById["composerTasks"]);
+    prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    chk("delegate row with identical parent/subagent id omits parent label",
+        prow.querySelector(".tparent") === null
+        && prow.querySelectorAll(".tsid").length === 1,
+        "parent=" + String(prow.querySelector(".tparent")));
     await pollSessions();   // 还原激活 workspace 缓存（后续测试基于轮询状态继续）
 
     // ---- Token 折叠：默认收起 → 点击展开 → 输入后按钮「已设置」 → 再点收起 ----
