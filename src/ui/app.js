@@ -42,6 +42,7 @@ const state = {
   status: "Idle",
   initSource: null,          // "history" | "snapshot" | null —— 初始渲染来源
   pollTimer: null,
+  pollGen: 0,              // 轮询代次：stopPolling 递增，使在途轮询的续调度失效
   lastValidateSig: null,     // 上一轮校验问题签名（相同则不再刷 banner）
   validateBannerUp: false,   // 当前 banner 是否由校验提示占用（恢复数据后只清自己的）
   sse: { ctrl: null, retryTimer: null, stopped: false },
@@ -77,7 +78,7 @@ const state = {
     streamText: new Map(),   // 展开中 delegate 行的已累积流式文本（key → string，重绘恢复用）
     degraded: new Set(),     // bash 行 output 端点 404/不可用 → 降级静态尾部（key；重绘不再重启轮询）
   },
-  renameActive: false,       // 行内重命名进行中：列表页 1s 轮询重绘跳过，防编辑框被冲掉
+  renameActive: false,       // 行内重命名进行中：列表页 2s 轮询重绘跳过，防编辑框被冲掉
 };
 
 /* 常用 DOM 引用 */
@@ -302,6 +303,8 @@ async function switchWorkspace(id, epoch) {
   state.tasks.streamText = new Map();
   state.tasks.degraded = new Set();
   state.tasks.composerOpen = false;
+  lastTasksSig = "";              // 任务面板签名跟随 workspace 重置（DOM 已清空）
+  lastTasksRenderedSig = "";
   state.sidebar.expanded = new Set();
   state.sidebar.filter = "";
   state.sidebar.showAllWs = new Set();
@@ -338,11 +341,11 @@ async function switchWorkspace(id, epoch) {
   updateTokenToggle();
   history.replaceState(null, "", "/");   // 丢弃可能指向旧工作区会话的 ?session= 深链
   // ---- 聚合视图立即重绘（用各 workspace 缓存列表，不等轮询） ----
-  renderSessionList();
+  renderSessionList(undefined, true);   // force：切换后清空过 DOM，必须重绘
   renderSidebarTree(true);
   // ---- 重跑启动加载序列（与 init() 的加载部分一致） ----
   startPolling();
-  pollAllWorkspaces();
+  pollSessions();   // 立即轮询经 runPollRound 与定时轮询共用 in-flight 守卫
   startTasksPolling();
   pollTasks();
 }

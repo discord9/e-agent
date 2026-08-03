@@ -101,6 +101,7 @@ function newAccumulator() {
     assistantText: "",   // 已累积的文本（用于替换/查重）
     thinkingEl: null,    // 当前 thinking 折叠块
     thinkBody: null,
+    thinkDot: null,      // 当前 thinking 的圆点元素（缓存：delta 追加不再 querySelector）
     toolStack: [],       // 未配对结果的工具卡片（live 事件按顺序配对）
     pendingByCall: new Map(), // call_id -> 卡片元素（history 渲染按 id 配对）
   };
@@ -116,7 +117,7 @@ function freezeAssistant(acc) {
   }
   // 思考结束：转圈 → 勾号（表示该轮思考完成）
   if (acc && acc.thinkingEl) {
-    const dot = acc.thinkingEl.querySelector(".think-dot");
+    const dot = acc.thinkDot || acc.thinkingEl.querySelector(".think-dot");
     if (dot) {
       dot.classList.remove("active");
       dot.classList.add("done");
@@ -145,6 +146,30 @@ function scrollBottom(force) {
     // 程序滚到底后同步按钮状态（scroll 事件被 isTrusted 拦截时不会触发）
     if (els.jumpBottomBtn) els.jumpBottomBtn.hidden = true;
   }
+}
+
+/* SSE delta 滚动合并（perf 修复）：delta 追加只标记「需要滚到底」，rAF 回调
+   里每帧最多执行一次 scrollBottom——帧内多个 delta（思考+正文+工具事件）
+   合并为一次 scrollHeight/scrollTop 布局读写，消除每 delta 的 forced reflow。
+   force 路径（工具卡片/结果等一次性事件）仍即时执行，保持现有语义；
+   scrollBottom 内部的 userScrolled/suppressScroll 锁定逻辑完全不变。
+   无 rAF 环境（gjs harness / 极老浏览器）退化为 setTimeout(0) 模拟；
+   两者都不可用则立即执行（保底不丢滚动）。 */
+let scrollRafPending = false;
+function scheduleScrollBottom() {
+  if (scrollRafPending) return;      // 帧内已挂起：合并，不重复调度
+  scrollRafPending = true;
+  const run = () => {
+    scrollRafPending = false;
+    scrollBottom(false);
+  };
+  try {
+    if (typeof requestAnimationFrame === "function") { requestAnimationFrame(run); return; }
+  } catch (e) { /* 落到 setTimeout 兜底 */ }
+  try {
+    if (typeof setTimeout === "function") { setTimeout(run, 0); return; }
+  } catch (e) { /* 立即执行保底 */ }
+  run();
 }
 
 function appendUserMsg(text) {
@@ -193,7 +218,7 @@ function appendAssistantDelta(text, acc) {
   acc.assistantText += text;
   // 流式渲染：直接追加（markdown 不重算，保持简单、快）
   body.insertAdjacentText("beforeend", text);
-  scrollBottom(false);
+  scheduleScrollBottom();   // rAF 批处理：帧内多个 delta 合并为一次滚动
 }
 
 /* 非流式回合结束时整段落文本 */
@@ -224,6 +249,7 @@ function thinkingBlock(acc) {
     els.messages.appendChild(det);
     acc.thinkingEl = det;                   // 先绑定再 prune：进行中的思考块不折叠
     acc.thinkBody = body;
+    acc.thinkDot = dot;                     // 缓存圆点：后续 delta 不再 querySelector
     pruneMessages();
   }
   return acc.thinkBody;
@@ -232,12 +258,12 @@ function thinkingBlock(acc) {
 function appendReasoningDelta(text, acc) {
   const body = thinkingBlock(acc);
   body.insertAdjacentText("beforeend", text);
-  // 思考进行中：折叠栏的圆点转圈
+  // 思考进行中：折叠栏的圆点转圈（dot 引用在 thinkingBlock 创建时缓存）
   if (acc.thinkingEl) {
-    const dot = acc.thinkingEl.querySelector(".think-dot");
+    const dot = acc.thinkDot || acc.thinkingEl.querySelector(".think-dot");
     if (dot) dot.classList.add("active");
   }
-  scrollBottom(false);
+  scheduleScrollBottom();   // rAF 批处理：帧内多个 delta 合并为一次滚动
 }
 
 /* 工具调用卡片（live 事件，无 call_id，按顺序配对结果） */
@@ -320,6 +346,7 @@ function reattachInFlight(acc) {
   if (t && !t.querySelector(".think-dot.done")) {
     acc.thinkingEl = t;
     acc.thinkBody = t.querySelector(".think-body");
+    acc.thinkDot = t.querySelector(".think-dot");   // 缓存圆点：增量续写不再查找
   }
   // 2. assistant：最后一个 .msg-assistant，且其 .msg-body 是纯文本（流式期间
   //    未 markdown 化，无元素子节点）→ 进行中，绑定并把 textContent 取回
@@ -668,7 +695,7 @@ function applyStatus(status) {
       state.acc.assistantBody.innerHTML = renderMarkdown(state.acc.assistantText);
     }
     if (state.acc.thinkingEl) {
-      const dot = state.acc.thinkingEl.querySelector(".think-dot");
+      const dot = state.acc.thinkDot || state.acc.thinkingEl.querySelector(".think-dot");
       if (dot) {
         dot.classList.remove("active");
         dot.classList.add("done");

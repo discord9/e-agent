@@ -207,7 +207,17 @@ globalThis.history={ replaceState(){} };
 globalThis.location={ search:"" };
 globalThis.URLSearchParams=class{ constructor(){} get(){ return null; } };
 globalThis.requestAnimationFrame=()=>0;
-globalThis.AbortController=class{ constructor(){this.signal={};} abort(){} };
+/* abort 桩（真实语义）：abort() 置 signal.aborted 并触发 abort 监听器；
+   fetch 侧对未 settle 的请求 reject AbortError（见 resp 的 signal 参数与
+   abortable），模拟真实 fetch 的 AbortController——10s 超时
+   （fetchWithTimeout）与主动取消（stopTaskStream）都能打断 pending 请求。 */
+globalThis.AbortController=class{
+  constructor(){ this.signal={ aborted:false, _abortListeners:[],
+    addEventListener:(t,fn)=>{ if(t==="abort") this.signal._abortListeners.push(fn); },
+    removeEventListener:(t,fn)=>{ if(t==="abort"){ const i=this.signal._abortListeners.indexOf(fn); if(i>=0) this.signal._abortListeners.splice(i,1); } } }; }
+  abort(){ if(this.signal.aborted) return; this.signal.aborted=true;
+    for(const fn of this.signal._abortListeners.slice()) fn(); }
+};
 // gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；用工厂替换页面里的 new TextDecoder()
 function makeTextDecoder(){ return { decode(v){ return typeof v==="string"?v:""; } }; }
 // gjs timers don't fire here; keep them inert. setTimeout 记录回调，测试可手动触发
@@ -271,12 +281,46 @@ function streamManual(){
     return { done: true };
   } }; } };
 }
-function resp(status, body){ return Promise.resolve({ ok:status>=200&&status<300, status, body,
-  json:async()=>typeof body==="string"?JSON.parse(body):body,
-  text:async()=>String(body) }); }
+/* 带 abort 感知的响应 Promise：signal 已 abort → 立即 reject AbortError；
+   pending 期间 abort → reject AbortError（resolve 后迟到 abort 是 no-op，
+   与真实 fetch 一致）。 */
+function resp(status, body, signal){
+  return new Promise((resolve, reject) => {
+    const ok = status>=200 && status<300;
+    const done = () => resolve({ ok, status, body,
+      json:async()=>typeof body==="string"?JSON.parse(body):body,
+      text:async()=>String(body) });
+    if (signal && signal.aborted) { const e=new Error("The operation was aborted."); e.name="AbortError"; reject(e); return; }
+    if (signal) signal.addEventListener("abort", () => {
+      const e=new Error("The operation was aborted."); e.name="AbortError"; reject(e);
+    });
+    done();
+  });
+}
+/* 挂 abort 的延迟响应：手动 resolve 的 Promise（慢响应桩）在 signal abort
+   时 reject AbortError（不再永久 pending）。 */
+function abortable(promise, signal){
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { const e=new Error("The operation was aborted."); e.name="AbortError"; reject(e); return; }
+    const onAbort = () => { const e=new Error("The operation was aborted."); e.name="AbortError"; reject(e); };
+    signal.addEventListener("abort", onAbort);
+    promise.then((v)=>{ signal.removeEventListener("abort", onAbort); resolve(v); },
+                 (e)=>{ signal.removeEventListener("abort", onAbort); reject(e); });
+  });
+}
 // 任务输出块测试用：/api/tasks 响应与 output 端点文本（测试中可变）
 let tasksData = [];
 let taskOutputText = "";
+// perf 回归测试：output 端点延迟（手动 resolve）——验证 500ms 轮询防重入
+let taskOutputDelayed = false;
+let taskOutputResolve = null;
+// 旧后端降级测试：output 端点 404（静态输出兜底）
+let taskOutput404 = false;
+// 网络失败测试：output 端点 fetch reject（模拟断网）→ 轮询停止、不降级
+let taskOutputNetFail = false;
+// 轮询超时测试：workspace 轮询请求是否带了 AbortSignal
+let pollSignalSeen = false;
 // 会话列表响应（测试中可变）：默认 s1；Bug C 测试会替换成含 subagent 的列表
 let sessionsData = [{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}];
 // 聚合模式：第二台服务器（url "http://b.local"）的独立列表 + 故障开关
@@ -285,6 +329,10 @@ let sessionsDataB = [
   {id:"b-orphan",parent_session_id:"missing-b",status:"Idle",entry_count:1,active:true},
 ];
 let sessionsBFail = false;
+// perf 回归测试：B 的 /api/sessions GET 延迟（手动 resolve）——验证整轮
+// 渲染一次 + 轮询 setTimeout 链防重入（慢响应期间不叠加、完成后才续调度）
+let sessionsPDelayed = false;
+let sessionsPResolve = null;
 // 竞态/格式测试开关：B 的 resume POST 延迟（手动 resolve）、A 的 history 延迟、
 // B 返回非数组 JSON（{}）
 let bPostDelayed = false;
@@ -305,59 +353,68 @@ let forkCandidatesData = [
 let forkPostResp = resp(201,{id:"fork-1"});
 globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
+  const signal = opts && opts.signal;   // 传给 abort 感知的响应桩
   const m=(opts.method||"GET").toUpperCase();
-  if(url==="/api/tasks") return resp(200, tasksData);
-  if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output"))
-    return resp(200, taskOutputText);
-  if(url==="/api/sessions"&&m==="GET") return resp(200, sessionsData);
+  if(url==="/api/tasks") return resp(200, tasksData, signal);
+  if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output")) {
+    if (taskOutput404) return resp(404, {}, signal);
+    if (taskOutputDelayed) return abortable(new Promise((resolve) => { taskOutputResolve = resolve; }), signal);
+    if (taskOutputNetFail) return Promise.reject(new TypeError("network error"));
+    return resp(200, taskOutputText, signal);
+  }
+  if(url==="/api/sessions"&&m==="GET") {
+    if (opts && opts.signal) pollSignalSeen = true;
+    return resp(200, sessionsData, signal);
+  }
   // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
   if(url==="http://b.local/api/sessions"&&m==="GET") {
-    if (sessionsBFail) return resp(500, {});
-    return resp(200, sessionsBFormat ? {} : sessionsDataB);
+    if (sessionsPDelayed) return abortable(new Promise((resolve) => { sessionsPResolve = resolve; }), signal);
+    if (sessionsBFail) return resp(500, {}, signal);
+    return resp(200, sessionsBFormat ? {} : sessionsDataB, signal);
   }
   if(url==="http://b.local/api/sessions"&&m==="POST") {
-    if (bPostDelayed) return new Promise((resolve) => { bPostResolve = resolve; });
-    return resp(201, { id: "b-hist", status: "Idle", active: true });
+    if (bPostDelayed) return abortable(new Promise((resolve) => { bPostResolve = resolve; }), signal);
+    return resp(201, { id: "b-hist", status: "Idle", active: true }, signal);
   }
-  if(url.startsWith("http://b.local/api/sessions/")&&m==="DELETE") return resp(204,null);
-  if(url==="/api/sessions"&&m==="POST") return resp(201,{id:"sess-new",status:"Idle"});
+  if(url.startsWith("http://b.local/api/sessions/")&&m==="DELETE") return resp(204,null,signal);
+  if(url==="/api/sessions"&&m==="POST") return resp(201,{id:"sess-new",status:"Idle"},signal);
   if(url.startsWith("/api/sessions/a1/history")) {
-    if (aHistoryDelayed) return new Promise((resolve) => { aHistoryResolve = resolve; });
-    return resp(200,{entries:[{type:"message",message:{Assistant:{content:"A 会话内容"}}}], next_before_seq:null});
+    if (aHistoryDelayed) return abortable(new Promise((resolve) => { aHistoryResolve = resolve; }), signal);
+    return resp(200,{entries:[{type:"message",message:{Assistant:{content:"A 会话内容"}}}], next_before_seq:null},signal);
   }
   if(url==="/api/sessions/a1/events")
-    return resp(200, a1StreamManual ? streamManual() : streamEmpty());
+    return resp(200, a1StreamManual ? streamManual() : streamEmpty(), signal);
   if(url.startsWith("http://b.local/api/sessions/b1/history"))
-    return resp(200,{entries:[{type:"message",message:{Assistant:{content:"B 会话内容"}}}], next_before_seq:null});
-  if(url==="http://b.local/api/sessions/b1/events") return resp(200, streamEmpty());
+    return resp(200,{entries:[{type:"message",message:{Assistant:{content:"B 会话内容"}}}], next_before_seq:null},signal);
+  if(url==="http://b.local/api/sessions/b1/events") return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/s1/history")) {
     if (url.includes("before_seq=")) {
       const seq=url.split("before_seq=")[1].split("&")[0];
-      return resp(200, seq==="100" ? historyOlderData : {entries:[], next_before_seq:null});
+      return resp(200, seq==="100" ? historyOlderData : {entries:[], next_before_seq:null}, signal);
     }
     return resp(200, historyData);   // 含 ?limit=…（loadHistory 尾部翻页）
   }
-  if(url.startsWith("/api/sessions/s2/history")) return resp(200, historyData);
-  if(url.startsWith("/api/sessions/fork-1/history")) return resp(200, {entries:[], next_before_seq:null});
+  if(url.startsWith("/api/sessions/s2/history")) return resp(200, historyData, signal);
+  if(url.startsWith("/api/sessions/fork-1/history")) return resp(200, {entries:[], next_before_seq:null}, signal);
   // restored 替换回归测试用：缓存过期后切回，history 含新消息（历史数据本身不变）
-  if(url.startsWith("/api/sessions/restored-test/history")) return resp(200, historyData);
-  if(url.startsWith("/api/sessions/restored-test2/history")) return resp(200, historyData);
-  if(url==="/api/sessions/s1/events") return resp(200, stream());
-  if(url==="/api/sessions/s2/events") return resp(200, stream());
-  if(url==="/api/sessions/fork-1/events") return resp(200, stream());
+  if(url.startsWith("/api/sessions/restored-test/history")) return resp(200, historyData, signal);
+  if(url.startsWith("/api/sessions/restored-test2/history")) return resp(200, historyData, signal);
+  if(url==="/api/sessions/s1/events") return resp(200, stream(), signal);
+  if(url==="/api/sessions/s2/events") return resp(200, stream(), signal);
+  if(url==="/api/sessions/fork-1/events") return resp(200, stream(), signal);
   // restored 回归测试：空 SSE 流（snapshot 应被 history 替换路径跳过）
-  if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty());
-  if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty());
-  if(url==="/api/sessions/s1/fork-candidates") return resp(200, forkCandidatesData);
+  if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty(), signal);
+  if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty(), signal);
+  if(url==="/api/sessions/s1/fork-candidates") return resp(200, forkCandidatesData, signal);
   if(url==="/api/sessions/s1/fork"&&m==="POST") return forkPostResp;
-  if(url==="/api/models") return resp(200, ["chatgpt/sol","chatgpt/terra","deepseek/flash","deepseek/high","deepseek/fast","kimi/k3"]);
-  if(url.startsWith("/api/sessions/")&&url.endsWith("/model")&&m==="POST") return resp(200,{ok:true,model:"sol"});
-  if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{});
-  if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{});
-  if(url.startsWith("/api/sessions/")&&url.endsWith("/compact")) return resp(202,{});
-  if(url.startsWith("/api/sessions/")&&url.endsWith("/archive")&&m==="PUT") return resp(204,null);
-  if(url.startsWith("/api/sessions/")&&m==="DELETE") return resp(204,null);
-  return resp(404,{});
+  if(url==="/api/models") return resp(200, ["chatgpt/sol","chatgpt/terra","deepseek/flash","deepseek/high","deepseek/fast","kimi/k3"], signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/model")&&m==="POST") return resp(200,{ok:true,model:"sol"},signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{},signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{},signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/compact")) return resp(202,{},signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/archive")&&m==="PUT") return resp(204,null,signal);
+  if(url.startsWith("/api/sessions/")&&m==="DELETE") return resp(204,null,signal);
+  return resp(404,{},signal);
 };
 '''
 
@@ -2141,6 +2198,622 @@ async function main(){
     // 恢复状态后清理：开关复位、sessionsData 复原（后续无其它断言依赖）
     state.showArchived = false;
     sessionsData = sessionsData.filter((s) => s.id !== "arch-1");
+    // =====================================================================
+    // perf 修复回归：聚合轮询整轮一次渲染 + 签名去重 + setTimeout 链防重入
+    // + 聊天视图停轮询 + 侧边栏 hidden 跳过树渲染 + 任务面板签名去重
+    // + 500ms output 轮询防重入
+    // =====================================================================
+    let renderSessionListCalls = 0;
+    const _origRSL = renderSessionList;
+    renderSessionList = function (...a) { renderSessionListCalls++; return _origRSL.apply(this, a); };
+    let renderSidebarTreeCalls = 0;
+    const _origRST = renderSidebarTree;
+    renderSidebarTree = function (...a) { renderSidebarTreeCalls++; return _origRST.apply(this, a); };
+    chk("perf poll interval is 2s", POLL_INTERVAL_MS === 2000, "=" + POLL_INTERVAL_MS);
+
+    // 双 workspace 整轮：两个响应只触发一次列表渲染 + 一次树渲染（旧实现
+    // 每 workspace 响应各自 renderSessionList/renderSidebarTree → 各 2 次）
+    sessionsData = [{ id: "p1", status: "Idle", title: "P 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    sessionsDataB = [{ id: "p2", status: "Busy", title: "P2 会话", created_at: "2024-02-02T00:00:00Z", entry_count: 2, busy: true, active: true }];
+    sessionsBFail = false;
+    sessionsBFormat = false;
+    state.workspaces = [
+      { id: "wsP1", name: "服务器P1", url: "", token: "tok-p1" },
+      { id: "wsP2", name: "服务器P2", url: "http://b.local", token: "tok-p2" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-p1";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    elsById["sidebar"].hidden = false;   // 侧边栏可见（默认态）
+    renderWorkspaceSelect();
+    renderSessionListCalls = 0;
+    renderSidebarTreeCalls = 0;
+    await pollAllWorkspaces();
+    await flush();
+    chk("perf whole round renders list once", renderSessionListCalls === 1,
+        "calls=" + renderSessionListCalls);
+    chk("perf whole round renders tree once", renderSidebarTreeCalls === 1,
+        "calls=" + renderSidebarTreeCalls);
+    chk("perf round rendered aggregate rows",
+        elsById["sessionList"].querySelectorAll(".session-row").length >= 2,
+        "n=" + elsById["sessionList"].querySelectorAll(".session-row").length);
+    // 数据未变：第二轮整轮 → 列表/树签名去重，不重建 DOM（元素同一性保持）
+    const rowRefP = elsById["sessionList"].querySelectorAll(".session-row")[0];
+    const treeRefP = elsById["sidebarTree"].querySelectorAll(".tree-ws-section")[0];
+    renderSessionListCalls = 0;
+    renderSidebarTreeCalls = 0;
+    await pollAllWorkspaces();
+    await flush();
+    chk("perf unchanged round skips DOM rebuild",
+        elsById["sessionList"].querySelectorAll(".session-row")[0] === rowRefP
+        && elsById["sidebarTree"].querySelectorAll(".tree-ws-section")[0] === treeRefP,
+        "rowSame=" + (elsById["sessionList"].querySelectorAll(".session-row")[0] === rowRefP)
+        + " treeSame=" + (elsById["sidebarTree"].querySelectorAll(".tree-ws-section")[0] === treeRefP));
+    // 数据变化（busy 翻转）→ 重绘
+    sessionsData = [{ id: "p1", status: "Busy", title: "P 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: true, active: true }];
+    await pollAllWorkspaces();
+    await flush();
+    chk("perf busy flip rebuilds list",
+        elsById["sessionList"].querySelectorAll(".session-row")[0] !== rowRefP
+        && elsById["sessionList"].querySelector(".busy-dot.busy") !== null,
+        "same=" + (elsById["sessionList"].querySelectorAll(".session-row")[0] === rowRefP));
+
+    // setTimeout 链防重入：慢响应期间不调度下一轮、不渲染；完成后才续调度
+    sessionsPDelayed = true;
+    sessionsPResolve = null;
+    renderSessionListCalls = 0;
+    const pollRoundPromise = pollRound();
+    await flush();
+    chk("perf in-flight round schedules no next round",
+        state.pollTimer === null && renderSessionListCalls === 0,
+        "timer=" + String(state.pollTimer) + " renders=" + renderSessionListCalls);
+    sessionsPResolve(resp(200, sessionsDataB));   // 手动 resolve 慢响应
+    await pollRoundPromise;
+    await flush();
+    chk("perf slow round renders once after settle", renderSessionListCalls === 1,
+        "calls=" + renderSessionListCalls);
+    chk("perf round completion schedules next round",
+        state.pollTimer !== null, "timer=" + String(state.pollTimer));
+    stopPolling();
+    sessionsPDelayed = false;
+
+    // 侧边栏不可见：轮询整轮跳过 renderSidebarTree（打开时 force 同步）
+    elsById["sidebar"].hidden = true;
+    renderSidebarTreeCalls = 0;
+    await pollAllWorkspaces();
+    await flush();
+    chk("perf hidden sidebar skips tree render", renderSidebarTreeCalls === 0,
+        "calls=" + renderSidebarTreeCalls);
+    elsById["sidebar"].hidden = false;
+
+    // 聊天视图停聚合轮询：openSession（侧边栏关）→ 停；openSidebar → 恢复；
+    // closeSidebar → 再停；backToList → 恢复
+    stopPolling();
+    state.sidebar.open = false;
+    state.view = "list";
+    startPolling();
+    chk("perf list view polls", state.pollTimer !== null, "timer=" + String(state.pollTimer));
+    state.sessionId = null;
+    openSession("p1");   // 聊天 + 侧边栏关 → 停聚合轮询
+    chk("perf openSession stops polling in chat",
+        state.pollTimer === null && state.view === "chat",
+        "timer=" + String(state.pollTimer) + " view=" + state.view);
+    stopSSE();
+    openSidebar();       // 聊天 + 侧边栏开 → 恢复轮询（树保持 busy/current 新鲜）
+    chk("perf openSidebar resumes polling in chat",
+        state.pollTimer !== null && state.sidebar.open,
+        "timer=" + String(state.pollTimer));
+    closeSidebar();      // 聊天 + 侧边栏关 → 再停
+    chk("perf closeSidebar stops polling in chat",
+        state.pollTimer === null && !state.sidebar.open,
+        "timer=" + String(state.pollTimer));
+    backToList();        // 回列表 → 恢复
+    chk("perf backToList resumes polling",
+        state.pollTimer !== null && state.view === "list",
+        "timer=" + String(state.pollTimer));
+    stopPolling();
+
+    // 任务面板签名去重：元数据未变 → 第二轮 pollTasks 不重建（计数 renderTaskList）
+    let renderTaskListCalls = 0;
+    const _origRTL = renderTaskList;
+    renderTaskList = function (...a) { renderTaskListCalls++; return _origRTL.apply(this, a); };
+    state.tasks.composerOpen = true;
+    state.tasks.list = [];
+    lastTasksSig = "";   // 强制首轮渲染
+    tasksData = [{ session_id: "s1", id: 300, kind: "bash", label: "sig test",
+      full_command: "sig test", output: "x", role: null }];
+    renderTaskListCalls = 0;
+    await pollTasks();
+    await flush();
+    chk("perf task first poll renders", renderTaskListCalls === 1,
+        "calls=" + renderTaskListCalls);
+    const taskRowRef = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    await pollTasks();   // 同一数据再来一轮：签名相同 → 跳过重建
+    await flush();
+    chk("perf task unchanged skips rebuild",
+        renderTaskListCalls === 1
+        && elsById["composerTasks"].querySelectorAll(".task-row")[0] === taskRowRef,
+        "calls=" + renderTaskListCalls
+        + " same=" + (elsById["composerTasks"].querySelectorAll(".task-row")[0] === taskRowRef));
+    tasksData = [{ session_id: "s1", id: 300, kind: "bash", label: "sig test 2",
+      full_command: "sig test 2", output: "x", role: null }];
+    await pollTasks();   // 元数据变化（label+full_command）→ 重建该行
+    await flush();
+    chk("perf task metadata change rebuilds row",
+        renderTaskListCalls === 2
+        && elsById["composerTasks"].querySelectorAll(".task-row")[0].textContent.includes("sig test 2"),
+        "calls=" + renderTaskListCalls
+        + " text=" + elsById["composerTasks"].querySelectorAll(".task-row")[0].textContent.slice(0, 40));
+
+    // 500ms output 轮询防重入：慢响应在途时只发一次请求（不叠加），
+    // resolve 后输出更新；收起/重展开后旧 tick 收尾不误停新轮询
+    tasksData = [{ session_id: "s1", id: 400, kind: "bash", label: "reentry",
+      full_command: "reentry", output: "", role: null }];
+    state.tasks.composerOpen = true;
+    state.tasks.list = [];
+    lastTasksSig = "";
+    await pollTasks();
+    await flush();
+    const rrow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    taskOutputDelayed = true;
+    taskOutputResolve = null;
+    const outFetchBefore = FETCHES.filter((u) => u.endsWith("/output")).length;
+    rrow._listeners["click"][0]();   // 展开 → 启动轮询，首个 tick 挂起
+    await flush();
+    chk("perf output poller single in-flight fetch",
+        state.tasks.pollers.has("s1:400")
+        && FETCHES.filter((u) => u.endsWith("/output")).length === outFetchBefore + 1,
+        "fetches=" + (FETCHES.filter((u) => u.endsWith("/output")).length - outFetchBefore));
+    taskOutputResolve(resp(200, "reentry-done"));
+    await flush();
+    chk("perf output poller updates after settle",
+        rrow.querySelector(".task-output").textContent.includes("reentry-done"),
+        "text=" + rrow.querySelector(".task-output").textContent.slice(0, 40));
+    taskOutputDelayed = false;
+    rrow._listeners["click"][0]();   // 收起，清理轮询
+    chk("perf output poller cleaned on collapse",
+        !state.tasks.pollers.has("s1:400"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+
+    // =====================================================================
+    // Issue 1 (高): 轮询重入 + 永久阻塞 + 异常断链
+    //   - 立即轮询与定时轮询共用 in-flight 守卫（同一时刻只有一轮）
+    //   - 每个 workspace 请求带 AbortController + 10s 超时（超时按失败处理）
+    //   - pollRound 的 finally 保证异常后仍续调度（防断链）
+    // =====================================================================
+    sessionsData = [{ id: "g1", status: "Idle", title: "G 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    sessionsDataB = [{ id: "g2", status: "Busy", title: "G2 会话", created_at: "2024-02-02T00:00:00Z", entry_count: 2, busy: true, active: true }];
+    sessionsBFail = false;
+    sessionsBFormat = false;
+    state.workspaces = [
+      { id: "wsG1", name: "服务器G1", url: "", token: "tok-g1" },
+      { id: "wsG2", name: "服务器G2", url: "http://b.local", token: "tok-g2" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-g1";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    elsById["sidebar"].hidden = false;
+    renderWorkspaceSelect();
+    renderSessionListCalls = 0;
+    renderSidebarTreeCalls = 0;
+    stopPolling();
+    chk("perf poll timeout constant is 10s", POLL_TIMEOUT_MS === 10000,
+        "=" + POLL_TIMEOUT_MS);
+    // 慢响应在途时连续两次立即轮询 → 不并发叠加：第一次启动在途轮询，
+    // 第二次排队一轮新鲜的（合并为同一轮）；在途轮询完成后才补跑
+    sessionsPDelayed = true;
+    sessionsPResolve = null;
+    const i1f = FETCHES.filter((u) => u === "/api/sessions").length;
+    const i1t = scheduledTimeouts.length;
+    const i1p1 = pollSessions();
+    const i1p2 = pollSessions();   // 立即轮询：必须排队（不并发），合并为同一轮
+    await flush();
+    chk("perf immediate polls no concurrent round",
+        FETCHES.filter((u) => u === "/api/sessions").length === i1f + 1,
+        "delta=" + (FETCHES.filter((u) => u === "/api/sessions").length - i1f));
+    chk("perf workspace poll arms abort timeout",
+        scheduledTimeouts.length === i1t + 2,   // 两个 workspace 各一个 abort 定时器
+        "delta=" + (scheduledTimeouts.length - i1t));
+    chk("perf in-flight round not rendered yet", renderSessionListCalls === 0,
+        "calls=" + renderSessionListCalls);
+    sessionsPResolve(resp(200, sessionsDataB));   // 在途轮询完成
+    await flush();
+    chk("perf shared round renders once after settle", renderSessionListCalls === 1,
+        "calls=" + renderSessionListCalls);
+    chk("perf workspace poll uses abort signal", pollSignalSeen === true,
+        "seen=" + pollSignalSeen);
+    sessionsPResolve(resp(200, sessionsDataB));   // 排队补跑的新鲜一轮（串行）
+    await Promise.all([i1p1, i1p2]);
+    await flush();
+    chk("perf queued fresh round renders after first", renderSessionListCalls === 2,
+        "calls=" + renderSessionListCalls);
+    sessionsPDelayed = false;
+    // afterPollRound 抛错 → pollRound 的 finally 仍续调度（不永久断链）
+    const i1apr = afterPollRound;
+    afterPollRound = function () { throw new Error("boom"); };
+    stopPolling();
+    const i1gen = state.pollGen;
+    const i1throw = pollRound();
+    await i1throw.catch(() => {});
+    await flush();
+    chk("perf poll round throw still reschedules",
+        state.pollTimer !== null && state.pollGen === i1gen,
+        "timer=" + String(state.pollTimer) + " gen=" + state.pollGen);
+    afterPollRound = i1apr;
+    stopPolling();
+
+    // =====================================================================
+    // Issue 2 (高): 任务面板收起期间数据变化 → 重开必须重建（不显示旧行/旧闭包）
+    // =====================================================================
+    state.tasks.composerOpen = true;
+    state.tasks.list = [];
+    lastTasksSig = "";
+    lastTasksRenderedSig = "";
+    tasksData = [{ session_id: "s1", id: 500, kind: "bash", label: "v1",
+      full_command: "v1", output: "", role: null }];
+    await pollTasks();
+    await flush();
+    const i2row = elsById["composerTasks"].querySelector(".task-row");
+    chk("issue2 panel renders open", i2row !== null && i2row.textContent.includes("v1"),
+        "text=" + (i2row ? i2row.textContent.slice(0, 30) : "none"));
+    state.tasks.composerOpen = false;   // 收起面板
+    renderComposerTasks();
+    chk("issue2 panel hidden when collapsed", elsById["composerTasks"].hidden === true,
+        "hidden=" + elsById["composerTasks"].hidden);
+    tasksData = [{ session_id: "s1", id: 500, kind: "bash", label: "v2",
+      full_command: "v2", output: "", role: null }];
+    await pollTasks();                  // 收起期间数据变化：只记录 data 签名，不碰 DOM
+    await flush();
+    chk("issue2 collapsed round leaves old DOM",
+        elsById["composerTasks"].querySelector(".task-row").textContent.includes("v1"),
+        "text=" + elsById["composerTasks"].querySelector(".task-row").textContent.slice(0, 30));
+    state.tasks.composerOpen = true;    // 重开：数据与已渲染 DOM 不符 → 重建
+    renderComposerTasks();
+    const i2row2 = elsById["composerTasks"].querySelector(".task-row");
+    chk("issue2 reopen rebuilds with new data",
+        i2row2 !== null && i2row2 !== i2row && i2row2.textContent.includes("v2")
+        && i2row2.getAttribute("data-key-sig") !== i2row.getAttribute("data-key-sig"),
+        "same=" + (i2row2 === i2row) + " text=" + (i2row2 ? i2row2.textContent.slice(0, 30) : "none"));
+
+    // =====================================================================
+    // Issue 3 (中): keyed 更新移动复用行——DOM 行序跟随 tasks 数组（纯重排不重建）
+    // =====================================================================
+    const i3panel = elsById["composerTasks"];
+    i3panel.innerHTML = "";
+    const i3task = (id, label) => ({ session_id: "s1", id, kind: "bash", label,
+      full_command: label, output: "", role: null });
+    renderTaskList([i3task(1, "A"), i3task(2, "B"), i3task(3, "C")], i3panel);
+    const i3rowA = i3panel.querySelectorAll(".task-row")[0];
+    const i3rowB = i3panel.querySelectorAll(".task-row")[1];
+    const i3rowC = i3panel.querySelectorAll(".task-row")[2];
+    chk("issue3 initial order",
+        [i3rowA, i3rowB, i3rowC].map((r) => r.getAttribute("data-task")).join(",") === "s1:1,s1:2,s1:3",
+        "order=" + [i3rowA, i3rowB, i3rowC].map((r) => r.getAttribute("data-task")).join(","));
+    renderTaskList([i3task(3, "C"), i3task(2, "B"), i3task(1, "A")], i3panel);   // 纯重排
+    const i3rows = i3panel.querySelectorAll(".task-row");
+    chk("issue3 reorder moves reused rows",
+        [...i3rows].map((r) => r.getAttribute("data-task")).join(",") === "s1:3,s1:2,s1:1",
+        "order=" + [...i3rows].map((r) => r.getAttribute("data-task")).join(","));
+    chk("issue3 reorder reuses nodes",
+        i3rows[0] === i3rowC && i3rows[1] === i3rowB && i3rows[2] === i3rowA,
+        "same=" + (i3rows[0] === i3rowC) + "," + (i3rows[1] === i3rowB) + "," + (i3rows[2] === i3rowA));
+
+    // =====================================================================
+    // Issue 4 (中): 旧后端静态输出兜底——output 端点 404（降级）时，/api/tasks
+    //   尾部 output 变化 → 保留行 .task-output 就地更新（不重建、不重启轮询）
+    // =====================================================================
+    i3panel.innerHTML = "";
+    state.tasks.composerOpen = true;
+    state.tasks.list = [];
+    state.tasks.degraded = new Set();
+    lastTasksSig = "";
+    lastTasksRenderedSig = "";
+    tasksData = [{ session_id: "s1", id: 600, kind: "bash", label: "degraded",
+      full_command: "degraded", output: "tail-old", role: null }];
+    taskOutput404 = true;
+    await pollTasks();
+    await flush();
+    const i4row = elsById["composerTasks"].querySelector(".task-row");
+    const i4pre = i4row.querySelector(".task-output");
+    i4row._listeners["click"][0]();   // 展开 → 启动轮询 → 404 → 降级静态
+    await flush();
+    chk("issue4 degraded on 404",
+        state.tasks.degraded.has("s1:600") && i4pre.hidden === false
+        && i4pre.textContent.includes("tail-old"),
+        "degraded=" + state.tasks.degraded.has("s1:600")
+        + " text=" + i4pre.textContent.slice(0, 20));
+    tasksData = [{ session_id: "s1", id: 600, kind: "bash", label: "degraded",
+      full_command: "degraded", output: "tail-new", role: null }];   // 元数据不变，仅 output 变
+    await pollTasks();   // 降级行的 output 计入渲染签名 → 触发保留行就地更新
+    await flush();
+    const i4row2 = elsById["composerTasks"].querySelector(".task-row");
+    chk("issue4 static output updated in place",
+        i4row2 === i4row && i4pre.textContent.includes("tail-new")
+        && !i4pre.textContent.includes("tail-old"),
+        "same=" + (i4row2 === i4row) + " text=" + i4pre.textContent.slice(0, 20));
+    chk("issue4 degraded row keeps degraded / poller not restarted",
+        state.tasks.degraded.has("s1:600") && !state.tasks.pollers.has("s1:600"),
+        "degraded=" + state.tasks.degraded.has("s1:600")
+        + " pollers=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    taskOutput404 = false;
+
+    // =====================================================================
+    // Issue 5 (低): 签名与渲染归一化完全一致
+    //   - 列表签名 entry_count 缺失 → null（页面显示 -，与 0 区分）
+    //   - 树签名含 model（树行 tooltip 渲染 model）
+    // =====================================================================
+    sessionsData = [{ id: "sig5a", status: "Idle", title: "Sig5",
+      created_at: "2024-01-01T00:00:00Z", busy: false, active: true }];   // entry_count 缺失
+    state.workspaces = [{ id: "ws5", name: "服务器5", url: "", token: "tok-5" }];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-5";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.view = "list";
+    state.sessionId = null;
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    elsById["sidebar"].hidden = false;
+    await pollAllWorkspaces();
+    await flush();
+    let smeta5 = elsById["sessionList"].querySelector(".smeta");
+    chk("issue5 entry_count missing shows dash",
+        smeta5.textContent.includes("- 条"),
+        "meta=" + JSON.stringify(smeta5.textContent.slice(-20)));
+    sessionsData = [{ id: "sig5a", status: "Idle", title: "Sig5",
+      created_at: "2024-01-01T00:00:00Z", entry_count: 0, busy: false, active: true }];   // 0 ≠ 缺失
+    await pollAllWorkspaces();   // 签名 null vs 0 → 必须重绘
+    await flush();
+    smeta5 = elsById["sessionList"].querySelector(".smeta");
+    chk("issue5 entry_count 0 re-renders as 0",
+        smeta5.textContent.includes("0 条") && !smeta5.textContent.includes("- 条"),
+        "meta=" + JSON.stringify(smeta5.textContent.slice(-20)));
+    // 树签名含 model：model 变化 → 树重绘 → tooltip 更新
+    sessionsData = [{ id: "sig5a", status: "Idle", title: "Sig5", model: "kimi",
+      created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    await pollAllWorkspaces();
+    await flush();
+    let trow5 = elsById["sidebarTree"].querySelector(".tree-row");
+    chk("issue5 tree tooltip shows model",
+        trow5.title.includes("· kimi"),
+        "title=" + JSON.stringify(trow5.title));
+    sessionsData = [{ id: "sig5a", status: "Idle", title: "Sig5", model: "gpt",
+      created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    await pollAllWorkspaces();   // 树签名含 model → 重绘
+    await flush();
+    trow5 = elsById["sidebarTree"].querySelector(".tree-row");
+    chk("issue5 tree model change re-renders tooltip",
+        trow5.title.includes("· gpt") && !trow5.title.includes("· kimi"),
+        "title=" + JSON.stringify(trow5.title));
+
+    // =====================================================================
+    // Issue 6 (中): stopPolling 取消已排队的下一轮——queued round 携带
+    //   generation，在途结束后启动前校验失效 → 丢弃；换代后的即时刷新
+    //   （pollSessions）替换旧 intent，仍保持全局 single-flight
+    // =====================================================================
+    sessionsData = [{ id: "p6", status: "Idle", title: "P6", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    sessionsDataB = [{ id: "p6b", status: "Busy", title: "P6B", created_at: "2024-02-02T00:00:00Z", entry_count: 1, busy: true, active: true }];
+    sessionsBFail = false;
+    sessionsBFormat = false;
+    sessionsPDelayed = true;    // B 慢响应：初始立即轮询在途（>2s 场景）
+    sessionsPResolve = null;
+    state.workspaces = [
+      { id: "wsP6", name: "服务器P6", url: "", token: "tok-p6" },
+      { id: "wsP6b", name: "服务器P6B", url: "http://b.local", token: "tok-p6b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-p6";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [{ id: "p6", parent_session_id: null, label: null, status: "Idle", entry_count: 1, active: true }];
+    state.view = "list";
+    state.sessionId = null;
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.sidebar.open = false;
+    elsById["sidebar"].hidden = false;
+    renderWorkspaceSelect();
+    stopPolling();
+    const i6f0 = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
+    const i6p1 = pollSessions();   // 初始立即轮询：在途（B 慢）
+    await flush();
+    const i6p2 = pollRound();      // 2s 定时器已排队第二轮（挂在在途 Promise 上）
+    await flush();
+    chk("issue6 second round queued while in-flight",
+        pollRoundQueued !== null
+        && FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1,
+        "queued=" + (pollRoundQueued !== null)
+        + " delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f0));
+    // openSession（聊天 + 侧边栏关）→ stopPolling：gen 递增，排队 intent 作废
+    openSession("p6");
+    await flush();
+    chk("issue6 openSession stops polling in chat",
+        state.pollTimer === null && state.view === "chat",
+        "timer=" + String(state.pollTimer) + " view=" + state.view);
+    stopSSE();
+    chk("issue6 queued round carries old generation",
+        pollRoundQueuedGen < state.pollGen,
+        "queued=" + pollRoundQueuedGen + " cur=" + state.pollGen);
+    sessionsPResolve(resp(200, sessionsDataB));   // 首轮完成
+    await i6p1;
+    await i6p2;
+    await flush();
+    chk("issue6 stopped round does not run after first settles",
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1
+        && pollRoundInFlight === null && pollRoundQueued === null,
+        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f0));
+    // 换代后的即时刷新：替换（重建）排队 intent，在途结束后按新 gen 补跑，
+    // 仍保持 single-flight（同代并发合并为同一轮）
+    sessionsPDelayed = true;
+    sessionsPResolve = null;
+    const i6f1 = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
+    const i6p3 = pollSessions();   // 新 generation 即时刷新：在途（B 慢）
+    await flush();
+    stopPolling();                 // 再停：gen 递增，使排队 intent 过期
+    const i6p4 = pollSessions();   // 换代即时刷新：替换旧 intent 为新 gen
+    await flush();
+    chk("issue6 regen refresh replaces queued intent",
+        pollRoundQueued !== null && pollRoundQueuedGen === state.pollGen,
+        "queuedGen=" + pollRoundQueuedGen + " cur=" + state.pollGen);
+    sessionsPResolve(resp(200, sessionsDataB));   // 首轮（在途）完成 → 排队 intent 以新 gen 补跑
+    await i6p3;                                    // 首轮完成（排队轮次由链补跑启动）
+    await flush();                                 // 补跑轮次启动（B 再次慢响应，sessionsPResolve 更新）
+    chk("issue6 regen queued round runs after settle",
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f1 + 2
+        && pollRoundInFlight !== null && pollRoundQueued === null,
+        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f1));
+    sessionsPResolve(resp(200, sessionsDataB));   // 补跑轮次的 B 也完成（串行收尾）
+    await i6p4;
+    await flush();
+    sessionsPDelayed = false;
+
+    // =====================================================================
+    // Issue 7 (中): 无活跃 output poller 的 bash 行——折叠普通行 / 轮询因
+    //   网络失败停止的展开行——output 变化计入渲染签名 → 保留行 <pre> 就地
+    //   更新（不重建行、不重启轮询）
+    // =====================================================================
+    elsById["composerTasks"].innerHTML = "";
+    state.tasks.composerOpen = true;
+    state.tasks.list = [];
+    state.tasks.degraded = new Set();
+    state.tasks.pollers = new Map();
+    lastTasksSig = "";
+    lastTasksRenderedSig = "";
+    taskOutput404 = false;
+    taskOutputDelayed = false;
+    taskOutputNetFail = false;
+    // (a) 折叠普通行（无 poller、非 degraded）：output 变化 → 就地更新
+    tasksData = [{ session_id: "s1", id: 700, kind: "bash", label: "collapsed",
+      full_command: "collapsed", output: "out-old", role: null }];
+    await pollTasks();
+    await flush();
+    const i7row = elsById["composerTasks"].querySelector(".task-row");
+    const i7pre = i7row.querySelector(".task-output");
+    chk("issue7 collapsed row starts hidden",
+        i7pre.hidden === true && !state.tasks.pollers.has("s1:700"),
+        "hidden=" + i7pre.hidden
+        + " pollers=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    tasksData = [{ session_id: "s1", id: 700, kind: "bash", label: "collapsed",
+      full_command: "collapsed", output: "out-new", role: null }];   // 元数据不变，仅 output 变
+    await pollTasks();
+    await flush();
+    const i7row2 = elsById["composerTasks"].querySelector(".task-row");
+    chk("issue7 collapsed static output updated in place",
+        i7row2 === i7row && i7pre.textContent.includes("out-new")
+        && !i7pre.textContent.includes("out-old") && i7pre.hidden === true,
+        "same=" + (i7row2 === i7row) + " text=" + i7pre.textContent.slice(0, 20));
+    // (b) 展开行轮询因网络失败停止（非 degraded）：/api/tasks 尾部 output
+    //     变化 → 就地更新
+    tasksData = [{ session_id: "s1", id: 701, kind: "bash", label: "netfail",
+      full_command: "netfail", output: "net-old", role: null }];
+    await pollTasks();
+    await flush();
+    const i7brow = elsById["composerTasks"].querySelector(".task-row");
+    const i7bpre = i7brow.querySelector(".task-output");
+    taskOutputNetFail = true;
+    i7brow._listeners["click"][0]();   // 展开 → 启动轮询 → 首 tick fetch 网络失败
+    await flush();
+    chk("issue7 net-fail stops poller without degraded",
+        !state.tasks.pollers.has("s1:701") && !state.tasks.degraded.has("s1:701")
+        && i7bpre.hidden === false,
+        "pollers=" + JSON.stringify([...state.tasks.pollers.keys()])
+        + " degraded=" + state.tasks.degraded.has("s1:701"));
+    taskOutputNetFail = false;
+    tasksData = [{ session_id: "s1", id: 701, kind: "bash", label: "netfail",
+      full_command: "netfail", output: "net-new", role: null }];   // 元数据不变，仅 output 变
+    await pollTasks();
+    await flush();
+    const i7brow2 = elsById["composerTasks"].querySelector(".task-row");
+    chk("issue7 net-fail stopped row output updated in place",
+        i7brow2 === i7brow && i7bpre.textContent.includes("net-new")
+        && !i7bpre.textContent.includes("net-old"),
+        "same=" + (i7brow2 === i7brow) + " text=" + i7bpre.textContent.slice(0, 20));
+
+    // =====================================================================
+    // Issue 8 (中): 10s 超时 → AbortError → 标记 timeout → 下一轮恢复成功
+    //   （AbortController 桩真实化：abort 后 pending fetch 的 signal reject
+    //   AbortError，pollWorkspaceSessions 按超时失败处理，保留 stale 列表）
+    // =====================================================================
+    sessionsData = [{ id: "t1", status: "Idle", title: "T1", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
+    sessionsDataB = [{ id: "t2", status: "Busy", title: "T2", created_at: "2024-02-02T00:00:00Z", entry_count: 1, busy: true, active: true }];
+    sessionsBFail = false;
+    sessionsBFormat = false;
+    sessionsPDelayed = false;
+    state.workspaces = [
+      { id: "wsT1", name: "服务器T1", url: "", token: "tok-t1" },
+      { id: "wsT2", name: "服务器T2", url: "http://b.local", token: "tok-t2" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-t1";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.view = "list";
+    state.sessionId = null;
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    elsById["sidebar"].hidden = false;
+    renderWorkspaceSelect();
+    stopPolling();
+    await pollSessions();   // 预置一轮成功：B 正常返回，workspaceErrors 干净
+    await flush();
+    chk("issue8 baseline errors clean",
+        state.workspaceErrors["wsT1"] === null && state.workspaceErrors["wsT2"] === null,
+        JSON.stringify(state.workspaceErrors));
+    // B 慢响应在途：触发其 abort 定时器（10s 超时）→ abort → AbortError → timeout
+    sessionsPDelayed = true;
+    sessionsPResolve = null;
+    const i8t0 = scheduledTimeouts.length;
+    const i8p = pollSessions();
+    await flush();
+    let i8abort = null;   // 两个 workspace 各 arm 一个 abort 定时器：A 立即完成
+    for (let i = scheduledTimeouts.length - 1; i >= i8t0; i--) {   // 并 clear，B 的保留
+      if (scheduledTimeouts[i]) { i8abort = scheduledTimeouts[i]; break; }
+    }
+    chk("issue8 timeout abort timer armed", i8abort !== null,
+        "none");
+    const i8fB = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
+    i8abort();   // 触发 10s 超时 → ctrl.abort() → B 的 pending fetch reject AbortError
+    await i8p;
+    await flush();
+    chk("issue8 abort marks timeout",
+        state.workspaceErrors["wsT2"] === "timeout" && state.workspaceErrors["wsT1"] === null,
+        JSON.stringify(state.workspaceErrors));
+    chk("issue8 no new fetch on aborted round",
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i8fB,
+        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i8fB));
+    // 下一轮恢复成功：B 正常 → 错误标记清除
+    sessionsPDelayed = false;
+    await pollSessions();
+    await flush();
+    chk("issue8 next round recovers",
+        state.workspaceErrors["wsT2"] === null && state.workspaceErrors["wsT1"] === null,
+        JSON.stringify(state.workspaceErrors));
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);
