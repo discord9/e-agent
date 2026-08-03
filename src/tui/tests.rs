@@ -53,7 +53,7 @@ fn lookbehind_is_bounded_with_10k_prefix() {
     );
     // Render the single line with the bounded prefix to prove it
     // completes without iterating the full 10k prefix.
-    let rendered = render_window(&lines, source_start, source_start + 1, 80);
+    let rendered = render_window(&lines, source_start, source_start + 1, 80, false);
     assert_eq!(rendered.len(), 1);
     assert_eq!(rendered[0].spans.len(), 1);
     assert_eq!(rendered[0].spans[0].content, "the actual rendered line");
@@ -2511,6 +2511,101 @@ fn empty_content_delta_does_not_split_the_reasoning_line() {
     assert_eq!(thinking[0].text, "thinking: plan more");
 }
 
+/// Extract the text of a rendered visual row (same span-join as the
+/// `text` closures in ux_tests).
+fn rendered_text(line: &ratatui::text::Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// Parse the `(N 行)` row count out of a collapsed thinking summary row.
+fn summary_row_count(line: &ratatui::text::Line<'_>) -> usize {
+    let text = rendered_text(line);
+    text.split_once('(')
+        .and_then(|(_, rest)| rest.split_once(" 行)"))
+        .and_then(|(n, _)| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no (N 行) count in summary row: {text:?}"))
+}
+
+#[test]
+fn thinking_lines_render_collapsed_by_default() {
+    // A fresh session collapses model reasoning to a single summary row.
+    let mut state = TuiState::default();
+    assert!(
+        state.collapse_thinking.0,
+        "new sessions default to collapsed"
+    );
+    state.push_agent_event(AgentEvent::ReasoningDelta("plan ".into()));
+    state.push_agent_event(AgentEvent::ReasoningDelta("more".into()));
+    assert_eq!(state.lines.len(), 1);
+    assert_eq!(state.lines[0].kind, LineKind::Thinking);
+    // Scroll accounting and rendering must agree: one visual row.
+    assert_eq!(line_visual_rows(&state.lines[0], 40, true), 1);
+    let visual = render_window(&state.lines, 0, state.lines.len(), 40, true);
+    assert_eq!(
+        visual.len(),
+        1,
+        "collapsed thinking renders one summary row"
+    );
+    let text = rendered_text(&visual[0]);
+    assert!(text.starts_with("▸ thinking"), "{text}");
+    assert!(text.contains("(1 行)"), "{text}");
+    assert!(text.contains("Tab 展开"), "{text}");
+}
+
+#[test]
+fn tab_toggles_thinking_collapse_between_summary_and_full_text() {
+    let mut state = TuiState::default();
+    // Long enough to wrap at width 20, so the expanded form is multi-row.
+    state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(30)));
+    let full_rows = hard_wrap(&state.lines[0].text, 20).len();
+    assert!(full_rows > 1, "test text must wrap when expanded");
+    assert_eq!(line_visual_rows(&state.lines[0], 20, true), 1);
+    assert_eq!(render_window(&state.lines, 0, 1, 20, true).len(), 1);
+
+    // Tab expands: the full wrapped text returns, and scroll accounting
+    // follows the same flag.
+    let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(!state.collapse_thinking.0);
+    assert_eq!(line_visual_rows(&state.lines[0], 20, false), full_rows);
+    assert_eq!(
+        render_window(&state.lines, 0, 1, 20, false).len(),
+        full_rows
+    );
+
+    // Tab again collapses back to a single summary row.
+    let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(state.collapse_thinking.0);
+    assert_eq!(render_window(&state.lines, 0, 1, 20, true).len(), 1);
+}
+
+#[test]
+fn collapsed_thinking_summary_count_tracks_streaming_deltas() {
+    let mut state = TuiState::default();
+    assert!(state.collapse_thinking.0);
+    state.push_agent_event(AgentEvent::ReasoningDelta("alpha ".repeat(30)));
+    assert_eq!(state.lines.len(), 1);
+    let n_before = summary_row_count(&render_window(&state.lines, 0, 1, 20, true)[0]);
+
+    // Streaming deltas keep appending to the same line while collapsed;
+    // the summary's row count grows with the accumulated text.
+    state.push_agent_event(AgentEvent::ReasoningDelta("beta ".repeat(60)));
+    assert_eq!(
+        state.lines.len(),
+        1,
+        "deltas still merge into one thinking line"
+    );
+    let visual = render_window(&state.lines, 0, 1, 20, true);
+    assert_eq!(visual.len(), 1, "still a single collapsed summary row");
+    let n_after = summary_row_count(&visual[0]);
+    assert!(
+        n_after > n_before,
+        "summary count grew {n_before} -> {n_after}"
+    );
+}
+
 #[test]
 fn reply_after_plain_text_turn_does_not_append_to_the_user_line() {
     // A turn ending on a plain text answer leaves active_lane = Content
@@ -2667,13 +2762,13 @@ fn wrapped_rows_counts_embedded_newlines_and_wrapping() {
         },
     ];
     // 1 + 3 + exact hard wrap of 25 cells at width 10
-    assert_eq!(wrapped_rows(&lines, 10), 1 + 3 + 3);
+    assert_eq!(wrapped_rows(&lines, 10, false), 1 + 3 + 3);
     let cjk = vec![DisplayLine {
         text: "你好世界".into(),
         kind: LineKind::Normal,
     }];
     // Each CJK char is 2 cells: "你好" then "世界" at width 5.
-    assert_eq!(wrapped_rows(&cjk, 5), 2);
+    assert_eq!(wrapped_rows(&cjk, 5, false), 2);
 }
 
 #[test]

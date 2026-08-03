@@ -26,9 +26,12 @@ pub(crate) fn hard_wrap(text: &str, width: usize) -> Vec<&str> {
 }
 
 #[cfg(test)]
-pub(crate) fn wrapped_rows(lines: &[DisplayLine], width: u16) -> usize {
+pub(crate) fn wrapped_rows(lines: &[DisplayLine], width: u16, collapse_thinking: bool) -> usize {
     let width = usize::from(width.max(1));
-    lines.iter().map(|line| line_visual_rows(line, width)).sum()
+    lines
+        .iter()
+        .map(|line| line_visual_rows(line, width, collapse_thinking))
+        .sum()
 }
 
 #[derive(Clone)]
@@ -198,7 +201,15 @@ impl ScrollWindow {
     /// limits. After this call the window is ready for rendering and
     /// `local_offset` points to the bottom (follow mode).
     /// Clears any frozen cursor so follow shows the live tail.
-    pub(crate) fn anchor_tail(&mut self, lines: &[DisplayLine], width: usize, height: usize) {
+    /// `collapse_thinking` must match the value the renderer uses, so
+    /// collapsed thinking blocks count as one visual row here too.
+    pub(crate) fn anchor_tail(
+        &mut self,
+        lines: &[DisplayLine],
+        width: usize,
+        height: usize,
+        collapse_thinking: bool,
+    ) {
         let total = lines.len();
         self.follow_bottom = true;
         self.frozen_tail_cursor = None;
@@ -215,8 +226,11 @@ impl ScrollWindow {
             && total - self.source_start < MAX_RENDER_SOURCE_LINES
         {
             self.source_start -= 1;
-            accumulated =
-                accumulated.saturating_add(line_visual_rows(&lines[self.source_start], width));
+            accumulated = accumulated.saturating_add(line_visual_rows(
+                &lines[self.source_start],
+                width,
+                collapse_thinking,
+            ));
         }
         self.local_offset = 0; // will be set after rendering
     }
@@ -232,13 +246,15 @@ impl ScrollWindow {
 /// Only `source_start`/`local_offset` are rewritten; `source_end`,
 /// `frozen_tail_cursor`, `frozen_source_end` and `follow_bottom` are
 /// left untouched so a frozen streaming snapshot stays frozen and a
-/// scrolled-up view stays scrolled up.
+/// scrolled-up view stays scrolled up. `collapse_thinking` must match the
+/// value the renderer uses (collapsed thinking blocks count as one row).
 pub(crate) fn reanchor_window_on_resize(
     lines: &[DisplayLine],
     window: &mut ScrollWindow,
     old_width: usize,
     new_width: usize,
     height: usize,
+    collapse_thinking: bool,
 ) {
     let old_width = old_width.max(1);
     let new_width = new_width.max(1);
@@ -251,7 +267,7 @@ pub(crate) fn reanchor_window_on_resize(
     // with the same head-drain as render_bounded_window so the trimmed
     // row stream matches what was drawn; `dropped` maps local_offset
     // (an index into the trimmed stream) back onto the full stream.
-    let visual_old = render_window(&local_old, 0, local_old.len(), old_width);
+    let visual_old = render_window(&local_old, 0, local_old.len(), old_width, collapse_thinking);
     let dropped = visual_old.len().saturating_sub(MAX_RENDER_VISUAL_ROWS);
     let target_row = window.local_offset.saturating_add(dropped);
     // Find the source line whose visual block contains the viewport
@@ -263,7 +279,7 @@ pub(crate) fn reanchor_window_on_resize(
     let mut block = 0usize;
     let mut rows_before = 0usize;
     for (index, line) in local_old.iter().enumerate() {
-        let rows = line_visual_rows(line, old_width);
+        let rows = line_visual_rows(line, old_width, collapse_thinking);
         if target_row < rows_before.saturating_add(rows) {
             block = index;
             break;
@@ -287,8 +303,11 @@ pub(crate) fn reanchor_window_on_resize(
         && anchor_source - window.source_start < MAX_RENDER_SOURCE_LINES
     {
         window.source_start -= 1;
-        rows_above =
-            rows_above.saturating_add(line_visual_rows(&lines[window.source_start], new_width));
+        rows_above = rows_above.saturating_add(line_visual_rows(
+            &lines[window.source_start],
+            new_width,
+            collapse_thinking,
+        ));
     }
     window.local_offset = rows_above;
 }
@@ -300,7 +319,12 @@ pub(crate) fn reanchor_window_on_resize(
 /// case and cheap for the overflow case: more source lines than viewport rows
 /// can never fit (every line renders at least one visual row), and a line
 /// longer than the viewport's whole cell budget can never fit either.
-pub(crate) fn scrollback_fits_viewport(lines: &[DisplayLine], width: usize, height: usize) -> bool {
+pub(crate) fn scrollback_fits_viewport(
+    lines: &[DisplayLine],
+    width: usize,
+    height: usize,
+    collapse_thinking: bool,
+) -> bool {
     if lines.len() > height {
         return false;
     }
@@ -314,7 +338,7 @@ pub(crate) fn scrollback_fits_viewport(lines: &[DisplayLine], width: usize, heig
         if line.text.chars().count() > cell_budget {
             return false;
         }
-        total = total.saturating_add(line_visual_rows(line, width));
+        total = total.saturating_add(line_visual_rows(line, width, collapse_thinking));
         if total > height {
             return false;
         }
@@ -327,9 +351,13 @@ pub(crate) fn scrollback_fits_viewport(lines: &[DisplayLine], width: usize, heig
 /// `render_window` so that inline-code/bold delimiters are stripped before
 /// wrapping — this keeps estimates consistent with actual rendering.
 /// For non-Normal lines, falls back to `hard_wrap` (matches `styled_scroll_line`).
-pub(crate) fn line_visual_rows(line: &DisplayLine, width: usize) -> usize {
+/// A `Thinking` line under `collapse_thinking` counts as exactly one row —
+/// the summary row `render_window` draws in that mode.
+pub(crate) fn line_visual_rows(line: &DisplayLine, width: usize, collapse_thinking: bool) -> usize {
     let width = width.max(1);
-    if line.kind == LineKind::Normal {
+    if line.kind == LineKind::Thinking && collapse_thinking {
+        1
+    } else if line.kind == LineKind::Normal {
         let mut md = crate::markdown::MarkdownLines::new();
         line.text
             .split('\n')
@@ -413,8 +441,13 @@ pub(crate) fn extend_window_down(
     let height = state.output_height.max(1);
     // Count the same bounded local copy that draw renders. Live deltas may
     // have made the source tail taller without changing the frozen cursor.
-    let mut total_visual =
-        render_bounded_window(&local_window_lines(&state.lines, &state.window), w, false).len();
+    let mut total_visual = render_bounded_window(
+        &local_window_lines(&state.lines, &state.window),
+        w,
+        false,
+        state.collapse_thinking.0,
+    )
+    .len();
     // The viewport-bottom check: the last visible row is
     // local_offset + height - 1.  Scrolling can advance until
     // local_offset + height >= total_visual.
@@ -423,7 +456,11 @@ pub(crate) fn extend_window_down(
     if at_visual_bottom && state.window.source_end < state.lines.len() {
         let mut added = 0usize;
         while state.window.source_end < state.lines.len() && added < step {
-            let rows = line_visual_rows(&state.lines[state.window.source_end], w);
+            let rows = line_visual_rows(
+                &state.lines[state.window.source_end],
+                w,
+                state.collapse_thinking.0,
+            );
             state.window.source_end += 1;
             added += rows;
             total_visual += rows;

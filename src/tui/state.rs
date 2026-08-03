@@ -100,6 +100,18 @@ pub(crate) fn truncate_background_output(output: &str) -> String {
     result
 }
 
+/// Default-true flag: model reasoning ("thinking") lines start collapsed.
+/// Wrapped so `TuiState` can keep `#[derive(Default)]` — a plain `bool`
+/// would default to `false` (= expanded).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CollapseThinking(pub(crate) bool);
+
+impl Default for CollapseThinking {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct TuiState {
     /// This session's id, shown in the input border (so it can be resumed
@@ -126,6 +138,11 @@ pub(crate) struct TuiState {
     pub(crate) busy: Option<BusyState>,
     pub(crate) streamed: bool,
     pub(crate) active_lane: Option<ActiveStreamLane>,
+    /// Whether model reasoning ("thinking") lines render as a single
+    /// collapsed summary row instead of the full wrapped text. Global
+    /// toggle (Tab), shared by rendering and scroll accounting so the two
+    /// never disagree on how many rows a thinking block occupies.
+    pub(crate) collapse_thinking: CollapseThinking,
     pub(crate) tokens_context: u64,
     /// Configured context window (token count) from the model profile, used
     /// to display a usage percentage and trigger the red style at >= 80%.
@@ -365,9 +382,13 @@ impl TaskDetail {
         self.window.source_end = self.lines.len();
         self.window.local_offset = 0;
         if anchor_bottom {
-            let total =
-                render_bounded_window(&local_window_lines(&self.lines, &self.window), width, false)
-                    .len();
+            let total = render_bounded_window(
+                &local_window_lines(&self.lines, &self.window),
+                width,
+                false,
+                false,
+            )
+            .len();
             self.window.local_offset = total.saturating_sub(height);
         }
     }
@@ -421,9 +442,13 @@ impl TaskDetail {
         if self.window.follow_bottom {
             return;
         }
-        let total =
-            render_bounded_window(&local_window_lines(&self.lines, &self.window), width, false)
-                .len();
+        let total = render_bounded_window(
+            &local_window_lines(&self.lines, &self.window),
+            width,
+            false,
+            false,
+        )
+        .len();
         if self.window.local_offset.saturating_add(height) < total {
             self.window.local_offset += 1;
         } else if self.base_line + self.lines.len() < self.spool.line_count() {
@@ -459,9 +484,13 @@ impl TaskDetail {
         if self.window.follow_bottom {
             return;
         }
-        let total =
-            render_bounded_window(&local_window_lines(&self.lines, &self.window), width, false)
-                .len();
+        let total = render_bounded_window(
+            &local_window_lines(&self.lines, &self.window),
+            width,
+            false,
+            false,
+        )
+        .len();
         if self.window.local_offset.saturating_add(height) < total {
             self.window.local_offset += height;
         } else if self.base_line + self.lines.len() < self.spool.line_count() {
@@ -865,6 +894,14 @@ impl TuiState {
             | KeyCode::PageDown
             | KeyCode::Home
             | KeyCode::End => self.handle_scroll(key),
+            // Collapse/expand model reasoning. The visual geometry changes
+            // (each thinking block shrinks to one summary row), so drop any
+            // frozen scroll state and let the next draw re-anchor at the
+            // tail under the new collapse state.
+            KeyCode::Tab => {
+                self.collapse_thinking.0 = !self.collapse_thinking.0;
+                self.follow();
+            }
             KeyCode::Enter => {
                 // Alt+Enter inserts a newline (Shift+Enter is not
                 // distinguishable in most terminals).
@@ -1128,7 +1165,11 @@ impl TuiState {
                     self.window.local_offset -= 1;
                 } else if self.window.source_start > 0 {
                     self.window.source_start -= 1;
-                    let n = line_visual_rows(&self.lines[self.window.source_start], w);
+                    let n = line_visual_rows(
+                        &self.lines[self.window.source_start],
+                        w,
+                        self.collapse_thinking.0,
+                    );
                     self.window.local_offset = n.saturating_sub(1);
                 }
                 if self.at_scrollback_top() {
@@ -1167,7 +1208,11 @@ impl TuiState {
                 let mut prepended_rows = 0usize;
                 while deficit > 0 && self.window.source_start > 0 {
                     self.window.source_start -= 1;
-                    let rows = line_visual_rows(&self.lines[self.window.source_start], w);
+                    let rows = line_visual_rows(
+                        &self.lines[self.window.source_start],
+                        w,
+                        self.collapse_thinking.0,
+                    );
                     prepended_rows += rows;
                     deficit = deficit.saturating_sub(rows);
                     if deficit == 0 {
