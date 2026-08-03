@@ -2546,24 +2546,24 @@ async function main(){
     const d1Dot = dotOf15(rowByTxt15("D 主会话"));
     const e1Dot = dotOf15(rowByTxt15("E 主会话"));
     const f1Dot = dotOf15(rowByTxt15("F 主会话"));
-    chk("busy badge shows two busy direct children",
-        c1Dot.classList.contains("busy-count") && c1Dot.textContent === "2",
+    chk("red dot when two active children",
+        c1Dot.classList.contains("busy") && !c1Dot.classList.contains("busy-count")
+        && c1Dot.textContent === "",
         "class=" + c1Dot.className + " text=" + c1Dot.textContent);
-    chk("busy badge counts active child, not inactive child",
-        c2Dot.classList.contains("busy-count") && c2Dot.textContent === "1",
-        "class=" + c2Dot.className + " text=" + c2Dot.textContent);
-    chk("parent-only busy keeps pulsing dot, not count",
+    chk("red dot when one active child, inactive ignored",
+        c2Dot.classList.contains("busy") && !c2Dot.classList.contains("busy-count"),
+        "class=" + c2Dot.className);
+    chk("red dot when parent busy, no active children",
         d1Dot.classList.contains("busy") && !d1Dot.classList.contains("busy-count")
         && d1Dot.textContent === "",
         "class=" + d1Dot.className + " text=" + d1Dot.textContent);
-    chk("fully idle parent keeps green dot",
+    chk("green dot when fully idle (no active children, parent idle)",
         !e1Dot.classList.contains("busy") && !e1Dot.classList.contains("busy-count")
         && e1Dot.textContent === "",
         "class=" + e1Dot.className + " text=" + e1Dot.textContent);
-    chk("busy child count takes priority when parent also busy",
-        f1Dot.classList.contains("busy-count") && !f1Dot.classList.contains("busy")
-        && f1Dot.textContent === "1",
-        "class=" + f1Dot.className + " text=" + f1Dot.textContent);
+    chk("red dot when parent busy AND active child (OR semantics)",
+        f1Dot.classList.contains("busy") && !f1Dot.classList.contains("busy-count"),
+        "class=" + f1Dot.className);
     chk("parent title keeps child-busy hint",
         rowByTxt15("C 主会话").title.includes("子任务处理中")
         && rowByTxt15("F 主会话").title.includes("子任务处理中")
