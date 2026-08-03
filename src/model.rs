@@ -10,7 +10,9 @@ use std::time::Duration;
 use crate::agent::{
     AssistantMessage, ImagePart, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
 };
-use crate::codex::CodexModel;
+use crate::codex::{
+    CONNECT_RETRY_ATTEMPTS, CONNECT_RETRY_BASE_BACKOFF_MS, CodexModel, retry_backoff_ms,
+};
 
 /// The two concrete model wires e-agent supports. Keeping this enum concrete
 /// preserves the existing `Model` seam while making delegated clones exact.
@@ -219,8 +221,14 @@ impl Model for OpenAiModel {
             tools,
             self.image_store.as_deref(),
         );
-        let mut retried = false;
+        // Transient gateway/connectivity hiccups before any bytes were
+        // exchanged (e.g. "tls handshake eof", ECONNREFUSED) recover on retry;
+        // same exponential policy as the codex wire: 6 attempts, 0.5s/1s/2s/4s/8s
+        // backoff (~15.5s window). HTTP status errors are not retried here —
+        // the 403 loop below owns those.
+        let mut attempt = 0u32;
         let response = loop {
+            attempt += 1;
             let result = self
                 .client
                 .post(format!("{}/chat/completions", self.base_url))
@@ -229,13 +237,18 @@ impl Model for OpenAiModel {
                 .send()
                 .await;
             match result {
-                // Transient gateway/connectivity hiccup before any bytes were
-                // exchanged; safe to retry once.
-                Err(error) if !retried && (error.is_timeout() || error.is_connect()) => {
-                    retried = true;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok(response) => break response,
+                Err(error)
+                    if attempt < CONNECT_RETRY_ATTEMPTS
+                        && (error.is_timeout() || error.is_connect()) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(retry_backoff_ms(
+                        CONNECT_RETRY_BASE_BACKOFF_MS,
+                        attempt,
+                    )))
+                    .await;
                 }
-                result => break result.map_err(request_error)?,
+                Err(error) => return Err(request_error(error)),
             }
         };
         let mut response = response;

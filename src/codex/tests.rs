@@ -311,11 +311,33 @@ async fn backend_401_refreshes_once_persists_rotation_and_retries_once() {
     );
 }
 
+#[test]
+fn retry_backoff_doubles_exponentially_within_a_15s_window() {
+    // Production schedule (base 500ms, 6 attempts): the sleeps before attempts
+    // 2..=6 are 0.5/1/2/4/8s — a ~15.5s recovery window for jittery networks.
+    let sleeps: Vec<u64> = (1..CONNECT_RETRY_ATTEMPTS)
+        .map(|attempt| retry_backoff_ms(500, attempt))
+        .collect();
+    assert_eq!(sleeps, [500, 1000, 2000, 4000, 8000]);
+    let total: u64 = sleeps.iter().sum();
+    assert!(
+        total >= 15_000,
+        "backoff window must be >= 15s, got {total}ms"
+    );
+    // Doubling invariant holds for any base.
+    for attempt in 2..CONNECT_RETRY_ATTEMPTS {
+        assert_eq!(
+            retry_backoff_ms(500, attempt),
+            2 * retry_backoff_ms(500, attempt - 1)
+        );
+    }
+}
+
 #[tokio::test]
 async fn transient_connect_errors_are_retried_then_fail_with_context() {
     // A port with no listener: every attempt fails with ECONNREFUSED, which
     // reqwest reports as an is_connect() error (same family as the
-    // "tls handshake eof" users hit). The loop must exhaust all 3 attempts
+    // "tls handshake eof" users hit). The loop must exhaust all 6 attempts
     // before the context-wrapped error surfaces.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -337,8 +359,15 @@ async fn transient_connect_errors_are_retried_then_fail_with_context() {
         )
         .await
         .unwrap_err();
-    // 3 attempts => 500ms + 1000ms of backoff; this proves the retries ran.
-    assert!(started.elapsed() >= Duration::from_millis(1500));
+    // 6 attempts => the sum of all retry backoffs (tests run with a 50ms
+    // base, so 50+100+200+400+800ms); this proves all retries ran.
+    let expected_sleep: u64 = (1..CONNECT_RETRY_ATTEMPTS)
+        .map(|attempt| retry_backoff_ms(CONNECT_RETRY_BASE_BACKOFF_MS, attempt))
+        .sum();
+    assert!(
+        started.elapsed() >= Duration::from_millis(expected_sleep),
+        "expected at least {expected_sleep}ms of backoff"
+    );
     let text = format!("{error:#}");
     assert!(text.contains("ChatGPT Responses request failed"), "{text}");
 }
