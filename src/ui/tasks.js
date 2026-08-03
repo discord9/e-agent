@@ -334,8 +334,8 @@ function renderTaskList(tasks, container) {
     const tags = [];
     if (t.background === true) tags.push(el("span", "task-tag", "background"));
     if (t.workspace && String(t.workspace).trim() !== "") {
-      const tag = el("span", "task-tag", "workspace: " + truncate(t.workspace, 40));
-      tag.title = String(t.workspace);   // 截断后完整路径放 title
+      const tag = el("span", "task-tag", "workspace: " + t.workspace);
+      tag.title = String(t.workspace);   // 完整路径，悬停 title 保留（无害）
       tags.push(tag);
     }
     if (t.resume && String(t.resume).trim() !== "") {

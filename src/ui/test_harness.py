@@ -1265,17 +1265,18 @@ async function main(){
     chk("bash task without fields renders no tags",
         tagRow.querySelector(".task-tags") === null,
         "tags=" + String(tagRow.querySelector(".task-tags")));
-    // 长 workspace 路径：文本截断到 ~40 字符，title 保留完整路径
+    // 长 workspace 路径：完整显示（不截断、无省略标记），换行交给 CSS 处理，
+    // title 保留完整路径
     const longPath = "/very/long/workspace/path/" + "x".repeat(60);
     renderTaskList([{ session_id: "s1", id: 72, kind: "delegate", label: "长路径任务",
       full_command: null, output: null, role: null, background: false,
       workspace: longPath, resume: null }], elsById["composerTasks"]);
     tagRow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
     const wsTag = tagRow.querySelector(".task-tag");
-    chk("long workspace truncated keeps full title",
+    chk("long workspace shown in full without ellipsis",
         wsTag.title === longPath
-        && wsTag.textContent.startsWith("workspace: " + longPath.slice(0, 40))
-        && wsTag.textContent.indexOf(longPath) === -1,
+        && wsTag.textContent === "workspace: " + longPath
+        && wsTag.textContent.indexOf("…") === -1,
         "title-ok=" + (wsTag.title === longPath)
         + " text=" + wsTag.textContent.slice(0, 50));
 
