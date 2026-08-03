@@ -1455,6 +1455,176 @@ async function main(){
         && !lastCardB.querySelector(".tool-result").classList.contains("expandable")
         && lastCardB.querySelector(".tool-result.err") !== null);
 
+    // ---- 文件工具差异化渲染：edit_file -/+ diff / read_file 行号 / write_file 单侧 ----
+    const lastCard = () => {
+      const cs = elsById["messages"].querySelectorAll("details.tool-card");
+      return cs[cs.length - 1];
+    };
+    // harness 的 matchSel 只认 "tag.class" 形态：复合 class 选择器按 tag 解析，
+    // 因此按单 class 取行再过滤（与现有测试对 _classes 的用法一致）
+    const diffRowsOf = (card, kind) =>
+      card.querySelectorAll(".diff-row").filter((r) => r.classList.contains(kind));
+    // edit_file：live 路径（appendToolCall → appendToolResult 按 toolStack 配对）
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    appendToolCall("edit_file",
+      JSON.stringify({ path: "a.txt", old: "foo\nbar\nbaz", new: "foo\nBAR\nbaz\nqux" }),
+      state.acc, null);
+    const editCard = lastCard();
+    chk("edit_file args parsed on card",
+        editCard._toolArgs !== null && editCard._toolArgs.path === "a.txt"
+        && editCard._toolArgs.old === "foo\nbar\nbaz" && editCard._toolArgs.new === "foo\nBAR\nbaz\nqux",
+        "args=" + JSON.stringify(editCard._toolArgs));
+    appendToolResult(false, "file edited (line 2)", state.acc, null);
+    const editRes = editCard.querySelector(".tool-result");
+    const delRows = diffRowsOf(editCard, "diff-del");
+    const addRows = diffRowsOf(editCard, "diff-add");
+    chk("edit_file diff rendered",
+        editRes.classList.contains("tool-diff")
+        && editRes.querySelector(".diff-head").textContent === "file edited (line 2)",
+        "cls=" + editRes.className + " head=" + JSON.stringify(editRes.querySelector(".diff-head") && editRes.querySelector(".diff-head").textContent));
+    chk("edit_file - rows numbered from edited line",
+        delRows.length === 3 && addRows.length === 4
+        && delRows[0].querySelector(".diff-sign").textContent === "− "
+        && delRows[0].querySelector(".diff-ln").textContent === "2"
+        && delRows[0].querySelector(".diff-text").textContent === "foo",
+        "del=" + delRows.length + " add=" + addRows.length);
+    chk("edit_file + rows with old/new split",
+        addRows[0].querySelector(".diff-text").textContent === "foo"
+        && addRows[1].querySelector(".diff-ln").textContent === "3"
+        && addRows[1].querySelector(".diff-text").textContent === "BAR"
+        && addRows[3].querySelector(".diff-text").textContent === "qux",
+        "rows=" + editCard.querySelector(".tool-result").textContent);
+    chk("edit_file result keeps card open", editCard.hasAttribute("open"),
+        "open=" + editCard.hasAttribute("open"));
+    // 30 行/侧截断 + "… (N more lines)"（镜像 TUI push_diff_side）
+    const bigOld = Array.from({ length: 40 }, (_, i) => "old line " + i).join("\n");
+    const bigNew = Array.from({ length: 40 }, (_, i) => "new line " + i).join("\n");
+    appendToolCall("edit_file",
+      JSON.stringify({ path: "b.txt", old: bigOld, new: bigNew }), state.acc, null);
+    const bigCard = lastCard();
+    appendToolResult(false, "file edited (line 100)", state.acc, null);
+    const bigRes = bigCard.querySelector(".tool-result");
+    chk("edit_file truncates each side to 30",
+        diffRowsOf(bigCard, "diff-del").length === 30
+        && diffRowsOf(bigCard, "diff-add").length === 30
+        && bigRes.querySelector(".diff-more").textContent === "−… (10 more lines)",
+        "more=" + JSON.stringify(bigRes.querySelector(".diff-more") && bigRes.querySelector(".diff-more").textContent));
+    // edit_file 出错：保持普通 err 文本，不渲染 diff
+    appendToolCall("edit_file", JSON.stringify({ path: "x.txt", old: "a", new: "b" }), state.acc, null);
+    const errCard = lastCard();
+    appendToolResult(true, "edit failed: not found", state.acc, null);
+    chk("edit_file error stays plain err text",
+        !errCard.querySelector(".tool-result").classList.contains("tool-diff")
+        && errCard.querySelector(".tool-result").classList.contains("err")
+        && errCard.querySelector(".tool-result").textContent === "edit failed: not found",
+        "cls=" + errCard.querySelector(".tool-result").className);
+    // read_file：行号 = offset + 行下标；页脚行不编号
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    appendToolCall("read_file", JSON.stringify({ path: "a.txt", offset: 5 }), state.acc, null);
+    const readCard = lastCard();
+    appendToolResult(false, "line one\nline two\nline three\n[showing lines 5-7 of 100; use offset 8 to continue]",
+      state.acc, null);
+    const readRes = readCard.querySelector(".tool-result");
+    const readRows = readCard.querySelectorAll(".diff-row");
+    chk("read_file line-number view",
+        readRes.classList.contains("tool-diff") && readRows.length === 4,
+        "rows=" + readRows.length);
+    chk("read_file numbers start at args.offset",
+        readRows[0].querySelector(".diff-ln").textContent === "5"
+        && readRows[0].querySelector(".diff-text").textContent === "line one"
+        && readRows[2].querySelector(".diff-ln").textContent === "7",
+        "ln0=" + (readRows[0].querySelector(".diff-ln") && readRows[0].querySelector(".diff-ln").textContent));
+    chk("read_file footer unnumbered",
+        readRows[3].classList.contains("diff-footer")
+        && readRows[3].querySelector(".diff-ln") === null
+        && readRows[3].querySelector(".diff-text").textContent.includes("showing lines 5-7 of 100"),
+        "cls=" + readRows[3].className);
+    chk("read_file keeps card open", readCard.hasAttribute("open"));
+    // read_file 默认 offset=1；纯状态输出不做行号
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    appendToolCall("read_file", JSON.stringify({ path: "e.txt" }), state.acc, null);
+    appendToolResult(false, "[empty file]", state.acc, null);
+    const emptyCard = lastCard();
+    chk("read_file status output plain",
+        !emptyCard.querySelector(".tool-result").classList.contains("tool-diff")
+        && emptyCard.querySelector(".tool-result").textContent === "[empty file]",
+        "cls=" + emptyCard.querySelector(".tool-result").className);
+    // read_file 超 30 行：预览 + 展开全文（复用 expand-toggle 委托）
+    appendToolCall("read_file", JSON.stringify({ path: "c.txt" }), state.acc, null);
+    const longCard = lastCard();
+    appendToolResult(false, Array.from({ length: 40 }, (_, i) => "row " + i).join("\n"),
+      state.acc, null);
+    const longRes = longCard.querySelector(".tool-result");
+    chk("read_file truncated to 30 preview rows",
+        longRes.classList.contains("expandable") && !longRes.classList.contains("expanded")
+        && longCard.querySelectorAll(".diff-row").length === 40
+        && longRes.querySelector(".diff-full").querySelectorAll(".diff-row").length === 10
+        && longRes.querySelector(".diff-more").textContent === "… (10 more lines)",
+        "total=" + longCard.querySelectorAll(".diff-row").length);
+    const readBtn = longRes.querySelector(".expand-toggle");
+    for (const fn of clicksA) fn({ target: readBtn });
+    chk("read_file expand shows all rows",
+        longRes.classList.contains("expanded")
+        && longRes.querySelector(".diff-full").textContent.includes("row 39")
+        && readBtn.textContent === "收起（内容）",
+        "btn=" + readBtn.textContent);
+    for (const fn of clicksA) fn({ target: readBtn });
+    chk("read_file collapse returns to preview",
+        !longRes.classList.contains("expanded") && readBtn.textContent === "展开全文（内容）",
+        "btn=" + readBtn.textContent);
+    // write_file：确认行 + 全新增（+ 绿）单侧 diff，行号从 1 起
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    appendToolCall("write_file", JSON.stringify({ path: "new.txt", content: "hello\nworld" }),
+      state.acc, null);
+    const wCard = lastCard();
+    appendToolResult(false, "file written", state.acc, null);
+    chk("write_file single-side add",
+        wCard.querySelector(".tool-result").classList.contains("tool-diff")
+        && wCard.querySelector(".diff-head").textContent === "file written"
+        && diffRowsOf(wCard, "diff-add").length === 2
+        && diffRowsOf(wCard, "diff-del").length === 0
+        && diffRowsOf(wCard, "diff-add")[0].querySelector(".diff-ln").textContent === "1"
+        && diffRowsOf(wCard, "diff-add")[0].querySelector(".diff-text").textContent === "hello",
+        "rows=" + wCard.querySelectorAll(".diff-row").length);
+    // history 路径：renderMessage 按 tc.id ↔ call_id 配对后同样渲染 diff
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    const histPending = new Map();
+    renderMessage({ Assistant: { content: "", reasoning: null,
+      tool_calls: [{ id: "ec1", name: "edit_file",
+        arguments: JSON.stringify({ path: "h.txt", old: "xx", new: "yy" }) }] } },
+      state.acc, histPending);
+    renderMessage({ Tool: { call_id: "ec1", name: "edit_file",
+      content: "file edited (line 9)", is_error: false } }, state.acc, histPending);
+    const histCard = lastCard();
+    chk("history edit_file diff via call_id pairing",
+        histCard.querySelector(".tool-result").classList.contains("tool-diff")
+        && diffRowsOf(histCard, "diff-del")[0].querySelector(".diff-text").textContent === "xx"
+        && diffRowsOf(histCard, "diff-add")[0].querySelector(".diff-text").textContent === "yy"
+        && diffRowsOf(histCard, "diff-add")[0].querySelector(".diff-ln").textContent === "9",
+        "cls=" + histCard.querySelector(".tool-result").className);
+    // innerHTML 快照往返（restored）：expando 丢失后从 .tool-args 重解析，
+    // 结果到达仍渲染 diff（reattachInFlight 场景）
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    appendToolCall("edit_file", JSON.stringify({ path: "r.txt", old: "AAA", new: "BBB" }),
+      state.acc, null);
+    const rtSnap = elsById["messages"].innerHTML;
+    elsById["messages"].innerHTML = rtSnap;
+    state.acc = newAccumulator();
+    state.acc.toolStack.push({ el: elsById["messages"].querySelector("details.tool-card"), filled: false });
+    appendToolResult(false, "file edited (line 4)", state.acc, null);
+    const rtCard = elsById["messages"].querySelector("details.tool-card");
+    chk("round-trip edit diff re-parsed from args",
+        rtCard.querySelector(".tool-result").classList.contains("tool-diff")
+        && diffRowsOf(rtCard, "diff-add")[0].querySelector(".diff-text").textContent === "BBB"
+        && diffRowsOf(rtCard, "diff-add")[0].querySelector(".diff-ln").textContent === "4",
+        "cls=" + rtCard.querySelector(".tool-result").className);
+
     // ---- B: 消息上限 pruneMessages ----
     const pm = elsById["messages"];
     pm.innerHTML = "";
@@ -4790,4 +4960,12 @@ for i in range(6):
     if cr < 4.5:
         _chip_ok = False
     print(("PASS" if cr >= 4.5 else "FAIL") + " ws-chip-%d contrast %.2f:1 (>=4.5)" % (i, cr))
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _empty_ok and _chip_ok else 1)
+# 文件工具差异化渲染的 diff 样式必须存在：- 红（#fbe3e4 底 + --red 符号）、
+# + 绿（#eef5e3 底 + --green 符号）、行号列灰底右对齐（--base2 + text-align:right）。
+_diff_rules_ok = bool(
+    re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s*\{[^}]*background:\s*var\(--base3\)', _css)
+    and re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-row\.diff-add\s*\{[^}]*background:\s*#eef5e3', _css)
+    and re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-row\.diff-del\s*\{[^}]*background:\s*#fbe3e4', _css)
+    and re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-ln\s*\{[^}]*text-align:\s*right', _css))
+print(("PASS" if _diff_rules_ok else "FAIL") + " file-tool diff styles (add/del/ln) in style.css")
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _empty_ok and _chip_ok and _diff_rules_ok else 1)
