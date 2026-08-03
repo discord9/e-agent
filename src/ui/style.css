@@ -1254,7 +1254,7 @@ mmlEqnNo}
   /* 置顶聚合行的服务器名小字：无边框无背景，复用 ws-chip-N 分色前景，
      行内跟在标题文字后（不换行、不撑宽，标题长时省略号）。 */
   .tree-row .ws-pin-label {
-    font-size: 10px;
+    font-size: 13px;   /* 与标题同字号（用户偏好：不比标题小） */
     line-height: 1.4;
     white-space: nowrap;
     max-width: 120px;

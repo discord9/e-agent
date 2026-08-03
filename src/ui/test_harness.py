@@ -4177,7 +4177,7 @@ print(("PASS" if _spin_ok else "FAIL") + " composer-status spinner + reduced-mot
 _marker = re.search(r'\.tree-row\s+\.ws-pin-label\s*\{([^}]*)\}', _css)
 _marker_css = _marker.group(1) if _marker else ''
 _marker_ok = bool(_marker
-                  and re.search(r'font-size:\s*1[0-2]px', _marker_css)
+                  and re.search(r'font-size:\s*1[2-4]px', _marker_css)
                   and re.search(r'white-space:\s*nowrap', _marker_css))
 print(("PASS" if _marker_ok else "FAIL") + " compact ws-pin-label layout in style.css")
 # LOW：ws-chip 10px 小字号前景/背景 WCAG AA 对比度 ≥ 4.5:1（深色文字配浅 tint）
