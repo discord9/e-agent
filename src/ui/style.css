@@ -1199,6 +1199,20 @@ mmlEqnNo}
   .ws-err { color: var(--red); font-size: 11px; opacity: 0.8; }
   /* 「当前」标记：激活 workspace 分组头右侧 */
   .ws-cur { color: var(--base01); font-size: 10px; margin-left: auto; flex: 0 0 auto; }
+  /* 分组头删除按钮：出错/无法连接的服务器也能移除（逃生口） */
+  .ws-del {
+    margin-left: auto;        /* 无「当前」标记时也推到右侧 */
+    flex: 0 0 auto;
+    border: none;
+    background: transparent;
+    color: var(--base01);
+    font-size: 13px;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .ws-del:hover { background: var(--red); color: var(--base3); }
   .tree-ws-body { padding-left: 2px; }
 
   /* ---------- 会话重命名：✎ / ✓ / × 小按钮与编辑态 ---------- */

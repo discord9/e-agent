@@ -1268,6 +1268,18 @@ function renderSidebarTree(force) {
       header.appendChild(el("span", "ws-cur", "当前"));
       sec.classList.add("active");
     }
+    if (state.workspaces.length > 1) {
+      // 组头删除按钮：出错/无法连接的服务器也能在侧边栏直接移除
+      //（顶部 × 只删当前激活的，切不过去就删不掉——这是它的逃生口）。
+      const delBtn = el("button", "ws-del", "×");
+      delBtn.title = "删除服务器 " + (ws.name || ws.url);
+      delBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();                 // 不触发组头切换
+        if (!confirm("确认删除服务器 " + (ws.name || ws.url) + " ？")) return;
+        removeWorkspace(ws);
+      });
+      header.appendChild(delBtn);
+    }
     header.addEventListener("click", () => {
       if (ws !== state.workspace) switchWorkspace(ws.id);   // 已激活则无操作
     });

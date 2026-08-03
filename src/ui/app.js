@@ -364,15 +364,28 @@ function saveWorkspaceFromEditor() {
 
 /* 「×」删除当前 workspace（仅剩一个时按钮禁用，switchWorkspace 里再挡一道） */
 function removeActiveWorkspace() {
+  removeWorkspace(state.workspace);
+}
+
+/* 删除指定 workspace（顶部 × 与聚合侧边栏组头的 × 共用）。删除后若删的
+   是激活 workspace，切到相邻一个；其它 workspace 的删除不打断当前视图，
+   只清理其聚合缓存并重绘侧边栏。 */
+function removeWorkspace(ws) {
   if (state.workspaces.length <= 1) return;
-  const removed = state.workspace;
-  const idx = state.workspaces.indexOf(removed);
+  const idx = state.workspaces.indexOf(ws);
+  if (idx < 0) return;
+  const wasActive = ws === state.workspace;
   state.workspaces.splice(idx, 1);
-  delete state.workspaceLists[removed.id];    // 清理聚合缓存：被删服务器不再显示
-  delete state.workspaceErrors[removed.id];
-  const next = state.workspaces[Math.max(0, idx - 1)] || state.workspaces[0];
+  delete state.workspaceLists[ws.id];    // 清理聚合缓存：被删服务器不再显示
+  delete state.workspaceErrors[ws.id];
   saveWorkspaces();
-  switchWorkspace(next.id);
+  if (wasActive) {
+    const next = state.workspaces[Math.max(0, idx - 1)] || state.workspaces[0];
+    switchWorkspace(next.id);
+  } else {
+    renderSidebarTree(true);   // 侧边栏立即移除该分组
+    renderWorkspaceSelect();
+  }
 }
 
 els.workspaceSelect.addEventListener("change", () => switchWorkspace(els.workspaceSelect.value));
