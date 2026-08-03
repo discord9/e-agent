@@ -1,0 +1,2 @@
+[build]
+target-dir = "/mnt/nvme_rust/rust-targets/e-agent-mobile-topbar"
