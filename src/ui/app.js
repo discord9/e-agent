@@ -414,6 +414,7 @@ function removeWorkspace(ws) {
   state.workspaces.splice(idx, 1);
   delete state.workspaceLists[ws.id];    // 清理聚合缓存：被删服务器不再显示
   delete state.workspaceErrors[ws.id];
+  removePinOrder(ws.id);                 // 清理该服务器所有置顶显示顺序
   saveWorkspaces();
   if (wasActive) {
     const next = state.workspaces[Math.max(0, idx - 1)] || state.workspaces[0];

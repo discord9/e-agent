@@ -417,6 +417,7 @@ function renderSessionList(list, force) {
         // sessionStates 只清激活 workspace 的会话：删除背景服务器的会话
         // 不能抹掉激活服务器对同名会话的视图缓存。
         if (ws.id === state.workspace.id) delete state.sessionStates[s.id];
+        removePinOrder(ws.id, s.id);
         renderSessionList();
         renderSidebarTree(true);
       } catch (e) {
@@ -1506,7 +1507,207 @@ async function refreshSessionsForSidebar() {
  * 列表未变化时跳过重绘，保留展开状态与滚动位置。
  * ===================================================================*/
 const MAX_TREE_ROOTS = 8;   // 每个 workspace 分组内默认只显示最近 8 个主会话（少滑即见）
+const PIN_ORDER_KEY = "eagent.pinOrder";
 let lastTreeSig = "";
+
+/* 置顶分组是跨 workspace 聚合的，sid 不能单独作键。存储只保留最小的
+   {wsId, sid} 有序对；localStorage 损坏/被禁用时静默回退到服务器列表顺序。 */
+function readPinOrder() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PIN_ORDER_KEY) || "[]");
+    if (!Array.isArray(raw)) return [];
+    const seen = new Set();
+    return raw.filter((x) => {
+      if (!x || typeof x.wsId !== "string" || typeof x.sid !== "string") return false;
+      const key = x.wsId + "\n" + x.sid;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).map((x) => ({ wsId: x.wsId, sid: x.sid }));
+  } catch (e) { return []; }
+}
+
+function writePinOrder(order) {
+  try { localStorage.setItem(PIN_ORDER_KEY, JSON.stringify(order)); }
+  catch (e) { /* 隐私模式/存储已满：本次拖拽仍可正常重绘 */ }
+}
+
+function pinOrderKey(wsId, sid) { return wsId + "\n" + sid; }
+
+/* 已记录项按存储顺序在前；新置顶（存储中没有）保持现有聚合顺序并沉底。 */
+function sortPinnedSessions(items) {
+  const rank = new Map(readPinOrder().map((x, i) => [pinOrderKey(x.wsId, x.sid), i]));
+  return items.map((x, i) => ({ x, i, rank: rank.get(pinOrderKey(x.ws.id, x.s.id)) }))
+    .sort((a, b) => {
+      const ar = a.rank, br = b.rank;
+      if (ar === undefined && br === undefined) return a.i - b.i;
+      if (ar === undefined) return 1;
+      if (br === undefined) return -1;
+      return ar - br;
+    }).map((x) => x.x);
+}
+
+function removePinOrder(wsId, sid) {
+  const old = readPinOrder();
+  const next = old.filter((x) => !(x.wsId === wsId && (sid === undefined || x.sid === sid)));
+  if (next.length !== old.length) writePinOrder(next);
+}
+
+function allPinnedSessions() {
+  const out = [];
+  for (const ws of state.workspaces) {
+    for (const s of workspaceListFor(ws)) {
+      if (s.pinned === true && isMainSession(s)) out.push({ ws, s });
+    }
+  }
+  return sortPinnedSessions(out);
+}
+
+/* from 移到 target 的上/下方，并把当前全部置顶项写成完整顺序。作为纯排序
+   入口也供 harness 直接调用，DOM 事件只负责算出 from/target。 */
+function movePinnedSession(fromWsId, fromSid, targetWsId, targetSid, before) {
+  const items = allPinnedSessions();
+  const fromKey = pinOrderKey(fromWsId, fromSid);
+  const targetKey = pinOrderKey(targetWsId, targetSid);
+  const from = items.find((x) => pinOrderKey(x.ws.id, x.s.id) === fromKey);
+  if (!from || fromKey === targetKey) return false;
+  const rest = items.filter((x) => pinOrderKey(x.ws.id, x.s.id) !== fromKey);
+  const targetAt = rest.findIndex((x) => pinOrderKey(x.ws.id, x.s.id) === targetKey);
+  if (targetAt < 0) return false;
+  rest.splice(targetAt + (before ? 0 : 1), 0, from);
+  writePinOrder(rest.map((x) => ({ wsId: x.ws.id, sid: x.s.id })));
+  renderSidebarTree(true);       // renderSidebarTree 自己保留 scrollTop / 展开状态
+  return true;
+}
+
+/* Pointer Events 同时覆盖鼠标、触控和笔。触屏先长按 280ms；长按前移动
+   超过阈值就按原方向滚动树。相比 HTML5 DnD，这条路径可在移动端工作，
+   并且不会把行内 toggle/pin/archive 按钮的普通点击误判为拖拽。 */
+function enablePinnedPointerDrag(row, node, wsId, sid) {
+  let press = null;
+  let dragging = false;
+  let timer = null;
+  let drop = null;
+  let suppressClick = false;
+  const clearDrop = () => {
+    if (drop) drop.node.classList.remove("pin-drop-before", "pin-drop-after");
+    drop = null;
+  };
+  const begin = (ev) => {
+    dragging = true;
+    node.classList.add("pin-dragging");
+    row.setAttribute("aria-grabbed", "true");
+    if (row.setPointerCapture) {
+      try { row.setPointerCapture(ev.pointerId); } catch (e) { /* pointer may already be gone */ }
+    }
+  };
+  row.classList.add("pin-draggable");
+  row.tabIndex = 0;
+  row.setAttribute("aria-grabbed", "false");
+  row.setAttribute("aria-roledescription", "可排序的置顶会话");
+  row.setAttribute("aria-keyshortcuts", "Alt+ArrowUp Alt+ArrowDown");
+  row.title += " · 拖拽调整置顶顺序 · Alt+↑/↓ 键盘排序";
+  // 键盘等价路径：焦点在行上时 Alt+↑/↓ 与前/后一项互换。
+  row.addEventListener("keydown", (ev) => {
+    if (!ev.altKey || (ev.key !== "ArrowUp" && ev.key !== "ArrowDown")) return;
+    const body = node.parentNode;
+    if (!body) return;
+    const nodes = [...body.children];
+    const at = nodes.indexOf(node);
+    const nextAt = at + (ev.key === "ArrowUp" ? -1 : 1);
+    if (nextAt < 0 || nextAt >= nodes.length) return;
+    const target = nodes[nextAt];
+    ev.preventDefault();
+    ev.stopPropagation();
+    movePinnedSession(wsId, sid, target.getAttribute("data-pin-ws"),
+      target.getAttribute("data-pin-sid"), ev.key === "ArrowUp");
+  });
+  // capture 阶段挡掉拖拽/手动滚动后的合成 click，尤其避免从行内按钮起滑
+  // 后误触取消置顶或归档。正常短按不受影响。
+  row.addEventListener("click", (ev) => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+  }, true);
+  row.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== undefined && ev.button !== 0) return;
+    const onButton = !!(ev.target && ev.target.closest && ev.target.closest("button"));
+    // 鼠标点按钮保持原交互；触屏按钮仍记录 pointer，以便手指从按钮起滑时
+    // 手动滚动（row 的 touch-action:none 是可靠接管纵向拖拽所必需）。
+    if (onButton && ev.pointerType !== "touch") return;
+    press = { x: ev.clientX, y: ev.clientY, lastY: ev.clientY, id: ev.pointerId,
+      touch: ev.pointerType === "touch", onButton, scrolling: false };
+    if (press.touch && row.setPointerCapture) {
+      try { row.setPointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
+    }
+    if (press.touch && !onButton) timer = window.setTimeout(() => { if (press && !press.scrolling) begin(ev); }, 280);
+  });
+  row.addEventListener("pointermove", (ev) => {
+    if (!press || ev.pointerId !== press.id) return;
+    const distance = Math.hypot(ev.clientX - press.x, ev.clientY - press.y);
+    if (!dragging) {
+      if (press.touch) {
+        if (distance > 8 || press.scrolling) {
+          window.clearTimeout(timer); timer = null;
+          press.scrolling = true;
+          const tree = els.sidebarTree;
+          if (tree) tree.scrollTop += press.lastY - ev.clientY;
+          press.lastY = ev.clientY;
+          ev.preventDefault();
+        }
+        return;
+      }
+      if (distance < 5) return;
+      begin(ev);
+    }
+    ev.preventDefault();
+    // 指针被 capture 后可继续拖到滚动容器边缘；轻量逐事件滚动，便于置顶项
+    // 多于一屏时跨越可视区，不启用持续动画循环。
+    const tree = els.sidebarTree;
+    if (tree && tree.getBoundingClientRect) {
+      const treeRect = tree.getBoundingClientRect();
+      if (ev.clientY < treeRect.top + 28) tree.scrollTop -= 14;
+      else if (ev.clientY > treeRect.bottom - 28) tree.scrollTop += 14;
+    }
+    clearDrop();
+    const body = node.parentNode;
+    for (const candidate of body.children) {
+      if (candidate === node) continue;
+      const targetRow = candidate.querySelector(".tree-row");
+      if (!targetRow || !targetRow.getBoundingClientRect) continue;
+      const rect = targetRow.getBoundingClientRect();
+      if (ev.clientY < rect.top || ev.clientY > rect.bottom) continue;
+      const before = ev.clientY < rect.top + rect.height / 2;
+      candidate.classList.add(before ? "pin-drop-before" : "pin-drop-after");
+      drop = { node: candidate, before,
+        wsId: candidate.getAttribute("data-pin-ws"), sid: candidate.getAttribute("data-pin-sid") };
+      break;
+    }
+  });
+  const finish = (ev) => {
+    if (!press || (ev.pointerId !== undefined && ev.pointerId !== press.id)) return;
+    window.clearTimeout(timer); timer = null;
+    const chosen = ev.type === "pointercancel" ? null : drop;
+    const wasScrolling = press.scrolling;
+    clearDrop();
+    node.classList.remove("pin-dragging");
+    row.setAttribute("aria-grabbed", "false");
+    press = null;
+    if (!dragging && !wasScrolling) return;
+    suppressClick = true;
+    window.setTimeout(() => { suppressClick = false; }, 0);
+    if (!dragging) return;
+    dragging = false;
+    // pointerup 后浏览器还会合成 click；行 click 自身也有样式标记兜底。
+    row.classList.add("pin-drag-click-block");
+    window.setTimeout(() => row.classList.remove("pin-drag-click-block"), 0);
+    if (chosen) movePinnedSession(wsId, sid, chosen.wsId, chosen.sid, chosen.before);
+  };
+  row.addEventListener("pointerup", finish);
+  row.addEventListener("pointercancel", finish);
+}
 
 /* 侧边栏筛选匹配：置顶分组与 workspace 内普通根共用同一规则——title 优先，
    无 title 回退 id；子串匹配、大小写不敏感。filter 为空 → 全部匹配。 */
@@ -1532,7 +1733,7 @@ function sidebarTreeSig() {
         s.archived === true ? 1 : 0, s.model || "",
       ])));
   }
-  return state.sessionId + "|" + parts.join("|");
+  return state.sessionId + "|" + JSON.stringify(readPinOrder()) + "|" + parts.join("|");
 }
 
 /* force=true 时无视签名强制重绘（筛选输入、展开全部按钮、切换 workspace）
@@ -1555,18 +1756,9 @@ function renderSidebarTree(force) {
   //  筛选非空时与普通根同一 title/id 匹配规则：仅匹配的置顶根显示、随父
   //  展示子会话；不匹配的隐藏（workspace 内剔除逻辑不变——剔除后置顶分组
   //  是它们唯一出现位，不匹配则整体不显示）。
-  const pinned = [];
   const filter = state.sidebar.filter;
-  for (const ws of state.workspaces) {
-    const list = workspaceListFor(ws);
-    for (const s of list) {
-      // 只收主会话：pinned 子会话留在其父节点下（见 isMainSession 注释），
-      // 避免既进置顶分组又留在 workspace 内重复渲染。
-      if (s.pinned === true && isMainSession(s) && treeSessionMatches(s, filter)) {
-        pinned.push({ ws, s });
-      }
-    }
-  }
+  // 先按完整置顶集合排序再筛选；这样筛选不会改变隐藏项的相对位置。
+  const pinned = allPinnedSessions().filter(({ s }) => treeSessionMatches(s, filter));
   if (pinned.length) {
     const pinnedSec = el("div", "tree-ws-section pinned");
     const pinnedBody = el("div", "tree-ws-body");
@@ -1583,7 +1775,11 @@ function renderSidebarTree(force) {
       // 置顶聚合行：workspace 小字跟在标题文字后面（标题行内，下一行是
       // 完整 session id）——有标题跟标题，无标题跟 id；复用 ws-chip-N 分色。
       const marker = el("span", "ws-pin-label " + wsChipClass(ws), ws.name || ws.url);
+      node.setAttribute("data-pin-ws", ws.id);
+      node.setAttribute("data-pin-sid", s.id);
       const row = node.querySelector(".tree-row");
+      // 筛选态不开放拖拽：只看见子集时重排会让插入位置含糊。
+      if (row && !filter) enablePinnedPointerDrag(row, node, ws.id, s.id);
       const titleEl = row && row.querySelector(".tree-id");
       if (titleEl) {
         const titleLine = titleEl.querySelector(".tree-title") || titleEl;
@@ -1767,11 +1963,17 @@ function buildTreeRoot(s, kids, wsId) {
       toggleSidebarNode(wsId + ":" + s.id, toggle, kids, wsId);
     });
   }
-  // busy-dot 聚合：父节点自身 busy，或任意直接子会话 busy（subagent 通常
-  // 一层，孙会话不计——需要时再递归）都亮橙点。点亮的 children 未展开
-  // 也能提示（dot 在行首，不依赖子节点渲染）。
-  const kidsBusy = kids.some((k) => k.busy);
-  const dot = el("span", "busy-dot" + ((s.busy || kidsBusy) ? " busy" : ""));
+  // busy 状态聚合只看直接子会话（subagent 通常一层，孙会话不计）：
+  // 有 busy 子会话时用数字徽标显示数量；否则父会话自身 busy 时仍用原有
+  // 脉动点。数字优先于父节点的点，因为它提供了更具体的并发任务信息。
+  const busyKidCount = kids.filter((k) => k.busy).length;
+  const kidsBusy = busyKidCount > 0;
+  const dot = busyKidCount > 0
+    ? el("span", "busy-dot busy-count", String(busyKidCount))
+    : el("span", "busy-dot" + (s.busy ? " busy" : ""));
+  dot.setAttribute("aria-label", busyKidCount > 0
+    ? busyKidCount + " 个子任务处理中"
+    : (s.busy ? "会话处理中" : "会话空闲"));
   // 有标题：两行（title 行 + 完整 id 行）；无标题：一行完整 id。
   // 单行 ellipsis 截断的长 id 无法区分会话，双行让 title/id 都可见。
   const hasTitle = !!s.title;
@@ -1813,8 +2015,13 @@ function buildTreeRoot(s, kids, wsId) {
   });
   row.append(toggle, dot, titleEl, count, pin, archive);
   row.title = (s.title || s.id) + (s.model ? " · " + s.model : "")
-    + (s.busy ? "（处理中）" : (kidsBusy ? "（子任务处理中）" : ""));
-  row.addEventListener("click", () => {
+    + (s.busy ? "（处理中）" : "")
+    + (kidsBusy ? "（子任务处理中）" : "");
+  row.addEventListener("click", (ev) => {
+    if (row.classList.contains("pin-drag-click-block")) {
+      if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+      return;
+    }
     if (s.active === false) { resumeSessionIn(wsId, s.id); return; }   // 与列表页一致：历史会话先恢复
     openSessionIn(wsId, s.id);
   });
@@ -1850,14 +2057,14 @@ function toggleSidebarNode(key, toggle, kids, wsId) {
   }
 }
 
-/* 父节点 / 「未关联」组的子节点渲染：默认只显示活跃 subagent
-   （active !== false，即活跃或 busy），非活跃收进折叠的
-   「历史子会话 (N)」分组（buildHistGroup，默认收起、点击展开）。 */
+/* 父节点 / 「未关联」组的子节点渲染：默认只显示正在运行的 subagent；
+   idle（无论 active 与否）都收进折叠的「历史子会话 (N)」分组
+   （buildHistGroup，默认收起、点击展开）。 */
 function renderTreeChildren(container, kids, wsId) {
   container.innerHTML = "";
-  const active = [], hist = [];
-  for (const k of kids) (k.active === false ? hist : active).push(k);
-  renderSubagentRows(container, active, false, wsId);
+  const busy = [], hist = [];
+  for (const k of kids) (k.busy ? busy : hist).push(k);
+  renderSubagentRows(container, busy, false, wsId);
   if (hist.length) container.appendChild(buildHistGroup(hist, wsId));
 }
 
@@ -2095,6 +2302,8 @@ async function togglePin(s, afterToggle, ws) {
     // 但数组每轮都是新的）：按 id 重新解析当前对象再写回，确保重绘反映新状态
     const cur = workspaceListFor(targetWs).find((x) => x.id === s.id) || s;
     cur.pinned = target;
+    // 取消后移除；重新置顶也先当作新项，按当前聚合顺序沉到已排序项之后。
+    removePinOrder(targetWs.id, s.id);
     afterToggle();
   } catch (e) {
     setBanner("⚠ 置顶失败：" + e.message, true);
@@ -2132,6 +2341,7 @@ async function toggleArchived(s, afterToggle, ws) {
     // 但数组每轮都是新的）：按 id 重新解析当前对象再写回，确保重绘反映新状态
     const cur = workspaceListFor(targetWs).find((x) => x.id === s.id) || s;
     cur.archived = target;
+    if (target) removePinOrder(targetWs.id, s.id);
     afterToggle();
   } catch (e) {
     setBanner("⚠ 归档失败：" + e.message, true);
