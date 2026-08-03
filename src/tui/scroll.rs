@@ -38,6 +38,26 @@ pub(crate) fn wrapped_rows(lines: &[DisplayLine], width: u16, collapse_thinking:
 pub(crate) struct DisplayLine {
     pub(crate) text: String,
     pub(crate) kind: LineKind,
+    /// Cached collapsed-summary row for `Thinking` lines
+    /// (`▸ thinking… (N 行) [Tab 展开]`, see `collapsed_summary_for`).
+    /// Refreshed on the source line whenever its text changes and the
+    /// render width is known (`TuiState::push_agent_event_inner` /
+    /// `push_line`); `None` for every other line kind and for Thinking
+    /// lines whose cache was never computed (render width unknown at
+    /// append time). The renderer reads this cache instead of hard-wrapping
+    /// the (possibly MB-sized) full text every frame, falling back to a
+    /// one-shot computation only when it is absent. `Clone` carries the
+    /// cache into the bounded local window unchanged.
+    pub(crate) collapsed_summary: Option<String>,
+}
+
+/// Build the collapsed summary row a `Thinking` line renders instead of its
+/// full wrapped text. `N` is the visual row count of the FULL text at
+/// `width` (same `hard_wrap` the expanded path uses), so the count stays
+/// exact even after `local_window_lines` truncates the text it carries.
+pub(crate) fn collapsed_summary_for(text: &str, width: usize) -> String {
+    let rows = hard_wrap(text, width).len();
+    format!("▸ thinking… ({rows} 行) [Tab 展开]")
 }
 
 /// Rendering never materializes more than this much scrollback. Limits are
@@ -82,10 +102,11 @@ pub(crate) fn utf8_tail(text: &str, end: usize, bytes: usize) -> &str {
 /// this is both bounded and stable while that line receives streaming deltas.
 ///
 /// `collapse_thinking` must match the flag the renderer will use on the
-/// result: a `Thinking` line whose text exceeds the byte budget keeps its
-/// FULL text while collapsed, so the collapsed summary's `(N 行)` count
-/// reflects the complete pre-truncation text instead of underestimating it
-/// from the truncated tail (see `render_window`).
+/// result: a `Thinking` line renders only its cached collapsed summary
+/// (`DisplayLine::collapsed_summary`), so its text is truncated like any
+/// other over-budget line — the summary's `(N 行)` count comes from the
+/// cache, which was computed from the complete pre-truncation text when the
+/// line last changed.
 pub(crate) fn local_window_lines(
     lines: &[DisplayLine],
     window: &ScrollWindow,
@@ -96,26 +117,28 @@ pub(crate) fn local_window_lines(
     let mut remaining = MAX_RENDER_BYTES;
     let mut local = Vec::new();
     // Copy one line into the bounded window. The byte budget is charged for
-    // the (possibly truncated) tail, so sibling lines keep their share.
-    // Exception: a `Thinking` line that exceeds the budget keeps its full
-    // text while collapsed — the collapsed render path draws only the
-    // summary row, whose row count is computed from this text, and the
-    // expanded path still renders the bounded tail (so the byte cap stays
-    // in force for anything actually drawn as body text). Returns false
-    // once the budget is exhausted (the line was still emitted).
-    let mut emit = |line: &DisplayLine, cursor: usize| -> bool {
+    // the (possibly truncated) tail, so sibling lines keep their share. A
+    // collapsed `Thinking` line renders only its cached summary row, so the
+    // truncated text never reaches the screen; the expanded path renders the
+    // bounded tail, so the byte cap stays in force for anything actually
+    // drawn as body text. Returns false once the budget is exhausted (the
+    // line was still emitted).
+    let mut emit = |line: &DisplayLine, cursor: usize, frozen_summary: Option<&str>| -> bool {
         let tail = utf8_tail(&line.text, cursor, remaining);
         remaining = remaining.saturating_sub(tail.len());
-        let text =
-            if collapse_thinking && line.kind == LineKind::Thinking && tail.len() < line.text.len()
-            {
-                line.text.clone()
-            } else {
-                tail.to_owned()
-            };
+        let collapsed_summary = if collapse_thinking && line.kind == LineKind::Thinking {
+            // Frozen view: pin the count to the value captured at the freeze
+            // point so post-freeze deltas cannot mutate the visible summary.
+            frozen_summary
+                .map(str::to_owned)
+                .or_else(|| line.collapsed_summary.clone())
+        } else {
+            None
+        };
         local.push(DisplayLine {
-            text,
+            text: tail.to_owned(),
             kind: line.kind,
+            collapsed_summary,
         });
         remaining > 0
     };
@@ -132,7 +155,7 @@ pub(crate) fn local_window_lines(
         && window.frozen_tail_cursor.is_none();
     if from_start {
         for line in lines[start..end].iter().take(MAX_RENDER_SOURCE_LINES) {
-            if !emit(line, line.text.len()) {
+            if !emit(line, line.text.len(), None) {
                 break;
             }
         }
@@ -140,12 +163,18 @@ pub(crate) fn local_window_lines(
     }
     for index in (start..end).rev().take(MAX_RENDER_SOURCE_LINES) {
         let line = &lines[index];
-        let cursor = if index + 1 == end {
+        let is_frozen_tail = index + 1 == end;
+        let cursor = if is_frozen_tail {
             window.frozen_tail_cursor.unwrap_or(line.text.len())
         } else {
             line.text.len()
         };
-        if !emit(line, cursor) {
+        let frozen_summary = if is_frozen_tail {
+            window.frozen_tail_summary.as_deref()
+        } else {
+            None
+        };
+        if !emit(line, cursor, frozen_summary) {
             break;
         }
     }
@@ -182,6 +211,11 @@ pub(crate) struct ScrollWindow {
     /// The source_end value at the moment the snapshot was taken; used to
     /// detect when the user has scrolled past the frozen range.
     pub(crate) frozen_source_end: usize,
+    /// Collapsed summary of the frozen tail line captured at the freeze
+    /// point, so the frozen view's `(N 行)` count reflects the text at
+    /// freeze time instead of the live post-freeze text. `None` unless the
+    /// frozen tail line was a collapsed `Thinking` line.
+    pub(crate) frozen_tail_summary: Option<String>,
 }
 
 impl Default for ScrollWindow {
@@ -199,6 +233,7 @@ impl ScrollWindow {
             follow_bottom: true,
             frozen_tail_cursor: None,
             frozen_source_end: 0,
+            frozen_tail_summary: None,
         }
     }
 
@@ -211,6 +246,7 @@ impl ScrollWindow {
     pub(crate) fn anchor_head(&mut self, lines: &[DisplayLine]) {
         self.follow_bottom = true;
         self.frozen_tail_cursor = None;
+        self.frozen_tail_summary = None;
         self.frozen_source_end = 0;
         self.source_start = 0;
         self.source_end = lines.len().min(MAX_RENDER_SOURCE_LINES);
@@ -235,6 +271,7 @@ impl ScrollWindow {
         let total = lines.len();
         self.follow_bottom = true;
         self.frozen_tail_cursor = None;
+        self.frozen_tail_summary = None;
         self.frozen_source_end = 0;
         self.source_end = total;
         // Walk backward counting visual rows until we have enough.
@@ -266,10 +303,11 @@ impl ScrollWindow {
 /// (shrink: top jumps to earlier content; grow: content jumps around).
 ///
 /// Only `source_start`/`local_offset` are rewritten; `source_end`,
-/// `frozen_tail_cursor`, `frozen_source_end` and `follow_bottom` are
-/// left untouched so a frozen streaming snapshot stays frozen and a
-/// scrolled-up view stays scrolled up. `collapse_thinking` must match the
-/// value the renderer uses (collapsed thinking blocks count as one row).
+/// `frozen_tail_cursor`, `frozen_tail_summary`, `frozen_source_end` and
+/// `follow_bottom` are left untouched so a frozen streaming snapshot stays
+/// frozen and a scrolled-up view stays scrolled up. `collapse_thinking`
+/// must match the value the renderer uses (collapsed thinking blocks count
+/// as one row).
 pub(crate) fn reanchor_window_on_resize(
     lines: &[DisplayLine],
     window: &mut ScrollWindow,
@@ -504,6 +542,7 @@ pub(crate) fn extend_window_down(
         // line. Switch to follow and clear the frozen cursor.
         state.window.follow_bottom = true;
         state.window.frozen_tail_cursor = None;
+        state.window.frozen_tail_summary = None;
     }
     // Reached the end of the *logically loaded* content while scrolling
     // down: queue the next newer middle segment. The trigger is

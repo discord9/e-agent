@@ -34,11 +34,13 @@ fn lookbehind_is_bounded_with_10k_prefix() {
         .map(|i| DisplayLine {
             text: format!("line {i}"),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         })
         .collect();
     lines.push(DisplayLine {
         text: "the actual rendered line".into(),
         kind: LineKind::Normal,
+        collapsed_summary: None,
     });
     let source_start = 10_000;
     let lb = lookbehind_start(&lines, source_start);
@@ -1246,10 +1248,12 @@ fn attached_view_scrolls_independently() {
         attached.state.lines.push(DisplayLine {
             text: "a".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         });
         attached.state.lines.push(DisplayLine {
             text: "b".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         });
         attached.state.window.source_start = 0;
         attached.state.window.source_end = 2;
@@ -1332,6 +1336,7 @@ async fn ready_scroll_keys_are_coalesced_without_consuming_following_input() {
         lines: vec![DisplayLine {
             text: "hello".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         inner_width: 80,
         ..Default::default()
@@ -1375,6 +1380,7 @@ async fn ready_scroll_keys_are_coalesced_without_consuming_following_input() {
         lines: vec![DisplayLine {
             text: "hello".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         inner_width: 80,
         ..Default::default()
@@ -1409,6 +1415,7 @@ async fn ready_scroll_keys_are_coalesced_without_consuming_following_input() {
         attached.state.lines.push(DisplayLine {
             text: "hello".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         });
         attached.state.window.source_start = 0;
         attached.state.window.source_end = 1;
@@ -1542,10 +1549,12 @@ fn wide_glyph_scroll_emits_trailing_cell_after_glyph() {
             DisplayLine {
                 text: " 好".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "好 ".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -1637,18 +1646,22 @@ fn scrolling_redraw_keeps_blank_scrollback_cells_on_solarized_surfaces() {
             DisplayLine {
                 text: "  leading and trailing  ".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "   ".into(),
                 kind: LineKind::ToolCall,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "+    7 wrapped diff text  ".into(),
                 kind: LineKind::Added,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "-    8 trailing   ".into(),
                 kind: LineKind::Removed,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -2322,34 +2335,42 @@ fn draw_uses_semantic_solarized_message_styles() {
             DisplayLine {
                 text: "normal".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "dim".into(),
                 kind: LineKind::Dim,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "user".into(),
                 kind: LineKind::User,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "tool".into(),
                 kind: LineKind::ToolCall,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "ok".into(),
                 kind: LineKind::ToolResult,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "error".into(),
                 kind: LineKind::ToolError,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "+    7 added".into(),
                 kind: LineKind::Added,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "-    7 removed".into(),
                 kind: LineKind::Removed,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -2633,31 +2654,47 @@ fn collapsed_thinking_summary_count_survives_local_window_truncation() {
     // Production rendering goes through local_window_lines, which caps the
     // window at MAX_RENDER_BYTES. A thinking block larger than the cap is
     // truncated there; the collapsed summary's (N 行) count must still
-    // reflect the FULL pre-truncation text, not the truncated tail
-    // (regression: the streamed summary count was computed after the cap).
+    // reflect the FULL pre-truncation text, not the truncated tail. The
+    // count now comes from the per-line cache, which is refreshed on the
+    // source line when the text changes (the width must be known — a draw
+    // has happened — for the cache to be populated).
     let mut state = TuiState::default();
     assert!(state.collapse_thinking.0);
+    let width = 20;
+    state.inner_width = width;
     state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(MAX_RENDER_BYTES)));
     assert_eq!(state.lines.len(), 1);
     assert!(
         state.lines[0].text.len() > MAX_RENDER_BYTES,
         "test text must exceed the local-window byte cap"
     );
-    let width = 20;
     let full_rows = hard_wrap(&state.lines[0].text, width).len();
     let window = ScrollWindow {
         source_start: 0,
         source_end: 1,
         ..ScrollWindow::new()
     };
+    // The source line carries the cache computed from its full text.
+    let expected_summary = collapsed_summary_for(&state.lines[0].text, width);
+    assert_eq!(
+        state.lines[0].collapsed_summary.as_deref(),
+        Some(expected_summary.as_str()),
+        "delta append must cache the full-text summary"
+    );
 
-    // Collapsed: the truncated thinking line keeps its full text so the
-    // summary count is exact.
+    // Collapsed: the local copy truncates the text (the byte cap applies to
+    // every line now) but carries the cache, so the summary count is exact.
     let local = local_window_lines(&state.lines, &window, true);
     assert_eq!(local.len(), 1);
+    assert!(
+        local[0].text.len() < state.lines[0].text.len(),
+        "collapsed truncated thinking must no longer keep its full text"
+    );
+    assert_eq!(local[0].text.len(), MAX_RENDER_BYTES);
     assert_eq!(
-        local[0].text, state.lines[0].text,
-        "collapsed truncated thinking must keep its full text"
+        local[0].collapsed_summary.as_deref(),
+        Some(expected_summary.as_str()),
+        "the cache is cloned into the local copy"
     );
     let visual = render_window(&local, 0, 1, width, true);
     assert_eq!(visual.len(), 1, "still a single collapsed summary row");
@@ -2679,6 +2716,45 @@ fn collapsed_thinking_summary_count_survives_local_window_truncation() {
         "expanded path must keep the bounded tail"
     );
     assert!(local_expanded[0].text.len() <= MAX_RENDER_BYTES);
+}
+
+#[test]
+fn collapsed_thinking_render_reads_cache_and_stays_bounded() {
+    // The collapsed render path must read the per-line cache instead of
+    // hard-wrapping the full text: rendering a thinking block larger than
+    // the 64 KiB local-window cap produces exactly one small summary row
+    // whose text is the cached string — the body is never materialized.
+    let mut state = TuiState::default();
+    assert!(state.collapse_thinking.0);
+    let width = 30;
+    state.inner_width = width;
+    state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(MAX_RENDER_BYTES)));
+    assert!(state.lines[0].text.len() > MAX_RENDER_BYTES);
+    let summary = state.lines[0]
+        .collapsed_summary
+        .clone()
+        .expect("cache is populated at append time once the width is known");
+    let window = ScrollWindow {
+        source_start: 0,
+        source_end: 1,
+        ..ScrollWindow::new()
+    };
+    // The bounded local copy feeds rendering, exactly like production draw.
+    let local = local_window_lines(&state.lines, &window, true);
+    assert_eq!(local[0].text.len(), MAX_RENDER_BYTES);
+    assert_eq!(
+        local[0].collapsed_summary.as_deref(),
+        Some(summary.as_str()),
+        "cache is carried through the truncating local window"
+    );
+    let visual = render_window(&local, 0, 1, width, true);
+    assert_eq!(visual.len(), 1, "collapsed renders exactly one row");
+    let text = rendered_text(&visual[0]);
+    assert_eq!(text, summary, "render outputs the cache verbatim");
+    assert!(
+        text.len() < MAX_RENDER_BYTES && !text.contains("word"),
+        "rendered output is the small summary, not the wrapped body"
+    );
 }
 
 #[test]
@@ -2724,10 +2800,12 @@ fn new_events_do_not_yank_a_scrolled_up_view() {
             DisplayLine {
                 text: "one".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "two".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -2752,10 +2830,12 @@ fn home_and_end_jump_to_session_edges() {
             DisplayLine {
                 text: "one".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "two".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -2783,10 +2863,12 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
             DisplayLine {
                 text: "one".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "two".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -2826,14 +2908,17 @@ fn wrapped_rows_counts_embedded_newlines_and_wrapping() {
         DisplayLine {
             text: "short".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "one\ntwo\nthree".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "x".repeat(25),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         },
     ];
     // 1 + 3 + exact hard wrap of 25 cells at width 10
@@ -2841,6 +2926,7 @@ fn wrapped_rows_counts_embedded_newlines_and_wrapping() {
     let cjk = vec![DisplayLine {
         text: "你好世界".into(),
         kind: LineKind::Normal,
+        collapsed_summary: None,
     }];
     // Each CJK char is 2 cells: "你好" then "世界" at width 5.
     assert_eq!(wrapped_rows(&cjk, 5, false), 2);
@@ -2898,6 +2984,7 @@ fn up_at_scrollback_top_requests_older_history() {
         lines: vec![DisplayLine {
             text: "only line".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         window: ScrollWindow {
             source_start: 0,
@@ -2932,10 +3019,12 @@ fn scrolled_up_mid_scrollback_or_without_store_never_requests_older() {
             DisplayLine {
                 text: "a".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "b".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         window: ScrollWindow {
@@ -2958,6 +3047,7 @@ fn scrolled_up_mid_scrollback_or_without_store_never_requests_older() {
         lines: vec![DisplayLine {
             text: "a".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         window: ScrollWindow {
             source_start: 0,
@@ -2980,14 +3070,17 @@ fn prepend_lines_shifts_window_indices_and_keeps_viewport() {
             DisplayLine {
                 text: "head-1".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-2".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-3".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         window: ScrollWindow {
@@ -3005,10 +3098,12 @@ fn prepend_lines_shifts_window_indices_and_keeps_viewport() {
         DisplayLine {
             text: "old-1".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "old-2".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
     ]);
     assert_eq!(state.lines.len(), 5);
@@ -3166,6 +3261,7 @@ async fn jsonl_store_load_older_marks_history_done_without_lines() {
         lines: vec![DisplayLine {
             text: "head".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         ..Default::default()
     };
@@ -3189,6 +3285,7 @@ fn home_requests_oldest_jump_and_pageup_stays_stepwise() {
         lines: vec![DisplayLine {
             text: "only line".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         window: ScrollWindow {
             source_start: 0,
@@ -3237,6 +3334,7 @@ async fn home_jump_loads_oldest_and_positions_at_beginning() {
         lines: vec![DisplayLine {
             text: "head".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         window: ScrollWindow {
             source_start: 1,
@@ -3269,6 +3367,7 @@ fn prepend_lines_shifts_head_start_with_window() {
         lines: vec![DisplayLine {
             text: "head-1".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         window: ScrollWindow {
             source_start: 0,
@@ -3282,10 +3381,12 @@ fn prepend_lines_shifts_head_start_with_window() {
         DisplayLine {
             text: "old-1".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "old-2".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
     ]);
     assert_eq!(state.lines.len(), 3);
@@ -3306,22 +3407,27 @@ fn splice_newer_lines_shifts_indices_and_keeps_viewport() {
             DisplayLine {
                 text: "old-1".into(),
                 kind: LineKind::Dim,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "old-2".into(),
                 kind: LineKind::Dim,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-1".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-2".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-3".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         window: ScrollWindow {
@@ -3341,10 +3447,12 @@ fn splice_newer_lines_shifts_indices_and_keeps_viewport() {
         DisplayLine {
             text: "mid-1".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "mid-2".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
     ]);
     assert_eq!(state.lines.len(), 7);
@@ -3369,10 +3477,12 @@ fn splice_newer_lines_shifts_indices_and_keeps_viewport() {
             DisplayLine {
                 text: "old-1".into(),
                 kind: LineKind::Dim,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-1".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         window: ScrollWindow {
@@ -3389,6 +3499,7 @@ fn splice_newer_lines_shifts_indices_and_keeps_viewport() {
     boundary.splice_newer_lines(vec![DisplayLine {
         text: "mid-1".into(),
         kind: LineKind::Dim,
+        collapsed_summary: None,
     }]);
     assert_eq!(boundary.lines.len(), 3);
     assert_eq!(boundary.head_start, 2);
@@ -3465,6 +3576,7 @@ async fn jsonl_store_load_newer_marks_done_without_lines() {
         lines: vec![DisplayLine {
             text: "head".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         head_start: 0,
         ..Default::default()

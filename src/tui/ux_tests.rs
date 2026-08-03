@@ -432,6 +432,81 @@ fn frozen_render_stable_then_end_shows_latest() {
     assert_eq!(row_text(term.backend().buffer(), 6), "");
 }
 
+#[test]
+fn frozen_collapsed_thinking_summary_pins_count_at_freeze_point() {
+    // Up/PageUp freeze the viewport while reasoning streams; the collapsed
+    // summary's (N 行) count must reflect the text at the freeze point, not
+    // keep growing as deltas append to the live source line.
+    let backend = ratatui::backend::TestBackend::new(40, 10);
+    let mut term = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    assert!(state.collapse_thinking.0);
+    state.inner_width = 40;
+    state.push_agent_event(AgentEvent::ReasoningDelta("alpha ".repeat(30)));
+    assert!(state.active_lane == Some(ActiveStreamLane::Reasoning));
+
+    // Freeze through the real scroll path (Up while following).
+    state.handle_scroll(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert!(state.window.frozen_tail_cursor.is_some());
+    let frozen_summary = state
+        .window
+        .frozen_tail_summary
+        .clone()
+        .expect("freeze captures the collapsed thinking summary");
+
+    // Deltas keep streaming into the live source line; the live cache
+    // grows past the freeze-point count.
+    state.push_agent_event(AgentEvent::ReasoningDelta("beta ".repeat(60)));
+    let live_summary = state
+        .lines
+        .last()
+        .unwrap()
+        .collapsed_summary
+        .clone()
+        .expect("live cache keeps refreshing on deltas");
+    assert_ne!(live_summary, frozen_summary, "live count must keep growing");
+
+    // The frozen viewport still renders the freeze-point summary.
+    draw(&mut term, &mut state).unwrap();
+    let summary_row = (0..term.backend().buffer().area.height)
+        .map(|y| row_text(term.backend().buffer(), y))
+        .find(|r| r.contains("Tab"))
+        .unwrap_or_else(|| panic!("no collapsed summary row rendered"));
+    // row_text pads cells after wide glyphs, so compare the (N 行) count.
+    let count = |text: &str| -> String {
+        text.split('(')
+            .nth(1)
+            .and_then(|s| s.split("行").next())
+            .unwrap_or("")
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(
+        count(&summary_row),
+        count(&frozen_summary),
+        "frozen view shows the freeze-point count, not the live count"
+    );
+    assert_ne!(
+        count(&summary_row),
+        count(&live_summary),
+        "frozen view must not show the live count {live_summary:?}"
+    );
+
+    // End resumes follow: the live count appears.
+    state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    assert!(state.window.frozen_tail_summary.is_none());
+    draw(&mut term, &mut state).unwrap();
+    let summary_row = (0..term.backend().buffer().area.height)
+        .map(|y| row_text(term.backend().buffer(), y))
+        .find(|r| r.contains("Tab"))
+        .unwrap_or_else(|| panic!("no collapsed summary row rendered after End"));
+    assert_eq!(
+        count(&summary_row),
+        count(&live_summary),
+        "live count after unfreezing"
+    );
+}
+
 // ── Terminal-style head/tail anchoring ─────────────────────────────
 
 #[test]
@@ -533,6 +608,7 @@ fn assistant_delta_down_resumes_live_follow_at_frozen_visual_bottom() {
                 &DisplayLine {
                     text: frozen,
                     kind: LineKind::Normal,
+                    collapsed_summary: None,
                 },
                 state.inner_width,
                 false,
@@ -584,6 +660,7 @@ fn reasoning_delta_pagedown_resumes_live_follow_at_frozen_visual_bottom() {
             &DisplayLine {
                 text: frozen,
                 kind: LineKind::Thinking,
+                collapsed_summary: None,
             },
             state.inner_width,
             state.collapse_thinking.0,
@@ -739,11 +816,15 @@ fn collapsed_huge_thinking_summary_shows_full_row_count_after_truncation() {
     // Production path: draw → local_window_lines (64 KiB cap) →
     // render_window. A thinking block larger than the cap must still show
     // the FULL text's wrapped row count in the collapsed summary, not the
-    // truncated tail's (under)estimate.
+    // truncated tail's (under)estimate. The count comes from the per-line
+    // cache, which is refreshed when the line's text changes — the render
+    // width must be known by then (a draw has happened), so prime
+    // inner_width with the terminal width before streaming.
     let backend = ratatui::backend::TestBackend::new(40, 12);
     let mut terminal = Terminal::new(backend).unwrap();
     let mut state = TuiState::default();
     assert!(state.collapse_thinking.0);
+    state.inner_width = 40;
     state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(MAX_RENDER_BYTES)));
     assert!(state.lines[0].text.len() > MAX_RENDER_BYTES);
     draw(&mut terminal, &mut state).unwrap();
@@ -768,11 +849,13 @@ fn local_window_obeys_all_limits_without_splitting_utf8() {
         .map(|index| DisplayLine {
             text: format!("line {index}"),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         })
         .collect();
     lines.push(DisplayLine {
         text: format!("prefix{}尾", "好".repeat(MAX_RENDER_BYTES)),
         kind: LineKind::Normal,
+        collapsed_summary: None,
     });
     let window = ScrollWindow {
         source_start: 0,
@@ -848,10 +931,12 @@ fn anchor_tail_includes_long_crossing_line() {
         DisplayLine {
             text: "x".repeat(2400),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "you> hello".into(),
             kind: LineKind::User,
+            collapsed_summary: None,
         },
     ];
     let mut window = ScrollWindow::new();

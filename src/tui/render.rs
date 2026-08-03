@@ -853,7 +853,13 @@ pub(crate) fn render_task_detail(
 /// A `Thinking` line with `collapse_thinking` renders as a single summary
 /// row (`▸ thinking… (N 行) [Tab 展开]`, N = the block's wrapped row count)
 /// instead of the full wrapped text — and `line_visual_rows` counts exactly
-/// one row for it, keeping render and scroll accounting in agreement.
+/// one row for it, keeping render and scroll accounting in agreement. The
+/// summary is read from `DisplayLine::collapsed_summary`, which the state
+/// refreshes whenever the line's text changes: rendering never hard-wraps
+/// the (possibly MB-sized) full text per frame. The fallback below only
+/// runs for a line whose cache was never computed (render width unknown at
+/// append time, i.e. tests or a Thinking line created before the first
+/// draw), and for those the local text is the full untruncated text.
 pub(crate) fn render_window(
     lines: &[DisplayLine],
     source_start: usize,
@@ -890,11 +896,15 @@ pub(crate) fn render_window(
                     })
                     .collect::<Vec<_>>()
             } else if line.kind == LineKind::Thinking && collapse_thinking {
-                let rows = hard_wrap(&line.text, width).len();
-                vec![styled_scroll_line(
-                    &format!("▸ thinking… ({rows} 行) [Tab 展开]"),
-                    line.kind,
-                )]
+                let fallback;
+                let summary: &str = match line.collapsed_summary.as_deref() {
+                    Some(cached) => cached,
+                    None => {
+                        fallback = collapsed_summary_for(&line.text, width);
+                        &fallback
+                    }
+                };
+                vec![styled_scroll_line(summary, line.kind)]
             } else {
                 hard_wrap(&line.text, width)
                     .into_iter()
