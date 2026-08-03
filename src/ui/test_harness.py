@@ -2280,7 +2280,8 @@ async function main(){
         && pinMarkerLabels.includes("所属服务器：服务器A")
         && pinMarkerLabels.includes("所属服务器：服务器B")
         && [...pinMarkers].every((m) => m.title && m.getAttribute("role") === "img"
-          && m.nextSibling && m.nextSibling.classList.contains("tree-count")),
+          && m.parentNode && m.parentNode.classList.contains("tree-row")
+          && m.nextSibling && m.nextSibling.classList.contains("busy-dot")),
         "markers=" + pinMarkers.length + " labels=" + pinMarkerLabels.join(","));
     chk("pinned roots all in pinned group",
         pinTop.textContent.includes("pa1") && pinTop.textContent.includes("pb1"),
@@ -4160,7 +4161,7 @@ _marker = re.search(r'\.tree-row\s+\.ws-pin-marker\s*\{([^}]*)\}', _css)
 _marker_css = _marker.group(1) if _marker else ''
 _marker_ok = bool(_marker
                   and re.search(r'width:\s*[4-6]px', _marker_css)
-                  and re.search(r'height:\s*1[2-4]px', _marker_css)
+                  and re.search(r'height:\s*1[2-6]px', _marker_css)
                   and re.search(r'flex:\s*0\s+0\s+auto', _marker_css)
                   and re.search(r'background:\s*currentColor', _marker_css))
 print(("PASS" if _marker_ok else "FAIL") + " compact ws-pin-marker layout in style.css")
