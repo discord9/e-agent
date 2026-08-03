@@ -199,7 +199,7 @@ async fn connect_twice_on_file_is_idempotent_and_persists() {
     let entries = test_entries();
     let s1 = SqliteSession::connect(p, &wid, &sid).await.unwrap();
     s1.append(&entries[..3]).await.unwrap();
-    s1.create_meta(&sid, Some("m"), Some("main"), None, None)
+    s1.create_meta(&sid, Some("m"), Some("main"), None, None, None)
         .await
         .unwrap();
     drop(s1);
@@ -646,7 +646,7 @@ async fn append_detects_concurrent_writer() {
     // set_title/set_pinned/backfill — stamps the writer identity), so the
     // conflict error below can name the latest snapshot writer.
     writer_a
-        .create_meta(&sid, Some("m"), None, None, None)
+        .create_meta(&sid, Some("m"), None, None, None, None)
         .await
         .unwrap();
     drop(writer_a);
@@ -1939,7 +1939,14 @@ async fn sessions_meta_create_list_touch_audit_delete() {
 
     // create → the list sees it immediately (synchronous create).
     session
-        .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+        .create_meta(
+            &sid,
+            Some("model-x"),
+            Some("main"),
+            None,
+            None,
+            Some("delegate label"),
+        )
         .await
         .unwrap();
     let list = session.list_meta().await.unwrap();
@@ -1950,10 +1957,15 @@ async fn sessions_meta_create_list_touch_audit_delete() {
     assert_eq!(created.model.as_deref(), Some("model-x"));
     assert_eq!(created.role.as_deref(), Some("main"));
     assert_eq!(created.entry_count, 0);
+    assert_eq!(
+        created.title.as_deref(),
+        Some("delegate label"),
+        "a title supplied at creation is recorded"
+    );
 
     // create is idempotent: a second create appends nothing.
     session
-        .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+        .create_meta(&sid, Some("model-x"), Some("main"), None, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -1997,7 +2009,7 @@ async fn sessions_meta_create_list_touch_audit_delete() {
 
     // ...and create_meta works again afterwards (delete → create cycle).
     session
-        .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+        .create_meta(&sid, Some("model-x"), Some("main"), None, None, None)
         .await
         .unwrap();
     assert_eq!(session.audit_meta(&sid).await.unwrap().len(), 1);
@@ -2012,6 +2024,81 @@ async fn sessions_meta_create_list_touch_audit_delete() {
 }
 
 #[tokio::test]
+async fn sessions_meta_create_title_preserved_on_resume_backfill() {
+    let (_dir, session, sid) = fresh_session().await;
+
+    // Fresh creation with a title.
+    session
+        .create_meta(
+            &sid,
+            Some("model-x"),
+            Some("main"),
+            None,
+            None,
+            Some("original title"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.audit_meta(&sid).await.unwrap().len(), 1);
+
+    // Resume (row exists, nothing missing): even a different title is a
+    // no-op — the creation title survives and nothing is appended.
+    session
+        .create_meta(
+            &sid,
+            Some("model-x"),
+            Some("main"),
+            None,
+            None,
+            Some("resume title"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session.audit_meta(&sid).await.unwrap().len(),
+        1,
+        "resume must not append a snapshot or rewrite the title"
+    );
+    let list = session.list_meta().await.unwrap();
+    assert_eq!(
+        list[0].title.as_deref(),
+        Some("original title"),
+        "resume keeps the creation title"
+    );
+
+    // Backfill (missing model on a pre-table row) also preserves the title.
+    let (_, session2, sid2) = fresh_session().await;
+    session2
+        .create_meta(&sid2, None, None, None, None, Some("pre-table title"))
+        .await
+        .unwrap();
+    session2
+        .create_meta(
+            &sid2,
+            Some("model-y"),
+            None,
+            Some("parent-1"),
+            Some(7),
+            None,
+        )
+        .await
+        .unwrap();
+    let latest = session2
+        .list_meta()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.session_id == sid2)
+        .expect("session listed");
+    assert_eq!(
+        latest.title.as_deref(),
+        Some("pre-table title"),
+        "backfill carries the existing title, never overwrites it"
+    );
+    assert_eq!(latest.model.as_deref(), Some("model-y"));
+}
+
+#[tokio::test]
 async fn sessions_meta_writer_is_process_identity() {
     // File-backed so a fresh connect can re-read the stamped writer from
     // the snapshot rows.
@@ -2022,7 +2109,7 @@ async fn sessions_meta_writer_is_process_identity() {
     let session = SqliteSession::connect(p, &wid, &sid).await.unwrap();
 
     session
-        .create_meta(&sid, Some("model-x"), None, None, None)
+        .create_meta(&sid, Some("model-x"), None, None, None, None)
         .await
         .unwrap();
     session.touch_meta().await.unwrap();
@@ -2068,7 +2155,7 @@ async fn sessions_meta_entry_count_is_next_seq() {
     session.append(&entries[..3]).await.unwrap();
     assert_eq!(*session.next_seq.lock().unwrap(), 3);
     session
-        .create_meta(&sid, Some("m"), None, None, None)
+        .create_meta(&sid, Some("m"), None, None, None, None)
         .await
         .unwrap();
     let list = session.list_meta().await.unwrap();
@@ -2113,6 +2200,7 @@ async fn sessions_meta_touch_never_self_creates() {
             Some("fixer"),
             Some("parent-x"),
             Some(7),
+            None,
         )
         .await
         .unwrap();
@@ -2138,7 +2226,7 @@ async fn sessions_meta_backfills_parent_link_once() {
 
     // 1. build writes the first row with parent = None.
     session
-        .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+        .create_meta(&sid, Some("model-x"), Some("main"), None, None, None)
         .await
         .unwrap();
     let trail = session.audit_meta(&sid).await.unwrap();
@@ -2155,6 +2243,7 @@ async fn sessions_meta_backfills_parent_link_once() {
             Some("main"),
             Some("parent-1"),
             Some(7),
+            None,
         )
         .await
         .unwrap();
@@ -2182,6 +2271,7 @@ async fn sessions_meta_backfills_parent_link_once() {
             Some("main"),
             Some("parent-1"),
             Some(7),
+            None,
         )
         .await
         .unwrap();
@@ -2199,6 +2289,7 @@ async fn sessions_meta_backfills_parent_link_once() {
             Some("main"),
             Some("parent-2"),
             Some(8),
+            None,
         )
         .await
         .unwrap();
@@ -2225,11 +2316,11 @@ async fn sessions_meta_backfills_parent_link_once() {
     //    appends nothing (the plain resume path stays a no-op).
     let (_dir2, session2, sid2) = fresh_session().await;
     session2
-        .create_meta(&sid2, Some("model-x"), Some("main"), None, None)
+        .create_meta(&sid2, Some("model-x"), Some("main"), None, None, None)
         .await
         .unwrap();
     session2
-        .create_meta(&sid2, Some("model-x"), Some("main"), None, None)
+        .create_meta(&sid2, Some("model-x"), Some("main"), None, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -2246,7 +2337,7 @@ async fn sessions_meta_backfills_missing_model_once() {
     // 1. a pre-table row: model NULL, no parent (backfill_sessions
     //    signature — create_meta with model/parent None).
     session
-        .create_meta(&sid, None, None, None, None)
+        .create_meta(&sid, None, None, None, None, None)
         .await
         .unwrap();
     let trail = session.audit_meta(&sid).await.unwrap();
@@ -2257,7 +2348,7 @@ async fn sessions_meta_backfills_missing_model_once() {
     // 2. btw spawn's create_meta (model + parent) → one fresh row fills
     //    both; old row kept; latest snapshot carries model + parent.
     session
-        .create_meta(&sid, Some("model-y"), None, Some("parent-1"), Some(7))
+        .create_meta(&sid, Some("model-y"), None, Some("parent-1"), Some(7), None)
         .await
         .unwrap();
     let trail = session.audit_meta(&sid).await.unwrap();
@@ -2279,7 +2370,7 @@ async fn sessions_meta_backfills_missing_model_once() {
 
     // 3. idempotent: re-recording with the same model appends nothing.
     session
-        .create_meta(&sid, Some("model-y"), None, Some("parent-1"), Some(7))
+        .create_meta(&sid, Some("model-y"), None, Some("parent-1"), Some(7), None)
         .await
         .unwrap();
     assert_eq!(
@@ -2290,7 +2381,7 @@ async fn sessions_meta_backfills_missing_model_once() {
 
     // 4. a different model never overwrites the recorded one.
     session
-        .create_meta(&sid, Some("model-z"), None, Some("parent-1"), Some(7))
+        .create_meta(&sid, Some("model-z"), None, Some("parent-1"), Some(7), None)
         .await
         .unwrap();
     let latest = session
@@ -2312,7 +2403,7 @@ async fn sessions_meta_set_title_persists_and_survives_touch() {
     assert!(session.audit_meta(&sid).await.unwrap().is_empty());
 
     session
-        .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+        .create_meta(&sid, Some("model-x"), Some("main"), None, None, None)
         .await
         .unwrap();
 
@@ -2376,7 +2467,7 @@ async fn sessions_meta_set_pinned_persists_and_survives_touch() {
     assert!(session.audit_meta(&sid).await.unwrap().is_empty());
 
     session
-        .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+        .create_meta(&sid, Some("model-x"), Some("main"), None, None, None)
         .await
         .unwrap();
     let created = session
@@ -2447,7 +2538,7 @@ async fn sessions_meta_set_archived_persists_and_survives_touch() {
     assert!(session.audit_meta(&sid).await.unwrap().is_empty());
 
     session
-        .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+        .create_meta(&sid, Some("model-x"), Some("main"), None, None, None)
         .await
         .unwrap();
     let created = session
@@ -2529,11 +2620,11 @@ async fn sessions_meta_list_is_latest_wins() {
     let session2 = SqliteSession::connect(p, &wid, &sid2).await.unwrap();
 
     session
-        .create_meta(&sid, Some("model-a"), Some("main"), None, None)
+        .create_meta(&sid, Some("model-a"), Some("main"), None, None, None)
         .await
         .unwrap();
     session2
-        .create_meta(&sid2, Some("model-b"), Some("main"), None, None)
+        .create_meta(&sid2, Some("model-b"), Some("main"), None, None, None)
         .await
         .unwrap();
 
@@ -2632,7 +2723,7 @@ async fn sessions_meta_backfill_skips_sessions_with_rows() {
     let entries = test_entries();
     session.append(&entries[..2]).await.unwrap();
     session
-        .create_meta(&sid, Some("m"), Some("main"), None, None)
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
         .await
         .unwrap();
     session.backfill_sessions().await.unwrap();

@@ -1274,7 +1274,11 @@ impl GreptimeSession {
     ///
     /// `model` / `role` / parent links are supplied by the caller — the
     /// parent process writes subagent rows at spawn time; the main
-    /// session's row is written by `SessionFactory::build`.
+    /// session's row is written by `SessionFactory::build`. `title`
+    /// names the session at CREATION time only (delegate / btw subagents
+    /// pass their task-panel label; main sessions pass `None`): on the
+    /// existing-row backfill path an existing title is preserved, so a
+    /// resume never rewrites a title.
     pub async fn create_meta(
         &self,
         session_id: &str,
@@ -1282,6 +1286,7 @@ impl GreptimeSession {
         role: Option<&str>,
         parent_session_id: Option<&str>,
         parent_task_id: Option<i64>,
+        title: Option<&str>,
     ) -> Result<()> {
         if let Some(existing) = self.load_meta_row(session_id).await? {
             // Row already exists (resume, or a btw/subagent row whose
@@ -1316,8 +1321,8 @@ impl GreptimeSession {
             entry_count: self.next_seq,
             parent_session_id: parent_session_id.map(str::to_owned),
             parent_task_id,
-            title: None,    // a fresh session is unnamed until the user names it
-            pinned: None,   // a fresh session is unpinned until the user pins it
+            title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
+            pinned: None,                    // a fresh session is unpinned until the user pins it
             archived: None, // a fresh session is unarchived until the user archives it
             writer: None,   // stamped by insert_meta with the writing process
             label: None,    // label lives in running_tasks, resolved at list time
@@ -2125,7 +2130,7 @@ mod tests {
         // set_title/set_pinned/backfill — stamps the writer identity), so
         // the conflict error below can name the latest snapshot writer.
         writer_a
-            .create_meta(&sid, Some("m"), None, None, None)
+            .create_meta(&sid, Some("m"), None, None, None, None)
             .await
             .unwrap();
         drop(writer_a);
@@ -3844,7 +3849,14 @@ mod tests {
 
         // create → the list sees it immediately (synchronous create).
         session
-            .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+            .create_meta(
+                &sid,
+                Some("model-x"),
+                Some("main"),
+                None,
+                None,
+                Some("delegate label"),
+            )
             .await
             .unwrap();
         let list = session.list_meta().await.unwrap();
@@ -3855,16 +3867,39 @@ mod tests {
         assert_eq!(created.model.as_deref(), Some("model-x"));
         assert_eq!(created.role.as_deref(), Some("main"));
         assert_eq!(created.entry_count, 0);
+        assert_eq!(
+            created.title.as_deref(),
+            Some("delegate label"),
+            "a title supplied at creation is recorded"
+        );
 
-        // create is idempotent: a second create appends nothing.
+        // create is idempotent: a second create appends nothing, and a
+        // different title on resume never overwrites the creation title.
         session
-            .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+            .create_meta(
+                &sid,
+                Some("model-x"),
+                Some("main"),
+                None,
+                None,
+                Some("resume title"),
+            )
             .await
             .unwrap();
         assert_eq!(
             session.audit_meta(&sid).await.unwrap().len(),
             1,
             "re-create must not append a second creation snapshot"
+        );
+        let list = session.list_meta().await.unwrap();
+        assert_eq!(
+            list.iter()
+                .find(|m| m.session_id == sid)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("delegate label"),
+            "resume keeps the creation title"
         );
 
         // touch twice → audit trail has 3 rows (create + 2 touches), the
@@ -3921,7 +3956,7 @@ mod tests {
 
         // create → the snapshot row is stamped with this process's identity.
         session
-            .create_meta(&sid, Some("model-x"), None, None, None)
+            .create_meta(&sid, Some("model-x"), None, None, None, None)
             .await
             .unwrap();
         session.touch_meta().await.unwrap();
@@ -3982,7 +4017,7 @@ mod tests {
         session.append(&entries[..3]).await.unwrap();
         assert_eq!(session.next_seq, 3);
         session
-            .create_meta(&sid, Some("m"), None, None, None)
+            .create_meta(&sid, Some("m"), None, None, None, None)
             .await
             .unwrap();
         let list = session.list_meta().await.unwrap();
@@ -4033,6 +4068,7 @@ mod tests {
                 Some("fixer"),
                 Some("parent-x"),
                 Some(7),
+                None,
             )
             .await
             .unwrap();
@@ -4071,7 +4107,7 @@ mod tests {
 
         // 1. build writes the first row with parent = None.
         session
-            .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+            .create_meta(&sid, Some("model-x"), Some("main"), None, None, None)
             .await
             .unwrap();
         let trail = session.audit_meta(&sid).await.unwrap();
@@ -4088,6 +4124,7 @@ mod tests {
                 Some("main"),
                 Some("parent-1"),
                 Some(7),
+                None,
             )
             .await
             .unwrap();
@@ -4115,6 +4152,7 @@ mod tests {
                 Some("main"),
                 Some("parent-1"),
                 Some(7),
+                None,
             )
             .await
             .unwrap();
@@ -4132,6 +4170,7 @@ mod tests {
                 Some("main"),
                 Some("parent-2"),
                 Some(8),
+                None,
             )
             .await
             .unwrap();
@@ -4162,11 +4201,11 @@ mod tests {
         );
         let session2 = GreptimeSession::connect(&conn, &wid, &sid2).await.unwrap();
         session2
-            .create_meta(&sid2, Some("model-x"), Some("main"), None, None)
+            .create_meta(&sid2, Some("model-x"), Some("main"), None, None, None)
             .await
             .unwrap();
         session2
-            .create_meta(&sid2, Some("model-x"), Some("main"), None, None)
+            .create_meta(&sid2, Some("model-x"), Some("main"), None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -4200,7 +4239,7 @@ mod tests {
         // 1. a pre-table row: model NULL, no parent (backfill_sessions
         //    signature — create_meta with model/parent None).
         session
-            .create_meta(&sid, None, None, None, None)
+            .create_meta(&sid, None, None, None, None, None)
             .await
             .unwrap();
         let trail = session.audit_meta(&sid).await.unwrap();
@@ -4211,7 +4250,7 @@ mod tests {
         // 2. btw spawn's create_meta (model + parent) → one fresh row fills
         //    both; old row kept; latest snapshot carries model + parent.
         session
-            .create_meta(&sid, Some("model-y"), None, Some("parent-1"), Some(7))
+            .create_meta(&sid, Some("model-y"), None, Some("parent-1"), Some(7), None)
             .await
             .unwrap();
         let trail = session.audit_meta(&sid).await.unwrap();
@@ -4233,7 +4272,7 @@ mod tests {
 
         // 3. idempotent: re-recording with the same model appends nothing.
         session
-            .create_meta(&sid, Some("model-y"), None, Some("parent-1"), Some(7))
+            .create_meta(&sid, Some("model-y"), None, Some("parent-1"), Some(7), None)
             .await
             .unwrap();
         assert_eq!(
@@ -4244,7 +4283,7 @@ mod tests {
 
         // 4. a different model never overwrites the recorded one.
         session
-            .create_meta(&sid, Some("model-z"), None, Some("parent-1"), Some(7))
+            .create_meta(&sid, Some("model-z"), None, Some("parent-1"), Some(7), None)
             .await
             .unwrap();
         let latest = session
@@ -4283,7 +4322,7 @@ mod tests {
         );
 
         session
-            .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+            .create_meta(&sid, Some("model-x"), Some("main"), None, None, None)
             .await
             .unwrap();
 
@@ -4359,7 +4398,7 @@ mod tests {
         );
 
         session
-            .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+            .create_meta(&sid, Some("model-x"), Some("main"), None, None, None)
             .await
             .unwrap();
         let created = session
@@ -4443,7 +4482,7 @@ mod tests {
         );
 
         session
-            .create_meta(&sid, Some("model-x"), Some("main"), None, None)
+            .create_meta(&sid, Some("model-x"), Some("main"), None, None, None)
             .await
             .unwrap();
         let created = session

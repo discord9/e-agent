@@ -42,7 +42,7 @@ fn task_label_falls_back_label_then_role_then_task() {
     let long = "x".repeat(200);
     let capped = task_label(Some(&long), None, "task");
     assert!(
-        capped.chars().count() <= 61 && capped.contains('\u{2026}'),
+        capped.chars().count() <= 41 && capped.contains('\u{2026}'),
         "caller label is capped with a middle ellipsis, got: {capped:?}"
     );
 }
@@ -571,8 +571,12 @@ async fn sync_abandon_aborts_runner_and_cleans_session() {
     // 真实 execute（background:false）：spawn 后主侧持有的是 execute
     // future（其内部 await done_rx，持有主侧 done_rx 的一端）。
     let execute = tokio::spawn(async move {
-        tool.execute(json!({"task": "block forever", "background": false}))
-            .await
+        tool.execute(json!({
+            "task": "block forever",
+            "workspace": temp.path().to_str().unwrap(),
+            "background": false
+        }))
+        .await
     });
 
     // 已开始信号：子 runner 的模型请求已被 stub 完整读取（runner 卡在
@@ -683,41 +687,50 @@ async fn panicking_inner_model_cleans_up_and_sends_one_failure_completion() {
 }
 
 async fn successful_model(answer: &str) -> String {
+    successful_model_n(answer, 1).await
+}
+
+/// Like `successful_model`, but answers `requests` sequential model calls
+/// (one per subagent runner) on the same listener — a single delegate
+/// execute consumes one answer, so a resume test needs two.
+async fn successful_model_n(answer: &str, requests: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let answer = serde_json::to_string(answer).unwrap();
     tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let header_end = loop {
-            let mut chunk = [0; 1024];
-            let count = stream.read(&mut chunk).await.unwrap();
-            request.extend_from_slice(&chunk[..count]);
-            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                break end + 4;
-            }
-        };
-        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().unwrap())
-            })
-            .unwrap();
-        let received_body = request.len() - header_end;
-        let mut rest = vec![0; content_length - received_body];
-        stream.read_exact(&mut rest).await.unwrap();
+        for _ in 0..requests {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0; 1024];
+                let count = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            let received_body = request.len() - header_end;
+            let mut rest = vec![0; content_length - received_body];
+            stream.read_exact(&mut rest).await.unwrap();
 
-        let body = format!(
-            "data: {{\"choices\":[{{\"delta\":{{\"content\":{answer}}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
-        );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
+            let body = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":{answer}}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
     });
     format!("http://{address}")
 }
@@ -836,6 +849,43 @@ async fn blocking_model() -> (String, BlockingStub) {
 }
 
 #[tokio::test]
+async fn delegate_requires_workspace_parameter() {
+    let temp = tempfile::tempdir().unwrap();
+    let tool = delegate(temp.path());
+
+    // Missing workspace: rejected before any subagent is spawned.
+    let error = tool
+        .execute(json!({"task": "hello", "background": false}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "delegate requires a workspace parameter: absolute path of the working directory"
+    );
+
+    // An empty/whitespace workspace is equally a missing parameter.
+    let error = tool
+        .execute(json!({"task": "hello", "workspace": "  ", "background": false}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "delegate requires a workspace parameter: absolute path of the working directory"
+    );
+
+    // `.` is no longer silently reinterpreted as the parent workspace: it
+    // is a relative path and reroot() rejects it.
+    let error = tool
+        .execute(json!({"task": "hello", "workspace": ".", "background": false}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("invalid `workspace`"),
+        "`.` must be rejected as a non-absolute workspace, got: {error}"
+    );
+}
+
+#[tokio::test]
 async fn rejects_empty_task() {
     let temp = tempfile::tempdir().unwrap();
     let delegate = delegate(temp.path());
@@ -862,7 +912,16 @@ fn spec_defaults_background_true_without_requiring_it() {
     let background = &spec.parameters["properties"]["background"];
     assert_eq!(background["type"], "boolean");
     assert_eq!(background["default"], true);
-    assert_eq!(spec.parameters["required"], json!(["task"]));
+    assert_eq!(spec.parameters["required"], json!(["task", "workspace"]));
+    let workspace = &spec.parameters["properties"]["workspace"];
+    assert_eq!(workspace["type"], "string");
+    assert!(
+        workspace["description"]
+            .as_str()
+            .unwrap()
+            .contains("REQUIRED"),
+        "workspace must be documented as required, got: {workspace}"
+    );
     assert!(
         spec.description
             .contains("By default it runs in the background")
@@ -1048,7 +1107,12 @@ async fn run_subagent_and_capture(
     tool.set_event_sender(sender);
 
     let output = tool
-        .execute(json!({"task": "audit", "role": "auditor", "background": false}))
+        .execute(json!({
+            "task": "audit",
+            "role": "auditor",
+            "workspace": temp.path().to_str().unwrap(),
+            "background": false
+        }))
         .await
         .unwrap();
     let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
@@ -1244,7 +1308,11 @@ async fn sync_success_contains_session_id_and_answer() {
     let tool = delegate_with_url(temp.path(), base_url);
 
     let output = tool
-        .execute(json!({"task": "hello", "background": false}))
+        .execute(json!({
+            "task": "hello",
+            "workspace": temp.path().to_str().unwrap(),
+            "background": false
+        }))
         .await
         .unwrap();
     let mut lines = output.lines();
@@ -1254,6 +1322,179 @@ async fn sync_success_contains_session_id_and_answer() {
         .expect("sync success contains the subagent session id");
     assert!(session_id.starts_with("sub-"));
     assert_eq!(lines.collect::<Vec<_>>(), ["finished answer"]);
+}
+
+/// Poll the JSONL metadata store until the subagent session's row appears
+/// (the parent writes it fire-and-forget via `spawn_subagent_meta_create`
+/// at spawn time) and return its title.
+async fn subagent_meta_title(root: &std::path::Path, session_id: &str) -> Option<String> {
+    let store = SessionStore::Jsonl;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let meta = store
+            .list_meta(root)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.session_id == session_id);
+        if let Some(meta) = meta {
+            return meta.title;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "subagent metadata row for `{session_id}` never appeared"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn fresh_spawn_records_label_as_subagent_session_title() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("sessions");
+    let base_url = successful_model("finished answer").await;
+    let mut tool = delegate_with_url(temp.path(), base_url).persist_sessions(root.clone());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+
+    let answer = tool
+        .execute(json!({
+            "task": "hello",
+            "label": "my panel title",
+            "workspace": temp.path().to_str().unwrap(),
+            "background": false
+        }))
+        .await
+        .unwrap();
+    let session_id = answer
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("subagent session: "))
+        .expect("sync success contains the subagent session id");
+    assert!(
+        session_id.starts_with("sub-"),
+        "fresh spawn must allocate a new session id, got {session_id}"
+    );
+
+    let title = subagent_meta_title(&root, session_id).await;
+    assert_eq!(
+        title.as_deref(),
+        Some("my panel title"),
+        "a fresh spawn records its task-panel label as the session title"
+    );
+}
+
+#[tokio::test]
+async fn fresh_spawn_without_label_records_the_fallback_title() {
+    // No caller label: task_label falls back to the role name or a task
+    // preview, so a fresh spawn's title is never empty.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("sessions");
+    let base_url = successful_model("finished answer").await;
+    let mut tool = delegate_with_url(temp.path(), base_url).persist_sessions(root.clone());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+
+    let answer = tool
+        .execute(json!({
+            "task": "hello world task",
+            "workspace": temp.path().to_str().unwrap(),
+            "background": false
+        }))
+        .await
+        .unwrap();
+    let session_id = answer
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("subagent session: "))
+        .expect("sync success contains the subagent session id");
+
+    let title = subagent_meta_title(&root, session_id).await;
+    assert_eq!(
+        title.as_deref(),
+        Some("hello world task"),
+        "fallback title (task preview) is recorded"
+    );
+}
+
+#[tokio::test]
+async fn resume_keeps_the_original_subagent_session_title() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("sessions");
+    let base_url = successful_model_n("finished answer", 2).await;
+    let mut tool = delegate_with_url(temp.path(), base_url).persist_sessions(root.clone());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+    let workspace = temp.path().to_str().unwrap().to_owned();
+
+    // 1. Fresh spawn records the caller's label as the title.
+    let answer = tool
+        .execute(json!({
+            "task": "first task",
+            "label": "first title",
+            "workspace": workspace.clone(),
+            "background": false
+        }))
+        .await
+        .unwrap();
+    let session_id = answer
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("subagent session: "))
+        .expect("sync success contains the subagent session id");
+    assert_eq!(
+        subagent_meta_title(&root, session_id).await.as_deref(),
+        Some("first title")
+    );
+
+    // 2. Resume with a different label: the resumed create_meta passes no
+    //    title (existing row → backfill no-op), so the original title is
+    //    preserved, never overwritten.
+    let answer = tool
+        .execute(json!({
+            "task": "follow-up",
+            "label": "second title",
+            "resume": session_id,
+            "workspace": workspace,
+            "background": false
+        }))
+        .await
+        .unwrap();
+    let resumed_id = answer
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("subagent session: "))
+        .expect("sync success contains the subagent session id");
+    assert_eq!(resumed_id, session_id, "resume reuses the session id");
+
+    // Let the fire-and-forget meta create run; the title must not move.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        subagent_meta_title(&root, session_id).await.as_deref(),
+        Some("first title"),
+        "resume must never overwrite the title recorded by the original spawn"
+    );
+}
+
+#[tokio::test]
+async fn subagent_meta_create_without_label_leaves_title_none() {
+    // The helper-level label is optional: recording a row with no label
+    // (e.g. a resume) leaves the session unnamed instead of inventing one.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("sessions");
+    let session_id = format!("sub-{}", crate::session::new_id());
+    spawn_subagent_meta_create(
+        SessionStore::Jsonl,
+        root.clone(),
+        session_id.clone(),
+        "test-model".into(),
+        None,
+        None,
+        1,
+        None,
+    );
+    let title = subagent_meta_title(&root, &session_id).await;
+    assert_eq!(title, None, "no label ⇒ no title (session stays unnamed)");
 }
 
 #[tokio::test]
@@ -1268,7 +1509,8 @@ async fn omitted_background_defaults_to_one_completion_with_session_id() {
     let answer = tool
         .execute(json!({
             "task": "hello",
-            "label": "first line\nsecond line"
+            "label": "first line\nsecond line",
+            "workspace": temp.path().to_str().unwrap()
         }))
         .await
         .unwrap();
@@ -1314,7 +1556,11 @@ async fn background_failure_completion_retains_session_id() {
     tool.set_event_sender(sender);
 
     let answer = tool
-        .execute(json!({"task": "hello", "background": true}))
+        .execute(json!({
+            "task": "hello",
+            "workspace": temp.path().to_str().unwrap(),
+            "background": true
+        }))
         .await
         .unwrap();
     let immediate_session = answer
@@ -1365,7 +1611,11 @@ async fn resume_replays_scrollback_into_session_sink() {
 
     // Omitting background defaults to a background delegate while resuming.
     let answer = tool
-        .execute(json!({"task": "new prompt", "resume": "sub-resume-scrollback"}))
+        .execute(json!({
+            "task": "new prompt",
+            "resume": "sub-resume-scrollback",
+            "workspace": temp.path().to_str().unwrap()
+        }))
         .await
         .unwrap();
     assert!(answer.starts_with("started background task"));
@@ -1629,8 +1879,21 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(
-        crate::session::Session::take_unfinished_background(&root, "web-main").is_empty(),
-        "cancelled btw task must not leave a killed-on-exit record"
-    );
+    // The wrapper's Drop-based cleanup clears the parent's background
+    // record immediately after removing the in-memory registration (no
+    // await between the two), but the OS may preempt the runtime thread
+    // in that window — poll for the record to clear instead of asserting
+    // once (the record MUST disappear: a cancelled btw task is not a
+    // killed-on-exit record).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if crate::session::Session::take_unfinished_background(&root, "web-main").is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cancelled btw task must not leave a killed-on-exit record"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }

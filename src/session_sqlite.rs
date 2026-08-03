@@ -1436,7 +1436,11 @@ impl SqliteSession {
     ///
     /// `model` / `role` / parent links are supplied by the caller — the
     /// parent process writes subagent rows at spawn time; the main
-    /// session's row is written by `SessionFactory::build`.
+    /// session's row is written by `SessionFactory::build`. `title`
+    /// names the session at CREATION time only (delegate / btw subagents
+    /// pass their task-panel label; main sessions pass `None`): on the
+    /// existing-row backfill path an existing title is preserved, so a
+    /// resume never rewrites a title.
     pub async fn create_meta(
         &self,
         session_id: &str,
@@ -1444,6 +1448,7 @@ impl SqliteSession {
         role: Option<&str>,
         parent_session_id: Option<&str>,
         parent_task_id: Option<i64>,
+        title: Option<&str>,
     ) -> Result<(), String> {
         if let Some(existing) = self.load_meta_row(session_id).await? {
             // Row already exists (resume, or a btw/subagent row whose
@@ -1478,8 +1483,8 @@ impl SqliteSession {
             entry_count: *self.next_seq.lock().unwrap(),
             parent_session_id: parent_session_id.map(str::to_owned),
             parent_task_id,
-            title: None,    // a fresh session is unnamed until the user names it
-            pinned: None,   // a fresh session is unpinned until the user pins it
+            title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
+            pinned: None,                    // a fresh session is unpinned until the user pins it
             archived: None, // a fresh session is unarchived until the user archives it
             writer: None,   // stamped by insert_meta with the writing process
             label: None,    // label lives in running_tasks, resolved at list time

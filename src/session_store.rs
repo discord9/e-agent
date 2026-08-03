@@ -736,8 +736,11 @@ impl SessionStore {
     /// (that would rewrite `created_at`). `model`/`role` come from the
     /// caller's configuration; `parent_session_id`/`parent_task_id` link
     /// subagent rows to their spawning delegate (main sessions pass
-    /// `None`).
-    #[allow(unused_variables)]
+    /// `None`). `title` names a session at CREATION time only (delegate /
+    /// btw subagents pass their task-panel label): on the existing-row
+    /// backfill path an existing title is preserved and `None` means
+    /// unnamed — a resume never rewrites a title.
+    #[allow(unused_variables, clippy::too_many_arguments)]
     pub async fn create_meta(
         &self,
         root: &Path,
@@ -746,6 +749,7 @@ impl SessionStore {
         role: Option<&str>,
         parent_session_id: Option<&str>,
         parent_task_id: Option<i64>,
+        title: Option<&str>,
     ) -> Result<()> {
         match self {
             SessionStore::Jsonl => jsonl_create_meta(
@@ -755,6 +759,7 @@ impl SessionStore {
                 role,
                 parent_session_id,
                 parent_task_id,
+                title,
             ),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
@@ -764,7 +769,14 @@ impl SessionStore {
                 greptime_session
                     .lock()
                     .await
-                    .create_meta(session, model, role, parent_session_id, parent_task_id)
+                    .create_meta(
+                        session,
+                        model,
+                        role,
+                        parent_session_id,
+                        parent_task_id,
+                        title,
+                    )
                     .await
             }
             #[cfg(feature = "sqlite")]
@@ -774,7 +786,14 @@ impl SessionStore {
             } => sqlite_session
                 .lock()
                 .await
-                .create_meta(session, model, role, parent_session_id, parent_task_id)
+                .create_meta(
+                    session,
+                    model,
+                    role,
+                    parent_session_id,
+                    parent_task_id,
+                    title,
+                )
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -1330,6 +1349,7 @@ fn jsonl_create_meta(
     role: Option<&str>,
     parent_session_id: Option<&str>,
     parent_task_id: Option<i64>,
+    title: Option<&str>,
 ) -> anyhow::Result<()> {
     if let Some(existing) = jsonl_read_meta_snapshot(root, session)? {
         // Row already exists (resume, or a backfill/btw/subagent row whose
@@ -1373,11 +1393,11 @@ fn jsonl_create_meta(
         entry_count: jsonl_count_transcript_entries(root, session)?,
         parent_session_id: parent_session_id.map(str::to_owned),
         parent_task_id,
-        title: None,    // a fresh session is unnamed until the user names it
-        pinned: None,   // a fresh session is unpinned until the user pins it
-        archived: None, // a fresh session is unarchived until the user archives it
-        writer: None,   // stamped by jsonl_append_meta_snapshot with the writing process
-        label: None,    // label lives in running_tasks / background records, resolved at list time
+        title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
+        pinned: None,                    // a fresh session is unpinned until the user pins it
+        archived: None,                  // a fresh session is unarchived until the user archives it
+        writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
+        label: None,  // label lives in running_tasks / background records, resolved at list time
     };
     jsonl_append_meta_snapshot(root, session, &mut meta)
 }
@@ -2006,6 +2026,7 @@ mod tests {
                     &session_a,
                     Some("test-model"),
                     Some("main"),
+                    None,
                     None,
                     None,
                 )

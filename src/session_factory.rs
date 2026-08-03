@@ -520,6 +520,7 @@ impl SessionFactory {
                 role_name.as_deref(),
                 None,
                 None,
+                None, // main sessions keep manual naming; title is a subagent-spawn concern
             )
             .await?;
         let (runner, handle) = SessionRunner::new(

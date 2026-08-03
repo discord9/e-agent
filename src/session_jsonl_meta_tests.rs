@@ -54,7 +54,15 @@ async fn create_meta_then_list_visible() {
     let store = SessionStore::Jsonl;
     let sid = format!("meta-create-{}", crate::session::new_id());
     store
-        .create_meta(temp.path(), &sid, Some("gpt-x"), Some("main"), None, None)
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            Some("delegate label"),
+        )
         .await
         .unwrap();
     let list = store.list_meta(temp.path()).await.unwrap();
@@ -67,7 +75,12 @@ async fn create_meta_then_list_visible() {
         meta.entry_count, 0,
         "fresh session has no transcript entries"
     );
-    assert!(meta.title.is_none() && meta.pinned.is_none() && meta.archived.is_none());
+    assert_eq!(
+        meta.title.as_deref(),
+        Some("delegate label"),
+        "a title supplied at creation is recorded"
+    );
+    assert!(meta.pinned.is_none() && meta.archived.is_none());
     assert_eq!(
         sidecar_lines(temp.path(), &sid),
         1,
@@ -78,6 +91,66 @@ async fn create_meta_then_list_visible() {
         Some(process_identity()),
         "snapshots are stamped with the writing process"
     );
+}
+
+#[tokio::test]
+async fn create_meta_title_only_applies_on_fresh_creation_and_is_preserved_on_resume() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::Jsonl;
+    let sid = format!("meta-title-{}", crate::session::new_id());
+    // Fresh creation with a title.
+    store
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            Some("original title"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sidecar_lines(temp.path(), &sid), 1);
+
+    // Resume (row exists, nothing missing): even a different title is a
+    // no-op — the creation title survives and nothing is appended.
+    store
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            Some("resume title"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sidecar_lines(temp.path(), &sid),
+        1,
+        "resume must not append a snapshot or rewrite the title"
+    );
+    let list = store.list_meta(temp.path()).await.unwrap();
+    assert_eq!(
+        list[0].title.as_deref(),
+        Some("original title"),
+        "resume keeps the creation title"
+    );
+
+    // No title at creation ⇒ the session stays unnamed.
+    let other = format!("meta-title-none-{}", crate::session::new_id());
+    store
+        .create_meta(temp.path(), &other, Some("gpt-x"), None, None, None, None)
+        .await
+        .unwrap();
+    let list = store.list_meta(temp.path()).await.unwrap();
+    let other_meta = list
+        .iter()
+        .find(|m| m.session_id == other)
+        .expect("other session listed");
+    assert_eq!(other_meta.title, None, "title None ⇒ unnamed");
 }
 
 #[tokio::test]
@@ -94,6 +167,7 @@ async fn create_meta_records_parent_links_for_subagents() {
             Some("delegate"),
             Some(&parent),
             Some(7),
+            None,
         )
         .await
         .unwrap();
@@ -108,13 +182,29 @@ async fn create_meta_is_idempotent_resume() {
     let store = SessionStore::Jsonl;
     let sid = format!("meta-idem-{}", crate::session::new_id());
     store
-        .create_meta(temp.path(), &sid, Some("model-a"), Some("main"), None, None)
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("model-a"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
     // Resume with a different model: no second line, created_at untouched.
     store
-        .create_meta(temp.path(), &sid, Some("model-b"), Some("main"), None, None)
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("model-b"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -138,7 +228,15 @@ async fn create_meta_after_transcript_counts_existing_entries() {
     Session::append(temp.path(), &sid, &entries()).unwrap();
     Session::append(temp.path(), &sid, &entries()).unwrap();
     store
-        .create_meta(temp.path(), &sid, Some("gpt-x"), Some("main"), None, None)
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let list = store.list_meta(temp.path()).await.unwrap();
@@ -161,7 +259,7 @@ async fn create_meta_backfills_missing_model_and_parent_link() {
 
     // First line like backfill_sessions would write it: no model, no parent.
     store
-        .create_meta(temp.path(), &sid, None, None, None, None)
+        .create_meta(temp.path(), &sid, None, None, None, None, None)
         .await
         .unwrap();
     let created = store.list_meta(temp.path()).await.unwrap();
@@ -178,6 +276,7 @@ async fn create_meta_backfills_missing_model_and_parent_link() {
             Some("main"),
             Some(&parent),
             Some(7),
+            None,
         )
         .await
         .unwrap();
@@ -207,7 +306,15 @@ async fn create_meta_backfills_missing_model_and_parent_link() {
     // A third call with a *different* model: the field is already set, so
     // nothing is appended (backfill exactly once).
     store
-        .create_meta(temp.path(), &sid, Some("gpt-y"), Some("other"), None, None)
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("gpt-y"),
+            Some("other"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(sidecar_lines(temp.path(), &sid), 2, "backfill happens once");
@@ -222,11 +329,11 @@ async fn create_meta_backfills_missing_model_and_parent_link() {
     // backfill (DB gate: only parent_session_id / model count).
     let other = format!("meta-backfill-only-task-{}", crate::session::new_id());
     store
-        .create_meta(temp.path(), &other, None, None, None, None)
+        .create_meta(temp.path(), &other, None, None, None, None, None)
         .await
         .unwrap();
     store
-        .create_meta(temp.path(), &other, None, None, None, Some(9))
+        .create_meta(temp.path(), &other, None, None, None, Some(9), None)
         .await
         .unwrap();
     assert_eq!(
@@ -244,7 +351,7 @@ async fn create_meta_backfill_preserves_existing_user_fields() {
     let store = SessionStore::Jsonl;
     let sid = format!("meta-backfill-fields-{}", crate::session::new_id());
     store
-        .create_meta(temp.path(), &sid, None, None, None, None)
+        .create_meta(temp.path(), &sid, None, None, None, None, None)
         .await
         .unwrap();
     store
@@ -256,7 +363,15 @@ async fn create_meta_backfill_preserves_existing_user_fields() {
     assert_eq!(before[0].model, None);
 
     store
-        .create_meta(temp.path(), &sid, Some("gpt-x"), Some("main"), None, None)
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let list = store.list_meta(temp.path()).await.unwrap();
@@ -294,7 +409,15 @@ async fn touch_updates_last_active_and_entry_count() {
 
     Session::append(temp.path(), &sid, &entries()).unwrap();
     store
-        .create_meta(temp.path(), &sid, Some("gpt-x"), Some("main"), None, None)
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let before = store.list_meta(temp.path()).await.unwrap();
@@ -335,7 +458,15 @@ async fn set_title_pin_archive_append_and_list_reflects() {
     let store = SessionStore::Jsonl;
     let sid = format!("meta-flags-{}", crate::session::new_id());
     store
-        .create_meta(temp.path(), &sid, Some("gpt-x"), Some("main"), None, None)
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     store
@@ -382,7 +513,15 @@ async fn snapshots_carry_full_state_no_partial_rows() {
     let sid = format!("meta-full-{}", crate::session::new_id());
     Session::append(temp.path(), &sid, &entries()).unwrap();
     store
-        .create_meta(temp.path(), &sid, Some("gpt-x"), Some("main"), None, None)
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     store.set_title(temp.path(), &sid, Some("t")).await.unwrap();
@@ -425,7 +564,7 @@ async fn writer_is_refreshed_on_every_append() {
     let store = SessionStore::Jsonl;
     let sid = format!("meta-writer-{}", crate::session::new_id());
     store
-        .create_meta(temp.path(), &sid, None, None, None, None)
+        .create_meta(temp.path(), &sid, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -445,7 +584,15 @@ async fn writer_is_refreshed_on_every_append() {
     store.set_title(temp.path(), &sid, Some("t")).await.unwrap();
     store.set_archived(temp.path(), &sid, true).await.unwrap();
     store
-        .create_meta(temp.path(), &sid, Some("gpt-x"), Some("main"), None, None)
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap(); // model was None → backfill path, also stamps fresh
 
@@ -505,7 +652,15 @@ async fn delete_meta_hides_from_list_keeps_transcript() {
     let sid = format!("meta-del-{}", crate::session::new_id());
     Session::append(temp.path(), &sid, &entries()).unwrap();
     store
-        .create_meta(temp.path(), &sid, Some("gpt-x"), Some("main"), None, None)
+        .create_meta(
+            temp.path(),
+            &sid,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(store.list_meta(temp.path()).await.unwrap().len(), 1);
@@ -536,7 +691,7 @@ async fn list_scans_sidecars_only_and_ignores_background_records() {
     Session::append(temp.path(), &a, &entries()).unwrap();
     Session::append(temp.path(), &b, &entries()).unwrap();
     store
-        .create_meta(temp.path(), &a, None, None, None, None)
+        .create_meta(temp.path(), &a, None, None, None, None, None)
         .await
         .unwrap();
     // b has a transcript but no sidecar → skipped (listing stays read-only;
@@ -549,7 +704,7 @@ async fn list_scans_sidecars_only_and_ignores_background_records() {
     // the sidecar is the sessions-table mirror, and the DB lists a row
     // whose session_entries are still empty too.
     store
-        .create_meta(temp.path(), "orphan-xyz", None, None, None, None)
+        .create_meta(temp.path(), "orphan-xyz", None, None, None, None, None)
         .await
         .unwrap();
     let list = store.list_meta(temp.path()).await.unwrap();
@@ -575,12 +730,12 @@ async fn list_meta_sorts_newest_activity_first() {
     let a = format!("meta-sort-a-{}", crate::session::new_id());
     let b = format!("meta-sort-b-{}", crate::session::new_id());
     store
-        .create_meta(temp.path(), &a, None, None, None, None)
+        .create_meta(temp.path(), &a, None, None, None, None, None)
         .await
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
     store
-        .create_meta(temp.path(), &b, None, None, None, None)
+        .create_meta(temp.path(), &b, None, None, None, None, None)
         .await
         .unwrap();
     let list = store.list_meta(temp.path()).await.unwrap();
@@ -607,7 +762,15 @@ async fn backfill_creates_first_lines_for_sidecar_less_transcripts() {
     Session::append(temp.path(), &old, &entries()).unwrap();
     Session::append(temp.path(), &old, &entries()).unwrap();
     store
-        .create_meta(temp.path(), &fresh, Some("gpt-x"), Some("main"), None, None)
+        .create_meta(
+            temp.path(),
+            &fresh,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let fresh_before = std::fs::read_to_string(sidecar(temp.path(), &fresh)).unwrap();
@@ -725,7 +888,7 @@ async fn sidecar_files_are_private_0600() {
     let store = SessionStore::Jsonl;
     let sid = format!("meta-mode-{}", crate::session::new_id());
     store
-        .create_meta(temp.path(), &sid, None, None, None, None)
+        .create_meta(temp.path(), &sid, None, None, None, None, None)
         .await
         .unwrap();
     let mode = std::fs::metadata(sidecar(temp.path(), &sid))
@@ -742,7 +905,7 @@ async fn invalid_session_names_are_rejected() {
     let store = SessionStore::Jsonl;
     assert!(
         store
-            .create_meta(temp.path(), "../escape", None, None, None, None)
+            .create_meta(temp.path(), "../escape", None, None, None, None, None)
             .await
             .is_err()
     );

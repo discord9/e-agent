@@ -194,9 +194,9 @@ fn task_label(label: Option<&str>, role: Option<&str>, task: &str) -> String {
     label
         .map(str::trim)
         .filter(|label| !label.is_empty())
-        .map(|label| preview(&single_line(label), 60))
+        .map(|label| preview(&single_line(label), 40))
         .or_else(|| role.map(single_line))
-        .unwrap_or_else(|| preview(&single_line(task), 60))
+        .unwrap_or_else(|| preview(&single_line(task), 40))
 }
 
 /// A delegated task plus the role template (if any) that shapes the
@@ -414,6 +414,7 @@ fn result_output(result: SessionResult) -> (bool, String) {
 /// id is only known inside the background spawn's synchronous `on_id`
 /// hook, so the (async) create is spawned onto the current runtime from
 /// there. Best-effort: a failure only logs and never fails the delegate.
+#[allow(clippy::too_many_arguments)]
 fn spawn_subagent_meta_create(
     store: SessionStore,
     root: std::path::PathBuf,
@@ -422,6 +423,7 @@ fn spawn_subagent_meta_create(
     role: Option<&str>,
     parent_session_id: Option<&str>,
     parent_task_id: u64,
+    label: Option<String>,
 ) {
     let role = role.map(str::to_owned);
     let parent_session_id = parent_session_id.map(str::to_owned);
@@ -436,6 +438,7 @@ fn spawn_subagent_meta_create(
                         role.as_deref(),
                         parent_session_id.as_deref(),
                         Some(parent_task_id as i64),
+                        label.as_deref(),
                     )
                     .await
                 {
@@ -664,6 +667,7 @@ pub async fn spawn_btw_subagent(
     let cleanup = DelegateCleanup::new(slot, sessions.clone(), record_in.clone());
     let record = record_in.clone();
     let record_label = label.clone();
+    let meta_label = label.clone();
     let record_session_id = session_id.clone();
     let output_session_id = session_id.clone();
     background.spawn_with_id(
@@ -699,6 +703,7 @@ pub async fn spawn_btw_subagent(
                 None,
                 parent_session_id.as_deref(),
                 id,
+                Some(meta_label),
             );
         },
         move || {
@@ -766,9 +771,9 @@ impl Tool for Delegate {
                     "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
                     "background": {"type": "boolean", "default": true, "description": "run without blocking and deliver the answer as a background completion (default true); pass false to wait for the final answer"},
                     "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
-                    "workspace": {"type": "string", "description": "working directory for the subagent (MUST be an absolute path like /home/user/project or C:\\Users\\user\\project; never pass `.` or a relative path — the parent's workspace is used by default)"}
+                    "workspace": {"type": "string", "description": "REQUIRED — absolute path of the working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). Must be an absolute path: never pass `.` or a relative path."}
                 },
-                "required": ["task"]
+                "required": ["task", "workspace"]
             }),
         }
     }
@@ -930,33 +935,39 @@ impl Tool for Delegate {
             .and_then(Value::as_str);
         let label = task_label(raw_label, role.as_deref(), &task);
 
-        // Resolve custom workspace, if given; otherwise inherit the parent's.
-        // Track whether a custom workspace was explicitly provided (for
-        // display metadata; inherited workspace is not shown).
-        let explicit_workspace_arg: Option<String> = arguments
+        // Resolve the (required) workspace: the subagent's working directory
+        // is an explicit parameter — there is no parent-workspace fallback
+        // (reroot() rejects non-absolute paths like `.`/`./`).
+        let workspace_arg: Option<String> = arguments
             .as_object()
             .and_then(|args| args.get("workspace"))
             .and_then(Value::as_str)
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
-        // `.`/`./` (and Windows `.\`) are common model mistakes — the parent
-        // workspace is the sane interpretation, so fall back to it instead
-        // of erroring (reroot() rejects non-absolute paths).
-        let explicit_workspace_arg = explicit_workspace_arg.filter(|s| {
-            s != "." && s != "./" && s != ".\\" && !s.starts_with("./") && !s.starts_with(".\\")
-        });
-        let workspace = match &explicit_workspace_arg {
-            Some(path) => self
-                .workspace
-                .reroot(path)
-                .map_err(|error| format!("invalid `workspace` path `{path}`: {error}"))?,
-            None => self.workspace.clone(),
+        let Some(workspace_arg) = workspace_arg else {
+            return Err(
+                "delegate requires a workspace parameter: absolute path of the working directory"
+                    .into(),
+            );
         };
+        let workspace = self
+            .workspace
+            .reroot(&workspace_arg)
+            .map_err(|error| format!("invalid `workspace` path `{workspace_arg}`: {error}"))?;
 
         let model_name = model.display_name().to_string();
         let (resume_id, resume_entries) = match resume {
             Some((id, entries)) => (Some(id), Some(entries)),
             None => (None, None),
+        };
+        // A fresh spawn records the task-panel label as the subagent
+        // session's title; a resume must never overwrite the title the
+        // original spawn recorded (create_meta on an existing row is a
+        // backfill no-op that keeps the existing title).
+        let meta_label = if resume_id.is_some() {
+            None
+        } else {
+            Some(label.clone())
         };
         let persist = PersistConfig {
             root: self
@@ -968,13 +979,14 @@ impl Tool for Delegate {
         };
         let session_id = persist.session_id.clone();
         // Build structured display metadata for the F2 task panel. Background
-        // reflects the effective execution mode; workspace remains explicit-only.
-        // The subagent session id lets the web task panel jump straight to the
-        // subagent's transcript without label matching (labels are lost once
-        // the Greptime `running_tasks` row is cleared at completion).
+        // reflects the effective execution mode; workspace is always explicit
+        // (required parameter). The subagent session id lets the web task
+        // panel jump straight to the subagent's transcript without label
+        // matching (labels are lost once the Greptime `running_tasks` row is
+        // cleared at completion).
         let task_display = crate::tools::TaskDisplayMeta {
             background,
-            workspace: explicit_workspace_arg.clone(),
+            workspace: Some(workspace_arg.clone()),
             subagent_session_id: Some(session_id.clone()),
             resume: resume_display,
         };
@@ -1068,6 +1080,7 @@ impl Tool for Delegate {
                         meta_role.as_deref(),
                         parent_session_id.as_deref(),
                         id,
+                        meta_label.clone(),
                     );
                 },
                 move || {
@@ -1110,6 +1123,7 @@ impl Tool for Delegate {
                     meta_role.as_deref(),
                     parent_session_id.as_deref(),
                     id,
+                    meta_label.clone(),
                 );
             },
             move || {
