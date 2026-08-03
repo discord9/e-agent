@@ -209,11 +209,19 @@ function initWorkspaces() {
     }
   } catch (e) { list = null; }
   if (!list) list = [{ id: "default", name: "默认", url: "", token: "" }];
+  // legacy 迁移（幂等）：老版本把顶部 tokenInput 同步进 workspace（ws.token 是
+  // eagent_token 的副本）；升级后 ws.token 优先于 globalToken，顶部输入不再能
+  // 替换它。凡 ws.token === legacy eagent_token 的一律清空 → 回退 globalToken
+  // （顶部输入即改 globalToken，重新生效）；legacy 值本身由 state.globalToken
+  // （模块加载时读 eagent_token 键）持有。保存后持久化也落盘清空结果。
+  let legacy = "";
+  try { legacy = localStorage.getItem("eagent_token") || ""; } catch (e) { /* 隐私模式等 */ }
   for (const ws of list) {
     if (!ws.id) ws.id = "ws-" + Math.random().toString(36).slice(2, 10);
     if (!ws.name) ws.name = ws.url || "默认";
     ws.url = normalizeWorkspaceUrl(ws.url);
     if (!ws.token) ws.token = "";
+    else if (legacy && ws.token === legacy) ws.token = "";   // 旧版全局输入的副本：回退全局
   }
   state.workspaces = list;
   state.workspaceLists = {};     // 重新加载：丢弃旧缓存（轮询会重新填充）

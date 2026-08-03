@@ -393,16 +393,19 @@ async function createSession() {
    meta 立即可用），再走跨 workspace 打开模式（openSessionIn：非激活先切）。 */
 async function createSessionIn(ws) {
   if (!workspaceToken(ws)) { setBanner("⚠ 请先输入 Token。", true); return; }
-  // 入口（组头「+」点击）声明一次 action 代次：POST 挂起期间用户切 workspace/
-  // 打开其它会话/发起新的新建都会取代代次，迟到响应到达时 epoch 已变 → 丢弃，
-  // 绝不把用户强切回发起创建时的 workspace（review：迟到响应覆盖用户导航）。
-  const claimed = ++sessionOpenEpoch;
+  // POST 前只捕获当前代次、绝不递增（review：旧实现 ++sessionOpenEpoch 声明
+  // action 代次，会让当前正在进行的 history/SSE 的 epoch 校验失败 → 创建挂起/
+  // 失败时当前流被误杀）。成功后才由打开动作 openSessionIn 声明新代次（它入口
+  // 自行 ++/claim，与 resumeSessionIn/openSessionIn「成功才声明」语义一致）；
+  // 迟到响应仍由 captured !== sessionOpenEpoch 丢弃，绝不把用户强切回发起创建
+  // 时的 workspace（review：迟到响应覆盖用户导航）。
+  const captured = sessionOpenEpoch;
   try {
     const res = await apiFor(ws, "/api/sessions", { method: "POST", body: JSON.stringify({}) });
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
     if (res.status !== 201) throw new Error("HTTP " + res.status);
     const s = await res.json();
-    if (claimed !== sessionOpenEpoch) return;    // 期间有更新导航：过期创建不打开
+    if (captured !== sessionOpenEpoch) return;    // 期间有更新导航：过期创建不打开
     if (!state.workspaces.includes(ws)) return;  // 目标 workspace 已被删除
     const wl = workspaceListFor(ws);
     if (Array.isArray(wl)) {
@@ -410,7 +413,7 @@ async function createSessionIn(ws) {
       if (i >= 0) wl.splice(i, 1);
       wl.push(s);
     }
-    await openSessionIn(ws.id, s.id, undefined, claimed);
+    await openSessionIn(ws.id, s.id);   // 成功路径：入口声明新 epoch（++/claim）
   } catch (e) {
     setBanner("⚠ 创建会话失败：" + e.message);
   }

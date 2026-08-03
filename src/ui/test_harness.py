@@ -276,6 +276,22 @@ function streamManual(){
     return { done: true };
   } }; } };
 }
+/* 手动控制的流（带真实事件块）：首个 read 挂起（resolve 保存在
+   a1StreamReadResolve），resolve 后下一个 read 吐出 Notice 块再结束。用于
+   「createSessionIn 挂起/失败期间当前流不中断」断言：块被处理 ⇔ epoch 未被
+   提前递增（旧 bug：POST 前 ++sessionOpenEpoch → stillCurrent 失败 → 块丢弃）。 */
+function streamManualNotice(){
+  let phase = 0;
+  return { getReader(){ return { read: async () => {
+    if (phase === 0) { phase = 1;
+      return new Promise((resolve) => { a1StreamReadResolve = resolve; });
+    }
+    if (phase === 1) { phase = 2;
+      return { done: false, value: "event: Notice\ndata: {\"type\":\"notice\",\"session_id\":\"a1\",\"seq\":99,\"text\":\"create-pending-stream-alive\"}\n\n" };
+    }
+    return { done: true };
+  } }; } };
+}
 function resp(status, body){ return Promise.resolve({ ok:status>=200&&status<300, status, body,
   json:async()=>typeof body==="string"?JSON.parse(body):body,
   text:async()=>String(body) }); }
@@ -308,6 +324,7 @@ let bCreateResolve = null;
 // 再 resolve 陈旧块；验证陈旧流不渲染到当前会话/workspace）
 let a1StreamManual = false;
 let a1StreamReadResolve = null;
+let a1StreamManualNotice = false;
 // fork 面板测试用：/fork-candidates 候选与 /fork POST 响应（测试中可变）
 let forkCandidatesData = [
   {at:2, seq:2, preview:"用户：你好，帮我看看"},
@@ -347,7 +364,8 @@ globalThis.fetch=(url,opts={})=>{
     return resp(200,{entries:[{type:"message",message:{Assistant:{content:"A 会话内容"}}}], next_before_seq:null});
   }
   if(url==="/api/sessions/a1/events")
-    return resp(200, a1StreamManual ? streamManual() : streamEmpty());
+    return resp(200, a1StreamManualNotice ? streamManualNotice()
+      : (a1StreamManual ? streamManual() : streamEmpty()));
   if(url.startsWith("http://b.local/api/sessions/b1/history"))
     return resp(200,{entries:[{type:"message",message:{Assistant:{content:"B 会话内容"}}}], next_before_seq:null});
   if(url==="http://b.local/api/sessions/b1/events") return resp(200, streamEmpty());
@@ -1687,6 +1705,41 @@ async function main(){
         JSON.parse(localStorage.getItem("eagent.workspaces")).length === 1,
         "n=" + JSON.parse(localStorage.getItem("eagent.workspaces")).length);
 
+    // ---- legacy 迁移：老版本把顶部输入同步进 workspace.token（== eagent_token
+    // 副本）；升级后 ws.token 优先、顶部输入失效（review）。加载时凡
+    // ws.token === legacy eagent_token 一律清空 → 回退 globalToken；legacy 值
+    // 本身进 globalToken；用户单独配置的 ws.token（≠ legacy）保留。----
+    localStorage.setItem("eagent_token", "legacy-X");
+    state.globalToken = "legacy-X";        // 模拟刷新：模块加载时 globalToken 已读 legacy 键
+    localStorage.setItem("eagent.workspaces", JSON.stringify([
+      { id: "default", name: "默认", url: "", token: "legacy-X" },          // 旧版全局输入的副本
+      { id: "ws-real", name: "真实服务器", url: "http://r.local", token: "tok-r" },  // 用户单独配置：保留
+    ]));
+    localStorage.setItem("eagent.activeWorkspace", "default");
+    state.workspaces = [];
+    state.workspace = null;
+    initWorkspaces();
+    chk("legacy token migration: copied ws.token cleared",
+        state.workspaces.find(w => w.id === "default").token === "",
+        "tok=" + JSON.stringify(state.workspaces.find(w => w.id === "default").token));
+    chk("legacy token migration: real ws token kept",
+        state.workspaces.find(w => w.id === "ws-real").token === "tok-r",
+        "tok=" + JSON.stringify(state.workspaces.find(w => w.id === "ws-real").token));
+    chk("legacy token migration: globalToken holds legacy value",
+        state.globalToken === "legacy-X" && localStorage.getItem("eagent_token") === "legacy-X",
+        "global=" + JSON.stringify(state.globalToken)
+        + " legacy=" + JSON.stringify(localStorage.getItem("eagent_token")));
+    chk("legacy token migration: workspaceToken falls back to global",
+        workspaceToken(state.workspaces.find(w => w.id === "default")) === "legacy-X"
+        && state.token === "legacy-X",
+        "eff=" + JSON.stringify(workspaceToken(state.workspaces.find(w => w.id === "default")))
+        + " token=" + JSON.stringify(state.token));
+    chk("legacy token migration: cleared token persisted",
+        JSON.parse(localStorage.getItem("eagent.workspaces"))
+          .find(w => w.id === "default").token === "",
+        "persisted=" + JSON.stringify(JSON.parse(localStorage.getItem("eagent.workspaces"))
+          .find(w => w.id === "default").token));
+
     // =====================================================================
     // 聚合模式：多 workspace 会话聚合（侧边栏分组 + 列表视图 + 跨服务器打开）
     // 双服务器：wsA（url "" 同源 → 默认路由 sessionsData）+ wsB（http://b.local）
@@ -2837,6 +2890,132 @@ async function main(){
     chk("ws-add success path after pending cleared",
         state.workspace.id === "wsB" && state.sessionId === "b-new" && state.view === "chat",
         "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+
+    // =====================================================================
+    // 20) 组头「+」不打断当前流（review：createSessionIn 在 POST 前递增
+    //     sessionOpenEpoch 误杀当前流）：活跃 SSE/会话下发起 createSessionIn
+    //     （挂起/失败）→ 当前会话的 SSE/history 不被中断（epoch 校验不失败）；
+    //     成功时才由 openSessionIn 声明新 epoch 并正常切换。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    state.wsCreatePending = new Set();
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    // 打开 A 的 a1：SSE 用手动流（首个 read 挂起；resolve 后吐出 Notice 块）
+    a1StreamManualNotice = true;
+    a1StreamReadResolve = null;
+    openSessionIn("wsA", "a1");
+    await flush();
+    await flush();
+    await flush();
+    const epochAtOpen = sessionOpenEpoch;
+    chk("create-no-kill: a1 open with SSE read pending",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat"
+        && a1StreamReadResolve !== null,
+        "sid=" + state.sessionId + " pending=" + (a1StreamReadResolve !== null));
+    // --- 场景 1：POST 挂起期间：epoch 不动、history 可加载（非 stale）、
+    //     SSE 分块照常处理；成功后才声明新 epoch 并切换 ---
+    bCreateDelayed = true;
+    bCreateResolve = null;
+    renderSidebarTree(true);
+    let addSec20 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    addSec20[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("create-no-kill: pending POST does not bump epoch",
+        bCreateResolve !== null && sessionOpenEpoch === epochAtOpen,
+        "epoch=" + sessionOpenEpoch + " atOpen=" + epochAtOpen);
+    chk("create-no-kill: SSE still current while pending",
+        stillCurrent("a1", "wsA", epochAtOpen) === true,
+        "cur=" + stillCurrent("a1", "wsA", epochAtOpen));
+    const histWhilePending = await loadHistory("a1", "wsA", epochAtOpen);
+    chk("create-no-kill: history loads (not stale) while pending",
+        histWhilePending === "ok", "r=" + histWhilePending);
+    a1StreamReadResolve({ done: false, value: "" });   // 挂起期间当前流的 SSE 分块到达：仍被处理
+    await flush();
+    await flush();
+    await flush();
+    chk("create-no-kill: SSE block processed while POST pending",
+        elsById["messages"].textContent.includes("create-pending-stream-alive"),
+        "msgs=" + JSON.stringify(elsById["messages"].textContent.slice(-60)));
+    bCreateResolve(resp(201, { id: "b-new", status: "Idle", active: true }));   // 成功：正常切换
+    await flush();
+    await flush();
+    await flush();
+    await flush();
+    chk("create-no-kill: success switches and opens new session",
+        state.workspace.id === "wsB" && state.sessionId === "b-new" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    chk("create-no-kill: success declared new epoch",
+        sessionOpenEpoch > epochAtOpen,
+        "epoch=" + sessionOpenEpoch + " atOpen=" + epochAtOpen);
+    bCreateDelayed = false;
+    bCreateResolve = null;
+    a1StreamManualNotice = false;
+    a1StreamReadResolve = null;
+    // --- 场景 2：失败路径（500）：epoch 不动、当前流不受影响 ---
+    switchWorkspace("wsA");     // 回 A 列表
+    await flush();
+    a1StreamManualNotice = true;
+    a1StreamReadResolve = null;
+    openSessionIn("wsA", "a1");     // 重新打开 a1：活跃会话 + SSE 手动流挂起
+    await flush();
+    await flush();
+    await flush();
+    const epochFail = sessionOpenEpoch;
+    chk("create-no-kill: failure-scenario a1 open with SSE pending",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat"
+        && a1StreamReadResolve !== null,
+        "sid=" + state.sessionId + " pending=" + (a1StreamReadResolve !== null));
+    sessionsBCreateFail = true;
+    renderSidebarTree(true);
+    addSec20 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    addSec20[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    await flush();
+    chk("create-no-kill: failure banner, epoch untouched",
+        elsById["banner"].hidden === false
+        && elsById["bannerText"].textContent.includes("创建会话失败")
+        && sessionOpenEpoch === epochFail,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " epoch=" + sessionOpenEpoch + " atOpen=" + epochFail);
+    chk("create-no-kill: failure keeps session open and current",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat"
+        && stillCurrent("a1", "wsA", epochFail) === true,
+        "ws=" + state.workspace.id + " sid=" + state.sessionId
+        + " cur=" + stillCurrent("a1", "wsA", epochFail));
+    a1StreamReadResolve({ done: false, value: "" });   // 失败后当前流的 SSE 分块仍被处理
+    await flush();
+    await flush();
+    await flush();
+    chk("create-no-kill: SSE block processed after failure",
+        elsById["messages"].textContent.includes("create-pending-stream-alive"),
+        "msgs=" + JSON.stringify(elsById["messages"].textContent.slice(-60)));
+    sessionsBCreateFail = false;
+    a1StreamManualNotice = false;
+    a1StreamReadResolve = null;
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);
