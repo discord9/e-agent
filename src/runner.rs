@@ -750,9 +750,6 @@ impl SessionRunner {
                 }
             }
             let cancelled = self.drain_ready_commands();
-            if self.has_work() {
-                self.cancelled = false;
-            }
             if cancelled && !self.has_work() && self.finish_cancelled_or_idle(true) {
                 return;
             }
@@ -788,9 +785,9 @@ impl SessionRunner {
                         // `self.cancelled` means a Cancel command interrupted
                         // the last turn: the delegate subagent stays alive
                         // (Idle) for follow-up messages instead of finalizing
-                        // here. The flag is cleared when the next prompt opens
-                        // a new turn (top of the loop), so a later natural
-                        // completion still finalizes below.
+                        // here. The flag is cleared only when a real prompt
+                        // opens a new turn (just below `take_prompt_batch`),
+                        // so a later natural completion still finalizes.
                         let result = SessionResult::Completed(self.last_answer.clone());
                         if self.finalize_when_idle(result) {
                             return;
@@ -821,6 +818,13 @@ impl SessionRunner {
                 }
             }
             let (prompt, image, consumed) = self.take_prompt_batch();
+            // A Cancel command interrupted the previous turn; the flag is
+            // cleared only now that a real prompt opens a new turn. Pending
+            // maintenance work (e.g. Compact) must not clear it, otherwise a
+            // FinishWhenIdle session would finalize as soon as the
+            // maintenance completes (see the `!self.cancelled` guard at the
+            // idle point).
+            self.cancelled = false;
             self.status(SessionStatus::Busy);
             if !prompt.is_empty()
                 && let Err(error) = self.commit_user_batch(prompt, image, consumed).await
