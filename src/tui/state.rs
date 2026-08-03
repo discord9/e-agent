@@ -1600,12 +1600,26 @@ impl TuiState {
     /// from the freeze-time text (the tail up to the frozen cursor), so a
     /// resize cannot pin a stale count while the pin still excludes
     /// post-freeze deltas.
+    ///
+    /// The scan covers only the source lines `local_window_lines` will
+    /// actually render — the head of the window when the whole window fits
+    /// the source-line budget, otherwise the LAST `MAX_RENDER_SOURCE_LINES`
+    /// lines of the window. The window range `[source_start, source_end)`
+    /// itself grows without bound as the user scrolls down
+    /// (`extend_window_down` only advances `source_end`), so scanning the
+    /// whole range would make every frame O(history browsed) after paging
+    /// from Home through a long session; aligning with `local_window_lines`
+    /// bounds this frame to O(MAX_RENDER_SOURCE_LINES). When the whole
+    /// window fits the budget the head and tail coincide, so one formula
+    /// covers both shapes.
     pub(crate) fn refresh_window_collapsed_summaries(&mut self, width: usize) {
         if width == 0 || !self.collapse_thinking.0 {
             return;
         }
-        let start = self.window.source_start.min(self.lines.len());
         let end = self.window.source_end.min(self.lines.len());
+        let start = end
+            .saturating_sub(MAX_RENDER_SOURCE_LINES)
+            .max(self.window.source_start.min(end));
         for line in &mut self.lines[start..end] {
             if line.kind == LineKind::Thinking
                 && line

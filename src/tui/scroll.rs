@@ -1,4 +1,4 @@
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use super::*;
 
@@ -30,19 +30,19 @@ pub(crate) fn hard_wrap(text: &str, width: usize) -> Vec<&str> {
 /// width in `incremental_rows`. The first row breaks when
 /// `initial + char_width > width`, which matches `hard_wrap` on the
 /// concatenated text exactly (the break decision only depends on the cell
-/// counts, not the glyphs). When `initial >= width` the old row was full
-/// and `text` starts a fresh row with no phantom empty row. Segments after
-/// the first newline start with zero cells used, like `hard_wrap`.
+/// counts, not the glyphs). `initial` is pre-consumed unconditionally, so
+/// an exactly-full old row (`initial >= width`) breaks at the first
+/// non-zero-width character, while zero-width characters (combining
+/// accents, variation selectors, ZWJ) never fire a break and attach to the
+/// old row — the same `used > 0 && used + char_width > width` rule
+/// `hard_wrap` applies. Segments after the first newline start with zero
+/// cells used, like `hard_wrap`.
 fn hard_wrap_continuation(text: &str, width: usize, initial: usize) -> Vec<&str> {
     let width = width.max(1);
     let mut rows = Vec::new();
     for (segment_index, logical) in text.split('\n').enumerate() {
         let mut start = 0;
-        let mut used = if segment_index == 0 && initial < width {
-            initial
-        } else {
-            0
-        };
+        let mut used = if segment_index == 0 { initial } else { 0 };
         for (index, character) in logical.char_indices() {
             let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
             if used > 0 && used + char_width > width {
@@ -64,16 +64,23 @@ fn hard_wrap_continuation(text: &str, width: usize, initial: usize) -> Vec<&str>
 /// small deltas costs O(total text) instead of O(N × total) — this is what
 /// keeps reasoning streaming cheap (`CollapsedSummary::append_delta`).
 ///
-/// The old last row merges with the head of the delta unless it is exactly
-/// full (`last_width >= width`: the delta starts a fresh row and the old
-/// row is kept) or empty (`last_width == 0`, i.e. the text was empty or
-/// ended with a newline: the delta fills that row and the old row is
-/// replaced). In the merge case `hard_wrap_continuation` pre-consumes the
-/// old row's cells on the first line, which produces exactly the rows
-/// `hard_wrap` would for the concatenated text. A delta that starts with a
-/// newline closes the old last row without creating an extra segment, so
-/// the fresh-wrap branch strips that one boundary newline before wrapping.
-/// An empty delta is a no-op.
+/// `hard_wrap_continuation` wraps the delta with the old last row's cell
+/// width pre-consumed on its first line, so every break decision matches
+/// `hard_wrap` on the concatenated text — including zero-width characters
+/// (combining accents, variation selectors, ZWJ), which never fire a break
+/// and therefore attach to an exactly-full old row (`last_width >= width`)
+/// instead of starting a phantom new row.
+///
+/// The old last row and the delta's first wrapped row always contribute
+/// exactly one row between them: a partially-full old row
+/// (`last_width < width`) is consumed and merged with the first wrapped
+/// row, while an exactly-full old row is kept and the first wrapped row is
+/// the (possibly empty) zero-width prefix that attached to it. So in both
+/// cases the row count is `old_rows - 1 + wrapped.len()`. When the delta
+/// collapses to a single wrapped row it either merged into a partial old
+/// row (occupied width `last_width + row width`) or, for a full old row, it
+/// is the zero-width attachment whose width is 0 — the old row's width is
+/// unchanged.
 pub(crate) fn incremental_rows(
     delta: &str,
     width: usize,
@@ -84,41 +91,42 @@ pub(crate) fn incremental_rows(
     if delta.is_empty() {
         return (old_rows, last_width);
     }
-    let (wrapped, consume_last) = if last_width >= width {
-        // Old last row exactly full: the delta starts a fresh row. A
-        // leading '\n' only terminates the old row — no extra segment.
-        let delta = delta.strip_prefix('\n').unwrap_or(delta);
-        (hard_wrap(delta, width), false)
+    let wrapped = hard_wrap_continuation(delta, width, last_width);
+    let rows = old_rows.saturating_sub(1) + wrapped.len();
+    let last_width = if wrapped.len() == 1 {
+        last_width + row_cell_width(wrapped[0])
     } else {
-        (hard_wrap_continuation(delta, width, last_width), true)
-    };
-    let rows = if consume_last {
-        old_rows.saturating_sub(1) + wrapped.len()
-    } else {
-        old_rows + wrapped.len()
-    };
-    // The last row of a single-row merge is the old last row with `initial`
-    // cells already consumed — its occupied width is initial + row width,
-    // not the row string's width alone. Multi-row continuations end on a
-    // plain row, so only their last row's string width counts.
-    let last_width = if consume_last && wrapped.len() == 1 {
-        last_width + UnicodeWidthStr::width(wrapped[0])
-    } else {
-        wrapped.last().map_or(0, |row| UnicodeWidthStr::width(*row))
+        row_cell_width(wrapped.last().unwrap())
     };
     (rows, last_width)
 }
 
+/// Cell width of `text` as `hard_wrap` counts it — the sum of per-character
+/// widths, zero-width chars contributing 0. This matches the wrap loop's
+/// `used` counter exactly, which `UnicodeWidthStr::width` does not always
+/// do: a ZWJ emoji sequence collapses to the emoji's width there (e.g.
+/// "👨\u{200D}👩" is 2 as a string but 4 as a char sum), so using the
+/// string width for the incremental state would pre-consume too few cells
+/// on the next append and diverge from `hard_wrap`'s break decisions.
+/// `last_width` must stay char-based so incremental wrapping stays exactly
+/// equivalent to the full wrap.
+fn row_cell_width(text: &str) -> usize {
+    text.chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
+}
+
 /// `(row count, last-row cell width)` of `text` wrapped at `width` — the
 /// wrapped-state pair `CollapsedSummary` maintains incrementally and
-/// `refresh` recomputes in full. Exposed for tests to compare against.
+/// `refresh` recomputes in full. The last-row width is the char-based sum
+/// (`row_cell_width`), i.e. exactly the `used` counter `hard_wrap` ends the
+/// last row with, so incremental pre-consumption (`incremental_rows`) and
+/// the full recompute can never disagree. Exposed for tests to compare
+/// against.
 pub(crate) fn wrap_state(text: &str, width: usize) -> (usize, usize) {
     let width = width.max(1);
     let rows = hard_wrap(text, width);
-    (
-        rows.len(),
-        rows.last().map_or(0, |row| UnicodeWidthStr::width(*row)),
-    )
+    (rows.len(), rows.last().map_or(0, |row| row_cell_width(row)))
 }
 
 #[cfg(test)]
@@ -166,7 +174,10 @@ pub(crate) struct CollapsedSummary {
     pub(crate) rows: usize,
     /// Cell width of the last wrapped row at `width`; 0 when the text is
     /// empty or ends with a newline, `width` when the last row is exactly
-    /// full.
+    /// full. Char-based (`row_cell_width`): the same `used` counter
+    /// `hard_wrap` ends the row with, so incremental pre-consumption stays
+    /// exact even for ZWJ emoji sequences whose `UnicodeWidthStr::width`
+    /// would under-report.
     pub(crate) last_width: usize,
 }
 

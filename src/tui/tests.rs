@@ -2787,6 +2787,24 @@ fn incremental_rows_matches_full_wrap_on_edge_cases() {
         ("ab", "\nrest"), // partial last row + newline-headed delta
         ("ab", "\n"),     // delta is only a newline
         ("ab", "\n\nrest"),
+        // Zero-width characters (combining accent U+0301, variation
+        // selector U+FE0F, ZWJ U+200D) never fire a wrap break: they must
+        // attach to the old row — even one that is exactly full — instead
+        // of starting a phantom new row, exactly like hard_wrap of the
+        // concatenated text.
+        ("a", "\u{0301}"),                  // zero-width delta onto a full last row
+        ("a", "\u{0301}b"),                 // zero-width prefix then a normal char
+        ("a", "\u{0301}\n"),                // zero-width prefix then a newline
+        ("a", "\u{0301}\nrest"),            // zero-width prefix, newline, more text
+        ("a", "\u{FE0F}"),                  // variation selector onto a full last row
+        ("a", "\u{FE0F}x"),                 // variation selector then a normal char
+        ("a", "x\u{FE0F}"),                 // variation selector after a char
+        ("ab", "\u{0301}"),                 // zero-width delta onto a partial last row
+        ("ab", "\u{0301}c"),                // zero-width prefix, partial last row
+        ("ab", "\u{200D}\u{0301}\u{FE0F}"), // all-zero-width delta
+        ("a", "\u{1F468}\u{200D}\u{1F469}"), // ZWJ family sequence
+        ("\u{1F468}\u{200D}\u{1F469}", "x"), // old last row holds a ZWJ seq
+        ("abcd\u{1F468}\u{200D}\u{1F469}", "\u{0301}"), // full row + ZWJ + accent
     ];
     for width in 1..=8usize {
         for &(old, delta) in cases {
@@ -2816,6 +2834,9 @@ fn collapsed_summary_incremental_deltas_match_full_wrap() {
         "narrow tail".to_string(),
         "\nnewline head".to_string(),
         "  pad  ".to_string(),
+        "\u{0301}".to_string(),  // combining accent: zero-width chunk
+        "x\u{FE0F}".to_string(), // variation selector after a char
+        "\u{1F468}\u{200D}\u{1F469}".to_string(), // ZWJ family sequence
         "\n".to_string(),
         "final".to_string(),
     ];
@@ -2879,6 +2900,57 @@ fn collapsed_summary_incremental_deltas_match_full_wrap() {
         cache.rows,
         wrap_state(&full, width + 7).0,
         "incremental delta after resize must stay exact"
+    );
+}
+
+#[test]
+fn refresh_window_collapsed_summaries_scan_is_bounded() {
+    // Scrolling down from Home extends source_end without advancing
+    // source_start (extend_window_down), so the window range can grow far
+    // beyond MAX_RENDER_SOURCE_LINES. The per-frame refresh must scan only
+    // the lines local_window_lines will actually render — the tail of the
+    // window — not the whole browsed history.
+    let mut state = TuiState::default();
+    // Push with width unknown (inner_width == 0): no caches are populated,
+    // so every Thinking line is stale and would be recomputed if scanned.
+    let total = MAX_RENDER_SOURCE_LINES * 4;
+    for i in 0..total {
+        state.push_line(format!("thinking {i}"), LineKind::Thinking);
+    }
+    assert!(
+        state.lines.iter().all(|l| l.collapsed_summary.is_none()),
+        "precondition: no caches yet (width unknown at push time)"
+    );
+    // A window covering the whole scrollback, exactly like after paging
+    // down from Home (source_start stayed 0, source_end reached the end).
+    state.inner_width = 40;
+    state.window.source_start = 0;
+    state.window.source_end = total;
+    state.window.follow_bottom = false;
+    state.refresh_window_collapsed_summaries(40);
+    let scanned = state
+        .lines
+        .iter()
+        .filter(|l| l.collapsed_summary.is_some())
+        .count();
+    assert!(
+        scanned <= MAX_RENDER_SOURCE_LINES,
+        "refresh scanned {scanned} lines, must be bounded by MAX_RENDER_SOURCE_LINES"
+    );
+    // The scanned lines are exactly the tail local_window_lines selects:
+    // the head of the window stays untouched, the last budget lines are
+    // refreshed.
+    assert!(
+        state.lines[..total - MAX_RENDER_SOURCE_LINES]
+            .iter()
+            .all(|l| l.collapsed_summary.is_none()),
+        "head lines outside the local window must not be scanned"
+    );
+    assert!(
+        state.lines[total - MAX_RENDER_SOURCE_LINES..]
+            .iter()
+            .all(|l| l.collapsed_summary.is_some()),
+        "tail lines inside the local window must all be refreshed"
     );
 }
 
