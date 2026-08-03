@@ -1279,6 +1279,44 @@ async function main(){
         "title-ok=" + (wsTag.title === longPath)
         + " text=" + wsTag.textContent.slice(0, 50));
 
+    // ---- 任务行父会话标签：delegate 任务显示「父: <t.session_id>」----
+    // 简单方案：后端 TaskMeta.session_id 对 delegate 任务就是父会话（发起
+    // 它的会话），直接显示，无需查 session 列表；非 delegate 任务
+    // session_id 即父且「会话 <id>」已显示，不重复加父标签。
+    renderTaskList([{ session_id: "s1", id: 80, kind: "delegate", label: "子任务Z",
+      full_command: null, output: null, role: null, subagent_session_id: "sub-9" }],
+      elsById["composerTasks"]);
+    let prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    let pmeta = prow.querySelectorAll(".tparent");
+    chk("delegate row shows parent label from session_id",
+        pmeta.length === 1 && pmeta[0].textContent === "父: s1",
+        "parent=" + pmeta.map((e) => e.textContent).join("|"));
+    // 非 delegate 任务：不显示父标签（session_id 即父，「会话 <id>」已显示）
+    renderTaskList([{ session_id: "s1", id: 81, kind: "bash", label: "ls",
+      full_command: "ls", output: "", role: null }], elsById["composerTasks"]);
+    prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    chk("bash row shows no parent label",
+        prow.querySelector(".tparent") === null,
+        "parent=" + String(prow.querySelector(".tparent")));
+    // delegate 无 session_id（异常数据）→ 安静降级
+    renderTaskList([{ id: 82, kind: "delegate", label: "幽灵任务",
+      full_command: null, output: null, role: null, subagent_session_id: "ghost-1" }],
+      elsById["composerTasks"]);
+    prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    chk("delegate row without session_id shows no parent label",
+        prow.querySelector(".tparent") === null,
+        "parent=" + String(prow.querySelector(".tparent")));
+    // 极端 resume：session_id === subagent_session_id → 省略父标签（避免「会话 X / 父: X」重复）
+    renderTaskList([{ session_id: "sub-9", id: 84, kind: "delegate", label: "自指任务",
+      full_command: null, output: null, role: null, subagent_session_id: "sub-9" }],
+      elsById["composerTasks"]);
+    prow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    chk("delegate row with identical parent/subagent id omits parent label",
+        prow.querySelector(".tparent") === null
+        && prow.querySelectorAll(".tsid").length === 1,
+        "parent=" + String(prow.querySelector(".tparent")));
+    await pollSessions();   // 还原激活 workspace 缓存（后续测试基于轮询状态继续）
+
     // ---- Token 折叠：默认收起 → 点击展开 → 输入后按钮「已设置」 → 再点收起 ----
     const tokBtn = elsById["tokenToggle"];
     const tokInp = elsById["tokenInput"];
