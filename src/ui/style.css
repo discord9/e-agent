@@ -147,6 +147,7 @@
   .ws-btn {
     padding: 4px 9px;
     font-size: 13px;
+  }
   .ws-btn.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
 
   /* 「+」添加面板：钉在顶栏下方右侧（topbar 是 sticky 定位，作 absolute 锚点） */
@@ -776,7 +777,6 @@
     font-size: 12px;
   }
   .queue-bar .queue-toggle:hover { background: #f6e7b8; }
-  }
 
   /* 斜杠命令补全菜单：输入框上方浮出（absolute 钉在 composer 顶部外侧），
      不占布局、不随消息滚动。Solarized Light：base2 底、base1 边框、
