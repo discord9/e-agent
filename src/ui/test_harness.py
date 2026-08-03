@@ -155,19 +155,31 @@ class El {
   getAttribute(k){ return Object.prototype.hasOwnProperty.call(this._attrs,k) ? this._attrs[k] : null; }
   hasAttribute(k){ return Object.prototype.hasOwnProperty.call(this._attrs,k); }
   removeAttribute(k){ delete this._attrs[k]; }
-  cloneNode(){ const c = new El(this.tag); c._className=this._className;
-    c._classes=new Set(this._classes); c.textContent=this.textContent;
-    c.hidden=this.hidden; c._attrs=Object.assign({}, this._attrs); return c; }
+  cloneNode(deep){ const c = new El(this.tag); c._className=this._className;
+    c._classes=new Set(this._classes); c._attrs=Object.assign({}, this._attrs);
+    if (deep) {   /* 真实 DOM：深拷贝子节点（含文本）；浅拷贝只复制属性/class */
+      c._children = this._children.map((x) => x instanceof El ? x.cloneNode(true)
+        : Object.assign({}, x));
+      c._children.forEach((x) => { if (x instanceof El) x._parent = c; });
+    } else { c._text = ""; }
+    c.hidden=this.hidden; return c; }
+  /* 真实 DOM 语义：textContent 赋值后 append 子节点时，已设的文本成为
+     文本子节点（而非被 children 遮蔽丢失）。 */
+  _materializeText(){ if (this._text !== "" && this._children.length === 0) {
+      this._children.push({ text: this._text }); this._text = ""; } }
   append(...nodes){ for(const n of nodes){ if(n==null) continue;
+    this._materializeText();
     const c=typeof n==="string"?{text:n}:n; this._children.push(c);
     if(c._parent==null) c._parent=this; } }
   appendChild(n){ const p=n._parent;   /* 真实 DOM 语义：移动=先从旧父节点移除 */
     if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
+    this._materializeText();
     this._children.push(n); n._parent=this; return n; }
   prepend(...nodes){ let i=0;           /* 真实 DOM 语义：头部插入（已有父节点先移除） */
     for(const n of nodes){ if(n==null) continue;
       const c=typeof n==="string"?{text:n}:n; const p=c._parent;
       if(p){ const j=p._children.indexOf(c); if(j>=0) p._children.splice(j,1); }
+      this._materializeText();
       this._children.splice(i++,0,c); c._parent=this; } }
   get isConnected(){ return this._parent != null; }
   insertBefore(n, ref){ const p=n._parent; if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
@@ -858,6 +870,9 @@ async function main(){
     handleSSEBlock("event: resync\ndata: [{\"type\":\"user_prompt\",\"data\":\"重放-用户\"},{\"type\":\"assistant_delta\",\"data\":\"重放-\"},{\"type\":\"assistant_delta\",\"data\":\"增量\"}]\n\n",
       state.sessionId, state.workspace.id, sessionOpenEpoch);
     const t3 = allText();
+    console.log("DBG t3=" + JSON.stringify(t3.slice(0, 200)));
+    console.log("DBG msgs children=" + elsById["messages"]._children.length
+      + " html=" + (elsById["messages"].innerHTML || "").slice(0, 150));
     chk("resync replaces transcript", !t3.includes("你好，帮我看看") && t3.includes("重放-用户"));
     chk("resync replayed deltas", t3.includes("重放-") && t3.includes("增量"));
     chk("resync rerenders", elsById["messages"]._children.length >= 2,
@@ -2279,8 +2294,8 @@ async function main(){
         pinMarkers.length === 2
         && pinMarkerLabels.includes("服务器A")
         && pinMarkerLabels.includes("服务器B")
-        && [...pinMarkers].every((m) => m.parentNode && m.parentNode.classList.contains("tree-row")
-          && m.nextSibling && m.nextSibling.classList.contains("tree-count")),
+        && [...pinMarkers].every((m) => m.parentNode
+          && m.parentNode.classList.contains("tree-title")),
         "labels=" + pinMarkerLabels.join(","));
     chk("pinned roots all in pinned group",
         pinTop.textContent.includes("pa1") && pinTop.textContent.includes("pb1"),
@@ -2342,6 +2357,7 @@ async function main(){
     await pollAllWorkspaces();
     await flush();
     await flush();
+    console.log("DBG 15 lastList=" + JSON.stringify(state.lastList.map((x) => [x.id, x.title, x.pinned])));
     renderSidebarTree(true);
     renderSessionList();
     const sec15 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
@@ -2366,6 +2382,8 @@ async function main(){
         "list=" + listCls15.join(","));
     // B) busy-dot 聚合：C（busy 子）亮、C2（idle 子）不亮、D（idle 子）不亮
     const rows15 = elsById["sidebarTree"].querySelectorAll(".tree-row");
+    console.log("DBG rows15=" + rows15.length + " texts=" + [...rows15].slice(0, 6).map((r) => JSON.stringify((r.textContent || "").slice(0, 20))).join(" | "));
+    console.log("DBG c1html=" + (rows15[0] && rows15[0].innerHTML || "").slice(0, 400));
     const dotOf15 = (r) => r.querySelector(".busy-dot");
     const rowByTxt15 = (t) => [...rows15].find((r) => r.textContent.includes(t));
     const c1Dot = dotOf15(rowByTxt15("C 主会话"));
@@ -4159,8 +4177,8 @@ print(("PASS" if _spin_ok else "FAIL") + " composer-status spinner + reduced-mot
 _marker = re.search(r'\.tree-row\s+\.ws-pin-label\s*\{([^}]*)\}', _css)
 _marker_css = _marker.group(1) if _marker else ''
 _marker_ok = bool(_marker
-                  and re.search(r'flex:\s*0\s+0\s+auto', _marker_css)
-                  and re.search(r'font-size:\s*1[0-2]px', _marker_css))
+                  and re.search(r'font-size:\s*1[0-2]px', _marker_css)
+                  and re.search(r'white-space:\s*nowrap', _marker_css))
 print(("PASS" if _marker_ok else "FAIL") + " compact ws-pin-label layout in style.css")
 # LOW：ws-chip 10px 小字号前景/背景 WCAG AA 对比度 ≥ 4.5:1（深色文字配浅 tint）
 def _rel_lum(hexc):

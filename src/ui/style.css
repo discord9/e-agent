@@ -1252,15 +1252,16 @@ mmlEqnNo}
   .ws-chip-4 { color: #4e548c;  border-color: #4e548c;  background: #f0eef8; }
   .ws-chip-5 { color: #96255a;  border-color: #96255a;  background: #f8eef3; }
   /* 置顶聚合行的服务器名小字：无边框无背景，复用 ws-chip-N 分色前景，
-     不挤占会话标题空间（flex 不收缩、不换行）。 */
+     行内跟在标题文字后（不换行、不撑宽，标题长时省略号）。 */
   .tree-row .ws-pin-label {
-    flex: 0 0 auto;
     font-size: 10px;
     line-height: 1.4;
     white-space: nowrap;
     max-width: 120px;
     overflow: hidden;
     text-overflow: ellipsis;
+    vertical-align: baseline;
+    margin-left: 4px;   /* 与标题文字之间空一格 */
   }
   /* 分组头错误标记：muted 红字（服务器轮询失败，列表保留为 stale） */
   .ws-err { color: var(--red); font-size: 11px; opacity: 0.8; }

@@ -1504,11 +1504,15 @@ function renderSidebarTree(force) {
         kidsByParent.get(x.parent_session_id).push(x);
       }
       const node = buildTreeRoot(s, kidsByParent.get(s.id) || [], ws.id);
-      // 置顶聚合行在标题后加小字服务器名（ws-chip-N 分色前景，无边框无
-      // 背景，不挤占标题空间）；颜色与列表行/组头一致，一眼可辨所属 ws。
+      // 置顶聚合行：workspace 小字跟在标题文字后面（标题行内，下一行是
+      // 完整 session id）——有标题跟标题，无标题跟 id；复用 ws-chip-N 分色。
       const marker = el("span", "ws-pin-label " + wsChipClass(ws), ws.name || ws.url);
       const row = node.querySelector(".tree-row");
-      if (row) row.insertBefore(marker, row.querySelector(".tree-count"));
+      const titleEl = row && row.querySelector(".tree-id");
+      if (titleEl) {
+        const titleLine = titleEl.querySelector(".tree-title") || titleEl;
+        titleLine.appendChild(marker);
+      }
       pinnedBody.appendChild(node);
     }
     pinnedSec.appendChild(pinnedBody);
