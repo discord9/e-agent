@@ -22,6 +22,30 @@ function stillCurrent(id, wsId, epoch) {
   return epoch === sessionOpenEpoch && state.workspace.id === wsId && state.sessionId === id;
 }
 
+/* 会话已知状态：区分 SSE 404 的两种含义（历史无流 vs 真不存在）。
+   /api/sessions/<id>/events 只服务 live 会话；历史/已结束会话保持 404
+   （server 端设计：streaming needs a live runner）。但历史 transcript
+   可读——404 不等于「会话不存在」。在 wsId 对应 workspace 的列表
+   （state.workspaceLists[wsId]）与激活列表（state.lastList，单服务器模式
+   的唯一数据源）中查找 id：
+   - 找到且 active===false → "historical"：历史/已结束，无实时流属预期
+   - 找到且 active!==false（true 或缺省=旧 server 视为活跃）→ "live"：
+     应存活，404 才意味着会话真不存在
+   - 两个列表都没有 → "unknown"：如任务面板直连刚结束的子会话（列表还
+     没刷新到它）——保守处理：404 静默，不弹「不存在」 */
+function sessionKnownState(id, wsId) {
+  const lists = [];
+  if (state.workspaceLists && Array.isArray(state.workspaceLists[wsId])) {
+    lists.push(state.workspaceLists[wsId]);
+  }
+  if (Array.isArray(state.lastList)) lists.push(state.lastList);
+  for (const list of lists) {
+    const s = list.find((x) => x && x.id === id);
+    if (s) return s.active === false ? "historical" : "live";
+  }
+  return "unknown";
+}
+
 function connectSSE(id, wsId, epoch) {
   // 起流前三重校验：陈旧 history 响应绝不能对刚激活的服务器/会话起 SSE。
   if (!stillCurrent(id, wsId, epoch)) return;
@@ -42,7 +66,22 @@ function connectSSE(id, wsId, epoch) {
       throw new Error("auth");
     }
     if (res.status === 404) {
+      // 404 的两种含义，按会话已知状态区分（判定见 sessionKnownState）：
+      // - 已知历史/已结束（active===false）或不在任何列表（任务面板直连
+      //   刚结束的子会话）：SSE 端点只服务 live 会话，404 = 没有实时流，
+      //   会话本身存在（history 刚加载成功，transcript 可读）。静默降级：
+      //   不弹「不存在」、不重连（重连只会再次 404）；历史会话给轻量提示。
+      // - 已知应存活（active!==false）却 404：会话真的不存在，保持报错。
+      // 先校验上下文：陈旧请求的 404 不得弹提示、不得停新会话的流。
+      if (!stillCurrent(id, wsId, epoch)) { try { ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
+      const known = sessionKnownState(id, wsId);
+      if (known !== "live") {
+        state.sse.stopped = true;                       // 无流可连：停，不重连
+        if (known === "historical") setConn("ended", "会话已结束");
+        throw new Error("silent-gone");
+      }
       setBanner("⚠ 会话不存在或已被删除。");
+      state.sse.stopped = true;                         // 404 = 无流：重连也 404
       throw new Error("gone");
     }
     if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
@@ -56,7 +95,10 @@ function connectSSE(id, wsId, epoch) {
   }).catch((err) => {
     if (err && err.name === "AbortError") return;   // 主动停止
     if (state.sse.stopped) return;
-    if (err && err.message === "auth") { state.sse.stopped = true; return; }
+    if (err && (err.message === "auth" || err.message === "gone" || err.message === "silent-gone")) {
+      state.sse.stopped = true;   // 认证失败 / 会话不存在 / 历史无流：都不重连（404 重连也 404）
+      return;
+    }
     scheduleReconnect(id, wsId, epoch);   // 携带断线流的三元组：重连前必须仍是同一上下文
   });
 }

@@ -296,6 +296,8 @@ let sessionsBFormat = false;
 // 再 resolve 陈旧块；验证陈旧流不渲染到当前会话/workspace）
 let a1StreamManual = false;
 let a1StreamReadResolve = null;
+// SSE 404 语义测试：命中这些 id 的 /events 返回 404（模拟历史/已结束会话无流）
+let sse404Ids = new Set();
 // fork 面板测试用：/fork-candidates 候选与 /fork POST 响应（测试中可变）
 let forkCandidatesData = [
   {at:2, seq:2, preview:"用户：你好，帮我看看"},
@@ -309,6 +311,9 @@ globalThis.fetch=(url,opts={})=>{
   if(url==="/api/tasks") return resp(200, tasksData);
   if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output"))
     return resp(200, taskOutputText);
+  // SSE 404 语义测试：命中这些 id 的 /events 返回 404（优先于下方具体会话路由）
+  const _m404 = /^\/api\/sessions\/([^/]+)\/events$/.exec(url);
+  if (_m404 && sse404Ids.has(_m404[1])) return resp(404, {});
   if(url==="/api/sessions"&&m==="GET") return resp(200, sessionsData);
   // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
   if(url==="http://b.local/api/sessions"&&m==="GET") {
@@ -2141,6 +2146,87 @@ async function main(){
     // 恢复状态后清理：开关复位、sessionsData 复原（后续无其它断言依赖）
     state.showArchived = false;
     sessionsData = sessionsData.filter((s) => s.id !== "arch-1");
+
+    // =====================================================================
+    // 15) SSE 404 语义区分（Fix）：历史/已结束会话的 /events 404 = 没有实时
+    //     流（server 只给 live 会话起流），不是「会话不存在」——从任务面板
+    //     点进已结束的子会话时不得误报。按 sessionKnownState 判定：
+    //     - active===false（已知历史）→ 静默降级 + 「会话已结束」轻提示，
+    //       不弹「不存在」、不重连
+    //     - active!==false（已知应存活）→ 保持「不存在」报错，但也不重连
+    //     - 不在任何列表（任务面板直连刚结束的子会话）→ 完全静默，不重连
+    // =====================================================================
+    const _savedList404 = state.lastList;
+    const _savedWsLists404 = Object.assign({}, state.workspaceLists);
+    const _savedSid404 = state.sessionId;
+    const _savedView404 = state.view;
+    const _savedBanner404 = { hidden: elsById["banner"].hidden, text: elsById["bannerText"].textContent };
+    const _open404 = (sid, list) => {
+      state.lastList = list;
+      state.workspaceLists[state.workspace.id] = list;
+      state.sessionId = sid;
+      state.view = "chat";
+      state.sse.stopped = false;
+      elsById["banner"].hidden = true;
+      elsById["bannerText"].textContent = "";
+    };
+    // (a) 已知历史（active===false）：无「不存在」banner、轻提示、不重连
+    _open404("s1", [{ id: "s1", status: "Idle", entry_count: 8, busy: false, active: false }]);
+    sse404Ids.add("s1");
+    const _to404a = scheduledTimeouts.length;
+    connectSSE("s1", state.workspace.id, sessionOpenEpoch);
+    await flush();
+    chk("sse404 historical: no gone banner",
+        elsById["banner"].hidden === true
+        && elsById["bannerText"].textContent.indexOf("不存在") === -1,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    chk("sse404 historical: light ended hint",
+        elsById["connState"].textContent === "会话已结束"
+        && elsById["connState"].className === "conn-state ended",
+        "conn=" + JSON.stringify(elsById["connState"].textContent));
+    chk("sse404 historical: stopped, no reconnect",
+        state.sse.stopped === true && state.sse.retryTimer === null
+        && scheduledTimeouts.length === _to404a,
+        "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
+    sse404Ids.delete("s1");
+    // (b) 已知应存活（active===true）：保持「不存在」报错，但不重连
+    _open404("s1", [{ id: "s1", status: "Idle", entry_count: 8, busy: false, active: true }]);
+    sse404Ids.add("s1");
+    const _to404b = scheduledTimeouts.length;
+    connectSSE("s1", state.workspace.id, sessionOpenEpoch);
+    await flush();
+    chk("sse404 live: gone banner still shown",
+        elsById["banner"].hidden === false
+        && elsById["bannerText"].textContent.indexOf("不存在") !== -1,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    chk("sse404 live: no reconnect on 404",
+        state.sse.stopped === true && state.sse.retryTimer === null
+        && scheduledTimeouts.length === _to404b + 1,   // +1 = banner 自动消失计时器，不是重连
+        "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
+    sse404Ids.delete("s1");
+    // (c) 未知（不在任何列表）：任务面板直连刚结束的子会话 → 完全静默
+    _open404("sub-finished", [{ id: "s1", status: "Idle", entry_count: 1, busy: false, active: true }]);
+    sse404Ids.add("sub-finished");
+    const _to404c = scheduledTimeouts.length;
+    connectSSE("sub-finished", state.workspace.id, sessionOpenEpoch);
+    await flush();
+    chk("sse404 unknown: silent, no gone banner",
+        elsById["banner"].hidden === true
+        && elsById["bannerText"].textContent.indexOf("不存在") === -1,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    chk("sse404 unknown: stopped, no reconnect",
+        state.sse.stopped === true && state.sse.retryTimer === null
+        && scheduledTimeouts.length === _to404c,
+        "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
+    sse404Ids.delete("sub-finished");
+    // 还原（本段之后无其它测试，仍保持整洁）
+    state.lastList = _savedList404;
+    state.workspaceLists = _savedWsLists404;
+    state.sessionId = _savedSid404;
+    state.view = _savedView404;
+    elsById["banner"].hidden = _savedBanner404.hidden;
+    elsById["bannerText"].textContent = _savedBanner404.text;
+    stopSSE();
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);
