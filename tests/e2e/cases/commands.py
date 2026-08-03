@@ -32,15 +32,17 @@ async def run_commands(c):
             "/compact" in (title_attr or "") and "/rename" in (title_attr or "")
             and "/btw" in (title_attr or ""), title_attr or "None")
 
-    await c.page.locator("#sessionList .session-row", has_text="main-idle").first.click()
-    await c.page.wait_for_function("() => state.view === 'chat'")
+    await c.open_sidebar()
+    await c.page.locator("#sidebarTree .tree-row", has_text="main-idle").first.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'main-idle'")
+    await c.close_sidebar()
 
     def banner():
         return c.ev("els.banner.textContent")
 
     # ---------- /compact ----------
     await c.page.fill("#promptInput", "/compact")
-    await c.page.press("#promptInput", "Enter")
+    await c.page.click("#sendBtn")
     await c.page.wait_for_timeout(900)
     c.check("/compact：POST /compact 发出（不 POST /prompt）",
             len(c.records["compact"]) == 1
@@ -53,7 +55,7 @@ async def run_commands(c):
 
     # ---------- /rename 裸命令 -> 用法 ----------
     await c.page.fill("#promptInput", "/rename")
-    await c.page.press("#promptInput", "Enter")
+    await c.page.click("#sendBtn")
     await c.page.wait_for_timeout(400)
     c.check("/rename 裸命令：用法 banner + 不发 PUT",
             "用法：/rename <标题>" in await banner() and len(c.records["title"]) == 0,
@@ -81,7 +83,7 @@ async def run_commands(c):
 
     # ---------- /btw 裸命令 -> 用法 ----------
     await c.page.fill("#promptInput", "/btw")
-    await c.page.press("#promptInput", "Enter")
+    await c.page.click("#sendBtn")
     await c.page.wait_for_timeout(400)
     c.check("/btw 裸命令：用法 banner + 不发 POST",
             "用法：/btw <问题>" in await banner() and len(c.records["btw"]) == 0,

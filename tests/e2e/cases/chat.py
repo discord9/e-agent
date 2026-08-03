@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """聊天视图用例（基于 05fc4c8 已合入功能）：
 
-  * chat_open_sse     —— openSession：列表行点开进入聊天视图、加载历史；
+  * chat_open_sse     —— 侧边栏树打开会话、加载历史；
                           SSE 基本流（mock 事件）：status/UserPrompt/AssistantDelta/
                           ReasoningDelta/ToolCall/ToolResult/AssistantText/Notice/
                           Usage/Error 的渲染；Busy 状态取消可用。
@@ -52,13 +52,17 @@ async def run_chat_open_sse(c):
     ]) + "\n\n"
 
     await c.start()
-    await c.page.locator("#sessionList .session-row", has_text="main-idle").first.click()
+    await c.open_sidebar()
+    await c.page.locator("#sidebarTree .tree-row", has_text="main-idle").first.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'main-idle'")
     await c.page.wait_for_timeout(800)
-    c.check("openSession：进入聊天视图", await c.ev("state.view") == "chat", await c.ev("state.view"))
-    c.check("openSession：会话 id 显示",
-            (await c.page.locator("#chatSessionId").text_content()) == "会话 main-idle", "")
-    c.check("openSession：chatView 可见、listView 隐藏",
-            await c.ev("!els.chatView.classList.contains('hidden') && els.listView.classList.contains('hidden')"), "")
+    c.check("openSession：进入当前会话", await c.ev("state.sessionId") == "main-idle",
+            await c.ev("state.sessionId"))
+    c.check("openSession：标题与会话 id 显示",
+            "主会话" in (await c.page.locator("#chatSessionId").text_content())
+            and "main-idle" in (await c.page.locator("#chatSessionId").text_content()), "")
+    c.check("openSession：chatView 可见且退出空状态",
+            await c.ev("!els.chatView.classList.contains('hidden') && !els.chatView.classList.contains('no-session')"), "")
 
     # history 渲染
     t = await c.ev("els.messages.textContent")
@@ -116,7 +120,8 @@ async def run_chat_state_preserved(c):
     c.extra_handlers.append((lambda url, method: url.endswith("/events"), hold_events))
 
     await c.start()
-    await c.page.locator("#sessionList .session-row", has_text="sess-a").first.click()
+    await c.open_sidebar()
+    await c.page.locator("#sidebarTree .tree-row", has_text="sess-a").first.locator(".tree-id").click()
     await c.page.wait_for_selector("#messages .msg-user", timeout=8000)
     n = await c.page.locator("#messages .msg-user").count()
     c.check("打开 sess-a：历史渲染", n == 30, f"msgs={n}")
@@ -127,18 +132,14 @@ async def run_chat_state_preserved(c):
     saved_scroll = await c.ev("els.messages.scrollTop = 300; els.messages.scrollTop")
     c.check("会话可滚动（scrollTop 生效）", saved_scroll > 0, f"scrollTop={saved_scroll}")
 
-    # 切到 sess-b（首次打开 -> 拉历史）
-    await c.page.click("#backBtn")
-    await c.page.wait_for_function("() => state.view === 'list'")
-    await c.page.locator("#sessionList .session-row", has_text="sess-b").first.click()
-    await c.page.wait_for_function("() => state.view === 'chat' && state.sessionId === 'sess-b'")
+    # 通过唯一导航切到 sess-b（首次打开 -> 拉历史）
+    await c.page.locator("#sidebarTree .tree-row", has_text="sess-b").first.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'sess-b'")
     c.check("切到 sess-b：进入聊天", await c.ev("state.sessionId") == "sess-b", "")
 
-    # 切回 sess-a：草稿/滚动/缓存恢复，不重新拉历史
-    await c.page.click("#backBtn")
-    await c.page.wait_for_function("() => state.view === 'list'")
-    await c.page.locator("#sessionList .session-row", has_text="sess-a").first.click()
-    await c.page.wait_for_function("() => state.view === 'chat' && state.sessionId === 'sess-a'")
+    # 通过侧边栏切回 sess-a：草稿/滚动/缓存恢复，不重新拉历史
+    await c.page.locator("#sidebarTree .tree-row", has_text="sess-a").first.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'sess-a'")
     await c.page.wait_for_timeout(300)
     c.check("切回 sess-a：草稿恢复",
             await c.ev("els.promptInput.value") == "草稿甲",
@@ -149,7 +150,7 @@ async def run_chat_state_preserved(c):
     c.check("切回 sess-a：消息缓存恢复（不重新渲染）",
             await c.page.locator("#messages .msg-user").count() == 30, "")
     hist_a = [u for u, _ in c.records["history"] if "/sess-a/history" in u]
-    c.check("切回 sess-a：不重新加载历史（仅首次 1 次）", len(hist_a) == 1, f"fetches={len(hist_a)}")
+    c.check("切回 sess-a：缓存先恢复并补拉最新历史", len(hist_a) == 2, f"fetches={len(hist_a)}")
 
 async def run_chat_error_render(c):
     c.sessions = [
@@ -159,16 +160,14 @@ async def run_chat_error_render(c):
     ]
     await c.start()
 
-    # 列表行：Failed -> 失败 chip
-    row = c.page.locator("#sessionList .session-row", has_text="main-failed").first
-    chip = row.locator(".status-chip")
-    c.check("列表：Failed 会话 chip=失败 + error 样式",
-            (await chip.text_content()) == "失败" and "error" in (await chip.get_attribute("class")),
-            await chip.get_attribute("class"))
+    c.check("Failed 状态标签与样式映射",
+            await c.ev("statusLabel('Failed')") == "失败"
+            and await c.ev("statusChipClass('Failed')") == "error", "")
 
-    # 打开失败会话 -> applyStatus('Failed(xx)') -> 失败
-    await row.click()
-    await c.page.wait_for_function("() => state.view === 'chat'")
+    # 从侧边栏打开失败会话 -> applyStatus('Failed(xx)') -> 失败
+    await c.open_sidebar()
+    await c.page.locator("#sidebarTree .tree-row", has_text="main-failed").first.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'main-failed'")
     await c.ev("applyStatus('Failed(xx)')")
     c.check("applyStatus('Failed(xx)')：状态标签=失败",
             (await c.page.locator("#chatStatus").text_content()) == "失败", "")
@@ -221,21 +220,14 @@ async def run_conflict_card(c):
                   "\"seq\":1,\"error\":\"会话被其他客户端占用，已停止写入以避免数据冲突。\"}\n\n")
 
     await c.start()
-    # 列表：Failed 状态会话 chip 显示「失败」（DOM 断言）
-    row = c.page.locator("#sessionList .session-row", has_text="main-conflict").first
-    chip = row.locator(".status-chip")
-    c.check("冲突会话（Failed）：列表 chip 文本=失败", (await chip.text_content()) == "失败",
-            await chip.text_content())
-    c.check("冲突会话（Failed）：chip error 样式",
-            "error" in (await chip.get_attribute("class")), await chip.get_attribute("class"))
-
     # statusLabel：Failed* -> 失败（现状唯一合入的友好化改动）
     c.check("statusLabel('Failed(concurrent write conflict)') === '失败'",
             await c.ev("statusLabel('Failed(concurrent write conflict)')") == "失败", "")
 
-    # 打开会话：SSE status=Failed + Error 事件（冲突提示）渲染
-    await row.click()
-    await c.page.wait_for_function("() => state.view === 'chat'")
+    # 从侧边栏打开会话：SSE status=Failed + Error 事件（冲突提示）渲染
+    await c.open_sidebar()
+    await c.page.locator("#sidebarTree .tree-row", has_text="main-conflict").first.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'main-conflict'")
     await c.page.wait_for_timeout(1000)
     c.check("冲突回合：聊天状态 chip 文本=失败",
             (await c.page.locator("#chatStatus").text_content()) == "失败",

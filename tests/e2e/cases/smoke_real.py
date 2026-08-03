@@ -3,8 +3,8 @@
 
 与核心 mock 用例不同，本用例连宿主 server（EAGENT_BASE，默认 18766）走真实 API：
   * 主页仍用当前 checkout 拼装的 HTML（保证测的是工作区前端）；
-  * GET /api/sessions 真实列表 -> 渲染；
-  * 若有会话则打开第一个 -> 真实 history + SSE。
+  * GET /api/sessions 真实数据 -> 侧边栏树渲染；
+  * 若有会话则从侧边栏打开第一个 -> 真实 history + SSE。
 只读操作，不创建/删除任何数据。server 不可达或 token 文件缺失 -> SKIP（不算 FAIL）。
 """
 import json
@@ -33,24 +33,28 @@ async def run_smoke(c):
         "localStorage.setItem('eagent_token', %s)" % json.dumps(token))
     await page.goto(common.BASE + "/", wait_until="load")
     await page.reload(wait_until="load")
-    # 等首轮真实轮询渲染完成（有行或空态提示）
+    # 等首轮真实轮询落入会话缓存，再打开侧边栏检查唯一导航。
     await page.wait_for_function(
-        "() => document.querySelectorAll('.session-row').length > 0 || "
-        "(els.listHint && els.listHint.textContent.includes('暂无会话'))",
+        "() => Array.isArray(state.lastList) && state.workspaceErrors[state.workspace.id] !== undefined",
         timeout=10000)
-    n = await page.locator(".session-row").count()
-    c.check("真实 API：会话列表渲染（%d 行）" % n, n >= 0, "")
+    n = await c.ev("state.lastList.length")
+    await c.open_sidebar()
+    c.check("真实 API：侧边栏会话树渲染（%d 条缓存）" % n,
+            (await page.locator("#sidebarTree .tree-row .tree-id").count()) >= min(n, 1), "")
 
     if n > 0:
-        await page.locator("#sessionList .session-row").first.click()
-        await page.wait_for_function("() => state.view === 'chat'", timeout=8000)
+        sid = await c.ev("state.lastList.find(s => !s.parent_session_id)?.id || state.lastList[0].id")
+        row = page.locator("#sidebarTree .tree-row").filter(has=page.locator(".tree-id", has_text=sid)).first
+        await row.locator(".tree-id").click()
+        await page.wait_for_function("id => state.sessionId === id", arg=sid, timeout=8000)
         await page.wait_for_timeout(1500)
-        c.check("真实 API：打开会话进入聊天视图", await c.ev("state.view") == "chat",
+        c.check("真实 API：从侧边栏打开会话", await c.ev("state.sessionId") == sid,
                 await c.ev("state.sessionId"))
-        c.check("真实 API：聊天视图可见", await c.ev("!els.chatView.classList.contains('hidden')"), "")
+        c.check("真实 API：聊天视图可见且非空状态",
+                await c.ev("!els.chatView.classList.contains('hidden') && !els.chatView.classList.contains('no-session')"), "")
 
 CASES = [
     {"name": "smoke_real_api",
-     "desc": "真实 server 冒烟：列表渲染 + 打开会话（--real 启用，只读）",
+     "desc": "真实 server 冒烟：侧边栏树渲染 + 打开会话（--real 启用，只读）",
      "requires_server": True, "real_api": True, "token": None, "run": run_smoke},
 ]

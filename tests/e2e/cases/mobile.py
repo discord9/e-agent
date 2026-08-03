@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""手机视口用例：390px 不横向溢出（列表 / 聊天 / 侧边栏展开）。
+"""手机视口用例：390px 不横向溢出（聊天空状态 / 聊天 / 侧边栏展开）。
 
 手机视口（≤600px）行为：侧边栏仍为覆盖式（遮罩显示、内容不位移）；
 桌面挤压布局见 sidebar_squeeze / sidebar_persist。
@@ -34,16 +34,10 @@ async def run_mobile_390(c):
                     " document.documentElement.scrollWidth, window.innerWidth]")
 
     w = await overflow_ok()
-    c.check("列表视图 390px 不横向溢出", w[0] is True, str(w[1:]))
+    c.check("聊天空状态 390px 不横向溢出", w[0] is True, str(w[1:]))
+    c.check("未选会话显示空状态", await c.ev("state.sessionId === null && els.chatView.classList.contains('no-session')"), "")
 
-    # 打开聊天（点 .sid 文本区，避开行内 ✎/📌 按钮）
-    await c.page.locator("#sessionList .session-row", has_text="root-a").first.locator(".sid").click()
-    await c.page.wait_for_function("() => state.view === 'chat'")
-    await c.page.wait_for_timeout(400)
-    w = await overflow_ok()
-    c.check("聊天视图 390px 不横向溢出", w[0] is True, str(w[1:]))
-
-    # 打开侧边栏（覆盖式）
+    # 打开侧边栏（覆盖式），通过唯一导航打开会话
     await c.open_sidebar()
     await c.page.wait_for_timeout(400)
     w = await overflow_ok()
@@ -55,13 +49,14 @@ async def run_mobile_390(c):
     c.check("手机遮罩显示",
             await c.ev("!els.sidebarOverlay.hidden && getComputedStyle(els.sidebarOverlay).display !== 'none'"), "")
 
-    # 树行切会话：侧边栏保持打开，聊天可见
+    # 树行打开会话：侧边栏保持打开，聊天可见
     tree_rows = c.page.locator("#sidebarTree .tree-row:not(.tasks-group-head)")
     await tree_rows.first.locator(".tree-id").click()      # 点文本区，避开行内按钮
-    await c.page.wait_for_function("() => state.view === 'chat'")
+    await c.page.wait_for_function("() => state.sessionId === 'root-a'")
     await c.page.wait_for_timeout(300)
     c.check("树行切会话后侧边栏仍打开", await c.ev("state.sidebar.open") is True, "")
     w = await overflow_ok()
+    c.check("聊天视图 390px 不横向溢出", w[0] is True, str(w[1:]))
     c.check("切会话后仍不横向溢出", w[0] is True, str(w[1:]))
 
     # 点遮罩关闭
@@ -70,6 +65,6 @@ async def run_mobile_390(c):
     c.check("手机点遮罩关闭侧边栏", await c.ev("!state.sidebar.open"), "")
 
 CASES = [
-    {"name": "mobile_390", "desc": "手机视口 390px：列表/聊天/侧边栏无横向溢出 + 遮罩关闭",
+    {"name": "mobile_390", "desc": "手机视口 390px：聊天空状态/聊天/侧边栏无横向溢出 + 遮罩关闭",
      "mobile": True, "viewport": {"width": 390, "height": 844}, "run": run_mobile_390},
 ]
