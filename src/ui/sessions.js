@@ -1834,14 +1834,12 @@ function buildTreeRoot(s, kids, wsId) {
   // 活跃子会话聚合只看直接子会话（subagent 通常一层，孙会话不计）：
   // 后端 running_tasks 分不清 Idle/Busy——live subagent（label 在）只有
   // active=true、busy 恒为 false（apply_subagent_label 只设 active）。
-  // 所以用 active===true 统计"存活/运行中的子 agent 数"（包括等待输入的
-  // Idle subagent——它们确实在工作流里活着）。数字优先于父节点的点。
+  // 所以 active===true 表示仍在工作流中的子 agent（包括等待输入的 Idle
+  // subagent）。父会话自身忙或存在活跃子会话时，统一显示橙色脉动点。
   const busyKidCount = kids.filter((k) => k.active === true).length;
-  const kidsBusy = busyKidCount > 0;
-  const dot = busyKidCount > 0
-    ? el("span", "busy-dot busy-count", String(busyKidCount))
-    : el("span", "busy-dot" + (s.busy ? " busy" : ""));
-  dot.setAttribute("aria-label", busyKidCount > 0
+  const hasActiveKids = kids.some((k) => k.active === true);
+  const dot = el("span", "busy-dot" + ((s.busy || hasActiveKids) ? " busy" : ""));
+  dot.setAttribute("aria-label", hasActiveKids
     ? busyKidCount + " 个子任务处理中"
     : (s.busy ? "会话处理中" : "会话空闲"));
   // 有标题：两行（title 行 + 完整 id 行）；无标题：一行完整 id。
@@ -1886,7 +1884,7 @@ function buildTreeRoot(s, kids, wsId) {
   row.append(toggle, dot, titleEl, count, pin, archive, treeDeleteButton(s, wsId));
   row.title = (s.title || s.id) + (s.model ? " · " + s.model : "")
     + (s.busy ? "（处理中）" : "")
-    + (kidsBusy ? "（子任务处理中）" : "");
+    + (hasActiveKids ? "（子任务处理中）" : "");
   row.addEventListener("click", (ev) => {
     if (row.classList.contains("pin-drag-click-block")) {
       if (ev) { ev.preventDefault(); ev.stopPropagation(); }

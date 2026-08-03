@@ -150,8 +150,6 @@ mmlEqnNo}
   .ws-btn {
     padding: 4px 9px;
     font-size: 13px;
-    line-height: 1;
-  }
   .ws-btn.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
 
   /* 「+」添加面板：钉在顶栏下方右侧（topbar 是 sticky 定位，作 absolute 锚点） */
@@ -1088,24 +1086,6 @@ mmlEqnNo}
   .tree-toggle:disabled::before { content: none; }   /* 无子会话：仅占位，不画箭头 */
   .tree-toggle.open { transform: rotate(90deg); }
   .tree-row .busy-dot { width: 7px; height: 7px; flex: 0 0 auto; }
-  /* 主会话的运行中子任务数：数字优先于父会话自身的 busy 点。
-     14px 圆/胶囊在窄屏仍清晰，多位数以 min-width 自然扩展。 */
-  .tree-row .busy-dot.busy-count {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: auto;
-    min-width: 14px;
-    height: 14px;
-    padding: 0 3px;
-    border-radius: 7px;
-    background: var(--orange);
-    color: #fff;
-    font-size: 10px;
-    font-weight: 700;
-    line-height: 1;
-    font-variant-numeric: tabular-nums;
-  }
   .tree-id {
     flex: 1;
     min-width: 0;
