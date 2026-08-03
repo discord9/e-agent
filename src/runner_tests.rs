@@ -1132,9 +1132,14 @@ async fn completed_tool_result_is_committed_before_stale_cancel() {
             }]
             .into(),
         }),
-        vec![Box::new(CompletingWithCancelTool {
-            commands: commands.clone(),
-        })],
+        vec![
+            Box::new(CompletingWithCancelTool {
+                commands: commands.clone(),
+            }),
+            // Keeps the background-completion channel open so the session
+            // can stay Idle after the cancel (see `recovering_agent`).
+            Box::new(KeepAliveTool { sender: None }),
+        ],
     );
     let (runner, handle) = SessionRunner::new(
         agent,
@@ -1144,10 +1149,23 @@ async fn completed_tool_result_is_committed_before_stale_cancel() {
         IdlePolicy::FinishWhenIdle,
     );
     *commands.lock().unwrap() = Some(handle.commands.clone());
+    let (_, mut live, mut status) = handle.attach();
     let task = runner.start(Some("prompt".into()));
-    let mut status = handle.status();
-    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
-    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
+    // The tool result is committed before the racing Cancel is processed, and
+    // the Cancel only cancels the turn: the FinishWhenIdle session returns to
+    // Idle and stays alive instead of finalizing (composer cancel must not
+    // kill a delegate subagent). The "turn cancelled" notice is emitted only
+    // after the tool entry commit, so it pins the commit-before-cancel order.
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::Notice(text) if text == "turn cancelled"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "tool-cancel")
         .await
@@ -1158,7 +1176,8 @@ async fn completed_tool_result_is_committed_before_stale_cancel() {
             message: Message::Tool { content, .. }
         } if content == "completed tool result"
     )));
-    task.join().await.unwrap();
+    drop(handle);
+    drop(task);
 }
 
 #[tokio::test]
@@ -1357,12 +1376,24 @@ async fn in_flight_compaction_cancel_has_no_entry_or_projection() {
         IdlePolicy::FinishWhenIdle,
     );
     handle.compact();
+    let (_, mut live, mut status) = handle.attach();
     let task = runner.start(None);
     entered.notified().await;
     handle.cancel();
-    let mut status = handle.status();
-    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
-    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
+    // The in-flight compaction is cancelled but the Cancel command only
+    // cancels the turn: the FinishWhenIdle session returns to Idle and stays
+    // alive instead of finalizing. The "compaction cancelled" notice is
+    // emitted only after the operation is dropped, pinning the order.
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::Notice(text) if text == "compaction cancelled"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "compact-in-flight-cancel")
         .await
@@ -1378,7 +1409,8 @@ async fn in_flight_compaction_cancel_has_no_entry_or_projection() {
             |event| matches!(event, AgentEvent::Notice(text) if text.starts_with("compacted:"))
         )
     );
-    task.join().await.unwrap();
+    drop(handle);
+    drop(task);
 }
 
 #[tokio::test]
@@ -1390,7 +1422,9 @@ async fn completed_round_is_committed_before_stale_cancel() {
             reply: Some("completed answer".into()),
             commands: commands.clone(),
         }),
-        vec![],
+        // Keeps the background-completion channel open so the session can
+        // stay Idle after the cancel (see `recovering_agent`).
+        vec![Box::new(KeepAliveTool { sender: None })],
     );
     let (runner, handle) = SessionRunner::new(
         agent,
@@ -1400,10 +1434,22 @@ async fn completed_round_is_committed_before_stale_cancel() {
         IdlePolicy::FinishWhenIdle,
     );
     *commands.lock().unwrap() = Some(handle.commands.clone());
+    let (_, mut live, mut status) = handle.attach();
     let task = runner.start(Some("prompt".into()));
-    let mut status = handle.status();
-    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
-    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
+    // The completed round is committed before the racing Cancel is processed;
+    // the Cancel only cancels the turn, so the FinishWhenIdle session returns
+    // to Idle and stays alive (composer cancel must not kill a delegate). The
+    // "turn cancelled" notice is emitted only after the round commit.
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::Notice(text) if text == "turn cancelled"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "round-cancel")
         .await
@@ -1413,7 +1459,8 @@ async fn completed_round_is_committed_before_stale_cancel() {
         SessionEntry::Message { message: Message::Assistant(message) }
             if message.content.as_deref() == Some("completed answer")
     )));
-    task.join().await.unwrap();
+    drop(handle);
+    drop(task);
 }
 
 #[tokio::test]
@@ -1425,7 +1472,9 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
             reply: Some("completed summary".into()),
             commands: commands.clone(),
         }),
-        vec![],
+        // Keeps the background-completion channel open so the session can
+        // stay Idle after the cancel (see `recovering_agent`).
+        vec![Box::new(KeepAliveTool { sender: None })],
     );
     history_for_compaction(&mut agent);
     let (runner, handle) = SessionRunner::new(
@@ -1437,10 +1486,22 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
     );
     *commands.lock().unwrap() = Some(handle.commands.clone());
     handle.compact();
+    let (_, mut live, mut status) = handle.attach();
     let task = runner.start(None);
-    let mut status = handle.status();
-    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
-    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
+    // The completed compaction is committed before the racing Cancel is
+    // processed; the Cancel only cancels the turn, so the FinishWhenIdle
+    // session returns to Idle and stays alive instead of finalizing. The
+    // projection notice pins the commit-before-cancel order.
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::Notice(text) if text == "compacted: completed summary"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "compact-cancel")
         .await
@@ -1461,31 +1522,167 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
                 .count(),
             1
         );
-    task.join().await.unwrap();
+    drop(handle);
+    drop(task);
 }
 
 #[tokio::test]
-async fn cancel_without_queued_work_returns_cancelled() {
+async fn cancel_keeps_finish_when_idle_session_alive_for_follow_up() {
+    // The composer cancel on a delegate subagent (FinishWhenIdle) must only
+    // cancel the current turn: the session returns to Idle, does NOT
+    // finalize, and still accepts a follow-up message. Natural completion of
+    // that follow-up turn still finalizes.
     let temp = tempfile::tempdir().unwrap();
-    let (agent, entered, _) = controlled(vec![Ok("unused".into())], true);
+    let (agent, entered, _release) = recovering_agent(
+        vec![
+            // Consumed by the blocked first call, never delivered.
+            Ok(AssistantMessage {
+                content: Some("interrupted".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+            Ok(AssistantMessage {
+                content: Some("follow-up answer".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+        ],
+        true,
+    );
     let (runner, handle) = SessionRunner::new(
         agent,
         SessionStore::Jsonl,
         temp.path().into(),
-        "cancel".into(),
+        "cancel-alive".into(),
         IdlePolicy::FinishWhenIdle,
     );
+    let (_, mut live, mut status) = handle.attach();
     let task = runner.start(Some("prompt".into()));
     entered.notified().await;
     handle.cancel();
+
+    // Cancelled turn -> Idle, not Finished: the delegate stays alive.
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(
+        !matches!(*status.borrow(), SessionStatus::Finished(_)),
+        "cancel must not finalize a FinishWhenIdle session"
+    );
+
+    // A follow-up message opens a new turn that completes naturally; with no
+    // queued work left, the session then finalizes as Completed.
+    handle.prompt("follow up");
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "follow-up answer" => break,
+            AgentEvent::Error(_) => panic!("follow-up turn failed"),
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("follow-up answer".into())))
+    );
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_with_queued_message_keeps_processing_it() {
+    // A Cancel command that interrupts a turn must not drop queued messages:
+    // the runner re-queues them (wait_for_operation's pending batch) and the
+    // next turn processes them normally.
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, entered, _) = recovering_agent(
+        vec![
+            // Consumed by the blocked first call, never delivered.
+            Ok(AssistantMessage {
+                content: Some("interrupted".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+            Ok(AssistantMessage {
+                content: Some("queued answer".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+        ],
+        true,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "cancel-queued".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("prompt".into()));
+    entered.notified().await;
+    handle.prompt("queued before cancel");
+    handle.cancel();
+
+    // The queued prompt survives the cancel and opens a fresh turn.
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::UserPrompt(text) if text == "queued before cancel" => break,
+            AgentEvent::Error(_) => panic!("queued turn failed"),
+            _ => {}
+        }
+    }
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "queued answer" => break,
+            AgentEvent::Error(_) => panic!("queued turn failed"),
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("queued answer".into())))
+    );
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "cancel-queued")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message { message: Message::User { content, .. } }
+            if content == "queued before cancel"
+    )));
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn natural_completion_of_finish_when_idle_still_finalizes() {
+    // The fix only changes the Cancel-command path: a delegate subagent that
+    // completes its turn with no queued work and no running background must
+    // still finalize (Finished(Completed)) as before.
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, _, _) = controlled(vec![Ok("done".into())], false);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "natural-complete".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("prompt".into()));
     let mut status = handle.status();
     let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
-    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
-    assert!(
-        !handle.snapshot().iter().any(
-            |event| matches!(event, AgentEvent::Notice(text) if text.starts_with("compacted:"))
-        )
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
     );
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "natural-complete")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message { message: Message::Assistant(message) }
+            if message.content.as_deref() == Some("done")
+    )));
     task.join().await.unwrap();
 }
 

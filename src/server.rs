@@ -447,7 +447,16 @@ pub enum SessionRef {
     Live(Arc<LiveSession>),
     /// A subagent registered in a parent's `Sessions` registry
     /// (key = background-task id, `entry.session_id` is the address).
-    Subagent(Arc<crate::delegate::SessionEntry>),
+    /// The parent and task id are kept so `DELETE /api/sessions/{id}` can
+    /// truly terminate the subagent through the parent's
+    /// `BackgroundTasks::cancel(task_id)` — a plain `handle().cancel()`
+    /// only interrupts the current turn and must not be relied on to end a
+    /// delegate.
+    Subagent {
+        entry: Arc<crate::delegate::SessionEntry>,
+        parent: Arc<LiveSession>,
+        task_id: u64,
+    },
 }
 
 impl SessionRef {
@@ -457,7 +466,7 @@ impl SessionRef {
     fn handle(&self) -> SessionHandle {
         match self {
             SessionRef::Live(session) => session.handle.clone(),
-            SessionRef::Subagent(entry) => entry.handle.clone(),
+            SessionRef::Subagent { entry, .. } => entry.handle.clone(),
         }
     }
 }
@@ -895,10 +904,14 @@ fn live(state: &AppState, id: &str) -> Result<SessionRef, (StatusCode, String)> 
     if let Some(session) = state.registry.get(id) {
         return Ok(SessionRef::Live(session));
     }
-    for (_, session) in state.registry.list() {
-        for (_task_id, entry) in session.sessions.list() {
+    for (_session_id, session) in state.registry.list() {
+        for (task_id, entry) in session.sessions.list() {
             if entry.session_id == id {
-                return Ok(SessionRef::Subagent(entry));
+                return Ok(SessionRef::Subagent {
+                    entry,
+                    parent: session,
+                    task_id,
+                });
             }
         }
     }
@@ -1125,7 +1138,7 @@ async fn session_title(
         Ok(SessionRef::Live(session)) => session.store.clone(),
         // A live subagent's own store is bound to its session id, so the
         // rename lands on the same rows the meta_store fallback would use.
-        Ok(SessionRef::Subagent(entry)) => entry.store.clone(),
+        Ok(SessionRef::Subagent { entry, .. }) => entry.store.clone(),
         Err(_) => {
             let historical = state
                 .meta_store
@@ -1170,7 +1183,7 @@ async fn session_pin(
     let root = state.factory.root();
     let store = match live(&state, &id) {
         Ok(SessionRef::Live(session)) => session.store.clone(),
-        Ok(SessionRef::Subagent(entry)) => entry.store.clone(),
+        Ok(SessionRef::Subagent { entry, .. }) => entry.store.clone(),
         Err(_) => {
             let historical = state
                 .meta_store
@@ -1216,7 +1229,7 @@ async fn session_archive(
     let root = state.factory.root();
     let store = match live(&state, &id) {
         Ok(SessionRef::Live(session)) => session.store.clone(),
-        Ok(SessionRef::Subagent(entry)) => entry.store.clone(),
+        Ok(SessionRef::Subagent { entry, .. }) => entry.store.clone(),
         Err(_) => {
             let historical = state
                 .meta_store
@@ -1246,15 +1259,29 @@ async fn delete_session(
     // Live session: cancel + remove from the registry. Dropping the
     // registry entry (and with it the SessionTask) aborts the runner;
     // in-flight SSE streams notice the closed event/status channels and
-    // end themselves. A live subagent is cancelled through its handle
-    // instead: its delegate/btw wrapper's cleanup then removes the
-    // `Sessions` entry and the running_tasks row (so it stops showing as
-    // active), and the transcript stays in its session file. Unknown or
-    // historical ids skip this step entirely.
+    // end themselves.
+    //
+    // A live subagent is truly terminated through its parent's
+    // `BackgroundTasks::cancel(task_id)` instead of a plain
+    // `handle().cancel()`: the latter only interrupts the current turn and
+    // the delegate runner now stays alive (Idle) for follow-up messages, so
+    // it could never end the session on its own. The abort drops the
+    // delegate wrapper, whose captured cleanup removes the `Sessions` entry
+    // and the running_tasks row, and dropping the wrapper's runner handle
+    // aborts the subagent runner (SessionTask::drop). This is the same path
+    // the task-panel cancel (`DELETE /api/sessions/{parent}/tasks/{id}`)
+    // uses. The transcript stays in its session file either way.
     if let Ok(session) = live(&state, &id) {
-        session.handle().cancel();
-        if matches!(session, SessionRef::Live(_)) {
-            state.registry.remove(&id);
+        match session {
+            SessionRef::Live(session) => {
+                session.handle.cancel();
+                state.registry.remove(&id);
+            }
+            SessionRef::Subagent {
+                parent, task_id, ..
+            } => {
+                parent.background.cancel(task_id);
+            }
         }
     }
     // Hide from the sessions list: delete the session's metadata rows
@@ -1463,7 +1490,7 @@ async fn resolve_session_store(
     let root = state.factory.root();
     match live(state, id) {
         Ok(SessionRef::Live(session)) => Ok(session.store.clone()),
-        Ok(SessionRef::Subagent(entry)) => Ok(entry.store.clone()),
+        Ok(SessionRef::Subagent { entry, .. }) => Ok(entry.store.clone()),
         Err((StatusCode::NOT_FOUND, _)) => {
             if crate::session::validate_session_name(id).is_err() {
                 return Err(error(
@@ -3485,9 +3512,18 @@ model = "deepseek-chat"
         ));
         // Subagent ids resolve through the parent's Sessions registry.
         match live(&state, "sub-abc").unwrap() {
-            SessionRef::Subagent(entry) => {
+            SessionRef::Subagent {
+                entry,
+                parent: found_parent,
+                task_id,
+            } => {
                 assert_eq!(entry.session_id, "sub-abc");
                 assert_eq!(entry.model, "sub-model");
+                assert_eq!(task_id, 7, "the subagent's task id in the parent registry");
+                assert!(
+                    Arc::ptr_eq(&found_parent, &parent),
+                    "parent must be the owning live session"
+                );
             }
             _ => panic!("expected a Subagent ref, got a registry session"),
         }
@@ -3543,6 +3579,194 @@ model = "deepseek-chat"
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(state.registry.get(&id).is_none(), "registry entry removed");
+    }
+
+    /// Regression (interrupt-no-longer-kills-delegate): `DELETE
+    /// /api/sessions/{id}` on a live delegate subagent must TRULY terminate
+    /// it. A plain `handle().cancel()` only interrupts the current turn — a
+    /// FinishWhenIdle delegate now returns to Idle and stays alive for
+    /// follow-up messages — so the endpoint routes through the parent's
+    /// `BackgroundTasks::cancel(task_id)` instead: the delegate wrapper is
+    /// aborted, its captured cleanup removes the `Sessions` entry, and
+    /// dropping the wrapper's runner handle aborts the subagent runner.
+    #[tokio::test]
+    async fn delete_subagent_session_aborts_delegate_runner_and_cleans_up() {
+        use async_trait::async_trait;
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+        use tower::util::ServiceExt;
+
+        use crate::agent::{Agent, AssistantMessage, ModelDeltaKind, ToolSpec, Usage};
+        use crate::runner::{SessionResult, SessionRunner};
+
+        // A subagent model that blocks inside complete() until the runner is
+        // aborted: the subagent is Busy and can never finish on its own.
+        struct BlockingModel {
+            entered: Arc<Notify>,
+            dropped: Arc<Notify>,
+            side_effects: Arc<AtomicUsize>,
+        }
+        struct DropProbe(Arc<Notify>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        #[async_trait]
+        impl Model for BlockingModel {
+            async fn complete(
+                &mut self,
+                _: &[Message],
+                _: &[ToolSpec],
+                _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+            ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+                let _probe = DropProbe(self.dropped.clone());
+                self.entered.notify_one();
+                std::future::pending::<()>().await;
+                self.side_effects.fetch_add(1, Ordering::SeqCst);
+                Ok((
+                    AssistantMessage {
+                        content: Some("too late".into()),
+                        tool_calls: Vec::new(),
+                        reasoning: None,
+                    },
+                    None,
+                ))
+            }
+        }
+
+        let state = test_app_state("sekrit");
+        let (parent_id, parent, mut completions) =
+            live_session_with_background_sender("web-parent-del");
+        let temp = tempfile::tempdir().unwrap();
+
+        // The delegate subagent runner (FinishWhenIdle), blocked in the model.
+        let entered = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let side_effects = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::new(
+            Box::new(BlockingModel {
+                entered: entered.clone(),
+                dropped: dropped.clone(),
+                side_effects: side_effects.clone(),
+            }),
+            vec![],
+        );
+        let (runner, handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            "sub-del".into(),
+            IdlePolicy::FinishWhenIdle,
+        );
+        let runner_task = runner.start(Some("delegated task".into()));
+
+        // Register the delegate in the parent's task panel the way
+        // Delegate::execute does: spawn_with_id + Sessions entry in the
+        // on_id hook; the work future mirrors the wrapper's runner_result
+        // await, and `TestCleanup` mirrors DelegateCleanup — removed on the
+        // normal-completion path AND on abort (Drop runs when the wrapper
+        // future is dropped).
+        struct TestCleanup {
+            sessions: Sessions,
+            slot: Arc<Mutex<Option<u64>>>,
+        }
+        impl Drop for TestCleanup {
+            fn drop(&mut self) {
+                if let Some(id) = self.slot.lock().unwrap().take() {
+                    self.sessions.remove(id);
+                }
+            }
+        }
+        let sessions = parent.sessions.clone();
+        let slot = Arc::new(Mutex::new(None::<u64>));
+        let entry = Arc::new(crate::delegate::SessionEntry {
+            handle: handle.clone(),
+            model: "sub-model".into(),
+            role: None,
+            cwd: "/tmp".into(),
+            session_id: "sub-del".into(),
+            context_window: None,
+            store: SessionStore::Jsonl,
+        });
+        let hook_sessions = sessions.clone();
+        let hook_slot = slot.clone();
+        let hook_entry = entry.clone();
+        parent
+            .background
+            .spawn_with_id(
+                "sub-del task".into(),
+                None,
+                None,
+                None,
+                move |id| {
+                    *hook_slot.lock().unwrap() = Some(id);
+                    hook_sessions.insert(id, hook_entry);
+                },
+                move || {
+                    let cleanup = TestCleanup {
+                        sessions: sessions.clone(),
+                        slot: slot.clone(),
+                    };
+                    async move {
+                        // Inline of Delegate::runner_result (private).
+                        let result = if let Err(error) = runner_task.join().await {
+                            SessionResult::Failed(error.to_string())
+                        } else {
+                            match handle.status().borrow().clone() {
+                                SessionStatus::Finished(result) => result,
+                                _ => SessionResult::Closed,
+                            }
+                        };
+                        drop(cleanup); // normal completion: remove the entry
+                        match result {
+                            SessionResult::Completed(answer) => answer.unwrap_or_default(),
+                            SessionResult::Failed(error) => format!("subagent failed: {error}"),
+                            SessionResult::Cancelled => "subagent cancelled".into(),
+                            SessionResult::Closed => "subagent closed".into(),
+                        }
+                    }
+                },
+            )
+            .unwrap();
+        // The subagent must be inside its model call before the DELETE, so
+        // the only way it can end is the abort.
+        entered.notified().await;
+        state.registry.insert(parent_id, parent.clone());
+        assert_eq!(parent.background.running().len(), 1);
+        assert_eq!(parent.sessions.list().len(), 1);
+
+        let app = router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/sub-del")
+                    .method("DELETE")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The runner was truly aborted: its model future was dropped before
+        // any side effect ran.
+        dropped.notified().await;
+        tokio::task::yield_now().await;
+        assert_eq!(side_effects.load(Ordering::SeqCst), 0);
+        // The task-panel registration and the Sessions entry are gone.
+        assert!(parent.background.running().is_empty());
+        assert!(parent.sessions.list().is_empty());
+        // The parent saw the same "background task cancelled" completion a
+        // task-panel cancel produces.
+        assert!(matches!(
+            completions.try_recv(),
+            Ok(AgentEvent::BackgroundCompleted { output, .. })
+                if output == "background task cancelled"
+        ));
     }
 
     /// The frontend contract (contract item 5): `SessionEntry` is internally

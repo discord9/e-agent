@@ -645,8 +645,18 @@ impl SessionRunner {
         (prompts.join("\n\n"), image, consumed)
     }
 
-    fn finish_cancelled_or_idle(&mut self) -> bool {
-        if self.policy == IdlePolicy::FinishWhenIdle && !self.agent.has_running_background() {
+    /// Handle a cancelled turn or an idle moment. `cancelled_by_command`
+    /// distinguishes a `SessionCommand::Cancel` interruption (external — the
+    /// composer cancel button) from a natural end. Only a natural end under
+    /// `FinishWhenIdle` with no running background finalizes; a Cancel-command
+    /// interruption returns the session to Idle so a delegate subagent stays
+    /// alive for follow-up messages (the "true kill" is the task-panel cancel,
+    /// which aborts the runner directly and never goes through this path).
+    fn finish_cancelled_or_idle(&mut self, cancelled_by_command: bool) -> bool {
+        if !cancelled_by_command
+            && self.policy == IdlePolicy::FinishWhenIdle
+            && !self.agent.has_running_background()
+        {
             self.finalize_when_idle(SessionResult::Cancelled)
         } else {
             self.status(SessionStatus::Idle);
@@ -665,7 +675,7 @@ impl SessionRunner {
         if self.has_work() {
             self.status(SessionStatus::Idle);
         } else {
-            self.finish_cancelled_or_idle();
+            self.finish_cancelled_or_idle(true);
         }
         true
     }
@@ -743,7 +753,7 @@ impl SessionRunner {
             if self.has_work() {
                 self.cancelled = false;
             }
-            if cancelled && !self.has_work() && self.finish_cancelled_or_idle() {
+            if cancelled && !self.has_work() && self.finish_cancelled_or_idle(true) {
                 return;
             }
             if matches!(self.pending.front(), Some(PendingCommand::Compact)) {
@@ -751,7 +761,7 @@ impl SessionRunner {
                 match self.compact_operation(CompactionSource::Manual).await {
                     OperationFlow::Done => {}
                     OperationFlow::Cancelled if self.has_work() => continue,
-                    OperationFlow::Cancelled if self.finish_cancelled_or_idle() => return,
+                    OperationFlow::Cancelled if self.finish_cancelled_or_idle(true) => return,
                     OperationFlow::Cancelled => continue,
                     OperationFlow::Finished => return,
                 }
@@ -766,19 +776,22 @@ impl SessionRunner {
                     continue;
                 }
                 if cancelled {
-                    if self.finish_cancelled_or_idle() {
+                    if self.finish_cancelled_or_idle(true) {
                         return;
                     }
                 } else {
                     self.status(SessionStatus::Idle);
                     if self.policy == IdlePolicy::FinishWhenIdle
                         && !self.agent.has_running_background()
+                        && !self.cancelled
                     {
-                        let result = if self.cancelled {
-                            SessionResult::Cancelled
-                        } else {
-                            SessionResult::Completed(self.last_answer.clone())
-                        };
+                        // `self.cancelled` means a Cancel command interrupted
+                        // the last turn: the delegate subagent stays alive
+                        // (Idle) for follow-up messages instead of finalizing
+                        // here. The flag is cleared when the next prompt opens
+                        // a new turn (top of the loop), so a later natural
+                        // completion still finalizes below.
+                        let result = SessionResult::Completed(self.last_answer.clone());
                         if self.finalize_when_idle(result) {
                             return;
                         }
@@ -846,7 +859,7 @@ impl SessionRunner {
                             .lock()
                             .unwrap()
                             .emit(AgentEvent::Notice("turn cancelled".into()));
-                        if !self.has_work() && self.finish_cancelled_or_idle() {
+                        if !self.has_work() && self.finish_cancelled_or_idle(true) {
                             return;
                         }
                         break 'turn;
@@ -885,7 +898,7 @@ impl SessionRunner {
                     match self.compact_operation(CompactionSource::Auto).await {
                         OperationFlow::Done => {}
                         OperationFlow::Cancelled => {
-                            if !self.has_work() && self.finish_cancelled_or_idle() {
+                            if !self.has_work() && self.finish_cancelled_or_idle(true) {
                                 return;
                             }
                             break 'turn;
@@ -914,7 +927,7 @@ impl SessionRunner {
                                 .lock()
                                 .unwrap()
                                 .emit(AgentEvent::Notice("turn cancelled".into()));
-                            if !self.has_work() && self.finish_cancelled_or_idle() {
+                            if !self.has_work() && self.finish_cancelled_or_idle(true) {
                                 return;
                             }
                             break 'turn;
