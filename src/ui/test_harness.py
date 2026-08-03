@@ -3388,12 +3388,35 @@ async function main(){
         && FETCHES.filter((u) => u.endsWith("/archive")).at(-1)
            === "/api/sessions/arch-1/archive",
         "puts=" + FETCHES.filter((u) => u.endsWith("/archive")).join(","));
+    // archived 是列表签名的一部分：PUT 成功写回后，即使其它字段不变也必须
+    // 立即重绘。恢复后当前行仍在 DOM，且不再带 archived 状态。
+    const restoredRow = [...elsById["sessionList"].querySelectorAll(".session-row")]
+      .find((r) => (r.textContent || "").includes("arch-1"));
+    chk("archive: 恢复后列表行立即出现且取消灰化",
+        !!restoredRow && !restoredRow.classList.contains("archived"),
+        "cls=" + (restoredRow && restoredRow.className));
+    // 关闭「显示归档」后将同一行再次归档：成功 PUT 后行应立即被默认筛选
+    // 移出 DOM（旧 sessionListSig 漏 archived 时会被签名去重跳过）。
+    for (const fn of archiveToggle._listeners["click"] || []) fn();
+    await flush();
+    const rowBeforeArchive = [...elsById["sessionList"].querySelectorAll(".session-row")]
+      .find((r) => (r.textContent || "").includes("arch-1"));
+    const archiveAgainBefore = FETCHES.filter((u) => u.endsWith("/archive")).length;
+    for (const fn of (rowBeforeArchive.querySelector(".archive-btn")._listeners["click"] || [])) fn(_noopEv);
+    await flush();
+    const rowAfterArchive = [...elsById["sessionList"].querySelectorAll(".session-row")]
+      .find((r) => (r.textContent || "").includes("arch-1"));
+    chk("archive: 归档 PUT 成功后列表行立即隐藏",
+        FETCHES.filter((u) => u.endsWith("/archive")).length === archiveAgainBefore + 1
+        && rowAfterArchive === undefined && state.showArchived === false,
+        "row=" + !!rowAfterArchive + " puts="
+        + FETCHES.filter((u) => u.endsWith("/archive")).length);
     // 侧边栏：归档会话收进折叠的「归档 (N)」分组，点击分组内会话可打开
     state.workspace = state.workspaces[0];   // 切回 wsA：lastList 直接喂归档列表
     state.lastList = [
       { id: "s1", parent_session_id: null, model: "kimi", role: "main", status: "Idle", entry_count: 8, active: true },
       { id: "sub-arch", parent_session_id: "s1", label: "已归档子任务", status: "Idle", entry_count: 1, active: true, archived: true },
-      { id: "arch-1", parent_session_id: null, model: "kimi", role: "main", status: "Idle", entry_count: 3, active: true, archived: true },
+      { id: "arch-1", parent_session_id: null, model: "kimi", role: "main", status: "Idle", entry_count: 3, active: true, pinned: true, archived: true },
     ];
     state.sidebar.filter = "";
     state.sidebar.showAllWs = new Set();
@@ -3404,6 +3427,18 @@ async function main(){
     chk("archive: 侧边栏有「归档」分组",
         !!archiveGroup, "groups=" +
         elsById["sidebarTree"].querySelectorAll(".tree-group").map((g) => g.textContent).join(" | "));
+    // pinned + archived 以「归档 = 隐藏活跃入口」为准：不进顶部置顶聚合，
+    // 只在 workspace 的归档分组出现一次。
+    const _pinArchiveSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section")
+      .find((sec) => sec.classList.contains("pinned"));
+    const _pinArchiveRows = elsById["sidebarTree"].querySelectorAll(".tree-row")
+      .filter((r) => (r.textContent || "").includes("arch-1"));
+    chk("archive: pinned+archived only appears once in archive group",
+        (!_pinArchiveSec || !_pinArchiveSec.textContent.includes("arch-1"))
+        && _pinArchiveRows.length === 1
+        && _pinArchiveRows[0].closest(".tree-children") !== null,
+        "pinnedHas=" + !!(_pinArchiveSec && _pinArchiveSec.textContent.includes("arch-1"))
+        + " rows=" + _pinArchiveRows.length);
     // 已归档子会话不重复出现在普通父节点子树里（只在归档分组内一次）
     const _allArchiveRows = elsById["sidebarTree"].querySelectorAll(".tree-row")
       .filter((r) => (r.textContent || "").includes("sub-arch"));
@@ -3435,12 +3470,12 @@ async function main(){
     // 服务端把 archived 沉底排序（server.rs），旧窗口 slice(0,8) 会让归档
     // 腾出的位被更早会话顶上（「归档后侧边栏不变短、冒出别的会话」）。
     // 前端按 last_active_at 重排（含归档恢复原槽位），窗口取槽位、归档
-    // 的空着：归档窗口内 1 个 → 主树根真实从 8 减到 7，且不显示更早的
-    // w1/w0，more 计数 = 非归档总数 - 已显示 = 9 - 7 = 2。
+    // 的空着：9 个总根中近期 1 个归档，虽然非归档 roots 恰好只有 8，
+    // 仍须按总根数进入窗口；主树显示 7 个，不显示最旧 w0，more = 1。
     const _winSessions = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 9; i++) {
       _winSessions.push({ id: "w" + i, parent_session_id: null, status: "Idle",
-        entry_count: 1, active: true, archived: i === 3,
+        entry_count: 1, active: true, archived: i === 7,
         last_active_at: "2024-01-" + String(i + 1).padStart(2, "0") + "T00:00:00Z" });
     }
     state.workspace = state.workspaces[0];
@@ -3462,14 +3497,14 @@ async function main(){
         + " rows=" + _winRoots.map((r) => (r.textContent || "").slice(0, 8)).join(","));
     const _winTexts = _winRoots.map((r) => (r.textContent || "").slice(0, 8));
     chk("archive window: no older session leaked into window",
-        !_winTexts.some((t) => t.includes("w1") || t.includes("w0")),
+        !_winTexts.some((t) => t.includes("w0")),
         "texts=" + _winTexts.join("|"));
     const _winMore = elsById["sidebarTree"].querySelector(".tree-more");
-    chk("archive window: more button counts remaining (2)",
-        _winMore !== null && _winMore.textContent.includes("2"),
+    chk("archive window: 9→8 boundary keeps more count 1",
+        _winMore !== null && _winMore.textContent.includes("1"),
         "more=" + (_winMore && _winMore.textContent));
-    // 对照组：同一列表但 w3 未归档 → 窗口满 8 根 + more 计数 2（9 非归档 - 8）
-    _winSessions[3].archived = false;
+    // 对照组：同一 9 根列表恢复近期归档 → 窗口满 8 根 + more 计数 1。
+    _winSessions[7].archived = false;
     renderSidebarTree(true);
     const _winRoots2 = [...elsById["sidebarTree"].querySelectorAll(".tree-row")]
       .filter((r) => r.closest(".tree-ws-section.active") !== null
@@ -3479,7 +3514,11 @@ async function main(){
     chk("archive window: unarchived same list shows 8 roots",
         _winRoots2.length === 8,
         "n=" + _winRoots2.length);
-    _winSessions[3].archived = true;   // 还原
+    const _winMore2 = elsById["sidebarTree"].querySelector(".tree-more");
+    chk("archive window: unarchived control keeps more count 1",
+        _winMore2 !== null && _winMore2.textContent.includes("1"),
+        "more=" + (_winMore2 && _winMore2.textContent));
+    _winSessions[7].archived = true;   // 还原
     // =====================================================================
     // perf 修复回归：聚合轮询整轮一次渲染 + 签名去重 + setTimeout 链防重入
     // + 聊天视图停轮询 + 侧边栏 hidden 跳过树渲染 + 任务面板签名去重

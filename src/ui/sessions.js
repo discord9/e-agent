@@ -299,7 +299,8 @@ function sessionListSig() {
       + JSON.stringify(list.map((s) => [
         s.id, s.title || "", s.model || "", s.status, s.busy ? 1 : 0,
         s.active === false ? 0 : 1, s.entry_count ?? null,
-        s.parent_session_id || "", s.pinned === true ? 1 : 0, s.created_at || "",
+        s.parent_session_id || "", s.pinned === true ? 1 : 0,
+        s.archived === true ? 1 : 0, s.created_at || "",
       ])));
   }
   return state.searchQuery + "|" + (state.showArchived ? 1 : 0) + "|" + parts.join("|");
@@ -1557,7 +1558,8 @@ function allPinnedSessions() {
   const out = [];
   for (const ws of state.workspaces) {
     for (const s of workspaceListFor(ws)) {
-      if (s.pinned === true && isMainSession(s)) out.push({ ws, s });
+      // 归档 = 从活跃入口隐藏：pinned+archived 只出现在「归档」分组。
+      if (s.pinned === true && s.archived !== true && isMainSession(s)) out.push({ ws, s });
     }
   }
   return sortPinnedSessions(out);
@@ -1758,6 +1760,7 @@ function renderSidebarTree(force) {
   //  是它们唯一出现位，不匹配则整体不显示）。
   const filter = state.sidebar.filter;
   // 先按完整置顶集合排序再筛选；这样筛选不会改变隐藏项的相对位置。
+  // （allPinnedSessions 已排除 archived：归档会话只出现在「归档」分组。）
   const pinned = allPinnedSessions().filter(({ s }) => treeSessionMatches(s, filter));
   if (pinned.length) {
     const pinnedSec = el("div", "tree-ws-section pinned");
@@ -1767,7 +1770,9 @@ function renderSidebarTree(force) {
       const wsList = workspaceListFor(ws);
       const kidsByParent = new Map();
       for (const x of wsList) {
-        if (!x.parent_session_id) continue;
+        // 已归档子会话只出现在 workspace 的「归档」分组，不能同时跟随
+        // pinned 根进入置顶聚合分组。
+        if (!x.parent_session_id || x.archived === true) continue;
         if (!kidsByParent.has(x.parent_session_id)) kidsByParent.set(x.parent_session_id, []);
         kidsByParent.get(x.parent_session_id).push(x);
       }
@@ -1923,7 +1928,8 @@ function renderTreeForList(container, list, wsId) {
   } else {
     let shown = roots;
     let moreBtn = null;
-    if (!state.sidebar.showAllWs.has(wsId) && roots.length > MAX_TREE_ROOTS) {
+    const totalRootSlots = sorted.filter((s) => isMainSession(s) && !inPinnedSubtree(s)).length;
+    if (!state.sidebar.showAllWs.has(wsId) && totalRootSlots > MAX_TREE_ROOTS) {
       // 槽位法窗口：取最近 MAX_TREE_ROOTS 个主会话槽位（含归档，sorted
       // 已按时间重排），归档会话的槽位空着、不顶替——归档后侧边栏真实
       // 变短，不会冒出更早的会话。
