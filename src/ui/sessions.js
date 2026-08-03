@@ -65,6 +65,12 @@ function applyValidation(problems) {
    按失败处理（保留旧列表 stale，标记 workspaceErrors）。 */
 const POLL_TIMEOUT_MS = 10000;
 
+/* 深链 history 有界超时：恶劣网络下深链直接按 id probe history，同样挂
+   10s 上限（复用 fetchWithTimeout）——只作用于深链路径（maybeHandleDeepLink
+   命中分支 / attemptDeepLinkProbe），普通会话打开的网络语义不变。超时按
+   失败处理 → 连 SSE 走 snapshot 兜底。 */
+const DEEP_LINK_HISTORY_TIMEOUT_MS = POLL_TIMEOUT_MS;
+
 async function fetchWithTimeout(ws, path, opts = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), POLL_TIMEOUT_MS);
@@ -90,7 +96,7 @@ async function pollAllWorkspaces() {
 function afterPollRound() {
   if (state.view === "list") {
     renderSessionList();
-    maybeHandleDeepLink(state.lastList || []);
+    maybeHandleDeepLink();
     applyValidation(validateSessions(state.lastList || []));
   } else if (state.view === "chat") {
     updateComposerMeta();               // model/role 可能随轮询更新（幂等）
@@ -181,22 +187,65 @@ async function pollWorkspaceSessions(ws) {
     state.lastList = state.workspaceLists[ws.id];
   }
 }
-/* URL 深链：?session=<id>。token 就绪且列表拿到数据后自动打开一次。
-   active 会话直接 openSession；inactive（历史）会话走 resumeSession
-   （resume 成功后内部会 openSession）。一次性标志防止轮询重复触发。 */
-function maybeHandleDeepLink(list) {
+/* URL 深链：?session=<id>。token 就绪后立即尝试（init / restartTransport /
+   afterPollRound 三个入口共用，状态机防重复）：
+   - fresh 列表命中（成功轮询过的列表里有该 id）→ 既有分支：active 直接
+     openSession；inactive（历史）走 resumeSession（resume 成功后内部会
+     openSession）
+   - fresh 列表成功但没有 id / 列表失败 / 超时 / 只有 stale 缓存 → 直接
+     对该 workspace probe history（列表缺失不是权威不存在：历史会话可能
+     还没进列表；深链只支持当前激活 workspace，不跨服务器遍历）
+   - attempt 状态机（probing + attemptEpoch）防止 init、token restart、
+     poll completion 重复发起；openSession/resumeSession 自身声明新 epoch，
+     与跨服务器打开竞态（过期深链不打开）。 */
+function maybeHandleDeepLink() {
   if (state.deepLink.handled || !state.deepLink.pending) return;
   if (!state.token) return;                    // token 为空：等用户填写后再处理
   const target = state.deepLink.pending;
-  const hit = (list || []).find((s) => s.id === target);
-  if (!hit) return;                            // 列表里还没出现：等下一轮轮询
-  state.deepLink.handled = true;
-  state.deepLink.pending = null;
-  // 深链可能从 pollSessions 触发（列表就绪时），与跨服务器打开竞态：
-  // openSession 自身声明新 epoch；resumeSession 携带发起时的工作区 id，
-  // POST 完成后校验（过期深链不打开）。
-  if (hit.active === false) resumeSession(state.workspace.id, target);
-  else openSession(target);
+  const ws = state.workspace;
+  if (!ws) return;
+  const hit = (state.lastList || []).find((s) => s.id === target);
+  // 只有成功轮询过的列表（workspaceErrors === null）才算 fresh 命中；
+  // stale/失败/过期缓存里的命中不可信 → 落到 probe 路径（列表缺失不是
+  // 权威不存在）。
+  if (hit && state.workspaceErrors[ws.id] === null) {
+    state.deepLink.handled = true;
+    state.deepLink.pending = null;
+    if (hit.active === false) {
+      // fresh inactive：resume 恢复后再拉 history——恢复也是深链 attempt 的
+      // 一部分：声明代次 + 标记，让恢复后的 history 带深链有界超时（防
+      // resume 后拉 history 永久 pending 卡死），SSE 404 恢复语义同
+      // probe 路径（标记在恢复成功/放弃时由 openWith/sse.js 清除）。
+      const claimed = ++sessionOpenEpoch;
+      state.deepLink.probing = true;
+      state.deepLink.attemptEpoch = claimed;
+      resumeSession(ws.id, target, claimed, DEEP_LINK_HISTORY_TIMEOUT_MS);
+    } else {
+      openSession(target, undefined, undefined, DEEP_LINK_HISTORY_TIMEOUT_MS);
+    }
+    return;
+  }
+  if (state.deepLink.probing) return;          // 在途 attempt：不重复发起
+  attemptDeepLinkProbe();
+}
+
+/* 深链直接请求主路径：不等列表，立即对激活 workspace 打开会话。
+   - history 加有界超时（fetchWithTimeout），只作用于深链路径
+   - "auth"/"gone" 停流（openWith 既有语义）；"fail"（网络/超时）连 SSE
+     走 snapshot 兜底
+   - 带 attempt 标记（probing + attemptEpoch）进入 SSE 阶段：/events 404
+     且 history 已成功、分类 historical/unknown → resumeSession 恢复
+     （sse.js connectSSE 404 分支处理）；history 与 SSE 都失败 → 持久
+     提示 + 自动重连重试
+   openSession 会消费 pending/handled——attempt 标记独立存活到 SSE 阶段，
+   由 sse.js 在 404 分类/连接成功时清除。 */
+function attemptDeepLinkProbe() {
+  const target = state.deepLink.pending;
+  const ws = state.workspace;
+  const claimed = ++sessionOpenEpoch;          // 入口声明一次代次（openSession 共享）
+  state.deepLink.probing = true;               // attempt 标记：防重复发起 + SSE 404 恢复判定
+  state.deepLink.attemptEpoch = claimed;
+  openSession(target, undefined, claimed, DEEP_LINK_HISTORY_TIMEOUT_MS);
 }
 
 /* workspace 的会话列表解析：
@@ -387,7 +436,7 @@ function renderSessionList(list, force) {
    实时激活服务器）；POST 成功后必须重新校验 epoch 与 wsId 才打开——否则
    POST 期间用户切到其它服务器/打开别的会话，过期恢复会在错误服务器上
    打开（旧 bug：resumeSession 无条件 openSession）。 */
-async function resumeSession(wsId, id, epoch) {
+async function resumeSession(wsId, id, epoch, timeoutMs) {
   const ws = state.workspaces.find((w) => w.id === wsId) || state.workspace;
   if (!workspaceToken(ws)) { setBanner("⚠ 请先输入 Token。", true); return; }
   // 恢复也是「打开」：入口（点击/深链）声明一次代次；嵌套调用（resumeSessionIn
@@ -400,7 +449,9 @@ async function resumeSession(wsId, id, epoch) {
     const s = await res.json();
     if (claimed !== sessionOpenEpoch) return;    // 期间有更新的打开/切换/返回列表：过期恢复丢弃
     if (state.workspace.id !== wsId) return;     // 发起恢复的服务器已不是激活的：不在这里打开
-    openSession(s.id, undefined, claimed);
+    // timeoutMs（深链恢复路径传入）透传给恢复后打开的 history：深链的
+    // 有界超时覆盖整个恢复生命周期；普通恢复不传 → 无超时，语义不变。
+    openSession(s.id, undefined, claimed, timeoutMs);
   } catch (e) {
     setBanner("⚠ 恢复会话失败：" + e.message);
   }
@@ -509,12 +560,28 @@ async function createSessionIn(ws) {
 /* =====================================================================
  * 对话视图流程
  * ===================================================================*/
-async function loadHistory(id, wsId, epoch) {
+/* 深链 attempt 标记匹配当前打开代次 → 返回深链 history 有界超时；否则
+   undefined（普通打开/重连不得获得超时，网络语义不变）。标记在深链
+   attempt 全生命周期存活（probe / fresh-hit resume / SSE 404 恢复 /
+   scheduleReconnect 重试），直到成功（SSE 200）或放弃（auth/gone/
+   backToList/switchWorkspace/404 恢复完成）。 */
+function deepLinkTimeoutFor(epoch) {
+  return (state.deepLink.probing && state.deepLink.attemptEpoch === epoch)
+    ? DEEP_LINK_HISTORY_TIMEOUT_MS : undefined;
+}
+
+async function loadHistory(id, wsId, epoch, timeoutMs) {
   const ws = state.workspaces.find((w) => w.id === wsId) || state.workspace;
   try {
     // 只取尾部 HISTORY_PAGE 条：长会话不一次全量渲染（Firefox 等浏览器
     // 对超大 DOM 滚动卡死）；滚动触顶时 loadOlder 增量加载更早。
-    const res = await apiFor(ws, "/api/sessions/" + encodeURIComponent(id) + "/history?limit=" + HISTORY_PAGE);
+    // 深链超时：显式 timeoutMs 优先（probe / resumeSession 恢复路径传入），
+    // 否则按深链 attempt 标记兜底（scheduleReconnect 重试路径：标记与
+    // 代次仍匹配 → 重试的 history 同样有界，不会永久 pending 卡死）；
+    // 普通打开/重连无标记 → 无超时，网络语义不变。
+    const effTimeout = (timeoutMs !== undefined) ? timeoutMs : deepLinkTimeoutFor(epoch);
+    const url = "/api/sessions/" + encodeURIComponent(id) + "/history?limit=" + HISTORY_PAGE;
+    const res = effTimeout ? await fetchWithTimeout(ws, url) : await apiFor(ws, url);
     // 竞态防护：响应回来时打开/切换/返回列表已发生 → 丢弃，不碰 DOM/state
     // （陈旧响应绝不渲染到新激活的服务器/会话，也不起 SSE）。
     if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== id) return "stale";
@@ -609,13 +676,19 @@ async function loadOlder() {
    触发一次）。
    wsId/epoch：打开时捕获的发起上下文——响应回来时任何一项不匹配
    （新的打开/切换/返回列表）→ 丢弃过期回调，不起 SSE。 */
-function openWith(id, withHistory, onReady, wsId, epoch) {
-  const step = withHistory ? loadHistory(id, wsId, epoch) : Promise.resolve("ok");
+function openWith(id, withHistory, onReady, wsId, epoch, timeoutMs) {
+  const step = withHistory ? loadHistory(id, wsId, epoch, timeoutMs) : Promise.resolve("ok");
   step.then((r) => {
     if (epoch !== sessionOpenEpoch) return;       // 更新的打开/切换/返回列表已发生
     if (state.workspace.id !== wsId) return;      // 已被切到其它服务器
     if (state.sessionId !== id) return;           // 已切换会话：丢弃过期回调
-    if (r === "auth" || r === "gone") return;
+    if (r === "auth" || r === "gone") {
+      // 深链 attempt 终止（无流可恢复）：清标记，防止残留标记污染后续
+      // 非深链会话的 SSE 404 分类（标记与 epoch 绑定，此处显式清更稳）
+      state.deepLink.probing = false;
+      state.deepLink.attemptEpoch = -1;
+      return;
+    }
     connectSSE(id, wsId, epoch);
     if (onReady) onReady();
   });
@@ -698,7 +771,7 @@ function saveSessionState() {
   };
 }
 
-function openSession(id, onReady, epoch) {
+function openSession(id, onReady, epoch, timeoutMs) {
   // 打开即声明新代次（入口调用）；嵌套调用（openSessionIn/resumeSession 等
   // 已声明过）传入共享的代次，不再递增——一次用户动作只有一个 action epoch。
   const claimed = (epoch === undefined) ? ++sessionOpenEpoch : epoch;
@@ -750,7 +823,7 @@ function openSession(id, onReady, epoch) {
     const atBottom = m.scrollHeight - m.scrollTop - m.clientHeight <= 4;
     userScrolled = !atBottom;      // 恢复到非底部位置：不自动跟随滚动
     els.jumpBottomBtn.hidden = atBottom;
-    openWith(id, true, onReady, wsId, claimed);   // 拉最新尾部替换过期缓存；onReady 在替换渲染完成后触发
+    openWith(id, true, onReady, wsId, claimed, timeoutMs);   // 拉最新尾部替换过期缓存；onReady 在替换渲染完成后触发
   } else {
     // 首次打开：走既有流程（加载历史 + SSE）
     state.initSource = null;
@@ -764,13 +837,15 @@ function openSession(id, onReady, epoch) {
     els.promptInput.value = "";    // 输入框草稿跟随会话：新会话从空开始
     autosizeInput();
     userScrolled = false;          // 打开新会话：恢复自动跟随
-    openWith(id, true, onReady, wsId, claimed);   // onReady 在 loadHistory 渲染完成后触发
+    openWith(id, true, onReady, wsId, claimed, timeoutMs);   // onReady 在 loadHistory 渲染完成后触发
   }
   if (!els.sidebar.hidden) renderSidebarTree();   // 更新 .current 高亮（侧边栏可见时）
 }
 
 function backToList() {
   ++sessionOpenEpoch;          // 返回列表：使一切在途打开/恢复/历史加载失效
+  state.deepLink.probing = false;      // 返回列表：深链 attempt 终止（epoch 已递增；标记清掉防残留）
+  state.deepLink.attemptEpoch = -1;
   saveSessionState();          // 返回列表也保存视图状态：再次打开该会话时恢复
   state.renameActive = false;  // 同 openSession：视图切换即销毁编辑框
   stopSSE();
@@ -1267,6 +1342,7 @@ function restartTransport() {
     state.initSource = null;
     openWith(id, true, undefined, state.workspace.id, sessionOpenEpoch);
   }
+  maybeHandleDeepLink();   // token 从空变有效：立即重试 pending 深链（不再等 poll round）
 }
 
 /* 聚合轮询：setTimeout 链（2s）驱动所有 workspace——一轮（并行拉取全部 +

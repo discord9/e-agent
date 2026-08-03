@@ -64,7 +64,9 @@ const state = {
   workspaceErrors: {},       // workspaceId -> error string|null：轮询失败标记（侧边栏显示「无法连接」）
   queue: [],                 // 排队提示（FIFO；最多显示 3 条 + "+N"）
   queueExpanded: false,      // 排队条是否展开显示全部（默认收起）
-  deepLink: { pending: null, handled: false },  // URL ?session= 深链：待打开 id + 一次性标志
+  deepLink: { pending: null, handled: false, probing: false, attemptEpoch: -1 },
+  // URL ?session= 深链：pending=待打开 id；handled=已消费（一次性）；
+  // probing+attemptEpoch=深链 attempt 标记（防重复发起 + SSE 404 恢复判定）
   sessionStates: {},         // sessionId -> {html, scrollTop, nextBeforeSeq, olderDone, draft}：切走时保存，切回时恢复（不重新加载历史）
   sidebar: {                 // 会话侧边栏
     open: false,             // 是否打开
@@ -312,6 +314,8 @@ async function switchWorkspace(id, epoch) {
   state.initSource = null;           // 旧工作区的历史/快照来源标志不跨工作区保留
   state.deepLink.pending = null;
   state.deepLink.handled = true;
+  state.deepLink.probing = false;    // 切换即终止深链 attempt（标记清掉，防残留污染后续 404 分类）
+  state.deepLink.attemptEpoch = -1;
   state.tasks.list = [];
   state.tasks.cancelling = new Set();
   state.tasks.pollers = new Map();

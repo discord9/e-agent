@@ -18,6 +18,7 @@ js = "\n".join(open(os.path.join(HERE, f), encoding='utf-8').read() for f in JS_
 vendor_js = open(os.path.join(HERE, 'vendor', 'marked.min.js'), encoding='utf-8').read()
 
 MODE = os.environ.get('MODE', 'open')   # 'open' = openSession path, 'direct' = loadHistory
+DEEP_LINK = os.environ.get('DEEP_LINK', '')   # 注入 ?session=<id> 到 location.search（init 启动时解析）
 TRACE = os.environ.get('TRACE') == '1'
 # gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；页面 JS 里的 new TextDecoder() 换成桩工厂。
 # 注意：拆分后 tasks.js（startTaskStream）在 sse.js 之前拼接，无缩进的搜索串会先命中
@@ -221,8 +222,12 @@ globalThis.confirm=()=>true;
 window.visualViewport=null; window.innerHeight=800;
 window.addEventListener=()=>{}; window.confirm=()=>true; window.setTimeout=()=>0;
 globalThis.history={ replaceState(){} };
-globalThis.location={ search:"" };
-globalThis.URLSearchParams=class{ constructor(){} get(){ return null; } };
+globalThis.location={ search:"__DEEP_LINK_SEARCH__" };
+/* URL 解析入口可配置：DEEP_LINK env → location.search（?session=<id>），
+   init() 在页面加载时读它；测试也可直接改 location.search 后重跑 init()。
+   URLSearchParams 桩做最小解析（?a=b&c=d，支持 URL 解码），键不存在 get
+   返回 null——与真实行为一致。 */
+globalThis.URLSearchParams=class{ constructor(s){ this._m=new Map(); const q=String(s||""); if(q.startsWith("?")){ for(const kv of q.slice(1).split("&")){ if(!kv) continue; const i=kv.indexOf("="); const k=i<0?kv:kv.slice(0,i); const v=i<0?"":decodeURIComponent(kv.slice(i+1)); if(k) this._m.set(k,v); } } } get(k){ return this._m.has(k)?this._m.get(k):null; } };
 globalThis.requestAnimationFrame=()=>0;
 /* abort 桩（真实语义）：abort() 置 signal.aborted 并触发 abort 监听器；
    fetch 侧对未 settle 的请求 reject AbortError（见 resp 的 signal 参数与
@@ -262,6 +267,7 @@ const historyOlderData={entries:[
 ], next_before_seq:null};
 const FETCHES=[];
 const FETCH_HEADERS=[];   // 每个请求的 {url, method, headers}（全局 token 回退测试断言 Authorization）
+const FETCH_BODIES=[];    // 每个请求的 body（深链 resume 断言 POST {"id":...}）
 const sseChunks = [
   "event: snapshot\ndata: [{\"type\":\"notice\",\"text\":\"SNAPSHOT-SHOULD-BE-SKIPPED\"}]\n\n",
   "event: status\ndata: {\"status\":\"Busy\"}\n\n",
@@ -395,6 +401,14 @@ let a1StreamManual = false;
 let a1StreamReadResolve = null;
 // SSE 404 语义测试：命中这些 id 的 /events 返回 404（模拟历史/已结束会话无流）
 let sse404Ids = new Set();
+// 深链测试开关：A 的 /api/sessions GET 失败（500）、POST /api/sessions 自定义
+// 响应（resume 断言）、history 响应覆盖（id → {status,body}|{netfail}|{hang}|{delay}）、
+// /events 200 集合（live 流）、延迟 history 手动 resolve
+let sessionsAFail = false;
+let sessionsPostCustom = null;
+let historyOverrides = new Map();
+let sseOkIds = new Set();
+let historyResolve = null;
 let a1StreamManualNotice = false;
 // fork 面板测试用：/fork-candidates 候选与 /fork POST 响应（测试中可变）
 let forkCandidatesData = [
@@ -406,6 +420,7 @@ let forkPostResp = resp(201,{id:"fork-1"});
 globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
   FETCH_HEADERS.push({ url, method: (opts.method||"GET").toUpperCase(), headers: opts.headers || {} });
+  FETCH_BODIES.push(opts.body || null);
   const signal = opts && opts.signal;   // 传给 abort 感知的响应桩
   const m=(opts.method||"GET").toUpperCase();
       if(url==="/api/tasks") return resp(200, tasksData, signal);
@@ -418,8 +433,21 @@ globalThis.fetch=(url,opts={})=>{
       // SSE 404 语义测试：命中这些 id 的 /events 返回 404（优先于下方具体会话路由）
       const _m404 = /^\/api\/sessions\/([^/]+)\/events$/.exec(url);
       if (_m404 && sse404Ids.has(_m404[1])) return resp(404, {}, signal);
+      // 深链测试：/events 200 集合（live 流）
+      const _mOk = /^\/api\/sessions\/([^/]+)\/events$/.exec(url);
+      if (_mOk && sseOkIds.has(_mOk[1])) return resp(200, streamEmpty(), signal);
+      // 深链测试：history 响应覆盖（404/401/网络失败/hang 超时/delay 迟到）
+      const _mHist = /^\/api\/sessions\/([^/]+)\/history/.exec(url);
+      if (_mHist && historyOverrides.has(_mHist[1])) {
+        const o = historyOverrides.get(_mHist[1]);
+        if (o.netfail) return Promise.reject(new TypeError("network error"));
+        if (o.hang) return abortable(new Promise(() => {}), signal);
+        if (o.delay) return abortable(new Promise((resolve) => { historyResolve = resolve; }), signal);
+        return resp(o.status, o.body, signal);
+      }
       if(url==="/api/sessions"&&m==="GET") {
         if (opts && opts.signal) pollSignalSeen = true;
+        if (sessionsAFail) return resp(500, {}, signal);
         if (sessionsDelayed) return new Promise((resolve) => { sessionsResolve = resolve; });
         return resp(200, sessionsData, signal);
   }
@@ -447,7 +475,10 @@ globalThis.fetch=(url,opts={})=>{
     return resp(201, { id: "b-hist", status: "Idle", active: true }, signal);
   }
   if(url.startsWith("http://b.local/api/sessions/")&&m==="DELETE") return resp(204,null,signal);
-  if(url==="/api/sessions"&&m==="POST") return resp(201,{id:"sess-new",status:"Idle"},signal);
+  if(url==="/api/sessions"&&m==="POST") {
+    if (sessionsPostCustom) return resp(201, sessionsPostCustom, signal);
+    return resp(201,{id:"sess-new",status:"Idle"},signal);
+  }
   if(url.startsWith("/api/sessions/a1/history")) {
     if (aHistoryDelayed) return abortable(new Promise((resolve) => { aHistoryResolve = resolve; }), signal);
     return resp(200,{entries:[{type:"message",message:{Assistant:{content:"A 会话内容"}}}], next_before_seq:null},signal);
@@ -4143,12 +4174,373 @@ async function main(){
     elsById["banner"].hidden = _savedBanner404.hidden;
     elsById["bannerText"].textContent = _savedBanner404.text;
     stopSSE();
+
+    // =====================================================================
+    // 16) 深链平滑降级（?session=<id> 不依赖列表轮询）：
+    //     - URL/token 就绪后立即尝试（与轮询并行），不再等 poll round
+    //     - fresh 列表命中 → 既有 active/resume 分支；列表缺失/失败/超时/
+    //       过期 → 直接对激活 workspace probe history（列表缺失不是权威
+    //       不存在）
+    //     - token 从空变有效 → 立即重试 pending 深链（不只 pollSessions）
+    //     - history 加有界超时；"fail"（网络/超时）→ SSE snapshot 兜底
+    //     - 深链专属 SSE 404 恢复：history 已成功 + historical/unknown →
+    //       resumeSession；任务面板路径（无深链标记）保持三态分类不变
+    //     - history 与 SSE 都失败 → 持久错误提示 + 自动重试，不白屏
+    //     - 竞态：深链 history 迟到 + 用户切走 → 旧响应不渲染不起流
+    //     - 无 workspace 参数 → 只用当前激活 workspace；背景 poll 卡住
+    //       不延迟目标 workspace 深链
+    // =====================================================================
+    const _dlSave = {
+      ws: state.workspaces, workspace: state.workspace, token: state.token,
+      lists: state.workspaceLists, errors: state.workspaceErrors, lastList: state.lastList,
+      sid: state.sessionId, view: state.view, dl: Object.assign({}, state.deepLink),
+      sidebarOpen: state.sidebar.open, search: location.search,
+      sessionsData: sessionsData, sessionsDataB: sessionsDataB, sessionsDelayed: sessionsDelayed,
+      sessionsBFail: sessionsBFail, bGetDelayed: bGetDelayed, sse404Ids: new Set(sse404Ids),
+      historyOverrides: new Map(historyOverrides),
+    };
+    const _postedIds = () => FETCH_BODIES.map((b) => {
+      try { return b ? JSON.parse(b).id : null; } catch (e) { return null; }
+    }).filter(Boolean);
+    const _dlReset = (id, token) => {
+      const tk = (token == null) ? "t" : token;   // "" 必须保持空串（token 从空变有效的测试前提）
+      state.workspaces = [{ id: "ws1", name: "默认", url: "", token: tk }];
+      state.workspace = state.workspaces[0];
+      state.token = tk;
+      state.workspaceLists = {}; state.workspaceErrors = {}; state.lastList = [];
+      state.deepLink = { pending: id, handled: false, probing: false, attemptEpoch: -1 };
+      state.sessionId = null; state.view = "list";
+      state.sidebar.open = false;
+      state.sse.stopped = false;
+      elsById["banner"].hidden = true; elsById["bannerText"].textContent = "";
+    };
+    const _hist = (text) => ({ entries: [{ type: "message", message: { User: { content: text, images: [] } } }], next_before_seq: null });
+
+    // (1) 列表永久 pending + history/SSE 成功 → 不等待列表即进入 chat
+    _dlReset(null, "t");
+    sessionsDelayed = true; sessionsResolve = null;
+    historyOverrides.set("dl1", { status: 200, body: _hist("深链1内容") });
+    sseOkIds.add("dl1");
+    location.search = "?session=dl1";
+    init();                                   // 重新走启动：URL 解析 → 立即深链（与轮询并行）
+    await flush(); await flush();
+    chk("deeplink: opens chat without waiting for list poll",
+        state.sessionId === "dl1" && state.view === "chat"
+        && elsById["messages"].textContent.includes("深链1内容"),
+        "sid=" + state.sessionId + " view=" + state.view);
+    chk("deeplink: list poll still pending while chat opened",
+        sessionsResolve !== null,
+        "pending=" + (sessionsResolve !== null));
+    sessionsResolve(resp(200, sessionsData));   // 放行列表轮询
+    await flush(); await flush();
+    sessionsDelayed = false;
+    historyOverrides.delete("dl1"); sseOkIds.delete("dl1");
+
+    // (2) token 初始为空：URL 解析记录 pending；输入 token 后立即处理（不等 poll round）
+    _dlReset(null, "");
+    location.search = "?session=dl2";
+    sessionsDelayed = true; sessionsResolve = null;
+    init();                                   // 重新走启动：记录 pending；token 空不触发深链
+    chk("deeplink: init records pending from URL when token empty",
+        state.deepLink.pending === "dl2" && state.deepLink.handled === false
+        && state.view === "list",
+        "pending=" + state.deepLink.pending);
+    await flush(); await flush();             // init 的轮询挂起（sessionsDelayed）
+    chk("deeplink: list poll pending while token empty",
+        sessionsResolve !== null,
+        "listPending=" + (sessionsResolve !== null));
+    historyOverrides.set("dl2", { status: 200, body: _hist("token后深链") });
+    sseOkIds.add("dl2");
+    sessionsDelayed = false;                  // 后续轮询正常完成（不再二次挂起）
+    state.token = "test-token";               // 模拟 token input 后的派生值
+    restartTransport();                       // token 变化 → 立即重试深链
+    await flush(); await flush();
+    chk("deeplink: token entry immediately probes (no poll round wait)",
+        state.sessionId === "dl2" && state.view === "chat"
+        && elsById["messages"].textContent.includes("token后深链")
+        && sessionsResolve !== null,          // 列表轮询仍在途：深链没等它
+        "sid=" + state.sessionId + " listPending=" + (sessionsResolve !== null));
+    sessionsResolve(resp(200, sessionsData)); // 放行挂起的列表轮询
+    await flush(); await flush();
+    historyOverrides.delete("dl2"); sseOkIds.delete("dl2");
+
+    // (3) fresh 列表命中 inactive → 仍调用 resume，不退化成只读 history
+    _dlReset("dl-hist", "t");
+    state.workspaceErrors = { ws1: null };    // fresh（成功轮询过）
+    state.lastList = [{ id: "dl-hist", status: "Idle", entry_count: 2, busy: false, active: false }];
+    sessionsPostCustom = { id: "dl-hist", status: "Idle", active: true };
+    maybeHandleDeepLink();
+    await flush(); await flush();
+    chk("deeplink: fresh inactive hit resumes (POST issued + session opened)",
+        _postedIds().includes("dl-hist")
+        && state.sessionId === "dl-hist" && state.view === "chat",
+        "sid=" + state.sessionId + " posted=" + JSON.stringify(_postedIds()));
+    sessionsPostCustom = null;
+
+    // (4) 列表失败 + history 200 + SSE 404 → 深链专属恢复（resume 被调用）
+    _dlReset("dl-404", "t");
+    sessionsAFail = true;
+    historyOverrides.set("dl-404", { status: 200, body: _hist("404恢复历史") });
+    sse404Ids.add("dl-404");
+    sessionsPostCustom = { id: "dl-404", status: "Idle", active: true };
+    maybeHandleDeepLink();
+    await flush(); await flush(); await flush();
+    chk("deeplink: list-fail + history 200 + SSE 404 resumes",
+        _postedIds().includes("dl-404")
+        && state.sessionId === "dl-404" && state.view === "chat",
+        "sid=" + state.sessionId + " posted=" + JSON.stringify(_postedIds()));
+    // 任务面板路径（无深链标记）：unknown 404 仍静默且不恢复（回归）
+    state.deepLink = { pending: null, handled: true, probing: false, attemptEpoch: -1 };
+    state.lastList = [{ id: "s1", status: "Idle", entry_count: 1, busy: false, active: true }];
+    state.workspaceLists["ws1"] = state.lastList;
+    state.sessionId = "sub-finished2"; state.view = "chat";
+    sse404Ids.add("sub-finished2");
+    elsById["banner"].hidden = true; elsById["bannerText"].textContent = "";
+    const _postsBefore4b = _postedIds().length;
+    connectSSE("sub-finished2", "ws1", sessionOpenEpoch);
+    await flush();
+    chk("deeplink: task-panel unknown 404 stays silent, no resume",
+        elsById["banner"].hidden === true
+        && _postedIds().length === _postsBefore4b,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    sse404Ids.delete("sub-finished2"); sse404Ids.delete("dl-404");
+    historyOverrides.delete("dl-404");
+    sessionsAFail = false; sessionsPostCustom = null;
+
+    // (5) history 失败形态：404/401 → 停流提示；网络失败/timeout → SSE snapshot 兜底
+    // (5a) 404 → gone banner，不起 SSE
+    _dlReset("dl-gone", "t");
+    historyOverrides.set("dl-gone", { status: 404, body: {} });
+    maybeHandleDeepLink();
+    await flush(); await flush();
+    chk("deeplink: history 404 shows gone banner, no SSE",
+        elsById["bannerText"].textContent.includes("不存在")
+        && !FETCHES.some((u) => u === "/api/sessions/dl-gone/events"),
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    historyOverrides.delete("dl-gone");
+    // (5b) 401 → auth banner，不起 SSE
+    _dlReset("dl-auth", "t");
+    historyOverrides.set("dl-auth", { status: 401, body: {} });
+    maybeHandleDeepLink();
+    await flush(); await flush();
+    chk("deeplink: history 401 shows auth banner, no SSE",
+        elsById["bannerText"].textContent.includes("认证失败")
+        && !FETCHES.some((u) => u === "/api/sessions/dl-auth/events"),
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    historyOverrides.delete("dl-auth");
+    // (5c) 网络失败 → SSE snapshot 兜底 + 持久错误提示（自动重试）
+    _dlReset("dl-net", "t");
+    historyOverrides.set("dl-net", { netfail: true });
+    maybeHandleDeepLink();
+    await flush(); await flush();
+    chk("deeplink: history network fail → SSE snapshot + persistent error",
+        FETCHES.some((u) => u === "/api/sessions/dl-net/events")
+        && elsById["bannerText"].textContent.includes("自动重试"),
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    historyOverrides.delete("dl-net");
+    // (5d) timeout（10s abort）→ SSE snapshot 兜底 + 持久错误提示
+    _dlReset("dl-timeout", "t");
+    historyOverrides.set("dl-timeout", { hang: true });
+    maybeHandleDeepLink();
+    const _abortIdx5d = scheduledTimeouts.length - 1;   // fetchWithTimeout 的 10s abort 定时器（同步 arm，最后一个槽）
+    scheduledTimeouts[_abortIdx5d]();                    // 触发超时 → AbortError → "fail"
+    await flush(); await flush();
+    chk("deeplink: history timeout → SSE snapshot + persistent error",
+        FETCHES.some((u) => u === "/api/sessions/dl-timeout/events")
+        && elsById["bannerText"].textContent.includes("自动重试"),
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    historyOverrides.delete("dl-timeout");
+
+    // (6) 深链 history 迟到 + 用户切 workspace/开另一会话 → 旧响应不渲染不起流
+    state.workspaces = [
+      { id: "wsA", name: "A", url: "", token: "t" },
+      { id: "wsB", name: "B", url: "http://b.local", token: "t" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "t";
+    state.workspaceLists = {}; state.workspaceErrors = {}; state.lastList = [];
+    state.deepLink = { pending: "dl-late", handled: false, probing: false, attemptEpoch: -1 };
+    state.sessionId = null; state.view = "list";
+    state.sidebar.open = false;
+    historyOverrides.set("dl-late", { delay: true });
+    maybeHandleDeepLink();
+    await flush();
+    chk("deeplink: probe in flight before user navigates",
+        state.sessionId === "dl-late" && state.view === "chat",
+        "sid=" + state.sessionId + " view=" + state.view);
+    openSessionIn("wsB", "b1");                        // 用户切走：代次取代
+    await flush(); await flush();
+    chk("deeplink: switched to b1", state.sessionId === "b1" && state.workspace.id === "wsB",
+        "sid=" + state.sessionId + " ws=" + state.workspace.id);
+    const _msgs6 = elsById["messages"].textContent;
+    historyResolve(resp(200, { entries: [{ type: "message", message: { User: { content: "迟到深链不应渲染", images: [] } } }], next_before_seq: null }));   // 迟到响应
+    await flush(); await flush();
+    chk("deeplink: late history response not rendered, no stream",
+        elsById["messages"].textContent === _msgs6
+        && !elsById["messages"].textContent.includes("迟到深链不应渲染")
+        && !FETCHES.some((u) => u === "/api/sessions/dl-late/events"),
+        "same=" + (elsById["messages"].textContent === _msgs6));
+    historyOverrides.delete("dl-late");
+
+    // (7) 两个 workspace 有同 id：无 workspace 参数 → 只用当前激活 workspace
+    state.workspaces = [
+      { id: "wsA", name: "A", url: "", token: "t" },
+      { id: "wsB", name: "B", url: "http://b.local", token: "t" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "t";
+    state.workspaceLists = {
+      wsA: [{ id: "dup1", status: "Idle", entry_count: 1, active: true }],
+      wsB: [{ id: "dup1", status: "Idle", entry_count: 1, active: true }],
+    };
+    state.workspaceErrors = { wsA: null, wsB: null };   // 都 fresh：命中走既有分支
+    state.lastList = state.workspaceLists.wsA;
+    state.deepLink = { pending: "dup1", handled: false, probing: false, attemptEpoch: -1 };
+    state.sessionId = null; state.view = "list";
+    state.sidebar.open = false;
+    historyOverrides.set("dup1", { status: 200, body: _hist("同id深链") });
+    sseOkIds.add("dup1");
+    maybeHandleDeepLink();
+    await flush(); await flush();
+    chk("deeplink: same-id sessions resolve against active workspace only",
+        FETCHES.some((u) => u.includes("dup1/history") && !u.startsWith("http://b.local"))
+        && !FETCHES.some((u) => u.startsWith("http://b.local") && u.includes("dup1/history"))
+        && state.sessionId === "dup1" && state.workspace.id === "wsA",
+        "sid=" + state.sessionId + " ws=" + state.workspace.id
+        + " hist=" + JSON.stringify(FETCHES.filter((u) => u.includes("dup1/history"))));
+    historyOverrides.delete("dup1"); sseOkIds.delete("dup1");
+
+    // (8) 背景 workspace poll 卡住 → 不延迟目标 workspace 深链
+    state.workspaces = [
+      { id: "wsA", name: "A", url: "", token: "t" },
+      { id: "wsB", name: "B", url: "http://b.local", token: "t" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "t";
+    state.workspaceLists = {}; state.workspaceErrors = {}; state.lastList = [];
+    state.deepLink = { pending: "dl8", handled: false, probing: false, attemptEpoch: -1 };
+    state.sessionId = null; state.view = "list";
+    state.sidebar.open = false;
+    historyOverrides.set("dl8", { status: 200, body: _hist("深链8") });
+    sseOkIds.add("dl8");
+    bGetDelayed = true; bGetResolve = null;
+    pollSessions();                               // 启动聚合轮询：B 卡住
+    await flush();
+    chk("deeplink: background B poll stuck", bGetResolve !== null,
+        "bStuck=" + (bGetResolve !== null));
+    maybeHandleDeepLink();                        // 深链与卡住的轮询并行
+    await flush(); await flush();
+    chk("deeplink: chat opened while B poll still stuck",
+        state.sessionId === "dl8" && state.view === "chat"
+        && elsById["messages"].textContent.includes("深链8")
+        && bGetResolve !== null,
+        "sid=" + state.sessionId + " bStuck=" + (bGetResolve !== null));
+    bGetResolve(resp(200, sessionsDataB));        // 放行 B
+    await flush(); await flush();
+    bGetDelayed = false;
+    historyOverrides.delete("dl8"); sseOkIds.delete("dl8");
+
+    // =====================================================================
+    // 9) 缺口 1（oracle 复审）：fresh inactive 深链经 resumeSession 后，
+    //    恢复的 history 必须仍带深链有界超时——resume 后拉 history 挂起，
+    //    10s 超时触发 → 不卡死 → SSE 404 → 持久错误 + 自动重试
+    // =====================================================================
+    _dlReset("dl-hist-t", "t");
+    state.workspaceErrors = { ws1: null };        // fresh（成功轮询过）
+    state.lastList = [{ id: "dl-hist-t", status: "Idle", entry_count: 2, busy: false, active: false }];
+    sessionsPostCustom = { id: "dl-hist-t", status: "Idle", active: true };
+    historyOverrides.set("dl-hist-t", { hang: true });   // resume 后的 history 永久挂起
+    sse404Ids.add("dl-hist-t");
+    const _t9 = scheduledTimeouts.length;
+    maybeHandleDeepLink();                        // fresh inactive → resume → openSession → loadHistory
+    await flush(); await flush();
+    let _abort9 = null;
+    for (let i = _t9; i < scheduledTimeouts.length; i++) {
+      if (scheduledTimeouts[i]) { _abort9 = scheduledTimeouts[i]; break; }
+    }
+    chk("deeplink gap1: resume issued + history bounded-timeout timer armed",
+        _postedIds().includes("dl-hist-t")
+        && state.sessionId === "dl-hist-t" && state.view === "chat"
+        && _abort9 !== null,
+        "posted=" + JSON.stringify(_postedIds()) + " sid=" + state.sessionId
+        + " abortTimer=" + (_abort9 !== null));
+    _abort9();                                    // 触发 10s 有界超时 → AbortError → "fail" → SSE
+    await flush(); await flush();
+    chk("deeplink gap1: bounded timeout does not hang; SSE + persistent retry",
+        FETCHES.some((u) => u === "/api/sessions/dl-hist-t/events")
+        && elsById["bannerText"].textContent.includes("自动重试"),
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    sse404Ids.delete("dl-hist-t"); historyOverrides.delete("dl-hist-t"); sessionsPostCustom = null;
+
+    // =====================================================================
+    // 10) 缺口 2（oracle 复审）：深链 history 失败 → SSE 404 →
+    //     scheduleReconnect 重试时，重试的 history 仍带深链有界超时
+    //     （attempt 标记兜底）；重试 history 超时同样不卡死
+    // =====================================================================
+    _dlReset("dl-retry-t", "t");
+    sessionsAFail = true;                         // 列表失败 → probe 路径
+    historyOverrides.set("dl-retry-t", { netfail: true });
+    sse404Ids.add("dl-retry-t");
+    const _base10 = scheduledTimeouts.length;
+    maybeHandleDeepLink();
+    await flush(); await flush();
+    let _retry10 = null;                          // phase 1 新 armed 的非空定时器 = 3s 重连
+    for (let i = _base10; i < scheduledTimeouts.length; i++) {
+      if (scheduledTimeouts[i]) { _retry10 = scheduledTimeouts[i]; break; }
+    }
+    chk("deeplink gap2: persistent retry scheduled after history-fail + SSE 404",
+        elsById["bannerText"].textContent.includes("自动重试")
+        && _retry10 !== null && state.sse.retryTimer !== null,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " retry=" + (_retry10 !== null));
+    // 重试前把 history 改成挂起：验证重试的 history 走 fetchWithTimeout（带超时）
+    historyOverrides.set("dl-retry-t", { hang: true });
+    const _hist10 = FETCHES.filter((u) => u.includes("dl-retry-t/history")).length;
+    const _t10 = scheduledTimeouts.length;
+    _retry10();                                   // 触发 3s 重连 → openWith → loadHistory（标记兜底 → 带超时）
+    await flush(); await flush();
+    let _abort10 = null;
+    for (let i = _t10; i < scheduledTimeouts.length; i++) {
+      if (scheduledTimeouts[i]) { _abort10 = scheduledTimeouts[i]; break; }
+    }
+    chk("deeplink gap2: retry history re-fetched with bounded timeout",
+        FETCHES.filter((u) => u.includes("dl-retry-t/history")).length === _hist10 + 1
+        && _abort10 !== null,
+        "hist=" + FETCHES.filter((u) => u.includes("dl-retry-t/history")).length
+        + " abortTimer=" + (_abort10 !== null));
+    const _events10 = FETCHES.filter((u) => u === "/api/sessions/dl-retry-t/events").length;
+    _abort10();                                   // 触发重试 history 的 10s 超时 → 不卡死
+    await flush(); await flush();
+    chk("deeplink gap2: retry history timeout does not hang (SSE + persistent error)",
+        FETCHES.filter((u) => u === "/api/sessions/dl-retry-t/events").length === _events10 + 1
+        && elsById["bannerText"].textContent.includes("自动重试"),
+        "events=" + FETCHES.filter((u) => u === "/api/sessions/dl-retry-t/events").length
+        + " banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    sse404Ids.delete("dl-retry-t"); historyOverrides.delete("dl-retry-t"); sessionsAFail = false;
+
+    // 还原（保持整洁）
+    state.workspaces = _dlSave.ws; state.workspace = _dlSave.workspace; state.token = _dlSave.token;
+    state.workspaceLists = _dlSave.lists; state.workspaceErrors = _dlSave.errors; state.lastList = _dlSave.lastList;
+    state.sessionId = _dlSave.sid; state.view = _dlSave.view;
+    state.deepLink = Object.assign({}, _dlSave.dl);
+    state.sidebar.open = _dlSave.sidebarOpen;
+    location.search = _dlSave.search;
+    sessionsData = _dlSave.sessionsData; sessionsDataB = _dlSave.sessionsDataB;
+    sessionsDelayed = _dlSave.sessionsDelayed; sessionsBFail = _dlSave.sessionsBFail;
+    bGetDelayed = _dlSave.bGetDelayed; bGetResolve = null;
+    sessionsAFail = false; sessionsPostCustom = null;
+    sse404Ids = new Set(_dlSave.sse404Ids); sseOkIds = new Set();
+    historyOverrides = new Map(_dlSave.historyOverrides);
+    stopSSE();
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);
 }
 main();
 '''.replace('MODE === \'direct\'', 'true' if MODE == 'direct' else 'false')
+
+# DEEP_LINK env → location.search 注入（init() 启动时 URL 解析入口）
+HARNESS = HARNESS.replace('__DEEP_LINK_SEARCH__', ('?session=' + DEEP_LINK) if DEEP_LINK else '')
 
 out = os.path.join(HERE, '.test_harness.js')
 with open(out, 'w', encoding='utf-8') as f:

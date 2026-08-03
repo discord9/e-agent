@@ -118,8 +118,37 @@ function connectSSE(id, wsId, epoch) {
       //   原「不存在」banner。
       // 先校验上下文：陈旧请求的 404 不得弹提示、不得停新会话的流。
       if (!stillCurrent(id, wsId, epoch)) { try { ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
-      state.sse.stopped = true;                         // 404 = 无流：一律停，不重连
       const known = sessionKnownState(id, wsId);
+      // 深链 attempt（?session=<id> 直接 probe history 打开）专属恢复：
+      // - history 已成功（transcript 可读）+ 分类 historical/unknown
+      //   （列表知其为历史，或列表还没有它——列表缺失不是权威不存在）
+      //   → 会话存在但无 live runner：resumeSession 建回活跃会话，
+      //     成功后复用现有 openSession（重连 SSE）。恢复只做一次
+      //     （resume 前清标记，防止恢复后重建的流再 404 造成循环）。
+      // - history 失败（网络/超时）→ history 与 SSE 都失败：持久提示 +
+      //   不置 stopped → 走 scheduleReconnect 自动重试，网络恢复后
+      //   history 成功 → 再次 404 → 走上面的恢复分支。
+      // - history 成功但分类 live → 清标记，落到既有 live 刷新重分类
+      //   （真 live 才报「不存在」）。
+      // 任务面板/普通路径（无 attempt 标记）保持既有三态分类不变。
+      if (state.deepLink.probing && state.deepLink.attemptEpoch === epoch) {
+        const historyOk = (state.initSource === "history" || state.initSource === "restored");
+        if (historyOk && (known === "historical" || known === "unknown")) {
+          state.deepLink.probing = false;
+          state.deepLink.attemptEpoch = -1;
+          // 恢复后的 openSession → history 同样带深链有界超时（显式透传；
+          // 标记已清防恢复循环，不能靠标记兜底）
+          resumeSession(wsId, id, epoch, DEEP_LINK_HISTORY_TIMEOUT_MS);
+          throw new Error("silent-gone");
+        }
+        if (!historyOk) {
+          setBanner("⚠ 无法读取会话历史，且该会话暂无实时流；将自动重试。", true);
+          throw new Error("deep-link-retry");
+        }
+        state.deepLink.probing = false;
+        state.deepLink.attemptEpoch = -1;
+      }
+      state.sse.stopped = true;                         // 404 = 无流：一律停，不重连
       if (known === "live") {
         // 缓存可能过期（任务面板直连刚结束的 subagent）：异步刷新列表后
         // 在 stillCurrent 守卫下重分类；期间用户切走/开了别的会话 → 不弹、
@@ -135,6 +164,9 @@ function connectSSE(id, wsId, epoch) {
     // 响应回来时上下文可能已被取代（新打开/切换）：不起流、不画连接状态
     if (!stillCurrent(id, wsId, epoch)) { try { ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     setConn("ok", "● 已连接");
+    // 深链 attempt 已完成（live 流建立）：清标记
+    state.deepLink.probing = false;
+    state.deepLink.attemptEpoch = -1;
     return readSSEStream(res.body.getReader(), id, wsId, epoch, ctrl);
   }).then(() => {
     // 正常结束（后端关闭流）→ 按断线处理
@@ -500,12 +532,14 @@ function init() {
   window.addEventListener("resize", syncAppHeight);
   els.chatView.classList.add("hidden");
   els.topActions.hidden = true;
-  // URL 深链：?session=<id>。只在列表拿到数据（pollSessions）且 token 就绪后
-  // 打开一次；token 为空时先记录，用户填 token 触发 restartTransport 再处理。
+  // URL 深链：?session=<id>。token 就绪后立即尝试（与轮询并行），不再等
+  // 列表轮询整轮——列表缺失/失败/超时/过期时直接按 id probe history 打开；
+  // token 为空时先记录，用户填 token 触发 restartTransport 再处理。
   const dl = new URLSearchParams(location.search).get("session");
   if (dl) state.deepLink.pending = dl;
   startPolling();
   pollSessions();
+  maybeHandleDeepLink();
   // 侧边栏跨刷新恢复：上次开着就继续开（切会话/返回列表都不关，仅手动关）
   try {
     if (localStorage.getItem("e-agent.sidebar.open") === "1") openSidebar();
