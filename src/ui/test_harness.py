@@ -164,6 +164,11 @@ class El {
   appendChild(n){ const p=n._parent;   /* 真实 DOM 语义：移动=先从旧父节点移除 */
     if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
     this._children.push(n); n._parent=this; return n; }
+  prepend(...nodes){ let i=0;           /* 真实 DOM 语义：头部插入（已有父节点先移除） */
+    for(const n of nodes){ if(n==null) continue;
+      const c=typeof n==="string"?{text:n}:n; const p=c._parent;
+      if(p){ const j=p._children.indexOf(c); if(j>=0) p._children.splice(j,1); }
+      this._children.splice(i++,0,c); c._parent=this; } }
   get isConnected(){ return this._parent != null; }
   insertBefore(n, ref){ const p=n._parent; if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
     const i=this._children.indexOf(ref);
@@ -244,6 +249,7 @@ const historyOlderData={entries:[
   {type:"notice", text:"更早的通知行"},
 ], next_before_seq:null};
 const FETCHES=[];
+const FETCH_HEADERS=[];   // 每个请求的 {url, method, headers}（全局 token 回退测试断言 Authorization）
 const sseChunks = [
   "event: snapshot\ndata: [{\"type\":\"notice\",\"text\":\"SNAPSHOT-SHOULD-BE-SKIPPED\"}]\n\n",
   "event: status\ndata: {\"status\":\"Busy\"}\n\n",
@@ -278,6 +284,22 @@ function streamManual(){
       return new Promise((resolve) => { a1StreamReadResolve = resolve; });
     }
     if (phase === 1) { phase = 2; return { done: false, value: "" }; }
+    return { done: true };
+  } }; } };
+}
+/* 手动控制的流（带真实事件块）：首个 read 挂起（resolve 保存在
+   a1StreamReadResolve），resolve 后下一个 read 吐出 Notice 块再结束。用于
+   「createSessionIn 挂起/失败期间当前流不中断」断言：块被处理 ⇔ epoch 未被
+   提前递增（旧 bug：POST 前 ++sessionOpenEpoch → stillCurrent 失败 → 块丢弃）。 */
+function streamManualNotice(){
+  let phase = 0;
+  return { getReader(){ return { read: async () => {
+    if (phase === 0) { phase = 1;
+      return new Promise((resolve) => { a1StreamReadResolve = resolve; });
+    }
+    if (phase === 1) { phase = 2;
+      return { done: false, value: "event: Notice\ndata: {\"type\":\"notice\",\"session_id\":\"a1\",\"seq\":99,\"text\":\"create-pending-stream-alive\"}\n\n" };
+    }
     return { done: true };
   } }; } };
 }
@@ -334,7 +356,8 @@ let sessionsBFail = false;
 let sessionsPDelayed = false;
 let sessionsPResolve = null;
 // 竞态/格式测试开关：B 的 resume POST 延迟（手动 resolve）、A 的 history 延迟、
-// B 返回非数组 JSON（{}）
+// B 返回非数组 JSON（{}）、B 的 GET /api/sessions 延迟（在途轮询守卫）、
+// B 的「新建会话」POST 失败（组头 + 按钮失败路径）
 let bPostDelayed = false;
 let bPostResolve = null;
 let aHistoryDelayed = false;
@@ -344,12 +367,23 @@ let sessionsBFormat = false;
 // 直连刚结束的 subagent」时列表刷新未完成（旧缓存仍 active:true）
 let sessionsDelayed = false;
 let sessionsResolve = null;
+let bGetDelayed = false;
+let bGetResolve = null;
+let sessionsBCreateFail = false;
+// 组头「+」新建会话 POST 延迟（手动 resolve）：迟到响应竞态测试
+let bCreateDelayed = false;
+let bCreateResolve = null;
+// 组头「+」新建会话 POST 已返回 201、json() 挂起（手动 resolve/reject）：
+// 解析期间用户导航 → 解析后校验（guard 2）与 catch 守卫（guard 3）测试
+let bCreateJsonDelayed = false;
+let bCreateJsonResolve = null;
 // SSE 生命周期测试：a1 的 events 流手动控制（首个 read 挂起，测试切走后
 // 再 resolve 陈旧块；验证陈旧流不渲染到当前会话/workspace）
 let a1StreamManual = false;
 let a1StreamReadResolve = null;
 // SSE 404 语义测试：命中这些 id 的 /events 返回 404（模拟历史/已结束会话无流）
 let sse404Ids = new Set();
+let a1StreamManualNotice = false;
 // fork 面板测试用：/fork-candidates 候选与 /fork POST 响应（测试中可变）
 let forkCandidatesData = [
   {at:2, seq:2, preview:"用户：你好，帮我看看"},
@@ -359,6 +393,7 @@ let forkCandidatesData = [
 let forkPostResp = resp(201,{id:"fork-1"});
 globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
+  FETCH_HEADERS.push({ url, method: (opts.method||"GET").toUpperCase(), headers: opts.headers || {} });
   const signal = opts && opts.signal;   // 传给 abort 感知的响应桩
   const m=(opts.method||"GET").toUpperCase();
       if(url==="/api/tasks") return resp(200, tasksData, signal);
@@ -378,11 +413,24 @@ globalThis.fetch=(url,opts={})=>{
   }
   // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
   if(url==="http://b.local/api/sessions"&&m==="GET") {
+    if (bGetDelayed) return abortable(new Promise((resolve) => { bGetResolve = resolve; }), signal);
     if (sessionsPDelayed) return abortable(new Promise((resolve) => { sessionsPResolve = resolve; }), signal);
     if (sessionsBFail) return resp(500, {}, signal);
     return resp(200, sessionsBFormat ? {} : sessionsDataB, signal);
   }
   if(url==="http://b.local/api/sessions"&&m==="POST") {
+    // 组头「+」新建会话：body {}（无 initial_prompt）→ 独立响应/失败开关；
+    // resume 恢复（body {"id":...}）走下方既有延迟/固定响应路径
+    if (opts.body === "{}") {
+      if (bCreateDelayed) return abortable(new Promise((resolve) => { bCreateResolve = resolve; }), signal);
+      // POST 成功但 json() 挂起（手动 resolve/reject）：解析期间导航竞态测试
+      if (bCreateJsonDelayed) return Promise.resolve({
+        ok: true, status: 201, body: null, text: async () => "",
+        json: () => new Promise((resolve, reject) => { bCreateJsonResolve = { resolve, reject }; }),
+      });
+      if (sessionsBCreateFail) return resp(500, {}, signal);
+      return resp(201, { id: "b-new", status: "Idle", active: true }, signal);
+    }
     if (bPostDelayed) return abortable(new Promise((resolve) => { bPostResolve = resolve; }), signal);
     return resp(201, { id: "b-hist", status: "Idle", active: true }, signal);
   }
@@ -393,7 +441,8 @@ globalThis.fetch=(url,opts={})=>{
     return resp(200,{entries:[{type:"message",message:{Assistant:{content:"A 会话内容"}}}], next_before_seq:null},signal);
   }
   if(url==="/api/sessions/a1/events")
-    return resp(200, a1StreamManual ? streamManual() : streamEmpty(), signal);
+    return resp(200, a1StreamManualNotice ? streamManualNotice()
+      : (a1StreamManual ? streamManual() : streamEmpty()), signal);
   if(url.startsWith("http://b.local/api/sessions/b1/history"))
     return resp(200,{entries:[{type:"message",message:{Assistant:{content:"B 会话内容"}}}], next_before_seq:null},signal);
   if(url==="http://b.local/api/sessions/b1/events") return resp(200, streamEmpty(), signal);
@@ -405,12 +454,16 @@ globalThis.fetch=(url,opts={})=>{
     return resp(200, historyData);   // 含 ?limit=…（loadHistory 尾部翻页）
   }
   if(url.startsWith("/api/sessions/s2/history")) return resp(200, historyData, signal);
+  if(url.startsWith("/api/sessions/sess-new/history")) return resp(200, {entries:[], next_before_seq:null}, signal);
+  if(url.startsWith("/api/sessions/b-new/history")) return resp(200, {entries:[], next_before_seq:null}, signal);
   if(url.startsWith("/api/sessions/fork-1/history")) return resp(200, {entries:[], next_before_seq:null}, signal);
   // restored 替换回归测试用：缓存过期后切回，history 含新消息（历史数据本身不变）
   if(url.startsWith("/api/sessions/restored-test/history")) return resp(200, historyData, signal);
   if(url.startsWith("/api/sessions/restored-test2/history")) return resp(200, historyData, signal);
   if(url==="/api/sessions/s1/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s2/events") return resp(200, stream(), signal);
+  if(url==="/api/sessions/sess-new/events") return resp(200, streamEmpty(), signal);
+  if(url==="http://b.local/api/sessions/b-new/events") return resp(200, streamEmpty(), signal);
   if(url==="/api/sessions/fork-1/events") return resp(200, stream(), signal);
   // restored 回归测试：空 SSE 流（snapshot 应被 history 替换路径跳过）
   if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty(), signal);
@@ -447,7 +500,8 @@ async function main(){
   let fail=0;
   const chk=(name, ok, extra)=>{ if(!ok) fail++; console.log((ok?"PASS":"FAIL")+" "+name+(extra?"  "+extra:"")); };
   try {
-    state.token="test-token";
+    state.globalToken="test-token";   // 全局回退 token（workspaceToken 的兜底）
+    state.token="test-token";         // 激活 workspace 派生 token（兼容既有引用）
     await pollSessions();
     chk("list rows rendered", elsById["sessionList"].children.length>=1);
     // pin 按钮用 SVG（emoji 📌 不吃 color，状态色灰⇄金必须 SVG currentColor）
@@ -1604,9 +1658,12 @@ async function main(){
         && state.workspaces[0].name === "默认" && state.workspaces[0].url === ""
         && state.workspace === state.workspaces[0],
         "n=" + state.workspaces.length + " name=" + state.workspaces[0].name);
-    chk("ws default token synced",
-        state.token === state.workspace.token && state.token !== "",
-        "token=" + JSON.stringify(state.token));
+    chk("ws default token falls back to global",
+        state.workspace.token === "" && state.token === state.globalToken && state.token !== ""
+        && workspaceToken(state.workspace) === state.globalToken,
+        "wsToken=" + JSON.stringify(state.workspace.token)
+        + " token=" + JSON.stringify(state.token)
+        + " global=" + JSON.stringify(state.globalToken));
     chk("ws default select rendered",
         elsById["workspaceSelect"].querySelectorAll("option").length === 1
         && elsById["workspaceSelect"].querySelector("option").textContent === "默认",
@@ -1647,9 +1704,13 @@ async function main(){
         + " name=" + state.workspace.name);
     chk("ws switch syncs token", state.token === "tok-b",
         "token=" + JSON.stringify(state.token));
-    chk("ws switch syncs legacy token key",
-        localStorage.getItem("eagent_token") === "tok-b",
-        "legacy=" + JSON.stringify(localStorage.getItem("eagent_token")));
+    // 切换 workspace 不再覆盖全局 token（legacy eagent_token 键 = 全局）：
+    // 全局仍是最早在 token 输入框设置的 tok-123，不被 B 的 tok-b 覆盖
+    chk("ws switch keeps global token",
+        state.globalToken === "tok-123"
+        && localStorage.getItem("eagent_token") === "tok-123",
+        "global=" + JSON.stringify(state.globalToken)
+        + " legacy=" + JSON.stringify(localStorage.getItem("eagent_token")));
     chk("ws select shows both",
         elsById["workspaceSelect"].querySelectorAll("option").length === 2,
         "opts=" + elsById["workspaceSelect"].querySelectorAll("option").length);
@@ -1677,8 +1738,9 @@ async function main(){
     await flush();
     chk("ws switch back to default",
         state.workspace.id === "default"
-        && state.token === state.workspace.token && state.view === "list",
-        "id=" + state.workspace.id + " token=" + JSON.stringify(state.token));
+        && state.token === (state.workspace.token || state.globalToken) && state.view === "list",
+        "id=" + state.workspace.id + " token=" + JSON.stringify(state.token)
+        + " global=" + JSON.stringify(state.globalToken));
     await api("/api/sessions");
     await flush();
     chk("ws api relative again",
@@ -1701,7 +1763,7 @@ async function main(){
     chk("ws reload restores workspaces",
         state.workspaces.length === 2 && state.workspace.id === "default"
         && state.workspace.token === _persisted.find(w => w.id === "default").token
-        && state.token === state.workspace.token,
+        && state.token === (state.workspace.token || state.globalToken),
         "n=" + state.workspaces.length + " active=" + state.workspace.id);
 
     // 删除：切到服务器B → 删 → 落回 default；仅剩一个时按钮禁用
@@ -1721,6 +1783,41 @@ async function main(){
     chk("ws remove persisted",
         JSON.parse(localStorage.getItem("eagent.workspaces")).length === 1,
         "n=" + JSON.parse(localStorage.getItem("eagent.workspaces")).length);
+
+    // ---- legacy 迁移：老版本把顶部输入同步进 workspace.token（== eagent_token
+    // 副本）；升级后 ws.token 优先、顶部输入失效（review）。加载时凡
+    // ws.token === legacy eagent_token 一律清空 → 回退 globalToken；legacy 值
+    // 本身进 globalToken；用户单独配置的 ws.token（≠ legacy）保留。----
+    localStorage.setItem("eagent_token", "legacy-X");
+    state.globalToken = "legacy-X";        // 模拟刷新：模块加载时 globalToken 已读 legacy 键
+    localStorage.setItem("eagent.workspaces", JSON.stringify([
+      { id: "default", name: "默认", url: "", token: "legacy-X" },          // 旧版全局输入的副本
+      { id: "ws-real", name: "真实服务器", url: "http://r.local", token: "tok-r" },  // 用户单独配置：保留
+    ]));
+    localStorage.setItem("eagent.activeWorkspace", "default");
+    state.workspaces = [];
+    state.workspace = null;
+    initWorkspaces();
+    chk("legacy token migration: copied ws.token cleared",
+        state.workspaces.find(w => w.id === "default").token === "",
+        "tok=" + JSON.stringify(state.workspaces.find(w => w.id === "default").token));
+    chk("legacy token migration: real ws token kept",
+        state.workspaces.find(w => w.id === "ws-real").token === "tok-r",
+        "tok=" + JSON.stringify(state.workspaces.find(w => w.id === "ws-real").token));
+    chk("legacy token migration: globalToken holds legacy value",
+        state.globalToken === "legacy-X" && localStorage.getItem("eagent_token") === "legacy-X",
+        "global=" + JSON.stringify(state.globalToken)
+        + " legacy=" + JSON.stringify(localStorage.getItem("eagent_token")));
+    chk("legacy token migration: workspaceToken falls back to global",
+        workspaceToken(state.workspaces.find(w => w.id === "default")) === "legacy-X"
+        && state.token === "legacy-X",
+        "eff=" + JSON.stringify(workspaceToken(state.workspaces.find(w => w.id === "default")))
+        + " token=" + JSON.stringify(state.token));
+    chk("legacy token migration: cleared token persisted",
+        JSON.parse(localStorage.getItem("eagent.workspaces"))
+          .find(w => w.id === "default").token === "",
+        "persisted=" + JSON.stringify(JSON.parse(localStorage.getItem("eagent.workspaces"))
+          .find(w => w.id === "default").token));
 
     // =====================================================================
     // 聚合模式：多 workspace 会话聚合（侧边栏分组 + 列表视图 + 跨服务器打开）
@@ -2128,6 +2225,1008 @@ async function main(){
         "events=" + FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length);
     a1StreamManual = false;
 
+    // =====================================================================
+    // 15) 置顶分组：所有 workspace 的 pinned 主会话集中到侧边栏最顶分组
+    //     （跨 workspace 徽章 + workspace 内剔除 + 子会话跟随 + pinned
+    //     子会话不重复渲染：只收主会话，pinned 子会话留在父节点下）
+    // =====================================================================
+    sessionsData = [
+      { id: "pa1", status: "Idle", title: "A 置顶", created_at: "2024-01-01T00:00:00Z", entry_count: 3, busy: false, active: true, pinned: true },
+      { id: "pa1-child", parent_session_id: "pa1", label: "A 置顶子任务", status: "Idle", entry_count: 1, active: true },
+      { id: "a-np", status: "Idle", title: "A 普通", created_at: "2024-01-02T00:00:00Z", entry_count: 1, active: true },
+      { id: "a-np-child", parent_session_id: "a-np", label: "A 普通子任务", status: "Idle", entry_count: 1, active: true, pinned: true },
+    ];
+    sessionsDataB = [
+      { id: "pb1", status: "Idle", title: "B 置顶", created_at: "2024-02-01T00:00:00Z", entry_count: 2, active: true, pinned: true },
+      { id: "b-np", status: "Idle", title: "B 普通", created_at: "2024-02-02T00:00:00Z", entry_count: 1, active: true },
+    ];
+    // 还原快照：测试末尾把聚合状态原样放回（workspaces/workspaceLists/
+    // workspaceErrors/sidebar/列表源数据）
+    const saveWs = { workspaces: state.workspaces, workspace: state.workspace, token: state.token,
+      lists: state.workspaceLists, errors: state.workspaceErrors, lastList: state.lastList,
+      sessionId: state.sessionId, view: state.view, query: state.searchQuery,
+      filter: state.sidebar.filter, showAll: state.sidebar.showAllWs, expanded: state.sidebar.expanded,
+      dataA: sessionsData, dataB: sessionsDataB };
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set(["wsA:pa1", "wsA:a-np"]);   // 展开以渲染子会话行
+    state.renameActive = false;
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSidebarTree(true);
+    const pinSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const pinTop = pinSections[0];
+    const pinA = pinSections[1];
+    const pinB = pinSections[2];
+    chk("pinned group is first .tree-ws-section",
+        pinTop.classList.contains("pinned"), "cls=" + pinTop.className);
+    chk("pinned group carries two server chips",
+        pinTop.querySelectorAll(".ws-chip").length === 2
+        && pinTop.textContent.includes("服务器A") && pinTop.textContent.includes("服务器B"),
+        "chips=" + pinTop.querySelectorAll(".ws-chip").length
+        + " txt=" + pinTop.textContent.slice(0, 60));
+    chk("pinned roots all in pinned group",
+        pinTop.textContent.includes("pa1") && pinTop.textContent.includes("pb1"),
+        "txt=" + pinTop.textContent.slice(0, 80));
+    chk("pinned roots not duplicated in their workspace sections",
+        !pinA.textContent.includes("pa1") && !pinB.textContent.includes("pb1"),
+        "aHas=" + pinA.textContent.includes("pa1") + " bHas=" + pinB.textContent.includes("pb1"));
+    chk("pinned root children follow into pinned group",
+        pinTop.textContent.includes("pa1-child") && !pinA.textContent.includes("pa1-child"),
+        "topHas=" + pinTop.textContent.includes("pa1-child"));
+    chk("non-pinned sessions stay in workspace sections",
+        pinA.textContent.includes("a-np") && pinB.textContent.includes("b-np"),
+        "aHas=" + pinA.textContent.includes("a-np") + " bHas=" + pinB.textContent.includes("b-np"));
+    chk("pinned subagent not hoisted to pinned group, stays under parent",
+        !pinTop.textContent.includes("a-np-child") && pinA.textContent.includes("a-np-child"),
+        "topHas=" + pinTop.textContent.includes("a-np-child")
+        + " aHas=" + pinA.textContent.includes("a-np-child"));
+    // 还原聚合状态（workspaces/workspaceLists/workspaceErrors/sidebar/数据源）
+    state.workspaces = saveWs.workspaces; state.workspace = saveWs.workspace; state.token = saveWs.token;
+    state.workspaceLists = saveWs.lists; state.workspaceErrors = saveWs.errors; state.lastList = saveWs.lastList;
+    state.sessionId = saveWs.sessionId; state.view = saveWs.view; state.searchQuery = saveWs.query;
+    state.sidebar.filter = saveWs.filter; state.sidebar.showAllWs = saveWs.showAll; state.sidebar.expanded = saveWs.expanded;
+    state.renameActive = false;
+    sessionsData = saveWs.dataA; sessionsDataB = saveWs.dataB;
+
+    // =====================================================================
+    // 15b) ws-chip 分色 + 父节点 busy-dot 聚合子会话
+    //     A) chip 按 workspace 下标取色（ws-chip-<n>）：不同 workspace
+    //        色类不同；同一 workspace 的列表行/组头/置顶行 chip 同色。
+    //     B) 父节点 dot 亮 = s.busy 或任意直接子会话 busy（孙会话不计，
+    //        直接子即够用：subagent 通常一层）；无 busy 子则不亮。
+    // =====================================================================
+    sessionsData = [
+      { id: "c1", status: "Idle", title: "C 主会话", created_at: "2024-03-01T00:00:00Z", entry_count: 1, busy: false, active: true, pinned: true },
+      { id: "c1-child-busy", parent_session_id: "c1", label: "C 子任务(忙)", status: "Busy", entry_count: 1, busy: true, active: true },
+      { id: "c2", status: "Idle", title: "C2 主会话", created_at: "2024-03-02T00:00:00Z", entry_count: 1, busy: false, active: true },
+      { id: "c2-child-idle", parent_session_id: "c2", label: "C2 子任务(闲)", status: "Idle", entry_count: 1, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "d1", status: "Idle", title: "D 主会话", created_at: "2024-04-01T00:00:00Z", entry_count: 1, busy: false, active: true, pinned: true },
+      { id: "d1-child-idle", parent_session_id: "d1", label: "D 子任务(闲)", status: "Idle", entry_count: 1, busy: false, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set(["wsA:c1", "wsA:c2"]);   // 展开渲染子会话行
+    state.renameActive = false;
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSidebarTree(true);
+    renderSessionList();
+    const sec15 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    // 组头 chip：A=ws-chip-0，B=ws-chip-1（数组下标取色，互不相同）
+    const hdrA = sec15[1].querySelector(".tree-ws-header").querySelector(".ws-chip");
+    const hdrB = sec15[2].querySelector(".tree-ws-header").querySelector(".ws-chip");
+    const chipCls15 = (e) => (e.className.split(/\s+/).find((c) => c.startsWith("ws-chip-")) || "");
+    chk("ws-chip color class differs across workspaces",
+        chipCls15(hdrA) === "ws-chip-0" && chipCls15(hdrB) === "ws-chip-1",
+        "A=" + chipCls15(hdrA) + " B=" + chipCls15(hdrB));
+    // 置顶分组每行 prepend 的 chip：A/B 各一，与组头同色（同 workspace 同色）
+    const pinChips15 = sec15[0].querySelectorAll(".ws-chip");
+    const pinCls15 = [...pinChips15].map(chipCls15).filter((c) => c);
+    chk("pinned row chips share workspace color",
+        pinChips15.length === 2 && pinCls15.includes("ws-chip-0") && pinCls15.includes("ws-chip-1"),
+        "pins=" + pinCls15.join(","));
+    // 列表行 chip：全部带色类，A/B 两色都在（与组头同一映射）
+    const listChips15 = elsById["sessionList"].querySelectorAll(".ws-chip");
+    const listCls15 = [...listChips15].map(chipCls15);
+    chk("list row chips share workspace color",
+        listChips15.length >= 4 && listCls15.includes("ws-chip-0") && listCls15.includes("ws-chip-1"),
+        "list=" + listCls15.join(","));
+    // B) busy-dot 聚合：C（busy 子）亮、C2（idle 子）不亮、D（idle 子）不亮
+    const rows15 = elsById["sidebarTree"].querySelectorAll(".tree-row");
+    const dotOf15 = (r) => r.querySelector(".busy-dot");
+    const rowByTxt15 = (t) => [...rows15].find((r) => r.textContent.includes(t));
+    const c1Dot = dotOf15(rowByTxt15("C 主会话"));
+    const c2Dot = dotOf15(rowByTxt15("C2 主会话"));
+    const d1Dot = dotOf15(rowByTxt15("D 主会话"));
+    chk("parent dot busy when direct child busy",
+        c1Dot !== null && c2Dot !== null && d1Dot !== null
+        && c1Dot.classList.contains("busy") && !c2Dot.classList.contains("busy")
+        && !d1Dot.classList.contains("busy"),
+        "c1=" + c1Dot.className + " c2=" + c2Dot.className + " d1=" + d1Dot.className);
+    // B) 父自身 busy 的提示不被聚合吞掉：busy 子 → 「子任务处理中」，
+    //    无 busy 子 → 不提示
+    chk("parent title hints child busy",
+        rowByTxt15("C 主会话").title.includes("子任务处理中")
+        && !rowByTxt15("C2 主会话").title.includes("子任务处理中"),
+        "t1=" + rowByTxt15("C 主会话").title);
+    // 还原聚合状态（与 15 一致）
+    state.workspaces = saveWs.workspaces; state.workspace = saveWs.workspace; state.token = saveWs.token;
+    state.workspaceLists = saveWs.lists; state.workspaceErrors = saveWs.errors; state.lastList = saveWs.lastList;
+    state.sessionId = saveWs.sessionId; state.view = saveWs.view; state.searchQuery = saveWs.query;
+    state.sidebar.filter = saveWs.filter; state.sidebar.showAllWs = saveWs.showAll; state.sidebar.expanded = saveWs.expanded;
+    state.renameActive = false;
+    sessionsData = saveWs.dataA; sessionsDataB = saveWs.dataB;
+
+    // =====================================================================
+    // 15c) 置顶分组筛选：filter 非空时置顶根与普通根同一 title/id 匹配规则
+    //     （仅匹配的置顶根显示在置顶分组、随父展示子会话；不匹配的隐藏；
+    //      workspace 内剔除逻辑不变——剔除后置顶分组是它们唯一出现位）。
+    //     跨 workspace：只匹配一方的词 → 另一方的置顶根整体隐藏。
+    // =====================================================================
+    sessionsData = [
+      { id: "pa1", status: "Idle", title: "Alpha 置顶", created_at: "2024-01-01T00:00:00Z", entry_count: 3, busy: false, active: true, pinned: true },
+      { id: "pa1-child", parent_session_id: "pa1", label: "Alpha 子任务", status: "Idle", entry_count: 1, active: true },
+      { id: "a-np", status: "Idle", title: "A 普通", created_at: "2024-01-02T00:00:00Z", entry_count: 1, active: true },
+    ];
+    sessionsDataB = [
+      { id: "pb1", status: "Idle", title: "Beta 置顶", created_at: "2024-02-01T00:00:00Z", entry_count: 2, active: true, pinned: true },
+      { id: "b-np", status: "Idle", title: "B 普通", created_at: "2024-02-02T00:00:00Z", entry_count: 1, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    // 筛选只匹配 A 的置顶根（title 子串；无 title 回退 id，与普通根一致）
+    state.sidebar.filter = "alpha";
+    renderSidebarTree(true);
+    let pinSec15c = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("pinned filter: matching pinned root shown in pinned group",
+        pinSec15c[0].classList.contains("pinned")
+        && pinSec15c[0].textContent.includes("pa1")
+        && !pinSec15c[0].textContent.includes("pb1"),
+        "top=" + pinSec15c[0].textContent.slice(0, 80));
+    chk("pinned filter: children follow matching pinned root",
+        pinSec15c[0].textContent.includes("pa1-child"),
+        "top=" + pinSec15c[0].textContent.slice(0, 100));
+    chk("pinned filter: non-matching pinned root hidden entirely",
+        !pinSec15c[1].textContent.includes("pb1") && !pinSec15c[2].textContent.includes("pb1"),
+        "secB=" + pinSec15c[2].textContent.slice(0, 60));
+    chk("pinned filter: non-pinned roots still filtered per workspace",
+        !pinSec15c[1].textContent.includes("a-np") && !pinSec15c[2].textContent.includes("b-np"),
+        "secA=" + pinSec15c[1].textContent.slice(0, 60)
+        + " secB=" + pinSec15c[2].textContent.slice(0, 60));
+    // 筛选只匹配 B 的置顶根 → 置顶分组只有 B
+    state.sidebar.filter = "beta";
+    renderSidebarTree(true);
+    pinSec15c = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("pinned filter: matching B pinned root shown",
+        pinSec15c[0].classList.contains("pinned")
+        && pinSec15c[0].textContent.includes("pb1")
+        && !pinSec15c[0].textContent.includes("pa1"),
+        "top=" + pinSec15c[0].textContent.slice(0, 80));
+    // 筛选同时匹配两个 workspace 的置顶根 → 都显示（跨 workspace）
+    state.sidebar.filter = "置顶";
+    renderSidebarTree(true);
+    pinSec15c = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("pinned filter: cross-workspace match shows both",
+        pinSec15c[0].classList.contains("pinned")
+        && pinSec15c[0].textContent.includes("pa1")
+        && pinSec15c[0].textContent.includes("pb1"),
+        "top=" + pinSec15c[0].textContent.slice(0, 100));
+    // 无匹配置顶根 → 置顶分组整体不出现（只剩两个 workspace 分组）
+    state.sidebar.filter = "zzz-no-match";
+    renderSidebarTree(true);
+    pinSec15c = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("pinned filter: no match hides pinned group",
+        pinSec15c.length === 2 && !pinSec15c[0].classList.contains("pinned"),
+        "n=" + pinSec15c.length + " cls0=" + pinSec15c[0].className);
+    state.sidebar.filter = "";
+
+    // =====================================================================
+    // 16) 删除 review 修复验证：后台删除（不切换/不重置视图 + 聚合列表同步
+    //     移除被删服务器会话）、confirm 取消、在途轮询写回守卫、首/中/末
+    //     active 删除回退。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSidebarTree(true);
+    let delSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("ws-del on both group headers",
+        delSec.length === 2
+        && delSec[0].querySelector(".ws-del") !== null
+        && delSec[1].querySelector(".ws-del") !== null,
+        "n=" + delSec.length);
+    // confirm 取消：点 B 的 × 但取消 → 不删除、不切换、列表/侧边栏原样
+    globalThis.confirm = () => false; window.confirm = () => false;
+    delSec[1].querySelector(".ws-del")._listeners["click"][0]({ stopPropagation(){} });
+    globalThis.confirm = () => true; window.confirm = () => true;
+    chk("ws-del cancel keeps workspace and list",
+        state.workspaces.length === 2 && state.workspace.id === "wsA"
+        && state.workspaceLists["wsB"] !== undefined
+        && elsById["sessionList"].textContent.includes("b1"),
+        "n=" + state.workspaces.length + " ws=" + state.workspace.id
+        + " listHasB=" + elsById["sessionList"].textContent.includes("b1"));
+    // 后台删除不重置视图：chat 视图下删 B → 仍停留 A 的 a1
+    openSessionIn("wsA", "a1");
+    await flush();
+    await flush();
+    chk("ws-del bg delete setup: chat on a1",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    renderSidebarTree(true);
+    delSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    delSec[1].querySelector(".ws-del")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("ws-del bg delete in chat keeps view/session",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat"
+        && state.workspaces.length === 1,
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view
+        + " n=" + state.workspaces.length);
+    renderSidebarTree(true);
+    chk("ws-del bg delete removes B group from sidebar",
+        elsById["sidebarTree"].querySelectorAll(".tree-ws-section").length === 1
+        && !elsById["sidebarTree"].textContent.includes("服务器B"),
+        "txt=" + elsById["sidebarTree"].textContent.slice(0, 60));
+    // 后台删除 + 聚合列表：list 视图下删 B → 聚合列表同步移除 B 的会话
+    //（review 发现 1：旧 DOM 不再残留被删服务器的行）
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSessionList();
+    chk("ws-del bg delete setup: B row in aggregate list",
+        elsById["sessionList"].textContent.includes("b1"),
+        "list=" + elsById["sessionList"].textContent.slice(0, 60));
+    renderSidebarTree(true);
+    delSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    delSec[1].querySelector(".ws-del")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("ws-del bg delete in list: stays on A, view unchanged",
+        state.workspace.id === "wsA" && state.view === "list" && state.workspaces.length === 1,
+        "ws=" + state.workspace.id + " view=" + state.view + " n=" + state.workspaces.length);
+    chk("ws-del bg delete in list: B cache cleared",
+        state.workspaceLists["wsB"] === undefined && state.workspaceErrors["wsB"] === undefined,
+        "lists=" + String(state.workspaceLists["wsB"] !== undefined)
+        + " errs=" + String(state.workspaceErrors["wsB"] !== undefined));
+    chk("ws-del bg delete in list: B rows gone from aggregate list",
+        !elsById["sessionList"].textContent.includes("b1")
+        && elsById["sessionList"].textContent.includes("a1"),
+        "list=" + elsById["sessionList"].textContent.slice(0, 60));
+    // 在途轮询写回守卫：B 的 GET /api/sessions 挂起期间删除 B → 延迟响应
+    // 到达后不得写回 workspaceLists/workspaceErrors（review 发现 2）
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    bGetDelayed = true;
+    bGetResolve = null;
+    pollWorkspaceSessions(state.workspaces[1]);   // B 的 GET 挂起（不 await）
+    await flush();
+    chk("ws-del in-flight poll: B GET pending",
+        bGetResolve !== null && state.workspaceLists["wsB"] === undefined,
+        "pending=" + (bGetResolve !== null));
+    removeWorkspace(state.workspaces[1]);         // 在途期间后台删除 B
+    await flush();
+    bGetResolve(resp(200, sessionsDataB));        // 延迟响应此刻才到达
+    await flush();
+    await flush();
+    chk("ws-del in-flight poll: stale GET does not resurrect B",
+        !state.workspaces.some((w) => w.id === "wsB")
+        && state.workspaceLists["wsB"] === undefined
+        && state.workspaceErrors["wsB"] === undefined,
+        "hasB=" + state.workspaces.some((w) => w.id === "wsB")
+        + " lists=" + String(state.workspaceLists["wsB"] !== undefined)
+        + " errs=" + String(state.workspaceErrors["wsB"] !== undefined));
+    bGetDelayed = false;
+    bGetResolve = null;
+    // 首/中/末 active 删除回退：idx=0 → 后一个；其余 → 前一个
+    const mkWs = (id, name) => ({ id, name, url: "", token: "tok-" + id });
+    state.workspaces = [mkWs("w1", "一"), mkWs("w2", "二"), mkWs("w3", "三")];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-w1";
+    state.workspaceLists = {}; state.workspaceErrors = {};
+    state.lastList = []; state.sessionId = null; state.view = "list";
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    removeActiveWorkspace();
+    await flush();
+    chk("ws-del delete first active falls to next",
+        state.workspaces.length === 2 && state.workspace.id === "w2",
+        "n=" + state.workspaces.length + " ws=" + state.workspace.id);
+    state.workspaces = [mkWs("w1", "一"), mkWs("w2", "二"), mkWs("w3", "三")];
+    state.workspace = state.workspaces[1];
+    state.token = "tok-w2";
+    state.workspaceLists = {}; state.workspaceErrors = {};
+    state.lastList = []; state.sessionId = null; state.view = "list";
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    removeActiveWorkspace();
+    await flush();
+    chk("ws-del delete middle active falls to previous",
+        state.workspaces.length === 2 && state.workspace.id === "w1",
+        "n=" + state.workspaces.length + " ws=" + state.workspace.id);
+    state.workspaces = [mkWs("w1", "一"), mkWs("w2", "二"), mkWs("w3", "三")];
+    state.workspace = state.workspaces[2];
+    state.token = "tok-w3";
+    state.workspaceLists = {}; state.workspaceErrors = {};
+    state.lastList = []; state.sessionId = null; state.view = "list";
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    removeActiveWorkspace();
+    await flush();
+    chk("ws-del delete last active falls to previous",
+        state.workspaces.length === 2 && state.workspace.id === "w2",
+        "n=" + state.workspaces.length + " ws=" + state.workspace.id);
+
+    // =====================================================================
+    // 17) 侧边栏组头「+」新建 session（B 任务）：每个分组头都有 +；点击 →
+    //     对该 workspace POST /api/sessions（body {}）→ 切到该 workspace 并
+    //     打开新会话；激活 workspace 直接打开不切换；失败 → banner。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSidebarTree(true);
+    let addSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const addA = addSec[0].querySelector(".ws-add");
+    const addB = addSec[1].querySelector(".ws-add");
+    chk("ws-add button on every group header",
+        addA !== null && addB !== null && addA.textContent === "+" && addB.textContent === "+",
+        "a=" + (addA ? addA.textContent : "none") + " b=" + (addB ? addB.textContent : "none"));
+    // 点 B 组头的 +：POST http://b.local/api/sessions body {} → 切到 B 打开 b-new
+    const fetchBeforeAddB = FETCHES.length;
+    let addStopped = false;
+    addB._listeners["click"][0]({ stopPropagation(){ addStopped = true; } });
+    await flush();
+    await flush();
+    await flush();
+    await flush();
+    chk("ws-add click stops header propagation",
+        addStopped === true, "stopped=" + addStopped);
+    chk("ws-add posts to target workspace",
+        FETCHES.slice(fetchBeforeAddB).includes("http://b.local/api/sessions"),
+        "new=" + JSON.stringify(FETCHES.slice(fetchBeforeAddB)));
+    chk("ws-add switches to target workspace and opens new session",
+        state.workspace.id === "wsB" && state.sessionId === "b-new" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    // 激活 workspace（A）的组头 +：不切换，直接打开新会话
+    switchWorkspace("wsA");
+    await flush();
+    renderSidebarTree(true);
+    addSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const fetchBeforeAddA = FETCHES.length;
+    addSec[0].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    await flush();
+    await flush();
+    await flush();
+    chk("ws-add on active workspace opens without switch",
+        state.workspace.id === "wsA" && state.sessionId === "sess-new" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    chk("ws-add on active posts to same-origin",
+        FETCHES.slice(fetchBeforeAddA).includes("/api/sessions"),
+        "new=" + JSON.stringify(FETCHES.slice(fetchBeforeAddA)));
+    // 失败路径：B 的 + 返回 500 → banner 报错、不切换、不打开
+    switchWorkspace("wsB");     // 当前在 wsA chat（刚打开 sess-new）→ 切到 B 回列表
+    await flush();
+    sessionsBCreateFail = true;
+    renderSidebarTree(true);
+    addSec = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    addSec[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    await flush();
+    chk("ws-add failure: banner error, no switch",
+        elsById["banner"].hidden === false
+        && elsById["bannerText"].textContent.includes("创建会话失败")
+        && state.workspace.id === "wsB" && state.view === "list" && state.sessionId === null,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " ws=" + state.workspace.id + " view=" + state.view);
+    sessionsBCreateFail = false;
+
+    // =====================================================================
+    // 18) 全局 token 回退：A 有单独 token、B 留空 → B 的后台轮询 / 切到 B /
+    //     打开会话与 SSE 全部使用全局 token（tokenInput 设置的全局值）；
+    //     切换 workspace 不清空/覆盖全局 token（review：token 全局回退设计
+    //     缺陷——A 的 token 泄漏给 B、切到 B 后 B 又失去认证）。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "" },   // B 不配置单独 token
+    ];
+    state.workspace = state.workspaces[0];
+    state.globalToken = "";          // 先清空全局：B 无生效 token → 轮询应被跳过
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    state.wsCreatePending = new Set();
+    renderWorkspaceSelect();
+    // 全局 token 为空时：B（无单独 token）无生效 token——绝不用 A 的 token
+    chk("global token empty: B has no effective token",
+        workspaceToken(state.workspaces[1]) === "",
+        "b=" + JSON.stringify(workspaceToken(state.workspaces[1])));
+    let hMark = FETCH_HEADERS.length;
+    await pollAllWorkspaces();
+    await flush();
+    chk("global token empty: B not polled with A token",
+        !FETCH_HEADERS.slice(hMark).some((f) => f.url === "http://b.local/api/sessions"),
+        "b=" + JSON.stringify(FETCH_HEADERS.slice(hMark)
+          .filter((f) => f.url === "http://b.local/api/sessions").map((f) => f.headers["Authorization"])));
+    // 通过顶部 tokenInput 设置全局 token（模拟用户输入；展开/收起交互已由
+    // 前序 token 折叠测试覆盖，这里直接驱动 input 事件）
+    elsById["tokenInput"].value = "tok-g";
+    elsById["tokenInput"]._listeners["input"][0]();
+    await flush();
+    chk("token input writes global token",
+        state.globalToken === "tok-g" && localStorage.getItem("eagent_token") === "tok-g"
+        && elsById["tokenInput"].value === "tok-g",
+        "global=" + JSON.stringify(state.globalToken)
+        + " legacy=" + JSON.stringify(localStorage.getItem("eagent_token")));
+    chk("per-workspace token takes precedence over global",
+        workspaceToken(state.workspace) === "tok-a"      // A 有单独 token：不受全局影响
+        && workspaceToken(state.workspaces[1]) === "tok-g",   // B 回退全局
+        "a=" + workspaceToken(state.workspace) + " b=" + workspaceToken(state.workspaces[1]));
+    chk("global token does not leak into A's stored token",
+        state.workspaces[0].token === "tok-a" && state.globalToken === "tok-g",
+        "a=" + JSON.stringify(state.workspaces[0].token)
+        + " g=" + JSON.stringify(state.globalToken));
+    // B 的后台轮询（A 仍激活）带上全局 token；A 用自己的 token
+    hMark = FETCH_HEADERS.length;
+    await pollAllWorkspaces();
+    await flush();
+    chk("background B poll uses global token",
+        FETCH_HEADERS.slice(hMark).some((f) => f.url === "http://b.local/api/sessions"
+          && f.headers["Authorization"] === "Bearer tok-g"),
+        "b=" + JSON.stringify(FETCH_HEADERS.slice(hMark)
+          .filter((f) => f.url === "http://b.local/api/sessions").map((f) => f.headers["Authorization"])));
+    chk("background A poll uses own token",
+        FETCH_HEADERS.slice(hMark).some((f) => f.url === "/api/sessions"
+          && f.headers["Authorization"] === "Bearer tok-a"),
+        "a=" + JSON.stringify(FETCH_HEADERS.slice(hMark)
+          .filter((f) => f.url === "/api/sessions").map((f) => f.headers["Authorization"])));
+    // 切到 B：全局 token 保留、state.token 派生为全局、legacy 键不被覆盖
+    const legacyBeforeSwitch = localStorage.getItem("eagent_token");
+    switchWorkspace("wsB");
+    await flush();
+    chk("switch to B keeps global token",
+        state.workspace.id === "wsB"
+        && state.globalToken === "tok-g"
+        && state.token === "tok-g"
+        && localStorage.getItem("eagent_token") === legacyBeforeSwitch,
+        "global=" + JSON.stringify(state.globalToken)
+        + " token=" + JSON.stringify(state.token)
+        + " legacy=" + JSON.stringify(localStorage.getItem("eagent_token")));
+    // 打开 B 的会话：history + SSE 都带全局 token
+    const hMarkOpen = FETCH_HEADERS.length;
+    openSessionIn("wsB", "b1");
+    await flush();
+    await flush();
+    await flush();
+    chk("B history uses global token",
+        state.workspace.id === "wsB" && state.sessionId === "b1" && state.view === "chat"
+        && FETCH_HEADERS.slice(hMarkOpen).some((f) =>
+            f.url.startsWith("http://b.local/api/sessions/b1/history")
+            && f.headers["Authorization"] === "Bearer tok-g"),
+        "sid=" + state.sessionId
+        + " hist=" + JSON.stringify(FETCH_HEADERS.slice(hMarkOpen)
+            .filter((f) => f.url.includes("b1/history")).map((f) => f.headers["Authorization"])));
+    chk("B SSE uses global token",
+        FETCH_HEADERS.slice(hMarkOpen).some((f) =>
+            f.url === "http://b.local/api/sessions/b1/events"
+            && f.headers["Authorization"] === "Bearer tok-g"),
+        "sse=" + JSON.stringify(FETCH_HEADERS.slice(hMarkOpen)
+            .filter((f) => f.url.includes("b1/events")).map((f) => f.headers["Authorization"])));
+    stopSSE();
+    state.view = "list";
+    state.sessionId = null;
+
+    // =====================================================================
+    // 19) 组头「+」迟到响应竞态：POST 挂起期间切 workspace / 打开其它会话 →
+    //     B 的响应到达不覆盖（不切回 B、不打开 b-new）；在途防重（pending
+    //     期间重复点击不重复发 POST）。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    state.wsCreatePending = new Set();
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    // --- 场景 1：B 激活时点 B 的 +（POST 挂起），期间切回 A ---
+    switchWorkspace("wsB");
+    await flush();
+    renderSidebarTree(true);
+    let addSec19 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const addB19 = addSec19[1].querySelector(".ws-add");   // 分组顺序 = workspaces 下标：1 = wsB
+    bCreateDelayed = true;
+    bCreateResolve = null;
+    addB19._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("ws-add in-flight: POST pending",
+        bCreateResolve !== null && state.wsCreatePending.has("wsB"),
+        "pending=" + (bCreateResolve !== null) + " set=" + state.wsCreatePending.has("wsB"));
+    // 重复点击：pending 期间再点 → 不重复发 POST
+    const createPostsBefore = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
+    addB19._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("ws-add in-flight: repeat click does not re-POST",
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === createPostsBefore,
+        "posts=" + FETCHES.filter((u) => u === "http://b.local/api/sessions").length);
+    // 挂起期间用户切到 A（直接切换递增代次）
+    switchWorkspace("wsA");
+    await flush();
+    chk("ws-add in-flight: switch during pending",
+        state.workspace.id === "wsA" && state.sessionId === null && state.view === "list",
+        "ws=" + state.workspace.id + " view=" + state.view);
+    bCreateResolve(resp(201, { id: "b-new", status: "Idle", active: true }));   // 迟到响应此刻到达
+    await flush();
+    await flush();
+    await flush();
+    chk("ws-add stale response does not reopen B",
+        state.workspace.id === "wsA" && state.sessionId === null && state.view === "list",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    chk("ws-add pending cleared after stale response",
+        !state.wsCreatePending.has("wsB"),
+        "pending=" + state.wsCreatePending.has("wsB"));
+    bCreateDelayed = false;
+    bCreateResolve = null;
+    // --- 场景 2：A 激活时点 B 的 +（POST 挂起），期间打开 A 的 a1 ---
+    switchWorkspace("wsA");
+    await flush();
+    renderSidebarTree(true);
+    addSec19 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const addB19b = addSec19[1].querySelector(".ws-add");
+    bCreateDelayed = true;
+    bCreateResolve = null;
+    addB19b._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("ws-add in-flight: POST pending (scenario 2)",
+        bCreateResolve !== null, "pending=" + (bCreateResolve !== null));
+    openSessionIn("wsA", "a1");      // 挂起期间打开其它会话（递增代次）
+    await flush();
+    await flush();
+    chk("ws-add in-flight: open other session during pending",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    bCreateResolve(resp(201, { id: "b-new", status: "Idle", active: true }));
+    await flush();
+    await flush();
+    await flush();
+    chk("ws-add stale response does not hijack open session",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    chk("ws-add stale response did not switch to B",
+        state.workspace.id === "wsA", "ws=" + state.workspace.id);
+    chk("ws-add pending cleared after scenario 2",
+        !state.wsCreatePending.has("wsB"),
+        "pending=" + state.wsCreatePending.has("wsB"));
+    bCreateDelayed = false;
+    bCreateResolve = null;
+    // --- 场景 3：成功路径 —— pending 清除后再次点击照常创建并打开 ---
+    renderSidebarTree(true);
+    addSec19 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    addSec19[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    await flush();
+    await flush();
+    await flush();
+    chk("ws-add success path after pending cleared",
+        state.workspace.id === "wsB" && state.sessionId === "b-new" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+
+    // =====================================================================
+    // 20) 组头「+」不打断当前流（review：createSessionIn 在 POST 前递增
+    //     sessionOpenEpoch 误杀当前流）：活跃 SSE/会话下发起 createSessionIn
+    //     （挂起/失败）→ 当前会话的 SSE/history 不被中断（epoch 校验不失败）；
+    //     成功时才由 openSessionIn 声明新 epoch 并正常切换。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    state.wsCreatePending = new Set();
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    // 打开 A 的 a1：SSE 用手动流（首个 read 挂起；resolve 后吐出 Notice 块）
+    a1StreamManualNotice = true;
+    a1StreamReadResolve = null;
+    openSessionIn("wsA", "a1");
+    await flush();
+    await flush();
+    await flush();
+    const epochAtOpen = sessionOpenEpoch;
+    chk("create-no-kill: a1 open with SSE read pending",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat"
+        && a1StreamReadResolve !== null,
+        "sid=" + state.sessionId + " pending=" + (a1StreamReadResolve !== null));
+    // --- 场景 1：POST 挂起期间：epoch 不动、history 可加载（非 stale）、
+    //     SSE 分块照常处理；成功后才声明新 epoch 并切换 ---
+    bCreateDelayed = true;
+    bCreateResolve = null;
+    renderSidebarTree(true);
+    let addSec20 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    addSec20[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("create-no-kill: pending POST does not bump epoch",
+        bCreateResolve !== null && sessionOpenEpoch === epochAtOpen,
+        "epoch=" + sessionOpenEpoch + " atOpen=" + epochAtOpen);
+    chk("create-no-kill: SSE still current while pending",
+        stillCurrent("a1", "wsA", epochAtOpen) === true,
+        "cur=" + stillCurrent("a1", "wsA", epochAtOpen));
+    const histWhilePending = await loadHistory("a1", "wsA", epochAtOpen);
+    chk("create-no-kill: history loads (not stale) while pending",
+        histWhilePending === "ok", "r=" + histWhilePending);
+    a1StreamReadResolve({ done: false, value: "" });   // 挂起期间当前流的 SSE 分块到达：仍被处理
+    await flush();
+    await flush();
+    await flush();
+    chk("create-no-kill: SSE block processed while POST pending",
+        elsById["messages"].textContent.includes("create-pending-stream-alive"),
+        "msgs=" + JSON.stringify(elsById["messages"].textContent.slice(-60)));
+    bCreateResolve(resp(201, { id: "b-new", status: "Idle", active: true }));   // 成功：正常切换
+    await flush();
+    await flush();
+    await flush();
+    await flush();
+    chk("create-no-kill: success switches and opens new session",
+        state.workspace.id === "wsB" && state.sessionId === "b-new" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    chk("create-no-kill: success declared new epoch",
+        sessionOpenEpoch > epochAtOpen,
+        "epoch=" + sessionOpenEpoch + " atOpen=" + epochAtOpen);
+    bCreateDelayed = false;
+    bCreateResolve = null;
+    a1StreamManualNotice = false;
+    a1StreamReadResolve = null;
+    // --- 场景 2：失败路径（500）：epoch 不动、当前流不受影响 ---
+    switchWorkspace("wsA");     // 回 A 列表
+    await flush();
+    a1StreamManualNotice = true;
+    a1StreamReadResolve = null;
+    openSessionIn("wsA", "a1");     // 重新打开 a1：活跃会话 + SSE 手动流挂起
+    await flush();
+    await flush();
+    await flush();
+    const epochFail = sessionOpenEpoch;
+    chk("create-no-kill: failure-scenario a1 open with SSE pending",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat"
+        && a1StreamReadResolve !== null,
+        "sid=" + state.sessionId + " pending=" + (a1StreamReadResolve !== null));
+    sessionsBCreateFail = true;
+    renderSidebarTree(true);
+    addSec20 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    addSec20[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    await flush();
+    chk("create-no-kill: failure banner, epoch untouched",
+        elsById["banner"].hidden === false
+        && elsById["bannerText"].textContent.includes("创建会话失败")
+        && sessionOpenEpoch === epochFail,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " epoch=" + sessionOpenEpoch + " atOpen=" + epochFail);
+    chk("create-no-kill: failure keeps session open and current",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat"
+        && stillCurrent("a1", "wsA", epochFail) === true,
+        "ws=" + state.workspace.id + " sid=" + state.sessionId
+        + " cur=" + stillCurrent("a1", "wsA", epochFail));
+    a1StreamReadResolve({ done: false, value: "" });   // 失败后当前流的 SSE 分块仍被处理
+    await flush();
+    await flush();
+    await flush();
+    chk("create-no-kill: SSE block processed after failure",
+        elsById["messages"].textContent.includes("create-pending-stream-alive"),
+        "msgs=" + JSON.stringify(elsById["messages"].textContent.slice(-60)));
+    sessionsBCreateFail = false;
+    a1StreamManualNotice = false;
+    a1StreamReadResolve = null;
+    // --- 场景 3（MEDIUM）：迟到失败不污染新视图 —— POST 挂起期间用户已
+    //     导航（打开会话 / 返回列表），迟到的 401 / 500 / 解析失败都不刷
+    //     banner、不改新视图（await apiFor 后先校验 captured epoch +
+    //     workspace；解析后再次校验；catch 刷 banner 前也守卫） ---
+    // 3a：挂起期间打开 a1（递增 epoch）→ 迟到 401 不刷 banner
+    renderSidebarTree(true);
+    addSec20 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    bCreateDelayed = true;
+    bCreateResolve = null;
+    addSec20[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("create-late: POST pending (401 scenario)",
+        bCreateResolve !== null, "pending=" + (bCreateResolve !== null));
+    openSessionIn("wsA", "a1");      // 挂起期间打开其它会话（递增 epoch）
+    await flush();
+    await flush();
+    bCreateResolve(resp(401, {}));   // 迟到 401：guard 1 丢弃
+    await flush();
+    await flush();
+    chk("create-late-401: no banner after navigation",
+        elsById["banner"].hidden === true,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    chk("create-late-401: stays on new view",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    chk("create-late-401: pending cleared",
+        !state.wsCreatePending.has("wsB"),
+        "pending=" + state.wsCreatePending.has("wsB"));
+    bCreateDelayed = false;
+    bCreateResolve = null;
+    // 3b：挂起期间返回列表（递增 epoch）→ 迟到 500 不刷 banner
+    renderSidebarTree(true);
+    addSec20 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    bCreateDelayed = true;
+    bCreateResolve = null;
+    addSec20[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    backToList();                    // 挂起期间返回列表（递增 epoch）
+    await flush();
+    bCreateResolve(resp(500, {}));   // 迟到 500：guard 1 丢弃
+    await flush();
+    await flush();
+    chk("create-late-500: no banner after backToList",
+        elsById["banner"].hidden === true
+        && state.view === "list" && state.sessionId === null,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " view=" + state.view);
+    bCreateDelayed = false;
+    bCreateResolve = null;
+    // 3c：挂起期间打开 a1 → 迟到 201 + 非 JSON body（解析会失败）不刷 banner
+    renderSidebarTree(true);
+    addSec20 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    bCreateDelayed = true;
+    bCreateResolve = null;
+    addSec20[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    openSessionIn("wsA", "a1");      // 挂起期间打开 a1（递增 epoch）
+    await flush();
+    await flush();
+    bCreateResolve(resp(201, "not-json"));   // 迟到解析失败：guard 1 丢弃
+    await flush();
+    await flush();
+    chk("create-late-parse-fail: no banner after navigation",
+        elsById["banner"].hidden === true,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    bCreateDelayed = false;
+    bCreateResolve = null;
+    // 3d：POST 已返回 201、json() 挂起期间打开 a1 → 解析后校验（guard 2）
+    //     丢弃：不塞列表、不打开；解析失败 → catch 守卫（guard 3）不刷 banner
+    renderSidebarTree(true);
+    addSec20 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    bCreateJsonDelayed = true;
+    bCreateJsonResolve = null;
+    addSec20[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    const epochJson = sessionOpenEpoch;
+    chk("create-late-json: POST ok, json pending, epoch untouched",
+        bCreateJsonResolve !== null && sessionOpenEpoch === epochJson,
+        "pending=" + (bCreateJsonResolve !== null) + " epoch=" + sessionOpenEpoch);
+    openSessionIn("wsA", "a1");      // json() 挂起期间打开 a1（递增 epoch）
+    await flush();
+    await flush();
+    chk("create-late-json: navigation bumped epoch",
+        sessionOpenEpoch > epochJson,
+        "epoch=" + sessionOpenEpoch + " at=" + epochJson);
+    bCreateJsonResolve.reject(new Error("parse boom"));   // 解析失败
+    await flush();
+    await flush();
+    chk("create-late-json: rejected parse after nav no banner",
+        elsById["banner"].hidden === true
+        && state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat",
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " ws=" + state.workspace.id + " sid=" + state.sessionId);
+    // 3e：同一场景但解析成功 → guard 2 丢弃：b-new-late 不塞进 B 列表、不打开
+    renderSidebarTree(true);
+    addSec20 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    bCreateJsonResolve = null;
+    addSec20[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    openSessionIn("wsA", "a1");      // json() 挂起期间打开 a1（递增 epoch）
+    await flush();
+    await flush();
+    // 用唯一 id（b-new 已被场景 1 成功创建合法塞进 B 列表，不能作哨兵）
+    bCreateJsonResolve.resolve({ id: "b-new-late", status: "Idle", active: true });
+    await flush();
+    await flush();
+    chk("create-late-json: parsed value after nav not applied",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat"
+        && !(state.workspaceLists["wsB"] || []).some((x) => x.id === "b-new-late")
+        && !(state.lastList || []).some((x) => x.id === "b-new-late"),
+        "ws=" + state.workspace.id + " sid=" + state.sessionId
+        + " bHas=" + (state.workspaceLists["wsB"] || []).some((x) => x.id === "b-new-late"));
+    chk("create-late-json: pending cleared",
+        !state.wsCreatePending.has("wsB"),
+        "pending=" + state.wsCreatePending.has("wsB"));
+    bCreateJsonDelayed = false;
+    bCreateJsonResolve = null;
+    // =====================================================================
+    // ---- main 侧（origin/main）测试段：归档 + perf 回归 + Issue 1-8 ----
+    //（合并时 main 侧各段保持原顺序与状态依赖；以下为各自所需的状态基线）
+    // =====================================================================
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+
     // ---- 归档（🗄 archive）----
     // 归档按钮渲染：列表行内 SVG 按钮（同 pin 模式）
     const firstArchive = elsById["sessionList"].querySelector(".archive-btn");
@@ -2233,6 +3332,7 @@ async function main(){
     ];
     state.workspace = state.workspaces[0];
     state.token = "tok-p1";
+
     state.workspaceLists = {};
     state.workspaceErrors = {};
     state.lastList = [];
@@ -2243,6 +3343,7 @@ async function main(){
     state.sidebar.showAllWs = new Set();
     state.sidebar.expanded = new Set();
     state.renameActive = false;
+
     elsById["sidebar"].hidden = false;   // 侧边栏可见（默认态）
     renderWorkspaceSelect();
     renderSessionListCalls = 0;
@@ -2410,16 +3511,12 @@ async function main(){
     ];
     state.workspace = state.workspaces[0];
     state.token = "tok-g1";
-    state.workspaceLists = {};
-    state.workspaceErrors = {};
-    state.lastList = [];
-    state.sessionId = null;
-    state.view = "list";
+
     state.searchQuery = "";
     state.sidebar.filter = "";
     state.sidebar.showAllWs = new Set();
     state.sidebar.expanded = new Set();
-    state.renameActive = false;
+
     elsById["sidebar"].hidden = false;
     renderWorkspaceSelect();
     renderSessionListCalls = 0;
@@ -2580,10 +3677,12 @@ async function main(){
     state.lastList = [];
     state.view = "list";
     state.sessionId = null;
+
     state.searchQuery = "";
     state.sidebar.filter = "";
     state.sidebar.showAllWs = new Set();
     state.sidebar.expanded = new Set();
+
     elsById["sidebar"].hidden = false;
     await pollAllWorkspaces();
     await flush();
@@ -3002,4 +4101,33 @@ _spin_ok = bool(re.search(r'\.composer-status\.busy::before[^{]*\{[^}]*animation
                 and re.search(r'@keyframes\s+composer-status-spin', _css)
                 and re.search(r'prefers-reduced-motion: reduce', _css))
 print(("PASS" if _spin_ok else "FAIL") + " composer-status spinner + reduced-motion in style.css")
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok else 1)
+# LOW：ws-chip 10px 小字号前景/背景 WCAG AA 对比度 ≥ 4.5:1（深色文字配浅 tint）
+def _rel_lum(hexc):
+    hexc = hexc.lstrip('#')
+    r, g, b = (int(hexc[i:i+2], 16) / 255 for i in (0, 2, 4))
+    def f(c):
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+def _contrast(a, b):
+    la, lb = _rel_lum(a), _rel_lum(b)
+    if la < lb:
+        la, lb = lb, la
+    return (la + 0.05) / (lb + 0.05)
+_chip_ok = True
+for i in range(6):
+    m = re.search(r'\.ws-chip-%d\s*\{([^}]*)\}' % i, _css)
+    if not m:
+        _chip_ok = False
+        print("FAIL ws-chip-%d rule missing in style.css" % i)
+        continue
+    c = re.search(r'color:\s*(#[0-9a-fA-F]{6})', m.group(1))
+    b = re.search(r'background:\s*(#[0-9a-fA-F]{6})', m.group(1))
+    if not c or not b:
+        _chip_ok = False
+        print("FAIL ws-chip-%d needs hex color+background" % i)
+        continue
+    cr = _contrast(c.group(1), b.group(1))
+    if cr < 4.5:
+        _chip_ok = False
+    print(("PASS" if cr >= 4.5 else "FAIL") + " ws-chip-%d contrast %.2f:1 (>=4.5)" % (i, cr))
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _chip_ok else 1)

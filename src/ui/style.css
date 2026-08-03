@@ -18,6 +18,7 @@ mmlEqnNo}
     --blue:   #268bd2;
     --cyan:   #2aa198;
     --green:  #859900;
+    --magenta: #d33682;
   }
 
   * { box-sizing: border-box; }
@@ -1219,10 +1220,54 @@ mmlEqnNo}
     text-overflow: ellipsis;
     flex: 0 0 auto;
   }
+  /* 服务器徽章分色：按 state.workspaces 下标循环取色（ws-chip-<n> 由
+     sessions.js wsChipClass 生成），同一 workspace 的 chip 全站同色。
+     10px 小字号的 WCAG AA 对比度（≥4.5:1）：前景用加深版 Solarized 色
+     （彩色边框 + 深色文字配浅 tint 底），原亮色前景（blue/cyan/green 等）
+     对比度仅 ~2.9:1，hover/active 组头下不可读。浅 tint 底本身在
+     hover/active 组头（base2/base3）下仍可读。 */
+  .ws-chip-0 { color: #155a86;  border-color: #155a86;  background: #e8f1f9; }
+  .ws-chip-1 { color: #17736e;  border-color: #17736e;  background: #e7f5f4; }
+  .ws-chip-2 { color: #526100;  border-color: #526100;  background: #f1f5e6; }
+  .ws-chip-3 { color: #a13f10;  border-color: #a13f10;  background: #faf0e8; }
+  .ws-chip-4 { color: #4e548c;  border-color: #4e548c;  background: #f0eef8; }
+  .ws-chip-5 { color: #96255a;  border-color: #96255a;  background: #f8eef3; }
   /* 分组头错误标记：muted 红字（服务器轮询失败，列表保留为 stale） */
   .ws-err { color: var(--red); font-size: 11px; opacity: 0.8; }
   /* 「当前」标记：激活 workspace 分组头右侧 */
   .ws-cur { color: var(--base01); font-size: 10px; margin-left: auto; flex: 0 0 auto; }
+  /* 组头右侧控件组（当前标记 / + / ×）相邻时不再各自推挤：margin-left:auto
+     只保留给组内最左一个（.ws-cur 或 .ws-add），其余归零——两个 auto margin
+     会把「当前」和 × 从中间拆开（review 发现 3） */
+  .ws-cur + .ws-add, .ws-cur + .ws-del, .ws-add + .ws-del { margin-left: 0; }
+  /* 组头新建按钮：在该 workspace 新建会话（正常色，hover 高亮不警示） */
+  .ws-add {
+    margin-left: auto;        /* 无「当前」标记时也推到右侧 */
+    flex: 0 0 auto;
+    border: none;
+    background: transparent;
+    color: var(--base01);
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .ws-add:hover { background: var(--base3); color: var(--violet); }
+  /* 分组头删除按钮：出错/无法连接的服务器也能移除（逃生口） */
+  .ws-del {
+    margin-left: auto;        /* 无「当前」标记时也推到右侧 */
+    flex: 0 0 auto;
+    border: none;
+    background: transparent;
+    color: var(--base01);
+    font-size: 13px;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .ws-del:hover { background: var(--red); color: var(--base3); }
   .tree-ws-body { padding-left: 2px; }
 
   /* ---------- 会话重命名：✎ / ✓ / × 小按钮与编辑态 ---------- */
