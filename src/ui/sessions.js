@@ -393,18 +393,24 @@ async function createSession() {
    meta 立即可用），再走跨 workspace 打开模式（openSessionIn：非激活先切）。 */
 async function createSessionIn(ws) {
   if (!workspaceToken(ws)) { setBanner("⚠ 请先输入 Token。", true); return; }
+  // 入口（组头「+」点击）声明一次 action 代次：POST 挂起期间用户切 workspace/
+  // 打开其它会话/发起新的新建都会取代代次，迟到响应到达时 epoch 已变 → 丢弃，
+  // 绝不把用户强切回发起创建时的 workspace（review：迟到响应覆盖用户导航）。
+  const claimed = ++sessionOpenEpoch;
   try {
     const res = await apiFor(ws, "/api/sessions", { method: "POST", body: JSON.stringify({}) });
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
     if (res.status !== 201) throw new Error("HTTP " + res.status);
     const s = await res.json();
+    if (claimed !== sessionOpenEpoch) return;    // 期间有更新导航：过期创建不打开
+    if (!state.workspaces.includes(ws)) return;  // 目标 workspace 已被删除
     const wl = workspaceListFor(ws);
     if (Array.isArray(wl)) {
       const i = wl.findIndex((x) => x.id === s.id);
       if (i >= 0) wl.splice(i, 1);
       wl.push(s);
     }
-    await openSessionIn(ws.id, s.id);
+    await openSessionIn(ws.id, s.id, undefined, claimed);
   } catch (e) {
     setBanner("⚠ 创建会话失败：" + e.message);
   }
@@ -1259,6 +1265,13 @@ async function refreshSessionsForSidebar() {
 const MAX_TREE_ROOTS = 8;   // 每个 workspace 分组内默认只显示最近 8 个主会话（少滑即见）
 let lastTreeSig = "";
 
+/* 侧边栏筛选匹配：置顶分组与 workspace 内普通根共用同一规则——title 优先，
+   无 title 回退 id；子串匹配、大小写不敏感。filter 为空 → 全部匹配。 */
+function treeSessionMatches(s, filter) {
+  if (!filter) return true;
+  return (s.title || s.id).toLowerCase().includes(filter);
+}
+
 /* 聚合树签名：所有 workspace 的列表（激活 = lastList，背景 = 各自缓存）+
    激活标记 + 错误标记 + 当前会话 id。任一变化 → 重绘（保留展开/滚动状态）。 */
 function sidebarTreeSig() {
@@ -1293,13 +1306,17 @@ function renderSidebarTree(force) {
   // ---- 置顶分组：所有 workspace 的 pinned 会话集中到最顶上 ----
   // （跨 workspace 聚合；点击自动切到所属 server 并打开。workspace 内
   //  不再重复渲染 pinned——buildTreeRoot 的 .pinned 样式标记仍保留。）
+  //  筛选非空时与普通根同一 title/id 匹配规则：仅匹配的置顶根显示、随父
+  //  展示子会话；不匹配的隐藏（workspace 内剔除逻辑不变——剔除后置顶分组
+  //  是它们唯一出现位，不匹配则整体不显示）。
   const pinned = [];
+  const filter = state.sidebar.filter;
   for (const ws of state.workspaces) {
     const list = workspaceListFor(ws);
     for (const s of list) {
       // 只收主会话：pinned 子会话留在其父节点下（见 isMainSession 注释），
       // 避免既进置顶分组又留在 workspace 内重复渲染。
-      if (s.pinned === true && isMainSession(s)) {
+      if (s.pinned === true && isMainSession(s) && treeSessionMatches(s, filter)) {
         pinned.push({ ws, s });
       }
     }
@@ -1343,11 +1360,20 @@ function renderSidebarTree(force) {
     }
     // 组头「+」：在该 workspace 新建会话（无 initial_prompt；请求打到该
     // workspace 而非激活的——聚合模式下「在某台服务器上新建」必须打给那台）。
+    // 在途防重：请求期间按钮禁用 + 忽略重复点击（pending 标志挂在 state，
+    // 不挂按钮元素——树随轮询重绘，元素会被替换）。
     const addBtn = el("button", "ws-add", "+");
     addBtn.title = "在 " + (ws.name || ws.url) + " 新建会话";
+    addBtn.disabled = state.wsCreatePending.has(ws.id);
     addBtn.addEventListener("click", (ev) => {
       ev.stopPropagation();                 // 不触发组头切换
-      createSessionIn(ws);
+      if (state.wsCreatePending.has(ws.id)) return;   // 在途：忽略重复点击
+      state.wsCreatePending.add(ws.id);
+      addBtn.disabled = true;
+      createSessionIn(ws).finally(() => {
+        state.wsCreatePending.delete(ws.id);
+        addBtn.disabled = false;   // 期间未重绘时恢复按钮（重绘后由 disabled 属性重新绑定）
+      });
     });
     header.appendChild(addBtn);
     if (state.workspaces.length > 1) {
@@ -1418,7 +1444,7 @@ function renderTreeForList(container, list, wsId) {
   const roots = listForWorkspace.filter(isMainSession);
   if (filter) {
     // 筛选：主会话匹配 title（无 title 回退 id），大小写不敏感；子会话随父显示
-    const match = (s) => (s.title || s.id).toLowerCase().includes(filter);
+    const match = (s) => treeSessionMatches(s, filter);
     const matchedRoots = roots.filter(match);
     const matchedOrphans = orphans.filter(match);
     if (!matchedRoots.length && !matchedOrphans.length) {

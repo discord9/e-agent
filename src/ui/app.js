@@ -34,7 +34,12 @@ const PROMPT_PLACEHOLDER = "输入消息：Enter 发送，Shift+Enter 换行…"
  * 全局状态
  * ===================================================================*/
 const state = {
-  token: localStorage.getItem("eagent_token") || "",
+  // 全局回退 token（独立稳定，不随激活 workspace 变化）：初始化读 legacy
+  // eagent_token 键；顶部 tokenInput 写它；workspace 单独配置的 token 优先。
+  globalToken: localStorage.getItem("eagent_token") || "",
+  // 激活 workspace 的派生 token（= ws.token || globalToken；兼容既有引用
+  // state.token 的代码，切换/输入时重新派生；绝不作全局回退使用）。
+  token: "",
   workspaces: [],            // [{id,name,url,token}] 多服务器实例（initWorkspaces 填充）
   workspace: null,           // 当前激活的 workspace 对象（state.token 是其派生字段）
   view: "list",              // "list" | "chat"
@@ -77,6 +82,7 @@ const state = {
     degraded: new Set(),     // bash 行 output 端点 404/不可用 → 降级静态尾部（key；重绘不再重启轮询）
   },
   renameActive: false,       // 行内重命名进行中：列表页 1s 轮询重绘跳过，防编辑框被冲掉
+  wsCreatePending: new Set(),// 侧边栏组头「+」在途新建（wsId 集合）：请求期间按钮禁用/忽略重复点击
 };
 
 /* 常用 DOM 引用 */
@@ -175,8 +181,9 @@ function pickText(payload, keys) {
  * 根地址（去尾部斜杠；空 = 同源相对路径），token 是该实例的访问令牌。
  * 持久化：localStorage "eagent.workspaces"（JSON 数组）+
  * "eagent.activeWorkspace"（激活 id）。state.workspace 是激活对象；
- * state.token 是派生字段，始终跟随激活 workspace 的 token（既有代码
- * 全部读 state.token，保持兼容）。
+ * state.globalToken 是全局回退 token（独立稳定，持久化在 legacy
+ * eagent_token 键）；state.token 是派生字段 = 激活 workspace 的 token ||
+ * 全局（既有代码全部读 state.token，保持兼容）。
  * ===================================================================*/
 function normalizeWorkspaceUrl(url) {
   return String(url || "").trim().replace(/\/+$/, "");
@@ -190,7 +197,8 @@ function saveWorkspaces() {
 }
 
 /* 启动时加载；从未保存过 → 建默认条目 {id:"default", name:"默认", url:"",
-   token:state.token}，既有单服务器行为完全不变。 */
+   token:""}（token 留空 → 回退全局 state.globalToken；legacy eagent_token
+   由 globalToken 持有，既有单服务器行为完全不变）。 */
 function initWorkspaces() {
   let list = null;
   try {
@@ -200,7 +208,7 @@ function initWorkspaces() {
       if (Array.isArray(parsed) && parsed.length) list = parsed;
     }
   } catch (e) { list = null; }
-  if (!list) list = [{ id: "default", name: "默认", url: "", token: state.token || "" }];
+  if (!list) list = [{ id: "default", name: "默认", url: "", token: "" }];
   for (const ws of list) {
     if (!ws.id) ws.id = "ws-" + Math.random().toString(36).slice(2, 10);
     if (!ws.name) ws.name = ws.url || "默认";
@@ -217,7 +225,7 @@ function initWorkspaces() {
   } catch (e) { active = null; }
   if (!active) active = list[0];
   state.workspace = active;
-  state.token = active.token || "";   // state.token 跟随激活 workspace
+  state.token = active.token || state.globalToken;   // 派生：激活 ws 的 token 优先，否则全局
   saveWorkspaces();
   renderWorkspaceSelect();
 }
@@ -295,12 +303,15 @@ async function switchWorkspace(id, epoch) {
   state.sidebar.expanded = new Set();
   state.sidebar.filter = "";
   state.sidebar.showAllWs = new Set();
-  // ---- 切换激活 workspace；state.token 跟随其 token ----
+  // ---- 切换激活 workspace；state.token 派生跟随（全局 token 独立不变） ----
   state.workspace = ws;
-  state.token = ws.token || "";
+  state.token = ws.token || state.globalToken;
   saveWorkspaces();
-  if (state.token) localStorage.setItem("eagent_token", state.token);
-  else localStorage.removeItem("eagent_token");
+  // 注意：不写 localStorage eagent_token——它是全局 token（state.globalToken）
+  // 的持久化键。旧逻辑在这里用激活 workspace 的 token 覆盖它：A 有 token、
+  // B 留空时 B 的后台轮询误用 A 的 token（workspaceToken 回退到激活派生值）；
+  // 一旦切到 B，state.token 变空，B 的 history/SSE/任务又全失去认证。
+  // 全局回退必须独立稳定（review：token 全局回退设计缺陷）。
   // ---- 视图重置到列表页（清空 DOM） ----
   els.chatView.classList.add("hidden");
   els.listView.classList.remove("hidden");
@@ -320,7 +331,7 @@ async function switchWorkspace(id, epoch) {
   els.usageInfo.textContent = "";
   els.composerMeta.hidden = true;
   els.composerMeta.textContent = "";
-  els.tokenInput.value = state.token;
+  els.tokenInput.value = state.globalToken;   // 顶部输入框编辑的是全局 token
   applyStatus("Idle");               // 重置状态条/按钮/placeholder
   closeWorkspaceEditor();
   renderWorkspaceSelect();
@@ -407,10 +418,10 @@ initWorkspaces();
 let tokenBoxOpen = false;          // token 输入框展开状态（默认折叠，只显示按钮）
 let tokenBlurTimer = null;         // 失焦延迟收起句柄（防止「点进去正要输入就收起」）
 
-/* 折叠按钮文案/高亮跟随 token 设置状态 */
+/* 折叠按钮文案/高亮跟随「生效 token」状态（激活 workspace 的 token 或全局） */
 function updateTokenToggle() {
   if (!els.tokenToggle) return;
-  const set = !!state.token;
+  const set = !!(state.workspace ? workspaceToken(state.workspace) : state.globalToken);
   els.tokenToggle.textContent = set ? "🔑 已设置" : "🔑 Token";
   els.tokenToggle.classList.toggle("set", set);
   els.tokenToggle.title = set ? "已设置 Token（点击展开 / 收起）" : "点击展开 Token 输入";
@@ -422,14 +433,14 @@ function setTokenBoxOpen(open) {
   if (tokenBlurTimer) { clearTimeout(tokenBlurTimer); tokenBlurTimer = null; }
 }
 
-els.tokenInput.value = state.token;
+els.tokenInput.value = state.globalToken;
 els.tokenInput.addEventListener("input", () => {
-  state.token = els.tokenInput.value.trim();
-  // 同步进当前 workspace 并持久化：token 是 workspace 的字段之一
-  if (state.workspace) state.workspace.token = state.token;
-  if (state.token) localStorage.setItem("eagent_token", state.token);
+  // 顶部输入框写全局 token（独立于各 workspace 的 token；workspace 未单独
+  // 配置 token 时自动回退全局，因此激活 workspace 无需额外同步字段）。
+  state.globalToken = els.tokenInput.value.trim();
+  if (state.workspace) state.token = state.workspace.token || state.globalToken;  // 重新派生激活 token
+  if (state.globalToken) localStorage.setItem("eagent_token", state.globalToken);
   else localStorage.removeItem("eagent_token");
-  saveWorkspaces();
   refreshBanner();
   restartTransport();   // token 变化 → 重启轮询 / SSE
   updateTokenToggle();  // 按钮文案跟随设置状态
@@ -449,23 +460,20 @@ setTokenBoxOpen(false);   // 默认折叠：只留按钮，不挤顶栏
 updateTokenToggle();
 
 function refreshBanner() {
-  if (!state.token) {
+  if (!workspaceToken(state.workspace)) {
     setBanner("⚠ 未配置访问令牌：请在右上角输入 Token，所有请求需要 Authorization: Bearer <token>。", true);
   } else {
     setBanner("");
   }
 }
 
-/* workspace 的生效 token：优先 workspace 自身 token；激活 workspace 未单独
-   配置时回退全局 state.token（历史行为：token 输入框直接写 state.token，
-   再同步进 workspace.token）。聚合模式下各服务器 token 彼此独立。 */
+/* workspace 的生效 token：优先 workspace 自身 token；未单独配置时回退全局
+   state.globalToken（独立稳定，切换 workspace 不清空/覆盖；背景 workspace
+   轮询与激活 workspace 的 history/SSE/任务共用同一回退）。聚合模式下仍允许
+   per-workspace token 覆盖（ws.token 优先），但默认不再要求每个实例单独填。 */
 function workspaceToken(ws) {
-  // 同一 e-agent 部署的多个 server 实例共用同一个 server.token——
-  // workspace 未单独配置 token 时回退全局 state.token（历史行为：
-  // token 输入框直接写 state.token）。聚合模式下仍允许 per-workspace
-  // token 覆盖（ws.token 优先），但默认不再要求每个实例单独填。
   if (ws && ws.token) return ws.token;
-  return state.token || "";
+  return state.globalToken || "";
 }
 
 /* 指定 workspace 的请求入口：base url 与 token 各自独立

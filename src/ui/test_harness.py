@@ -238,6 +238,7 @@ const historyOlderData={entries:[
   {type:"notice", text:"更早的通知行"},
 ], next_before_seq:null};
 const FETCHES=[];
+const FETCH_HEADERS=[];   // 每个请求的 {url, method, headers}（全局 token 回退测试断言 Authorization）
 const sseChunks = [
   "event: snapshot\ndata: [{\"type\":\"notice\",\"text\":\"SNAPSHOT-SHOULD-BE-SKIPPED\"}]\n\n",
   "event: status\ndata: {\"status\":\"Busy\"}\n\n",
@@ -300,6 +301,9 @@ let sessionsBFormat = false;
 let bGetDelayed = false;
 let bGetResolve = null;
 let sessionsBCreateFail = false;
+// 组头「+」新建会话 POST 延迟（手动 resolve）：迟到响应竞态测试
+let bCreateDelayed = false;
+let bCreateResolve = null;
 // SSE 生命周期测试：a1 的 events 流手动控制（首个 read 挂起，测试切走后
 // 再 resolve 陈旧块；验证陈旧流不渲染到当前会话/workspace）
 let a1StreamManual = false;
@@ -313,6 +317,7 @@ let forkCandidatesData = [
 let forkPostResp = resp(201,{id:"fork-1"});
 globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
+  FETCH_HEADERS.push({ url, method: (opts.method||"GET").toUpperCase(), headers: opts.headers || {} });
   const m=(opts.method||"GET").toUpperCase();
   if(url==="/api/tasks") return resp(200, tasksData);
   if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output"))
@@ -328,6 +333,7 @@ globalThis.fetch=(url,opts={})=>{
     // 组头「+」新建会话：body {}（无 initial_prompt）→ 独立响应/失败开关；
     // resume 恢复（body {"id":...}）走下方既有延迟/固定响应路径
     if (opts.body === "{}") {
+      if (bCreateDelayed) return new Promise((resolve) => { bCreateResolve = resolve; });
       if (sessionsBCreateFail) return resp(500, {});
       return resp(201, { id: "b-new", status: "Idle", active: true });
     }
@@ -398,7 +404,8 @@ async function main(){
   let fail=0;
   const chk=(name, ok, extra)=>{ if(!ok) fail++; console.log((ok?"PASS":"FAIL")+" "+name+(extra?"  "+extra:"")); };
   try {
-    state.token="test-token";
+    state.globalToken="test-token";   // 全局回退 token（workspaceToken 的兜底）
+    state.token="test-token";         // 激活 workspace 派生 token（兼容既有引用）
     await pollSessions();
     chk("list rows rendered", elsById["sessionList"].children.length>=1);
     // pin 按钮用 SVG（emoji 📌 不吃 color，状态色灰⇄金必须 SVG currentColor）
@@ -1554,9 +1561,12 @@ async function main(){
         && state.workspaces[0].name === "默认" && state.workspaces[0].url === ""
         && state.workspace === state.workspaces[0],
         "n=" + state.workspaces.length + " name=" + state.workspaces[0].name);
-    chk("ws default token synced",
-        state.token === state.workspace.token && state.token !== "",
-        "token=" + JSON.stringify(state.token));
+    chk("ws default token falls back to global",
+        state.workspace.token === "" && state.token === state.globalToken && state.token !== ""
+        && workspaceToken(state.workspace) === state.globalToken,
+        "wsToken=" + JSON.stringify(state.workspace.token)
+        + " token=" + JSON.stringify(state.token)
+        + " global=" + JSON.stringify(state.globalToken));
     chk("ws default select rendered",
         elsById["workspaceSelect"].querySelectorAll("option").length === 1
         && elsById["workspaceSelect"].querySelector("option").textContent === "默认",
@@ -1597,9 +1607,13 @@ async function main(){
         + " name=" + state.workspace.name);
     chk("ws switch syncs token", state.token === "tok-b",
         "token=" + JSON.stringify(state.token));
-    chk("ws switch syncs legacy token key",
-        localStorage.getItem("eagent_token") === "tok-b",
-        "legacy=" + JSON.stringify(localStorage.getItem("eagent_token")));
+    // 切换 workspace 不再覆盖全局 token（legacy eagent_token 键 = 全局）：
+    // 全局仍是最早在 token 输入框设置的 tok-123，不被 B 的 tok-b 覆盖
+    chk("ws switch keeps global token",
+        state.globalToken === "tok-123"
+        && localStorage.getItem("eagent_token") === "tok-123",
+        "global=" + JSON.stringify(state.globalToken)
+        + " legacy=" + JSON.stringify(localStorage.getItem("eagent_token")));
     chk("ws select shows both",
         elsById["workspaceSelect"].querySelectorAll("option").length === 2,
         "opts=" + elsById["workspaceSelect"].querySelectorAll("option").length);
@@ -1627,8 +1641,9 @@ async function main(){
     await flush();
     chk("ws switch back to default",
         state.workspace.id === "default"
-        && state.token === state.workspace.token && state.view === "list",
-        "id=" + state.workspace.id + " token=" + JSON.stringify(state.token));
+        && state.token === (state.workspace.token || state.globalToken) && state.view === "list",
+        "id=" + state.workspace.id + " token=" + JSON.stringify(state.token)
+        + " global=" + JSON.stringify(state.globalToken));
     await api("/api/sessions");
     await flush();
     chk("ws api relative again",
@@ -1651,7 +1666,7 @@ async function main(){
     chk("ws reload restores workspaces",
         state.workspaces.length === 2 && state.workspace.id === "default"
         && state.workspace.token === _persisted.find(w => w.id === "default").token
-        && state.token === state.workspace.token,
+        && state.token === (state.workspace.token || state.globalToken),
         "n=" + state.workspaces.length + " active=" + state.workspace.id);
 
     // 删除：切到服务器B → 删 → 落回 default；仅剩一个时按钮禁用
@@ -2240,6 +2255,86 @@ async function main(){
     sessionsData = saveWs.dataA; sessionsDataB = saveWs.dataB;
 
     // =====================================================================
+    // 15c) 置顶分组筛选：filter 非空时置顶根与普通根同一 title/id 匹配规则
+    //     （仅匹配的置顶根显示在置顶分组、随父展示子会话；不匹配的隐藏；
+    //      workspace 内剔除逻辑不变——剔除后置顶分组是它们唯一出现位）。
+    //     跨 workspace：只匹配一方的词 → 另一方的置顶根整体隐藏。
+    // =====================================================================
+    sessionsData = [
+      { id: "pa1", status: "Idle", title: "Alpha 置顶", created_at: "2024-01-01T00:00:00Z", entry_count: 3, busy: false, active: true, pinned: true },
+      { id: "pa1-child", parent_session_id: "pa1", label: "Alpha 子任务", status: "Idle", entry_count: 1, active: true },
+      { id: "a-np", status: "Idle", title: "A 普通", created_at: "2024-01-02T00:00:00Z", entry_count: 1, active: true },
+    ];
+    sessionsDataB = [
+      { id: "pb1", status: "Idle", title: "Beta 置顶", created_at: "2024-02-01T00:00:00Z", entry_count: 2, active: true, pinned: true },
+      { id: "b-np", status: "Idle", title: "B 普通", created_at: "2024-02-02T00:00:00Z", entry_count: 1, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    // 筛选只匹配 A 的置顶根（title 子串；无 title 回退 id，与普通根一致）
+    state.sidebar.filter = "alpha";
+    renderSidebarTree(true);
+    let pinSec15c = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("pinned filter: matching pinned root shown in pinned group",
+        pinSec15c[0].classList.contains("pinned")
+        && pinSec15c[0].textContent.includes("pa1")
+        && !pinSec15c[0].textContent.includes("pb1"),
+        "top=" + pinSec15c[0].textContent.slice(0, 80));
+    chk("pinned filter: children follow matching pinned root",
+        pinSec15c[0].textContent.includes("pa1-child"),
+        "top=" + pinSec15c[0].textContent.slice(0, 100));
+    chk("pinned filter: non-matching pinned root hidden entirely",
+        !pinSec15c[1].textContent.includes("pb1") && !pinSec15c[2].textContent.includes("pb1"),
+        "secB=" + pinSec15c[2].textContent.slice(0, 60));
+    chk("pinned filter: non-pinned roots still filtered per workspace",
+        !pinSec15c[1].textContent.includes("a-np") && !pinSec15c[2].textContent.includes("b-np"),
+        "secA=" + pinSec15c[1].textContent.slice(0, 60)
+        + " secB=" + pinSec15c[2].textContent.slice(0, 60));
+    // 筛选只匹配 B 的置顶根 → 置顶分组只有 B
+    state.sidebar.filter = "beta";
+    renderSidebarTree(true);
+    pinSec15c = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("pinned filter: matching B pinned root shown",
+        pinSec15c[0].classList.contains("pinned")
+        && pinSec15c[0].textContent.includes("pb1")
+        && !pinSec15c[0].textContent.includes("pa1"),
+        "top=" + pinSec15c[0].textContent.slice(0, 80));
+    // 筛选同时匹配两个 workspace 的置顶根 → 都显示（跨 workspace）
+    state.sidebar.filter = "置顶";
+    renderSidebarTree(true);
+    pinSec15c = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("pinned filter: cross-workspace match shows both",
+        pinSec15c[0].classList.contains("pinned")
+        && pinSec15c[0].textContent.includes("pa1")
+        && pinSec15c[0].textContent.includes("pb1"),
+        "top=" + pinSec15c[0].textContent.slice(0, 100));
+    // 无匹配置顶根 → 置顶分组整体不出现（只剩两个 workspace 分组）
+    state.sidebar.filter = "zzz-no-match";
+    renderSidebarTree(true);
+    pinSec15c = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("pinned filter: no match hides pinned group",
+        pinSec15c.length === 2 && !pinSec15c[0].classList.contains("pinned"),
+        "n=" + pinSec15c.length + " cls0=" + pinSec15c[0].className);
+    state.sidebar.filter = "";
+
+    // =====================================================================
     // 16) 删除 review 修复验证：后台删除（不切换/不重置视图 + 聚合列表同步
     //     移除被删服务器会话）、confirm 取消、在途轮询写回守卫、首/中/末
     //     active 删除回退。
@@ -2518,6 +2613,230 @@ async function main(){
         "banner=" + JSON.stringify(elsById["bannerText"].textContent)
         + " ws=" + state.workspace.id + " view=" + state.view);
     sessionsBCreateFail = false;
+
+    // =====================================================================
+    // 18) 全局 token 回退：A 有单独 token、B 留空 → B 的后台轮询 / 切到 B /
+    //     打开会话与 SSE 全部使用全局 token（tokenInput 设置的全局值）；
+    //     切换 workspace 不清空/覆盖全局 token（review：token 全局回退设计
+    //     缺陷——A 的 token 泄漏给 B、切到 B 后 B 又失去认证）。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "" },   // B 不配置单独 token
+    ];
+    state.workspace = state.workspaces[0];
+    state.globalToken = "";          // 先清空全局：B 无生效 token → 轮询应被跳过
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    state.wsCreatePending = new Set();
+    renderWorkspaceSelect();
+    // 全局 token 为空时：B（无单独 token）无生效 token——绝不用 A 的 token
+    chk("global token empty: B has no effective token",
+        workspaceToken(state.workspaces[1]) === "",
+        "b=" + JSON.stringify(workspaceToken(state.workspaces[1])));
+    let hMark = FETCH_HEADERS.length;
+    await pollAllWorkspaces();
+    await flush();
+    chk("global token empty: B not polled with A token",
+        !FETCH_HEADERS.slice(hMark).some((f) => f.url === "http://b.local/api/sessions"),
+        "b=" + JSON.stringify(FETCH_HEADERS.slice(hMark)
+          .filter((f) => f.url === "http://b.local/api/sessions").map((f) => f.headers["Authorization"])));
+    // 通过顶部 tokenInput 设置全局 token（模拟用户输入；展开/收起交互已由
+    // 前序 token 折叠测试覆盖，这里直接驱动 input 事件）
+    elsById["tokenInput"].value = "tok-g";
+    elsById["tokenInput"]._listeners["input"][0]();
+    await flush();
+    chk("token input writes global token",
+        state.globalToken === "tok-g" && localStorage.getItem("eagent_token") === "tok-g"
+        && elsById["tokenInput"].value === "tok-g",
+        "global=" + JSON.stringify(state.globalToken)
+        + " legacy=" + JSON.stringify(localStorage.getItem("eagent_token")));
+    chk("per-workspace token takes precedence over global",
+        workspaceToken(state.workspace) === "tok-a"      // A 有单独 token：不受全局影响
+        && workspaceToken(state.workspaces[1]) === "tok-g",   // B 回退全局
+        "a=" + workspaceToken(state.workspace) + " b=" + workspaceToken(state.workspaces[1]));
+    chk("global token does not leak into A's stored token",
+        state.workspaces[0].token === "tok-a" && state.globalToken === "tok-g",
+        "a=" + JSON.stringify(state.workspaces[0].token)
+        + " g=" + JSON.stringify(state.globalToken));
+    // B 的后台轮询（A 仍激活）带上全局 token；A 用自己的 token
+    hMark = FETCH_HEADERS.length;
+    await pollAllWorkspaces();
+    await flush();
+    chk("background B poll uses global token",
+        FETCH_HEADERS.slice(hMark).some((f) => f.url === "http://b.local/api/sessions"
+          && f.headers["Authorization"] === "Bearer tok-g"),
+        "b=" + JSON.stringify(FETCH_HEADERS.slice(hMark)
+          .filter((f) => f.url === "http://b.local/api/sessions").map((f) => f.headers["Authorization"])));
+    chk("background A poll uses own token",
+        FETCH_HEADERS.slice(hMark).some((f) => f.url === "/api/sessions"
+          && f.headers["Authorization"] === "Bearer tok-a"),
+        "a=" + JSON.stringify(FETCH_HEADERS.slice(hMark)
+          .filter((f) => f.url === "/api/sessions").map((f) => f.headers["Authorization"])));
+    // 切到 B：全局 token 保留、state.token 派生为全局、legacy 键不被覆盖
+    const legacyBeforeSwitch = localStorage.getItem("eagent_token");
+    switchWorkspace("wsB");
+    await flush();
+    chk("switch to B keeps global token",
+        state.workspace.id === "wsB"
+        && state.globalToken === "tok-g"
+        && state.token === "tok-g"
+        && localStorage.getItem("eagent_token") === legacyBeforeSwitch,
+        "global=" + JSON.stringify(state.globalToken)
+        + " token=" + JSON.stringify(state.token)
+        + " legacy=" + JSON.stringify(localStorage.getItem("eagent_token")));
+    // 打开 B 的会话：history + SSE 都带全局 token
+    const hMarkOpen = FETCH_HEADERS.length;
+    openSessionIn("wsB", "b1");
+    await flush();
+    await flush();
+    await flush();
+    chk("B history uses global token",
+        state.workspace.id === "wsB" && state.sessionId === "b1" && state.view === "chat"
+        && FETCH_HEADERS.slice(hMarkOpen).some((f) =>
+            f.url.startsWith("http://b.local/api/sessions/b1/history")
+            && f.headers["Authorization"] === "Bearer tok-g"),
+        "sid=" + state.sessionId
+        + " hist=" + JSON.stringify(FETCH_HEADERS.slice(hMarkOpen)
+            .filter((f) => f.url.includes("b1/history")).map((f) => f.headers["Authorization"])));
+    chk("B SSE uses global token",
+        FETCH_HEADERS.slice(hMarkOpen).some((f) =>
+            f.url === "http://b.local/api/sessions/b1/events"
+            && f.headers["Authorization"] === "Bearer tok-g"),
+        "sse=" + JSON.stringify(FETCH_HEADERS.slice(hMarkOpen)
+            .filter((f) => f.url.includes("b1/events")).map((f) => f.headers["Authorization"])));
+    stopSSE();
+    state.view = "list";
+    state.sessionId = null;
+
+    // =====================================================================
+    // 19) 组头「+」迟到响应竞态：POST 挂起期间切 workspace / 打开其它会话 →
+    //     B 的响应到达不覆盖（不切回 B、不打开 b-new）；在途防重（pending
+    //     期间重复点击不重复发 POST）。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    state.wsCreatePending = new Set();
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    // --- 场景 1：B 激活时点 B 的 +（POST 挂起），期间切回 A ---
+    switchWorkspace("wsB");
+    await flush();
+    renderSidebarTree(true);
+    let addSec19 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const addB19 = addSec19[1].querySelector(".ws-add");   // 分组顺序 = workspaces 下标：1 = wsB
+    bCreateDelayed = true;
+    bCreateResolve = null;
+    addB19._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("ws-add in-flight: POST pending",
+        bCreateResolve !== null && state.wsCreatePending.has("wsB"),
+        "pending=" + (bCreateResolve !== null) + " set=" + state.wsCreatePending.has("wsB"));
+    // 重复点击：pending 期间再点 → 不重复发 POST
+    const createPostsBefore = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
+    addB19._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("ws-add in-flight: repeat click does not re-POST",
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === createPostsBefore,
+        "posts=" + FETCHES.filter((u) => u === "http://b.local/api/sessions").length);
+    // 挂起期间用户切到 A（直接切换递增代次）
+    switchWorkspace("wsA");
+    await flush();
+    chk("ws-add in-flight: switch during pending",
+        state.workspace.id === "wsA" && state.sessionId === null && state.view === "list",
+        "ws=" + state.workspace.id + " view=" + state.view);
+    bCreateResolve(resp(201, { id: "b-new", status: "Idle", active: true }));   // 迟到响应此刻到达
+    await flush();
+    await flush();
+    await flush();
+    chk("ws-add stale response does not reopen B",
+        state.workspace.id === "wsA" && state.sessionId === null && state.view === "list",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    chk("ws-add pending cleared after stale response",
+        !state.wsCreatePending.has("wsB"),
+        "pending=" + state.wsCreatePending.has("wsB"));
+    bCreateDelayed = false;
+    bCreateResolve = null;
+    // --- 场景 2：A 激活时点 B 的 +（POST 挂起），期间打开 A 的 a1 ---
+    switchWorkspace("wsA");
+    await flush();
+    renderSidebarTree(true);
+    addSec19 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const addB19b = addSec19[1].querySelector(".ws-add");
+    bCreateDelayed = true;
+    bCreateResolve = null;
+    addB19b._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    chk("ws-add in-flight: POST pending (scenario 2)",
+        bCreateResolve !== null, "pending=" + (bCreateResolve !== null));
+    openSessionIn("wsA", "a1");      // 挂起期间打开其它会话（递增代次）
+    await flush();
+    await flush();
+    chk("ws-add in-flight: open other session during pending",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    bCreateResolve(resp(201, { id: "b-new", status: "Idle", active: true }));
+    await flush();
+    await flush();
+    await flush();
+    chk("ws-add stale response does not hijack open session",
+        state.workspace.id === "wsA" && state.sessionId === "a1" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
+    chk("ws-add stale response did not switch to B",
+        state.workspace.id === "wsA", "ws=" + state.workspace.id);
+    chk("ws-add pending cleared after scenario 2",
+        !state.wsCreatePending.has("wsB"),
+        "pending=" + state.wsCreatePending.has("wsB"));
+    bCreateDelayed = false;
+    bCreateResolve = null;
+    // --- 场景 3：成功路径 —— pending 清除后再次点击照常创建并打开 ---
+    renderSidebarTree(true);
+    addSec19 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    addSec19[1].querySelector(".ws-add")._listeners["click"][0]({ stopPropagation(){} });
+    await flush();
+    await flush();
+    await flush();
+    await flush();
+    chk("ws-add success path after pending cleared",
+        state.workspace.id === "wsB" && state.sessionId === "b-new" && state.view === "chat",
+        "ws=" + state.workspace.id + " sid=" + state.sessionId + " view=" + state.view);
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
   imports.system.exit(0);
@@ -2547,4 +2866,33 @@ _spin_ok = bool(re.search(r'\.composer-status\.busy::before[^{]*\{[^}]*animation
                 and re.search(r'@keyframes\s+composer-status-spin', _css)
                 and re.search(r'prefers-reduced-motion: reduce', _css))
 print(("PASS" if _spin_ok else "FAIL") + " composer-status spinner + reduced-motion in style.css")
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok else 1)
+# LOW：ws-chip 10px 小字号前景/背景 WCAG AA 对比度 ≥ 4.5:1（深色文字配浅 tint）
+def _rel_lum(hexc):
+    hexc = hexc.lstrip('#')
+    r, g, b = (int(hexc[i:i+2], 16) / 255 for i in (0, 2, 4))
+    def f(c):
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+def _contrast(a, b):
+    la, lb = _rel_lum(a), _rel_lum(b)
+    if la < lb:
+        la, lb = lb, la
+    return (la + 0.05) / (lb + 0.05)
+_chip_ok = True
+for i in range(6):
+    m = re.search(r'\.ws-chip-%d\s*\{([^}]*)\}' % i, _css)
+    if not m:
+        _chip_ok = False
+        print("FAIL ws-chip-%d rule missing in style.css" % i)
+        continue
+    c = re.search(r'color:\s*(#[0-9a-fA-F]{6})', m.group(1))
+    b = re.search(r'background:\s*(#[0-9a-fA-F]{6})', m.group(1))
+    if not c or not b:
+        _chip_ok = False
+        print("FAIL ws-chip-%d needs hex color+background" % i)
+        continue
+    cr = _contrast(c.group(1), b.group(1))
+    if cr < 4.5:
+        _chip_ok = False
+    print(("PASS" if cr >= 4.5 else "FAIL") + " ws-chip-%d contrast %.2f:1 (>=4.5)" % (i, cr))
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _chip_ok else 1)
