@@ -1446,6 +1446,24 @@ mmlEqnNo}
     /* 添加面板窄屏换行，不横向溢出 */
     .ws-editor { flex-wrap: wrap; max-width: calc(100vw - 20px); right: 10px; }
     .ws-editor input { flex: 1 1 100px; width: auto; }
+    /* 对话头部（.chat-head）窄屏收紧：一行放不下时换行，各子项可收缩，
+       保证 390px 下单行（或最多两行）不横向溢出。与 mobile-topbar 同模式：
+       仅移动端媒体查询内收紧，桌面端（>480px）零改动。 */
+    .chat-head { gap: 6px; flex-wrap: wrap; }
+    .chat-session-id { min-width: 0; max-width: 34vw; }
+    .chat-session-id .chat-sid-title { font-size: 12px; max-width: 34vw; }
+    .chat-session-id .chat-sid-id { max-width: 34vw; }
+    .status-chip { font-size: 10px; padding: 1px 6px; }
+    #usageInfo {
+      font-size: 12px;
+      max-width: 30vw;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex-shrink: 1;
+      min-width: 0;   /* 允许 flex 收缩：长用量文本省略号截断，不撑宽/溢出 */
+    }
+    .compact-head { font-size: 10px; padding: 0 6px; }
   }
   /* 更窄的手机（≤360px，如 320px 的 iPhone SE）：再藏品牌名，保证单行不溢出 */
   @media (max-width: 360px) {
