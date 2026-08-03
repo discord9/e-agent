@@ -2227,7 +2227,7 @@ async function main(){
 
     // =====================================================================
     // 15) 置顶分组：所有 workspace 的 pinned 主会话集中到侧边栏最顶分组
-    //     （跨 workspace 徽章 + workspace 内剔除 + 子会话跟随 + pinned
+    //     （跨 workspace 色条 + workspace 内剔除 + 子会话跟随 + pinned
     //     子会话不重复渲染：只收主会话，pinned 子会话留在父节点下）
     // =====================================================================
     sessionsData = [
@@ -2273,11 +2273,15 @@ async function main(){
     const pinB = pinSections[2];
     chk("pinned group is first .tree-ws-section",
         pinTop.classList.contains("pinned"), "cls=" + pinTop.className);
-    chk("pinned group carries two server chips",
-        pinTop.querySelectorAll(".ws-chip").length === 2
-        && pinTop.textContent.includes("服务器A") && pinTop.textContent.includes("服务器B"),
-        "chips=" + pinTop.querySelectorAll(".ws-chip").length
-        + " txt=" + pinTop.textContent.slice(0, 60));
+    const pinMarkers = pinTop.querySelectorAll(".ws-pin-marker");
+    const pinMarkerLabels = [...pinMarkers].map((m) => m.getAttribute("aria-label"));
+    chk("pinned group carries two compact server markers",
+        pinMarkers.length === 2
+        && pinMarkerLabels.includes("所属服务器：服务器A")
+        && pinMarkerLabels.includes("所属服务器：服务器B")
+        && [...pinMarkers].every((m) => m.title && m.getAttribute("role") === "img"
+          && m.nextSibling && m.nextSibling.classList.contains("tree-count")),
+        "markers=" + pinMarkers.length + " labels=" + pinMarkerLabels.join(","));
     chk("pinned roots all in pinned group",
         pinTop.textContent.includes("pa1") && pinTop.textContent.includes("pb1"),
         "txt=" + pinTop.textContent.slice(0, 80));
@@ -2303,9 +2307,9 @@ async function main(){
     sessionsData = saveWs.dataA; sessionsDataB = saveWs.dataB;
 
     // =====================================================================
-    // 15b) ws-chip 分色 + 父节点 busy-dot 聚合子会话
-    //     A) chip 按 workspace 下标取色（ws-chip-<n>）：不同 workspace
-    //        色类不同；同一 workspace 的列表行/组头/置顶行 chip 同色。
+    // 15b) workspace 标识分色 + 父节点 busy-dot 聚合子会话
+    //     A) 标识按 workspace 下标取色（ws-chip-<n>）：不同 workspace
+    //        色类不同；同一 workspace 的列表 chip / 组头 chip / 置顶色条同色。
     //     B) 父节点 dot 亮 = s.busy 或任意直接子会话 busy（孙会话不计，
     //        直接子即够用：subagent 通常一层）；无 busy 子则不亮。
     // =====================================================================
@@ -2348,11 +2352,11 @@ async function main(){
     chk("ws-chip color class differs across workspaces",
         chipCls15(hdrA) === "ws-chip-0" && chipCls15(hdrB) === "ws-chip-1",
         "A=" + chipCls15(hdrA) + " B=" + chipCls15(hdrB));
-    // 置顶分组每行 prepend 的 chip：A/B 各一，与组头同色（同 workspace 同色）
-    const pinChips15 = sec15[0].querySelectorAll(".ws-chip");
-    const pinCls15 = [...pinChips15].map(chipCls15).filter((c) => c);
-    chk("pinned row chips share workspace color",
-        pinChips15.length === 2 && pinCls15.includes("ws-chip-0") && pinCls15.includes("ws-chip-1"),
+    // 置顶分组每行的紧凑色条：A/B 各一，与组头同色（同 workspace 同色）
+    const pinMarkers15 = sec15[0].querySelectorAll(".ws-pin-marker");
+    const pinCls15 = [...pinMarkers15].map(chipCls15).filter((c) => c);
+    chk("pinned row markers share workspace color",
+        pinMarkers15.length === 2 && pinCls15.includes("ws-chip-0") && pinCls15.includes("ws-chip-1"),
         "pins=" + pinCls15.join(","));
     // 列表行 chip：全部带色类，A/B 两色都在（与组头同一映射）
     const listChips15 = elsById["sessionList"].querySelectorAll(".ws-chip");
@@ -4150,6 +4154,16 @@ _spin_ok = bool(re.search(r'\.composer-status\.busy::before[^{]*\{[^}]*animation
                 and re.search(r'@keyframes\s+composer-status-spin', _css)
                 and re.search(r'prefers-reduced-motion: reduce', _css))
 print(("PASS" if _spin_ok else "FAIL") + " composer-status spinner + reduced-motion in style.css")
+# 置顶聚合行的 workspace 标记必须保持紧凑且不参与 flex 收缩；否则空 span
+# 不可见，或再次挤占会话标题空间。
+_marker = re.search(r'\.tree-row\s+\.ws-pin-marker\s*\{([^}]*)\}', _css)
+_marker_css = _marker.group(1) if _marker else ''
+_marker_ok = bool(_marker
+                  and re.search(r'width:\s*[4-6]px', _marker_css)
+                  and re.search(r'height:\s*1[2-4]px', _marker_css)
+                  and re.search(r'flex:\s*0\s+0\s+auto', _marker_css)
+                  and re.search(r'background:\s*currentColor', _marker_css))
+print(("PASS" if _marker_ok else "FAIL") + " compact ws-pin-marker layout in style.css")
 # LOW：ws-chip 10px 小字号前景/背景 WCAG AA 对比度 ≥ 4.5:1（深色文字配浅 tint）
 def _rel_lum(hexc):
     hexc = hexc.lstrip('#')
@@ -4179,4 +4193,4 @@ for i in range(6):
     if cr < 4.5:
         _chip_ok = False
     print(("PASS" if cr >= 4.5 else "FAIL") + " ws-chip-%d contrast %.2f:1 (>=4.5)" % (i, cr))
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _chip_ok else 1)
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _chip_ok else 1)

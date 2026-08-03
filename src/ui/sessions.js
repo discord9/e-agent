@@ -1504,8 +1504,14 @@ function renderSidebarTree(force) {
         kidsByParent.get(x.parent_session_id).push(x);
       }
       const node = buildTreeRoot(s, kidsByParent.get(s.id) || [], ws.id);
-      // 行前加 server 徽章，跨 workspace 一眼可辨（与列表行/组头同色映射）
-      node.querySelector(".tree-row")?.prepend(el("span", "ws-chip " + wsChipClass(ws), ws.name));
+      // 置顶聚合行在标题后只放紧凑色条，避免完整 server 名称挤占会话信息；
+      // 颜色与列表行/组头一致，名称留在 hover 与无障碍标签中。
+      const marker = el("span", "ws-pin-marker " + wsChipClass(ws));
+      marker.title = ws.name || ws.url;
+      marker.setAttribute("role", "img");
+      marker.setAttribute("aria-label", "所属服务器：" + (ws.name || ws.url));
+      const row = node.querySelector(".tree-row");
+      if (row) row.insertBefore(marker, row.querySelector(".tree-count"));
       pinnedBody.appendChild(node);
     }
     pinnedSec.appendChild(pinnedBody);

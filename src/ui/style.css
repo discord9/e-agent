@@ -1232,6 +1232,15 @@ mmlEqnNo}
   .ws-chip-3 { color: #a13f10;  border-color: #a13f10;  background: #faf0e8; }
   .ws-chip-4 { color: #4e548c;  border-color: #4e548c;  background: #f0eef8; }
   .ws-chip-5 { color: #96255a;  border-color: #96255a;  background: #f8eef3; }
+  /* 置顶聚合行的服务器标记：复用 ws-chip-N 的深色前景作为紧凑色条，
+     不显示名称、不占用会话标题宽度；完整名称由 title / aria-label 提供。 */
+  .tree-row .ws-pin-marker {
+    width: 5px;
+    height: 14px;
+    flex: 0 0 auto;
+    border-radius: 3px;
+    background: currentColor;
+  }
   /* 分组头错误标记：muted 红字（服务器轮询失败，列表保留为 stale） */
   .ws-err { color: var(--red); font-size: 11px; opacity: 0.8; }
   /* 「当前」标记：激活 workspace 分组头右侧 */
