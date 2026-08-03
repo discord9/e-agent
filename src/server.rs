@@ -3694,6 +3694,17 @@ model = "deepseek-chat"
         let hook_sessions = sessions.clone();
         let hook_slot = slot.clone();
         let hook_entry = entry.clone();
+        // Construct the guard BEFORE the spawn and capture it into the
+        // wrapper, mirroring DelegateCleanup in delegate.rs: `entered`
+        // only proves the subagent runner reached its model call, not that
+        // the wrapper's work factory was invoked. If the DELETE abort lands
+        // before the wrapper's first poll, the closure is dropped
+        // un-invoked, and only a guard already captured in it can still
+        // remove the Sessions entry.
+        let cleanup = TestCleanup {
+            sessions: sessions.clone(),
+            slot: slot.clone(),
+        };
         parent
             .background
             .spawn_with_id(
@@ -3706,10 +3717,7 @@ model = "deepseek-chat"
                     hook_sessions.insert(id, hook_entry);
                 },
                 move || {
-                    let cleanup = TestCleanup {
-                        sessions: sessions.clone(),
-                        slot: slot.clone(),
-                    };
+                    let cleanup = cleanup;
                     async move {
                         // Inline of Delegate::runner_result (private).
                         let result = if let Err(error) = runner_task.join().await {

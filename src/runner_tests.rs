@@ -1587,6 +1587,96 @@ async fn cancel_keeps_finish_when_idle_session_alive_for_follow_up() {
 }
 
 #[tokio::test]
+async fn cancel_then_compact_keeps_finish_when_idle_session_alive_for_follow_up() {
+    // A Cancel interruption must survive maintenance work: queuing a Compact
+    // after the cancel must NOT clear the cancel flag (`has_work()` includes
+    // `PendingCommand::Compact`, not just prompts), otherwise the compacted
+    // FinishWhenIdle session would finalize at the next idle point. The flag
+    // is cleared only when a real follow-up prompt opens a new turn, so the
+    // session stays Idle after the compaction and the follow-up message
+    // completes naturally into Finished(Completed).
+    let temp = tempfile::tempdir().unwrap();
+    let (mut agent, entered, _release) = recovering_agent(
+        vec![
+            // Consumed by the blocked first call, never delivered.
+            Ok(AssistantMessage {
+                content: Some("interrupted".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+            // Compaction call.
+            Ok(AssistantMessage {
+                content: Some("compact summary".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+            // Follow-up turn.
+            Ok(AssistantMessage {
+                content: Some("follow-up answer".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+        ],
+        true,
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "cancel-compact-alive".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("prompt".into()));
+    entered.notified().await;
+    handle.cancel();
+
+    // Cancelled turn -> Idle, not Finished: the delegate stays alive.
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+
+    // Compact while the cancel flag is still set: the completed compaction
+    // must return the session to Idle, never finalize it. If the queued
+    // Compact had wrongly cleared the flag, the runner would finalize
+    // right after the projection notice — wait for either state and assert
+    // it parked at Idle instead.
+    handle.compact();
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == "compacted: compact summary" => break,
+            AgentEvent::Error(_) => panic!("compaction failed"),
+            _ => {}
+        }
+    }
+    let after_compact = wait_for_status(&mut status, |s| {
+        matches!(s, SessionStatus::Idle | SessionStatus::Finished(_))
+    })
+    .await;
+    assert!(
+        matches!(after_compact, SessionStatus::Idle),
+        "a Compact queued after Cancel must not finalize the session"
+    );
+
+    // The follow-up prompt opens a new turn that completes naturally; with
+    // no queued work left, the session then finalizes as Completed.
+    handle.prompt("follow up");
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "follow-up answer" => break,
+            AgentEvent::Error(_) => panic!("follow-up turn failed"),
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("follow-up answer".into())))
+    );
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
 async fn cancel_with_queued_message_keeps_processing_it() {
     // A Cancel command that interrupts a turn must not drop queued messages:
     // the runner re-queues them (wait_for_operation's pending batch) and the
