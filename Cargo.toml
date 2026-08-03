@@ -41,11 +41,19 @@ name = "e-agent-import-jsonl"
 path = "src/bin/import_jsonl.rs"
 required-features = ["greptime"]
 
-# Windows-only: TerminateProcess for the degraded process-kill path
-# (ProcessGroupGuard). Kept target-gated so Linux/macOS builds never pull
-# the windows-sys dependency.
+# Windows-only APIs used by the restricted-token write sandbox and its
+# degraded (top-level-process only) cancellation path.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 [features]
 default = ["greptime", "sqlite"]

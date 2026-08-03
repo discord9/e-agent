@@ -212,16 +212,8 @@ impl SessionFactory {
             .with_external_roots(&resolved_policy)
             .map_err(anyhow::Error::msg)?;
         let sandbox = resolved_policy.enabled.then_some(resolved_policy.clone());
-        if sandbox.is_some() {
-            if !crate::tools::bwrap_available() {
-                return Err(anyhow!(
-                    "[sandbox] enabled = true but bwrap is not available. \
-                     Install bubblewrap or disable the sandbox."
-                ));
-            }
-            if announce {
-                eprintln!("e-agent: bash sandboxed with bwrap");
-            }
+        if let Some(policy) = &sandbox {
+            preflight_sandbox(policy, announce)?;
         }
         Ok(Self {
             workspace,
@@ -593,6 +585,74 @@ impl SessionFactory {
             skills_instructions: None,
             announce: false,
         }
+    }
+}
+
+fn preflight_sandbox(policy: &Sandbox, announce: bool) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        if !policy.network {
+            return Err(anyhow!(
+                "Windows write-sandbox MVP does not implement network isolation"
+            ));
+        }
+        if announce {
+            eprintln!("e-agent: shell write-restricted with a Windows restricted token");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = policy;
+        if !crate::tools::bwrap_available() {
+            return Err(anyhow!(
+                "[sandbox] enabled = true but bwrap is not available. \
+                 Install bubblewrap or disable the sandbox."
+            ));
+        }
+        if announce {
+            eprintln!("e-agent: bash sandboxed with bwrap");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn enabled_preflight_does_not_require_bwrap() {
+        preflight_sandbox(
+            &Sandbox {
+                enabled: true,
+                network: true,
+                workspace_writable: true,
+                writable_paths: Vec::new(),
+                readable_paths: Vec::new(),
+            },
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn network_isolation_request_is_rejected() {
+        let error = preflight_sandbox(
+            &Sandbox {
+                enabled: true,
+                network: false,
+                workspace_writable: true,
+                writable_paths: Vec::new(),
+                readable_paths: Vec::new(),
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not implement network isolation")
+        );
     }
 }
 

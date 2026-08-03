@@ -10,6 +10,8 @@ mod bash;
 mod file;
 mod tasks;
 mod web;
+#[cfg(windows)]
+mod windows_sandbox;
 
 use file::*;
 use tasks::*;
@@ -272,3 +274,7 @@ fn optional_bool(arguments: &Value, name: &str) -> Result<bool, String> {
 #[cfg(test)]
 #[path = "tools_tests.rs"]
 mod tests;
+
+#[cfg(all(test, windows))]
+#[path = "tools/windows_sandbox_tests.rs"]
+mod windows_sandbox_tests;

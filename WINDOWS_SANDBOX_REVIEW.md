@@ -1,0 +1,201 @@
+# Windows 写沙箱 MVP — 审查交接报告
+
+> 审查对象：分支 `feat/windows-write-sandbox-mvp`
+> 提交：`bf46b26`（MVP）+ `1d995dd`（硬链接修复），基于 `6fb118d`
+> 审查轮次：第 1 轮（`22fd6cd`，verdict **REJECT**）→ 第 2 轮复查（`1d995dd`，verdict **REJECT**）
+> 日期：2026-08-02
+> 方式：静态代码审查（Linux 主机，Windows 专属测试未实际执行；分支所有者的真机测试结果以其自身报告为准）
+
+## Verdict：REJECT — 暂不合并
+
+实现能执行真实 Windows 访问检查（restricted token + capability ACE）且整体 fail-closed（任何 token/ACL/spawn 步骤失败都不回退裸 shell），但当前仍有 **2 个可信逃逸路径**（硬链接竞态未闭环、控制台/桌面通道），作为"强制写边界"尚不安全。修复硬门槛通过后即可重新审查。
+
+## 修复状态总表
+
+| # | 级别 | Finding | 状态 | 证据（分支 tip `1d995dd`） |
+|---|---|---|---|---|
+| 1 | 🔴 Blocker | 硬链接把 capability ACE 传播到根外文件 | **部分修复**：静态场景已关闭，扫描→ACL 之间竞态未闭环 | `windows_sandbox.rs:276-317, 444, 638-646`；竞态见 `:246-273, :502-513` |
+| 2 | 🔴 Blocker | 子进程继承父真实控制台 stdin + `Winsta0\Default` | **未修** | `:770-790`（复制真实 stdin）、`:818-865`（作为 hStdInput）、`:858-877`（Default 桌面、无 CREATE_NO_WINDOW） |
+| 3 | 🟠 Major | 句柄检查 vs 路径名应用 TOCTOU | **未修** | `RootAcl` 只存路径+裸 ACL `:240-244, :404-474`；`SetNamedSecurityInfoW(root.path)` `:502-513` |
+| 4 | 🟠 Major | capability ACE 缺 `DELETE` / `FILE_DELETE_CHILD` | **未修** | 仅 `FILE_GENERIC_READ\|WRITE\|EXECUTE` `:486-488` |
+| 5 | 🟠 Major | 无 Job Object，超时/取消只杀顶层进程 | **未修** | `ProcessGuard` `:66-105`；timeout 路径 `:978-1015`；README 确认 `README.md:344-350` |
+| 6 | 🟠 Major | 安全/生命周期测试矩阵不足 | **部分修复**：+1 静态硬链接回归测试 | `windows_sandbox_tests.rs:96-116`；全量清单见下 |
+| 7 | 🟠 Major | **新增**：每次 shell 调用无界同步树遍历 | **未修** | `scan_descendants` `:276-317`；每命令全根重扫 `:625-642`；同步阻塞 tokio worker、不落在 timeout 内 `:974, :1003-1017`；违背 SPEC 自身约束 `WINDOWS_SANDBOX_SPEC.md:150-151` |
+| 8 | 🟠 Major | **新增**：duplicate-handle 失败时命令仍在跑却报启动失败 | **未修** | `:66-89`：`TerminateProcess` 结果被忽略，关闭进程句柄不终止进程 |
+| 9 | 🟡 Minor | Windows 环境变量透传警告写在 Linux 段落 | **未修** | 透传除 6 个凭证外的全部父变量 `:740-767`；警告仅 `README.md:352-364` |
+| 10 | 🟡 Minor | SPEC 头部"设计/调研，尚未实现"与正文矛盾 + Phase-A 旧文案 | **未修** | `WINDOWS_SANDBOX_SPEC.md:3-5, :56, :73, :192` |
+
+## Blocker 详情
+
+### Blocker 1 — 硬链接越权（部分修复，竞态未闭环）
+
+**原问题**：`set_path_ace` 以可继承 capability ACE 递归传播到现有子项（`SetNamedSecurityInfoW`），NTFS 硬链接的 ACL 属于底层文件而非路径名——工作区内指向工作区外用户可写文件的硬链接，会让 capability SID 传播到该外部文件，受限 token 即可经任意别名写入。
+
+**修复内容（1d995dd，静态场景有效）**：
+- `scan_descendants`：`symlink_metadata`（不跟随）+ `FILE_ATTRIBUTE_REPARSE_POINT` 位检查，拒绝一切 reparse descendant（junction/mount point 全覆盖）；`GetFileInformationByHandle` 的 `nNumberOfLinks > 1` 拒绝硬链接文件；任何扫描错误 `?` 传播（fail-closed）。
+- 时序正确：所有写根先完成 `preflight_root`（含扫描）才开 source token / 改 ACL（`:638-646` vs `:701-707`）。
+- 回归测试真实：同卷外部硬链接 → 断言报错含路径 + 外部文件内容 `"unchanged"`（`:96-116`）。
+
+**已确认无问题**：目录硬链接（Windows 不支持，目录别名走 reparse 拒绝）；非 NTFS 卷在扫描前拒绝（`:355-401`）；`file_link_count` 的 `Handle` RAII 无泄漏（含 `GetFileInformationByHandle` 失败路径）。
+
+**未闭环竞态**：所有检查句柄在 ACL 应用前已丢弃（`:246-273` 的 `Handle` 随函数返回 drop；root 检查句柄也不保留在 `RootAcl`），ACL 仍按路径名 `SetNamedSecurityInfoW` 应用。**扫描后、传播前**，descendant 被替换成硬链接 / root 路径被替换 → 原越权可复现。README 的 TOCTOU 承认（`:335-338`）不构成闭环。
+
+**修复方向**：让身份稳定、排除变更的句柄从校验贯穿到 ACL 应用（句柄版 `SetSecurityInfo`），保证被授予继承权限的对象就是被扫描的对象；若无法竞态安全，不得把路径名传播设计表述为"强制写边界"。
+
+### Blocker 2 — 子进程获得交互式主机控制台通道与默认桌面（未修）
+
+**证据**：`duplicate_stdin` 复制真实 `STD_INPUT_HANDLE`（`DUPLICATE_SAME_ACCESS` + 可继承，`:770-790`）并作为 `hStdInput` 装入显式继承句柄列表（`:818-865`）；显式挂到 `Winsta0\Default`，创建标志无 `CREATE_NO_WINDOW`（`:858-877`）。
+
+**风险**：复制句柄保留父进程已获授权——受限 token 不会追溯收窄既有句柄；子进程可消费/注入共享控制台输入缓冲，默认桌面保留不必要的宿主交互面（这正是微软建议 restricted-token 应用使用独立桌面的原因）。可借此操纵无限制的 agent 本身，而非仅通过受限 token 写文件。
+
+**修复方向**：stdin 改传 EOF 匿名管道或只读 `NUL` 句柄，绝不复制父控制台；`CREATE_NO_WINDOW` 非交互启动；如需 GUI 兼容，用私有 window station/desktop 而非 `Winsta0\Default`。
+
+## Major 详情
+
+### Major 3 — 授权句柄检查、路径名消费的 TOCTOU（未修）
+`preflight_root` 临时开句柄检查后即弃，ACL 应用与进程 cwd 都重新按路径解析。持久对象 ACE 使路径替换尤其危险。方向：保留 reparse-safe 句柄、经句柄校验卷/文件身份、`SetSecurityInfo` 用句柄、启动前复核 cwd/root 身份；或并发启动串行化并证明 fail-closed。
+
+### Major 4 — 删除/重命名权限缺失（未修）
+capability ACE 无 `DELETE` 与目录 `FILE_DELETE_CHILD`。Git checkout、编译器清理、原子保存（临时文件替换）、`Remove-Item`/`Move-Item` 都会在"可写"工作区失败。方向：文件与目录分别授予正确掩码（可用两条不同继承的 ACE），并补 create/overwrite/atomic-replace/rename/delete 测试（含根外拒绝）。
+
+### Major 5 — 超时/取消后子孙进程仍持能力（未修，SPEC 已推后但属安全缺口）
+无 `CREATE_SUSPENDED` + Job Object 原子分配；timeout 丢弃 guard 仅 `TerminateProcess` 顶层。脱离的编译器/脚本子进程仍能继续改所有允许根；子孙持有 stdout/stderr 句柄还会让阻塞的管道读取任务悬挂。方向：suspended 创建 → Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）→ resume；timeout/取消/registry teardown 都关/杀 job；补子孙存活回归测试。
+
+### Major 6 — 测试矩阵不足（部分修复）
+当前 5 个测试：
+1. `restricted_token_enforces_configured_write_roots` `:37-94`（新建/单 extra root/兄弟拒绝/`workspace_writable=false`）
+2. `hard_linked_descendant_is_rejected_before_external_file_can_change` `:96-116`（静态硬链接）
+3. `restricted_token_preserves_output_and_nonzero_exit` `:118-133`
+4. `restricted_token_rejects_network_false_at_execution` `:135-151`
+5. `protected_git_is_rejected_before_acl_preflight_or_process_start` `:153-174`
+
+**缺口**：junction/mount-point/symlink descendant；不可读目录/枚举失败/瞬态消失项；多根场景（最后一个根失败时前序根未被动过）；删除/目录删除/重命名/原子替换；stdin EOF 且无继承真实控制台句柄；超时/取消后存活子孙；ACL 幂等性与受保护子 DACL；根/descendant 替换竞态或证明句柄策略可防。需真实 Windows CI runner 执行，不能只靠交叉编译。
+
+### Major 7 — 新增：无界同步树遍历阻塞运行时（未修）
+每次 shell 调用都对全部写根做同步递归 `read_dir`/`symlink_metadata`/`CreateFileW`，发生在 `spawn` 返回前、timeout 开始前（`:974, :1003-1017`）。大游戏工作区可无界阻塞 tokio worker 且不受 timeout 保护；任何不可读/瞬态消失的 descendant 还会让所有 shell 命令失效。与 SPEC 自己写的"启动路径不得无界递归"（`WINDOWS_SANDBOX_SPEC.md:150-151`）直接冲突。**注意**：不要用缓存扫描来"解决"——那会失效安全检查；ACL 策略本身需要有界或竞态安全设计。最低限度：`spawn_blocking` + 显式时间/条目限额，超限按"不支持的根"fail-closed 报错。
+
+### Major 8 — 新增：duplicate 失败路径报错但命令仍在跑（未修）
+进程创建成功后 `ProcessGuard::duplicate` 失败 → 调 `TerminateProcess` 但忽略结果 → 立即返回 duplicate 错误；unwind 只关进程句柄（不终止进程）。资源耗尽下工具报"启动失败"但受限命令还在执行。方向：检查 `TerminateProcess` 结果、确认终止后才报错；更优：进程先进入已构造好的 kill guard / Job Object，再做任何可失败的后续操作。
+
+## Minor 详情
+
+- **Minor 9**：Windows 环境块转发除 6 个 API key 外的全部父变量（`:740-767`），含 `GITHUB_TOKEN`/AWS/Azure 凭证/代理/数据库 URL；对应警告只在 `README.md:352-364` 的 Linux/macOS 段落。方向：Windows 段同样明示 + 精确列出剥离名单；如需更强，改为 allowlist/可配置 denylist。
+- **Minor 10**：`WINDOWS_SANDBOX_SPEC.md:3-5` 状态头仍写"设计 / 调研，尚未实现"，紧接正文"当前已实现"；`:56, :73, :192` 的 Phase-A 旧文案仍把 Windows `enabled = true` 描述为需要"尚未实现"的 fail-closed 错误。方向：更新状态头，把过时 Phase-A 文案标记为历史或改写为描述当前 MVP。
+
+## 已确认的正常行为（无需改动）
+
+- 非 no-op：Windows 启用时 shell 真正分支进 `windows_sandbox::run`（`bash.rs:359-372`），失败不回退裸 shell。
+- `network=false` 与 `protect_git=true` 在 token/ACL 准备前拒绝（`:890-897`），fail-closed。
+- 非 Windows 平台保持 bwrap 门控，不静默变 no-op（`session_factory.rs:599-611`）。
+- `windows-sys` 依赖与模块 cfg 门控正确（`Cargo.toml:43-55`、`tools.rs:13-15`）。
+- 子代理一律 `protect_git=true`（`tools.rs:131-138`）→ Windows 沙箱下 delegate 当前全是拒绝执行的壳（fail-closed，但功能受限，README 已披露 `README.md:336-340`）。
+
+## 下一轮硬门槛（按优先级）
+
+1. **Blocker 2**：stdin 改 EOF 管道/只读 NUL；私有非交互 window station/desktop；`CREATE_NO_WINDOW`（不视为桌面隔离）。
+2. **Blocker 1 竞态闭环**：句柄从校验贯穿到 `SetSecurityInfo`；或明确放弃"路径名传播 = 强制边界"的表述。
+3. **Major 7**：树遍历移入 `spawn_blocking` + 时间/条目限额。
+4. **Major 8**：确认终止后才报启动失败；进程先入 kill guard/Job 再做可失败操作。
+5. **Major 4**：补 DELETE / FILE_DELETE_CHILD 及相应操作测试。
+6. **Major 5**：Job Object 生命周期（可与 8 合并设计）。
+7. **Major 6**：补全测试矩阵并在真 Windows CI 跑。
+8. **Minor 9/10**：文档修订（可随时顺手做）。
+
+## 备注
+
+- 本报告为静态审查；Windows 专属 enforce 测试未在 Linux 执行，最终验收以真机测试为准。
+- 审查期间远端另出现 `fix/windows-tui-paste` 分支（未审查，不在本报告范围）。
+
+---
+
+## 分支所有者回应 / tip `1931bbf`
+
+> 本节由分支所有者追加，仅回应上述审查意见；不改写原 reviewer 报告及其 verdict。
+
+### 当前版本与验证
+
+当前分支 tip 为 `1931bbf`，基于 `6fb118d`。真 Windows 上的聚焦测试结果为 **14 passed**；`cargo fmt --all`、`cargo build` 与 `git diff --check` 均通过。`cargo clippy --all-targets -- -D warnings` 仅被本分支未修改的基线 lint `src/server.rs:1660` 阻塞。
+
+### 已修复项
+
+#### Major 4 — 删除、重命名及常见开发工作流
+
+已修。capability SID 现为稳定的 **v3 SID**。capability ACE 增加 `FILE_DELETE_CHILD`，使受权目录内的文件/目录重命名、删除及原子替换可用；写根本身不授予 `DELETE`。
+
+真实 Windows 测试现覆盖：
+
+- workspace 内文件 rename/delete；
+- workspace 内目录 rename/delete；
+- 临时文件覆盖目标文件的 atomic replace；
+- Git lock-file/rename 路径、commit 及 checkout；
+- workspace 外 rename 被拒绝。
+
+#### Major 7 — 每命令无界扫描
+
+已修。仅当写根缺少 **exact v3 ACE**、即将执行首次安装或版本升级传播时，才扫描该根；检测到 exact v3 ACE 后，后续命令同时跳过全树扫描与 ACL 传播。所有确实需要扫描的 roots 仍会在任何 ACL mutation 之前全部完成扫描，因此首次安装/升级保持“先全量检查、后修改”的顺序。
+
+本实现没有采用 reviewer 建议的“每命令限时/限条目扫描”。原因是缓存或限时会使安全判定随缓存新旧、目录规模和运行时机变化，形成不稳定的准入结果；而 exact ACE 已安装后根本不再传播 ACL，新出现的 hard link 不会因此获得 capability ACE，也就不存在由传播产生的 hard-link 授权风险。基于这一点，跳过扫描比保留一个可能超时或过期的每命令扫描更直接。
+
+#### Major 8 — DuplicateHandle 失败清理
+
+已修。`DuplicateHandle` 失败时保留并使用创建进程返回的 exact process handle；检查 `TerminateProcess` 的返回结果，并以 `WaitForSingleObject` 确认进程已经终止后才返回启动失败。已增加 helper 级失败路径测试，覆盖成功终止并等待确认，以及终止失败且进程仍存活的严重清理错误报告。
+
+### 对 Blocker 1 的回应 — 接受已披露风险，不同意继续作为当前 MVP blocker
+
+静态 hard-link/reparse 的 ACL 传播路径现已关闭：首次安装/升级前扫描会拒绝它们；exact v3 ACE 存在后既不扫描也不传播，因此之后出现的 hard link 不会从传播中获得授权。
+
+我们仍承认 **scan → path-based ACL application 的 TOCTOU 未修复**，也不把本轮改动表述为修复了该竞态。当前产品承诺是 **accident-prevention write restriction（防事故性误写约束）**，不是针对能够并发篡改 workspace 的主动恶意进程所提供的强制安全边界；README 已明确披露该 TOCTOU。
+
+reviewer 提议的“保留 root handle + `SetSecurityInfo`”只能稳定 root 对象本身，不能单独闭环 descendant 在扫描完成后、传播前被替换的问题。完整闭环需要 handle-relative 遍历/更新、USN 辅助验证、目录锁定，或改用不同的授权架构，超出本 Windows write-sandbox MVP 的范围。因此本轮请求将此项降级为**已披露的非目标/接受风险**；这不是修复声明，而是不同意继续把它作为当前 accident-prevention MVP 的合并 blocker。
+
+### 对 Blocker 2 的回应 — 接受兼容性取舍，不同意继续作为当前 MVP blocker
+
+我们承认继承的 console stdin 与 default desktop 对主动恶意进程构成攻击面。当前目标仍是防止工具发生事故性文件误写；普通 PowerShell、MSVC、Git 及游戏开发工具不会意外执行 `WriteConsoleInput` 或 window-message injection 来攻击宿主。
+
+将 stdin 固定为 EOF、使用 private desktop，或强制 `CREATE_NO_WINDOW`，会破坏交互式工具、credential manager、GUI helper、许可证流程及游戏开发工具兼容性。基于当前威胁模型，本轮选择保留兼容行为，请求把该项降为未来可选的 **hardened mode** 工作；我们不声称当前实现提供安全隔离，也不声称能防护恶意代码。
+
+### Major 5 — Job Object
+
+此项尚未修复。取消/超时后后代进程可能继续存活并保留 capability，确属安全缺口；当前 README 已明确说明只终止顶层进程。Job Object 生命周期管理列为下一阶段工作，本轮不宣称已经解决。
+
+### Major 6 — 测试状态
+
+当前共有 **14 项** Windows 聚焦测试。相较原报告所列范围，本轮新增/强化的准确范围为：
+
+1. stable capability SID 测试更新为验证 v3、UTF-16 path 与 capability class 的稳定派生；
+2. exact v3 ACE 判定测试，覆盖缺 ACE、mask 不完整、inheritance 不完整及完全匹配；
+3. DuplicateHandle 失败后成功终止并确认退出的 helper 测试；
+4. DuplicateHandle 失败且 `TerminateProcess` 失败、进程仍存活的 helper 测试；
+5. 真实 file/dir rename-delete、atomic replace、Git lock/commit/checkout 与 outside rename deny 集成测试；
+6. exact ACE 安装后跳过 rescan/propagation、随后创建 hard link 仍不能修改 outside 文件的集成测试。
+
+上述聚焦测试已在真 Windows 环境执行并 14 passed；但持续运行这些测试的真实 Windows CI runner **尚未建立**，该缺口仍然承认。
+
+### Minor 9 / Minor 10
+
+Minor 9（Windows 环境变量透传警告位置/策略）与 Minor 10（SPEC 状态头及 Phase-A 旧文案）均**尚未处理**；本轮不作已修暗示。
+
+### Re-review checklist
+
+请下一轮 reviewer：
+
+1. 在 tip `1931bbf` 验证三项实现修复：Major 4 的 v3 ACE/删除重命名能力、Major 7 的 exact-ACE 条件扫描与无传播快路径、Major 8 的 duplicate-failure 确认终止；
+2. 裁决是否接受当前 accident-prevention MVP 威胁模型，以及将 Blocker 1 TOCTOU 与 Blocker 2 console/desktop 通道降级为已披露风险/未来 hardened mode 的两个请求；
+3. 若不接受，请明确要求的是 **hardened sandbox**，而不是 accident-prevention write-restriction MVP，避免把两种产品承诺混为同一验收标准。
+
+---
+
+## 评审结论（主 agent，2026-08-02）
+
+> 本节由产品负责人（主 agent + 用户）追加，确认威胁模型与关闭项；不改写原 reviewer 报告、分支所有者回应及其 verdict。
+
+1. **威胁模型确认（用户拍板）**：该功能的唯一目的是防止模型不小心读错/写错/删错目录（防模型误操作 / accident-prevention），不是防恶意进程。接受分支所有者在"分支所有者回应"中提出的 accident-prevention 威胁模型（本文件 `:147-149`）。
+2. **Blocker 1（硬链接 TOCTOU）与 Blocker 2（console/desktop 通道）降级接受**：两者都是针对能并发篡改文件系统/注入控制台的主动恶意进程的攻击面；模型（即使被 prompt injection 诱导）只是顺序调用工具，没有在扫描后微秒窗口内替换 hard link 或注入控制台输入的能力。静态 hard link 已被扫描拒绝，exact ACE 安装后不再传播（本文件 `:145`、`README.md:338-340`）→ 之后新建的 hard link 拿不到 capability ACE。故接受这两个 blocker 降级为"已披露风险 / 未来 hardened mode"，不再作为合并 blocker。
+3. **"防读"明确不进范围（用户拍板）**：Windows MVP 不防读、环境变量除 6 个 API key 外全透传，是已知边界，接受。read_file 等文件工具已有 workspace/外部 root capability 边界；bash 读 + 环境变量透传是自由面，靠提示词纪律。Linux bwrap 只在用户配置 `enabled = true` 时限制读。
+4. **Major 5（Job Object）降级为 follow-up**：超时/取消后子孙进程继续存活属生命周期正确性问题，在"模型以为已取消"场景仍是误写来源，但不阻塞合并；必须在分支上列为显式 follow-up（README 已披露只终止顶层进程 `README.md:353-355`）。合并时须保留该披露。
+5. **Minor 9（README Windows 段环境变量警告）与 Minor 10（SPEC 状态头）要求**：合并前应修（小改动），具体改法：
+   - Minor 10：`WINDOWS_SANDBOX_SPEC.md` 状态头（`:3-5`）改为"已实现 restricted-token 写限制 MVP（accident-prevention）"；明确 Job Object 进程树生命周期（Phase A）与 AppContainer（Phase C）尚未实现；`:56`/`:73`/`:192` 的 Phase-A 旧文案（"Windows `enabled = true` 报尚未实现"）标记为历史 Phase-A 过渡约定或改写。
+   - Minor 9：`README.md` 的 Windows MVP 段落（约 `:329-355`）补一句与 Linux 段（`:366-369`）相同的环境变量披露：除剥离名单（`EXA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `KIMI_API_KEY`）外的父进程环境变量对子进程可见。
+6. **下一轮 review 验收标准**：按 accident-prevention MVP 验收（fail-closed 无回退裸 shell + 写根限制 + 静态 hard link/reparse 拒绝 + 已披露风险清单）；未来若要做 hardened mode（AppContainer/Job Object/私有桌面/防读）需单独提案，不以同一标准混评。
+
+**待合并前完成**：Minor 9/10 文档修订 + Major 5 follow-up 登记。

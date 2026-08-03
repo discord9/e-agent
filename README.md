@@ -317,50 +317,69 @@ as a process group; on non-Unix platforms only the direct child is killed.
 stdout and stderr are each captured up to 64 KiB, then drained and marked as
 truncated.
 
-Optional sandboxing is available when `bubblewrap` (`bwrap`) is installed and
-`[sandbox] enabled = true` is set in the config. Bash mounts and file-tool
-capabilities are independent boundaries that share the resolved path policy:
-with bwrap disabled Bash retains ambient host access, while configured file
-capabilities still apply; `workspace_writable` controls only the Bash mount.
-Every `bash` call — main agent
-and subagents alike — is then wrapped in `bwrap`: system directories are
-mounted read-only, the workspace is mounted read-write (`workspace_writable =
-false` makes it read-only), `/tmp` and `/home` are fresh tmpfs, PID/IPC/UTS
-namespaces are unshared, and TIOCSTI is blocked via `--new-session`. Network
-stays available by default; `network = false` unshares it. When the host uses
-systemd-resolved, the stub resolver at `/run/systemd/resolve` is mounted
-read-only so that DNS resolution via the symlinked `/etc/resolv.conf` works
-inside the sandbox. The sandbox constrains
-the spawned command, not the agent process itself. This sandbox is best-effort:
-it is not setuid bwrap, the host network is shared by default, and environment
-variables of the parent process other than the stripped credential names
-(`EXA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`,
-`MOONSHOT_API_KEY`, `KIMI_API_KEY`) remain visible inside the sandbox.
+Optional shell restriction is available when `[sandbox] enabled = true` is set.
+On Linux/macOS this uses `bubblewrap` (`bwrap`) as described below. On Windows,
+the **write-sandbox MVP is an accident-prevention mechanism**, using a restricted
+primary token and stable synthetic capability ACEs. It restricts writes to the
+workspace (only when `workspace_writable = true`) plus explicit
+`writable_paths`; `workspace_writable = false` grants no workspace write ACE,
+and `readable_paths` never grants write access. TEMP/TMP, HOME, Cargo/NuGet, and
+engine caches are not implicitly writable.
 
-Additionally, when the sandbox is enabled, the protection applied to the
-workspace `.git` entry depends on the agent role:
+The Windows MVP is not complete filesystem isolation: it does not restrict
+reads or network access, and `network = false` is rejected before launch. Except
+for the explicitly stripped credential variables (`EXA_API_KEY`,
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
+and `KIMI_API_KEY`), parent-process environment variables remain visible to the
+child process; this is not read or secret isolation. Locations already writable
+through Everyone or the current logon SID, including
+some public locations, may remain writable. Only existing canonical directory paths on
+fixed local NTFS volumes are accepted. UNC/device paths, non-directory roots,
+roots that are symlinks/reparse points, NULL DACLs, and case-sensitive roots
+are rejected. Before the first installation (or a versioned ACE upgrade), every
+write root that needs its complete inheritable capability ACE is scanned without
+following links; hard-linked file descendants and nested symlink/reparse point
+descendants are unsupported and rejected. Once the exact current-version ACE is
+installed, later commands skip both ACL propagation and that root's full-tree
+scan. The ACE grants create/overwrite plus child rename/delete/atomic replace
+through `FILE_DELETE_CHILD` inherited by directories, without granting `DELETE`
+on the write root itself. Concurrent path replacement races (TOCTOU) remain a
+risk. Windows shell
+execution with protected Git metadata (`protect_git = true`, used by delegated
+subagents/fixers) is unsupported and fails before token or ACL changes with
+`Windows write-sandbox MVP does not support protected-git shell execution`;
+there is no `.git` ACL carve-out.
 
-- **Main agent (orchestrator):** the `.git` directory (or linked-worktree
-  pointer file) is left writable so that `git add`, `git commit`,
-  `git worktree`, `git cherry-pick`, and other repository operations work
-  normally. The main agent needs to mutate Git metadata to drive the
-  development workflow.
-- **Delegated subagent / fixer:** the sandbox binds `<workspace>/.git`
-  read-only **over itself** after all writable mounts. This prevents the
-  subagent from deleting or corrupting the pointer, running `git init`, or
-  writing any commit metadata — protecting the workspace Git metadata against
-  accidental corruption by a delegated subtask.
+Synthetic capability allow ACEs persist after successful execution. If adding
+an ACE to a later root fails, ACEs already added to earlier roots may also
+remain; the process is not started and no whole-DACL rollback is attempted.
+These synthetic SID ACEs are inert for ordinary tokens that do not contain the
+SID, but administrators may need to remove them manually. Cancellation,
+timeout, and running-task registry teardown currently terminate only the
+top-level process. Descendants may keep running with the capability and continue
+writing the allowed roots. Atomic assignment to a Job Object, with process-tree
+termination on cancellation, timeout, and registry teardown, is a future
+lifecycle enhancement.
 
-This protection covers only the `.git` entry inside the workspace; it does
-not cover a repository's object store, packed references, or other data that
-resides outside the workspace (e.g. in a common Git directory referenced by a
-linked-worktree pointer). This protection does not prevent `git` commands from reading
-the repository, and it does not extend to any repository outside the workspace
-that happens to be mounted via `writable_paths`.
+On Linux/macOS every `bash` call—main agent and subagents alike—is wrapped in
+`bwrap`: system directories are mounted read-only, the workspace is mounted
+read-write (`workspace_writable = false` makes it read-only), `/tmp` and `/home`
+are fresh tmpfs, PID/IPC/UTS namespaces are unshared, and TIOCSTI is blocked via
+`--new-session`. Network stays available by default; `network = false` unshares
+it. When the host uses systemd-resolved, the stub resolver at
+`/run/systemd/resolve` is mounted read-only so DNS resolution via the symlinked
+`/etc/resolv.conf` works inside the sandbox. The restriction constrains the
+spawned command, not the agent process itself. It is best-effort: bwrap is not
+setuid, the host network is shared by default, and environment variables of the
+parent process other than the stripped credential names (`EXA_API_KEY`,
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
+`KIMI_API_KEY`) remain visible.
 
-Background bash commands inherit their parent's role: a background task
-started by the main agent has writable `.git`; one started by a subagent has
-`.git` bound read-only.
+On Linux/macOS, the workspace `.git` entry depends on the role. The main agent
+leaves it writable for repository operations. Delegated subagents/fixers bind
+`<workspace>/.git` read-only over itself after writable mounts. This covers only
+the workspace `.git` entry, not external object stores or other repositories.
+Background commands inherit the parent's role.
 
 Every `web_search` query is disclosed to Exa, a third party. Never include
 credentials, tokens, private repository contents, customer data, personal data,
@@ -685,9 +704,12 @@ loading is workspace-root-only: there is no parent/nested discovery or merging.
 Subagents exist but are deliberately minimal: no agent-to-agent messaging,
 no delegation deeper than 1 level, and no process-level isolation yet
 (subagents are runtime tasks, not subprocesses).
-Windows 当前没有安全 sandbox；Job Object 即使加入也只治理进程树，不隔离文件或网络，
-且不承诺与 bwrap 等价。完整 Windows 后端实现前，Windows 上
-`[sandbox] enabled = true` 必须 fail-closed。
+Windows restricted-token MVP is only an accident-prevention write restriction:
+no read isolation, network isolation, Job Object, AppContainer, broker/IPC,
+ConPTY, dedicated user, protected-git shell execution, or bwrap-equivalent
+filesystem view. Everyone/logon-SID writable public locations can remain
+writable, synthetic capability ACEs persist, and cancellation currently
+terminates only the top-level process.
 It does speak MCP to local stdio servers (tools only), but it does NOT do
 remote MCP over HTTP/SSE, MCP OAuth, MCP resources/prompts, server-initiated
 notifications, `listChanged` refresh, server restart on crash, or concurrent

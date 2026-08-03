@@ -1,8 +1,8 @@
 # Windows sandbox 调研与分阶段实现方案
 
-> 状态：**设计 / 调研，尚未实现**。
+> 状态：restricted-token **写限制 MVP（accident-prevention）已实现**；Job Object 进程树生命周期增强与 AppContainer/hardened backend **尚未实现**。
 >
-> 本文记录 Windows 进程树治理与 sandbox 的技术结论、阻断问题和分阶段实施门槛。当前代码没有 Windows 安全 sandbox；也不能声称下述方案与 Linux bubblewrap（bwrap）等价。完整 Windows sandbox 正式接入前，Windows 上 `[sandbox] enabled = true` 必须继续 **fail-closed**，不得回退为裸 shell。
+> 本文记录 Windows 进程树治理与 sandbox 的技术结论、阻断问题和分阶段实施门槛。当前已实现 restricted-token **写限制 MVP**，首要场景是原生 Windows 游戏开发（PowerShell/MSVC/Git/Godot/Unity/Unreal 工具链）。它不是读隔离、网络隔离或 Linux bubblewrap（bwrap）等价物；任一 token、ACL 或 native spawn 步骤失败都 **fail-closed**，不得回退为裸 shell。
 
 ## 1. 定位、威胁模型与保证分层
 
@@ -10,22 +10,23 @@ Windows 实现必须把“进程生命周期”与“安全隔离”分开描述
 
 | 层级 | 机制 | 可以保证 | 不可以保证 |
 |---|---|---|---|
-| Phase A：进程树生命周期 | Job Object，`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，原子入 job | 取消、墙钟超时或后台 registry 销毁时终止该命令的子/孙进程 | 不能限制文件读取/写入，不能限制网络，不是安全 sandbox |
+| 已实现 MVP：写限制 | restricted primary token（`DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED`）+ 稳定 capability SID/ACL | workspace（按 `workspace_writable`）及显式 `writable_paths` 写入；原生工具链兼容 | 不限制读取/网络；Everyone/logon-SID 本来可写的公共位置可能仍可写 |
+| 后续生命周期增强 | Job Object，`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，原子入 job | 取消、墙钟超时或后台 registry 销毁时终止该命令的子/孙进程 | 不阻塞写限制 MVP；本身不提供文件或网络隔离 |
 | Phase B：隔离技术原型 | AppContainer profile/SID、security capabilities、ACL 实验 | 验证文件访问和网络 capability 的可行边界与兼容性 | 尚不承诺正式配置语义、可靠清理或与 bwrap 等价 |
 | Phase C：正式 Windows sandbox | 原子创建时同时应用 Job Object 与 AppContainer；经审定的 ACL 生命周期 | 在明确支持范围内实现 workspace/path 权限、网络能力和进程树清理；任一步失败都关闭执行 | 无 mount namespace、tmpfs HOME 或 bind mount 覆盖；不承诺任意 Windows 环境均兼容 |
 
-威胁模型针对由 shell 启动的不受信命令及其后代：
+当前 MVP 的威胁模型是防止 shell 命令事故性误写，而不是隔离主动恶意进程；后续 hardened backend 才针对由 shell 启动的不受信命令及其后代讨论更强边界：
 
-- Phase A 只防止取消/超时后残留进程继续运行，以及 PID 驱动清理造成的错误目标风险；它不改变命令对宿主资源的权限。
-- 完整 sandbox 才讨论 workspace 外文件访问、写权限和网络访问。其安全边界依赖 AppContainer、访问令牌、宿主 DACL、capability 以及 Windows 本身的访问检查共同成立。
+- 计划中的 Phase A 只处理取消/超时/registry teardown 后的残留进程，以及 PID 驱动清理造成的错误目标风险；它不改变命令对宿主资源的权限。
+- 当前 restricted-token MVP 限制配置写根，但不限制 workspace 外读取或网络；未来 hardened sandbox 的安全边界依赖 AppContainer、访问令牌、宿主 DACL、capability 以及 Windows 本身的访问检查共同成立。
 - 任何 AppContainer 创建、profile/SID 解析、属性列表构造、ACL 准备、管道准备或进程创建失败，都不得改为普通用户权限启动。
-- 在 Phase C 完成前，即使 Phase A 已上线，Windows `[sandbox] enabled = true` 仍须 fail-closed；Job Object 不能被当成 enabled 模式的降级 sandbox。
+- 当前 Windows `[sandbox] enabled = true` 启用 restricted-token 写限制 MVP；`network = false`、`protect_git = true` 等不支持的组合 fail-closed。它不是 Job Object、AppContainer 或 bwrap 等价 sandbox。
 
 ## 2. 已确认的设计决策
 
 | 主题 | 决策 | 理由 / 约束 |
 |---|---|---|
-| Job Object 启用条件 | 与 `[sandbox]` 开关无关；Windows 所有前台和后台 shell（包括 `enabled = false`）都使用 | 生命周期治理不是文件/网络 sandbox；禁用 sandbox 也不应留下进程树 |
+| Job Object 启用条件（后续） | 与 `[sandbox]` 开关无关；计划让 Windows 所有前台和后台 shell（包括 `enabled = false`）都使用 | 生命周期治理不是文件/网络 sandbox；禁用 sandbox 也不应留下进程树 |
 | Job 限制 | 设置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`；不配置/允许 breakaway，也不向子进程传 `CREATE_BREAKAWAY_FROM_JOB` | 所有后代留在同一生命周期边界内 |
 | 超时 | 保留 `tokio::time::timeout` 作为墙钟 timeout，超时时终止 job 并等待进程结束 | `JOB_OBJECT_LIMIT_JOB_TIME` 是 CPU 时间语义，不能替代墙钟 timeout |
 | 后台状态 | Windows 状态持有 owned/shared Job handle；不以 PID 或 `AtomicI32` 作为清理权威 | PID 可复用；稍后按 PID `OpenProcess` 可能误杀无关进程，且只能可靠指向顶层进程 |
@@ -33,7 +34,7 @@ Windows 实现必须把“进程生命周期”与“安全隔离”分开描述
 | 原生启动层 | 允许增加一个小型 `cfg(windows)` native spawn helper，同时承载属性列表、security capabilities 和 stdio 管道 | Tokio `Command` 不足以配置这里需要的完整 `STARTUPINFOEX` 属性列表；不引入通用进程框架或 trait |
 | AppContainer | Phase B 仅做独立技术原型，不接正式 `[sandbox]` 配置 | ACL 生命周期与工具链兼容性尚属阻断问题 |
 | 网络 | `network = false` 不授予网络 capabilities；`network = true` 第一版只授予出站客户端能力（例如 `internetClient`） | 不承诺服务端监听、入站连接或内网访问；不默认添加 `internetClientServer` / `privateNetworkClientServer` |
-| 备选方案 | restricted token 只作为可能的 MVP 备选，且必须显式标注读隔离缺失 | `WRITE_RESTRICTED` 可约束写访问检查，但不能提供“workspace 外权威 deny-read” |
+| restricted-token 写限制 | 已作为 accident-prevention MVP 实现，且必须显式标注读隔离缺失 | `WRITE_RESTRICTED` 可约束写访问检查，但不能提供“workspace 外权威 deny-read” |
 | 正式接入 | 仅在 Phase B 原型门槛和 ACL 方案评审通过后进入 Phase C | 避免把实验性 ACL 修改直接绑定用户配置 |
 
 不推荐 `CREATE_SUSPENDED -> 按 PID OpenThread -> ResumeThread`。按 PID 找线程存在标识复用、选错线程和额外权限问题，也没有必要。若某个受控 fallback 必须先 suspended 再 assign，应直接保留 `CreateProcess` 返回的 `PROCESS_INFORMATION.hThread` 并使用该 handle；但正式推荐路线仍是创建时的 `PROC_THREAD_ATTRIBUTE_JOB_LIST`。
@@ -44,7 +45,7 @@ Windows 实现必须把“进程生命周期”与“安全隔离”分开描述
 
 | 路径 | 当前位置 | 需要的改动方向 |
 |---|---|---|
-| `src/tools/bash.rs:58-100` | shell 工具描述当前直接描述 bubblewrap | Phase C 按平台生成准确描述；Windows 未接入前不能宣称处于 sandbox |
+| `src/tools/bash.rs:58-100` | shell 工具描述需按平台反映实际保证 | Windows 只描述已生效的 restricted-token 写限制；未来 hardened backend 也只能描述测试覆盖的保证 |
 | `src/tools/bash.rs:157-232` | Unix `ProcessGroupGuard` 与 Windows 顶层 `TerminateProcess` 降级 | Phase A 将 Windows guard 改为拥有/共享 Job handle；正常完成后 disarm，取消/drop 时终止 job |
 | `src/tools/bash.rs:234-300` | `Shell` 与 Windows PowerShell/Git Bash 检测 | 原生 spawn helper 必须保留现有 shell 选择、参数和 `PowerShell -NoProfile` 行为 |
 | `src/tools/bash.rs:322-500` | `run_bash`、bwrap 参数构造与 spawn | 平台分流：Unix 保持 bwrap；Windows enabled=false 走带 Job 的普通 shell；Phase C enabled=true 走 Job + AppContainer 原子创建 |
@@ -52,7 +53,7 @@ Windows 实现必须把“进程生命周期”与“安全隔离”分开描述
 | `src/tools/background.rs:274-300` | `RunningTask.process_group: Arc<AtomicI32>` | Windows 需要独立的 shared owned Job 状态，不能把 HANDLE 塞入整数 PID slot |
 | `src/tools/background.rs:455-493` | 后台 shell 建立 PID slot并调用 `run_bash` | 启动后把 job ownership 发布给 registry；处理“任务已取消但 job 尚未发布”的竞态 |
 | `src/tools/background.rs:677-711` | registry drop：Unix 杀进程组，Windows 按 PID `OpenProcess` | Windows 改为终止/关闭每个 task 自己持有的 job；不得重新按 PID 打开进程 |
-| `src/session_factory.rs:194-211` | 解析 sandbox 后统一执行 bwrap preflight | Phase A 按平台分流：Linux 保持 bwrap preflight；Windows `enabled = true` 由 `cfg(windows)` 明确返回“Windows sandbox backend 尚未实现”类错误，不依赖 PATH 中缺少 bwrap；Phase C 再替换为真实 Windows 后端 preflight |
+| `src/session_factory.rs:194-211` | sandbox preflight 已按平台分流 | Linux 保持 bwrap preflight；Windows `enabled = true` 启用 restricted-token 写限制 MVP，并对 `network = false`、`protect_git = true` 等不支持组合 fail-closed；未来 hardened backend 再扩展或替换 Windows preflight |
 | `src/tools.rs:41-48` | `bwrap_available()` | 保持为 Unix/bwrap 能力，不作为 Windows sandbox 判定依据 |
 | `src/config.rs:68-105` | `Sandbox`：`enabled/network/workspace_writable/writable_paths/readable_paths` | Phase B 不接入；Phase C 才映射完整 Windows 语义并验证所有字段 |
 | `Cargo.toml:43-47` | target-gated `windows-sys = 0.61` | 增加 Job/AppContainer/ACL 所需 features，依赖仍只在 Windows target 下 |
@@ -69,7 +70,7 @@ Phase A 不能改变 `enabled = false` 命令本身的 shell、参数、当前�
 4. 通过 `STARTUPINFOEXW` 的 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 在 `CreateProcessW` 创建时将新进程放入 job。
 5. 前台 guard 和后台 registry 持有 owned/shared Job handle。取消、`tokio::time::timeout`、后台取消、最后一个 registry owner drop 都应显式 `TerminateJobObject`；最后 handle 关闭时 `KILL_ON_JOB_CLOSE` 是兜底。
 6. 正常等待到 shell 与管道读取完成后解除 guard/释放 registry 状态，不将正常退出报告为取消，也不影响下一次命令。
-7. `enabled = false` 也执行以上步骤。Phase A 合入时，`SessionFactory` 必须按 `cfg(windows)` 对 `enabled = true` 明确返回“Windows sandbox backend 尚未实现”类错误，不得以 PATH 中恰好没有 `bwrap` 作为拒绝依据；Linux 的 bwrap preflight 保持不变。Phase C 再以真实 Windows backend preflight 替换该显式拒绝。
+7. `enabled = false` 也执行以上步骤。这里曾要求在 Windows `enabled = true` 时显式报告“backend 尚未实现”，那是 restricted-token MVP 实施前的历史过渡约定，现已失效。当前 `enabled = true` 启用 restricted-token 写限制 MVP，不支持的策略组合 fail-closed；未来 hardened backend 再扩展或替换 Windows preflight，Linux 的 bwrap preflight 保持不变。
 
 shared Job 状态需要表达“尚未创建 / 已发布 job / 已正常完成或已取消”。若取消先于 native spawn 完成，spawn 路径在发布 handle 时必须观察取消状态并立即终止 job，不能留下发布竞态。具体可用 `Arc<Mutex<State>>` 或等价的小型状态，但不得退回 PID + `AtomicI32`。
 
@@ -153,22 +154,22 @@ AppContainer 不等价于“只有一个低权限用户”：
 
 在这些问题有可执行方案前，Phase B 只能对受控临时目录实验，不能对真实 workspace 做不可恢复的递归授权，也不能进入正式配置。
 
-## 7. restricted-token 备选 MVP
+## 7. 已实现的 restricted-token 写限制 MVP
 
-若 AppContainer/ACL 路线无法满足兼容性或可恢复性，可另行评估 restricted token：
+当前 MVP 采用 restricted token：
 
 - `WRITE_RESTRICTED` 等机制可让写访问接受额外 restricted SID 检查，从而约束写入范围。
 - 它不能提供权威的 deny-read 边界；普通用户原本可读的 workspace 外内容仍可能可读。
-- 若选择该 MVP，产品、工具描述、错误信息和 README 都必须明确：**不保证 workspace 外不可读**，不得称其与 bwrap 或完整 Windows sandbox 等价。
+- 产品、工具描述、错误信息和 README 必须明确：**不保证 workspace 外不可读**，不得称其与 bwrap 或完整 Windows sandbox 等价。
 - 只复用本项目现有 pipe shell 模型；不复制 Codex 的 elevated runner、broker/IPC、ConPTY 或整套 Windows 执行框架。
 
-restricted-token MVP 仍需 Job Object、失败关闭和真实 Windows 测试，且不能把“限制写”描述成“文件系统隔离”。
+restricted-token MVP 已实现失败关闭和真实 Windows native spawn；Job Object 改为后续生命周期增强，不阻塞 MVP。当前取消、timeout 与 registry teardown 只终止顶层进程，后代可能继续持有 capability 并写入允许 roots。后续必须以原子入 Job Object 配合取消、timeout 与 registry drop 的进程树终止来关闭该生命周期缺口。它只是防止事故性误写的机制，不能称为安全 sandbox 或文件系统隔离。写根仅为按配置启用的 workspace 和全部 `writable_paths`；`workspace_writable = false` 不添加 workspace 写 ACE，`readable_paths` 不授权写入。无写根时只构造 inert capability SID，不设置文件 ACE。capability SID 由 canonical path 原始 UTF-16 code units 的长度分隔字节与 class 经 SHA-256 稳定派生，保留 canonical path 的原始拼写。只接受已存在、canonical、fixed local NTFS 的目录根；拒绝 UNC/device path、非目录根、根自身为 symlink/reparse point、NULL DACL 及 case-sensitive 根，不声称支持 case-sensitive directory。每个写根先派生本版本 capability SID 并读取 root ACL；仅当缺少本版本完整可继承 ACE、即将安装或升级并传播 ACL 时，才在任何 token 或 ACL 修改前以 `symlink_metadata`/`read_dir` 递归扫描且不跟随链接；exact ACE 已安装时后续命令跳过全树扫描和 ACL 传播。首次安装/升级扫描中 hard-linked 文件 descendants 与嵌套 symlink/reparse descendants 不受支持并 fail-closed。capability ACE 包含 `FILE_DELETE_CHILD` 并继承到 descendant directories，使写根内 create/overwrite/rename/delete/atomic replace 可用；不授予 write root 自身 `DELETE`。TokenDefaultDacl 保留 source token 的现有 DACL，只合并 capability SID 的 `GENERIC_ALL` ACE；不会向 Everyone 或 logon SID 新增该权限。`SeChangeNotifyPrivilege` 无法确认已分配时失败关闭。Windows `protect_git = true` shell 不受支持，在任何 token/ACL 变更前失败关闭；不实现 `.git` deny ACE 或 carve-out。成功添加的 synthetic SID ACE 持久保留；若多根 ACL 添加中途失败则不启动进程，先前 ACE 可能持久留下，但对不含 synthetic SID 的普通 token inert，不做危险的整 DACL rollback。不默认放行 TEMP/TMP、HOME、Cargo/NuGet 或引擎缓存。Everyone/logon-SID 原本可写的公共位置仍可能可写，workspace 外仍可读且网络不隔离。检查后并发路径替换（TOCTOU）仍是 remaining risk。policy anchor 没有在 MVP 中猜测性加 deny；现有 `.e-agent/config.toml` 若位于可写根内仍可能被修改。
 
 ## 8. Phase C：门槛通过后的正式接入
 
 只有 Phase B 验证矩阵通过、ACL 生命周期方案完成评审并有失败回滚测试后，才实施正式接入：
 
-1. `SessionFactory` sandbox preflight 按平台分流：Linux 保持现有 bwrap probe；Windows 用真实后端对文件系统支持、profile/SID、ACL 准备与 native spawn 能力做检查，并替换 Phase A 的“Windows sandbox backend 尚未实现”显式拒绝。
+1. `SessionFactory` sandbox preflight 保持平台分流：Linux 保持现有 bwrap probe；Windows hardened backend 在当前 restricted-token MVP preflight 上扩展或替换，对文件系统支持、profile/SID、ACL 准备与 native spawn 能力做检查。
 2. Windows `enabled = false` 继续采用 Phase A Job Object + 普通 shell；命令行为保持不变。
 3. Windows `enabled = true` 在一次原子创建中应用 Job list 与 security capabilities。ACL、profile、属性列表、pipe、process 创建中任一步失败都 fail-closed，并执行已审定回滚。
 4. 将 `workspace_writable`、`writable_paths`、`readable_paths`、`.git`/policy anchor 保护和 `network` 逐项定义为 Windows 可验证语义；无法安全映射的组合应在 preflight 拒绝，而不是忽略。
@@ -188,7 +189,7 @@ restricted-token MVP 仍需 Job Object、失败关闭和真实 Windows 测试，
 - 最后一个后台 registry owner drop 后全部退出，包括 job 尚在发布过程中的竞态用例。
 - 正常命令完成后不被误报为取消，不影响已完成输出，也不误杀后续新命令。
 - `enabled = false` 时 shell 选择、参数、cwd、环境、管道输出、退出码和前后台行为与改动前一致；只新增进程树清理保证。
-- Windows `enabled = true` 由 `cfg(windows)` 明确报“Windows sandbox backend 尚未实现”类错误并 fail-closed，不能依赖 PATH 中没有 bwrap，也不能仅因 Job Object 可用而执行；Linux bwrap preflight 保持原行为。
+- Windows `enabled = true` 启用 restricted-token 写限制 MVP；`network = false`、`protect_git = true` 等不支持组合在启动前 fail-closed，且不依赖 PATH 中是否存在 bwrap；Linux bwrap preflight 保持原行为。
 - 并发启动多个前台/后台命令，各自只进入自己的 job，取消或完成互不干扰。
 - 启动前预置无关的 inheritable handle，子进程只能继承 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 白名单中为其选定或安全复制的 inherited stdin handle 与 stdout/stderr 子端；pipe 父端及预置无关 handle 均不可继承。另验证前台和后台命令仍使用改动前的 inherited stdin 语义。
 - 分别对 Job 创建、`SetInformationJobObject`、pipe 创建、attribute list 初始化/更新及 `CreateProcessW` 注入故障；每个部分成功路径均证明无存活进程、无 handle 泄漏。
@@ -212,7 +213,7 @@ restricted-token MVP 仍需 Job Object、失败关闭和真实 Windows 测试，
 ### 9.3 Phase C
 
 - `Sandbox` 全部字段在 Windows 有文档化、平台化测试覆盖的语义；不支持的输入在启动前报错。
-- `enabled=false` 为 Phase A 生命周期治理但无文件/网络隔离；`enabled=true` 才表示已生效的完整 Windows 后端。
+- `enabled=false` 在 Phase A 获得生命周期治理但无文件/网络隔离；`enabled=true` 当前表示已生效的 restricted-token 写限制 MVP，Phase C 再将其升级为 hardened backend，仍不声称与 bwrap 等价。
 - `network=false/true`、workspace RO/RW、额外路径、前后台、取消、timeout、registry drop 均组合测试。
 - 并发启动多个完整 sandbox 命令，各自的 Job、profile/capabilities 与 ACL 生命周期互不串扰；取消或失败一个命令不影响其他命令。
 - 启动前预置无关的 inheritable handle，完整 sandbox 子进程仍只能继承 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 白名单中为其选定或安全复制的 stdin handle 与 stdout/stderr 子端，pipe 父端及无关 handle 均不可继承；若 Phase C 改变 stdin 策略，必须明确记录并分别验证前台、后台与控制台场景。
