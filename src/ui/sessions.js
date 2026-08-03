@@ -184,6 +184,16 @@ function workspaceListFor(ws) {
   return Array.isArray(l) ? l : [];
 }
 
+/* ws-chip 按 workspace 分色：以 state.workspaces 数组下标对固定色板取模
+   （色板 6 色，超 6 个 workspace 循环复用）。同一 workspace 的所有 chip
+   （列表行/组头/置顶行）同色，跨 workspace 一眼可辨。色类样式见
+   style.css 的 .ws-chip-0..5（Solarized 色 tint）。 */
+const WS_CHIP_PALETTE = 6;
+function wsChipClass(ws) {
+  const i = state.workspaces.indexOf(ws);
+  return i < 0 ? "" : "ws-chip-" + (i % WS_CHIP_PALETTE);
+}
+
 /* 聚合行：所有 workspace 的会话，每行携带所属 ws（row click 用 (wsId, sid)
    定位；session id 可能跨服务器撞名，绝不能只用 sid）。 */
 function aggregateSessionRows() {
@@ -234,7 +244,7 @@ function renderSessionList(list) {
     row.title = s.id + (s.model ? " · " + s.model : "") +
       (s.parent_session_id ? " · 子会话 ← " + s.parent_session_id : "");
 
-    const chip = el("span", "ws-chip", ws.name);   // 服务器徽章：跨服务器会话可区分
+    const chip = el("span", "ws-chip " + wsChipClass(ws), ws.name);  // 服务器徽章：跨服务器会话可区分
     chip.title = ws.url || ws.name;                // hover 显示服务器地址
     const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
     // 有标题优先显示：标题一行 + 完整 id 小字一行；无标题单行完整 id
@@ -1307,8 +1317,8 @@ function renderSidebarTree(force) {
         kidsByParent.get(x.parent_session_id).push(x);
       }
       const node = buildTreeRoot(s, kidsByParent.get(s.id) || [], ws.id);
-      // 行前加 server 徽章，跨 workspace 一眼可辨
-      node.querySelector(".tree-row")?.prepend(el("span", "ws-chip", ws.name));
+      // 行前加 server 徽章，跨 workspace 一眼可辨（与列表行/组头同色映射）
+      node.querySelector(".tree-row")?.prepend(el("span", "ws-chip " + wsChipClass(ws), ws.name));
       pinnedBody.appendChild(node);
     }
     pinnedSec.appendChild(pinnedBody);
@@ -1321,7 +1331,7 @@ function renderSidebarTree(force) {
     // ---- 组头：服务器名 + 徽章；点击切换 workspace（switchWorkspace 回列表视图） ----
     const header = el("div", "tree-ws-header");
     header.title = ws.url || ws.name;          // hover 显示服务器地址
-    const chip = el("span", "ws-chip", ws.name);
+    const chip = el("span", "ws-chip " + wsChipClass(ws), ws.name);
     header.appendChild(chip);
     if (err) {
       header.appendChild(el("span", "ws-err", "无法连接"));
@@ -1453,7 +1463,11 @@ function buildTreeRoot(s, kids, wsId) {
       toggleSidebarNode(wsId + ":" + s.id, toggle, kids, wsId);
     });
   }
-  const dot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
+  // busy-dot 聚合：父节点自身 busy，或任意直接子会话 busy（subagent 通常
+  // 一层，孙会话不计——需要时再递归）都亮橙点。点亮的 children 未展开
+  // 也能提示（dot 在行首，不依赖子节点渲染）。
+  const kidsBusy = kids.some((k) => k.busy);
+  const dot = el("span", "busy-dot" + ((s.busy || kidsBusy) ? " busy" : ""));
   // 有标题：两行（title 行 + 完整 id 行）；无标题：一行完整 id。
   // 单行 ellipsis 截断的长 id 无法区分会话，双行让 title/id 都可见。
   const hasTitle = !!s.title;
@@ -1481,7 +1495,8 @@ function buildTreeRoot(s, kids, wsId) {
     togglePin(s, () => { renderSidebarTree(true); renderSessionList(); }, ws);
   });
   row.append(toggle, dot, titleEl, count, pin);
-  row.title = (s.title || s.id) + (s.model ? " · " + s.model : "") + (s.busy ? "（处理中）" : "");
+  row.title = (s.title || s.id) + (s.model ? " · " + s.model : "")
+    + (s.busy ? "（处理中）" : (kidsBusy ? "（子任务处理中）" : ""));
   row.addEventListener("click", () => {
     if (s.active === false) { resumeSessionIn(wsId, s.id); return; }   // 与列表页一致：历史会话先恢复
     openSessionIn(wsId, s.id);

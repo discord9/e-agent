@@ -18,6 +18,7 @@ mmlEqnNo}
     --blue:   #268bd2;
     --cyan:   #2aa198;
     --green:  #859900;
+    --magenta: #d33682;
   }
 
   * { box-sizing: border-box; }
@@ -1195,6 +1196,15 @@ mmlEqnNo}
     text-overflow: ellipsis;
     flex: 0 0 auto;
   }
+  /* 服务器徽章分色：按 state.workspaces 下标循环取色（ws-chip-<n> 由
+     sessions.js wsChipClass 生成），同一 workspace 的 chip 全站同色。
+     浅色 tint 底在 hover/active 组头（base2/base3）下仍可读。 */
+  .ws-chip-0 { color: var(--blue);    border-color: var(--blue);    background: #e8f1f9; }
+  .ws-chip-1 { color: var(--cyan);    border-color: var(--cyan);    background: #e7f5f4; }
+  .ws-chip-2 { color: var(--green);   border-color: var(--green);   background: #f1f5e6; }
+  .ws-chip-3 { color: var(--orange);  border-color: var(--orange);  background: #faf0e8; }
+  .ws-chip-4 { color: var(--violet);  border-color: var(--violet);  background: #f0eef8; }
+  .ws-chip-5 { color: var(--magenta); border-color: var(--magenta); background: #f8eef3; }
   /* 分组头错误标记：muted 红字（服务器轮询失败，列表保留为 stale） */
   .ws-err { color: var(--red); font-size: 11px; opacity: 0.8; }
   /* 「当前」标记：激活 workspace 分组头右侧 */

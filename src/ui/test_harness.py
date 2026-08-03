@@ -2156,6 +2156,90 @@ async function main(){
     sessionsData = saveWs.dataA; sessionsDataB = saveWs.dataB;
 
     // =====================================================================
+    // 15b) ws-chip 分色 + 父节点 busy-dot 聚合子会话
+    //     A) chip 按 workspace 下标取色（ws-chip-<n>）：不同 workspace
+    //        色类不同；同一 workspace 的列表行/组头/置顶行 chip 同色。
+    //     B) 父节点 dot 亮 = s.busy 或任意直接子会话 busy（孙会话不计，
+    //        直接子即够用：subagent 通常一层）；无 busy 子则不亮。
+    // =====================================================================
+    sessionsData = [
+      { id: "c1", status: "Idle", title: "C 主会话", created_at: "2024-03-01T00:00:00Z", entry_count: 1, busy: false, active: true, pinned: true },
+      { id: "c1-child-busy", parent_session_id: "c1", label: "C 子任务(忙)", status: "Busy", entry_count: 1, busy: true, active: true },
+      { id: "c2", status: "Idle", title: "C2 主会话", created_at: "2024-03-02T00:00:00Z", entry_count: 1, busy: false, active: true },
+      { id: "c2-child-idle", parent_session_id: "c2", label: "C2 子任务(闲)", status: "Idle", entry_count: 1, busy: false, active: true },
+    ];
+    sessionsDataB = [
+      { id: "d1", status: "Idle", title: "D 主会话", created_at: "2024-04-01T00:00:00Z", entry_count: 1, busy: false, active: true, pinned: true },
+      { id: "d1-child-idle", parent_session_id: "d1", label: "D 子任务(闲)", status: "Idle", entry_count: 1, busy: false, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.view = "list";
+    state.searchQuery = "";
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set(["wsA:c1", "wsA:c2"]);   // 展开渲染子会话行
+    state.renameActive = false;
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSidebarTree(true);
+    renderSessionList();
+    const sec15 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    // 组头 chip：A=ws-chip-0，B=ws-chip-1（数组下标取色，互不相同）
+    const hdrA = sec15[1].querySelector(".tree-ws-header").querySelector(".ws-chip");
+    const hdrB = sec15[2].querySelector(".tree-ws-header").querySelector(".ws-chip");
+    const chipCls15 = (e) => (e.className.split(/\s+/).find((c) => c.startsWith("ws-chip-")) || "");
+    chk("ws-chip color class differs across workspaces",
+        chipCls15(hdrA) === "ws-chip-0" && chipCls15(hdrB) === "ws-chip-1",
+        "A=" + chipCls15(hdrA) + " B=" + chipCls15(hdrB));
+    // 置顶分组每行 prepend 的 chip：A/B 各一，与组头同色（同 workspace 同色）
+    const pinChips15 = sec15[0].querySelectorAll(".ws-chip");
+    const pinCls15 = [...pinChips15].map(chipCls15).filter((c) => c);
+    chk("pinned row chips share workspace color",
+        pinChips15.length === 2 && pinCls15.includes("ws-chip-0") && pinCls15.includes("ws-chip-1"),
+        "pins=" + pinCls15.join(","));
+    // 列表行 chip：全部带色类，A/B 两色都在（与组头同一映射）
+    const listChips15 = elsById["sessionList"].querySelectorAll(".ws-chip");
+    const listCls15 = [...listChips15].map(chipCls15);
+    chk("list row chips share workspace color",
+        listChips15.length >= 4 && listCls15.includes("ws-chip-0") && listCls15.includes("ws-chip-1"),
+        "list=" + listCls15.join(","));
+    // B) busy-dot 聚合：C（busy 子）亮、C2（idle 子）不亮、D（idle 子）不亮
+    const rows15 = elsById["sidebarTree"].querySelectorAll(".tree-row");
+    const dotOf15 = (r) => r.querySelector(".busy-dot");
+    const rowByTxt15 = (t) => [...rows15].find((r) => r.textContent.includes(t));
+    const c1Dot = dotOf15(rowByTxt15("C 主会话"));
+    const c2Dot = dotOf15(rowByTxt15("C2 主会话"));
+    const d1Dot = dotOf15(rowByTxt15("D 主会话"));
+    chk("parent dot busy when direct child busy",
+        c1Dot !== null && c2Dot !== null && d1Dot !== null
+        && c1Dot.classList.contains("busy") && !c2Dot.classList.contains("busy")
+        && !d1Dot.classList.contains("busy"),
+        "c1=" + c1Dot.className + " c2=" + c2Dot.className + " d1=" + d1Dot.className);
+    // B) 父自身 busy 的提示不被聚合吞掉：busy 子 → 「子任务处理中」，
+    //    无 busy 子 → 不提示
+    chk("parent title hints child busy",
+        rowByTxt15("C 主会话").title.includes("子任务处理中")
+        && !rowByTxt15("C2 主会话").title.includes("子任务处理中"),
+        "t1=" + rowByTxt15("C 主会话").title);
+    // 还原聚合状态（与 15 一致）
+    state.workspaces = saveWs.workspaces; state.workspace = saveWs.workspace; state.token = saveWs.token;
+    state.workspaceLists = saveWs.lists; state.workspaceErrors = saveWs.errors; state.lastList = saveWs.lastList;
+    state.sessionId = saveWs.sessionId; state.view = saveWs.view; state.searchQuery = saveWs.query;
+    state.sidebar.filter = saveWs.filter; state.sidebar.showAllWs = saveWs.showAll; state.sidebar.expanded = saveWs.expanded;
+    state.renameActive = false;
+    sessionsData = saveWs.dataA; sessionsDataB = saveWs.dataB;
+
+    // =====================================================================
     // 16) 删除 review 修复验证：后台删除（不切换/不重置视图 + 聚合列表同步
     //     移除被删服务器会话）、confirm 取消、在途轮询写回守卫、首/中/末
     //     active 删除回退。
