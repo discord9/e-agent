@@ -587,6 +587,8 @@ function openSession(id, onReady, epoch, timeoutMs) {
   // 已声明过）传入共享的代次，不再递增——一次用户动作只有一个 action epoch。
   const claimed = (epoch === undefined) ? ++sessionOpenEpoch : epoch;
   const wsId = state.workspace.id;    // 发起时的工作区（history/SSE 校验用）
+  stopTaskRows();              // 会话行级 output interval / delegate SSE 不跨导航存活
+  closeForkMenu();
   saveSessionState();          // 切走：保存当前会话（消息/滚动/分页/草稿）
   state.renameActive = false;  // 切换会话会销毁编辑框：清标志，恢复轮询重绘
   stopSSE();
@@ -837,25 +839,37 @@ const forkMenu = {
   items: [],       // 候选 [{at, seq, preview}, ...]（与渲染行一一对应）
   selected: 0,     // 当前选中索引
   loading: false,  // 是否正在拉取候选（渲染「加载中…」）
+  requestSeq: 0,    // 打开/关闭代次：同一会话重复打开时也丢弃更早候选响应
 };
+
+function forkContextCurrent(sid, wsId, epoch) {
+  return epoch === sessionOpenEpoch && state.workspace.id === wsId && state.sessionId === sid;
+}
 
 async function openForkMenu() {
   if (!state.sessionId) return;
+  const sid = state.sessionId;
+  const wsId = state.workspace.id;
+  const captured = sessionOpenEpoch;
+  const requestSeq = ++forkMenu.requestSeq;
   forkMenu.open = true;
   forkMenu.loading = true;
   forkMenu.items = [];
   forkMenu.selected = 0;
   renderForkMenu();
   try {
-    const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId) + "/fork-candidates");
+    const res = await api("/api/sessions/" + encodeURIComponent(sid) + "/fork-candidates");
+    if (!forkContextCurrent(sid, wsId, captured) || requestSeq !== forkMenu.requestSeq || !forkMenu.open) return;
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。", true); closeForkMenu(); return; }
     if (res.status === 404 || res.status === 405) { setBanner("⚠ 服务器不支持 fork（需新版后端）", true); closeForkMenu(); return; }
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
+    if (!forkContextCurrent(sid, wsId, captured) || requestSeq !== forkMenu.requestSeq || !forkMenu.open) return;
     forkMenu.items = Array.isArray(data) ? data : [];
     forkMenu.loading = false;
     renderForkMenu();
   } catch (e) {
+    if (!forkContextCurrent(sid, wsId, captured) || requestSeq !== forkMenu.requestSeq || !forkMenu.open) return;
     forkMenu.loading = false;
     setBanner("⚠ 加载 fork 候选失败：" + e.message, true);
     closeForkMenu();
@@ -863,6 +877,7 @@ async function openForkMenu() {
 }
 
 function closeForkMenu() {
+  ++forkMenu.requestSeq;   // 让已发出的 candidates 响应失效（含 blur/Esc/导航关闭）
   if (!forkMenu.open) return;
   forkMenu.open = false;
   forkMenu.items = [];
@@ -912,18 +927,23 @@ async function selectForkItem(i) {
   const item = forkMenu.items[i];
   if (!item) return;
   const sid = state.sessionId;
+  const wsId = state.workspace.id;
+  const captured = sessionOpenEpoch;
   const savedItems = forkMenu.items;       // 409 冲突时重开面板保留候选
   const savedSelected = forkMenu.selected;
   closeForkMenu();
+  const requestSeq = forkMenu.requestSeq;   // 同一会话重新打开/重选也会取代旧 POST
   try {
     const res = await api("/api/sessions/" + encodeURIComponent(sid) + "/fork",
       { method: "POST", body: JSON.stringify({ at: item.at }) });
+    if (!forkContextCurrent(sid, wsId, captured) || requestSeq !== forkMenu.requestSeq) return;
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。", true); return; }
     if (res.status === 409) {
       // 后端拒绝（非边界/越界）：提示原因并重开面板，保留候选供重选
       let msg = "HTTP 409";
       try {
         const d = await res.json();
+        if (!forkContextCurrent(sid, wsId, captured) || requestSeq !== forkMenu.requestSeq) return;
         if (d && typeof d.error === "string") msg = d.error;
         else if (d && typeof d.message === "string") msg = d.message;
       } catch (e) { /* 非 JSON 响应：用通用文本 */ }
@@ -936,6 +956,7 @@ async function selectForkItem(i) {
     }
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
+    if (!forkContextCurrent(sid, wsId, captured) || requestSeq !== forkMenu.requestSeq) return;
     const id = data && data.id;
     if (!id) throw new Error("响应缺少 id");
     // 成功：清空输入框，打开新会话并刷新侧边栏列表；banner 放最后——
@@ -946,6 +967,7 @@ async function selectForkItem(i) {
     refreshSessionsForSidebar();
     setBanner("已从历史 fork 出新会话：" + id);
   } catch (e) {
+    if (!forkContextCurrent(sid, wsId, captured) || requestSeq !== forkMenu.requestSeq) return;
     setBanner("⚠ fork 失败：" + e.message, true);
   }
 }
@@ -1115,6 +1137,10 @@ function autosizeInput() {
 
 /* token 变化后重启传输（轮询 / SSE） */
 function restartTransport() {
+  // 每次 token 重连声明独立代次：即使 workspace/session 未变，上一 token 的
+  // history/SSE 迟到响应也会因 captured !== sessionOpenEpoch 被丢弃。
+  const claimed = ++sessionOpenEpoch;
+  closeForkMenu();
   stopPolling();
   startPolling();
   pollSessions();
@@ -1123,7 +1149,7 @@ function restartTransport() {
     const id = state.sessionId;
     stopSSE();
     state.initSource = null;
-    openWith(id, true, undefined, state.workspace.id, sessionOpenEpoch);
+    openWith(id, true, undefined, state.workspace.id, claimed);
   }
   maybeHandleDeepLink();   // token 从空变有效：立即重试 pending 深链（不再等 poll round）
 }
@@ -1769,6 +1795,8 @@ function treeDeleteButton(s, wsId) {
 function clearCurrentSession() {
   ++sessionOpenEpoch;
   saveSessionState();
+  stopTaskRows();
+  closeForkMenu();
   stopSSE();
   state.sessionId = null;
   state.acc = null;

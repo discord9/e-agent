@@ -291,6 +291,8 @@ async function switchWorkspace(id, epoch) {
   const claimed = (epoch === undefined) ? ++sessionOpenEpoch : epoch;
   stopPolling();
   stopTasksPolling();
+  stopTaskRows();
+  closeForkMenu();
   stopSSE();
   // ---- 清空当前工作区的会话/聊天状态（其它 workspace 的聚合缓存保留） ----
   state.sessionId = null;

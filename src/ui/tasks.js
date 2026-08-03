@@ -165,12 +165,16 @@ function startOutputPoller(key, t, pre, onPhase) {
   };
   let tickInFlight = false;   // 防重入：上一轮未完成则跳过本轮（慢响应不叠加）
   const tick = async () => {
+    // clearInterval 无法撤回已排入事件队列的 tick；导航清理后即使旧回调
+    // 恰好开始执行，也必须在发请求前确认自己仍是该行的当前 poller。
+    if (state.tasks.pollers.get(key) !== intervalId) return;
     if (!state.token) { stop(false); return; }
     if (tickInFlight) return;
     tickInFlight = true;
     try {
       const res = await api("/api/sessions/" + encodeURIComponent(t.session_id || "")
         + "/tasks/" + encodeURIComponent(t.id) + "/output");
+      if (state.tasks.pollers.get(key) !== intervalId) return;
       if (res.status === 401 || res.status === 403) {
         setBanner("⚠ 认证失败：请检查 Token。");
         stop(false); return;
@@ -180,6 +184,7 @@ function startOutputPoller(key, t, pre, onPhase) {
         stop(true); return;
       }
       const text = await res.text();
+      if (state.tasks.pollers.get(key) !== intervalId) return;
       if (!pre.isConnected) { stop(false); return; }
       const txt = String(text).trim() !== "" ? String(text) : "";
       pre.classList.toggle("empty", txt === "");
@@ -191,9 +196,9 @@ function startOutputPoller(key, t, pre, onPhase) {
       tickInFlight = false;
     }
   };
-  tick();   // 启动即拉一次
   intervalId = setInterval(tick, 500);
   state.tasks.pollers.set(key, intervalId);
+  tick();   // 先登记所有权再立即拉一次，tick 顶部可统一做陈旧回调校验
 }
 
 function stopTaskPoller(key) {
@@ -222,6 +227,9 @@ function startTaskStream(t, key, streamEl, status) {
         headers: { "Accept": "text/event-stream" },
         signal: ctrl.signal,
       });
+      // workspace/会话导航会 abort 并从 map 移除旧流；迟到响应不得再写
+      // banner、状态或旧行文本（AbortController 在响应已落地时未必能阻止续体）。
+      if (ctrl.signal.aborted || state.tasks.streams.get(key) !== ctrl) return;
       if (res.status === 401 || res.status === 403) {
         setBanner("⚠ 认证失败：请检查 Token。");
         if (status) status.hidden = true;
@@ -242,8 +250,8 @@ function startTaskStream(t, key, streamEl, status) {
       let buf = "";
       for (;;) {
         const { done, value } = await reader.read();
+        if (ctrl.signal.aborted || state.tasks.streams.get(key) !== ctrl) break;
         if (done) break;
-        if (ctrl.signal.aborted) break;
         buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
         let idx;
         while ((idx = buf.indexOf("\n\n")) !== -1) {
@@ -252,8 +260,9 @@ function startTaskStream(t, key, streamEl, status) {
           handleTaskStreamBlock(block, streamEl, key);
         }
       }
-      // 正常结束（后端关闭流）：停止消费，保留已显示内容
-      if (status) status.hidden = true;
+      // 正常结束（后端关闭流）：停止消费，保留已显示内容。导航清理后的
+      // 旧流不再触碰已脱离 DOM 的状态节点。
+      if (!ctrl.signal.aborted && state.tasks.streams.get(key) === ctrl && status) status.hidden = true;
     } catch (e) {
       if (e && e.name === "AbortError") return;   // 主动收起/任务消失/重绘
       // 网络失败：保留已显示内容
@@ -268,6 +277,21 @@ function startTaskStream(t, key, streamEl, status) {
 function stopTaskStream(key) {
   const ctrl = state.tasks.streams.get(key);
   if (ctrl) { ctrl.abort(); state.tasks.streams.delete(key); }
+}
+
+/* workspace / 会话导航的统一行级资源清理。除了主任务 2s 轮询，展开行还
+   各自持有 output interval 或 delegate SSE；导航时全部停止并清掉旧 DOM，
+   防止旧 workspace/session 在后台继续请求。下次展开由最新 tasks.list 重建。 */
+function stopTaskRows() {
+  for (const key of [...state.tasks.pollers.keys()]) stopTaskPoller(key);
+  for (const key of [...state.tasks.streams.keys()]) stopTaskStream(key);
+  state.tasks.composerOpen = false;
+  lastTasksSig = "";
+  lastTasksRenderedSig = "";
+  if (els.composerTasks) {
+    els.composerTasks.hidden = true;
+    els.composerTasks.innerHTML = "";
+  }
 }
 
 /* 整体替换流式区文本（snapshot 重放 / AssistantText / 404 提示） */
