@@ -1315,6 +1315,30 @@ async function main(){
         prow.querySelector(".tparent") === null
         && prow.querySelectorAll(".tsid").length === 1,
         "parent=" + String(prow.querySelector(".tparent")));
+
+    // ---- 任务行序号：#<id>（后端 TaskMeta.id）----
+    // 有 id → badge 后、label 前显示 #<id>；无 id → 安静省略
+    renderTaskList([{ session_id: "s1", id: 90, kind: "delegate", label: "序号任务",
+      full_command: null, output: null, role: "coder" }], elsById["composerTasks"]);
+    let idRow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    let tidEl = idRow.querySelector(".task-meta.tid");
+    chk("task row shows #id after badge",
+        tidEl !== null && tidEl.textContent === "#90"
+        && idRow.querySelector(".kind-badge").nextSibling === tidEl,
+        "tid=" + (tidEl ? tidEl.textContent : "null"));
+    chk("tid sits before label",
+        tidEl !== null && tidEl.nextSibling !== null
+        && tidEl.nextSibling.className === "task-label"
+        && tidEl.nextSibling.textContent === "序号任务",
+        "next=" + (tidEl && tidEl.nextSibling ? tidEl.nextSibling.className : "null"));
+    // 无 id（异常/旧数据）→ 不渲染序号 span
+    renderTaskList([{ session_id: "s1", kind: "bash", label: "ls",
+      full_command: "ls", output: "", role: null }], elsById["composerTasks"]);
+    idRow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    chk("task row without id omits tid",
+        idRow.querySelector(".task-meta.tid") === null,
+        "tid=" + String(idRow.querySelector(".task-meta.tid")));
+
     await pollSessions();   // 还原激活 workspace 缓存（后续测试基于轮询状态继续）
 
     // ---- Token 折叠：默认收起 → 点击展开 → 输入后按钮「已设置」 → 再点收起 ----
