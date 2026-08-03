@@ -199,6 +199,8 @@ class El {
   closest(sel){ let n=this; while(n){ if(matchSel(n,sel)) return n; n=n._parent; } return null; }
   focus(){}
   blur(){}
+  setPointerCapture(){}
+  getBoundingClientRect(){ return { top: 0, bottom: 32, height: 32 }; }
 }
 const elsById={};
 for(const id of ["topActions","backBtn","backParentBtn","connState","banner","bannerText","bannerClose","tokenInput","tokenToggle","listView","chatView",
@@ -219,7 +221,7 @@ globalThis.navigator={ onLine:true };
 globalThis.confirm=()=>true;
 // gjs 自带 window 全局（不可整体替换）：就地补上页面需要的属性
 window.visualViewport=null; window.innerHeight=800;
-window.addEventListener=()=>{}; window.confirm=()=>true; window.setTimeout=()=>0;
+window.addEventListener=()=>{}; window.confirm=()=>true; window.setTimeout=()=>0; window.clearTimeout=()=>{};
 globalThis.history={ replaceState(){} };
 globalThis.location={ search:"" };
 globalThis.URLSearchParams=class{ constructor(){} get(){ return null; } };
@@ -446,6 +448,7 @@ globalThis.fetch=(url,opts={})=>{
     if (bPostDelayed) return abortable(new Promise((resolve) => { bPostResolve = resolve; }), signal);
     return resp(201, { id: "b-hist", status: "Idle", active: true }, signal);
   }
+  if(url.startsWith("http://b.local/api/sessions/")&&url.endsWith("/pin")&&m==="PUT") return resp(204,null,signal);
   if(url.startsWith("http://b.local/api/sessions/")&&m==="DELETE") return resp(204,null,signal);
   if(url==="/api/sessions"&&m==="POST") return resp(201,{id:"sess-new",status:"Idle"},signal);
   if(url.startsWith("/api/sessions/a1/history")) {
@@ -487,6 +490,7 @@ globalThis.fetch=(url,opts={})=>{
   if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{},signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{},signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/compact")) return resp(202,{},signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/pin")&&m==="PUT") return resp(204,null,signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/archive")&&m==="PUT") return resp(204,null,signal);
   if(url.startsWith("/api/sessions/")&&m==="DELETE") return resp(204,null,signal);
   return resp(404,{},signal);
@@ -2313,6 +2317,38 @@ async function main(){
         !pinTop.textContent.includes("a-np-child") && pinA.textContent.includes("a-np-child"),
         "topHas=" + pinTop.textContent.includes("a-np-child")
         + " aHas=" + pinA.textContent.includes("a-np-child"));
+
+    // 15a) 置顶顺序：直接调用排序入口等价于拖拽 drop，覆盖持久化与渲染。
+    localStorage.removeItem(PIN_ORDER_KEY);
+    chk("pin order: move persists cross-workspace ordered pairs",
+        movePinnedSession("wsB", "pb1", "wsA", "pa1", true) === true
+        && JSON.stringify(JSON.parse(localStorage.getItem(PIN_ORDER_KEY)))
+          === JSON.stringify([{wsId:"wsB",sid:"pb1"},{wsId:"wsA",sid:"pa1"}]),
+        "stored=" + localStorage.getItem(PIN_ORDER_KEY));
+    let orderedPinNodes = elsById["sidebarTree"].querySelector(".tree-ws-section.pinned")
+      .querySelector(".tree-ws-body").children;
+    chk("pin order: render follows stored order",
+        orderedPinNodes.length === 2
+        && orderedPinNodes[0].getAttribute("data-pin-sid") === "pb1"
+        && orderedPinNodes[1].getAttribute("data-pin-sid") === "pa1",
+        "ids=" + [...orderedPinNodes].map((n) => n.getAttribute("data-pin-sid")).join(","));
+    // 新置顶不在存储中：已记录项保持在前，新项沉底。
+    state.lastList.push({ id: "pa-new", status: "Idle", title: "A 新置顶",
+      entry_count: 1, active: true, pinned: true });
+    renderSidebarTree(true);
+    orderedPinNodes = elsById["sidebarTree"].querySelector(".tree-ws-section.pinned")
+      .querySelector(".tree-ws-body").children;
+    chk("pin order: newly pinned session appends after stored items",
+        orderedPinNodes.length === 3
+        && orderedPinNodes[2].getAttribute("data-pin-sid") === "pa-new",
+        "ids=" + [...orderedPinNodes].map((n) => n.getAttribute("data-pin-sid")).join(","));
+    // 取消置顶成功后清理该 wsId+sid（通过真实 togglePin 成功路径）。
+    await togglePin(state.workspaceLists["wsB"].find((x) => x.id === "pb1"), () => {}, state.workspaces[1]);
+    chk("pin order: unpin removes persisted entry",
+        !JSON.parse(localStorage.getItem(PIN_ORDER_KEY)).some((x) => x.wsId === "wsB" && x.sid === "pb1")
+        && JSON.parse(localStorage.getItem(PIN_ORDER_KEY)).some((x) => x.wsId === "wsA" && x.sid === "pa1"),
+        "stored=" + localStorage.getItem(PIN_ORDER_KEY));
+    localStorage.removeItem(PIN_ORDER_KEY);
     // 还原聚合状态（workspaces/workspaceLists/workspaceErrors/sidebar/数据源）
     state.workspaces = saveWs.workspaces; state.workspace = saveWs.workspace; state.token = saveWs.token;
     state.workspaceLists = saveWs.lists; state.workspaceErrors = saveWs.errors; state.lastList = saveWs.lastList;
@@ -2322,21 +2358,29 @@ async function main(){
     sessionsData = saveWs.dataA; sessionsDataB = saveWs.dataB;
 
     // =====================================================================
-    // 15b) workspace 标识分色 + 父节点 busy-dot 聚合子会话
+    // 15b) workspace 标识分色 + 父节点 busy 数量徽标 + 子会话分组
     //     A) 标识按 workspace 下标取色（ws-chip-<n>）：不同 workspace
     //        色类不同；同一 workspace 的列表 chip / 组头 chip / 置顶色条同色。
-    //     B) 父节点 dot 亮 = s.busy 或任意直接子会话 busy（孙会话不计，
-    //        直接子即够用：subagent 通常一层）；无 busy 子则不亮。
+    //     B) 父节点显示直接 busy 子会话数量；无 busy 子时，父自身 busy
+    //        保留脉动点，否则为绿色点。父自身与子会话同时 busy 时数字优先。
+    //     C) 展开父节点只直显 busy 子会话，idle（包括 active=true）收进
+    //        「历史子会话 (N)」折叠组。
     // =====================================================================
     sessionsData = [
       { id: "c1", status: "Idle", title: "C 主会话", created_at: "2024-03-01T00:00:00Z", entry_count: 1, busy: false, active: true, pinned: true },
-      { id: "c1-child-busy", parent_session_id: "c1", label: "C 子任务(忙)", status: "Busy", entry_count: 1, busy: true, active: true },
+      { id: "c1-child-busy-1", parent_session_id: "c1", label: "C 子任务忙一", status: "Busy", entry_count: 1, busy: true, active: true },
+      { id: "c1-child-busy-2", parent_session_id: "c1", label: "C 子任务忙二", status: "Busy", entry_count: 1, busy: true, active: true },
       { id: "c2", status: "Idle", title: "C2 主会话", created_at: "2024-03-02T00:00:00Z", entry_count: 1, busy: false, active: true },
-      { id: "c2-child-idle", parent_session_id: "c2", label: "C2 子任务(闲)", status: "Idle", entry_count: 1, busy: false, active: true },
+      { id: "c2-child-busy", parent_session_id: "c2", label: "C2 子任务忙", status: "Busy", entry_count: 1, busy: true, active: true },
+      { id: "c2-child-idle", parent_session_id: "c2", label: "C2 子任务闲", status: "Idle", entry_count: 1, busy: false, active: true },
+      { id: "e1", status: "Idle", title: "E 主会话", created_at: "2024-03-03T00:00:00Z", entry_count: 1, busy: false, active: true },
+      { id: "e1-child-idle", parent_session_id: "e1", label: "E 子任务闲", status: "Idle", entry_count: 1, busy: false, active: true },
     ];
     sessionsDataB = [
-      { id: "d1", status: "Idle", title: "D 主会话", created_at: "2024-04-01T00:00:00Z", entry_count: 1, busy: false, active: true, pinned: true },
-      { id: "d1-child-idle", parent_session_id: "d1", label: "D 子任务(闲)", status: "Idle", entry_count: 1, busy: false, active: true },
+      { id: "d1", status: "Busy", title: "D 主会话", created_at: "2024-04-01T00:00:00Z", entry_count: 1, busy: true, active: true, pinned: true },
+      { id: "d1-child-idle", parent_session_id: "d1", label: "D 子任务闲", status: "Idle", entry_count: 1, busy: false, active: true },
+      { id: "f1", status: "Busy", title: "F 主会话", created_at: "2024-04-02T00:00:00Z", entry_count: 1, busy: true, active: true },
+      { id: "f1-child-busy", parent_session_id: "f1", label: "F 子任务忙", status: "Busy", entry_count: 1, busy: true, active: true },
     ];
     state.workspaces = [
       { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
@@ -2352,7 +2396,7 @@ async function main(){
     state.searchQuery = "";
     state.sidebar.filter = "";
     state.sidebar.showAllWs = new Set();
-    state.sidebar.expanded = new Set(["wsA:c1", "wsA:c2"]);   // 展开渲染子会话行
+    state.sidebar.expanded = new Set(["wsA:c1", "wsA:c2", "wsA:e1"]);   // 展开验证 busy 直显 / idle 折叠
     state.renameActive = false;
     await pollAllWorkspaces();
     await flush();
@@ -2380,26 +2424,53 @@ async function main(){
     chk("list row chips share workspace color",
         listChips15.length >= 4 && listCls15.includes("ws-chip-0") && listCls15.includes("ws-chip-1"),
         "list=" + listCls15.join(","));
-    // B) busy-dot 聚合：C（busy 子）亮、C2（idle 子）不亮、D（idle 子）不亮
+    // B) 数量徽标 / 父自身 busy 点 / idle 绿点的五种组合
     const rows15 = elsById["sidebarTree"].querySelectorAll(".tree-row");
-    console.log("DBG rows15=" + rows15.length + " texts=" + [...rows15].slice(0, 6).map((r) => JSON.stringify((r.textContent || "").slice(0, 20))).join(" | "));
-    console.log("DBG c1html=" + (rows15[0] && rows15[0].innerHTML || "").slice(0, 400));
     const dotOf15 = (r) => r.querySelector(".busy-dot");
     const rowByTxt15 = (t) => [...rows15].find((r) => r.textContent.includes(t));
     const c1Dot = dotOf15(rowByTxt15("C 主会话"));
     const c2Dot = dotOf15(rowByTxt15("C2 主会话"));
     const d1Dot = dotOf15(rowByTxt15("D 主会话"));
-    chk("parent dot busy when direct child busy",
-        c1Dot !== null && c2Dot !== null && d1Dot !== null
-        && c1Dot.classList.contains("busy") && !c2Dot.classList.contains("busy")
-        && !d1Dot.classList.contains("busy"),
-        "c1=" + c1Dot.className + " c2=" + c2Dot.className + " d1=" + d1Dot.className);
-    // B) 父自身 busy 的提示不被聚合吞掉：busy 子 → 「子任务处理中」，
-    //    无 busy 子 → 不提示
-    chk("parent title hints child busy",
+    const e1Dot = dotOf15(rowByTxt15("E 主会话"));
+    const f1Dot = dotOf15(rowByTxt15("F 主会话"));
+    chk("busy badge shows two busy direct children",
+        c1Dot.classList.contains("busy-count") && c1Dot.textContent === "2",
+        "class=" + c1Dot.className + " text=" + c1Dot.textContent);
+    chk("busy badge counts busy child, not idle child",
+        c2Dot.classList.contains("busy-count") && c2Dot.textContent === "1",
+        "class=" + c2Dot.className + " text=" + c2Dot.textContent);
+    chk("parent-only busy keeps pulsing dot, not count",
+        d1Dot.classList.contains("busy") && !d1Dot.classList.contains("busy-count")
+        && d1Dot.textContent === "",
+        "class=" + d1Dot.className + " text=" + d1Dot.textContent);
+    chk("fully idle parent keeps green dot",
+        !e1Dot.classList.contains("busy") && !e1Dot.classList.contains("busy-count")
+        && e1Dot.textContent === "",
+        "class=" + e1Dot.className + " text=" + e1Dot.textContent);
+    chk("busy child count takes priority when parent also busy",
+        f1Dot.classList.contains("busy-count") && !f1Dot.classList.contains("busy")
+        && f1Dot.textContent === "1",
+        "class=" + f1Dot.className + " text=" + f1Dot.textContent);
+    chk("parent title keeps child-busy hint",
         rowByTxt15("C 主会话").title.includes("子任务处理中")
-        && !rowByTxt15("C2 主会话").title.includes("子任务处理中"),
-        "t1=" + rowByTxt15("C 主会话").title);
+        && rowByTxt15("F 主会话").title.includes("子任务处理中")
+        && !rowByTxt15("E 主会话").title.includes("子任务处理中"),
+        "c=" + rowByTxt15("C 主会话").title + " f=" + rowByTxt15("F 主会话").title);
+    // C) busy 子会话直显；active=true 的 idle 子会话也必须进入默认收起的历史组
+    const c2BusyRow = rowByTxt15("C2 子任务忙");
+    const c2IdleRow = rowByTxt15("C2 子任务闲");
+    const e1IdleRow = rowByTxt15("E 子任务闲");
+    const histLabels15 = elsById["sidebarTree"].querySelectorAll(".tree-hist-label");
+    chk("expanded parent directly shows only busy children",
+        c2BusyRow.parentNode.hidden === false
+        && c2IdleRow.classList.contains("tree-hist") && c2IdleRow.parentNode.hidden === true
+        && e1IdleRow.classList.contains("tree-hist") && e1IdleRow.parentNode.hidden === true,
+        "busyHidden=" + c2BusyRow.parentNode.hidden
+        + " c2IdleHidden=" + c2IdleRow.parentNode.hidden
+        + " e1IdleHidden=" + e1IdleRow.parentNode.hidden);
+    chk("idle children are counted in collapsed history groups",
+        [...histLabels15].filter((e) => e.textContent === "历史子会话 (1)").length >= 2,
+        "labels=" + [...histLabels15].map((e) => e.textContent).join(","));
     // 还原聚合状态（与 15 一致）
     state.workspaces = saveWs.workspaces; state.workspace = saveWs.workspace; state.token = saveWs.token;
     state.workspaceLists = saveWs.lists; state.workspaceErrors = saveWs.errors; state.lastList = saveWs.lastList;
