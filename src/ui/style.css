@@ -1372,18 +1372,34 @@ mmlEqnNo}
   }
   /* 手机宽度（390px）：顶栏挤进汉堡按钮后收紧间距/字号，保证不横向溢出 */
   @media (max-width: 480px) {
-    #topbar { gap: 8px; padding: 8px 10px; }
+    #topbar { gap: 6px; padding: 6px 8px; }
     #sidebarBtn { padding: 2px 8px; }
-    .top-actions { gap: 5px; min-width: 0; }
+    .brand { font-size: 13px; }
+    .top-actions { gap: 5px; min-width: 0; flex-wrap: nowrap; }
+    /* 返回按钮文字禁止换行（否则窄 flex 里被挤成多行，把顶栏撑到 100px+）；
+       收紧内边距/字号，让一行放得下 */
+    #backBtn, #backParentBtn { white-space: nowrap; padding: 3px 6px; font-size: 12px; }
+    #workspaceSelect { max-width: 96px; min-width: 55px; padding: 3px 4px; font-size: 11px; }
+    .ws-btn { padding: 2px 5px; font-size: 11px; }
     .conn-state {
       font-size: 11px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
       max-width: 34vw;
+      min-width: 0;   /* 允许 flex 收缩：长状态文本省略号截断，不撑高/溢出 */
     }
-    #tokenInput { width: 108px; min-width: 0; }
+    .token-toggle { padding: 3px 8px; font-size: 11px; }
+    #tokenInput { width: 108px; min-width: 0; font-size: 12px; padding: 3px 6px; }
+    /* 子会话导航（← 主会话）：手机顶栏一行放不下，隐藏；侧边栏树仍可回到主会话 */
+    #backParentBtn { display: none; }
     /* 添加面板窄屏换行，不横向溢出 */
     .ws-editor { flex-wrap: wrap; max-width: calc(100vw - 20px); right: 10px; }
     .ws-editor input { flex: 1 1 100px; width: auto; }
+  }
+  /* 更窄的手机（≤360px，如 320px 的 iPhone SE）：再藏品牌名，保证单行不溢出 */
+  @media (max-width: 360px) {
+    .brand { display: none; }
+    .token-toggle { padding: 2px 6px; }
+    #workspaceSelect { max-width: 80px; }
   }
