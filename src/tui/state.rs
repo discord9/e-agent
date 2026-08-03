@@ -100,6 +100,18 @@ pub(crate) fn truncate_background_output(output: &str) -> String {
     result
 }
 
+/// Default-true flag: model reasoning ("thinking") lines start collapsed.
+/// Wrapped so `TuiState` can keep `#[derive(Default)]` — a plain `bool`
+/// would default to `false` (= expanded).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CollapseThinking(pub(crate) bool);
+
+impl Default for CollapseThinking {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct TuiState {
     /// This session's id, shown in the input border (so it can be resumed
@@ -126,6 +138,11 @@ pub(crate) struct TuiState {
     pub(crate) busy: Option<BusyState>,
     pub(crate) streamed: bool,
     pub(crate) active_lane: Option<ActiveStreamLane>,
+    /// Whether model reasoning ("thinking") lines render as a single
+    /// collapsed summary row instead of the full wrapped text. Global
+    /// toggle (Tab), shared by rendering and scroll accounting so the two
+    /// never disagree on how many rows a thinking block occupies.
+    pub(crate) collapse_thinking: CollapseThinking,
     pub(crate) tokens_context: u64,
     /// Configured context window (token count) from the model profile, used
     /// to display a usage percentage and trigger the red style at >= 80%.
@@ -359,15 +376,20 @@ impl TaskDetail {
             .map(|text| DisplayLine {
                 text,
                 kind: LineKind::Dim,
+                collapsed_summary: None,
             })
             .collect();
         self.window.source_start = 0;
         self.window.source_end = self.lines.len();
         self.window.local_offset = 0;
         if anchor_bottom {
-            let total =
-                render_bounded_window(&local_window_lines(&self.lines, &self.window), width, false)
-                    .len();
+            let total = render_bounded_window(
+                &local_window_lines(&self.lines, &self.window, false),
+                width,
+                false,
+                false,
+            )
+            .len();
             self.window.local_offset = total.saturating_sub(height);
         }
     }
@@ -386,6 +408,7 @@ impl TaskDetail {
         );
         self.window.follow_bottom = true;
         self.window.frozen_tail_cursor = None;
+        self.window.frozen_tail_summary = None;
         self.window.frozen_source_end = 0;
     }
 
@@ -398,6 +421,7 @@ impl TaskDetail {
         self.load_page(0, capacity, false, width, height);
         self.window.follow_bottom = true;
         self.window.frozen_tail_cursor = None;
+        self.window.frozen_tail_summary = None;
         self.window.frozen_source_end = 0;
     }
 
@@ -421,9 +445,13 @@ impl TaskDetail {
         if self.window.follow_bottom {
             return;
         }
-        let total =
-            render_bounded_window(&local_window_lines(&self.lines, &self.window), width, false)
-                .len();
+        let total = render_bounded_window(
+            &local_window_lines(&self.lines, &self.window, false),
+            width,
+            false,
+            false,
+        )
+        .len();
         if self.window.local_offset.saturating_add(height) < total {
             self.window.local_offset += 1;
         } else if self.base_line + self.lines.len() < self.spool.line_count() {
@@ -459,9 +487,13 @@ impl TaskDetail {
         if self.window.follow_bottom {
             return;
         }
-        let total =
-            render_bounded_window(&local_window_lines(&self.lines, &self.window), width, false)
-                .len();
+        let total = render_bounded_window(
+            &local_window_lines(&self.lines, &self.window, false),
+            width,
+            false,
+            false,
+        )
+        .len();
         if self.window.local_offset.saturating_add(height) < total {
             self.window.local_offset += height;
         } else if self.base_line + self.lines.len() < self.spool.line_count() {
@@ -709,8 +741,10 @@ impl TuiState {
 
     /// Keys pressed while attached: F2 toggles the tasks panel (so another
     /// session can be selected), scroll keys move the attached scrollback,
-    /// Enter steers the session (queues a prompt for its next turn), Ctrl-C
-    /// cancels its in-flight turn, everything else edits the steering input.
+    /// Tab collapses/expands model reasoning (same flag and tail re-anchor
+    /// as the main view), Enter steers the session (queues a prompt for its
+    /// next turn), Ctrl-C cancels its in-flight turn, everything else edits
+    /// the steering input.
     pub(crate) fn handle_attached_key(&mut self, key: KeyEvent, input_width: usize) {
         if key.code == KeyCode::F(2) {
             self.show_tasks = !self.show_tasks;
@@ -727,6 +761,17 @@ impl TuiState {
             | KeyCode::PageDown
             | KeyCode::Home
             | KeyCode::End => attached.state.handle_scroll(key),
+            KeyCode::Tab => {
+                // Collapse/expand the attached scrollback's thinking blocks,
+                // mirroring the main view. Tab has no input-editing use in
+                // the attached buffer (see AttachedView::edit_input), so the
+                // key is free. The attached render path already forwards
+                // collapse_thinking to the shared renderer; re-anchor at the
+                // tail because the visual geometry changes (each thinking
+                // block shrinks to one summary row).
+                attached.state.collapse_thinking.0 = !attached.state.collapse_thinking.0;
+                attached.state.follow();
+            }
             KeyCode::Enter if key.modifiers == KeyModifiers::ALT => {
                 attached.input.insert_char('\n');
             }
@@ -865,6 +910,14 @@ impl TuiState {
             | KeyCode::PageDown
             | KeyCode::Home
             | KeyCode::End => self.handle_scroll(key),
+            // Collapse/expand model reasoning. The visual geometry changes
+            // (each thinking block shrinks to one summary row), so drop any
+            // frozen scroll state and let the next draw re-anchor at the
+            // tail under the new collapse state.
+            KeyCode::Tab => {
+                self.collapse_thinking.0 = !self.collapse_thinking.0;
+                self.follow();
+            }
             KeyCode::Enter => {
                 // Alt+Enter inserts a newline (Shift+Enter is not
                 // distinguishable in most terminals).
@@ -1121,6 +1174,18 @@ impl TuiState {
                     if self.active_lane.is_some() {
                         self.window.frozen_tail_cursor =
                             self.lines.last().map(|line| line.text.len());
+                        // Pin the collapsed summary to the freeze point so
+                        // the frozen view's (N 行) count stops growing as
+                        // deltas keep streaming in.
+                        self.window.frozen_tail_summary = self.lines.last().and_then(|line| {
+                            (line.kind == LineKind::Thinking && self.collapse_thinking.0).then(
+                                || {
+                                    line.collapsed_summary.clone().unwrap_or_else(|| {
+                                        CollapsedSummary::new(&line.text, self.inner_width.max(1))
+                                    })
+                                },
+                            )
+                        });
                     }
                 }
                 let w = self.inner_width.max(1);
@@ -1128,7 +1193,11 @@ impl TuiState {
                     self.window.local_offset -= 1;
                 } else if self.window.source_start > 0 {
                     self.window.source_start -= 1;
-                    let n = line_visual_rows(&self.lines[self.window.source_start], w);
+                    let n = line_visual_rows(
+                        &self.lines[self.window.source_start],
+                        w,
+                        self.collapse_thinking.0,
+                    );
                     self.window.local_offset = n.saturating_sub(1);
                 }
                 if self.at_scrollback_top() {
@@ -1147,6 +1216,7 @@ impl TuiState {
                         && state.window.source_end > state.window.frozen_source_end
                     {
                         state.window.frozen_tail_cursor = None;
+                        state.window.frozen_tail_summary = None;
                     }
                 });
             }
@@ -1159,6 +1229,18 @@ impl TuiState {
                     if self.active_lane.is_some() {
                         self.window.frozen_tail_cursor =
                             self.lines.last().map(|line| line.text.len());
+                        // Pin the collapsed summary to the freeze point so
+                        // the frozen view's (N 行) count stops growing as
+                        // deltas keep streaming in.
+                        self.window.frozen_tail_summary = self.lines.last().and_then(|line| {
+                            (line.kind == LineKind::Thinking && self.collapse_thinking.0).then(
+                                || {
+                                    line.collapsed_summary.clone().unwrap_or_else(|| {
+                                        CollapsedSummary::new(&line.text, self.inner_width.max(1))
+                                    })
+                                },
+                            )
+                        });
                     }
                 }
                 let step = 10usize;
@@ -1167,7 +1249,11 @@ impl TuiState {
                 let mut prepended_rows = 0usize;
                 while deficit > 0 && self.window.source_start > 0 {
                     self.window.source_start -= 1;
-                    let rows = line_visual_rows(&self.lines[self.window.source_start], w);
+                    let rows = line_visual_rows(
+                        &self.lines[self.window.source_start],
+                        w,
+                        self.collapse_thinking.0,
+                    );
                     prepended_rows += rows;
                     deficit = deficit.saturating_sub(rows);
                     if deficit == 0 {
@@ -1201,6 +1287,7 @@ impl TuiState {
                         && state.window.source_end > state.window.frozen_source_end
                     {
                         state.window.frozen_tail_cursor = None;
+                        state.window.frozen_tail_summary = None;
                     }
                 });
             }
@@ -1215,6 +1302,7 @@ impl TuiState {
                 self.window.source_start = 0;
                 self.window.local_offset = 0;
                 self.window.frozen_tail_cursor = None;
+                self.window.frozen_tail_summary = None;
                 // If older history is still unloaded, queue a
                 // jump-to-oldest load (`load_oldest` in one step) rather
                 // than the stepwise PageUp path: with N compaction
@@ -1233,6 +1321,7 @@ impl TuiState {
             KeyCode::End => {
                 self.window.follow_bottom = true;
                 self.window.frozen_tail_cursor = None;
+                self.window.frozen_tail_summary = None;
             }
             _ => {}
         }
@@ -1469,6 +1558,102 @@ impl TuiState {
         self.head_start += n;
     }
 
+    /// Refresh the cached collapsed summary of a `Thinking` line whose text
+    /// just changed, using the current render width. Before the first draw
+    /// the width is unknown (`inner_width == 0`), so the cache is left
+    /// `None`; the draw entry then recomputes it from the complete source
+    /// line (`refresh_window_collapsed_summaries`).
+    fn refresh_collapsed_summary(line: &mut DisplayLine, width: usize) {
+        if line.kind == LineKind::Thinking && width > 0 {
+            line.collapsed_summary = Some(CollapsedSummary::new(&line.text, width));
+        }
+    }
+
+    /// Incrementally extend the cached collapsed summary of a `Thinking`
+    /// line after `delta` was appended to its text. A cache bound to the
+    /// current width is extended by wrapping only the delta
+    /// (`CollapsedSummary::append_delta`) — streaming N small deltas costs
+    /// O(total text), not O(N × total). A missing cache (width unknown at
+    /// append time — attach/snapshot replay, history loads) or one computed
+    /// at a stale width (terminal resized since the last append) falls back
+    /// to a full recompute from the complete source text.
+    fn update_collapsed_summary(line: &mut DisplayLine, delta: &str, width: usize) {
+        if line.kind != LineKind::Thinking || width == 0 {
+            return;
+        }
+        match &mut line.collapsed_summary {
+            Some(cache) if cache.width == width => cache.append_delta(delta, width),
+            _ => line.collapsed_summary = Some(CollapsedSummary::new(&line.text, width)),
+        }
+    }
+
+    /// Recompute the cached collapsed summary of every `Thinking` line in
+    /// the current render window whose cache is absent or was computed at a
+    /// different width. Called on every draw AFTER the terminal width is
+    /// known and the window is anchored but BEFORE `local_window_lines`
+    /// truncates the text, so the `(N 行)` count is computed from the
+    /// COMPLETE source line — fixing attach/snapshot replay (width unknown
+    /// at append time, cache never populated) and terminal resizes (cache
+    /// bound to the old width). Only caches whose width mismatches are
+    /// recomputed, so steady-state drawing stays O(window) with no
+    /// hard-wraps. A frozen tail summary is re-wrapped at the current width
+    /// from the freeze-time text (the tail up to the frozen cursor), so a
+    /// resize cannot pin a stale count while the pin still excludes
+    /// post-freeze deltas.
+    ///
+    /// The scan covers only the source lines `local_window_lines` will
+    /// actually render — the head of the window when the whole window fits
+    /// the source-line budget, otherwise the LAST `MAX_RENDER_SOURCE_LINES`
+    /// lines of the window. The window range `[source_start, source_end)`
+    /// itself grows without bound as the user scrolls down
+    /// (`extend_window_down` only advances `source_end`), so scanning the
+    /// whole range would make every frame O(history browsed) after paging
+    /// from Home through a long session; aligning with `local_window_lines`
+    /// bounds this frame to O(MAX_RENDER_SOURCE_LINES). When the whole
+    /// window fits the budget the head and tail coincide, so one formula
+    /// covers both shapes.
+    pub(crate) fn refresh_window_collapsed_summaries(&mut self, width: usize) {
+        if width == 0 || !self.collapse_thinking.0 {
+            return;
+        }
+        let end = self.window.source_end.min(self.lines.len());
+        let start = end
+            .saturating_sub(MAX_RENDER_SOURCE_LINES)
+            .max(self.window.source_start.min(end));
+        for line in &mut self.lines[start..end] {
+            if line.kind == LineKind::Thinking
+                && line
+                    .collapsed_summary
+                    .as_ref()
+                    .is_none_or(|cache| cache.width != width)
+            {
+                line.collapsed_summary = Some(CollapsedSummary::new(&line.text, width));
+            }
+        }
+        // Frozen tail summary: keep the freeze-time text (up to the frozen
+        // cursor) but re-wrap it at the current width.
+        let stale_frozen = self
+            .window
+            .frozen_tail_summary
+            .as_ref()
+            .is_some_and(|summary| summary.width != width);
+        if stale_frozen
+            && self.window.source_end > 0
+            && let Some(cursor) = self.window.frozen_tail_cursor
+        {
+            let tail_index = self.window.source_end - 1;
+            let recomputed = self.lines.get(tail_index).and_then(|line| {
+                (line.kind == LineKind::Thinking).then(|| {
+                    let end = utf8_floor_boundary(&line.text, cursor.min(line.text.len()));
+                    CollapsedSummary::new(&line.text[..end], width)
+                })
+            });
+            if recomputed.is_some() {
+                self.window.frozen_tail_summary = recomputed;
+            }
+        }
+    }
+
     pub(crate) fn push_agent_event_inner(&mut self, event: AgentEvent) {
         let ends_delta = matches!(
             &event,
@@ -1508,7 +1693,14 @@ impl TuiState {
             }
             AgentEvent::ReasoningDelta(text) if !text.is_empty() => {
                 if self.active_lane == Some(ActiveStreamLane::Reasoning) {
-                    self.lines.last_mut().unwrap().text.push_str(&text);
+                    let line = self.lines.last_mut().unwrap();
+                    line.text.push_str(&text);
+                    // The text changed: extend the cached collapsed summary
+                    // incrementally (wrap only the delta) instead of
+                    // hard-wrapping the (possibly MB-sized) accumulated text
+                    // once per delta. Width unknown (never drawn) or stale
+                    // (resized) falls back to a full recompute.
+                    Self::update_collapsed_summary(line, &text, self.inner_width);
                 } else {
                     self.push_line(format!("thinking: {text}"), LineKind::Thinking);
                     self.active_lane = Some(ActiveStreamLane::Reasoning);
@@ -1551,13 +1743,21 @@ impl TuiState {
     pub(crate) fn follow(&mut self) {
         self.window.follow_bottom = true;
         self.window.frozen_tail_cursor = None;
+        self.window.frozen_tail_summary = None;
         self.window.frozen_source_end = 0;
         // source_start/source_end will be anchored at the tail on next draw.
     }
 
     pub(crate) fn push_line(&mut self, text: String, kind: LineKind) {
         let was_empty = self.lines.is_empty();
-        self.lines.push(DisplayLine { text, kind });
+        self.lines.push(DisplayLine {
+            text,
+            kind,
+            collapsed_summary: None,
+        });
+        if kind == LineKind::Thinking {
+            Self::refresh_collapsed_summary(self.lines.last_mut().unwrap(), self.inner_width);
+        }
         if !was_empty && self.window.follow_bottom {
             self.window.source_end = self.lines.len();
         }
@@ -1658,6 +1858,7 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
         } => vec![DisplayLine {
             text: format!("you> {content}"),
             kind: LineKind::User,
+            collapsed_summary: None,
         }],
         SessionEntry::Message {
             message: Message::Assistant(message),
@@ -1668,6 +1869,7 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
                 vec![DisplayLine {
                     text,
                     kind: LineKind::Normal,
+                    collapsed_summary: None,
                 }]
             })
             .unwrap_or_default(),
@@ -1686,10 +1888,12 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
             } else {
                 LineKind::ToolResult
             },
+            collapsed_summary: None,
         }],
         SessionEntry::Compaction { summary, .. } => vec![DisplayLine {
             text: format!("compacted: {summary}"),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         }],
         SessionEntry::Notice { text } => vec![DisplayLine {
             text: text.clone(),
@@ -1698,6 +1902,7 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
             } else {
                 LineKind::Dim
             },
+            collapsed_summary: None,
         }],
         SessionEntry::BackgroundCompletion {
             id, output, label, ..
@@ -1705,11 +1910,13 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
             let mut lines = vec![DisplayLine {
                 text: background_completion_header(*id, label.as_deref()),
                 kind: LineKind::Dim,
+                collapsed_summary: None,
             }];
             for line in truncate_background_output(output).lines() {
                 lines.push(DisplayLine {
                     text: line.to_owned(),
                     kind: LineKind::Dim,
+                    collapsed_summary: None,
                 });
             }
             lines
@@ -1717,6 +1924,7 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
         SessionEntry::ForkedFrom { source, at, .. } => vec![DisplayLine {
             text: format!("forked from {source} at entry {at}"),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         }],
     }
 }

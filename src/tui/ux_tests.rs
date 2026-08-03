@@ -141,7 +141,7 @@ fn home_budgets_from_start_when_head_segment_exceeds_byte_cap() {
     }
     state.handle_scroll(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
     // Direct check of the local window (bypasses draw, isolates the bug).
-    let local = local_window_lines(&state.lines, &state.window);
+    let local = local_window_lines(&state.lines, &state.window, false);
     assert_eq!(
         local.first().map(|l| l.text.as_str()),
         Some("FIRST_LINE_START"),
@@ -432,6 +432,82 @@ fn frozen_render_stable_then_end_shows_latest() {
     assert_eq!(row_text(term.backend().buffer(), 6), "");
 }
 
+#[test]
+fn frozen_collapsed_thinking_summary_pins_count_at_freeze_point() {
+    // Up/PageUp freeze the viewport while reasoning streams; the collapsed
+    // summary's (N 行) count must reflect the text at the freeze point, not
+    // keep growing as deltas append to the live source line.
+    let backend = ratatui::backend::TestBackend::new(40, 10);
+    let mut term = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    assert!(state.collapse_thinking.0);
+    state.inner_width = 40;
+    state.push_agent_event(AgentEvent::ReasoningDelta("alpha ".repeat(30)));
+    assert!(state.active_lane == Some(ActiveStreamLane::Reasoning));
+
+    // Freeze through the real scroll path (Up while following).
+    state.handle_scroll(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert!(state.window.frozen_tail_cursor.is_some());
+    let frozen_summary = state
+        .window
+        .frozen_tail_summary
+        .clone()
+        .expect("freeze captures the collapsed thinking summary");
+
+    // Deltas keep streaming into the live source line; the live cache
+    // grows past the freeze-point count.
+    state.push_agent_event(AgentEvent::ReasoningDelta("beta ".repeat(60)));
+    let live_summary = state
+        .lines
+        .last()
+        .unwrap()
+        .collapsed_summary
+        .clone()
+        .expect("live cache keeps refreshing on deltas");
+    assert_ne!(live_summary, frozen_summary, "live count must keep growing");
+
+    // The frozen viewport still renders the freeze-point summary.
+    draw(&mut term, &mut state).unwrap();
+    let summary_row = (0..term.backend().buffer().area.height)
+        .map(|y| row_text(term.backend().buffer(), y))
+        .find(|r| r.contains("Tab"))
+        .unwrap_or_else(|| panic!("no collapsed summary row rendered"));
+    // row_text pads cells after wide glyphs, so compare the (N 行) count.
+    let count = |text: &str| -> String {
+        text.split('(')
+            .nth(1)
+            .and_then(|s| s.split("行").next())
+            .unwrap_or("")
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(
+        count(&summary_row),
+        count(&frozen_summary.text),
+        "frozen view shows the freeze-point count, not the live count"
+    );
+    assert_ne!(
+        count(&summary_row),
+        count(&live_summary.text),
+        "frozen view must not show the live count {:?}",
+        live_summary.text
+    );
+
+    // End resumes follow: the live count appears.
+    state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    assert!(state.window.frozen_tail_summary.is_none());
+    draw(&mut term, &mut state).unwrap();
+    let summary_row = (0..term.backend().buffer().area.height)
+        .map(|y| row_text(term.backend().buffer(), y))
+        .find(|r| r.contains("Tab"))
+        .unwrap_or_else(|| panic!("no collapsed summary row rendered after End"));
+    assert_eq!(
+        count(&summary_row),
+        count(&live_summary.text),
+        "live count after unfreezing"
+    );
+}
+
 // ── Terminal-style head/tail anchoring ─────────────────────────────
 
 #[test]
@@ -528,13 +604,15 @@ fn assistant_delta_down_resumes_live_follow_at_frozen_visual_bottom() {
     state.push_agent_event(AgentEvent::AssistantDelta("growth ".repeat(60)));
     assert!(state.lines.last().unwrap().text.len() > frozen.len());
     assert!(
-        line_visual_rows(state.lines.last().unwrap(), state.inner_width)
+        line_visual_rows(state.lines.last().unwrap(), state.inner_width, false)
             > line_visual_rows(
                 &DisplayLine {
                     text: frozen,
                     kind: LineKind::Normal,
+                    collapsed_summary: None,
                 },
                 state.inner_width,
+                false,
             )
     );
     draw(&mut term, &mut state).unwrap();
@@ -562,6 +640,10 @@ fn reasoning_delta_pagedown_resumes_live_follow_at_frozen_visual_bottom() {
     let backend = ratatui::backend::TestBackend::new(20, 8);
     let mut term = Terminal::new(backend).unwrap();
     let mut state = TuiState::default();
+    // This test exercises frozen-cursor row accounting on the full wrapped
+    // thinking text; pin the collapse toggle off (the default is collapsed,
+    // which would collapse both sides of the comparison to one row).
+    state.collapse_thinking.0 = false;
     state.push_agent_event(AgentEvent::ReasoningDelta("initial ".repeat(45)));
     draw(&mut term, &mut state).unwrap();
 
@@ -571,14 +653,19 @@ fn reasoning_delta_pagedown_resumes_live_follow_at_frozen_visual_bottom() {
     state.push_agent_event(AgentEvent::ReasoningDelta("growth ".repeat(60)));
     assert!(state.lines.last().unwrap().text.len() > frozen.len());
     assert!(
-        line_visual_rows(state.lines.last().unwrap(), state.inner_width)
-            > line_visual_rows(
-                &DisplayLine {
-                    text: frozen,
-                    kind: LineKind::Thinking,
-                },
-                state.inner_width,
-            )
+        line_visual_rows(
+            state.lines.last().unwrap(),
+            state.inner_width,
+            state.collapse_thinking.0
+        ) > line_visual_rows(
+            &DisplayLine {
+                text: frozen,
+                kind: LineKind::Thinking,
+                collapsed_summary: None,
+            },
+            state.inner_width,
+            state.collapse_thinking.0,
+        )
     );
     draw(&mut term, &mut state).unwrap();
 
@@ -601,28 +688,187 @@ fn reasoning_delta_pagedown_resumes_live_follow_at_frozen_visual_bottom() {
 }
 
 #[test]
+fn collapsed_thinking_hides_body_until_tab_expands_it() {
+    let backend = ratatui::backend::TestBackend::new(20, 8);
+    let mut term = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    assert!(state.collapse_thinking.0, "default is collapsed");
+    state.push_agent_event(AgentEvent::ReasoningDelta("secret ".repeat(60)));
+    draw(&mut term, &mut state).unwrap();
+    let rows = |term: &Terminal<ratatui::backend::TestBackend>| {
+        (0..term.backend().buffer().area.height)
+            .map(|y| row_text(term.backend().buffer(), y))
+            .collect::<Vec<_>>()
+    };
+    // Collapsed: one summary row, and the wrapped body stays off-screen.
+    let collapsed = rows(&term);
+    assert_eq!(
+        collapsed.iter().filter(|r| r.contains("thinking")).count(),
+        1
+    );
+    assert!(
+        !collapsed.iter().any(|r| r.contains("secret")),
+        "thinking body hidden while collapsed: {collapsed:?}"
+    );
+
+    // Tab expands: the full body renders instead of the summary.
+    let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    draw(&mut term, &mut state).unwrap();
+    let expanded = rows(&term);
+    assert!(
+        expanded.iter().any(|r| r.contains("secret")),
+        "thinking body visible after expand: {expanded:?}"
+    );
+    assert!(
+        !expanded.iter().any(|r| r.contains("Tab 展开")),
+        "no summary row while expanded"
+    );
+
+    // Tab collapses again: back to a single summary row.
+    let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    draw(&mut term, &mut state).unwrap();
+    let recollapsed = rows(&term);
+    assert_eq!(
+        recollapsed
+            .iter()
+            .filter(|r| r.contains("thinking"))
+            .count(),
+        1
+    );
+    assert!(!recollapsed.iter().any(|r| r.contains("secret")));
+}
+
+#[test]
+fn attached_tab_collapses_and_expands_thinking_in_rendered_output() {
+    // The attached (subagent) view renders through the same shared
+    // pipeline; Tab must collapse/expand its thinking blocks exactly like
+    // the main view's Tab.
+    let backend = ratatui::backend::TestBackend::new(40, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    let snapshot = handle.snapshot();
+    let status = handle.status();
+    state.attach(
+        1,
+        "task".into(),
+        handle,
+        String::new(),
+        None,
+        String::new(),
+        String::new(),
+        None,
+        snapshot,
+        status,
+    );
+    {
+        let attached = state.attached.as_mut().unwrap();
+        assert!(
+            attached.state.collapse_thinking.0,
+            "attached defaults to collapsed"
+        );
+        attached
+            .state
+            .push_agent_event(AgentEvent::ReasoningDelta("secret ".repeat(60)));
+    }
+    draw(&mut terminal, &mut state).unwrap();
+    let rows = |term: &Terminal<ratatui::backend::TestBackend>| {
+        (0..term.backend().buffer().area.height)
+            .map(|y| row_text(term.backend().buffer(), y))
+            .collect::<Vec<_>>()
+    };
+    // Collapsed: one summary row, no thinking body.
+    let collapsed = rows(&terminal);
+    assert!(
+        collapsed.iter().any(|r| r.contains("Tab")),
+        "attached view must show the collapsed summary: {collapsed:?}"
+    );
+    assert!(
+        !collapsed.iter().any(|r| r.contains("secret")),
+        "attached thinking body hidden while collapsed: {collapsed:?}"
+    );
+
+    // Tab expands: the full body renders instead of the summary.
+    state.handle_attached_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), 80);
+    draw(&mut terminal, &mut state).unwrap();
+    let expanded = rows(&terminal);
+    assert!(
+        expanded.iter().any(|r| r.contains("secret")),
+        "attached thinking body visible after Tab: {expanded:?}"
+    );
+    assert!(
+        !expanded.iter().any(|r| r.contains("Tab")),
+        "no summary row while expanded: {expanded:?}"
+    );
+
+    // Tab collapses again: back to a single summary row.
+    state.handle_attached_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), 80);
+    draw(&mut terminal, &mut state).unwrap();
+    let recollapsed = rows(&terminal);
+    assert!(
+        recollapsed.iter().any(|r| r.contains("Tab")),
+        "attached view must collapse again: {recollapsed:?}"
+    );
+    assert!(!recollapsed.iter().any(|r| r.contains("secret")));
+}
+
+#[test]
+fn collapsed_huge_thinking_summary_shows_full_row_count_after_truncation() {
+    // Production path: draw → local_window_lines (64 KiB cap) →
+    // render_window. A thinking block larger than the cap must still show
+    // the FULL text's wrapped row count in the collapsed summary, not the
+    // truncated tail's (under)estimate. The count comes from the per-line
+    // cache, which is refreshed when the line's text changes — the render
+    // width must be known by then (a draw has happened), so prime
+    // inner_width with the terminal width before streaming.
+    let backend = ratatui::backend::TestBackend::new(40, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = TuiState::default();
+    assert!(state.collapse_thinking.0);
+    state.inner_width = 40;
+    state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(MAX_RENDER_BYTES)));
+    assert!(state.lines[0].text.len() > MAX_RENDER_BYTES);
+    draw(&mut terminal, &mut state).unwrap();
+    let width = state.inner_width.max(1);
+    let full_rows = hard_wrap(&state.lines[0].text, width).len();
+    let rendered = (0..terminal.backend().buffer().area.height)
+        .map(|y| row_text(terminal.backend().buffer(), y))
+        .collect::<Vec<_>>();
+    let summary = rendered
+        .iter()
+        .find(|r| r.contains("Tab"))
+        .unwrap_or_else(|| panic!("no collapsed summary row in: {rendered:?}"));
+    assert!(
+        summary.contains(&format!("({full_rows} 行")),
+        "summary must show the full row count {full_rows}, got: {summary:?}"
+    );
+}
+
+#[test]
 fn local_window_obeys_all_limits_without_splitting_utf8() {
     let mut lines: Vec<_> = (0..300)
         .map(|index| DisplayLine {
             text: format!("line {index}"),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         })
         .collect();
     lines.push(DisplayLine {
         text: format!("prefix{}尾", "好".repeat(MAX_RENDER_BYTES)),
         kind: LineKind::Normal,
+        collapsed_summary: None,
     });
     let window = ScrollWindow {
         source_start: 0,
         source_end: lines.len(),
         ..ScrollWindow::new()
     };
-    let local = local_window_lines(&lines, &window);
+    let local = local_window_lines(&lines, &window, false);
     assert!(local.len() <= MAX_RENDER_SOURCE_LINES);
     assert!(local.iter().map(|line| line.text.len()).sum::<usize>() <= MAX_RENDER_BYTES);
     assert!(local.last().unwrap().text.is_char_boundary(0));
     assert!(local.last().unwrap().text.ends_with('尾'));
-    assert!(render_bounded_window(&local, 80, false).len() <= MAX_RENDER_VISUAL_ROWS);
+    assert!(render_bounded_window(&local, 80, false, false).len() <= MAX_RENDER_VISUAL_ROWS);
 }
 
 #[test]
@@ -686,17 +932,19 @@ fn anchor_tail_includes_long_crossing_line() {
         DisplayLine {
             text: "x".repeat(2400),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "you> hello".into(),
             kind: LineKind::User,
+            collapsed_summary: None,
         },
     ];
     let mut window = ScrollWindow::new();
-    window.anchor_tail(&lines, 80, 6);
+    window.anchor_tail(&lines, 80, 6, false);
     assert_eq!(window.source_start, 0);
 
-    let rendered = render_window(&lines, 0, window.source_end, 80);
+    let rendered = render_window(&lines, 0, window.source_end, 80, false);
     let visible = &rendered[rendered.len() - 6..];
     let text = |row: &ratatui::text::Line<'_>| {
         row.spans
@@ -843,8 +1091,8 @@ fn resize_matrix_cjk_long_and_compaction_no_panic() {
     for (w, h) in [(20u16, 12u16), (120, 12), (40, 12)] {
         term.backend_mut().resize(w, h);
         draw(&mut term, &mut state).unwrap();
-        let local = local_window_lines(&state.lines, &state.window);
-        let visual = render_bounded_window(&local, state.inner_width, false);
+        let local = local_window_lines(&state.lines, &state.window, false);
+        let visual = render_bounded_window(&local, state.inner_width, false, false);
         let total = visual.len();
         assert!(
             state.window.local_offset <= total.saturating_sub(state.output_height),

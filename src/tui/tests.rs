@@ -34,11 +34,13 @@ fn lookbehind_is_bounded_with_10k_prefix() {
         .map(|i| DisplayLine {
             text: format!("line {i}"),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         })
         .collect();
     lines.push(DisplayLine {
         text: "the actual rendered line".into(),
         kind: LineKind::Normal,
+        collapsed_summary: None,
     });
     let source_start = 10_000;
     let lb = lookbehind_start(&lines, source_start);
@@ -53,7 +55,7 @@ fn lookbehind_is_bounded_with_10k_prefix() {
     );
     // Render the single line with the bounded prefix to prove it
     // completes without iterating the full 10k prefix.
-    let rendered = render_window(&lines, source_start, source_start + 1, 80);
+    let rendered = render_window(&lines, source_start, source_start + 1, 80, false);
     assert_eq!(rendered.len(), 1);
     assert_eq!(rendered[0].spans.len(), 1);
     assert_eq!(rendered[0].spans[0].content, "the actual rendered line");
@@ -1246,10 +1248,12 @@ fn attached_view_scrolls_independently() {
         attached.state.lines.push(DisplayLine {
             text: "a".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         });
         attached.state.lines.push(DisplayLine {
             text: "b".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         });
         attached.state.window.source_start = 0;
         attached.state.window.source_end = 2;
@@ -1268,6 +1272,28 @@ fn attached_view_scrolls_independently() {
         state.attached.as_ref().unwrap().state.window.local_offset,
         1
     );
+}
+
+#[test]
+fn attached_tab_toggles_thinking_collapse_in_the_attached_view() {
+    let (handle, _sink, _source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    attach_test(&mut state, 1, "task", handle);
+    assert!(
+        state.attached.as_ref().unwrap().state.collapse_thinking.0,
+        "attached views default to collapsed"
+    );
+    // Tab in the attached view flips the ATTACHED view's collapse flag
+    // (the main view's flag is a per-view toggle and must stay untouched).
+    state.handle_attached_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), 80);
+    assert!(!state.attached.as_ref().unwrap().state.collapse_thinking.0);
+    assert!(
+        state.collapse_thinking.0,
+        "main view collapse state must be independent"
+    );
+    // Tab again collapses back to the summary.
+    state.handle_attached_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), 80);
+    assert!(state.attached.as_ref().unwrap().state.collapse_thinking.0);
 }
 
 #[test]
@@ -1310,6 +1336,7 @@ async fn ready_scroll_keys_are_coalesced_without_consuming_following_input() {
         lines: vec![DisplayLine {
             text: "hello".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         inner_width: 80,
         ..Default::default()
@@ -1353,6 +1380,7 @@ async fn ready_scroll_keys_are_coalesced_without_consuming_following_input() {
         lines: vec![DisplayLine {
             text: "hello".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         inner_width: 80,
         ..Default::default()
@@ -1387,6 +1415,7 @@ async fn ready_scroll_keys_are_coalesced_without_consuming_following_input() {
         attached.state.lines.push(DisplayLine {
             text: "hello".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         });
         attached.state.window.source_start = 0;
         attached.state.window.source_end = 1;
@@ -1520,10 +1549,12 @@ fn wide_glyph_scroll_emits_trailing_cell_after_glyph() {
             DisplayLine {
                 text: " 好".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "好 ".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -1615,18 +1646,22 @@ fn scrolling_redraw_keeps_blank_scrollback_cells_on_solarized_surfaces() {
             DisplayLine {
                 text: "  leading and trailing  ".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "   ".into(),
                 kind: LineKind::ToolCall,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "+    7 wrapped diff text  ".into(),
                 kind: LineKind::Added,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "-    8 trailing   ".into(),
                 kind: LineKind::Removed,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -2300,34 +2335,42 @@ fn draw_uses_semantic_solarized_message_styles() {
             DisplayLine {
                 text: "normal".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "dim".into(),
                 kind: LineKind::Dim,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "user".into(),
                 kind: LineKind::User,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "tool".into(),
                 kind: LineKind::ToolCall,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "ok".into(),
                 kind: LineKind::ToolResult,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "error".into(),
                 kind: LineKind::ToolError,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "+    7 added".into(),
                 kind: LineKind::Added,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "-    7 removed".into(),
                 kind: LineKind::Removed,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -2511,6 +2554,600 @@ fn empty_content_delta_does_not_split_the_reasoning_line() {
     assert_eq!(thinking[0].text, "thinking: plan more");
 }
 
+/// Extract the text of a rendered visual row (same span-join as the
+/// `text` closures in ux_tests).
+fn rendered_text(line: &ratatui::text::Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// Parse the `(N 行)` row count out of a collapsed thinking summary row.
+fn summary_row_count(line: &ratatui::text::Line<'_>) -> usize {
+    let text = rendered_text(line);
+    text.split_once('(')
+        .and_then(|(_, rest)| rest.split_once(" 行)"))
+        .and_then(|(n, _)| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no (N 行) count in summary row: {text:?}"))
+}
+
+#[test]
+fn thinking_lines_render_collapsed_by_default() {
+    // A fresh session collapses model reasoning to a single summary row.
+    let mut state = TuiState::default();
+    assert!(
+        state.collapse_thinking.0,
+        "new sessions default to collapsed"
+    );
+    state.push_agent_event(AgentEvent::ReasoningDelta("plan ".into()));
+    state.push_agent_event(AgentEvent::ReasoningDelta("more".into()));
+    assert_eq!(state.lines.len(), 1);
+    assert_eq!(state.lines[0].kind, LineKind::Thinking);
+    // Scroll accounting and rendering must agree: one visual row.
+    assert_eq!(line_visual_rows(&state.lines[0], 40, true), 1);
+    let visual = render_window(&state.lines, 0, state.lines.len(), 40, true);
+    assert_eq!(
+        visual.len(),
+        1,
+        "collapsed thinking renders one summary row"
+    );
+    let text = rendered_text(&visual[0]);
+    assert!(text.starts_with("▸ thinking"), "{text}");
+    assert!(text.contains("(1 行)"), "{text}");
+    assert!(text.contains("Tab 展开"), "{text}");
+}
+
+#[test]
+fn tab_toggles_thinking_collapse_between_summary_and_full_text() {
+    let mut state = TuiState::default();
+    // Long enough to wrap at width 20, so the expanded form is multi-row.
+    state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(30)));
+    let full_rows = hard_wrap(&state.lines[0].text, 20).len();
+    assert!(full_rows > 1, "test text must wrap when expanded");
+    assert_eq!(line_visual_rows(&state.lines[0], 20, true), 1);
+    assert_eq!(render_window(&state.lines, 0, 1, 20, true).len(), 1);
+
+    // Tab expands: the full wrapped text returns, and scroll accounting
+    // follows the same flag.
+    let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(!state.collapse_thinking.0);
+    assert_eq!(line_visual_rows(&state.lines[0], 20, false), full_rows);
+    assert_eq!(
+        render_window(&state.lines, 0, 1, 20, false).len(),
+        full_rows
+    );
+
+    // Tab again collapses back to a single summary row.
+    let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(state.collapse_thinking.0);
+    assert_eq!(render_window(&state.lines, 0, 1, 20, true).len(), 1);
+}
+
+#[test]
+fn collapsed_thinking_summary_count_tracks_streaming_deltas() {
+    let mut state = TuiState::default();
+    assert!(state.collapse_thinking.0);
+    state.push_agent_event(AgentEvent::ReasoningDelta("alpha ".repeat(30)));
+    assert_eq!(state.lines.len(), 1);
+    let n_before = summary_row_count(&render_window(&state.lines, 0, 1, 20, true)[0]);
+
+    // Streaming deltas keep appending to the same line while collapsed;
+    // the summary's row count grows with the accumulated text.
+    state.push_agent_event(AgentEvent::ReasoningDelta("beta ".repeat(60)));
+    assert_eq!(
+        state.lines.len(),
+        1,
+        "deltas still merge into one thinking line"
+    );
+    let visual = render_window(&state.lines, 0, 1, 20, true);
+    assert_eq!(visual.len(), 1, "still a single collapsed summary row");
+    let n_after = summary_row_count(&visual[0]);
+    assert!(
+        n_after > n_before,
+        "summary count grew {n_before} -> {n_after}"
+    );
+}
+
+#[test]
+fn collapsed_thinking_summary_count_survives_local_window_truncation() {
+    // Production rendering goes through local_window_lines, which caps the
+    // window at MAX_RENDER_BYTES. A thinking block larger than the cap is
+    // truncated there; the collapsed summary's (N 行) count must still
+    // reflect the FULL pre-truncation text, not the truncated tail. The
+    // count now comes from the per-line cache, which is refreshed on the
+    // source line when the text changes (the width must be known — a draw
+    // has happened — for the cache to be populated).
+    let mut state = TuiState::default();
+    assert!(state.collapse_thinking.0);
+    let width = 20;
+    state.inner_width = width;
+    state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(MAX_RENDER_BYTES)));
+    assert_eq!(state.lines.len(), 1);
+    assert!(
+        state.lines[0].text.len() > MAX_RENDER_BYTES,
+        "test text must exceed the local-window byte cap"
+    );
+    let full_rows = hard_wrap(&state.lines[0].text, width).len();
+    let window = ScrollWindow {
+        source_start: 0,
+        source_end: 1,
+        ..ScrollWindow::new()
+    };
+    // The source line carries the cache computed from its full text.
+    let expected_summary = collapsed_summary_for(&state.lines[0].text, width);
+    assert_eq!(
+        state.lines[0]
+            .collapsed_summary
+            .as_ref()
+            .map(|c| c.text.as_str()),
+        Some(expected_summary.as_str()),
+        "delta append must cache the full-text summary"
+    );
+
+    // Collapsed: the local copy truncates the text (the byte cap applies to
+    // every line now) but carries the cache, so the summary count is exact.
+    let local = local_window_lines(&state.lines, &window, true);
+    assert_eq!(local.len(), 1);
+    assert!(
+        local[0].text.len() < state.lines[0].text.len(),
+        "collapsed truncated thinking must no longer keep its full text"
+    );
+    assert_eq!(local[0].text.len(), MAX_RENDER_BYTES);
+    assert_eq!(
+        local[0].collapsed_summary.as_ref().map(|c| c.text.as_str()),
+        Some(expected_summary.as_str()),
+        "the cache is cloned into the local copy"
+    );
+    let visual = render_window(&local, 0, 1, width, true);
+    assert_eq!(visual.len(), 1, "still a single collapsed summary row");
+    assert_eq!(
+        summary_row_count(&visual[0]),
+        full_rows,
+        "summary count must reflect the full pre-truncation text"
+    );
+    // Sanity: the truncated tail alone would underestimate the count.
+    let tail = &state.lines[0].text[state.lines[0].text.len() - MAX_RENDER_BYTES..];
+    assert!(hard_wrap(tail, width).len() < full_rows);
+
+    // Expanded (or non-thinking lines): the byte cap stays in force and
+    // only the bounded tail is carried into the renderer.
+    let local_expanded = local_window_lines(&state.lines, &window, false);
+    assert_eq!(local_expanded.len(), 1);
+    assert!(
+        local_expanded[0].text.len() < state.lines[0].text.len(),
+        "expanded path must keep the bounded tail"
+    );
+    assert!(local_expanded[0].text.len() <= MAX_RENDER_BYTES);
+}
+
+#[test]
+fn collapsed_thinking_render_reads_cache_and_stays_bounded() {
+    // The collapsed render path must read the per-line cache instead of
+    // hard-wrapping the full text: rendering a thinking block larger than
+    // the 64 KiB local-window cap produces exactly one small summary row
+    // whose text is the cached string — the body is never materialized.
+    let mut state = TuiState::default();
+    assert!(state.collapse_thinking.0);
+    let width = 30;
+    state.inner_width = width;
+    state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(MAX_RENDER_BYTES)));
+    assert!(state.lines[0].text.len() > MAX_RENDER_BYTES);
+    let summary = state.lines[0]
+        .collapsed_summary
+        .as_ref()
+        .map(|c| c.text.clone())
+        .expect("cache is populated at append time once the width is known");
+    let window = ScrollWindow {
+        source_start: 0,
+        source_end: 1,
+        ..ScrollWindow::new()
+    };
+    // The bounded local copy feeds rendering, exactly like production draw.
+    let local = local_window_lines(&state.lines, &window, true);
+    assert_eq!(local[0].text.len(), MAX_RENDER_BYTES);
+    assert_eq!(
+        local[0].collapsed_summary.as_ref().map(|c| c.text.as_str()),
+        Some(summary.as_str()),
+        "cache is carried through the truncating local window"
+    );
+    let visual = render_window(&local, 0, 1, width, true);
+    assert_eq!(visual.len(), 1, "collapsed renders exactly one row");
+    let text = rendered_text(&visual[0]);
+    assert_eq!(text, summary, "render outputs the cache verbatim");
+    assert!(
+        text.len() < MAX_RENDER_BYTES && !text.contains("word"),
+        "rendered output is the small summary, not the wrapped body"
+    );
+}
+
+#[test]
+fn incremental_rows_matches_full_wrap_on_edge_cases() {
+    // Every (old, delta) pair must extend the wrapped state exactly as
+    // hard_wrap of the concatenated text would: partial-last-row merge,
+    // exactly-full last row, empty text / trailing-newline empty row, wide
+    // chars (exact fit and overflow), newlines inside and at the head of
+    // the delta. Swept across many widths so the boundary conditions
+    // (last_width == 0, last_width == width, wide-char fits) all fire.
+    let cases: &[(&str, &str)] = &[
+        ("ab", "cd"),
+        ("ab", "cdef"),
+        ("ab", "中"),
+        ("ab", "中a"),
+        ("a", "中"),        // wide char fits exactly in the free space
+        ("ab中", "x"),      // wide char inside the old last row
+        ("abcd", "e"),      // last row exactly full
+        ("abcd", "\nrest"), // full last row + newline-headed delta
+        ("abcd", "\n"),
+        ("abcd\nwxyz", "\nrest"),
+        ("", "hello"),    // empty text
+        ("", "中中"),     // empty text + wide chars
+        ("ab\n", "x"),    // trailing newline: empty last row
+        ("ab\n", "\n"),   // trailing newline + newline delta
+        ("ab", "\nrest"), // partial last row + newline-headed delta
+        ("ab", "\n"),     // delta is only a newline
+        ("ab", "\n\nrest"),
+        // Zero-width characters (combining accent U+0301, variation
+        // selector U+FE0F, ZWJ U+200D) never fire a wrap break: they must
+        // attach to the old row — even one that is exactly full — instead
+        // of starting a phantom new row, exactly like hard_wrap of the
+        // concatenated text.
+        ("a", "\u{0301}"),                  // zero-width delta onto a full last row
+        ("a", "\u{0301}b"),                 // zero-width prefix then a normal char
+        ("a", "\u{0301}\n"),                // zero-width prefix then a newline
+        ("a", "\u{0301}\nrest"),            // zero-width prefix, newline, more text
+        ("a", "\u{FE0F}"),                  // variation selector onto a full last row
+        ("a", "\u{FE0F}x"),                 // variation selector then a normal char
+        ("a", "x\u{FE0F}"),                 // variation selector after a char
+        ("ab", "\u{0301}"),                 // zero-width delta onto a partial last row
+        ("ab", "\u{0301}c"),                // zero-width prefix, partial last row
+        ("ab", "\u{200D}\u{0301}\u{FE0F}"), // all-zero-width delta
+        ("a", "\u{1F468}\u{200D}\u{1F469}"), // ZWJ family sequence
+        ("\u{1F468}\u{200D}\u{1F469}", "x"), // old last row holds a ZWJ seq
+        ("abcd\u{1F468}\u{200D}\u{1F469}", "\u{0301}"), // full row + ZWJ + accent
+    ];
+    for width in 1..=8usize {
+        for &(old, delta) in cases {
+            let (old_rows, old_last) = wrap_state(old, width);
+            let got = incremental_rows(delta, width, old_rows, old_last);
+            assert_eq!(
+                got,
+                wrap_state(&format!("{old}{delta}"), width),
+                "old={old:?} delta={delta:?} width={width}"
+            );
+        }
+    }
+}
+
+#[test]
+fn collapsed_summary_incremental_deltas_match_full_wrap() {
+    // Streaming many small ReasoningDeltas must maintain the cached
+    // (N 行) count incrementally; at every step it must equal a full
+    // hard_wrap of the accumulated text, including wide chars, newlines
+    // and a delta that exactly fills the last row.
+    let mut state = TuiState::default();
+    let width = 23;
+    state.inner_width = width;
+    let deltas = [
+        "word ".repeat(5),
+        "中中中".to_string(),
+        "narrow tail".to_string(),
+        "\nnewline head".to_string(),
+        "  pad  ".to_string(),
+        "\u{0301}".to_string(),  // combining accent: zero-width chunk
+        "x\u{FE0F}".to_string(), // variation selector after a char
+        "\u{1F468}\u{200D}\u{1F469}".to_string(), // ZWJ family sequence
+        "\n".to_string(),
+        "final".to_string(),
+    ];
+    let mut full = String::new();
+    for (i, delta) in deltas.iter().enumerate() {
+        state.push_agent_event(AgentEvent::ReasoningDelta(delta.clone()));
+        if i == 0 {
+            full.push_str("thinking: ");
+        }
+        full.push_str(delta);
+        let cache = state
+            .lines
+            .last()
+            .unwrap()
+            .collapsed_summary
+            .as_ref()
+            .expect("cache exists once the width is known");
+        assert_eq!(cache.width, width);
+        assert_eq!(
+            cache.rows,
+            wrap_state(&full, width).0,
+            "incremental rows diverge after {i} deltas (text {} bytes)",
+            full.len()
+        );
+        assert_eq!(
+            cache.last_width,
+            wrap_state(&full, width).1,
+            "incremental last_width diverges after {i} deltas"
+        );
+    }
+    // The rendered summary carries the same incremental count.
+    let visual = render_window(&state.lines, 0, 1, width, true);
+    assert_eq!(summary_row_count(&visual[0]), wrap_state(&full, width).0);
+
+    // Resize: the full recompute at the new width must agree with a fresh
+    // hard_wrap (and with the next incremental delta after the resize).
+    state.refresh_window_collapsed_summaries(width + 7);
+    let cache = state
+        .lines
+        .last()
+        .unwrap()
+        .collapsed_summary
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        cache.rows,
+        wrap_state(&full, width + 7).0,
+        "resize recompute must agree with a fresh full wrap"
+    );
+    state.inner_width = width + 7;
+    state.push_agent_event(AgentEvent::ReasoningDelta("post-resize".into()));
+    full.push_str("post-resize");
+    let cache = state
+        .lines
+        .last()
+        .unwrap()
+        .collapsed_summary
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        cache.rows,
+        wrap_state(&full, width + 7).0,
+        "incremental delta after resize must stay exact"
+    );
+}
+
+#[test]
+fn refresh_window_collapsed_summaries_scan_is_bounded() {
+    // Scrolling down from Home extends source_end without advancing
+    // source_start (extend_window_down), so the window range can grow far
+    // beyond MAX_RENDER_SOURCE_LINES. The per-frame refresh must scan only
+    // the lines local_window_lines will actually render — the tail of the
+    // window — not the whole browsed history.
+    let mut state = TuiState::default();
+    // Push with width unknown (inner_width == 0): no caches are populated,
+    // so every Thinking line is stale and would be recomputed if scanned.
+    let total = MAX_RENDER_SOURCE_LINES * 4;
+    for i in 0..total {
+        state.push_line(format!("thinking {i}"), LineKind::Thinking);
+    }
+    assert!(
+        state.lines.iter().all(|l| l.collapsed_summary.is_none()),
+        "precondition: no caches yet (width unknown at push time)"
+    );
+    // A window covering the whole scrollback, exactly like after paging
+    // down from Home (source_start stayed 0, source_end reached the end).
+    state.inner_width = 40;
+    state.window.source_start = 0;
+    state.window.source_end = total;
+    state.window.follow_bottom = false;
+    state.refresh_window_collapsed_summaries(40);
+    let scanned = state
+        .lines
+        .iter()
+        .filter(|l| l.collapsed_summary.is_some())
+        .count();
+    assert!(
+        scanned <= MAX_RENDER_SOURCE_LINES,
+        "refresh scanned {scanned} lines, must be bounded by MAX_RENDER_SOURCE_LINES"
+    );
+    // The scanned lines are exactly the tail local_window_lines selects:
+    // the head of the window stays untouched, the last budget lines are
+    // refreshed.
+    assert!(
+        state.lines[..total - MAX_RENDER_SOURCE_LINES]
+            .iter()
+            .all(|l| l.collapsed_summary.is_none()),
+        "head lines outside the local window must not be scanned"
+    );
+    assert!(
+        state.lines[total - MAX_RENDER_SOURCE_LINES..]
+            .iter()
+            .all(|l| l.collapsed_summary.is_some()),
+        "tail lines inside the local window must all be refreshed"
+    );
+}
+
+#[test]
+fn attached_snapshot_replay_recomputes_summary_on_first_draw() {
+    // Attach replay (problem: width unknown at append time): a fresh
+    // TuiState (inner_width == 0, no draw yet) replays the snapshot
+    // events, so append-time caching is skipped and every replayed
+    // thinking line has NO cache. The first draw must recompute the
+    // collapsed summary from the COMPLETE source line before
+    // local_window_lines truncates it — the (N 行) count must not be
+    // underestimated from the truncated tail.
+    let (handle, emitter, _commands) = crate::runner::session_test_channel();
+    let huge = "word ".repeat(MAX_RENDER_BYTES);
+    emitter.emit(AgentEvent::ReasoningDelta(huge));
+    let snapshot = handle.snapshot();
+    let status = handle.status();
+    let mut parent = TuiState::default();
+    parent.attach(
+        1,
+        "task".into(),
+        handle,
+        String::new(),
+        None,
+        String::new(),
+        String::new(),
+        None,
+        snapshot,
+        status,
+    );
+    {
+        let attached = parent.attached.as_mut().unwrap();
+        assert_eq!(attached.state.lines.len(), 1);
+        assert_eq!(
+            attached.state.inner_width, 0,
+            "attach replays before any draw"
+        );
+        assert!(
+            attached.state.lines[0].collapsed_summary.is_none(),
+            "no cache may be computed while the width is unknown"
+        );
+        assert!(attached.state.lines[0].text.len() > MAX_RENDER_BYTES);
+    }
+    let full_rows = hard_wrap(&parent.attached.as_ref().unwrap().state.lines[0].text, 44).len();
+
+    // First draw at a real terminal width: the draw entry refreshes the
+    // cache from the full source line before truncation.
+    let backend = ratatui::backend::TestBackend::new(44, 10);
+    let mut term = Terminal::new(backend).unwrap();
+    draw(&mut term, &mut parent).unwrap();
+    let attached = parent.attached.as_mut().unwrap();
+    let cache = attached
+        .state
+        .lines
+        .first()
+        .unwrap()
+        .collapsed_summary
+        .as_ref()
+        .expect("first draw populates the cache from the complete source line");
+    assert_eq!(cache.width, 44, "cache bound to the real inner width");
+    assert_eq!(
+        cache.rows, full_rows,
+        "count from the FULL pre-truncation text"
+    );
+    // And the truncated-tail fallback would have underestimated: prove the
+    // rendered row shows the full count, not the tail's.
+    let buffer = term.backend().buffer();
+    let row = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+        })
+        .find(|r| r.contains("Tab"))
+        .unwrap_or_else(|| panic!("no collapsed summary row rendered"));
+    let shown: usize = row
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split("行").next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no (N 行) count in {row:?}"));
+    assert_eq!(shown, full_rows);
+    let tail = {
+        let text = &attached.state.lines[0].text;
+        &text[text.len() - MAX_RENDER_BYTES..]
+    };
+    assert!(
+        hard_wrap(tail, 44).len() < full_rows,
+        "the truncated tail alone would underestimate — the test must be meaningful"
+    );
+}
+
+#[test]
+fn collapsed_summary_recomputes_on_terminal_resize() {
+    // Problem: the cache is bound to the width it was computed at, and a
+    // resize only re-anchored the window — an ended reasoning line kept
+    // its old-width (N 行) forever. The draw entry must re-bind the cache
+    // to the current width from the complete source line.
+    let mut state = TuiState {
+        inner_width: 20,
+        ..Default::default()
+    };
+    state.push_agent_event(AgentEvent::ReasoningDelta("word ".repeat(200)));
+    let cache = state.lines[0].collapsed_summary.as_ref().unwrap();
+    assert_eq!(cache.width, 20);
+    let w20 = wrap_state(&state.lines[0].text, 20).0;
+    assert_eq!(cache.rows, w20);
+
+    // A draw at a wider terminal re-wraps the cache at the new width.
+    // The scrollback area spans the full terminal width, so the draw
+    // inner width is 44.
+    let backend = ratatui::backend::TestBackend::new(44, 10);
+    let mut term = Terminal::new(backend).unwrap();
+    draw(&mut term, &mut state).unwrap();
+    let w44 = wrap_state(&state.lines[0].text, 44).0;
+    assert_ne!(w44, w20, "width change must change the count");
+    let cache = state.lines[0].collapsed_summary.as_ref().unwrap();
+    assert_eq!(cache.width, 44);
+    assert_eq!(cache.rows, w44);
+    let buffer = term.backend().buffer();
+    let row = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+        })
+        .find(|r| r.contains("Tab"))
+        .unwrap_or_else(|| panic!("no collapsed summary row rendered"));
+    // The buffer splits wide glyphs across cells, so parse the count
+    // tolerantly instead of matching the exact summary text.
+    let shown: usize = row
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split("行").next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no (N 行) count in {row:?}"));
+    assert_eq!(shown, w44);
+    assert_ne!(shown, w20);
+
+    // And the NEXT delta after the resize continues incrementally from the
+    // new width (a stale-width cache would fall back to a full recompute —
+    // correct, but the width-bound path must not regress to the old count).
+    state.inner_width = 44;
+    state.push_agent_event(AgentEvent::ReasoningDelta("more ".repeat(10)));
+    let cache = state.lines[0].collapsed_summary.as_ref().unwrap();
+    assert_eq!(
+        cache.rows,
+        wrap_state(&state.lines[0].text, 44).0,
+        "delta after resize extends the width-fresh cache"
+    );
+}
+
+#[test]
+fn frozen_summary_rewraps_at_new_width_but_keeps_freeze_point() {
+    // A frozen tail summary is pinned to the freeze-time text (deltas that
+    // stream after the freeze must not grow its count), but a terminal
+    // resize must re-wrap that freeze-time text at the new width instead of
+    // pinning a stale old-width count forever.
+    let mut state = TuiState {
+        inner_width: 40,
+        ..Default::default()
+    };
+    state.push_agent_event(AgentEvent::ReasoningDelta("alpha ".repeat(30)));
+    state.handle_scroll(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    let frozen = state
+        .window
+        .frozen_tail_summary
+        .clone()
+        .expect("freeze pins the summary");
+    assert_eq!(frozen.width, 40);
+    let freeze_len = state.window.frozen_tail_cursor.unwrap();
+
+    // Post-freeze deltas keep growing the live source line.
+    state.push_agent_event(AgentEvent::ReasoningDelta("beta ".repeat(60)));
+    assert!(state.lines.last().unwrap().text.len() > freeze_len);
+
+    // Resize refresh: the frozen summary is re-wrapped from the text up to
+    // the frozen cursor at the new width.
+    state.refresh_window_collapsed_summaries(60);
+    let re = state
+        .window
+        .frozen_tail_summary
+        .as_ref()
+        .expect("frozen summary survives the refresh");
+    assert_eq!(re.width, 60);
+    let freeze_text = &state.lines.last().unwrap().text[..freeze_len];
+    assert_eq!(re.rows, wrap_state(freeze_text, 60).0);
+    assert_ne!(
+        re.rows,
+        wrap_state(freeze_text, 40).0,
+        "the re-wrap must change the count so the test is meaningful"
+    );
+    assert_ne!(
+        re.rows,
+        wrap_state(&state.lines.last().unwrap().text, 60).0,
+        "post-freeze deltas must stay excluded from the frozen count"
+    );
+}
+
 #[test]
 fn reply_after_plain_text_turn_does_not_append_to_the_user_line() {
     // A turn ending on a plain text answer leaves active_lane = Content
@@ -2554,10 +3191,12 @@ fn new_events_do_not_yank_a_scrolled_up_view() {
             DisplayLine {
                 text: "one".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "two".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -2582,10 +3221,12 @@ fn home_and_end_jump_to_session_edges() {
             DisplayLine {
                 text: "one".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "two".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -2613,10 +3254,12 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
             DisplayLine {
                 text: "one".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "two".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         ..Default::default()
@@ -2656,24 +3299,28 @@ fn wrapped_rows_counts_embedded_newlines_and_wrapping() {
         DisplayLine {
             text: "short".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "one\ntwo\nthree".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "x".repeat(25),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         },
     ];
     // 1 + 3 + exact hard wrap of 25 cells at width 10
-    assert_eq!(wrapped_rows(&lines, 10), 1 + 3 + 3);
+    assert_eq!(wrapped_rows(&lines, 10, false), 1 + 3 + 3);
     let cjk = vec![DisplayLine {
         text: "你好世界".into(),
         kind: LineKind::Normal,
+        collapsed_summary: None,
     }];
     // Each CJK char is 2 cells: "你好" then "世界" at width 5.
-    assert_eq!(wrapped_rows(&cjk, 5), 2);
+    assert_eq!(wrapped_rows(&cjk, 5, false), 2);
 }
 
 #[test]
@@ -2728,6 +3375,7 @@ fn up_at_scrollback_top_requests_older_history() {
         lines: vec![DisplayLine {
             text: "only line".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         window: ScrollWindow {
             source_start: 0,
@@ -2762,10 +3410,12 @@ fn scrolled_up_mid_scrollback_or_without_store_never_requests_older() {
             DisplayLine {
                 text: "a".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "b".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         window: ScrollWindow {
@@ -2788,6 +3438,7 @@ fn scrolled_up_mid_scrollback_or_without_store_never_requests_older() {
         lines: vec![DisplayLine {
             text: "a".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         window: ScrollWindow {
             source_start: 0,
@@ -2810,14 +3461,17 @@ fn prepend_lines_shifts_window_indices_and_keeps_viewport() {
             DisplayLine {
                 text: "head-1".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-2".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-3".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         window: ScrollWindow {
@@ -2835,10 +3489,12 @@ fn prepend_lines_shifts_window_indices_and_keeps_viewport() {
         DisplayLine {
             text: "old-1".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "old-2".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
     ]);
     assert_eq!(state.lines.len(), 5);
@@ -2996,6 +3652,7 @@ async fn jsonl_store_load_older_marks_history_done_without_lines() {
         lines: vec![DisplayLine {
             text: "head".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         ..Default::default()
     };
@@ -3019,6 +3676,7 @@ fn home_requests_oldest_jump_and_pageup_stays_stepwise() {
         lines: vec![DisplayLine {
             text: "only line".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         window: ScrollWindow {
             source_start: 0,
@@ -3067,6 +3725,7 @@ async fn home_jump_loads_oldest_and_positions_at_beginning() {
         lines: vec![DisplayLine {
             text: "head".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         window: ScrollWindow {
             source_start: 1,
@@ -3099,6 +3758,7 @@ fn prepend_lines_shifts_head_start_with_window() {
         lines: vec![DisplayLine {
             text: "head-1".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         window: ScrollWindow {
             source_start: 0,
@@ -3112,10 +3772,12 @@ fn prepend_lines_shifts_head_start_with_window() {
         DisplayLine {
             text: "old-1".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "old-2".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
     ]);
     assert_eq!(state.lines.len(), 3);
@@ -3136,22 +3798,27 @@ fn splice_newer_lines_shifts_indices_and_keeps_viewport() {
             DisplayLine {
                 text: "old-1".into(),
                 kind: LineKind::Dim,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "old-2".into(),
                 kind: LineKind::Dim,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-1".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-2".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-3".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         window: ScrollWindow {
@@ -3171,10 +3838,12 @@ fn splice_newer_lines_shifts_indices_and_keeps_viewport() {
         DisplayLine {
             text: "mid-1".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
         DisplayLine {
             text: "mid-2".into(),
             kind: LineKind::Dim,
+            collapsed_summary: None,
         },
     ]);
     assert_eq!(state.lines.len(), 7);
@@ -3199,10 +3868,12 @@ fn splice_newer_lines_shifts_indices_and_keeps_viewport() {
             DisplayLine {
                 text: "old-1".into(),
                 kind: LineKind::Dim,
+                collapsed_summary: None,
             },
             DisplayLine {
                 text: "head-1".into(),
                 kind: LineKind::Normal,
+                collapsed_summary: None,
             },
         ],
         window: ScrollWindow {
@@ -3219,6 +3890,7 @@ fn splice_newer_lines_shifts_indices_and_keeps_viewport() {
     boundary.splice_newer_lines(vec![DisplayLine {
         text: "mid-1".into(),
         kind: LineKind::Dim,
+        collapsed_summary: None,
     }]);
     assert_eq!(boundary.lines.len(), 3);
     assert_eq!(boundary.head_start, 2);
@@ -3295,6 +3967,7 @@ async fn jsonl_store_load_newer_marks_done_without_lines() {
         lines: vec![DisplayLine {
             text: "head".into(),
             kind: LineKind::Normal,
+            collapsed_summary: None,
         }],
         head_start: 0,
         ..Default::default()

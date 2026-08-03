@@ -209,6 +209,7 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
                 old_width,
                 inner_width,
                 usize::from(output.height),
+                scroll_state.collapse_thinking.0,
             );
         }
         // When following, anchor the window. Terminal-style output: content
@@ -219,21 +220,45 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
         // restores following — the anchor decision only runs while following.
         if scroll_state.window.follow_bottom {
             let height = usize::from(output.height);
-            if scrollback_fits_viewport(&scroll_state.lines, inner_width, height) {
+            if scrollback_fits_viewport(
+                &scroll_state.lines,
+                inner_width,
+                height,
+                scroll_state.collapse_thinking.0,
+            ) {
                 scroll_state.window.anchor_head(&scroll_state.lines);
             } else {
-                scroll_state
-                    .window
-                    .anchor_tail(&scroll_state.lines, inner_width, height);
+                scroll_state.window.anchor_tail(
+                    &scroll_state.lines,
+                    inner_width,
+                    height,
+                    scroll_state.collapse_thinking.0,
+                );
             }
         }
+        // Recompute absent or width-stale collapsed-summary caches at the
+        // CURRENT width from the COMPLETE source lines, before
+        // local_window_lines truncates them: attach/snapshot replay appends
+        // with width 0 (cache None) and a terminal resize leaves caches
+        // bound to the old width — both land here on the first draw after
+        // the width is known.
+        scroll_state.refresh_window_collapsed_summaries(inner_width);
         // Render a bounded local tail. The cursor captured when scrolling
         // away from a streaming tail keeps later deltas out of this view.
-        let local_lines = local_window_lines(&scroll_state.lines, &scroll_state.window);
+        let local_lines = local_window_lines(
+            &scroll_state.lines,
+            &scroll_state.window,
+            scroll_state.collapse_thinking.0,
+        );
         let at_top = scroll_state.window.source_start == 0
             && scroll_state.window.source_end <= MAX_RENDER_SOURCE_LINES
             && scroll_state.window.frozen_tail_cursor.is_none();
-        let visual = render_bounded_window(&local_lines, inner_width, at_top);
+        let visual = render_bounded_window(
+            &local_lines,
+            inner_width,
+            at_top,
+            scroll_state.collapse_thinking.0,
+        );
         let total_rows = visual.len();
         let height = usize::from(output.height);
         // Clamp local_offset in follow mode.
@@ -589,13 +614,16 @@ pub(crate) fn shorten_home(cwd: &str) -> std::borrow::Cow<'_, str> {
 
 /// Render the local copy and retain its most recent visual rows. The local
 /// copy is byte-bounded before markdown parsing; trimming after wrapping also
-/// bounds the actual ratatui history passed to the frame.
+/// bounds the actual ratatui history passed to the frame. `collapse_thinking`
+/// is forwarded to `render_window` so collapsed thinking blocks render as one
+/// summary row.
 pub(crate) fn render_bounded_window(
     lines: &[DisplayLine],
     width: usize,
     keep_head: bool,
+    collapse_thinking: bool,
 ) -> Vec<ratatui::text::Line<'static>> {
-    let mut rows = render_window(lines, 0, lines.len(), width);
+    let mut rows = render_window(lines, 0, lines.len(), width, collapse_thinking);
     if rows.len() > MAX_RENDER_VISUAL_ROWS {
         if keep_head {
             // Viewport at the absolute top (Home / PageUp at the top): keep
@@ -724,7 +752,16 @@ pub(crate) fn render_task_detail(
     let old_width = detail.rendered_width;
     detail.rendered_width = width;
     if !detail.window.follow_bottom && old_width > 0 && old_width != width {
-        reanchor_window_on_resize(&detail.lines, &mut detail.window, old_width, width, height);
+        // Task-detail pages are plain Dim spool lines — never Thinking —
+        // so the collapse flag is irrelevant here; pass `false`.
+        reanchor_window_on_resize(
+            &detail.lines,
+            &mut detail.window,
+            old_width,
+            width,
+            height,
+            false,
+        );
     }
     let status = if detail.finished {
         "finished"
@@ -743,7 +780,7 @@ pub(crate) fn render_task_detail(
     let block = SOLARIZED_LIGHT.block(header);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let local = local_window_lines(&detail.lines, &detail.window);
+    let local = local_window_lines(&detail.lines, &detail.window, false);
     // Per-frame wrap budget: follow mode re-wraps the page every frame
     // (even without a reload), so bound the wrap to the viewport's own
     // cell count instead of the full 64 KiB page — a cargo build dumping
@@ -757,7 +794,8 @@ pub(crate) fn render_task_detail(
         MAX_RENDER_BYTES
     };
     let local = bound_wrap_bytes(local, wrap_budget);
-    let visual = render_bounded_window(&local, width, false);
+    // All spool lines are Dim, so the collapse flag is irrelevant; `false`.
+    let visual = render_bounded_window(&local, width, false, false);
     let total_rows = visual.len();
     if detail.window.follow_bottom {
         detail.window.local_offset = total_rows.saturating_sub(content_height);
@@ -818,11 +856,24 @@ pub(crate) fn render_task_detail(
 /// `FENCE_LOOKBEHIND` preceding lines through the MarkdownLines renderer
 /// (see `lookbehind_start`). A code fence opened earlier may be invisible
 /// to the priming pass and produce incorrect styling.
+///
+/// A `Thinking` line with `collapse_thinking` renders as a single summary
+/// row (`▸ thinking… (N 行) [Tab 展开]`, N = the block's wrapped row count)
+/// instead of the full wrapped text — and `line_visual_rows` counts exactly
+/// one row for it, keeping render and scroll accounting in agreement. The
+/// summary is read from `DisplayLine::collapsed_summary`, which the state
+/// maintains when the line's text changes and the draw entry re-binds to
+/// the current width (`TuiState::refresh_window_collapsed_summaries`):
+/// rendering never hard-wraps the (possibly MB-sized) full text per frame.
+/// The fallback below only runs for a line whose cache was never computed
+/// (direct callers that bypass the draw entry, e.g. tests), and for those
+/// the local text is the full untruncated text.
 pub(crate) fn render_window(
     lines: &[DisplayLine],
     source_start: usize,
     source_end: usize,
     width: usize,
+    collapse_thinking: bool,
 ) -> Vec<ratatui::text::Line<'static>> {
     let width = width.max(1);
     let mut markdown = crate::markdown::MarkdownLines::new();
@@ -852,6 +903,16 @@ pub(crate) fn render_window(
                         crate::markdown::wrap_spans(&spans, width)
                     })
                     .collect::<Vec<_>>()
+            } else if line.kind == LineKind::Thinking && collapse_thinking {
+                let fallback;
+                let summary: &str = match line.collapsed_summary.as_ref() {
+                    Some(cached) => &cached.text,
+                    None => {
+                        fallback = collapsed_summary_for(&line.text, width);
+                        &fallback
+                    }
+                };
+                vec![styled_scroll_line(summary, line.kind)]
             } else {
                 hard_wrap(&line.text, width)
                     .into_iter()
