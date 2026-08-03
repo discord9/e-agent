@@ -1299,8 +1299,8 @@ mmlEqnNo}
   .task-meta.tid { color: var(--base00); }
   .task-meta.tsid { color: var(--cyan); }
   .task-meta.tparent { color: var(--base00); }
-  .task-tags { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: middle; }
-  .task-tag { font-size: 10px; padding: 0 5px; border: 1px solid var(--base1); border-radius: 8px; color: var(--base01); background: var(--base3); white-space: nowrap; }
+  .task-tags { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: middle; min-width: 0; flex-wrap: wrap; }
+  .task-tag { font-size: 10px; padding: 0 5px; border: 1px solid var(--base1); border-radius: 8px; color: var(--base01); background: var(--base3); word-break: break-all; }
   .task-cancel {
     padding: 1px 10px;
     font-size: 12px;
