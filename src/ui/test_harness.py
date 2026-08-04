@@ -270,6 +270,7 @@ const historyOlderData={entries:[
 const FETCHES=[];
 const FETCH_HEADERS=[];   // 每个请求的 {url, method, headers}（全局 token 回退测试断言 Authorization）
 const FETCH_BODIES=[];    // 每个请求的 body（深链 resume 断言 POST {"id":...}）
+const FETCH_OPTS=[];      // 每个请求的 {url, method, cache}（apiFor cache:no-store 断言）
 const sseChunks = [
   "event: snapshot\ndata: [{\"type\":\"notice\",\"text\":\"SNAPSHOT-SHOULD-BE-SKIPPED\"}]\n\n",
   "event: status\ndata: {\"status\":\"Busy\"}\n\n",
@@ -428,6 +429,7 @@ globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
   FETCH_HEADERS.push({ url, method: (opts.method||"GET").toUpperCase(), headers: opts.headers || {} });
   FETCH_BODIES.push(opts.body || null);
+  FETCH_OPTS.push({ url, method: (opts.method||"GET").toUpperCase(), cache: opts.cache || null });
   const signal = opts && opts.signal;   // 传给 abort 感知的响应桩
   const m=(opts.method||"GET").toUpperCase();
       if(url==="/api/tasks") return resp(200, tasksData, signal);
@@ -574,6 +576,13 @@ async function main(){
     chk("tree filter matches title", treeSessionMatches({ id: "sid-42", title: "标题甲" }, "标题甲"));
     chk("tree filter matches ID when title exists",
         treeSessionMatches({ id: "sid-42", title: "标题甲" }, "SID-42"));
+    // 多 workspace 防误标加固：所有 apiFor 发起的请求必须带 cache:no-store
+    // （唯一不走 apiFor 的 fetch 是 sse.js 的 /events 流，直连 fetch 不带
+    //  cache——按 url 排除；它也不需要 HTTP 缓存）。
+    chk("apiFor fetches carry cache:no-store",
+        FETCH_OPTS.filter((f) => !f.url.endsWith("/events"))
+          .every((f) => f.cache === "no-store"),
+        "caches=" + JSON.stringify([...new Set(FETCH_OPTS.map((f) => f.cache))]));
 
     if (MODE === 'direct') {
       state.sessionId = "s1";   // loadHistory 现在按 (wsId, sid, epoch) 三重校验发起上下文
@@ -2983,6 +2992,92 @@ async function main(){
         pinSec15c.length === 2 && !pinSec15c[0].classList.contains("pinned"),
         "n=" + pinSec15c.length + " cls0=" + pinSec15c[0].className);
     state.sidebar.filter = "";
+
+    // =====================================================================
+    // 15d) 多 workspace 防误标加固：轮询失败（workspaceErrors 非空）的
+    //      workspace 其 stale 列表的 pin 不进全局置顶聚合；workspace 分组
+    //      内 stale 列表仍渲染（用户可看）+ 组头「无法连接」标记；错误清除
+    //      （下一次成功轮询）后 pin 自动回到聚合。另锁回归：成功响应 []
+    //      是 truthy → 覆盖旧缓存，绝不保留 stale 列表（否则被删/已停实例
+    //      的 pin 会一直显示）。
+    // =====================================================================
+    sessionsData = [
+      { id: "pa1", status: "Idle", title: "A 置顶", created_at: "2024-01-01T00:00:00Z", entry_count: 3, busy: false, active: true, pinned: true },
+      { id: "a-np", status: "Idle", title: "A 普通", created_at: "2024-01-02T00:00:00Z", entry_count: 1, active: true },
+    ];
+    sessionsDataB = [
+      { id: "pb1", status: "Idle", title: "B 置顶", created_at: "2024-02-01T00:00:00Z", entry_count: 2, active: true, pinned: true },
+      { id: "b-np", status: "Idle", title: "B 普通", created_at: "2024-02-02T00:00:00Z", entry_count: 1, active: true },
+    ];
+    state.workspaces = [
+      { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
+      { id: "wsB", name: "服务器B", url: "http://b.local", token: "tok-b" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    // 健康状态：两个 workspace 的置顶都进聚合。
+    const pinsHealthy = allPinnedSessions().map((x) => x.s.id);
+    chk("pinned errguard: healthy workspaces all pinned",
+        pinsHealthy.includes("pa1") && pinsHealthy.includes("pb1"),
+        "pins=" + JSON.stringify(pinsHealthy));
+    // B 轮询失败（模拟旧实例挂掉）：标记 workspaceErrors，保留 stale 列表。
+    sessionsBFail = true;
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    chk("pinned errguard: poll failure marks error and keeps stale list",
+        state.workspaceErrors["wsB"] === "http500"
+        && state.workspaceLists["wsB"] !== undefined
+        && state.workspaceLists["wsB"].some((x) => x.id === "pb1"),
+        "err=" + state.workspaceErrors["wsB"]);
+    const pinsErr = allPinnedSessions().map((x) => x.s.id);
+    chk("pinned errguard: stale workspace pin excluded from aggregate",
+        pinsErr.includes("pa1") && !pinsErr.includes("pb1"),
+        "pins=" + JSON.stringify(pinsErr));
+    // workspace 分组内 stale 列表仍渲染（用户可看），组头带「无法连接」。
+    renderSidebarTree(true);
+    const errSecs = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    chk("pinned errguard: stale workspace section still shows list + err mark",
+        errSecs.length === 3
+        && errSecs[2].textContent.includes("b-np")
+        && !errSecs[0].textContent.includes("pb1")   // 置顶聚合里没有 B 的 pin
+        && errSecs[2].querySelector(".ws-err") !== null,
+        "secB=" + errSecs[2].textContent.slice(0, 60));
+    // 错误清除（下一次成功轮询）→ pin 自动回到聚合。
+    sessionsBFail = false;
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    const pinsRecover = allPinnedSessions().map((x) => x.s.id);
+    chk("pinned errguard: error cleared restores pin to aggregate",
+        state.workspaceErrors["wsB"] === null && pinsRecover.includes("pb1"),
+        "err=" + state.workspaceErrors["wsB"] + " pins=" + JSON.stringify(pinsRecover));
+    // 回归锁：成功响应 []（truthy）覆盖旧缓存——不能因「空列表」而保留
+    //  stale 旧列表（那是误标根因的持久化形态）。
+    sessionsDataB = [];
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    const pinsEmpty = allPinnedSessions().map((x) => x.s.id);
+    chk("pinned errguard: successful [] overwrites stale cache",
+        state.workspaceErrors["wsB"] === null
+        && Array.isArray(state.workspaceLists["wsB"])
+        && state.workspaceLists["wsB"].length === 0
+        && !pinsEmpty.includes("pb1"),
+        "len=" + state.workspaceLists["wsB"].length
+        + " pins=" + JSON.stringify(pinsEmpty));
+    sessionsBFail = false;
 
     // =====================================================================
     // 16) 删除 review 修复验证：后台删除（不切换/不重置当前聊天 + 侧边栏同步

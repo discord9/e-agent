@@ -1355,6 +1355,12 @@ function removePinOrder(wsId, sid) {
 function allPinnedSessions() {
   const out = [];
   for (const ws of state.workspaces) {
+    // 轮询失败的 workspace（workspaceErrors 非空）其列表是 stale 缓存——
+    // 可能来自旧实例/旧连接的响应（多 workspace 误标根因）。stale 期间的
+    // pin 不进全局置顶聚合，避免把已停实例的 pin 错标到当前聚合视图；
+    // workspace 分组内 stale 列表仍显示（带「无法连接」标记），错误清除
+    // （下一次成功轮询）后 pin 自动回到置顶聚合。
+    if (state.workspaceErrors[ws.id]) continue;
     for (const s of workspaceListFor(ws)) {
       // 归档 = 从活跃入口隐藏：pinned+archived 只出现在「归档」分组。
       if (s.pinned === true && s.archived !== true && isMainSession(s)) out.push({ ws, s });
