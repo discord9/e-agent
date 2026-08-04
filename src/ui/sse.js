@@ -483,6 +483,18 @@ els.messages.addEventListener("click", (ev) => {
     t.textContent = expanded ? "收起" + label : "展开全文" + label;
     return;
   }
+  if (t.classList.contains("copy-toggle")) {
+    // 「复制全文」：_srcText 存未截断原文（live 元素）；innerHTML 快照往返后
+    // expando 丢失 → 回退到 _target / closest(.expandable) 里的 .expand-full
+    // （全文常驻 DOM 且随快照序列化，与展开按钮同一兜底机制）。
+    // 短文本不生成 copy-toggle，能走到这里的一定是超阈值长文本。
+    const c = t._target || t.closest(".expandable")
+      || (t.closest(".tool-card") || t.closest(".notice") || {}).querySelector?.(".expandable");
+    const text = t._srcText != null ? t._srcText
+      : (c ? (c.querySelector(".expand-full") || {}).textContent : "");
+    if (typeof text === "string" && text !== "") copyTextToClipboard(text, t);
+    return;
+  }
   if (t.classList.contains("older-load")) {
     ev.preventDefault();
     ev.stopPropagation();

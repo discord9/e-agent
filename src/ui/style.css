@@ -940,6 +940,41 @@
     overflow-y: auto;
   }
 
+  /* 「复制全文」按钮 + 右上角按钮组（render.js maybeTruncateEl 长文本分支）：
+     容器标 .expand-copy（diff 展开路径 renderFileView 不标，保持原布局）；
+     展开/复制按钮绝对定位到正文区域右上角，正文第一行让出顶部留白
+     （padding-top）避免被按钮压住。.expandable.expanded 展开全文时按钮组
+     仍可见（绝对定位不随预览/全文切换隐藏）。 */
+  .expandable.expand-copy {
+    position: relative;
+    padding-top: 26px;
+  }
+  .expandable.expand-copy .expand-toggle,
+  .expandable.expand-copy .copy-toggle {
+    position: absolute;
+    top: 2px;
+    margin: 0;
+    z-index: 1;
+  }
+  /* 展开按钮在左、复制按钮在右（右缘对齐正文框） */
+  .expandable.expand-copy .expand-toggle { right: 70px; }
+  .expandable.expand-copy .copy-toggle { right: 2px; }
+  /* 复制按钮：与展开按钮同控件风格，绿色系区分（Solarized --green） */
+  .copy-toggle {
+    display: inline-block;
+    cursor: pointer;
+    background: var(--base2);
+    border: 1px solid var(--base1);
+    border-radius: 3px;
+    padding: 1px 8px;
+    font: inherit;
+    font-size: 11px;
+    color: var(--green);
+    user-select: none;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .copy-toggle:hover { background: var(--base1); border-color: var(--green); }
+
   /* 消息上限占位（app.js pruneMessages）：折叠最早的一批已完成块；
      summary 点击展开原位查看，另附「加载更早历史」链接（无更早时隐藏） */
   .older-collapse {

@@ -21,20 +21,76 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
   const n = (threshold > 0) ? threshold : LONG_TEXT_THRESHOLD;
   if (s.length <= n) { container.textContent = s; return container; }
   container.textContent = "";
-  container.classList.add("expandable");
+  container.classList.add("expandable", "expand-copy");
   const preview = el("span", "expand-preview", s.slice(0, n) + "\n… ");
   const btn = el("button", "expand-toggle", "展开全文" + (label ? "（" + label + "）" : ""));
   btn.type = "button";
   // 记住按钮控制的正文 pre：卡片里可能有多个 .expandable（args/result），
   // 事件委托用这个引用精确定位，而不是就近找第一个
   btn._target = container;
+  // 「复制全文」按钮：与展开按钮同框并排（CSS .expandable.expand-copy 把
+  // 按钮组绝对定位到正文右上角）。_srcText 存未截断原文，事件委托直接复制；
+  // _target 与展开按钮同机制。注意不能用 _text：El/textContent 内部用它做
+  // 文本后备存储，会被原文覆盖掉按钮标签。innerHTML 快照往返后 expando
+  // （_srcText/_target）丢失，委托回退到常驻 DOM 的 .expand-full 取全文
+  // （随快照序列化）。
+  const copy = el("button", "copy-toggle", "复制全文");
+  copy.type = "button";
+  copy._target = container;
+  copy._srcText = s;
   const full = el("span", "expand-full", s);
   container.append(preview, full);
-  // 按钮在正文 pre 框内末尾（同框，控件样式与正文区分）；footerEl 保留
+  // 按钮在正文 pre 框内（同框，控件样式与正文区分）；footerEl 保留
   // 为兼容参数（当前无调用传它）
-  if (footerEl) footerEl.appendChild(btn);
-  else container.appendChild(btn);
+  if (footerEl) {
+    footerEl.appendChild(btn);
+    footerEl.appendChild(copy);
+  } else {
+    container.append(btn, copy);
+  }
   return container;
+}
+/* 「复制全文」剪贴板写入：navigator.clipboard.writeText（https/现代浏览器）
+   优先；失败或不可用回退 document.execCommand("copy")（临时 textarea，兼容
+   非 https 上下文与老浏览器）。成功按钮短暂显示「已复制」、失败显示
+   「复制失败」，1.2s 后还原为「复制全文」。纯前端，不依赖后端。 */
+function copyTextToClipboard(text, btn) {
+  const restore = () => {
+    try { setTimeout(() => { if (btn) btn.textContent = "复制全文"; }, 1200); }
+    catch (e) { /* 无计时器环境（harness）：不还原也不报错 */ }
+  };
+  const show = (ok) => { if (btn) { btn.textContent = ok ? "已复制" : "复制失败"; restore(); } };
+  const fallback = () => show(fallbackCopyText(text));
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      const p = navigator.clipboard.writeText(text);
+      if (p && typeof p.then === "function") p.then(() => show(true), fallback);
+      else show(true);   // 同步返回（罕见实现）：视为成功
+    } catch (e) { fallback(); }
+  } else {
+    fallback();
+  }
+}
+/* execCommand 兜底：临时 textarea（fixed + 透明，不引起页面跳动），选中后
+   document.execCommand("copy")；成功返回 true，任何一步异常（无 body / 无
+   execCommand / 权限拒绝）都返回 false → 按钮显示「复制失败」。 */
+function fallbackCopyText(text) {
+  let ta = null;
+  try {
+    ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    (document.body || document.documentElement).appendChild(ta);
+    ta.focus();
+    ta.select();
+    return typeof document.execCommand === "function" && document.execCommand("copy");
+  } catch (e) {
+    return false;
+  } finally {
+    if (ta) { try { ta.remove(); } catch (e) { /* ignore */ } }
+  }
 }
 /* =====================================================================
  * 文件工具差异化渲染：edit_file → -/+ 两段 diff、read_file → 行号+内容

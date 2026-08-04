@@ -1630,6 +1630,73 @@ async function main(){
         && !lastCardB.querySelector(".tool-result").classList.contains("expandable")
         && lastCardB.querySelector(".tool-result.err") !== null);
 
+    // ---- 「复制全文」按钮（copy-toggle）：长文本才有，复制未截断原文 ----
+    // 长文本容器（cardA 的 args/result 都超阈值）：两个按钮并存，copy 的
+    // _srcText 指向完整原文（非预览截断）、_target 与展开按钮同机制
+    const copyBtnA = cardA.querySelectorAll(".copy-toggle")
+      .find((b) => b._target === resPreA) || cardA.querySelector(".copy-toggle");
+    chk("A long text has copy button with full text",
+        !!copyBtnA && copyBtnA._srcText === "y".repeat(500)
+        && copyBtnA._target === resPreA
+        && copyBtnA.textContent === "复制全文",
+        "text-len=" + (copyBtnA && copyBtnA._srcText && copyBtnA._srcText.length)
+        + " target=" + (copyBtnA && copyBtnA._target === resPreA)
+        + " label=" + (copyBtnA && JSON.stringify(copyBtnA.textContent)));
+    chk("A expand+copy buttons coexist",
+        !!resPreA.querySelector(".expand-toggle") && !!resPreA.querySelector(".copy-toggle"),
+        "in-pre=" + resPreA._children.filter((c) => c instanceof El).map((c) => c._className).join(","));
+    // 短文本（不超阈值）无 copy-toggle（用户可选中复制，不加噪音）
+    chk("A short text has no copy button",
+        argsShortA.querySelector(".copy-toggle") === null
+        && lastCardB.querySelector(".tool-result").querySelector(".copy-toggle") === null,
+        "args-short=" + (argsShortA.querySelector(".copy-toggle") !== null)
+        + " res-short=" + (lastCardB.querySelector(".tool-result").querySelector(".copy-toggle") !== null));
+    // 点击复制：stub navigator.clipboard.writeText，断言写入完整原文
+    // （"y".repeat(500)，非 300 字符预览截断）；按钮短暂显示「已复制」
+    let copiedText = null;
+    navigator.clipboard = { writeText: (t) => { copiedText = t; return Promise.resolve(); } };
+    for (const fn of clicksA) fn({ target: copyBtnA });
+    await flush();
+    chk("A copy writes full text via clipboard API",
+        copiedText === "y".repeat(500) && copyBtnA.textContent === "已复制",
+        "len=" + (copiedText == null ? "null" : copiedText.length) + " btn=" + copyBtnA.textContent);
+    // 复制失败 fallback：clipboard 不可用 → document.execCommand("copy")
+    // （临时 textarea 选中）；execCommand 成功 → 仍显示「已复制」
+    delete navigator.clipboard;
+    const origExecA = document.execCommand;
+    const origCreateA = document.createElement;
+    let execCmdA = null;
+    document.execCommand = (cmd) => { execCmdA = cmd; return true; };
+    document.createElement = (tag) => {
+      const e = origCreateA(tag);
+      if (tag === "textarea") e.select = () => {};   // harness El 无 select：兜底路径需要
+      return e;
+    };
+    for (const fn of clicksA) fn({ target: copyBtnA });
+    await flush();
+    chk("A copy falls back to execCommand",
+        execCmdA === "copy" && copyBtnA.textContent === "已复制",
+        "exec=" + execCmdA + " btn=" + copyBtnA.textContent);
+    document.execCommand = origExecA;
+    document.createElement = origCreateA;
+    // 兜底也失败（无 execCommand / textarea 不可用）→ 「复制失败」
+    for (const fn of clicksA) fn({ target: copyBtnA });
+    await flush();
+    chk("A copy failure shows 复制失败",
+        copyBtnA.textContent === "复制失败",
+        "btn=" + copyBtnA.textContent);
+    // innerHTML 快照往返后 copy-toggle 的 _srcText/_target expando 丢失 →
+    // 委托回退 .expand-full（常驻 DOM 的全文）取原文，复制仍可用
+    const restoredCopyA = restoredCardA[restoredCardA.length - 1].querySelector(".copy-toggle");
+    let copiedText2 = null;
+    navigator.clipboard = { writeText: (t) => { copiedText2 = t; return Promise.resolve(); } };
+    for (const fn of clicksA) fn({ target: restoredCopyA });
+    await flush();
+    chk("A round-trip copy falls back to expand-full text",
+        copiedText2 === "z".repeat(400) && restoredCopyA.textContent === "已复制",
+        "len=" + (copiedText2 == null ? "null" : copiedText2.length)
+        + " btn=" + restoredCopyA.textContent);
+
     // ---- 文件工具差异化渲染：edit_file -/+ diff / read_file 行号 / write_file 单侧 ----
     const lastCard = () => {
       const cs = elsById["messages"].querySelectorAll("details.tool-card");
