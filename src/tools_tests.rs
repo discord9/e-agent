@@ -896,7 +896,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
     }
     assert!(desc.contains("/mnt/big/cargo-home"), "{desc}");
     #[cfg(windows)]
-    assert!(desc.contains("protected-git shell execution"), "{desc}");
+    assert!(desc.contains("protect_git = false"), "{desc}");
     #[cfg(not(windows))]
     assert!(desc.contains("`.git`"), "{desc}");
 

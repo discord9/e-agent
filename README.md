@@ -128,6 +128,30 @@ read-only too, give their role template a `read_only = true` frontmatter as
 described above; forced inheritance of the parent's read-only policy into
 subagents is a planned future option, not implemented today.
 
+### Role frontmatter: `protect_git`
+
+Subagent/fixer `bash` protects the workspace `.git` metadata by default
+(`protect_git = true`): on Linux/macOS the sandbox binds `<workspace>/.git`
+read-only so a delegated agent cannot delete or corrupt the repository (the
+main agent leaves `.git` writable so it can orchestrate git operations). The
+same frontmatter block can opt a role out with `protect_git = false`:
+
+```markdown
+---
+protect_git = false
+---
+Fix the code and run the checks.
+```
+
+This matters on Windows: the write-sandbox MVP has no way to make `.git`
+read-only, so when `protect_git = true` it fails closed — every shell command
+in a delegated subagent/fixer is rejected before execution with guidance in
+the error message. Setting `protect_git = false` in the role's frontmatter
+(and accepting that `.git` stays writable inside the sandbox) restores a
+working shell for that role. The key defaults to `true` when omitted, so
+Linux/macOS behavior is unchanged; only roles that explicitly opt out lose the
+`.git` protection.
+
 The `bash` tool can be sandboxed with `bubblewrap` when it is installed. The
 sandbox is off unless explicitly enabled:
 
@@ -361,9 +385,11 @@ broader `~/.cargo`. A hardlink that would alias a file outside the write roots
 is still rejected with all alias paths listed, so align the write roots with
 the locations the build actually shares. Windows shell
 execution with protected Git metadata (`protect_git = true`, used by delegated
-subagents/fixers) is unsupported and fails before token or ACL changes with
-`Windows write-sandbox MVP does not support protected-git shell execution`;
-there is no `.git` ACL carve-out.
+subagents/fixers) is unsupported and fails closed before token or ACL changes
+with actionable guidance in the error message; there is no `.git` ACL
+carve-out. A role template can opt out per role with `protect_git = false` in
+its frontmatter (see "Role frontmatter: `protect_git`" above), restoring a
+working shell for that role under the Windows sandbox.
 
 Synthetic capability allow ACEs persist after successful execution. If adding
 an ACE to a later root fails, ACEs already added to earlier roots may also

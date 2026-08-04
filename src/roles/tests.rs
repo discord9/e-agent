@@ -168,6 +168,74 @@ fn frontmatter_fails_closed_on_unclosed_or_invalid_toml() {
 }
 
 #[test]
+fn frontmatter_protect_git_flag_defaults_true_and_parses_explicit_values() {
+    let _guard = XDG_TEST_LOCK.lock().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (_, ws_agents) = isolated_layers(&workspace);
+
+    // No frontmatter at all: protect_git stays true (historical subagent
+    // default — Linux .git protection unchanged).
+    std::fs::write(ws_agents.join("plain.md"), "You fix things.").unwrap();
+    let template = role_template(workspace.path(), "plain").unwrap().unwrap();
+    assert!(
+        template.protect_git,
+        "no frontmatter must keep protect_git = true"
+    );
+
+    // Frontmatter without the key: true (the default, not the read_only
+    // false default).
+    std::fs::write(
+        ws_agents.join("default.md"),
+        "---\nread_only = true\n---\nAudit only.\n",
+    )
+    .unwrap();
+    let template = role_template(workspace.path(), "default").unwrap().unwrap();
+    assert!(
+        template.protect_git,
+        "protect_git omitted in frontmatter must stay true"
+    );
+    assert!(template.read_only);
+
+    // Explicit protect_git = false: opt-out (the Windows fixer escape hatch).
+    std::fs::write(
+        ws_agents.join("winfixer.md"),
+        "---\nprotect_git = false\n---\nFix things on Windows.\n",
+    )
+    .unwrap();
+    let template = role_template(workspace.path(), "winfixer")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !template.protect_git,
+        "protect_git = false must clear the flag"
+    );
+    assert_eq!(template.prompt, "Fix things on Windows.\n");
+
+    // Explicit protect_git = true: unchanged.
+    std::fs::write(
+        ws_agents.join("strict.md"),
+        "---\nprotect_git = true\n---\nStrict fixer.",
+    )
+    .unwrap();
+    let template = role_template(workspace.path(), "strict").unwrap().unwrap();
+    assert!(template.protect_git);
+
+    // Non-boolean value fails closed like any other TOML type error.
+    std::fs::write(
+        ws_agents.join("bogus.md"),
+        "---\nprotect_git = \"no\"\n---\nPrompt",
+    )
+    .unwrap();
+    let error = role_template(workspace.path(), "bogus").unwrap_err();
+    assert!(
+        error.to_string().contains("not valid TOML"),
+        "protect_git = \"no\" must be rejected, got: {error}"
+    );
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+#[test]
 fn frontmatter_flag_comes_from_the_winning_workspace_layer() {
     let _guard = XDG_TEST_LOCK.lock().unwrap();
     let workspace = tempfile::tempdir().unwrap();

@@ -1480,7 +1480,8 @@ pub(super) async fn run(
 ) -> Result<String, String> {
     if protect_git {
         return Err(
-            "Windows write-sandbox MVP does not support protected-git shell execution".into(),
+            "Windows write-sandbox: this role sets protect_git=true, which the Windows MVP cannot enforce (there is no .git read-only bind, so running shell commands would silently leave .git writable). Add 'protect_git = false' to the role's frontmatter (e.g. the fixer role template), or disable the sandbox, to run shell commands."
+                .into(),
         );
     }
     if !policy.network {
