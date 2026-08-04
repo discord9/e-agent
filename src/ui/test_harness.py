@@ -1878,7 +1878,7 @@ async function main(){
         tagEls.length === 3
         && tagEls[0].textContent === "background"
         && tagEls[1].textContent === "workspace: /custom/path"
-        && tagEls[2].textContent === "resume: sub-123",
+        && tagEls[2].textContent === "resume",   // 简化：只显示 resume 文字（完整 id 在 title）
         "tags=" + tagEls.map((t) => t.textContent).join("|"));
     chk("tags live in .task-tags container",
         tagRow.querySelector(".task-tags") !== null
@@ -5114,6 +5114,12 @@ r = subprocess.run(['gjs', out], capture_output=True, text=True)
 print(r.stdout, end="")
 if r.stderr.strip():
     print(r.stderr[:12000])
+    # gjs 的 PASS/FAIL/ALL PASS 都走 stderr，且总输出可能超过 12000 字符：
+    # 只打印头部会把结尾的 "ALL PASS"/"N FAILURES" 截掉，导致 exit code
+    # 误报（"ALL PASS" 判据找不到）。补打尾部，保证总判定永远可见。
+    if len(r.stderr) > 12000:
+        print("... [stderr tail] ...")
+        print(r.stderr[-3000:])
 if os.environ.get('KEEP') != '1':
     os.unlink(out)
 
