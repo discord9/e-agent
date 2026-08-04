@@ -158,7 +158,14 @@ file/section — or a `[sandbox]` with no paths — inherits all global roots
 unchanged. If either path field appears, selection mode applies and the other
 field is empty. Readable selections may come from global readable or writable
 roots (downgrading authority), while writable selections must come from global
-writable roots. Malformed or
+writable roots: the user-level `[sandbox]` defines the authorized roots, and a
+project can only narrow or accumulate within them — it can never widen them.
+A project path outside every global root is a startup error naming the
+offending path and the fix: add that path or an ancestor to the user-level
+`[sandbox]` (e.g. `writable_paths` for writes), or remove/narrow the
+project-local entry. With no user-level `[sandbox]` at all, project path
+fields are rejected with the same guidance; project scalar overrides such as
+`enabled = true` still apply without any global `[sandbox]`. Malformed or
 unreadable project config is a startup error. The project `[sandbox]` scalars
 `enabled`, `network`, and `workspace_writable` override the global keys
 per-key: a key present in the project config replaces the global value, and
@@ -338,13 +345,21 @@ fixed local NTFS volumes are accepted. UNC/device paths, non-directory roots,
 roots that are symlinks/reparse points, NULL DACLs, and case-sensitive roots
 are rejected. Before the first installation (or a versioned ACE upgrade), every
 write root that needs its complete inheritable capability ACE is scanned without
-following links; hard-linked file descendants and nested symlink/reparse point
-descendants are unsupported and rejected. Once the exact current-version ACE is
+following links. Hard-linked file descendants whose aliases all stay inside the
+write roots are allowed; a hardlink that aliases a file outside the write roots
+(out-of-bounds) is rejected with every alias path listed. Nested
+symlink/reparse point descendants are unsupported and rejected. Once the exact current-version ACE is
 installed, later commands skip both ACL propagation and that root's full-tree
 scan. The ACE grants create/overwrite plus child rename/delete/atomic replace
 through `FILE_DELETE_CHILD` inherited by directories, without granting `DELETE`
 on the write root itself. Concurrent path replacement races (TOCTOU) remain a
-risk. Windows shell
+risk. In practice this makes cargo's `link_or_copy` (which hardlinks cached
+files, e.g. from `~/.cargo/registry/src`, into the build target directory)
+work when every alias stays inside the write roots — for example a writable
+workspace plus `~/.cargo/registry` as a narrowed write root instead of the
+broader `~/.cargo`. A hardlink that would alias a file outside the write roots
+is still rejected with all alias paths listed, so align the write roots with
+the locations the build actually shares. Windows shell
 execution with protected Git metadata (`protect_git = true`, used by delegated
 subagents/fixers) is unsupported and fails before token or ACL changes with
 `Windows write-sandbox MVP does not support protected-git shell execution`;

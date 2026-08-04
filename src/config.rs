@@ -516,7 +516,9 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
         for path in &local_writable {
             if !global_writable.iter().any(|root| path.starts_with(root)) {
                 bail!(
-                    "project writable path {} is not within a global writable root",
+                    "project writable path {} is not within any globally authorized writable root; \
+                     add this path or an ancestor to [sandbox].writable_paths in the user-level \
+                     config, or remove/narrow the project-local writable_paths entry",
                     path.display()
                 );
             }
@@ -528,7 +530,10 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
                 .any(|root| path.starts_with(root))
             {
                 bail!(
-                    "project readable path {} is not within a global readable or writable root",
+                    "project readable path {} is not within any globally authorized readable or \
+                     writable root; add this path or an ancestor to [sandbox].readable_paths in \
+                     the user-level config (or to writable_paths if writes are intended), or \
+                     remove/narrow the project-local readable_paths entry",
                     path.display()
                 );
             }

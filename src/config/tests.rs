@@ -609,9 +609,11 @@ fn sandbox_project_subset_validation_still_applies() {
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("not within a global writable root"),
+        error.contains("not within any globally authorized writable root"),
         "{error}"
     );
+    assert!(error.contains("project-local"), "{error}");
+    assert!(error.contains("user-level config"), "{error}");
 }
 
 #[test]
@@ -814,7 +816,7 @@ readable_paths = ["{}"]
             .sandbox(&workspace)
             .unwrap_err()
             .to_string()
-            .contains("global writable")
+            .contains("globally authorized writable root")
     );
 
     std::fs::write(
@@ -830,7 +832,7 @@ readable_paths = ["{}"]
             .sandbox(&workspace)
             .unwrap_err()
             .to_string()
-            .contains("global readable or writable")
+            .contains("globally authorized readable or writable root")
     );
 
     std::fs::write(workspace.join(".e-agent/config.toml"), "[sandbox\n").unwrap();
@@ -1513,4 +1515,55 @@ fn sandbox_project_scalars_can_enable_without_global_sandbox() {
         "unset scalars keep Sandbox defaults"
     );
     assert!(sandbox.writable_paths.is_empty());
+}
+
+#[test]
+fn sandbox_project_writable_path_without_global_sandbox_guides_user() {
+    // No global [sandbox] at all + a project writable_paths entry must fail
+    // with the offending path and actionable remediation, not a bare subset
+    // rejection.
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let path = write_config(temp.path(), ""); // no [sandbox] section
+    std::fs::write(
+        workspace.join(".e-agent/config.toml"),
+        format!("[sandbox]\nwritable_paths = [\"{}\"]\n", outside.display()),
+    )
+    .unwrap();
+    let error = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&outside.display().to_string()), "{error}");
+    assert!(error.contains("user-level config"), "{error}");
+    assert!(error.contains("[sandbox].writable_paths"), "{error}");
+    assert!(error.contains("project-local"), "{error}");
+}
+
+#[test]
+fn sandbox_project_readable_path_without_global_sandbox_guides_user() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let path = write_config(temp.path(), ""); // no [sandbox] section
+    std::fs::write(
+        workspace.join(".e-agent/config.toml"),
+        format!("[sandbox]\nreadable_paths = [\"{}\"]\n", outside.display()),
+    )
+    .unwrap();
+    let error = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&outside.display().to_string()), "{error}");
+    assert!(error.contains("user-level config"), "{error}");
+    assert!(error.contains("[sandbox].readable_paths"), "{error}");
+    assert!(error.contains("project-local"), "{error}");
 }
