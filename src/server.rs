@@ -125,22 +125,19 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
     // connections and lets in-flight handlers finish (their synchronous
     // persistence writes already landed before the response). Long-lived
     // SSE connections are NOT waited for — a dropped connection is fine,
-    // data was written by the handler. A short drain timeout forces the
-    // process out even if a handler is stuck (a second Ctrl-C also kills
-    // outright via the default handler).
+    // data was written by the handler. After Ctrl-C, a short drain
+    // timeout forces the process out even if a handler is stuck; a second
+    // Ctrl-C also kills outright via the default handler. The timeout
+    // must live INSIDE the shutdown future so the server never exits
+    // while serving normally.
     let shutdown = async {
         shutdown_signal().await;
+        tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT).await;
     };
-    let server = axum::serve(listener, router(state)).with_graceful_shutdown(shutdown);
-    tokio::select! {
-        result = server => result.context("server error")?,
-        _ = tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT) => {
-            // Drain window expired: in-flight SSE/HTTP connections are
-            // dropped as the runtime shuts down. Persistence is
-            // synchronous per request, so nothing durable is lost by
-            // exiting now.
-        }
-    }
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown)
+        .await
+        .context("server error")?;
     Ok(())
 }
 
