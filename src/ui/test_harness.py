@@ -1490,7 +1490,7 @@ async function main(){
     chk("read_image path shown", argsTextOf(riCard).includes("🖼 pics/cat.png"),
         "text=" + JSON.stringify(argsTextOf(riCard)));
     // delegate：role chip + background chip（未提供默认 true=后台运行）+ label +
-    // task 正文 + workspace 行 + resume 行
+    // workspace 行（卡片头部，task 之前）+ resume 行 + task 正文
     const dgCard = buildToolCard("delegate", JSON.stringify({
       task: "请审查这段代码", role: "seer", label: "看图",
       workspace: "/home/user/proj", resume: "sub-123",
@@ -1502,6 +1502,12 @@ async function main(){
         && dgText.includes("工作区: /home/user/proj") && dgText.includes("续接会话: sub-123")
         && !dgText.includes('"task"'),
         "text=" + JSON.stringify(dgText));
+    // workspace 位于卡片头部：在 task 正文之前（用户反馈：原先在底部）
+    const wsIdx = dgText.indexOf("工作区: /home/user/proj");
+    const taskIdx = dgText.indexOf("请审查这段代码");
+    chk("delegate workspace before task (card head)",
+        wsIdx !== -1 && taskIdx !== -1 && wsIdx < taskIdx,
+        "ws=" + wsIdx + " task=" + taskIdx + " text=" + JSON.stringify(dgText));
     // delegate 无 background → 默认后台（后端默认 true）；background:false → 前台同步
     const dgSync = buildToolCard("delegate", JSON.stringify({ task: "t", workspace: "/w", background: false }), "完成", "", "ok");
     chk("delegate background defaults true, explicit false shows sync",
