@@ -121,29 +121,37 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .with_context(|| format!("cannot bind {host}:{port}"))?;
-    // Graceful shutdown on Ctrl-C, but bound: long-lived SSE connections
-    // (a phone keeping the chat open) would otherwise hold the process
-    // forever — the first Ctrl-C looks like it "does nothing". After
-    // SHUTDOWN_DRAIN_TIMEOUT the server exits anyway (a second Ctrl-C
-    // still kills outright via the default handler).
+    // Ctrl-C triggers graceful shutdown: axum stops accepting new
+    // connections and lets in-flight handlers finish (their synchronous
+    // persistence writes already landed before the response). Long-lived
+    // SSE connections are NOT waited for — a dropped connection is fine,
+    // data was written by the handler. A short drain timeout forces the
+    // process out even if a handler is stuck (a second Ctrl-C also kills
+    // outright via the default handler).
     let shutdown = async {
         shutdown_signal().await;
-        tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT).await;
     };
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("server error")?;
+    let server = axum::serve(listener, router(state)).with_graceful_shutdown(shutdown);
+    tokio::select! {
+        result = server => result.context("server error")?,
+        _ = tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT) => {
+            // Drain window expired: in-flight SSE/HTTP connections are
+            // dropped as the runtime shuts down. Persistence is
+            // synchronous per request, so nothing durable is lost by
+            // exiting now.
+        }
+    }
     Ok(())
 }
 
-/// How long graceful shutdown waits for in-flight connections to close
-/// after Ctrl-C before exiting regardless.
-const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long graceful shutdown waits before exiting regardless of lingering
+/// connections. Persistence is synchronous inside request handlers, so this
+/// only covers a stuck handler, not data durability.
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 async fn shutdown_signal() {
     // Ctrl-C only. A second Ctrl-C kills the process outright (default
-    // handler) while the first is draining in-flight connections.
+    // handler).
     let _ = tokio::signal::ctrl_c().await;
 }
 
