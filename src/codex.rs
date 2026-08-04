@@ -19,7 +19,9 @@ const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 /// exponential backoff `base * 2^(attempt-1)` — in production 0.5/1/2/4/8s, a
 /// ~15.5s recovery window — so multi-second network jitter (e.g. "tls handshake
 /// eof") self-heals before a turn fails. Only errors where no bytes were
-/// exchanged qualify (`is_timeout() || is_connect()`); HTTP status errors are
+/// exchanged qualify (`is_timeout() || is_connect() || is_request()` — the
+/// latter covers TLS-layer send failures such as rustls decrypt errors);
+/// HTTP status errors are
 /// left to the callers (401 refresh, 403 retry in the chat wire).
 pub(crate) const CONNECT_RETRY_ATTEMPTS: u32 = 6;
 #[cfg(not(test))]
@@ -122,7 +124,7 @@ impl CodexModel {
                 Ok(response) => return Ok((response, access_token)),
                 Err(error)
                     if attempt < CONNECT_RETRY_ATTEMPTS
-                        && (error.is_timeout() || error.is_connect()) =>
+                        && (error.is_timeout() || error.is_connect() || error.is_request()) =>
                 {
                     last_error = Some(error);
                     tokio::time::sleep(Duration::from_millis(retry_backoff_ms(

@@ -240,7 +240,7 @@ impl Model for OpenAiModel {
                 Ok(response) => break response,
                 Err(error)
                     if attempt < CONNECT_RETRY_ATTEMPTS
-                        && (error.is_timeout() || error.is_connect()) =>
+                        && (error.is_timeout() || error.is_connect() || error.is_request()) =>
                 {
                     tokio::time::sleep(Duration::from_millis(retry_backoff_ms(
                         CONNECT_RETRY_BASE_BACKOFF_MS,
