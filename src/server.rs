@@ -2257,11 +2257,19 @@ const PLACEHOLDER_HTML: &str = r#"<!doctype html>
 "#;
 
 #[cfg(not(web_ui))]
-fn html_headers() -> [(header::HeaderName, header::HeaderValue); 1] {
-    [(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("text/html; charset=utf-8"),
-    )]
+fn html_headers() -> [(header::HeaderName, header::HeaderValue); 2] {
+    [
+        (
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/html; charset=utf-8"),
+        ),
+        // Stable URL, no content hash: never let a browser cache the
+        // placeholder either.
+        (
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        ),
+    ]
 }
 
 #[cfg(not(web_ui))]
@@ -2273,19 +2281,8 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 #[cfg(web_ui)]
-async fn index() -> impl IntoResponse {
-    use axum::http::Response as HttpResponse;
-    // Dev-friendly: read the UI skeleton from disk and inline the CSS/JS
-    // pieces on every request, so frontend edits (style.css, app.js, vendor
-    // libs) show up on refresh without recompiling. The response stays a
-    // single self-contained HTML file. Located via CARGO_MANIFEST_DIR
-    // (stable regardless of the process cwd).
-    let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
-    let read = |name: &str| -> Result<String, String> {
-        std::fs::read_to_string(ui.join(name))
-            .map_err(|e| format!("cannot read {}: {e}", ui.join(name).display()))
-    };
-    let assembled = read("index.html").and_then(|skeleton| {
+fn assemble(read: impl Fn(&str) -> Result<String, String>) -> Result<String, String> {
+    read("index.html").and_then(|skeleton| {
         let katex_css = read("vendor/katex.min.css")?;
         let css = read("style.css")?;
         let vendor_js = read("vendor/marked.min.js")?;
@@ -2305,25 +2302,92 @@ async fn index() -> impl IntoResponse {
             .replace("/*__JS_VENDOR__*/", &vendor_js)
             .replace("/*__JS_APP__*/", &app_js)
             .replace("<!--__PET__-->", &pet_html))
-    });
-    match assembled {
-        Ok(html) => HttpResponse::builder()
+    })
+}
+
+/// Release compile-time asset reader: the ten UI files are baked into the
+/// binary with `include_str!`, so the server keeps serving the UI after the
+/// source tree (and its `src/ui` directory) is deleted. gated to release +
+/// tests only — a plain debug build must keep the on-disk read (missing
+/// file → 500) semantics, not silently fall back to an embedded copy.
+#[cfg(all(web_ui, any(not(debug_assertions), test)))]
+fn read_embedded_ui(name: &str) -> Result<String, String> {
+    let source = match name {
+        "index.html" => include_str!("ui/index.html"),
+        "vendor/katex.min.css" => include_str!("ui/vendor/katex.min.css"),
+        "style.css" => include_str!("ui/style.css"),
+        "vendor/marked.min.js" => include_str!("ui/vendor/marked.min.js"),
+        "pet.html" => include_str!("ui/pet.html"),
+        "app.js" => include_str!("ui/app.js"),
+        "render.js" => include_str!("ui/render.js"),
+        "sessions.js" => include_str!("ui/sessions.js"),
+        "tasks.js" => include_str!("ui/tasks.js"),
+        "sse.js" => include_str!("ui/sse.js"),
+        _ => return Err(format!("unknown embedded UI asset: {name}")),
+    };
+    Ok(source.to_owned())
+}
+
+/// Release-only process-lifetime cache of the assembled UI. The response
+/// body is served as a `&'static str` (via `Body`'s `From<&'static str>`),
+/// so a request never clones the cached HTML.
+#[cfg(all(web_ui, not(debug_assertions)))]
+static EMBEDDED_UI_HTML: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[cfg(web_ui)]
+async fn index() -> impl IntoResponse {
+    use axum::http::Response as HttpResponse;
+
+    #[cfg(debug_assertions)]
+    {
+        // Dev-friendly: read the UI skeleton from disk and inline the
+        // CSS/JS pieces on every request, so frontend edits (style.css,
+        // app.js, vendor libs) show up on refresh without recompiling. The
+        // response stays a single self-contained HTML file. Located via
+        // CARGO_MANIFEST_DIR (stable regardless of the process cwd).
+        let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+        let read = |name: &str| -> Result<String, String> {
+            std::fs::read_to_string(ui.join(name))
+                .map_err(|e| format!("cannot read {}: {e}", ui.join(name).display()))
+        };
+        match assemble(read) {
+            Ok(html) => HttpResponse::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                // Never cache the dev UI: browsers would serve a stale HTML
+                // after a reload.
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(html)
+                .unwrap(),
+            Err(error) => HttpResponse::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(format!(
+                    "<!doctype html><meta charset=\"utf-8\"><title>e-agent UI error</title>\
+                     <body style=\"font-family:system-ui,sans-serif;padding:2rem\">\
+                     <h1>Cannot assemble UI</h1><pre>{error}</pre></body>"
+                ))
+                .unwrap(),
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        // Release: the UI is compiled into the binary (read_embedded_ui),
+        // so it survives a deleted source tree. Assemble once into
+        // EMBEDDED_UI_HTML and serve the cached string; the `.expect`
+        // mirrors the dev 500 — the embedded asset table must stay in sync
+        // with `assemble`'s read order.
+        let html = EMBEDDED_UI_HTML.get_or_init(|| {
+            assemble(read_embedded_ui).expect("embedded UI asset table must match assemble()")
+        });
+        HttpResponse::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            // Never cache the dev UI: browsers would serve a stale HTML
-            // after a reload.
+            // Stable URL, no content hash: never cache this either.
             .header(header::CACHE_CONTROL, "no-store")
-            .body(html)
-            .unwrap(),
-        Err(error) => HttpResponse::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .body(format!(
-                "<!doctype html><meta charset=\"utf-8\"><title>e-agent UI error</title>\
-                 <body style=\"font-family:system-ui,sans-serif;padding:2rem\">\
-                 <h1>Cannot assemble UI</h1><pre>{error}</pre></body>"
-            ))
-            .unwrap(),
+            .body(Body::from(html.as_str()))
+            .unwrap()
     }
 }
 
@@ -3236,6 +3300,81 @@ model = "deepseek-chat"
         let html = PLACEHOLDER_HTML.replace("__TOKEN__", "abc");
         assert!(html.contains("server running"));
         assert!(html.contains("abc"));
+    }
+
+    /// The release UI path (include_str! table) must assemble exactly like
+    /// the dev disk path: all ten assets present, all five placeholders
+    /// replaced, and the key frontend entry points inlined.
+    #[cfg(web_ui)]
+    #[test]
+    fn embedded_ui_assembles_all_assets() {
+        let html = assemble(read_embedded_ui).unwrap();
+        for placeholder in [
+            "/*__KATEX_CSS__*/",
+            "/*__CSS__*/",
+            "/*__JS_VENDOR__*/",
+            "/*__JS_APP__*/",
+            "<!--__PET__-->",
+        ] {
+            assert!(
+                !html.contains(placeholder),
+                "placeholder {placeholder} leaked into assembled UI"
+            );
+        }
+        assert!(html.contains("<title>e-agent · Web UI</title>"));
+        assert!(html.contains("marked.setOptions"));
+        assert!(html.contains("katex.renderToString"));
+    }
+
+    /// GET / serves the assembled UI uncached: 200, text/html, no-store,
+    /// and no placeholder markers in the body. Runs against the dev disk
+    /// reader in debug and the embedded reader in release.
+    #[cfg(web_ui)]
+    #[tokio::test]
+    async fn index_serves_assembled_ui_uncached() {
+        use tower::util::ServiceExt;
+        let app = router(Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(std::env::temp_dir()),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        for placeholder in [
+            "/*__KATEX_CSS__*/",
+            "/*__CSS__*/",
+            "/*__JS_VENDOR__*/",
+            "/*__JS_APP__*/",
+            "<!--__PET__-->",
+        ] {
+            assert!(
+                !html.contains(placeholder),
+                "placeholder {placeholder} leaked into GET / body"
+            );
+        }
     }
 
     fn live_session(id: &str) -> (String, Arc<LiveSession>) {
