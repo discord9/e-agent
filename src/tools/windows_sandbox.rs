@@ -297,12 +297,16 @@ fn explicit_entry(
 const CAPABILITY_MASK: u32 =
     FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | FILE_DELETE_CHILD;
 const CAPABILITY_INHERITANCE: ACE_FLAGS = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
-/// Inheritance flags of the second capability ACE. OBJECT_INHERIT_ACE on a
-/// directory is inherited by direct child files as an effective ACE and by
-/// child directories as an inherit-only ACE (per the documented ACE
-/// inheritance rules), so the root itself never receives DELETE, subdirectories
-/// only carry the ACE onward, and files at any depth eventually get DELETE.
-const DELETE_ACE_INHERITANCE: u8 = (OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE) as u8;
+/// Inheritance flags of the second capability ACE. CONTAINER_INHERIT_ACE |
+/// OBJECT_INHERIT_ACE propagate the ACE to every descendant object, and
+/// INHERIT_ONLY_ACE keeps it off the root itself: child files receive DELETE
+/// as an effective ACE, child directories receive it as an inherit-only
+/// carrier that keeps propagating to their own descendants (per the documented
+/// ACE inheritance rules). Directories at any depth therefore become deletable
+/// — including recursive deletion — while the root itself never receives
+/// DELETE.
+const DELETE_ACE_INHERITANCE: u8 =
+    (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE) as u8;
 
 /// Exact structural check for the current (v4) capability layout on a write
 /// root: exactly two non-inherited ACCESS_ALLOWED_ACEs for `sid` — one with
@@ -853,11 +857,13 @@ fn set_path_ace(root: &RootAcl, sid: PSID) -> Result<(), String> {
     // to survive (worst case only one ACE remains). The first ACE grants the
     // full capability mask (including FILE_DELETE_CHILD, which propagates
     // through every descendant directory) with container+object inheritance.
-    // The second ACE grants DELETE and is OBJECT_INHERIT_ACE|INHERIT_ONLY_ACE:
-    // direct child files receive it as an effective ACE, child directories
-    // inherit it as an inherit-only carrier, the root itself never receives
-    // DELETE, and files at any depth eventually do — FILE_DELETE_CHILD on a
-    // directory alone does not cover deleting/renaming files from the
+    // The second ACE grants DELETE and is
+    // CONTAINER_INHERIT_ACE|OBJECT_INHERIT_ACE|INHERIT_ONLY_ACE: child files
+    // receive it as an effective ACE and child directories as an inherit-only
+    // carrier that keeps propagating, so files and directories at any depth
+    // eventually get DELETE (recursive directory removal included) while the
+    // root itself never receives it — FILE_DELETE_CHILD on a directory alone
+    // does not cover deleting/renaming files or deleting directories from the
     // restricted token.
     let old_acl = root.old_acl;
     let mut kept = Vec::new(); // (raw ACE pointer, ACE size) in original order
@@ -1641,7 +1647,7 @@ mod tests {
     fn v4_layout_requires_exactly_two_matching_aces_in_any_order() {
         let sid = string_sid("S-1-5-21-1-2-3-4").unwrap();
         let main = (CAPABILITY_MASK, CAPABILITY_INHERITANCE);
-        let delete = (DELETE, OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE);
+        let delete = (DELETE, DELETE_ACE_INHERITANCE as u32);
 
         // Both ACEs present, main first: installed.
         let acl = TestAcl::build(sid.0, &[main, delete]);
@@ -1663,6 +1669,14 @@ mod tests {
         // root-effective, which the model forbids.
         let root_effective_delete = (DELETE, OBJECT_INHERIT_ACE);
         let acl = TestAcl::build(sid.0, &[main, root_effective_delete]);
+        assert!(!unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
+
+        // Wrong DELETE flags: the 0.1.1 layout (no CONTAINER_INHERIT) never
+        // propagated DELETE to directories, so directory deletion stayed
+        // Access denied; the current layout must require container inherit so
+        // child directories carry DELETE onward.
+        let files_only_delete = (DELETE, OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE);
+        let acl = TestAcl::build(sid.0, &[main, files_only_delete]);
         assert!(!unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
 
         // Wrong main mask: a legacy capability ACE without FILE_DELETE_CHILD.
@@ -1687,7 +1701,7 @@ mod tests {
     fn inherited_aces_cannot_satisfy_root_install() {
         let sid = string_sid("S-1-5-21-1-2-3-4").unwrap();
         let main = (CAPABILITY_MASK, CAPABILITY_INHERITANCE);
-        let delete = (DELETE, OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE);
+        let delete = (DELETE, DELETE_ACE_INHERITANCE as u32);
 
         // Even the complete two-ACE layout fails once the ACEs are inherited:
         // only an explicit root install counts.
