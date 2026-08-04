@@ -436,6 +436,15 @@ els.promptInput.addEventListener("keydown", (e) => {
 });
 els.promptInput.addEventListener("input", () => {
   autosizeInput();
+  // 草稿实时同步进会话缓存（per-ws 键）：openSession 之外的路径
+  // （scheduleReconnect/restartTransport 的 openWith→loadHistory）不经过
+  // saveSessionState，这里兜底保证缓存里的 draft 与输入框一致。条目只在
+  // 切走时由 saveSessionState 创建；当前会话尚无条目（从未切走过）时跳过
+  // ——输入框本身就是草稿源，无需复制（也不制造残缺缓存条目）。
+  if (state.sessionId) {
+    const st = state.sessionStates[state.workspace.id + ":" + state.sessionId];
+    if (st) st.draft = els.promptInput.value;
+  }
   if (forkMenu.open) return;   // fork 面板开着：不弹 slash 菜单，避免两面板重叠
   updateSlashMenu();
 });

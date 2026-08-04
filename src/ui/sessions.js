@@ -488,6 +488,23 @@ async function loadOlder() {
    wsId/epoch：打开时捕获的发起上下文——响应回来时任何一项不匹配
    （新的打开/切换 workspace）→ 丢弃过期回调，不起 SSE。 */
 function openWith(id, withHistory, onReady, wsId, epoch, timeoutMs) {
+  // 排队条是会话级 UI：任何打开/重连路径（openSession 两分支、
+  // restartTransport、scheduleReconnect）都经 openWith，一律从空队列开始，
+  // 防止 A 的排队项显示在 B（state.queue 是全局单数组，切会话不重置就串）。
+  // 先清后恢复（方案 A + B）：openSession 切走时把当前 queue 快照进
+  // state.queues（wsId:sid 键），这里清空后再从快照恢复——切走再切回
+  // 能看到之前的排队项。快照可能过期（切走后该会话 SSE 停、PromptConsumed
+  // 收不到，残留已消费项），但后端队列本身是准的，显示层稍不准可接受；
+  // restartTransport/scheduleReconnect 无快照可恢复，队列显示从下一个
+  // PromptQueued 事件重建。
+  state.queue.length = 0;
+  state.queueExpanded = false;
+  const qkey = wsId + ":" + id;
+  const snap = state.queues[qkey];
+  if (snap && snap.length) {
+    state.queue.push(...snap);
+  }
+  renderQueueBar();
   const step = withHistory ? loadHistory(id, wsId, epoch, timeoutMs) : Promise.resolve("ok");
   step.then((r) => {
     if (epoch !== sessionOpenEpoch) return;       // 更新的打开/切换 workspace 已发生
@@ -570,10 +587,11 @@ function updateComposerMeta() {
 }
 
 /* 切走前保存当前会话视图状态（消息 DOM、滚动位置、分页游标、输入草稿），
-   切回时原样恢复、不重新加载历史。 */
+   切回时原样恢复、不重新加载历史。键为 wsId:sessionId（与 sidebar.expanded
+   同款约定）：跨 workspace 同名 sessionId 互不串用各自的缓存槽。 */
 function saveSessionState() {
   if (!state.sessionId) return;
-  state.sessionStates[state.sessionId] = {
+  state.sessionStates[state.workspace.id + ":" + state.sessionId] = {
     html: els.messages.innerHTML,
     scrollTop: els.messages.scrollTop,
     nextBeforeSeq: state.nextBeforeSeq,
@@ -590,6 +608,14 @@ function openSession(id, onReady, epoch, timeoutMs) {
   stopTaskRows();              // 会话行级 output interval / delegate SSE 不跨导航存活
   closeForkMenu();
   saveSessionState();          // 切走：保存当前会话（消息/滚动/分页/草稿）
+  // 方案 B：切走时把当前排队条快照存进 state.queues（wsId:sid 键，拷贝），
+  // 供切回时由 openWith 恢复；队列为空则删掉旧快照（不留空/过期残留）。
+  // 随后 openWith 会清空全局 queue（方案 A），再按需从快照恢复——先清后恢复。
+  if (state.sessionId) {
+    const qkey = state.workspace.id + ":" + state.sessionId;
+    if (state.queue.length) state.queues[qkey] = state.queue.slice();
+    else delete state.queues[qkey];
+  }
   state.renameActive = false;  // 切换会话会销毁编辑框：清标志，恢复轮询重绘
   stopSSE();
   state.sessionId = id;
@@ -611,7 +637,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
   applyStatus("Idle");
   refreshBanner();
   history.replaceState(null, "", "/?session=" + encodeURIComponent(id));
-  const cached = state.sessionStates[id];
+  const cached = state.sessionStates[state.workspace.id + ":" + id];
   if (cached) {
     // 切回缓存过的会话：先恢复视图（立即响应），再拉最新尾部补全——
     // 切走期间会话可能继续产生消息（缓存已过期），必须用最新 history
@@ -1781,12 +1807,16 @@ function treeDeleteButton(s, wsId) {
       const list = workspaceListFor(ws);
       const at = list.findIndex((x) => x.id === s.id);
       if (at >= 0) list.splice(at, 1);
-      if (ws === state.workspace) {
+      if (ws === state.workspace && state.sessionId === s.id) {
         // 删除当前会话后不制造另一种导航态：留在聊天空状态，并打开侧边栏。
-        if (state.sessionId === s.id) clearCurrentSession();
+        clearCurrentSession();
         // clearCurrentSession 会先保存离开时视图；删除成功后再清，避免复活缓存。
-        delete state.sessionStates[s.id];
       }
+      // 删除成功：清掉该会话的前端残留（视图缓存 + queue 快照），per-ws 键。
+      // 无论删除的会话属于激活 workspace 与否都清理——同名会话按 wsId:sid
+      // 隔离：删 B 的 b1 只清 wsB:b1，A 的同名缓存/快照不受影响。
+      delete state.sessionStates[wsId + ":" + s.id];
+      delete state.queues[wsId + ":" + s.id];
       removePinOrder(ws.id, s.id);
       renderSidebarTree(true);
     } catch (e) {
@@ -1801,6 +1831,13 @@ function treeDeleteButton(s, wsId) {
 function clearCurrentSession() {
   ++sessionOpenEpoch;
   saveSessionState();
+  // 排队条是会话级 UI：清空当前会话 → 同步清空全局 queue（与 openWith
+  // 同款语义，防跨会话串）。这里只清显示、不保存快照：本函数只用于删除
+  // 当前会话（treeDeleteButton），随后会删快照；若在别的场景重开该会话，
+  // 残留快照是「可能过期」的可接受小代价（见 openWith 注释）。
+  state.queue.length = 0;
+  state.queueExpanded = false;
+  renderQueueBar();
   stopTaskRows();
   closeForkMenu();
   stopSSE();

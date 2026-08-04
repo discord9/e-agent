@@ -61,10 +61,11 @@ const state = {
   workspaceErrors: {},       // workspaceId -> error string|null：轮询失败标记（侧边栏显示「无法连接」）
   queue: [],                 // 排队提示（FIFO；最多显示 3 条 + "+N"）
   queueExpanded: false,      // 排队条是否展开显示全部（默认收起）
+  queues: {},                // wsId:sessionId -> queued prompt 快照（方案 B：切走保存、切回恢复；可能过期）
   deepLink: { pending: null, handled: false, probing: false, attemptEpoch: -1 },
   // URL ?session= 深链：pending=待打开 id；handled=已消费（一次性）；
   // probing+attemptEpoch=深链 attempt 标记（防重复发起 + SSE 404 恢复判定）
-  sessionStates: {},         // sessionId -> {html, scrollTop, nextBeforeSeq, olderDone, draft}：切走时保存，切回时恢复（不重新加载历史）
+  sessionStates: {},         // wsId:sessionId -> {html, scrollTop, nextBeforeSeq, olderDone, draft}：切走时保存，切回时恢复（不重新加载历史）
   sidebar: {                 // 会话侧边栏
     open: false,             // 是否打开
     expanded: new Set(),     // 已展开的主会话 id（会话树；重绘时保留）
@@ -294,9 +295,10 @@ async function switchWorkspace(id, epoch) {
   stopTaskRows();
   closeForkMenu();
   stopSSE();
+  saveSessionState();        // 切 workspace 前保存当前会话视图/草稿（per-ws 键，
+                             // 跨 workspace 保留；须在 stopSSE 后、清空 sessionId 前）
   // ---- 清空当前工作区的会话/聊天状态（其它 workspace 的聚合缓存保留） ----
   state.sessionId = null;
-  state.sessionStates = {};
   state.lastList = (state.workspaceLists[ws.id] !== undefined) ? state.workspaceLists[ws.id] : [];
   state.queue.length = 0;
   state.queueExpanded = false;
