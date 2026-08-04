@@ -492,7 +492,10 @@ async fn restricted_token_preserves_output_and_nonzero_exit() {
     let command = if bash.shell.executable.ends_with("bash.exe") {
         "set -e; printf out; printf err >&2; exit 7"
     } else {
-        "$ErrorActionPreference='Stop'; Write-Output 'out'; [Console]::Error.WriteLine('err'); exit 7"
+        // [Console]::Error.WriteLine() is a method invocation — forbidden in
+        // ConstrainedLanguage mode under the restricted token. Write-Error is
+        // a native cmdlet (no method call) and still writes to stderr.
+        "$ErrorActionPreference='Stop'; Write-Output 'out'; Write-Error 'err'; exit 7"
     };
     let error = bash.execute(json!({"command": command})).await.unwrap_err();
     assert!(error.contains("exit code: 7"), "{error}");
