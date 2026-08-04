@@ -1134,9 +1134,10 @@ async function main(){
       m.appendChild(card);
       return { det, dot, tb, ab, card };
     }
-    // 预置带 .think-dot.active 的缓存 HTML（序列化 innerHTML，模拟 saveSessionState）
+    // 预置带 .think-dot.active 的缓存 HTML（序列化 innerHTML，模拟 saveSessionState；
+    // 键为 per-ws wsId:sessionId）
     function cacheCurrentView(){
-      state.sessionStates["s1"] = { html: elsById["messages"].innerHTML, scrollTop: 0,
+      state.sessionStates[state.workspace.id + ":s1"] = { html: elsById["messages"].innerHTML, scrollTop: 0,
         nextBeforeSeq: null, olderDone: false, draft: "" };
     }
     function openRestored(){           // 从另一会话切回 → restored 分支
@@ -1344,20 +1345,70 @@ async function main(){
     clearCurrentSession();
     chk("clearCurrentSession stops card poller", !state.tasks.pollers.has("s1:9"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
-    chk("cached html saved", !!state.sessionStates["s1"]
-        && state.sessionStates["s1"].html.length > 0,
-        "len=" + (state.sessionStates["s1"] && state.sessionStates["s1"].html.length));
+    chk("cached html saved", !!state.sessionStates[state.workspace.id + ":s1"]
+        && state.sessionStates[state.workspace.id + ":s1"].html.length > 0,
+        "len=" + (state.sessionStates[state.workspace.id + ":s1"] && state.sessionStates[state.workspace.id + ":s1"].html.length));
     openSession("s1");
     await flush();
     chk("restored chat view", state.sessionId === "s1",
         "sid=" + state.sessionId);
+
+    // ---- Bug 1+2：草稿 per-ws 缓存 + queue 快照（真实代码路径） ----
+    // 场景：会话 s1 有草稿 + 排队项 → 切到 s2 → 切回 s1。
+    // 期望：切走时 saveSessionState 存草稿（per-ws 键）、queue 快照
+    // slice 进 state.queues；openWith 清空全局 queue（方案 A：A 的排队项
+    // 不显示在 B）；切回时草稿 + 快照恢复（方案 B）；消费到空清快照。
+    elsById["promptInput"].value = "未保存草稿";
+    queuePromptQueued("排队-A");
+    queuePromptQueued("排队-B");
+    // s2 在上游测试被切走过（fork-POST 竞态留了草稿）→ 清掉缓存让本次
+    // 走「首次打开」分支（输入框从空开始），断言才有意义。
+    delete state.sessionStates[state.workspace.id + ":s2"];
+    delete state.queues[state.workspace.id + ":s2"];
+    openSession("s2");          // 真实切走：openSession 顶部保存 → openWith 清空
+    chk("draft saved under per-ws key on switch",
+        state.sessionStates[state.workspace.id + ":s1"] !== undefined
+        && state.sessionStates[state.workspace.id + ":s1"].draft === "未保存草稿",
+        "draft=" + JSON.stringify(state.sessionStates[state.workspace.id + ":s1"]
+          && state.sessionStates[state.workspace.id + ":s1"].draft));
+    chk("queue snapshot saved on switch-away",
+        state.queues[state.workspace.id + ":s1"] !== undefined
+        && state.queues[state.workspace.id + ":s1"].length === 2
+        && state.queues[state.workspace.id + ":s1"][0] === "排队-A",
+        "snap=" + JSON.stringify(state.queues[state.workspace.id + ":s1"]));
+    chk("openWith clears queue on switch (A not shown in B)",
+        state.queue.length === 0 && state.queueExpanded === false
+        && elsById["queueBar"].hidden === true,
+        "q=" + state.queue.length + " exp=" + state.queueExpanded);
+    chk("new session starts with empty draft",
+        elsById["promptInput"].value === "",
+        "draft=" + JSON.stringify(elsById["promptInput"].value));
+    openSession("s1");          // 真实切回：cached 分支恢复草稿 + openWith 恢复快照
+    await flush();
+    chk("draft restored on switch-back",
+        elsById["promptInput"].value === "未保存草稿",
+        "draft=" + JSON.stringify(elsById["promptInput"].value));
+    chk("queue snapshot restored on switch-back",
+        state.queue.length === 2 && state.queue[0] === "排队-A" && state.queue[1] === "排队-B",
+        "q=" + JSON.stringify(state.queue));
+    // 消费到空 → queuePromptConsumed 清理快照
+    queuePromptConsumed();
+    chk("queue consumed one leaves rest", state.queue.length === 1 && state.queue[0] === "排队-B",
+        "q=" + JSON.stringify(state.queue));
+    queuePromptConsumed();
+    chk("queue consumed empty cleans snapshot",
+        state.queue.length === 0
+        && state.queues[state.workspace.id + ":s1"] === undefined,
+        "q=" + state.queue.length + " snap=" + JSON.stringify(state.queues[state.workspace.id + ":s1"]));
+    chk("queue bar hidden when empty", elsById["queueBar"].hidden === true,
+        "hidden=" + elsById["queueBar"].hidden);
 
     // ---- restored 替换回归：切走期间的会话更新必须可见 ----
     // 场景：用户切走会话（缓存旧快照）→ 会话继续产出新消息 → 切回。
     // 旧实现恢复缓存 + 跳过 snapshot → 新消息永不显示。现在 restored
     // 会拉最新 history 替换过期缓存。
     state.sessionId = null;
-    state.sessionStates["restored-test"] = {
+    state.sessionStates[state.workspace.id + ":restored-test"] = {
       html: "<div class='notice'>旧缓存消息</div>", scrollTop: 0,
       nextBeforeSeq: 8, olderDone: false, draft: "",
     };
@@ -1370,7 +1421,7 @@ async function main(){
     // 进行中的增量块（未落盘、只活在缓存/SSE 里）必须保留并重新绑定：
     // 替换后 live delta 才能继续续写，而不是丢失或重复。
     state.sessionId = null;
-    state.sessionStates["restored-test2"] = {
+    state.sessionStates[state.workspace.id + ":restored-test2"] = {
       html: "<div class='msg msg-assistant'><div class='msg-body'>正在流式</div></div>",
       scrollTop: 0, nextBeforeSeq: 8, olderDone: false, draft: "",
     };
@@ -1769,7 +1820,7 @@ async function main(){
     // 「加载更早历史」链接断言依赖 nextBeforeSeq=null，避免互相污染）
     // (b) 未打开会话时点击 bash 卡片：不切会话，就地展开 + 启动轮询
     state.sessionId = null;
-    state.sessionStates["s1"] = { html: elsById["messages"].innerHTML, scrollTop: 0,
+    state.sessionStates[state.workspace.id + ":s1"] = { html: elsById["messages"].innerHTML, scrollTop: 0,
       nextBeforeSeq: null, olderDone: false, draft: "" };   // 模拟切走前的缓存
     const switchTasks = [{ session_id: "s1", id: 55, kind: "bash", label: "cargo run",
       full_command: "cargo run", output: "building", role: null }];
@@ -2155,15 +2206,28 @@ async function main(){
     elsById["wsNameInput"].value = "服务器B";
     elsById["wsUrlInput"].value = "http://localhost:9000/";   // 带尾斜杠 → 应被归一化
     elsById["wsTokenInput"].value = "tok-b";
+    // Bug 1：切 ws 前有当前会话 + 草稿 → switchWorkspace 必须保存草稿
+    // （per-ws 键），不能像旧实现那样直接清空 sessionStates 丢稿。
+    state.sessionId = "s1";
+    elsById["promptInput"].value = "跨ws草稿";
     elsById["wsSaveBtn"]._listeners["click"][0]();
     // 同步断言：清空立即生效（轮询响应尚未回来，不会污染这些字段）
     chk("ws switch clears session state",
         state.sessionId === null
-        && state.sessionStates["s1"] === undefined && state.lastList.length === 0
+        && state.lastList.length === 0
         && state.tasks.list.length === 0 && state.tasks.pollers.size === 0
         && elsById["messages"].innerHTML === "",
         "sid=" + state.sessionId
         + " lastList=" + state.lastList.length);
+    // Bug 1：切 ws 不再清空 sessionStates；当前会话草稿按 per-ws 键
+    // （default:s1）保留——切回默认 ws 重开 s1 时不丢。
+    chk("ws switch keeps per-ws draft cache",
+        state.sessionStates["default:s1"] !== undefined
+        && state.sessionStates["default:s1"].draft === "跨ws草稿",
+        "st=" + String(state.sessionStates["default:s1"] && state.sessionStates["default:s1"].draft));
+    chk("ws switch uses no bare sid keys",
+        !("s1" in state.sessionStates),
+        "keys=" + JSON.stringify(Object.keys(state.sessionStates).slice(0,5)));
     chk("workspace switch clears old row interval",
         !state.tasks.pollers.has("s1:910") && scheduledIntervals[wsOldInterval - 1] === null,
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
@@ -2464,9 +2528,12 @@ async function main(){
 
     // =====================================================================
     // 10) 删除路由：删除 B 的会话 → 只更新 workspaceLists.B；A 的缓存不动；
-    //     激活=A 时 sessionStates 不清除（同名会话的视图缓存属于 A）
+    //     激活=A 时 A 的同名会话缓存/快照不清除（per-ws 键隔离）；
+    //     B 的前端残留（视图缓存 + queue 快照）随删除清理
     // =====================================================================
-    state.sessionStates["b1"] = { html: "cache-b1", scrollTop: 0, nextBeforeSeq: null, olderDone: true, draft: "" };
+    state.sessionStates["wsA:b1"] = { html: "cache-A-b1", scrollTop: 0, nextBeforeSeq: null, olderDone: true, draft: "" };
+    state.sessionStates["wsB:b1"] = { html: "cache-B-b1", scrollTop: 0, nextBeforeSeq: null, olderDone: true, draft: "" };
+    state.queues["wsB:b1"] = ["B 排队"];   // B 的 queue 快照残留
     const aCacheJson = JSON.stringify(state.workspaceLists["wsA"]);
     const bHadB1 = state.workspaceLists["wsB"].some((x) => x.id === "b1");
     renderSidebarTree(true);
@@ -2487,10 +2554,17 @@ async function main(){
         JSON.stringify(state.workspaceLists["wsA"]) === aCacheJson
         && state.workspaceLists["wsA"].some((x) => x.id === "a1"),
         "A=" + JSON.stringify(state.workspaceLists["wsA"].map((x) => x.id)));
-    chk("agg delete: A sessionStates not cleared (active=A)",
-        state.sessionStates["b1"] !== undefined,
-        "st=" + String(state.sessionStates["b1"] && state.sessionStates["b1"].html));
-    delete state.sessionStates["b1"];   // 清理测试残留
+    chk("agg delete: B view cache entry removed (per-ws key)",
+        state.sessionStates["wsB:b1"] === undefined,
+        "st=" + String(state.sessionStates["wsB:b1"] && state.sessionStates["wsB:b1"].html));
+    chk("agg delete: B queue snapshot removed",
+        state.queues["wsB:b1"] === undefined,
+        "q=" + JSON.stringify(state.queues["wsB:b1"]));
+    chk("agg delete: A same-name sessionStates entry untouched (active=A)",
+        state.sessionStates["wsA:b1"] !== undefined
+        && state.sessionStates["wsA:b1"].html === "cache-A-b1",
+        "st=" + String(state.sessionStates["wsA:b1"] && state.sessionStates["wsA:b1"].html));
+    delete state.sessionStates["wsA:b1"];   // 清理测试残留
 
     // =====================================================================
     // 11) 非数组 JSON：B 返回 {}（合法 JSON 非数组）→ B 分组显示错误标记、
@@ -5022,7 +5096,9 @@ async function main(){
     historyOverrides = new Map(_dlSave.historyOverrides);
     stopSSE();
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
+
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
+
   imports.system.exit(0);
 }
 main();

@@ -627,6 +627,10 @@ function queuePromptQueued(text) {
 
 function queuePromptConsumed() {
   if (state.queue.length) state.queue.shift();   // 移除最旧一条（正在被处理的那条）
+  // 消费完（队列空）→ 清理该会话的快照，避免残留空快照/过期项
+  if (!state.queue.length && state.sessionId) {
+    delete state.queues[state.workspace.id + ":" + state.sessionId];
+  }
   renderQueueBar();
 }
 
