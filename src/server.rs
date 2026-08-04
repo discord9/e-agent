@@ -118,6 +118,28 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<no state dir>".to_owned())
     );
+    // Startup workspace identity: the canonical root and its derived
+    // workspace_id (greptime/sqlite) or the JSONL session dir. Lets an
+    // operator see at a glance which namespace this server serves —
+    // multi-workspace setups (several `e web` on different ports) are
+    // otherwise indistinguishable from the outside.
+    let root = state.factory.root();
+    let workspace_id = match state.factory.backend() {
+        crate::config::SessionBackend::Jsonl => root.join(".e-agent/sessions").display().to_string(),
+        crate::config::SessionBackend::Greptime { .. } => {
+            crate::session_greptime::derive_workspace_id(root)
+        }
+        crate::config::SessionBackend::Sqlite { .. } => {
+            crate::session_sqlite::derive_workspace_id(root)
+        }
+    };
+    eprintln!(
+        "e-agent: workspace root: {} (workspace_id: {}; backend: {:?}; pid: {})",
+        root.display(),
+        workspace_id,
+        state.factory.backend(),
+        std::process::id()
+    );
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .with_context(|| format!("cannot bind {host}:{port}"))?;
