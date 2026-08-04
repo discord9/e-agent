@@ -582,9 +582,13 @@ pub struct SessionMeta {
     /// True while a turn is in flight (Busy or Compacting); the list renders
     /// the busy dot from this.
     pub busy: bool,
-    /// True while the session is live in the registry. Historical sessions
+    /// True while the session is live: either in the main registry, or —
+    /// for subagents — registered in a live parent's `Sessions` registry
+    /// (real handles; `list_sessions` backfills those). Historical sessions
     /// from the metadata table are `false` and rendered grey by the
-    /// frontend; clicking one resumes it (`POST /api/sessions {id}`).
+    /// frontend; clicking one resumes it (`POST /api/sessions {id}`). The
+    /// running_tasks label lookup never sets this — the label is task
+    /// metadata, not runtime liveness.
     pub active: bool,
     /// Parent subagent link (sessions spawned by the `delegate` tool); the
     /// frontend shows it as provenance when present.
@@ -826,23 +830,27 @@ fn merge_session_metas(
     metas
 }
 
-/// Apply one subagent's running_tasks label lookup to its list entry: a
-/// surviving label means the delegate task that spawned it is still running
-/// (rows are consumed when the task completes), so the subagent is live and
-/// the entry must render in the live group. `None` = no live task, the
-/// entry stays inactive. Pure so the active rule is unit-testable without
-/// a Greptime backend.
+/// Apply one subagent's running_tasks label lookup to its list entry.
+/// Display-only: the label is task-panel metadata (`running_tasks.label`),
+/// not runtime liveness — it has an async write/cleanup window, so a
+/// surviving label alone never marks the entry live. `active`/`busy`/
+/// `status` come exclusively from the main registry (`session_meta`) or
+/// a live parent's `Sessions` registry (real handles), never from here.
+/// Pure so the label rule is unit-testable without a Greptime backend.
 fn apply_subagent_label(meta: &mut SessionMeta, label: Option<String>) {
-    if label.is_some() {
-        meta.active = true;
-    }
     meta.label = label;
 }
 
 async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMeta>> {
     let root = state.factory.root();
     let mut active: Vec<SessionMeta> = Vec::with_capacity(state.registry.list().len());
+    // Main-registry ids: an entry restored/resumed into the main registry
+    // already carries its real status/busy/active from `session_meta`, so
+    // the child-handle backfill below must skip it — a stale same-id child
+    // handle must never overwrite the authoritative registry state.
+    let mut main_registry_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (id, session) in state.registry.list() {
+        main_registry_ids.insert(id.clone());
         active.push(session_meta(&id, &session, root).await);
     }
     // Historical sessions from the metadata table (Greptime/SQLite audit
@@ -861,25 +869,67 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
     // because only a handful of delegates run at once; a batched
     // `subagent_session_id = ANY(...)` query stays premature until that
     // assumption breaks.
-    for meta in &mut merged {
+    let mut labels: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for meta in &merged {
         if meta.parent_session_id.is_some() {
             match state.meta_store.label_for_subagent(root, &meta.id).await {
                 Ok(label) => {
-                    // A surviving running_tasks row means the delegate task
-                    // that spawned this subagent is still running (rows are
-                    // consumed when the task completes) — so the subagent
-                    // is live right now. Its id is not in the registry, so
-                    // the merge would otherwise leave it grey/inactive;
-                    // mark it active so the sidebar tree renders it in the
-                    // live group (status stays as-is: running_tasks cannot
-                    // tell Idle from Busy, and `active` alone is what the
-                    // live grouping keys off).
-                    apply_subagent_label(meta, label);
+                    labels.insert(meta.id.clone(), label);
                 }
                 Err(error) => {
                     eprintln!("e-agent: cannot look up subagent label: {error:#}");
                 }
             }
+        }
+    }
+    // Live subagent handles live in their parent session's `Sessions`
+    // registry, not the main registry, so `session_meta` never sees their
+    // real status. Snapshot them AFTER the async label queries so every
+    // entry sees the same view: subagent session id → current handle
+    // status. A subagent id can hold several handles (resume re-registers);
+    // any Busy/Compacting handle wins — an Idle handle must not mask a
+    // sibling that is still working.
+    let mut subagent_status: std::collections::HashMap<String, SessionStatus> =
+        std::collections::HashMap::new();
+    for (_, session) in state.registry.list() {
+        for (_, entry) in session.sessions.list() {
+            let status = entry.handle.status();
+            let status = status.borrow().clone();
+            let running = matches!(status, SessionStatus::Busy | SessionStatus::Compacting);
+            let overwrite = match subagent_status.get(&entry.session_id) {
+                None => true,
+                Some(existing) => {
+                    !matches!(existing, SessionStatus::Busy | SessionStatus::Compacting)
+                }
+            };
+            if running || overwrite {
+                subagent_status.insert(entry.session_id.clone(), status);
+            }
+        }
+    }
+    for meta in &mut merged {
+        if meta.parent_session_id.is_none() {
+            continue;
+        }
+        // A real handle in a live parent's `Sessions` registry means the
+        // subagent is live right now: backfill its real status/busy and
+        // mark it active. Entries with no handle keep their merged values
+        // untouched, and a stale label alone never marks an entry live
+        // (test 5 in `list_sessions_subagent_liveness` covers exactly
+        // that). A main-registry entry is skipped entirely: it already has
+        // the authoritative status/busy/active from `session_meta`, and a
+        // stale same-id child handle must not overwrite it (test 7 in
+        // `list_sessions_subagent_liveness_matrix` covers that).
+        if !main_registry_ids.contains(&meta.id)
+            && let Some(status) = subagent_status.get(&meta.id)
+        {
+            meta.status = status_string(status).to_owned();
+            meta.busy = matches!(status, SessionStatus::Busy | SessionStatus::Compacting);
+            meta.active = true;
+        }
+        if let Some(label) = labels.get(&meta.id) {
+            apply_subagent_label(meta, label.clone());
         }
     }
     Json(merged)
@@ -3558,12 +3608,14 @@ model = "deepseek-chat"
         assert_eq!(ids, vec!["live-1", "arch-live"]);
     }
 
-    /// The active rule for subagent list entries: a surviving running_tasks
-    /// label means the delegate task is still running, so the subagent is
-    /// live and must render in the live group; `None` (task completed, row
-    /// consumed) keeps the entry inactive.
+    /// The label rule for subagent list entries: `apply_subagent_label` is
+    /// display-only — it never touches `active`. Liveness comes from the
+    /// main registry or a live parent's `Sessions` registry (real
+    /// handles), never from a surviving `running_tasks` label row alone
+    /// (the label is task metadata with an async write/cleanup window, not
+    /// runtime liveness).
     #[test]
-    fn subagent_label_marks_live_subagent_active() {
+    fn subagent_label_is_display_only() {
         let dt = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
         let meta = |active: bool| SessionMeta {
             id: "sub-1".into(),
@@ -3584,17 +3636,240 @@ model = "deepseek-chat"
         let mut live = meta(false);
         apply_subagent_label(&mut live, Some("delegate task".into()));
         assert!(
-            live.active,
-            "a surviving running_tasks label means the subagent is live"
+            !live.active,
+            "a surviving label alone never marks a subagent live"
         );
         assert_eq!(live.label.as_deref(), Some("delegate task"));
-        let mut done = meta(false);
+        let mut done = meta(true);
         apply_subagent_label(&mut done, None);
         assert!(
-            !done.active,
-            "no live delegate task keeps the subagent inactive"
+            done.active,
+            "the label lookup must not clear a real liveness flag either"
         );
         assert_eq!(done.label, None);
+    }
+
+    /// `list_sessions` subagent liveness matrix (oracle#95): `active` and
+    /// `busy`/`status` come only from real handles — the main registry or
+    /// a live parent's `Sessions` registry — never from the task-panel
+    /// label. Eight combinations:
+    ///   1. Child Busy                    → active=true, status=Busy, busy=true
+    ///   2. Child Compacting              → active=true, status=Compacting, busy=true
+    ///   3. Child Idle + label            → active=true, busy=false, label=Some
+    ///   4. Child Finished, cleanup not done → active=true, busy=false
+    ///   5. stale label, no child handle  → active=false, busy=false, label=Some
+    ///   6. label lookup fails/misses but child Busy → active=true, busy=true
+    ///   7. parent-linked in main registry Busy, no child-map entry → busy not
+    ///      overwritten to false
+    ///   8. two handles for one id, one Busy one Idle → Busy wins
+    ///
+    /// The Jsonl backend's `label_for_subagent` never returns `Err` (a
+    /// missing record is `Ok(None)`), so combination 6 stands in for the
+    /// lookup-failure path: both leave the labels map without the id, and
+    /// the handle-based backfill must proceed regardless.
+    #[tokio::test]
+    async fn list_sessions_subagent_liveness_matrix() {
+        use crate::runner::SessionStatus as Status;
+        use crate::session_store::SessionMeta as HistoryMeta;
+        use std::collections::HashMap;
+        use std::io::Write;
+
+        let root = std::env::temp_dir().join(format!(
+            "e-agent-server-subagent-liveness-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sessions_dir = root.join(".e-agent/sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let naive = |secs: i64| {
+            chrono::DateTime::from_timestamp(secs, 0)
+                .unwrap()
+                .naive_utc()
+        };
+        // Historical sidecar: every subagent under test appears in the
+        // metadata table (parent-linked, Idle/inactive like any history
+        // row) so the merge produces a subagent list entry for it.
+        let sidecar = |id: &str, parent: &str| HistoryMeta {
+            session_id: id.to_owned(),
+            created_at: naive(1_700_000_000),
+            last_active_at: naive(1_700_000_000),
+            model: None,
+            role: None,
+            entry_count: 1,
+            parent_session_id: Some(parent.to_owned()),
+            parent_task_id: None,
+            title: None,
+            pinned: None,
+            archived: None,
+            writer: None,
+            label: None,
+        };
+        for id in [
+            "sub-busy",
+            "sub-compact",
+            "sub-idle",
+            "sub-finished",
+            "sub-stale",
+            "sub-nolabel",
+            "sub-multi",
+        ] {
+            let mut line = serde_json::to_vec(&sidecar(id, "web-parent")).unwrap();
+            line.push(b'\n');
+            std::fs::write(sessions_dir.join(format!("{id}.meta.jsonl")), line).unwrap();
+        }
+        // Combination 7: the parent-linked MAIN-registry session also has a
+        // sidecar so the merge backfills its parent link.
+        let mut parent_line =
+            serde_json::to_vec(&sidecar("web-parent", "web-grandparent")).unwrap();
+        parent_line.push(b'\n');
+        std::fs::write(sessions_dir.join("web-parent.meta.jsonl"), parent_line).unwrap();
+        // Combination 7b: a second parent-linked main-registry session, same
+        // parent link, but with NO child-map entry at all — it keeps the
+        // original "no handle must not reset busy" coverage.
+        let mut nohandle_line =
+            serde_json::to_vec(&sidecar("web-parent-nohandle", "web-grandparent")).unwrap();
+        nohandle_line.push(b'\n');
+        std::fs::write(
+            sessions_dir.join("web-parent-nohandle.meta.jsonl"),
+            nohandle_line,
+        )
+        .unwrap();
+
+        // Label records (running_tasks stand-ins): sub-busy, sub-idle and
+        // sub-stale carry one; sub-nolabel deliberately has none.
+        let label_record = |id: &str, label: &str| serde_json::json!({ "id": 1, "label": label, "session_id": id });
+        for (id, label) in [
+            ("sub-busy", "任务-忙"),
+            ("sub-idle", "任务-闲"),
+            ("sub-stale", "任务-过期"),
+        ] {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(sessions_dir.join("web-parent.background.jsonl"))
+                .unwrap();
+            writeln!(file, "{}", label_record(id, label)).unwrap();
+        }
+
+        // The parent in the main registry; its `Sessions` registry holds
+        // the live subagent handles with test-controlled statuses. The
+        // parent itself is Busy (combination 7 needs a real Busy status
+        // from `session_meta` that must not be overwritten).
+        let (parent_handle, parent_emitter, _parent_commands) =
+            crate::runner::session_test_channel();
+        parent_emitter.set_status(Status::Busy);
+        let parent = live_session_with_handle(parent_handle);
+        let parent_id = "web-parent".to_owned();
+        let entry = |sid: &str, status: Status| {
+            let (handle, emitter, _commands) = crate::runner::session_test_channel();
+            emitter.set_status(status);
+            (
+                crate::delegate::SessionEntry {
+                    handle,
+                    model: "sub-model".into(),
+                    role: None,
+                    cwd: "/tmp".into(),
+                    session_id: sid.to_owned(),
+                    context_window: None,
+                    store: SessionStore::Jsonl,
+                },
+                emitter,
+            )
+        };
+        let mut task_id = 1u64;
+        let mut insert = |sid: &str, status: Status| {
+            let (entry, _emitter) = entry(sid, status);
+            parent.sessions.insert(task_id, Arc::new(entry));
+            task_id += 1;
+        };
+        insert("sub-busy", Status::Busy);
+        insert("sub-compact", Status::Compacting);
+        insert("sub-idle", Status::Idle);
+        insert(
+            "sub-finished",
+            Status::Finished(crate::runner::SessionResult::Completed(None)),
+        );
+        insert("sub-nolabel", Status::Busy);
+        // Combination 7: same-ID child handle for the main-registry parent,
+        // conflicting Idle status — the main registry's Busy must win.
+        insert("web-parent", Status::Idle);
+        // Combination 8: two handles for the same id — Busy must win.
+        insert("sub-multi", Status::Busy);
+        insert("sub-multi", Status::Idle);
+
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(root.clone()),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".into(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+        });
+        state.registry.insert(parent_id, parent);
+        // Combination 7b: a second parent-linked main-registry session with
+        // no child-map entry; Busy from `session_meta` must stay.
+        let (nohandle_handle, nohandle_emitter, _nohandle_commands) =
+            crate::runner::session_test_channel();
+        nohandle_emitter.set_status(Status::Busy);
+        let nohandle = live_session_with_handle(nohandle_handle);
+        state
+            .registry
+            .insert("web-parent-nohandle".to_owned(), nohandle);
+
+        let listed = list_sessions(State(state)).await.0;
+        let by_id: HashMap<&str, &SessionMeta> =
+            listed.iter().map(|m| (m.id.as_str(), m)).collect();
+
+        // 1) Child Busy.
+        let m = by_id["sub-busy"];
+        assert_eq!((m.active, m.status.as_str(), m.busy), (true, "Busy", true));
+        assert_eq!(m.label.as_deref(), Some("任务-忙"));
+        // 2) Child Compacting.
+        let m = by_id["sub-compact"];
+        assert_eq!(
+            (m.active, m.status.as_str(), m.busy),
+            (true, "Compacting", true)
+        );
+        // 3) Child Idle + label → live, not busy.
+        let m = by_id["sub-idle"];
+        assert_eq!((m.active, m.status.as_str(), m.busy), (true, "Idle", false));
+        assert_eq!(m.label.as_deref(), Some("任务-闲"));
+        // 4) Child Finished, cleanup not yet run → live, not busy.
+        let m = by_id["sub-finished"];
+        assert_eq!(
+            (m.active, m.status.as_str(), m.busy),
+            (true, "Finished", false)
+        );
+        // 5) Stale label, no child handle → stays inactive, busy=false.
+        let m = by_id["sub-stale"];
+        assert_eq!(
+            (m.active, m.status.as_str(), m.busy),
+            (false, "Idle", false)
+        );
+        assert_eq!(m.label.as_deref(), Some("任务-过期"));
+        // 6) No label (stands in for a failed lookup) + child Busy → the
+        //    handle-based backfill still applies.
+        let m = by_id["sub-nolabel"];
+        assert_eq!((m.active, m.status.as_str(), m.busy), (true, "Busy", true));
+        assert_eq!(m.label, None);
+        // 7) Parent-linked session IN the main registry, Busy from
+        //    `session_meta`, plus a same-ID child handle at Idle → the
+        //    main registry wins: the child handle must not overwrite it.
+        let m = by_id["web-parent"];
+        assert_eq!(m.parent_session_id.as_deref(), Some("web-grandparent"));
+        assert_eq!((m.active, m.status.as_str(), m.busy), (true, "Busy", true));
+        // 7b) Same, but NO child-map entry at all → busy likewise not
+        //     overwritten (the original no-handle coverage).
+        let m = by_id["web-parent-nohandle"];
+        assert_eq!(m.parent_session_id.as_deref(), Some("web-grandparent"));
+        assert_eq!((m.active, m.status.as_str(), m.busy), (true, "Busy", true));
+        // 8) Two handles for one id: Busy beats the Idle sibling.
+        let m = by_id["sub-multi"];
+        assert_eq!((m.active, m.status.as_str(), m.busy), (true, "Busy", true));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The web addresses a subagent by session id exactly like the TUI:
