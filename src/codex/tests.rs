@@ -37,7 +37,13 @@ fn responses_wire_flattens_system_tools_and_tool_results() {
         &[ToolSpec {
             name: "bash".into(),
             description: "run".into(),
-            parameters: json!({"type":"object"}),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "workspace": {"type": "string"},
+                    "task": {"type": "string"},
+                }
+            }),
         }],
         None,
     );
@@ -48,6 +54,14 @@ fn responses_wire_flattens_system_tools_and_tool_results() {
     assert_eq!(value["input"][3]["output"], "ERROR: failed");
     assert_eq!(value["tools"][0]["name"], "bash");
     assert!(value["tools"][0].get("function").is_none());
+    // parameters.properties must keep input key order (workspace first) on the wire.
+    let keys = value["tools"][0]["parameters"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(keys, ["workspace", "task"]);
     assert_eq!(value["reasoning"]["effort"], "high");
     assert_eq!(value["include"], json!([]));
 }

@@ -912,7 +912,17 @@ fn spec_defaults_background_true_without_requiring_it() {
     let background = &spec.parameters["properties"]["background"];
     assert_eq!(background["type"], "boolean");
     assert_eq!(background["default"], true);
-    assert_eq!(spec.parameters["required"], json!(["task", "workspace"]));
+    assert_eq!(spec.parameters["required"], json!(["workspace", "task"]));
+    let keys = spec.parameters["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        ["workspace", "role", "label", "background", "resume", "task"]
+    );
     let workspace = &spec.parameters["properties"]["workspace"];
     assert_eq!(workspace["type"], "string");
     assert!(

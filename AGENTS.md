@@ -110,7 +110,7 @@ asks anything that requires seeing an image, do NOT say you cannot see it
 and do NOT pass the image into your own context: delegate to a `seer`
 subagent instead.
 
-- Use the `delegate` tool with `role: "seer"` and a task that names the
+- Use the `delegate` tool with the absolute `workspace` as the first argument, `role: "seer"`, and a task that names the
   image path (or says the image is attached) and the user's exact question.
 - The seer runs on a vision-capable model, calls `read_image` itself, and
   returns a text description you can relay verbatim.
