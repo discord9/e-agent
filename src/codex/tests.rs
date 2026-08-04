@@ -312,17 +312,18 @@ async fn backend_401_refreshes_once_persists_rotation_and_retries_once() {
 }
 
 #[test]
-fn retry_backoff_doubles_exponentially_within_a_15s_window() {
-    // Production schedule (base 500ms, 6 attempts): the sleeps before attempts
-    // 2..=6 are 0.5/1/2/4/8s — a ~15.5s recovery window for jittery networks.
+fn retry_backoff_doubles_exponentially_within_a_63s_window() {
+    // Production schedule (base 500ms, 8 attempts): the sleeps before attempts
+    // 2..=8 are 0.5/1/2/4/8/16/32s — a ~63.5s recovery window for jittery
+    // peak-hour networks (codex flakiness).
     let sleeps: Vec<u64> = (1..CONNECT_RETRY_ATTEMPTS)
         .map(|attempt| retry_backoff_ms(500, attempt))
         .collect();
-    assert_eq!(sleeps, [500, 1000, 2000, 4000, 8000]);
+    assert_eq!(sleeps, [500, 1000, 2000, 4000, 8000, 16000, 32000]);
     let total: u64 = sleeps.iter().sum();
     assert!(
-        total >= 15_000,
-        "backoff window must be >= 15s, got {total}ms"
+        total >= 60_000,
+        "backoff window must be >= 60s, got {total}ms"
     );
     // Doubling invariant holds for any base.
     for attempt in 2..CONNECT_RETRY_ATTEMPTS {
@@ -337,7 +338,7 @@ fn retry_backoff_doubles_exponentially_within_a_15s_window() {
 async fn transient_connect_errors_are_retried_then_fail_with_context() {
     // A port with no listener: every attempt fails with ECONNREFUSED, which
     // reqwest reports as an is_connect() error (same family as the
-    // "tls handshake eof" users hit). The loop must exhaust all 6 attempts
+    // "tls handshake eof" users hit). The loop must exhaust all 8 attempts
     // before the context-wrapped error surfaces.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -359,8 +360,8 @@ async fn transient_connect_errors_are_retried_then_fail_with_context() {
         )
         .await
         .unwrap_err();
-    // 6 attempts => the sum of all retry backoffs (tests run with a 50ms
-    // base, so 50+100+200+400+800ms); this proves all retries ran.
+    // 8 attempts => the sum of all retry backoffs (tests run with a 10ms
+    // base, so 10+20+40+80+160+320+640ms); this proves all retries ran.
     let expected_sleep: u64 = (1..CONNECT_RETRY_ATTEMPTS)
         .map(|attempt| retry_backoff_ms(CONNECT_RETRY_BASE_BACKOFF_MS, attempt))
         .sum();
@@ -392,6 +393,184 @@ async fn transient_connect_error_retries_and_recovers() {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer access")
         );
+        let done = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n";
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    done.len(),
+                    done
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let mut model = CodexModel::with_endpoint(
+        crate::codex_auth::CodexAuth::test_auth(temp.path().join("auth.json")),
+        endpoint,
+    );
+    let (message, usage) = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(message.content, None);
+    assert_eq!(
+        usage,
+        Some(Usage {
+            input_tokens: 1,
+            output_tokens: 2
+        })
+    );
+}
+
+#[tokio::test]
+async fn http_5xx_is_retried_then_succeeds() {
+    // Two 503s (server overloaded), then a completed stream: the codex wire
+    // retries transient HTTP errors (same whole-request loop as the chat
+    // wire) and recovers on the third attempt.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let _ = stream.read(&mut request).await.unwrap();
+        let done = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n";
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    done.len(),
+                    done
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let mut model = CodexModel::with_endpoint(
+        crate::codex_auth::CodexAuth::test_auth(temp.path().join("auth.json")),
+        endpoint,
+    );
+    let (message, usage) = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(message.content, None);
+    assert_eq!(
+        usage,
+        Some(Usage {
+            input_tokens: 1,
+            output_tokens: 2
+        })
+    );
+}
+
+#[tokio::test]
+async fn http_5xx_is_retried_then_fails_with_status() {
+    // 503 on every attempt: after HTTP_RETRY_ATTEMPTS the error surfaces with
+    // the status code, having run the full backoff schedule.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for _ in 0..HTTP_RETRY_ATTEMPTS {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let mut model = CodexModel::with_endpoint(
+        crate::codex_auth::CodexAuth::test_auth(temp.path().join("auth.json")),
+        endpoint,
+    );
+    let started = std::time::Instant::now();
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+    // 3 attempts => the sum of the retry backoffs (tests run with a 10ms
+    // base, so 10+20ms) before the final 503 surfaces.
+    let expected_sleep: u64 = (1..HTTP_RETRY_ATTEMPTS)
+        .map(|attempt| retry_backoff_ms(HTTP_RETRY_BASE_BACKOFF_MS, attempt))
+        .sum();
+    assert!(
+        started.elapsed() >= Duration::from_millis(expected_sleep),
+        "expected at least {expected_sleep}ms of backoff"
+    );
+    let text = format!("{error:#}");
+    assert!(text.contains("HTTP 503"), "{text}");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn stream_decode_error_is_retried_then_succeeds() {
+    // First response delivers a data frame that is not valid JSON: the stream
+    // dies mid-flight with "cannot decode ChatGPT Responses event", and the
+    // whole idempotent request is retried, landing on a healthy stream.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let _ = stream.read(&mut request).await.unwrap();
+        let bad = b"data: {not-json}\n\n";
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bad.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(bad).await.unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let _ = stream.read(&mut request).await.unwrap();
         let done = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n";
         stream
             .write_all(

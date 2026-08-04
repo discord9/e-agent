@@ -253,8 +253,10 @@ async fn request_times_out_when_server_stalls() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
+        // Every attempt must reach the server and stall (each request times
+        // out); CONNECT_RETRY_ATTEMPTS = 8 attempts in total.
         let mut streams = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..CONNECT_RETRY_ATTEMPTS {
             let (mut stream, _) = listener.accept().await.unwrap();
             let _ = read_request(&mut stream).await;
             streams.push(stream);
@@ -330,7 +332,7 @@ async fn retries_once_after_a_send_failure() {
 async fn transient_connect_errors_are_retried_then_fail_with_context() {
     // A port with no listener: every attempt fails with ECONNREFUSED, which
     // reqwest reports as an is_connect() error (same family as the
-    // "tls handshake eof" users hit). The chat-wire loop must exhaust all 6
+    // "tls handshake eof" users hit). The chat-wire loop must exhaust all 8
     // attempts (shared with the codex wire) before the error surfaces.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -356,8 +358,8 @@ async fn transient_connect_errors_are_retried_then_fail_with_context() {
         )
         .await
         .unwrap_err();
-    // 6 attempts => the sum of all retry backoffs (tests run with a 50ms
-    // base, so 50+100+200+400+800ms); this proves all retries ran.
+    // 8 attempts => the sum of all retry backoffs (tests run with a 10ms
+    // base, so 10+20+40+80+160+320+640ms); this proves all retries ran.
     let expected_sleep: u64 = (1..CONNECT_RETRY_ATTEMPTS)
         .map(|attempt| retry_backoff_ms(CONNECT_RETRY_BASE_BACKOFF_MS, attempt))
         .sum();
@@ -367,6 +369,212 @@ async fn transient_connect_errors_are_retried_then_fail_with_context() {
     );
     let text = format!("{error:#}");
     assert!(text.contains("provider request failed"), "{text}");
+}
+
+#[tokio::test]
+async fn http_5xx_is_retried_then_succeeds() {
+    // Two 503s (server overloaded), then a healthy stream: the chat wire must
+    // retry transient server errors (same whole-request loop as 403) and
+    // recover on the third attempt.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut stream).await;
+        reply_sse(
+            &mut stream,
+            &[
+                json!({"choices":[{"delta":{"content":"recovered"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ],
+        )
+        .await;
+    });
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "test-model".into(),
+        None,
+        false,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let (message, _) = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(message.content.as_deref(), Some("recovered"));
+}
+
+#[tokio::test]
+async fn http_5xx_is_retried_then_fails_with_status() {
+    // 503 on every attempt: after HTTP_RETRY_ATTEMPTS the error surfaces with
+    // the status code, and the full backoff schedule has run.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..HTTP_RETRY_ATTEMPTS {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "test-model".into(),
+        None,
+        false,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+    // 3 attempts => the sum of the retry backoffs (tests run with a 10ms
+    // base, so 10+20ms) before the final 503 surfaces.
+    let expected_sleep: u64 = (1..HTTP_RETRY_ATTEMPTS)
+        .map(|attempt| retry_backoff_ms(HTTP_RETRY_BASE_BACKOFF_MS, attempt))
+        .sum();
+    assert!(
+        started.elapsed() >= Duration::from_millis(expected_sleep),
+        "expected at least {expected_sleep}ms of backoff"
+    );
+    let text = format!("{error:#}");
+    assert!(text.contains("HTTP 503"), "{text}");
+}
+
+#[tokio::test]
+async fn http_403_is_retried_then_succeeds() {
+    // Bare 403 (rate limit) twice, then a healthy stream: 403 joins the same
+    // transient-HTTP retry loop as 5xx.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut stream).await;
+        reply_sse(
+            &mut stream,
+            &[
+                json!({"choices":[{"delta":{"content":"rate limit lifted"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ],
+        )
+        .await;
+    });
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "test-model".into(),
+        None,
+        false,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let (message, _) = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(message.content.as_deref(), Some("rate limit lifted"));
+}
+
+#[tokio::test]
+async fn stream_decode_error_is_retried_then_succeeds() {
+    // First response delivers a data frame that is not valid JSON: the stream
+    // dies mid-flight with "cannot decode provider stream chunk", and the
+    // whole idempotent request is retried, landing on a healthy stream.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut stream).await;
+        let body = b"data: {not-json}\n\ndata: [DONE]\n\n";
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut stream).await;
+        reply_sse(
+            &mut stream,
+            &[
+                json!({"choices":[{"delta":{"content":"clean"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ],
+        )
+        .await;
+    });
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "test-model".into(),
+        None,
+        false,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let (message, _) = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(message.content.as_deref(), Some("clean"));
 }
 
 struct FailingTool;
