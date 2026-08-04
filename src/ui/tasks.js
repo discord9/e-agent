@@ -481,7 +481,9 @@ function buildTaskRow(t, key, restoreExpanded) {
       tags.push(tag);
     }
     if (t.resume && String(t.resume).trim() !== "") {
-      const tag = el("span", "task-tag", "resume: " + t.resume);
+      // 只显示 "resume" 文字：session id 不占标签空间（完整 id 在 hover
+      // title 里，需要时仍可查看）。
+      const tag = el("span", "task-tag", "resume");
       tag.title = String(t.resume);
       tags.push(tag);
     }
