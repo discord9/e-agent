@@ -695,7 +695,7 @@ impl SessionRunner {
     fn finish_cancelled_or_idle(&mut self, cancelled_by_command: bool) -> bool {
         if !cancelled_by_command
             && self.policy == IdlePolicy::FinishWhenIdle
-            && !self.agent.has_running_background()
+            && !self.agent.has_blocking_background()
         {
             self.finalize_when_idle(SessionResult::Cancelled)
         } else {
@@ -819,7 +819,7 @@ impl SessionRunner {
                 } else {
                     self.status(SessionStatus::Idle);
                     if self.policy == IdlePolicy::FinishWhenIdle
-                        && !self.agent.has_running_background()
+                        && !self.agent.has_blocking_background()
                         && !self.cancelled
                     {
                         // `self.cancelled` means a Cancel command interrupted

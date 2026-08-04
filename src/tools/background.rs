@@ -463,6 +463,60 @@ impl BackgroundTasks {
         sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
         sandbox: Option<crate::config::Sandbox>,
     ) -> Result<String, String> {
+        let sender = sender
+            .filter(|sender| !sender.is_closed())
+            .ok_or("background task delivery is unavailable")?;
+        let label = preview(&command, 100);
+        let completion_label = label.clone();
+        self.spawn_bash_command(
+            label,
+            workspace,
+            command,
+            protect_git,
+            sandbox,
+            move |id, output| {
+                let _ = sender.send(AgentEvent::BackgroundCompleted {
+                    id,
+                    output,
+                    label: Some(completion_label.clone()),
+                });
+            },
+        )
+    }
+
+    /// Start a background bash command as a detached daemon / long-lived
+    /// service / watcher. The task runs in the shared registry and stays
+    /// visible in the task panel, but never delivers a completion event:
+    /// it must not block the spawning session from finishing
+    /// (FinishWhenIdle ignores it), and no completion is promised to a
+    /// session that may already have ended. The task leaves the registry
+    /// when it finishes on its own.
+    pub fn start_detached(
+        &self,
+        workspace: Workspace,
+        command: String,
+        protect_git: bool,
+        sandbox: Option<crate::config::Sandbox>,
+    ) -> Result<String, String> {
+        let label = preview(&command, 100);
+        self.spawn_bash_command(label, workspace, command, protect_git, sandbox, |_, _| {})
+    }
+
+    /// Shared bash background spawn: register the task, run the command
+    /// under the facade's sandbox policy, and remove it from the registry
+    /// when it completes. `on_complete` decides what happens at completion
+    /// (deliver a `BackgroundCompleted` event, or nothing for detached
+    /// tasks).
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_bash_command(
+        &self,
+        label: String,
+        workspace: Workspace,
+        command: String,
+        protect_git: bool,
+        sandbox: Option<crate::config::Sandbox>,
+        on_complete: impl FnOnce(u64, String) + Send + 'static,
+    ) -> Result<String, String> {
         let shell = Shell::detect()?;
         let process_group = Arc::new(AtomicI32::new(0));
         let output: OutputSlot = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -474,9 +528,8 @@ impl BackgroundTasks {
         let timeout = self.timeout;
         let running = self.registry.clone();
         let shell_name = shell.tool_name.to_owned();
-        self.spawn_with_id_to(
-            sender,
-            preview(&command, 100),
+        self.spawn_inner(
+            label,
             None,
             Some(process_group),
             None, // display_meta
@@ -506,6 +559,7 @@ impl BackgroundTasks {
                     Ok(output) | Err(output) => output,
                 }
             },
+            on_complete,
         )
     }
 

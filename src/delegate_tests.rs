@@ -1897,3 +1897,284 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Detached daemon + FinishWhenIdle subagent finalization
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// Serve one scripted SSE chat response per accepted connection, in order.
+/// Each entry is `(delta, finish_reason)`, e.g.
+/// `(json!({"content": "done"}), "stop")` for text, or a tool-call delta
+/// with `"tool_calls"` finish reason.
+async fn scripted_chat(replies: Vec<(Value, &'static str)>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for (delta, finish_reason) in replies {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0; 1024];
+                let count = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            let received_body = request.len() - header_end;
+            let mut rest = vec![0; content_length - received_body];
+            stream.read_exact(&mut rest).await.unwrap();
+
+            let body = format!(
+                "data: {{\"choices\":[{{\"delta\":{delta},\"finish_reason\":\"{finish_reason}\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    format!("http://{address}")
+}
+
+/// SSE delta for a bash tool call with the given arguments.
+fn bash_tool_call_delta(arguments: &str) -> Value {
+    json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [{
+            "index": 0,
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": arguments}
+        }]
+    })
+}
+
+#[tokio::test]
+async fn background_delegate_with_detached_daemon_finalizes_and_keeps_daemon() {
+    // The subagent starts a detached daemon and then outputs its final
+    // report. FinishWhenIdle must finalize despite the live daemon: the
+    // wrapper completes and delivers exactly one BackgroundCompleted, the
+    // subagent's Sessions entry and the delegate task are cleaned up, and
+    // the daemon stays in the shared registry.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let base_url = scripted_chat(vec![
+        (
+            bash_tool_call_delta(
+                r#"{"command": "sleep 3600", "background": true, "detached": true}"#,
+            ),
+            "tool_calls",
+        ),
+        (json!({"content": "report done"}), "stop"),
+    ])
+    .await;
+    let mut tool = delegate_with_url(temp.path(), base_url)
+        .persist_sessions(root.join("sessions"))
+        .record_background_tasks_in(root.clone(), "parent", SessionStore::Jsonl);
+    let background = tool.background.clone();
+    let sessions = tool.sessions.clone();
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+
+    let answer = tool
+        .execute(json!({
+            "task": "start the daemon and report",
+            "workspace": temp.path().to_str().unwrap()
+        }))
+        .await
+        .unwrap();
+    let delegate_task_id: u64 = answer
+        .strip_prefix("started background task ")
+        .and_then(|s| s.split(':').next())
+        .and_then(|s| s.trim().parse().ok())
+        .expect("immediate result must carry the delegate task id");
+    let session_id = answer
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix("subagent session: "))
+        .expect("immediate result must carry the subagent session id");
+
+    // The subagent finished; the wrapper completed and sent one completion.
+    let event = tokio::time::timeout(std::time::Duration::from_secs(10), completions.recv())
+        .await
+        .expect("timed out waiting for the background completion")
+        .unwrap();
+    assert!(matches!(
+        event,
+        AgentEvent::BackgroundCompleted { output, .. }
+            if output == format!("subagent session: {session_id}\nreport done")
+    ));
+    assert!(
+        completions.try_recv().is_err(),
+        "exactly one completion is sent"
+    );
+
+    // Cleanup ran: the subagent's Sessions entry is gone and the delegate
+    // task left the registry. The detached daemon remains.
+    assert!(sessions.sessions.lock().unwrap().is_empty());
+    assert!(
+        crate::session::Session::take_unfinished_background(&root, "parent").is_empty(),
+        "the finished delegate must clear its killed-on-exit record"
+    );
+    let running = background.running();
+    assert_eq!(running.len(), 1, "only the daemon remains: {running:?}");
+    assert_eq!(running[0].kind, "bash");
+    assert_ne!(running[0].id, delegate_task_id);
+    // Explicit cancel so the sleep process does not leak past the test.
+    background.cancel(running[0].id);
+    assert!(background.running().is_empty());
+}
+
+#[tokio::test]
+async fn sync_delegate_with_detached_daemon_returns_without_waiting_for_daemon() {
+    // The synchronous delegate (background:false) shares the same
+    // FinishWhenIdle runner: the subagent starts a detached daemon and
+    // answers, the delegate returns the final answer and session id without
+    // waiting for the daemon, and the daemon stays in the shared registry.
+    let temp = tempfile::tempdir().unwrap();
+    let base_url = scripted_chat(vec![
+        (
+            bash_tool_call_delta(
+                r#"{"command": "sleep 3600", "background": true, "detached": true}"#,
+            ),
+            "tool_calls",
+        ),
+        (json!({"content": "final answer"}), "stop"),
+    ])
+    .await;
+    let mut tool = delegate_with_url(temp.path(), base_url);
+    let background = tool.background.clone();
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+
+    let output = tool
+        .execute(json!({
+            "task": "start the daemon and answer",
+            "workspace": temp.path().to_str().unwrap(),
+            "background": false
+        }))
+        .await
+        .unwrap();
+    let session_id = output
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("subagent session: "))
+        .expect("sync success contains the subagent session id");
+    assert!(session_id.starts_with("sub-"));
+    assert!(
+        output.lines().any(|line| line == "final answer"),
+        "sync delegate returns the subagent's final answer, got: {output}"
+    );
+
+    // The daemon is still alive in the shared registry after the sync
+    // delegate returned.
+    let running = background.running();
+    assert_eq!(running.len(), 1, "daemon must remain: {running:?}");
+    assert_eq!(running[0].kind, "bash");
+    background.cancel(running[0].id);
+    assert!(background.running().is_empty());
+}
+
+#[tokio::test]
+async fn background_delegate_with_non_detached_task_waits_for_completion() {
+    // A plain non-detached background task must hold the delegate open:
+    // until its completion arrives the wrapper must NOT return, the
+    // subagent session stays registered, and both tasks are in the
+    // registry. After the completion is injected the model outputs the
+    // final answer and the wrapper completes.
+    let temp = tempfile::tempdir().unwrap();
+    let base_url = scripted_chat(vec![
+        (
+            bash_tool_call_delta(r#"{"command": "sleep 1", "background": true}"#),
+            "tool_calls",
+        ),
+        (json!({"content": "build started, waiting"}), "stop"),
+        (json!({"content": "build finished, done"}), "stop"),
+    ])
+    .await;
+    let mut tool = delegate_with_url(temp.path(), base_url);
+    let background = tool.background.clone();
+    let sessions = tool.sessions.clone();
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+
+    let answer = tool
+        .execute(json!({
+            "task": "run the build and report",
+            "workspace": temp.path().to_str().unwrap()
+        }))
+        .await
+        .unwrap();
+    let delegate_task_id: u64 = answer
+        .strip_prefix("started background task ")
+        .and_then(|s| s.split(':').next())
+        .and_then(|s| s.trim().parse().ok())
+        .expect("immediate result must carry the delegate task id");
+
+    // While the non-detached build task is still running (sleep 1), the
+    // delegate must not have completed: no parent completion yet, the
+    // subagent session still registered, and both the delegate wrapper task
+    // and the build task in the shared registry.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let running = background.running();
+        let build_running = running.iter().any(|task| task.kind == "bash");
+        let delegate_running = running.iter().any(|task| task.id == delegate_task_id);
+        if completions.try_recv().is_err()
+            && !sessions.sessions.lock().unwrap().is_empty()
+            && build_running
+            && delegate_running
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delegate must stay open while the background task runs: \
+             completion_pending={} sessions={} build_running={build_running} \
+             delegate_running={delegate_running}",
+            completions.try_recv().is_ok(),
+            sessions.sessions.lock().unwrap().len(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // The build completes on its own; its completion is injected into the
+    // subagent, the model produces the final answer, and the wrapper
+    // completes with exactly one BackgroundCompleted.
+    let event = tokio::time::timeout(std::time::Duration::from_secs(10), completions.recv())
+        .await
+        .expect("timed out waiting for the delegate completion")
+        .unwrap();
+    assert!(matches!(
+        event,
+        AgentEvent::BackgroundCompleted { output, .. }
+            if output.ends_with("\nbuild finished, done")
+    ));
+    assert!(
+        completions.try_recv().is_err(),
+        "exactly one completion is sent"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if background.running().is_empty() && sessions.sessions.lock().unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delegate task and build task must both leave the registry"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
