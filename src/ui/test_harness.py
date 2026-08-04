@@ -2005,6 +2005,7 @@ async function main(){
     // ---- 后台完成（appendBackgroundCompletion）：delegate 完成 vs bash ----
     elsById["messages"].innerHTML = "";
     state.acc = newAccumulator();
+    // 短答案（≤200 字符）：直接展开显示，不包 details
     const dgComp = appendBackgroundCompletion(7, "看图",
       "subagent session: sub-abc\n完成：**好**");
     chk("bg delegate completion rendered",
@@ -2015,6 +2016,41 @@ async function main(){
         && dgComp.textContent.includes("完成：好")
         && dgComp.querySelector(".tool-markdown") !== null,
         "text=" + JSON.stringify(dgComp.textContent));
+    chk("bg short answer not collapsed",
+        dgComp.querySelector("details.delegate-collapse") === null
+        && dgComp.querySelector(".tool-markdown").parentNode === dgComp,
+        "details=" + (dgComp.querySelector("details.delegate-collapse") !== null));
+    // 长答案（>200 字符）：默认折叠进 details.delegate-collapse，summary 显示字符数
+    const longAnswer = "这是很长的答案。".repeat(30);   // 240 字符 > 200
+    const dgLong = appendBackgroundCompletion(8, "审阅",
+      "subagent session: sub-long\n" + longAnswer);
+    const dgDet = dgLong.querySelector("details.delegate-collapse");
+    const dgSum = dgDet ? dgDet.querySelector("summary") : null;
+    chk("bg long answer folded by default",
+        dgDet !== null && dgDet.hasAttribute("open") === false
+        && dgSum !== null && dgSum.textContent === "查看完整答案（" + longAnswer.length + " 字符）"
+        && dgLong.querySelector(".tool-markdown") !== null
+        && dgLong.querySelector(".tool-markdown").parentNode === dgDet
+        && dgLong.textContent.includes("子代理会话 sub-long"),
+        "det=" + (dgDet !== null) + " open=" + (dgDet && dgDet.hasAttribute("open"))
+        + " sum=" + JSON.stringify(dgSum && dgSum.textContent));
+    // 点击 summary 展开（fake DOM 无原生 details 交互，用 open 属性模拟；
+    // 序列化往返后 open 保留、markdown 内容完整）
+    dgDet.setAttribute("open", "");
+    chk("bg long answer expandable shows full text",
+        dgDet.hasAttribute("open")
+        && dgDet.querySelector(".tool-markdown").textContent.includes("这是很长的答案。"),
+        "text=" + JSON.stringify(dgDet.querySelector(".tool-markdown").textContent.slice(0, 24)));
+    const dgHost = el("div");
+    dgHost.appendChild(dgLong);
+    const dgHost2 = el("div");
+    dgHost2.innerHTML = dgHost.innerHTML;
+    chk("bg long answer open state survives round-trip",
+        dgHost2.querySelector("details.delegate-collapse") !== null
+        && dgHost2.querySelector("details.delegate-collapse").hasAttribute("open")
+        && dgHost2.querySelector("details.delegate-collapse").querySelector(".tool-markdown").textContent.includes("这是很长的答案。"),
+        "open=" + (dgHost2.querySelector("details.delegate-collapse") !== null
+          && dgHost2.querySelector("details.delegate-collapse").hasAttribute("open")));
     const bashComp = appendBackgroundCompletion(9, "cargo", "build ok");
     chk("bg bash completion keeps notice path",
         !bashComp.classList.contains("delegate-complete")
@@ -2027,7 +2063,8 @@ async function main(){
     chk("history background_completion delegate rendered",
         histComp.classList.contains("delegate-complete")
         && histComp.textContent.includes("子代理会话 sub-9")
-        && histComp.textContent.includes("答：好"),
+        && histComp.textContent.includes("答：好")
+        && histComp.querySelector("details.delegate-collapse") === null,
         "text=" + JSON.stringify(histComp.textContent));
     // live SSE BackgroundCompleted（delegate 输出）→ 同一渲染路径
     handleSSEBlock("event: BackgroundCompleted\ndata: {\"type\":\"background_completed\",\"session_id\":\"" + state.sessionId + "\",\"seq\":300,\"id\":11,\"label\":\"审图\",\"output\":\"subagent session: sub-11\\n搞定\\n\"}\n\n",
@@ -2037,7 +2074,8 @@ async function main(){
     chk("live BackgroundCompleted delegate rendered",
         lastNoticeBg.classList.contains("delegate-complete")
         && lastNoticeBg.textContent.includes("子代理会话 sub-11")
-        && lastNoticeBg.textContent.includes("搞定"),
+        && lastNoticeBg.textContent.includes("搞定")
+        && lastNoticeBg.querySelector("details.delegate-collapse") === null,
         "text=" + JSON.stringify(lastNoticeBg.textContent));
 
     // ---- B: 消息上限 pruneMessages ----

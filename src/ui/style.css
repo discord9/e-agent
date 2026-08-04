@@ -763,6 +763,39 @@
   }
   .notice.delegate-complete .delegate-label { color: var(--base01); }
 
+  /* delegate 长答案折叠（appendBackgroundCompletion 的 details.delegate-collapse）：
+     沿用 details.thinking/.older-collapse 的折叠风格——小字号 summary、隐藏
+     默认 marker、自定义三角箭头（展开时旋转 90°），与 notice 布局协调 */
+  .notice.delegate-complete .delegate-collapse {
+    flex-shrink: 0;
+    margin: 2px 0 0;
+    border-left: 2px solid var(--blue);
+    padding-left: 8px;
+    font-size: 12px;
+  }
+  .notice.delegate-complete .delegate-collapse summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;          /* summary 可点击折叠/展开 */
+    user-select: none;
+    color: var(--blue);
+    font-size: 12px;
+  }
+  .notice.delegate-complete .delegate-collapse summary::-webkit-details-marker { display: none; }
+  .notice.delegate-complete .delegate-collapse summary::before {
+    content: "";
+    width: 0;
+    height: 0;
+    flex: 0 0 auto;
+    border-left: 6px solid var(--base01);
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
+    transition: transform 0.15s;
+  }
+  .notice.delegate-complete .delegate-collapse[open] summary::before { transform: rotate(90deg); }
+  .notice.delegate-complete .delegate-collapse .tool-markdown { margin-top: 4px; }
+
   .notice {
     flex-shrink: 0;
     color: var(--base01);

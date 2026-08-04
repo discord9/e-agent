@@ -44,6 +44,7 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
  * 行号列灰底右对齐、删除红/新增绿，样式在 style.css .tool-card 区。
  * ===================================================================*/
 const DIFF_LINE_LIMIT = 30;      // 镜像 TUI push_diff_side 的每侧截断行数
+const DELEGATE_COLLAPSE_THRESHOLD = 200;  // delegate 完成答案超过该字符数时默认折叠
 
 /* "file edited (line N)" → N（TUI parse_edited_line 的 JS 版）；解析失败返回
    null（调用方按「不编号」处理，镜像 TUI 的 start.unwrap_or(0) + 空 label） */
@@ -891,7 +892,18 @@ function appendBackgroundCompletion(id, label, output) {
   if (m[2]) {
     const md = el("div", "tool-markdown");
     md.innerHTML = renderMarkdown(m[2]);
-    n.appendChild(md);
+    // delegate 答案：长答案（>200 字符）默认折叠——包进 details.delegate-collapse
+    // （不 open），summary 显示字符数，点击展开；短答案直接展开显示，避免
+    // 「已完成」这类短回复也要点开
+    if (m[2].length <= DELEGATE_COLLAPSE_THRESHOLD) {
+      n.appendChild(md);
+    } else {
+      const det = el("details", "delegate-collapse");
+      det.open = false;                       // 默认折叠
+      const sum = el("summary", "", "查看完整答案（" + m[2].length + " 字符）");
+      det.append(sum, md);
+      n.appendChild(det);
+    }
   }
   els.messages.appendChild(n);
   scrollBottom(false);
