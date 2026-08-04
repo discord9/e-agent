@@ -264,6 +264,12 @@ impl TestSessionEmitter {
     pub(crate) fn emit(&self, event: AgentEvent) {
         self.shared.lock().unwrap().emit(event);
     }
+    /// Test-only: force the runner's status watch to a specific value so
+    /// tests can simulate a Busy/Compacting/Finished subagent handle
+    /// without a live runner task.
+    pub(crate) fn set_status(&self, status: SessionStatus) {
+        self.shared.lock().unwrap().status.send_replace(status);
+    }
 }
 #[cfg(test)]
 pub(crate) fn session_test_channel() -> (

@@ -1319,9 +1319,11 @@ async function refreshSessionsForSidebar() {
  * 会话侧边栏：会话树
  * 主会话（parent_session_id 空）为根，默认折叠；subagent 挂父节点下
  * （缩进 + 「子」徽章），展开才渲染子节点；孤儿 subagent 归入「未关联」。
- * 每个父节点（及「未关联」组）默认只显示活跃 subagent（active !== false，
- * 即活跃或 busy；旧 server 无 active 字段 → 视为活跃）：非活跃 subagent
- * 收进折叠的「历史子会话 (N)」分组（点击展开，不持久化展开状态）。
+ * 每个父节点（及「未关联」组）展开时直显 live subagent（active !== false，
+ * 含 Idle 存活；旧 server 无 active 字段 → 视为 live）；inactive（active ===
+ * false）subagent 收进折叠的「历史子会话 (N)」分组（点击展开，不持久化
+ * 展开状态）。subagent 的环绕红点/忙点只表达 running（busy===true 或
+ * status Busy/Compacting 回退），live 但不 running 的子行不点亮。
  * subagent 标题优先用 label（running_tasks 任务面板标题），回退 title/id。
  * 默认只渲染最近 15 个主会话（列表按 last_active_at 降序），超出显示
  * 「+N 个更早的会话」按钮点击显示全部；子会话/孤儿组不计数。
@@ -1701,6 +1703,14 @@ function isMainSession(s) {
   return !s.parent_session_id && !/^(sub|btw)-/i.test(String(s.id || ""));
 }
 
+/* subagent 是否正在运行（环绕红点 / 子行 busy 点）：busy===true 权威；
+   旧 server 无 busy 字段时由 status 回退（Busy/Compacting）。busy:false
+   是权威否定，不回退 active/label（oracle#95）。 */
+function isSubagentRunning(s) {
+  return !!s && s.parent_session_id != null
+    && (s.busy === true || (s.busy === undefined && isRunningStatus(s.status)));
+}
+
 /* 单个 workspace 的树渲染（原 renderSidebarTree 主体，抽出来按 ws 复用）：
    roots/orphans/MAX_TREE_ROOTS/hist-groups 全部按本列表判定；wsId 用于
    expanded 键限定（wsId:sid）与 .current 高亮（只高亮激活 workspace 内
@@ -1829,39 +1839,39 @@ function buildTreeRoot(s, kids, wsId) {
       toggleSidebarNode(wsId + ":" + s.id, toggle, kids, wsId);
     });
   }
-  // 活跃子会话聚合只看直接子会话（subagent 通常一层，孙会话不计）：
-  // 后端 running_tasks 分不清 Idle/Busy——live subagent（label 在）只有
-  // active=true、busy 恒为 false（apply_subagent_label 只设 active）。
-  // 所以 active===true 表示仍在工作流中的子 agent（包括等待输入的 Idle
-  // subagent）。主点只表达父会话自身状态；活跃子 agent 用环绕红点独立表达。
-  const busyKidCount = kids.filter((k) => k.active === true).length;
-  const hasActiveKids = busyKidCount > 0;
+  // 环绕红点只看直接子会话（subagent 通常一层，孙会话不计），且只统计
+  // 正在运行的子 agent（isSubagentRunning：busy===true，或旧 server 无
+  // busy 字段时由 status 回退 Busy/Compacting）；Idle 但存活的 live
+  // subagent 不点亮红点（busy:false 是权威否定）。主点只表达父会话自身
+  // 状态；正在运行的子 agent 用环绕红点独立表达。
+  const runningKidCount = kids.filter(isSubagentRunning).length;
+  const hasRunningKids = runningKidCount > 0;
   const dot = el("span", "busy-dot-wrap");
   dot.setAttribute("role", "img");
   dot.setAttribute("aria-label", (s.busy ? "会话处理中" : "会话空闲")
-    + (hasActiveKids ? "，" + busyKidCount + " 个子任务处理中" : ""));
+    + (hasRunningKids ? "，" + runningKidCount + " 个子任务处理中" : ""));
   const mainDot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
   mainDot.setAttribute("aria-hidden", "true");
   dot.appendChild(mainDot);
 
   // 环上最多画六个红点；更多任务由第七个位置的 +N 汇总，避免
   // 小尺寸侧栏状态标记过密。位置按当前红点数量均匀选取。
-  const hasOverflow = busyKidCount > 6;
-  const visibleKidDots = Math.min(busyKidCount, 6);
+  const hasOverflow = runningKidCount > 6;
+  const visibleKidDots = Math.min(runningKidCount, 6);
   const orbitSlots = {
     1: [1], 2: [1, 5], 3: [1, 4, 6], 4: [1, 3, 5, 7],
     5: [1, 2, 4, 6, 8], 6: [1, 2, 4, 5, 6, 8],
   }[visibleKidDots] || [];
   for (let i = 0; i < visibleKidDots; i++) {
     const subDot = el("span", "busy-dot-sub orbit-slot-" + orbitSlots[i]);
-    subDot.title = "子任务 " + (i + 1) + "/" + busyKidCount;
+    subDot.title = "子任务 " + (i + 1) + "/" + runningKidCount;
     subDot.setAttribute("aria-hidden", "true");
     dot.appendChild(subDot);
   }
   if (hasOverflow) {
     const overflow = el("span", "busy-dot-overflow",
-      "+" + (busyKidCount - visibleKidDots));
-    overflow.title = "共 " + busyKidCount + " 个子任务处理中";
+      "+" + (runningKidCount - visibleKidDots));
+    overflow.title = "共 " + runningKidCount + " 个子任务处理中";
     overflow.setAttribute("aria-hidden", "true");
     dot.appendChild(overflow);
   }
@@ -1907,13 +1917,13 @@ function buildTreeRoot(s, kids, wsId) {
   row.append(toggle, dot, titleEl, count, pin, archive);
   row.title = (s.title || s.id) + (s.model ? " · " + s.model : "")
     + (s.busy ? "（处理中）" : "")
-    + (hasActiveKids ? "（子任务处理中）" : "");
+    + (hasRunningKids ? "（子任务处理中）" : "");
   row.addEventListener("click", (ev) => {
     if (row.classList.contains("pin-drag-click-block")) {
       if (ev) { ev.preventDefault(); ev.stopPropagation(); }
       return;
     }
-    if (s.active === false) { resumeSessionIn(wsId, s.id); return; }   // 历史会话先恢复
+    if (!isSessionLive(s)) { resumeSessionIn(wsId, s.id); return; }   // 历史会话先恢复
     openSessionIn(wsId, s.id);
   });
   node.appendChild(row);
@@ -1948,23 +1958,25 @@ function toggleSidebarNode(key, toggle, kids, wsId) {
   }
 }
 
-/* 父节点 / 「未关联」组的子节点渲染：默认只显示正在运行的 subagent；
-   idle（无论 active 与否）都收进折叠的「历史子会话 (N)」分组
-   （buildHistGroup，默认收起、点击展开）。 */
+/* 父节点 / 「未关联」组的子节点渲染：live subagent（active !== false，
+   含 Idle 存活与旧 server 无 active 字段）直显；inactive（active ===
+   false）收进折叠的「历史子会话 (N)」分组（buildHistGroup，默认收起、
+   点击展开）。 */
 function renderTreeChildren(container, kids, wsId) {
   container.innerHTML = "";
-  const busy = [], hist = [];
-  for (const k of kids) (k.busy ? busy : hist).push(k);
-  renderSubagentRows(container, busy, false, wsId);
+  const live = [], hist = [];
+  for (const k of kids) (isSessionLive(k) ? live : hist).push(k);
+  renderSubagentRows(container, live, false, wsId);
   if (hist.length) container.appendChild(buildHistGroup(hist, wsId));
 }
 
 /* 渲染 subagent 行（不做活跃/历史分组）；hist=true 时行灰显小字 */
 function renderSubagentRows(container, kids, hist, wsId) {
   for (const k of kids) {
+    const running = isSubagentRunning(k);
     const row = el("div", "tree-row tree-row-child" + (hist ? " tree-hist" : "") +
       (state.workspace.id === wsId && state.sessionId === k.id ? " current" : ""));
-    const dot = el("span", "busy-dot" + (k.busy ? " busy" : ""));
+    const dot = el("span", "busy-dot" + (running ? " busy" : ""));
     // label 优先：subagent 的任务面板标题最友好；旧 server 无 label → 回退 title/id
     // 有 label/title：两行（label/title 行 + 完整 id 行）；无则一行完整 id。
     const hasTitle = !!(k.label || k.title);
@@ -1979,18 +1991,22 @@ function renderSubagentRows(container, kids, hist, wsId) {
     }
     const badge = el("span", "child-badge", "子");
     row.append(dot, titleEl, badge);
-    // busy 的 subagent：title 提示可发送消息（点击行 openSession 是现有行为，保持不变）
-    row.title = (k.label || k.title || k.id) + (k.busy ? "（处理中）· 可发送消息" : "");
+    // running 的 subagent：title 提示可发送消息（点击行 openSession 是现有行为，
+    // 保持不变）。Idle 但存活的 live 子行显示「空闲 · 可发送消息」（oracle Low#8）；
+    // inactive 历史子行不带状态后缀。
+    row.title = (k.label || k.title || k.id) + (running ? "（处理中）· 可发送消息"
+      : isSessionLive(k) ? "（空闲）· 可发送消息" : "");
     row.addEventListener("click", () => {
-      if (k.active === false) { resumeSessionIn(wsId, k.id); return; }
+      if (!isSessionLive(k)) { resumeSessionIn(wsId, k.id); return; }
       openSessionIn(wsId, k.id);
     });
     container.appendChild(row);
   }
 }
 
-/* 「历史子会话 (N)」折叠分组：非活跃 subagent 默认收起，点击展开；
-   不持久化展开状态（每次重绘默认折叠，简单）。 */
+/* 「历史子会话 (N)」折叠分组：只收 active === false 的 inactive subagent
+   （live 直显组之外），默认收起，点击展开；不持久化展开状态（每次重绘
+   默认折叠，简单）。 */
 function buildHistGroup(kids, wsId) {
   const node = el("div", "tree-node");
   const row = el("div", "tree-row tree-hist-row");

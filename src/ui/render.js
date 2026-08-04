@@ -1201,7 +1201,7 @@ function applyStatus(status) {
   state.status = status || "Idle";
   els.chatStatus.textContent = statusLabel(state.status);
   els.chatStatus.className = "status-chip " + statusChipClass(state.status);
-  const busy = state.status === "Busy" || state.status === "Compacting";
+  const busy = isRunningStatus(state.status);
   els.cancelBtn.disabled = !busy;         // Busy/Compacting 时可取消
   els.compactBtn.disabled = busy;         // 空闲时才压缩
   // Finished：会话不再接受输入，禁用输入区（busy 的 subagent 仍可排队输入）

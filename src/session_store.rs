@@ -1186,8 +1186,14 @@ impl SessionStore {
     /// back to the session id). JSONL: scans every `<id>.background.jsonl`
     /// record file for a surviving delegate line whose `session_id`
     /// matches — record lines are removed on task completion
-    /// (`clear_background_task`), so a surviving line means the delegate is
-    /// still live, mirroring `running_tasks`.
+    /// (`clear_background_task`), mirroring `running_tasks`.
+    ///
+    /// This is persisted task metadata, not runtime liveness: the record
+    /// files / `running_tasks` rows have async write and cleanup windows,
+    /// so a surviving label cannot promise a tail-free "the subagent is
+    /// alive right now". `list_sessions` treats the label as display-only;
+    /// liveness comes from the main registry or a live parent's `Sessions`
+    /// registry (real handles).
     pub async fn label_for_subagent(
         &self,
         root: &Path,

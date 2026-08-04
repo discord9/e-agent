@@ -531,6 +531,13 @@ function statusChipClass(s) {
   return "idle";
 }
 
+/* oracle#95 双正交谓词：
+   isRunningStatus —— 真实 Busy/Compacting（正在消耗/占用资源）；
+   isSessionLive —— registry 存活（active !== false；旧 server 无 active
+   字段 → undefined 视为 live，兼容规则不动）。 */
+function isRunningStatus(status) { return status === "Busy" || status === "Compacting"; }
+function isSessionLive(s) { return !!s && s.active !== false; }
+
 function shortId(id) {
   return id && id.length > 8 ? id.slice(0, 8) + "…" : (id || "");
 }

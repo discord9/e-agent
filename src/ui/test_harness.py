@@ -3210,15 +3210,18 @@ async function main(){
     // 15b) workspace 标识分色 + 父节点 / subagent 分层 busy 点 + 子会话分组
     //     A) 标识按 workspace 下标取色（ws-chip-<n>）：不同 workspace
     //        色类不同；同一 workspace 的列表 chip / 组头 chip / 置顶色条同色。
-    //     B) 父节点中心点只显示自身 busy/idle；每个 active 子会话显示一个
-    //        环绕红点，超过六个显示 +N，父与子状态可同时一眼识别。
-    //     C) 展开父节点只直显 busy 子会话，idle（包括 active=true）收进
-    //        「历史子会话 (N)」折叠组。
+    //     B) 父节点中心点只显示自身 busy/idle；每个 running 子会话
+    //        （busy===true 或 status Busy/Compacting 回退）显示一个环绕
+    //        红点，超过六个显示 +N；live 但不 running 的子会话（active
+    //        Idle）不点亮红点。父与子状态可同时一眼识别。
+    //     C) 展开父节点直显 live 子会话（active !== false，含 Idle 存活），
+    //        inactive（active === false）收进「历史子会话 (N)」折叠组。
     // =====================================================================
     sessionsData = [
       { id: "c1", status: "Idle", title: "C 主会话", created_at: "2024-03-01T00:00:00Z", entry_count: 1, busy: false, active: true, pinned: true },
       { id: "c1-child-busy-1", parent_session_id: "c1", label: "C 子任务忙一", status: "Busy", entry_count: 1, busy: true, active: true },
       { id: "c1-child-busy-2", parent_session_id: "c1", label: "C 子任务忙二", status: "Busy", entry_count: 1, busy: true, active: true },
+      { id: "c1-child-idle-live", parent_session_id: "c1", label: "C 子任务闲活", status: "Idle", entry_count: 1, busy: false, active: true },
       { id: "c2", status: "Idle", title: "C2 主会话", created_at: "2024-03-02T00:00:00Z", entry_count: 1, busy: false, active: true },
       { id: "c2-child-busy", parent_session_id: "c2", label: "C2 子任务忙", status: "Busy", entry_count: 1, busy: true, active: true },
       { id: "c2-child-idle", parent_session_id: "c2", label: "C2 子任务闲", status: "Idle", entry_count: 1, busy: false, active: false },
@@ -3280,7 +3283,7 @@ async function main(){
     const e1Row = rowByTxt15("E 主会话");
     const f1Row = rowByTxt15("F 主会话");
     const g1Row = rowByTxt15("G 主会话");
-    chk("two active children render two orbit dots",
+    chk("two running children render two orbit dots",
         wrapOf15(c1Row).querySelectorAll(".busy-dot-sub").length === 2
         && !mainDotOf15(c1Row).classList.contains("busy"),
         "dots=" + wrapOf15(c1Row).querySelectorAll(".busy-dot-sub").length
@@ -3288,6 +3291,9 @@ async function main(){
     chk("inactive child is ignored by orbit count",
         wrapOf15(c2Row).querySelectorAll(".busy-dot-sub").length === 1,
         "dots=" + wrapOf15(c2Row).querySelectorAll(".busy-dot-sub").length);
+    chk("live idle child is not counted by orbit count",
+        wrapOf15(c1Row).querySelectorAll(".busy-dot-sub").length === 2,
+        "dots=" + wrapOf15(c1Row).querySelectorAll(".busy-dot-sub").length);
     chk("busy parent keeps orange busy main dot with no orbit dots",
         mainDotOf15(d1Row).classList.contains("busy")
         && wrapOf15(d1Row).querySelectorAll(".busy-dot-sub").length === 0,
@@ -3318,22 +3324,248 @@ async function main(){
         && f1Row.title.includes("子任务处理中")
         && !e1Row.title.includes("子任务处理中"),
         "c=" + c1Row.title + " f=" + f1Row.title);
-    // C) busy 子会话直显；active=true 的 idle 子会话也必须进入默认收起的历史组
+    // C) live 子会话（active !== false，含 Idle 存活）直显；inactive
+    //    （active === false）收进默认收起的历史组
     const c2BusyRow = rowByTxt15("C2 子任务忙");
     const c2IdleRow = rowByTxt15("C2 子任务闲");
     const e1IdleRow = rowByTxt15("E 子任务闲");
+    const c1IdleLiveRow = rowByTxt15("C 子任务闲活");
     const histLabels15 = elsById["sidebarTree"].querySelectorAll(".tree-hist-label");
-    chk("expanded parent directly shows only busy children",
+    chk("expanded parent directly shows live children, inactive fold into history",
         c2BusyRow.parentNode.hidden === false
         && c2IdleRow.classList.contains("tree-hist") && c2IdleRow.parentNode.hidden === true
         && e1IdleRow.classList.contains("tree-hist") && e1IdleRow.parentNode.hidden === true,
         "busyHidden=" + c2BusyRow.parentNode.hidden
         + " c2IdleHidden=" + c2IdleRow.parentNode.hidden
         + " e1IdleHidden=" + e1IdleRow.parentNode.hidden);
+    chk("live idle subagent stays in live group without a red dot",
+        c1IdleLiveRow !== null
+        && !c1IdleLiveRow.classList.contains("tree-hist")
+        && c1IdleLiveRow.parentNode.hidden === false
+        && !c1IdleLiveRow.querySelector(".busy-dot").classList.contains("busy"),
+        "hist=" + (c1IdleLiveRow && c1IdleLiveRow.classList.contains("tree-hist"))
+        + " hidden=" + (c1IdleLiveRow && c1IdleLiveRow.parentNode.hidden));
+    chk("live idle child row title shows idle hint",
+        c1IdleLiveRow !== null && c1IdleLiveRow.title.includes("空闲") && c1IdleLiveRow.title.includes("可发送消息"),
+        "title=" + (c1IdleLiveRow && c1IdleLiveRow.title));
     chk("idle children are counted in collapsed history groups",
         [...histLabels15].filter((e) => e.textContent === "历史子会话 (1)").length >= 2,
         "labels=" + [...histLabels15].map((e) => e.textContent).join(","));
     // 还原聚合状态（与 15 一致）
+    state.workspaces = saveWs.workspaces; state.workspace = saveWs.workspace; state.token = saveWs.token;
+    state.workspaceLists = saveWs.lists; state.workspaceErrors = saveWs.errors; state.lastList = saveWs.lastList;
+    state.sessionId = saveWs.sessionId;
+    state.sidebar.filter = saveWs.filter; state.sidebar.showAllWs = saveWs.showAll; state.sidebar.expanded = saveWs.expanded;
+    state.renameActive = false;
+    sessionsData = saveWs.dataA; sessionsDataB = saveWs.dataB;
+
+    // =====================================================================
+    // 15b2) oracle#95 双谓词 12 组合矩阵：running（busy/status）与 live
+    //     （active!==false）各司其职。断言四件事：环绕红点是否点亮、行
+    //     进 live 直显还是历史折叠、点击走 open 还是 resume（resume =
+    //     POST /api/sessions body {"id":...}，open = 直接 openSession）。
+    //     11/12 补 oracle#109：busy:false 权威否定不回退 status；以及
+    //     active:false + busy:true 正交（红点按 busy 亮、分组/路由按 active）。
+    // =====================================================================
+    sessionsData = [
+      // 1) active:true,busy:true,label:null → 红点、live 直显、open
+      { id: "m1", status: "Idle", title: "M1 主会话", created_at: "2024-05-01T00:00:00Z", entry_count: 1, busy: false, active: true },
+      { id: "m1-run", parent_session_id: "m1", label: null, title: "M1 运行中", status: "Busy", entry_count: 1, busy: true, active: true },
+      // 2) active:true,busy:false,label:"btw" → 无红点、live 直显、open
+      { id: "m1-idle", parent_session_id: "m1", label: "btw", status: "Idle", entry_count: 1, busy: false, active: true },
+      // 3) active:false,busy:false,label:"stale" → 无红点、历史折叠、resume
+      { id: "m1-stale", parent_session_id: "m1", label: "stale", status: "Idle", entry_count: 1, busy: false, active: false },
+      // 4) active:true,busy:false,status:"Finished",label:"tail" → 无红点（live 直显）
+      { id: "m1-finished", parent_session_id: "m1", label: "tail", status: "Finished", entry_count: 1, busy: false, active: true },
+      // 5) active:undefined,busy:true → 视为 live、running（旧 server 兼容）
+      { id: "m1-legacy-run", parent_session_id: "m1", status: "Busy", entry_count: 1, busy: true },
+      // 6) active:undefined,busy:false → live、无红点
+      { id: "m1-legacy-idle", parent_session_id: "m1", status: "Idle", entry_count: 1, busy: false },
+      // 7) busy:undefined,status:"Compacting" → fallback running
+      { id: "m1-compact", parent_session_id: "m1", status: "Compacting", entry_count: 1, active: true },
+      // 8) Busy parent + Busy child → 中心点 + orbit 同现
+      { id: "m2", status: "Busy", title: "M2 主会话", created_at: "2024-05-02T00:00:00Z", entry_count: 1, busy: true, active: true },
+      { id: "m2-run", parent_session_id: "m2", label: "M2 忙", status: "Busy", entry_count: 1, busy: true, active: true },
+      // 9) Busy parent + Idle live child → 仅中心点，child 在 live 组
+      { id: "m2-idle", parent_session_id: "m2", label: "M2 闲", status: "Idle", entry_count: 1, busy: false, active: true },
+      // 10) 超 6 个 running child → 6 点 + +N
+      { id: "m3", status: "Idle", title: "M3 主会话", created_at: "2024-05-03T00:00:00Z", entry_count: 1, busy: false, active: true },
+      ...Array.from({ length: 8 }, (_, i) => ({
+        id: "m3-run-" + (i + 1), parent_session_id: "m3", label: "M3 任务 " + (i + 1),
+        status: "Busy", entry_count: 1, busy: true, active: true,
+      })),
+      // 11) busy:false + status:"Busy" → busy:false 权威否定，不回退 status
+      { id: "m4", status: "Idle", title: "M4 主会话", created_at: "2024-05-04T00:00:00Z", entry_count: 1, busy: false, active: true },
+      { id: "m4-busy-status", parent_session_id: "m4", status: "Busy", entry_count: 1, busy: false, active: true },
+      // 12) active:false + busy:true → 红点按 busy 亮，分组/点击按 active
+      { id: "m4-folded-run", parent_session_id: "m4", status: "Busy", entry_count: 1, busy: true, active: false },
+    ];
+    sessionsDataB = [];
+    state.workspaces = [{ id: "wsA", name: "服务器A", url: "", token: "tok-a" }];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set(["wsA:m1", "wsA:m2", "wsA:m3", "wsA:m4"]);
+    state.renameActive = false;
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSidebarTree(true);
+    const rowsM = elsById["sidebarTree"].querySelectorAll(".tree-row");
+    const rowM = (t) => [...rowsM].find((r) => r.textContent.includes(t));
+    const wrapM = (r) => r.querySelector(".busy-dot-wrap");
+    const mainM = (r) => wrapM(r).querySelector(".busy-dot");
+    const kidM = (r) => r.querySelector(".busy-dot");
+    const m1Row = rowM("M1 主会话");
+    const m2Row = rowM("M2 主会话");
+    const m3Row = rowM("M3 主会话");
+    const m4Row = rowM("M4 主会话");
+    const m1Run = rowM("M1 运行中");
+    const m1Idle = rowM("btw");
+    const m1Stale = rowM("stale");
+    const m1Finished = rowM("tail");
+    const m1LegacyRun = rowM("m1-legacy-run");
+    const m1LegacyIdle = rowM("m1-legacy-idle");
+    const m1Compact = rowM("m1-compact");
+    const m2Run = rowM("M2 忙");
+    const m2Idle = rowM("M2 闲");
+    const m4BusyStatus = rowM("m4-busy-status");
+    const m4FoldedRun = rowM("m4-folded-run");
+    // 1) busy child: red dot + live direct
+    chk("m1: busy child has red dot and is live direct",
+        m1Run !== null && kidM(m1Run).classList.contains("busy")
+        && !m1Run.classList.contains("tree-hist") && m1Run.parentNode.hidden === false,
+        "dot=" + (m1Run && kidM(m1Run).className));
+    // 2) busy:false child: no red dot, live direct
+    chk("m1: busy:false live child has no red dot",
+        m1Idle !== null && !kidM(m1Idle).classList.contains("busy")
+        && !m1Idle.classList.contains("tree-hist") && m1Idle.parentNode.hidden === false,
+        "dot=" + (m1Idle && kidM(m1Idle).className));
+    // 3) active:false child: no red dot, history fold
+    chk("m1: active:false child folds into history without red dot",
+        m1Stale !== null && m1Stale.classList.contains("tree-hist")
+        && m1Stale.parentNode.hidden === true && !kidM(m1Stale).classList.contains("busy"),
+        "hist=" + (m1Stale && m1Stale.classList.contains("tree-hist")));
+    // 4) Finished live child: no red dot
+    chk("m1: Finished live child has no red dot",
+        m1Finished !== null && !kidM(m1Finished).classList.contains("busy")
+        && !m1Finished.classList.contains("tree-hist"),
+        "dot=" + (m1Finished && kidM(m1Finished).className));
+    // 5) active undefined + busy:true → live + running
+    chk("m1: legacy (active undefined) busy child is live and running",
+        m1LegacyRun !== null && kidM(m1LegacyRun).classList.contains("busy")
+        && !m1LegacyRun.classList.contains("tree-hist"),
+        "dot=" + (m1LegacyRun && kidM(m1LegacyRun).className));
+    // 6) active undefined + busy:false → live, no red dot
+    chk("m1: legacy (active undefined) idle child is live without red dot",
+        m1LegacyIdle !== null && !kidM(m1LegacyIdle).classList.contains("busy")
+        && !m1LegacyIdle.classList.contains("tree-hist"),
+        "dot=" + (m1LegacyIdle && kidM(m1LegacyIdle).className));
+    // 7) busy undefined + status Compacting → fallback running
+    chk("m1: busy undefined falls back to Compacting status for red dot",
+        m1Compact !== null && kidM(m1Compact).classList.contains("busy")
+        && !m1Compact.classList.contains("tree-hist"),
+        "dot=" + (m1Compact && kidM(m1Compact).className));
+    // orbit count for m1 = 3 running (m1-run, m1-legacy-run, m1-compact)
+    chk("m1 orbit counts only running children",
+        wrapM(m1Row).querySelectorAll(".busy-dot-sub").length === 3,
+        "dots=" + wrapM(m1Row).querySelectorAll(".busy-dot-sub").length);
+    // 8) Busy parent + Busy child → both layers
+    chk("m2: busy parent and busy child show both status layers",
+        mainM(m2Row).classList.contains("busy")
+        && wrapM(m2Row).querySelectorAll(".busy-dot-sub").length === 1
+        && kidM(m2Run).classList.contains("busy"),
+        "main=" + mainM(m2Row).className
+        + " dots=" + wrapM(m2Row).querySelectorAll(".busy-dot-sub").length);
+    // 9) Busy parent + Idle live child → center dot only, child in live group
+    chk("m2: idle live child under busy parent stays in live group without red dot",
+        !kidM(m2Idle).classList.contains("busy")
+        && !m2Idle.classList.contains("tree-hist") && m2Idle.parentNode.hidden === false
+        && wrapM(m2Row).querySelectorAll(".busy-dot-sub").length === 1,
+        "dots=" + wrapM(m2Row).querySelectorAll(".busy-dot-sub").length);
+    // 10) more than six running children → six dots + overflow
+    chk("m3: more than six running children render six dots and overflow",
+        wrapM(m3Row).querySelectorAll(".busy-dot-sub").length === 6
+        && wrapM(m3Row).querySelector(".busy-dot-overflow").textContent === "+2",
+        "dots=" + wrapM(m3Row).querySelectorAll(".busy-dot-sub").length
+        + " overflow=" + wrapM(m3Row).querySelector(".busy-dot-overflow").textContent);
+    // 11) busy:false + status:"Busy" → busy:false 权威否定：无红点、
+    //     live 直显（active:true），orbit 不计数
+    chk("m4: busy:false negates Busy status (no red dot, live direct)",
+        m4BusyStatus !== null && !kidM(m4BusyStatus).classList.contains("busy")
+        && !m4BusyStatus.classList.contains("tree-hist") && m4BusyStatus.parentNode.hidden === false,
+        "dot=" + (m4BusyStatus && kidM(m4BusyStatus).className));
+    // 12) active:false + busy:true → running 与 live 正交：红点按 busy
+    //     亮（busy class），但行按 active 收进历史折叠组
+    chk("m4: active:false busy:true child folds into history with red dot lit",
+        m4FoldedRun !== null && m4FoldedRun.classList.contains("tree-hist")
+        && m4FoldedRun.parentNode.hidden === true && kidM(m4FoldedRun).classList.contains("busy"),
+        "hist=" + (m4FoldedRun && m4FoldedRun.classList.contains("tree-hist"))
+        + " dot=" + (m4FoldedRun && kidM(m4FoldedRun).className));
+    // orbit：只计 busy 的（m4-folded-run），busy:false + status:"Busy" 不计数
+    chk("m4 orbit counts only busy children (busy:false negates status)",
+        wrapM(m4Row).querySelectorAll(".busy-dot-sub").length === 1,
+        "dots=" + wrapM(m4Row).querySelectorAll(".busy-dot-sub").length);
+    // ---- 点击路由：live 直开（不 POST resume），inactive 才 POST resume ----
+    const bodyAfter = (n) => FETCH_BODIES.slice(n);
+    sessionsPostCustom = { id: "m1-stale", status: "Idle", active: true };
+    let nB = FETCH_BODIES.length;
+    m1Stale._listeners["click"][0]();        // inactive → resume（POST /api/sessions）
+    await flush();
+    await flush();
+    chk("click: inactive child POSTs resume and opens",
+        state.sessionId === "m1-stale"
+        && bodyAfter(nB).some((b) => b === '{"id":"m1-stale"}'),
+        "sid=" + state.sessionId + " posts=" + JSON.stringify(bodyAfter(nB)));
+    sessionsPostCustom = null;
+    nB = FETCH_BODIES.length;
+    m1Run._listeners["click"][0]();          // busy live → open，无 resume POST
+    await flush();
+    await flush();
+    chk("click: busy live child opens without resume POST",
+        state.sessionId === "m1-run"
+        && !bodyAfter(nB).some((b) => b === '{"id":"m1-run"}'),
+        "sid=" + state.sessionId + " posts=" + JSON.stringify(bodyAfter(nB)));
+    nB = FETCH_BODIES.length;
+    m1Idle._listeners["click"][0]();         // busy:false live → open
+    await flush();
+    await flush();
+    chk("click: idle live child opens without resume POST",
+        state.sessionId === "m1-idle"
+        && !bodyAfter(nB).some((b) => b === '{"id":"m1-idle"}'),
+        "sid=" + state.sessionId + " posts=" + JSON.stringify(bodyAfter(nB)));
+    nB = FETCH_BODIES.length;
+    m1LegacyRun._listeners["click"][0]();    // active undefined → live → open
+    await flush();
+    await flush();
+    chk("click: legacy (active undefined) child opens without resume POST",
+        state.sessionId === "m1-legacy-run"
+        && !bodyAfter(nB).some((b) => b === '{"id":"m1-legacy-run"}'),
+        "sid=" + state.sessionId + " posts=" + JSON.stringify(bodyAfter(nB)));
+    nB = FETCH_BODIES.length;
+    m2Row._listeners["click"][0]();          // busy parent live → open
+    await flush();
+    await flush();
+    chk("click: busy parent opens without resume POST",
+        state.sessionId === "m2"
+        && !bodyAfter(nB).some((b) => b === '{"id":"m2"}'),
+        "sid=" + state.sessionId + " posts=" + JSON.stringify(bodyAfter(nB)));
+    nB = FETCH_BODIES.length;
+    sessionsPostCustom = { id: "m4-folded-run", status: "Busy", active: true };
+    m4FoldedRun._listeners["click"][0]();    // active:false → resume，即使 busy:true
+    await flush();
+    await flush();
+    chk("click: active:false busy:true child POSTs resume despite running style",
+        state.sessionId === "m4-folded-run"
+        && bodyAfter(nB).some((b) => b === '{"id":"m4-folded-run"}'),
+        "sid=" + state.sessionId + " posts=" + JSON.stringify(bodyAfter(nB)));
+    sessionsPostCustom = null;
+    // 还原聚合状态（与 15b 一致）
     state.workspaces = saveWs.workspaces; state.workspace = saveWs.workspace; state.token = saveWs.token;
     state.workspaceLists = saveWs.lists; state.workspaceErrors = saveWs.errors; state.lastList = saveWs.lastList;
     state.sessionId = saveWs.sessionId;

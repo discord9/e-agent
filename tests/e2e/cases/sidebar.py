@@ -47,6 +47,17 @@ SESSIONS = [
 
 async def run_sidebar_tree(c):
     c.sessions = SESSIONS
+    # resume 拦截：POST /api/sessions 按请求的 id 原样返回（默认 handler 固定
+    # 回 sess-new，无法区分恢复的是哪个会话）；同时记录进 c.records["create"]，
+    # 供「live 点击不 POST resume、inactive 才 POST resume」断言。
+    async def on_create(route, url, method):
+        body = route.request.post_data
+        c.records["create"].append(body)
+        sid = json.loads(body or "{}").get("id", "sess-new")
+        await route.fulfill(status=201, content_type="application/json",
+                            body=json.dumps({"id": sid, "status": "Idle", "active": True}))
+    c.extra_handlers.append(
+        (lambda url, method: method == "POST" and url.rstrip("/").endswith("/api/sessions"), on_create))
     await c.start()
     # ---------- 开合 ----------
     await c.open_sidebar()
@@ -61,7 +72,8 @@ async def run_sidebar_tree(c):
 
     tree = lambda: c.page.locator("#sidebarTree")
 
-    # ---------- A：root-a（busy 直显；其余 idle 子会话收进历史组） ----------
+    # ---------- A：root-a（live 直显：busy + Idle 存活 + 旧 server 兼容；
+    #              inactive（active === false）收进历史组） ----------
     root_a = tree().locator(".tree-row", has_text="根会话A").first
     await root_a.locator("button.tree-toggle").click()
     await c.page.wait_for_timeout(200)
@@ -71,15 +83,34 @@ async def run_sidebar_tree(c):
             await busy_row.count() == 1 and await busy_row.locator(".busy-dot.busy").count() == 1, "")
     c.check("A busy subagent 行 title 提示可发送消息",
             "可发送消息" in (await busy_row.get_attribute("title")), "")
+    live_idle = a_node.locator(".tree-row-child:not(.tree-hist)", has_text="任务A-1")
+    c.check("A Idle 存活 subagent 直显且无红点",
+            await live_idle.count() == 1
+            and await live_idle.locator(".busy-dot.busy").count() == 0, "")
+    legacy_live = a_node.locator(".tree-row-child:not(.tree-hist)", has_text="旧服务器子会话")
+    c.check("A 旧 server（无 active 字段）subagent 视为 live 直显",
+            await legacy_live.count() == 1, "")
     hist_a = a_node.locator(".tree-hist-row")
-    c.check("A idle 子会话收进历史组",
-            await hist_a.count() == 1 and "历史子会话 (3)" in (await hist_a.text_content()), "")
+    c.check("A 仅 inactive 子会话收进历史组",
+            await hist_a.count() == 1 and "历史子会话 (1)" in (await hist_a.text_content()), "")
     await hist_a.locator("button.tree-toggle").click()
     await c.page.wait_for_timeout(200)
-    c.check("A 历史组 label/title 回退与完整 id 可见",
-            await a_node.locator(".tree-row-child.tree-hist", has_text="任务A-1").count() == 1
-            and await a_node.locator(".tree-row-child.tree-hist", has_text="旧服务器子会话").count() == 1
-            and await a_node.locator(".tree-row-child.tree-hist", has_text="sub-a1-cccc").count() == 1, "")
+    c.check("A 历史组只含 inactive 子会话（label 可见，live 的不进历史）",
+            await a_node.locator(".tree-row-child.tree-hist", has_text="任务A-2").count() == 1
+            and await a_node.locator(".tree-row-child.tree-hist", has_text="任务A-1").count() == 0
+            and await a_node.locator(".tree-row-child.tree-hist", has_text="旧服务器子会话").count() == 0, "")
+    # Idle 存活行点击：直接打开，不 POST resume。
+    await live_idle.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'sub-a1-cccc'")
+    c.check("A Idle 存活 subagent 点击直接打开（不 POST resume）",
+            c.records["create"] == [], str(c.records["create"]))
+    # inactive 历史行点击：先 POST resume 再打开（重绘后历史组默认收起，重新展开）。
+    await a_node.locator(".tree-hist-row button.tree-toggle").click()
+    await c.page.wait_for_timeout(200)
+    await a_node.locator(".tree-row-child.tree-hist", has_text="任务A-2").locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'sub-a2-dddd'")
+    c.check("A inactive subagent 点击先 POST resume 再打开",
+            c.records["create"] == ['{"id":"sub-a2-dddd"}'], str(c.records["create"]))
 
     # ---------- B：root-b 全 idle -> 只显示历史组 ----------
     root_b = tree().locator(".tree-row", has_text="根会话B").first
@@ -96,27 +127,31 @@ async def run_sidebar_tree(c):
     await root_c.locator("button.tree-toggle").click()
     await c.page.wait_for_timeout(200)
     c_node = root_c.locator("xpath=..")
+    live_c1 = c_node.locator(".tree-row-child:not(.tree-hist)", has_text="无标签子C")
+    c.check("C active 无 label subagent 直显（title 回退，无红点）",
+            await live_c1.count() == 1 and await live_c1.locator(".busy-dot.busy").count() == 0, "")
     hist_c = c_node.locator(".tree-hist-row")
-    c.check("C idle 子会话收进历史组", "历史子会话 (2)" in (await hist_c.text_content()), "")
+    c.check("C 仅 inactive 子会话进历史组", "历史子会话 (1)" in (await hist_c.text_content()), "")
     await hist_c.locator("button.tree-toggle").click()
     await c.page.wait_for_timeout(200)
-    c.check("C 无 label -> title 回退；无 title -> 完整 id",
-            await c_node.locator(".tree-row-child.tree-hist", has_text="无标签子C").count() == 1
-            and await c_node.locator(".tree-row-child.tree-hist", has_text="sub-c2-abcd").count() == 1, "")
+    c.check("C 历史组无 label 无 title -> 完整 id 回退",
+            await c_node.locator(".tree-row-child.tree-hist", has_text="sub-c2-abcd").count() == 1, "")
 
-    # ---------- D：孤儿「未关联」同样进入历史分组 ----------
+    # ---------- D：孤儿「未关联」同样 live 直显 / inactive 进历史分组 ----------
     unrel = tree().locator(".tree-row", has_text="未关联").first
     await unrel.locator("button.tree-toggle").click()
     await c.page.wait_for_timeout(200)
     u_node = unrel.locator("xpath=..")
+    live_orph = u_node.locator(".tree-row-child:not(.tree-hist)", has_text="孤儿活跃标签")
+    c.check("D 未关联 active 孤儿直显（无红点）",
+            await live_orph.count() == 1 and await live_orph.locator(".busy-dot.busy").count() == 0, "")
     hist_u = u_node.locator(".tree-hist-row")
-    c.check("D 未关联 idle 会话收进历史组",
-            await hist_u.count() == 1 and "历史子会话 (2)" in (await hist_u.text_content()), "")
+    c.check("D 未关联仅 inactive 收进历史组",
+            await hist_u.count() == 1 and "历史子会话 (1)" in (await hist_u.text_content()), "")
     await hist_u.locator("button.tree-toggle").click()
     await c.page.wait_for_timeout(200)
-    c.check("D 展开后两个孤儿 label 可见",
-            await u_node.locator(".tree-row-child.tree-hist", has_text="孤儿活跃标签").is_visible()
-            and await u_node.locator(".tree-row-child.tree-hist", has_text="孤儿历史标签").is_visible(), "")
+    c.check("D 展开后历史孤儿 label 可见",
+            await u_node.locator(".tree-row-child.tree-hist", has_text="孤儿历史标签").is_visible(), "")
 
     # ---------- E：关闭方式（× / Escape / 遮罩） ----------
     await c.close_sidebar()
@@ -165,11 +200,8 @@ async def run_sidebar_filter(c):
     unrel = c.page.locator("#sidebarTree .tree-ws-body > .tree-node > .tree-row", has_text="未关联").first
     await unrel.locator("button.tree-toggle").click()
     await c.page.wait_for_timeout(200)
-    orphan_hist = unrel.locator("xpath=..").locator(".tree-hist-row")
-    await orphan_hist.locator("button.tree-toggle").click()
-    await c.page.wait_for_timeout(200)
-    c.check("孤儿组展开后命中孤儿可见",
-            await c.page.locator(".tree-row-child", has_text="孤儿活跃标签").is_visible(), "")
+    c.check("孤儿组命中孤儿直显（live）",
+            await c.page.locator(".tree-row-child:not(.tree-hist)", has_text="孤儿活跃标签").is_visible(), "")
 
     # 有标题的会话仍必须能按完整 id 命中（输入框承诺 title / ID）。
     await c.page.fill("#sidebarFilter", "root-a")
