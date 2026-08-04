@@ -4,7 +4,7 @@ All notable changes to e-agent are tracked here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 does not yet follow semantic versioning strictly.
 
-## [0.1.1] — 2026-08-03
+## [0.1.1] — 2026-08-04
 
 ### Fixed
 
