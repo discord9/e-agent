@@ -12,7 +12,13 @@ fn converts_internal_messages_and_function_schemas() {
     let tools = [ToolSpec {
         name: "read_file".into(),
         description: "read".into(),
-        parameters: json!({"type":"object"}),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string"},
+                "role": {"type": "string"},
+            }
+        }),
     }];
     let request = ChatRequest::from_internal(
         "test-model",
@@ -42,6 +48,14 @@ fn converts_internal_messages_and_function_schemas() {
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["tools"][0]["type"], "function");
     assert_eq!(value["tools"][0]["function"]["name"], "read_file");
+    // parameters.properties must keep input key order (workspace first) on the wire.
+    let keys = value["tools"][0]["function"]["parameters"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(keys, ["workspace", "role"]);
     assert_eq!(
         value["messages"][0]["tool_calls"][0]["function"]["arguments"],
         r#"{"path":"a.txt"}"#

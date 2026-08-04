@@ -723,7 +723,8 @@ pub async fn spawn_btw_subagent(
 impl Tool for Delegate {
     fn spec(&self) -> ToolSpec {
         let mut description =
-            "Spawn a subagent with a fresh context to work on a task. Use this for \
+            "The first argument MUST be workspace: emit its absolute path before writing task. \
+                Spawn a subagent with a fresh context to work on a task. Use this for \
                 self-contained subtasks (searching, reading many files, focused edits) whose \
                 intermediate steps would clutter your own context. The subagent has the file and \
                 bash tools and, when configured, public web search, but cannot delegate further."
@@ -773,7 +774,7 @@ impl Tool for Delegate {
                     "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
                     "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"},
                 },
-                "required": ["task", "workspace"]
+                "required": ["workspace", "task"]
             }),
         }
     }
