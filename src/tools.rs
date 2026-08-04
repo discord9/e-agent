@@ -119,22 +119,30 @@ pub fn builtins_with_bash_timeout(
 /// Subagents use this path to share global task visibility while their bash
 /// facade is independently bound to the subagent Agent's completion sink.
 /// `read_only` applies the read-only role policy (see [`builtins`]).
+/// `protect_git` comes from the role's frontmatter (default true): when true,
+/// bash binds `<workspace>/.git` read-only on non-Windows; the Windows
+/// write-sandbox MVP rejects the mode before execution, so a role with
+/// `protect_git = false` is how a fixer/subagent gets a working shell under
+/// the Windows sandbox.
 pub fn builtins_with_background(
     workspace: Workspace,
     background: BackgroundTasks,
     sandbox: Option<crate::config::Sandbox>,
     read_only: bool,
+    protect_git: bool,
 ) -> Vec<Box<dyn Tool>> {
     // Subagents have no loaded global Config; apply the workspace `[bash]`
     // override plus the default (mirrors `builtins`).
     let bash_timeout = crate::config::resolve_bash_timeout(None, workspace.root()).unwrap_or(None);
-    // Subagent / fixer: protect_git = true so .git is read-only.
+    // Subagent / fixer: protect_git defaults to true so .git is read-only;
+    // a role frontmatter `protect_git = false` opts out (needed under the
+    // Windows sandbox, whose MVP cannot enforce the protection).
     tools_with_background_and_exa_key(
         workspace,
         background,
         std::env::var("EXA_API_KEY").ok(),
         sandbox,
-        true,
+        protect_git,
         read_only,
         bash_timeout,
     )

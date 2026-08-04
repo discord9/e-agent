@@ -1,6 +1,7 @@
 //! Role templates: each role's system prompt lives in a Markdown file named
 //! `<role>.md`, optionally led by a TOML frontmatter block
-//! (`---` … `---`) declaring role attributes such as `read_only = true`.
+//! (`---` … `---`) declaring role attributes such as `read_only = true` or
+//! `protect_git = false`.
 //! Roles come from two layers, merged with the workspace overriding the
 //! global user config:
 //!
@@ -47,13 +48,22 @@ pub struct RoleTemplate {
     /// false). A read-only role gets no write/edit tools and its bash (when
     /// sandboxed) runs in a narrowed read-only sandbox with network disabled.
     pub read_only: bool,
+    /// `protect_git` declaration from the frontmatter (default true). When
+    /// true, subagent bash binds `<workspace>/.git` read-only (non-Windows)
+    /// — which the Windows write-sandbox MVP cannot enforce, so on Windows a
+    /// protect_git subagent's bash fails closed before execution. Set
+    /// `protect_git = false` in the role frontmatter to lift that (e.g. to
+    /// let a fixer run under the Windows sandbox).
+    pub protect_git: bool,
 }
 
 /// Frontmatter metadata parsed from the leading TOML block of a role file.
-/// Unknown keys are ignored (serde default); `read_only` defaults to false.
+/// Unknown keys are ignored (serde default); `read_only` defaults to false,
+/// `protect_git` to true.
 #[derive(serde::Deserialize)]
 struct RoleMeta {
     read_only: Option<bool>,
+    protect_git: Option<bool>,
 }
 
 /// Read the template for `role`, including frontmatter attributes: the
@@ -88,10 +98,10 @@ pub fn role_template(workspace: &Path, role: &str) -> std::io::Result<Option<Rol
 
 /// Parse one role file. Frontmatter mode starts only when the file's FIRST
 /// line is exactly `---`; the block runs until the next `---` line and must
-/// parse as TOML. Without a leading `---` the whole file is the prompt and
-/// `read_only` is false. Anything else is fail-closed: an unclosed opener or
-/// invalid TOML is an error (the role is rejected rather than partially
-/// applied).
+/// parse as TOML. Without a leading `---` the whole file is the prompt,
+/// `read_only` is false, and `protect_git` stays true (the subagent
+/// default). Anything else is fail-closed: an unclosed opener or invalid
+/// TOML is an error (the role is rejected rather than partially applied).
 fn parse_role_template(content: String) -> std::io::Result<RoleTemplate> {
     // Frontmatter mode starts only when the file's FIRST line is exactly
     // `---`.
@@ -101,6 +111,7 @@ fn parse_role_template(content: String) -> std::io::Result<RoleTemplate> {
         return Ok(RoleTemplate {
             prompt: content,
             read_only: false,
+            protect_git: true,
         });
     }
     // The block between the two `---` lines is the frontmatter.
@@ -130,6 +141,7 @@ fn parse_role_template(content: String) -> std::io::Result<RoleTemplate> {
     Ok(RoleTemplate {
         prompt: after.to_owned(),
         read_only: meta.read_only.unwrap_or(false),
+        protect_git: meta.protect_git.unwrap_or(true),
     })
 }
 

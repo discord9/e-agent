@@ -14,7 +14,9 @@ use super::background::{BackgroundTasks, OutputSlot, TaskSpool, slot_append};
 
 /// A bash tool bound to a shared background-task registry.
 /// `protect_git`: on non-Windows, `<workspace>/.git` is bound read-only for
-/// subagents/fixers. The Windows write-sandbox MVP rejects this mode.
+/// subagents/fixers. It comes from the role's frontmatter (default true; a
+/// role declares `protect_git = false` to opt out). The Windows write-sandbox
+/// MVP rejects this mode.
 /// `timeout`: foreground command timeout; `None` means no timeout.
 /// Callers resolve it from config (`[bash]`), defaulting to 30s.
 pub fn bash_tool(
@@ -46,6 +48,7 @@ pub(super) struct Bash {
     pub(super) sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
     pub(super) sandbox: Option<crate::config::Sandbox>,
     /// On non-Windows, bind `<workspace>/.git` read-only when sandboxed.
+    /// Resolved from the role's frontmatter `protect_git` (default true).
     /// The Windows write-sandbox MVP rejects this mode before side effects.
     pub(super) protect_git: bool,
     /// Resolved platform shell (pwsh on Windows, bash elsewhere).
@@ -80,7 +83,7 @@ impl Tool for Bash {
                     ));
                 }
                 if self.protect_git {
-                    description.push_str(" Windows write-sandbox MVP does not support protected-git shell execution; execution fails before token or ACL changes.");
+                    description.push_str(" Windows write-sandbox MVP cannot enforce .git protection: shell commands fail closed with guidance to set `protect_git = false` in the role frontmatter (or disable the sandbox).");
                 }
             }
             #[cfg(not(windows))]

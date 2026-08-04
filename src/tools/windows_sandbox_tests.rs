@@ -550,10 +550,11 @@ async fn protected_git_is_rejected_before_acl_preflight_or_process_start() {
     let marker = temp.path().join("must-not-exist.txt");
     let command = write_command(&bash.shell, &marker, "started");
     let error = bash.execute(json!({"command": command})).await.unwrap_err();
-    assert_eq!(
-        error,
-        "Windows write-sandbox MVP does not support protected-git shell execution"
+    assert!(
+        error.contains("protect_git = false"),
+        "the rejection must point at the role frontmatter escape hatch, got: {error}"
     );
+    assert!(error.contains("disable the sandbox"), "{error}");
     assert!(!marker.exists());
 }
 

@@ -1231,6 +1231,52 @@ async fn ordinary_role_keeps_write_tools_without_the_read_only_note() {
 }
 
 #[tokio::test]
+// Test-only env isolation: the std Mutex guard is held across .execute()
+// awaits to serialize XDG_CONFIG_HOME mutation with roles.rs tests.
+#[allow(clippy::await_holding_lock)]
+async fn protect_git_role_flag_reaches_the_subagent_bash_tool() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg-empty");
+    std::fs::create_dir_all(&xdg).unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+    // Marker text the sandboxed bash description carries exactly when
+    // protect_git = true (Linux: the .git ro-bind note; Windows: the
+    // fail-closed guidance).
+    #[cfg(windows)]
+    let protect_marker = "protect_git = false";
+    #[cfg(not(windows))]
+    let protect_marker = "prevent accidental corruption by fixer subagents";
+
+    // Default role (no protect_git frontmatter): protect_git stays true, so
+    // the subagent's sandboxed bash claims the .git protection (Linux) or
+    // the fail-closed note (Windows).
+    let (output, request) = run_subagent_and_capture(&temp, "Fix things.", true).await;
+    assert!(output.contains("done"), "{output}");
+    assert!(
+        request.contains(protect_marker),
+        "default role must keep protect_git=true in the bash description"
+    );
+
+    // protect_git = false frontmatter: the protection is gone from the
+    // description (Linux: no ro-bind claim; Windows: no fail-closed note).
+    let (output, request) = run_subagent_and_capture(
+        &temp,
+        "---\nprotect_git = false\n---\nFix things on Windows.\n",
+        true,
+    )
+    .await;
+    assert!(output.contains("done"), "{output}");
+    assert!(
+        !request.contains(protect_marker),
+        "protect_git = false must drop the .git protection from the bash description"
+    );
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+#[tokio::test]
 async fn shared_background_registry_completion_reaches_its_configured_channel() {
     // A bash tool bound to the parent's BackgroundTasks keeps that
     // sender when wrapped in an Agent (Agent::new must not retarget

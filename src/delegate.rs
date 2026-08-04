@@ -208,6 +208,12 @@ struct DelegatedTask {
     /// caller's policy demands it): the subagent gets no write/edit tools and
     /// its bash runs in a narrowed read-only sandbox with network disabled.
     read_only: bool,
+    /// True (the default, incl. roles without a `protect_git` frontmatter
+    /// key) when the subagent's bash must bind `<workspace>/.git` read-only
+    /// on non-Windows. A role with `protect_git = false` opts out — required
+    /// for any bash at all under the Windows write-sandbox MVP, which cannot
+    /// enforce the protection and fails closed instead.
+    protect_git: bool,
     sandbox: Option<crate::config::Sandbox>,
     /// True for a btw fork: an interactive side conversation, not a one-shot
     /// delegated task. Swaps the system instructions (no "return a concise
@@ -345,6 +351,7 @@ impl Delegate {
             background,
             task.sandbox,
             task.read_only,
+            task.protect_git,
         );
         let mut agent = Agent::new(Box::new(model), tools);
         if let Some(window) = context_window {
@@ -619,6 +626,9 @@ pub async fn spawn_btw_subagent(
             task: question.to_owned(),
             role_prompt: None,
             read_only,
+            // btw fork has no role frontmatter: keep the historical
+            // subagent default (protect .git).
+            protect_git: true,
             sandbox,
             interactive: true,
         },
@@ -816,11 +826,11 @@ impl Tool for Delegate {
             .and_then(Value::as_str)
             .map(str::to_owned);
         // Resolve the role: its model ([roles] <role> > subagent > main), its
-        // prompt template and read_only declaration
+        // prompt template, read_only and protect_git declarations
         // (.e-agent/agents/<role>.md frontmatter). An unknown role is
         // rejected unless no roles are configured at all; a malformed
         // frontmatter is an error (fail closed — the role is not spawned).
-        let (model, context_window, role_prompt, read_only) = match role.as_deref() {
+        let (model, context_window, role_prompt, read_only, protect_git) = match role.as_deref() {
             Some(role) => {
                 let root = self
                     .roles_root
@@ -850,13 +860,22 @@ impl Tool for Delegate {
                     .copied()
                     .flatten()
                     .or(self.subagent_context_window);
-                (model, cw, Some(template.prompt), template.read_only)
+                (
+                    model,
+                    cw,
+                    Some(template.prompt),
+                    template.read_only,
+                    template.protect_git,
+                )
             }
             None => (
                 self.subagent_model.clone(),
                 self.subagent_context_window,
                 None,
                 false,
+                // No role: keep the historical subagent default (protect
+                // .git, exactly like the fixer path).
+                true,
             ),
         };
         let resume = arguments
@@ -1020,6 +1039,7 @@ impl Tool for Delegate {
                 task,
                 role_prompt,
                 read_only,
+                protect_git,
                 sandbox: task_sandbox,
                 interactive: false,
             },
