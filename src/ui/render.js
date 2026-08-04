@@ -384,9 +384,9 @@ function renderSearchArgs(parsed, rawText) {
   return row;
 }
 
-/* delegate：role chip + background chip + label（有才显示）+ task 正文（pre，
-   长任务可展开）+ workspace 行 + resume 行（有才显示）。background 未提供时
-   按 true（后端默认，delegate.rs）。全 textContent。 */
+/* delegate：role chip + background chip + label（有才显示）+ workspace 行 +
+   resume 行（有才显示，随 workspace 位于卡片头部）+ task 正文（pre，长任务
+   可展开）。background 未提供时按 true（后端默认，delegate.rs）。全 textContent。 */
 function renderDelegateArgs(parsed, rawText) {
   if (!parsed || typeof parsed !== "object" || typeof parsed.task !== "string") return rawText;
   const wrap = el("div", "delegate-args");
@@ -401,8 +401,6 @@ function renderDelegateArgs(parsed, rawText) {
     meta.appendChild(el("span", "delegate-label", String(parsed.label)));
   }
   wrap.appendChild(meta);
-  wrap.appendChild(maybeTruncateEl(el("pre", "task-snapshot-body"), parsed.task,
-    LONG_TEXT_THRESHOLD, null));
   const loc = el("div", "delegate-loc");
   loc.appendChild(el("div", "delegate-ws",
     "工作区: " + (parsed.workspace != null ? parsed.workspace : "")));
@@ -410,6 +408,8 @@ function renderDelegateArgs(parsed, rawText) {
     loc.appendChild(el("div", "delegate-resume", "续接会话: " + parsed.resume));
   }
   wrap.appendChild(loc);
+  wrap.appendChild(maybeTruncateEl(el("pre", "task-snapshot-body"), parsed.task,
+    LONG_TEXT_THRESHOLD, null));
   return wrap;
 }
 

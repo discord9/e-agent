@@ -730,6 +730,10 @@
     color: var(--base01);
     overflow-wrap: anywhere;
   }
+  .delegate-ws {
+    font-weight: bold;
+    color: var(--base02);
+  }
 
   /* delegate 结果（后台回执 / 同步完成）：子代理会话行 + markdown 答案 */
   .tool-card .tool-result.delegate-result { background: var(--base3); }
