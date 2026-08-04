@@ -1530,21 +1530,8 @@
   .archive-btn.on { color: var(--red); }
   .archive-btn.on:hover { background: var(--base3); color: var(--red); }
   .archive-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
-  .tree-del {
-    flex: 0 0 auto;
-    width: 24px;
-    height: 24px;
-    padding: 0;
-    border: none;
-    background: transparent;
-    color: var(--base01);
-    font-size: 17px;
-    line-height: 1;
-  }
-  .tree-del:hover:not(:disabled) { background: #fbe3e4; color: var(--red); }
-  .tree-del:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
   /* ---------- 侧边栏操作按钮：默认收起，hover/focus 行时展开 ----------
-     根因：pin/archive/del 三个 24px 按钮常显 + gap 把 280px 侧边栏的标题列
+     根因：pin/archive 两个 24px 按钮常显 + gap 把 280px 侧边栏的标题列
      挤到 ~90px，标题被迫按字符换行、条目 150-200px 高。改为默认收起
      （宽度 0 + 透明），行 hover 或 :focus-within 时展开，宽度让给标题列。
      不用 display:none：隐藏元素不可聚焦，键盘 Tab 永远到不了按钮，
@@ -1554,8 +1541,7 @@
      触屏没有 hover：@media (hover:none) 下常显，否则触屏无法操作。
      置顶行 pin 按钮常显（置顶状态一眼可见）。 */
   .tree-row .pin-btn,
-  .tree-row .archive-btn,
-  .tree-row .tree-del {
+  .tree-row .archive-btn {
     width: 0;
     margin: 0 -2px;   /* 抵消收起按钮两侧的 gap，宽度让给标题列 */
     padding: 0;
@@ -1563,8 +1549,7 @@
     opacity: 0;
   }
   .tree-row:hover .pin-btn, .tree-row:focus-within .pin-btn,
-  .tree-row:hover .archive-btn, .tree-row:focus-within .archive-btn,
-  .tree-row:hover .tree-del, .tree-row:focus-within .tree-del {
+  .tree-row:hover .archive-btn, .tree-row:focus-within .archive-btn {
     width: 24px;
     margin: 0;
     opacity: 1;
@@ -1576,8 +1561,8 @@
     opacity: 1;
   }
   @media (hover: none) {
-    /* 触屏：没有 hover 态，操作按钮常显（否则触屏用户无法 pin/archive/删除） */
-    .tree-row .pin-btn, .tree-row .archive-btn, .tree-row .tree-del {
+    /* 触屏：没有 hover 态，操作按钮常显（否则触屏用户无法 pin/archive） */
+    .tree-row .pin-btn, .tree-row .archive-btn {
       width: 24px;
       margin: 0;
       opacity: 1;
