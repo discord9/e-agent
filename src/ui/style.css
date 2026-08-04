@@ -1073,7 +1073,7 @@
   .tree-row {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 4px;                 /* 6px→4px：释放 ~12px 给标题列（6 个 flex 间隙） */
     padding: 6px 8px;
     border-left: 3px solid transparent;
     border-radius: 3px;
@@ -1150,11 +1150,12 @@
     min-width: 0;
     font-size: 14px;
     color: var(--blue);
-    white-space: normal;          /* 完整显示，允许换行 */
+    white-space: normal;          /* 无标题会话的一行 id：完整显示可换行 */
     overflow-wrap: anywhere;      /* 长 id 换行不撑破 */
     word-break: break-all;
   }
-  /* 有标题的会话：两行（title + 完整 id），都完整显示可换行 */
+  /* 有标题的会话：两行（title 完整可换行 + id 单行省略），
+     标题中文按词断行，id 机器标识不参与换行（hover title 有完整值） */
   .tree-id.has-title {
     display: flex;
     flex-direction: column;
@@ -1173,9 +1174,9 @@
     font-size: 10px;
     color: var(--base01);
     width: 100%;
-    white-space: normal;
-    overflow-wrap: anywhere;
-    word-break: break-all;
+    white-space: nowrap;          /* 单行省略：长 id 不再把条目撑高 */
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .tree-group { color: var(--base01); }
   .tree-count { color: var(--base01); font-size: 12px; flex: 0 0 auto; }
@@ -1379,6 +1380,46 @@
   }
   .tree-del:hover:not(:disabled) { background: #fbe3e4; color: var(--red); }
   .tree-del:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  /* ---------- 侧边栏操作按钮：默认收起，hover/focus 行时展开 ----------
+     根因：pin/archive/del 三个 24px 按钮常显 + gap 把 280px 侧边栏的标题列
+     挤到 ~90px，标题被迫按字符换行、条目 150-200px 高。改为默认收起
+     （宽度 0 + 透明），行 hover 或 :focus-within 时展开，宽度让给标题列。
+     不用 display:none：隐藏元素不可聚焦，键盘 Tab 永远到不了按钮，
+     :focus-within 也就永不触发；宽度 0 保留可聚焦性（Tab 到按钮时行
+     :focus-within 触发展开）。收起按钮仍是 flex 项会保留两侧 gap，用
+     -2px 负边距抵消，宽度完整让给标题列。
+     触屏没有 hover：@media (hover:none) 下常显，否则触屏无法操作。
+     置顶行 pin 按钮常显（置顶状态一眼可见）。 */
+  .tree-row .pin-btn,
+  .tree-row .archive-btn,
+  .tree-row .tree-del {
+    width: 0;
+    margin: 0 -2px;   /* 抵消收起按钮两侧的 gap，宽度让给标题列 */
+    padding: 0;
+    overflow: hidden;
+    opacity: 0;
+  }
+  .tree-row:hover .pin-btn, .tree-row:focus-within .pin-btn,
+  .tree-row:hover .archive-btn, .tree-row:focus-within .archive-btn,
+  .tree-row:hover .tree-del, .tree-row:focus-within .tree-del {
+    width: 24px;
+    margin: 0;
+    opacity: 1;
+  }
+  /* 已置顶：pin 按钮常显金色（置顶状态一眼可见），hover 时其余按钮照常展开 */
+  .tree-row .pin-btn.on {
+    width: 24px;
+    margin: 0;
+    opacity: 1;
+  }
+  @media (hover: none) {
+    /* 触屏：没有 hover 态，操作按钮常显（否则触屏用户无法 pin/archive/删除） */
+    .tree-row .pin-btn, .tree-row .archive-btn, .tree-row .tree-del {
+      width: 24px;
+      margin: 0;
+      opacity: 1;
+    }
+  }
   /* 「归档 (N)」分组头（侧边栏）：muted 灰化 */
   .tree-archive-label { color: var(--base01); }
   /* 编辑态：input 内嵌行内（原位替换标题文本） */
