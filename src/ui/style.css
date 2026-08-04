@@ -537,6 +537,68 @@
     background: var(--base2);
     color: var(--base01);
   }
+  /* 文件工具差异化渲染：edit_file -/+ diff、read_file 行号视图、
+     write_file 单侧新增。行号列灰底右对齐；删除红 / 新增绿（Solarized Light）。 */
+  .tool-card .tool-result.tool-diff {
+    background: var(--base3);
+    color: var(--base02);
+    padding: 0;              /* 行内自带宽距（diff-head 顶部） */
+  }
+  .tool-card .tool-result.tool-diff .diff-head {
+    padding: 4px 6px;
+    font-size: 12px;
+    color: var(--base02);   /* WCAG AA：base02 on base2 = 10.6:1（base01 仅 4.39:1） */
+    background: var(--base2);
+    border-bottom: 1px solid var(--base1);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+  .tool-card .tool-result.tool-diff .diff-row {
+    display: flex;
+    align-items: baseline;
+    padding: 0 6px;
+    font-size: 12px;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+  .tool-card .tool-result.tool-diff .diff-ln {
+    flex: 0 0 auto;
+    min-width: 3.2em;
+    text-align: right;
+    padding: 0 8px 0 0;
+    margin-right: 6px;
+    background: var(--base2);   /* 行号列灰底 */
+    color: var(--base02);       /* WCAG AA：base02 on base2 = 10.6:1（base01 仅 4.39:1） */
+    user-select: none;
+  }
+  .tool-card .tool-result.tool-diff .diff-sign { flex: 0 0 auto; font-weight: bold; }
+  /* 文本列参与 flex 收缩并允许任意位置断行：长 URL/长行在窄屏不撑破卡片 */
+  .tool-card .tool-result.tool-diff .diff-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: break-word;
+    overflow-wrap: anywhere;
+  }
+  .tool-card .tool-result.tool-diff .diff-row.diff-add { background: #eef5e3; }
+  .tool-card .tool-result.tool-diff .diff-row.diff-add .diff-sign { color: var(--green); }
+  .tool-card .tool-result.tool-diff .diff-row.diff-del { background: #fbe3e4; }
+  .tool-card .tool-result.tool-diff .diff-row.diff-del .diff-sign { color: var(--red); }
+  .tool-card .tool-result.tool-diff .diff-more {
+    padding: 0 6px;
+    font-size: 12px;
+    font-style: italic;
+    color: var(--base01);   /* 容器底 base3：base01 on base3 = 4.99:1，已达 AA */
+  }
+  .tool-card .tool-result.tool-diff .diff-footer {
+    padding: 0 6px;
+    font-size: 11px;
+    color: var(--base01);
+    background: var(--base3);
+  }
+  /* 行号视图（read_file）截断：预览行 + 截断标记 + 隐藏全文；展开后互换 */
+  .tool-card .tool-result.tool-diff.expandable .diff-full { display: none; }
+  .tool-card .tool-result.tool-diff.expandable.expanded .diff-full { display: block; }
+  .tool-card .tool-result.tool-diff.expandable.expanded .diff-more { display: none; }
 
   .notice {
     flex-shrink: 0;

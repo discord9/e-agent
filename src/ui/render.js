@@ -37,6 +37,168 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
   return container;
 }
 /* =====================================================================
+ * 文件工具差异化渲染：edit_file → -/+ 两段 diff、read_file → 行号+内容
+ * 视图、write_file → 全新增单侧 diff。解析逻辑平移自 TUI
+ * （tui/keys.rs parse_edit_arguments / parse_edited_line；渲染镜像
+ * tui/state.rs push_diff_side 的 30 行/侧截断 + "… (N more lines)"）。
+ * 行号列灰底右对齐、删除红/新增绿，样式在 style.css .tool-card 区。
+ * ===================================================================*/
+const DIFF_LINE_LIMIT = 30;      // 镜像 TUI push_diff_side 的每侧截断行数
+
+/* "file edited (line N)" → N（TUI parse_edited_line 的 JS 版）；解析失败返回
+   null（调用方按「不编号」处理，镜像 TUI 的 start.unwrap_or(0) + 空 label） */
+function parseEditedLine(content) {
+  const m = /^file edited \(line (\d+)\)$/.exec(String(content == null ? "" : content).trim());
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/* edit_file arguments（原始 JSON 字符串）→ {path, old, new}（TUI
+   parse_edit_arguments 的 JS 版）；非 edit_file / 解析失败返回 null */
+function parseEditArguments(args) {
+  let v;
+  try { v = JSON.parse(String(args)); } catch (e) { return null; }
+  if (!v || typeof v !== "object") return null;
+  const { path, old: oldText, new: newText } = v;
+  if (typeof path !== "string" || typeof oldText !== "string" || typeof newText !== "string") return null;
+  return { path, old: oldText, new: newText };
+}
+
+/* buildToolCard 时解析文件工具参数缓存到卡片 expando；innerHTML 快照往返
+   （缓存恢复 / resync 离屏替换）后 expando 丢失，从 .tool-args 的完整 JSON
+   （展开态取 .expand-full 全文，直出取 textContent）重解析 */
+function cardArgs(card) {
+  if (card._toolArgs) return card._toolArgs;
+  const pre = card.querySelector(".tool-args");
+  if (!pre) return null;
+  const full = pre.querySelector(".expand-full");
+  const text = full ? full.textContent : pre.textContent;
+  try { return JSON.parse(text); } catch (e) { return null; }
+}
+
+/* 同上：expando 丢失后从 .tool-name 取工具名 */
+function cardToolName(card) {
+  if (card._toolName) return card._toolName;
+  const nm = card.querySelector(".tool-name");
+  return nm ? nm.textContent : "";
+}
+
+/* 单行 diff 行：[符号][行号][内容]。sign 空串 → 无符号列（read_file 视图）；
+   lineNo null → 无行号列（页脚行 / TUI 解析失败路径）。sign 决定行的
+   diff-add / diff-del 底色类（+ 绿 / - 红） */
+function diffRow(sign, lineNo, text, extraCls) {
+  const kind = sign === "+" ? " diff-add" : (sign === "−" || sign === "-" ? " diff-del" : "");
+  const row = el("div", "diff-row" + kind + (extraCls ? " " + extraCls : ""));
+  if (sign) row.appendChild(el("span", "diff-sign", sign + " "));
+  if (lineNo != null) row.appendChild(el("span", "diff-ln", String(lineNo)));
+  const tx = el("span", "diff-text");
+  tx.textContent = text;   // 原样保留（行内空白/尾随空格），CSS pre-wrap 呈现
+  row.appendChild(tx);
+  return row;
+}
+
+/* 单侧 diff 行序列（镜像 TUI push_diff_side）：最多 30 行，超出的行数用
+   "… (N more lines)" 标记（带同侧符号）。startLine null → 行不编号 */
+function diffSideRows(text, sign, startLine) {
+  const rows = [];
+  const s = String(text == null ? "" : text);
+  if (s === "") return rows;   // 空 old/new/content：不生成空红/绿 diff 行（纯新增/纯删除）
+  const lines = s.split("\n");
+  // Rust str::lines() 丢弃结尾单个空段：文本以 \n 结尾时不产生空 diff 行
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  const shown = Math.min(lines.length, DIFF_LINE_LIMIT);
+  for (let i = 0; i < shown; i++) {
+    rows.push(diffRow(sign, startLine != null ? startLine + i : null, lines[i]));
+  }
+  const remaining = lines.length - shown;
+  if (remaining > 0) rows.push(el("div", "diff-more", sign + "… (" + remaining + " more lines)"));
+  return rows;
+}
+
+/* edit_file 结果："file edited (line N)" → 行号 N 起，- 红 / + 绿 两段 diff
+   （旧内容在上、新内容在下，镜像 TUI push_tool_result 的顺序） */
+function renderEditDiff(resEl, args, content) {
+  const line = parseEditedLine(content);
+  resEl.classList.add("tool-diff");
+  resEl.appendChild(el("div", "diff-head",
+    "file edited" + (line != null ? " (line " + line + ")" : "")));
+  for (const r of diffSideRows(args.old, "−", line)) resEl.appendChild(r);
+  for (const r of diffSideRows(args.new, "+", line)) resEl.appendChild(r);
+}
+
+/* write_file 结果："file written" 确认行 + 全新增（+ 绿）单侧 diff。
+   新文件内容即全部行，行号从 1 起；覆盖写时旧内容前端不可得，纯新增
+   视图即是诚实呈现（后端旧内容 marker 属后续项，不做） */
+function renderWriteDiff(resEl, args, content) {
+  resEl.classList.add("tool-diff");
+  resEl.appendChild(el("div", "diff-head", content || "file written"));
+  for (const r of diffSideRows(args.content, "+", 1)) resEl.appendChild(r);
+}
+
+/* read_file 结果 → 行号 + 内容逐行视图：行号 = args.offset（默认 1）+ 行下标；
+   页脚 "[showing lines X-Y of Z; ...]" 行原样显示但不编号；纯状态输出
+   （[empty file] / [offset ... past end ...]）不做行号，走普通截断。
+   超过 DIFF_LINE_LIMIT 行时预览 + "… (N more lines)" + 展开全文（复用
+   expand-toggle 事件委托；全文常驻 .diff-full，快照往返后仍可展开） */
+const READ_STATUS_RE = /^\[(empty file|offset \d+ is past end of file \(\d+ lines\))\]$/;
+const READ_FOOTER_RE = /^\[showing lines \d+-\d+ of \d+[^\]]*\]$/;
+function renderFileView(resEl, args, content) {
+  const s = String(content == null ? "" : content);
+  if (s === "") {   // 空内容与后端 "[empty file]" 语义一致：状态输出，不生成空行号行
+    maybeTruncateEl(resEl, "[empty file]", LONG_TEXT_THRESHOLD, null);
+    return;
+  }
+  if (READ_STATUS_RE.test(s.trim())) {          // 状态输出不是文件行：不编号
+    maybeTruncateEl(resEl, s, LONG_TEXT_THRESHOLD, null);
+    return;
+  }
+  const offset = Math.max(1, parseInt(args && args.offset, 10) || 1);
+  const lines = s.split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();  // 镜像 Rust lines()
+  const rows = [];
+  for (let i = 0; i < lines.length; i++) {
+    const isFooter = READ_FOOTER_RE.test(lines[i].trim());
+    rows.push(diffRow("", isFooter ? null : offset + i, lines[i], isFooter ? "diff-footer" : null));
+  }
+  resEl.classList.add("tool-diff");
+  if (rows.length <= DIFF_LINE_LIMIT) {
+    for (const r of rows) resEl.appendChild(r);
+    return;
+  }
+  resEl.classList.add("expandable");
+  for (const r of rows.slice(0, DIFF_LINE_LIMIT)) resEl.appendChild(r);
+  resEl.appendChild(el("div", "diff-more", "… (" + (rows.length - DIFF_LINE_LIMIT) + " more lines)"));
+  // 展开按钮紧跟预览区（截断标记之后、全文之前）：不依赖滚动到内容底部即可发现
+  const btn = el("button", "expand-toggle", "展开全文（内容）");
+  btn.type = "button";
+  btn._target = resEl;      // 事件委托精确定位（与 maybeTruncateEl 同机制）
+  resEl.appendChild(btn);
+  const full = el("div", "diff-full");
+  for (const r of rows.slice(DIFF_LINE_LIMIT)) full.appendChild(r);
+  resEl.appendChild(full);
+}
+
+/* 文件工具结果渲染入口：edit_file → diff、read_file → 行号视图、write_file →
+   单侧新增；参数/结果格式不符时退回普通文本截断。isError 由调用方排除。
+   渲染前清空结果容器：pending 期间的 "等待结果…" 占位文本（maybeTruncateEl
+   写入的 textContent）与可能残留的展开态不能混进结构化 diff 内容。 */
+function renderFileToolResult(resEl, name, args, content) {
+  resEl.textContent = "";
+  resEl.classList.remove("expandable", "expanded");
+  if (name === "edit_file" && args && typeof args.old === "string" && typeof args.new === "string") {
+    renderEditDiff(resEl, args, content);
+    return;
+  }
+  if (name === "read_file" && args) {
+    renderFileView(resEl, args, content);
+    return;
+  }
+  if (name === "write_file" && args && typeof args.content === "string") {
+    renderWriteDiff(resEl, args, content);
+    return;
+  }
+  maybeTruncateEl(resEl, content || "(无输出)", LONG_TEXT_THRESHOLD, null);
+}
+/* =====================================================================
  * Markdown 渲染：marked + KaTeX（内嵌，单 HTML 自包含）。
  * marked 配置在启动时注册一次；renderMarkdown 只做摘公式 → 解析 →
  * 还原，避免每条消息重复 setOptions/use（开销虽小但纯属浪费）。
@@ -296,9 +458,20 @@ function appendToolResult(isError, content, acc, callId) {
     const resEl = card.querySelector(".tool-result");
     resEl.classList.remove("pending");
     resEl.classList.toggle("err", isError);
-    maybeTruncateEl(resEl, content || (isError ? "(无错误信息)" : "(无输出)"),
-      LONG_TEXT_THRESHOLD, null);
-    card.removeAttribute("open");   // 结果到达：收起为标题行（默认折叠）
+    // 文件工具（edit/read/write）成功 → 差异化渲染（diff / 行号视图）；
+    // 结果要可见，卡片保持展开。其余工具维持原行为：文本 + 收起。
+    const name = cardToolName(card);
+    const tArgs = (name === "edit_file" || name === "read_file" || name === "write_file")
+      ? cardArgs(card) : null;
+    const isFileTool = tArgs !== null;
+    if (isFileTool && !isError) {
+      renderFileToolResult(resEl, name, tArgs, content);
+      card.setAttribute("open", "");
+    } else {
+      maybeTruncateEl(resEl, content || (isError ? "(无错误信息)" : "(无输出)"),
+        LONG_TEXT_THRESHOLD, null);
+      card.removeAttribute("open");   // 结果到达：收起为标题行（默认折叠）
+    }
   } else {
     // 没有可配对的卡片：独立展示结果行
     const card2 = buildToolCard("工具结果", "", isError ? "失败" : "完成",
@@ -313,6 +486,7 @@ function appendToolResult(isError, content, acc, callId) {
 function buildToolCard(name, args, stateText, stateCls, resultText) {
   // 工具卡片：details 可折叠。pending（执行中/等待结果）时默认展开，
   // 结果到达后由 appendToolResult 收起（details.removeAttribute("open")）。
+  // 文件工具（edit/read/write）例外：结果到达后保持展开（diff/行号要可见）。
   const card = el("details", "tool-card");
   if (stateCls === "pending") card.setAttribute("open", "");
   const head = el("summary", "tool-head");
@@ -326,15 +500,33 @@ function buildToolCard(name, args, stateText, stateCls, resultText) {
   // 先 append 到 card（maybeTruncateEl 需要 parentNode 把按钮插到 pre 后面），
   // 再处理长内容展开
   const argsEl = el("pre", "tool-args");
-  const resEl = el("pre", "tool-result " + stateCls);
+  // 文件工具结果区是结构化 DOM（diff 行 / 行号行），用 div；其余保持 pre 语义
+  const isFileTool = name === "edit_file" || name === "read_file" || name === "write_file";
+  const resEl = el(isFileTool ? "div" : "pre", "tool-result " + stateCls);
   card.append(head, argsEl, resEl);
   maybeTruncateEl(argsEl, pretty, LONG_TEXT_THRESHOLD, null, "参数");
   maybeTruncateEl(resEl,
     resultText != null ? resultText : (stateCls === "pending" ? "等待结果…" : ""),
     LONG_TEXT_THRESHOLD, null, "结果");
+  // 文件工具：解析参数供结果到达后的差异化渲染（diff / 行号视图）。
+  // expando 在 innerHTML 快照往返后丢失，cardArgs/cardToolName 会从 DOM 重解析。
+  card._toolName = name;
+  card._toolArgs = parseToolArgs(name, argsText);
   return card;
 }
 
+/* buildToolCard 用的参数预解析：edit_file 严格校验 {path, old, new}；
+   read_file / write_file 只要对象即可（字段在渲染时按需取用） */
+function parseToolArgs(name, argsText) {
+  if (name === "edit_file") return parseEditArguments(argsText);
+  if (name === "read_file" || name === "write_file") {
+    try {
+      const v = JSON.parse(String(argsText));
+      return v && typeof v === "object" ? v : null;
+    } catch (e) { return null; }
+  }
+  return null;
+}
 
 /* 切回缓存会话（openSession restored 分支）时，把缓存 DOM 里「进行中」的
    元素重新绑定到新的累积器上：后续 ReasoningDelta / AssistantDelta /
@@ -535,8 +727,16 @@ function renderMessage(m, acc, pendingCards) {
       const resEl = card.querySelector(".tool-result");
       resEl.classList.remove("pending");
       resEl.classList.toggle("err", t.is_error);
-      maybeTruncateEl(resEl, t.content || (t.is_error ? "(无错误信息)" : "(无输出)"),
-        LONG_TEXT_THRESHOLD, null);
+      const name = cardToolName(card);
+      const tArgs = (name === "edit_file" || name === "read_file" || name === "write_file")
+        ? cardArgs(card) : null;
+      const isFileTool = tArgs !== null;
+      if (isFileTool && !t.is_error) {
+        renderFileToolResult(resEl, name, tArgs, t.content);
+      } else {
+        maybeTruncateEl(resEl, t.content || (t.is_error ? "(无错误信息)" : "(无输出)"),
+          LONG_TEXT_THRESHOLD, null);
+      }
     } else {
       // 无对应 ToolCall（如历史截断后）：独立卡片
       const card2 = buildToolCard(t.name, "", t.is_error ? "失败" : "完成",
