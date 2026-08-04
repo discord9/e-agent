@@ -50,6 +50,12 @@ function serEl(e){
   if (e.tag === "#comment") return "<!--" + (e.textContent||"") + "-->";
   let out = "<" + e.tag;
   if (e._classes.size) out += ' class="' + [...e._classes].join(" ") + '"';
+  // 属性序列化（与真实 DOM 一致）：data-* 携带原始数据（data-tool-args），
+  // hidden/open 反映折叠与可见状态——innerHTML 快照往返后都保留
+  const attrs = Object.keys(e._attrs).filter((k) => k.startsWith("data-")).sort();
+  for (const k of attrs) out += ' ' + k + '="' + escHtml(e._attrs[k]) + '"';
+  if (e.hidden) out += ' hidden=""';
+  if (e.hasAttribute("open")) out += ' open=""';
   out += ">";
   if (e._children.length) {
     for (const c of e._children) {
@@ -87,7 +93,17 @@ function parseHtml(html){
           const cls = [];
           let am;
           const attrRe = /\s+([a-zA-Z-]+)=("[^"]*"|'[^']*')/g;
-          while ((am = attrRe.exec(m[2]))) { if (am[1] === "class") cls.push(am[2].slice(1, -1)); }
+          while ((am = attrRe.exec(m[2]))) {
+            const an = am[1];
+            const av = am[2].slice(1, -1)
+              .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+              .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+              .replace(/&amp;/g, "&");
+            if (an === "class") cls.push(av);
+            else if (an.startsWith("data-")) e.setAttribute(an, av);
+            else if (an === "hidden") e.hidden = true;
+            else if (an === "open") e.setAttribute("open", "");
+          }
           if (cls.length) e.className = cls.join(" ");
           parent.push(e);
           e._parent = host || null;   // 与程序化 append/insertBefore 一致：closest 依赖父链
@@ -1434,8 +1450,9 @@ async function main(){
         "connected=" + (state.acc && state.acc.assistantEl && state.acc.assistantEl.isConnected));
 
     // ---- A: 长内容「预览 + 展开全文」（maybeTruncateEl） ----
+    // 用 MCP/未知工具名走 pretty JSON 回退路径（bash 等已改紧凑渲染）
     const longArgsA = JSON.stringify({ cmd: "echo hi", data: "x".repeat(700) });
-    const cardA = buildToolCard("bash", longArgsA, "完成", "", "y".repeat(500));
+    const cardA = buildToolCard("mcp_notes", longArgsA, "完成", "", "y".repeat(500));
     const argsPreA = cardA.querySelector(".tool-args");
     const resPreA = cardA.querySelector(".tool-result");
     chk("A long args folded by default",
@@ -1451,7 +1468,7 @@ async function main(){
     chk("A long result folded by default",
         resPreA.classList.contains("expandable") && !resPreA.classList.contains("expanded"));
     // 短内容直出：无 expandable、无按钮、文本完整
-    const shortCardA = buildToolCard("bash", '{"cmd":"ls"}', "完成", "", "ok");
+    const shortCardA = buildToolCard("mcp_notes", '{"cmd":"ls"}', "完成", "", "ok");
     const argsShortA = shortCardA.querySelector(".tool-args");
     chk("A short args direct output",
         !argsShortA.classList.contains("expandable")
@@ -1464,12 +1481,121 @@ async function main(){
     chk("bash command rendered as terminal line",
         bashArgs.textContent === "$ cd /tmp && ls",
         "text=" + JSON.stringify(bashArgs.textContent));
-    // 非 bash 工具不特殊处理（仍 pretty JSON）
-    const nonBashCard = buildToolCard("read_file", '{"path":"/a","offset":1}', "完成", "", "ok");
-    chk("non-bash tool keeps pretty JSON args",
-        nonBashCard.querySelector(".tool-args").textContent
-          === JSON.stringify(JSON.parse('{"path":"/a","offset":1}'), null, 2),
-        "text=" + JSON.stringify(nonBashCard.querySelector(".tool-args").textContent));
+    // =====================================================================
+    // 统一参数渲染（renderToolArgs）：各工具紧凑参数 / 隐藏 / 原文回退 /
+    // XSS 防护（所有用户内容 textContent，<script> 不注入）
+    // =====================================================================
+    const argsTextOf = (card) => card.querySelector(".tool-args").textContent;
+    const argsHiddenOf = (card) => card.querySelector(".tool-args").hidden;
+    // read_file：📄 path + offset/limit chips（无完整 JSON）
+    const rfCard = buildToolCard("read_file", '{"path":"/a/b.txt","offset":5,"limit":20}', "完成", "", "ok");
+    chk("read_file compact path+range args",
+        argsTextOf(rfCard).includes("📄 /a/b.txt")
+        && argsTextOf(rfCard).includes("offset 5") && argsTextOf(rfCard).includes("limit 20")
+        && !argsTextOf(rfCard).includes('"path"'),
+        "text=" + JSON.stringify(argsTextOf(rfCard)));
+    // write_file：✎ path + N 行/N 字符 chips，完整 content 不进参数区
+    const wfCard = buildToolCard("write_file", JSON.stringify({ path: "w.txt", content: "a\nb\nc" }), "完成", "", "ok");
+    chk("write_file compact path+line/char counts, no content JSON",
+        argsTextOf(wfCard).includes("✎ w.txt")
+        && argsTextOf(wfCard).includes("3 行") && argsTextOf(wfCard).includes("5 字符")
+        && !argsTextOf(wfCard).includes("a\nb\nc"),
+        "text=" + JSON.stringify(argsTextOf(wfCard)));
+    // edit_file：✎ path + 旧 N 行 → 新 M 行，old/new 正文不进参数区
+    const efCard = buildToolCard("edit_file", JSON.stringify({ path: "edit.md", old: "x\ny", new: "x\ny\nz" }), "完成", "", "ok");
+    chk("edit_file compact path+old/new counts, no old/new JSON",
+        argsTextOf(efCard).includes("✎ edit.md")
+        && argsTextOf(efCard).includes("旧 2 行") && argsTextOf(efCard).includes("新 3 行")
+        && !argsTextOf(efCard).includes("x") && !argsTextOf(efCard).includes('"old"'),
+        "text=" + JSON.stringify(argsTextOf(efCard)));
+    // web_search：🔎 query 直接显示（无 JSON 包装）
+    const wsCard = buildToolCard("web_search", '{"query":"rust borrow checker"}', "完成", "", "ok");
+    chk("web_search query shown directly",
+        argsTextOf(wsCard).includes("🔎 rust borrow checker")
+        && !argsTextOf(wsCard).includes('"query"'),
+        "text=" + JSON.stringify(argsTextOf(wsCard)));
+    // read_image：🖼 path
+    const riCard = buildToolCard("read_image", '{"path":"pics/cat.png"}', "完成", "", "ok");
+    chk("read_image path shown", argsTextOf(riCard).includes("🖼 pics/cat.png"),
+        "text=" + JSON.stringify(argsTextOf(riCard)));
+    // delegate：role chip + background chip（未提供默认 true=后台运行）+ label +
+    // task 正文 + workspace 行 + resume 行
+    const dgCard = buildToolCard("delegate", JSON.stringify({
+      task: "请审查这段代码", role: "seer", label: "看图",
+      workspace: "/home/user/proj", resume: "sub-123",
+    }), "完成", "", "ok");
+    const dgText = argsTextOf(dgCard);
+    chk("delegate role/mode/label/task/workspace/resume rendered",
+        dgText.includes("role: seer") && dgText.includes("后台运行")
+        && dgText.includes("看图") && dgText.includes("请审查这段代码")
+        && dgText.includes("工作区: /home/user/proj") && dgText.includes("续接会话: sub-123")
+        && !dgText.includes('"task"'),
+        "text=" + JSON.stringify(dgText));
+    // delegate 无 background → 默认后台（后端默认 true）；background:false → 前台同步
+    const dgSync = buildToolCard("delegate", JSON.stringify({ task: "t", workspace: "/w", background: false }), "完成", "", "ok");
+    chk("delegate background defaults true, explicit false shows sync",
+        argsTextOf(dgCard).includes("后台运行")
+        && argsTextOf(dgSync).includes("前台同步") && !argsTextOf(dgSync).includes("后台运行"),
+        "text=" + JSON.stringify(argsTextOf(dgSync)));
+    // get_background_tasks：空对象 / 空串 → 参数区隐藏
+    const bgtCard = buildToolCard("get_background_tasks", "{}", "完成", "", "ok");
+    const bgtCard2 = buildToolCard("get_background_tasks", "", "完成", "", "ok");
+    chk("get_background_tasks empty args hides args area",
+        argsHiddenOf(bgtCard) && argsHiddenOf(bgtCard2),
+        "h1=" + argsHiddenOf(bgtCard) + " h2=" + argsHiddenOf(bgtCard2));
+    // cancel_background_task：#N
+    const cbtCard = buildToolCard("cancel_background_task", '{"id":42}', "完成", "", "ok");
+    chk("cancel_background_task id shown", argsTextOf(cbtCard).includes("取消后台任务 #42"),
+        "text=" + JSON.stringify(argsTextOf(cbtCard)));
+    // bash + pwsh：都显示 $ command 且无 JSON；background:true 追加徽标
+    const pwshCard = buildToolCard("pwsh", '{"command":"Get-ChildItem","background":true}', "完成", "", "ok");
+    chk("pwsh command line + background badge",
+        argsTextOf(pwshCard).includes("$ Get-ChildItem")
+        && argsTextOf(pwshCard).includes("[background]")
+        && !argsTextOf(pwshCard).includes('"command"'),
+        "text=" + JSON.stringify(argsTextOf(pwshCard)));
+    const bashBgCard = buildToolCard("bash", '{"command":"sleep 5","background":true}', "完成", "", "ok");
+    chk("bash background badge shown",
+        argsTextOf(bashBgCard).includes("$ sleep 5") && argsTextOf(bashBgCard).includes("[background]"),
+        "text=" + JSON.stringify(argsTextOf(bashBgCard)));
+    // MCP / 未知工具仍 pretty JSON
+    const mcpCard = buildToolCard("mcp_notes", '{"path":"/a","offset":1}', "完成", "", "ok");
+    chk("MCP/unknown tool keeps pretty JSON args",
+        argsTextOf(mcpCard) === JSON.stringify(JSON.parse('{"path":"/a","offset":1}'), null, 2),
+        "text=" + JSON.stringify(argsTextOf(mcpCard)));
+    // 格式不匹配 → 安全回退原文（不丢信息）：read_file 缺 path、bash 缺 command
+    const rfBad = buildToolCard("read_file", '{"offset":3}', "完成", "", "ok");
+    const bashBad = buildToolCard("bash", '{"cmd":"ls"}', "完成", "", "ok");
+    chk("mismatched read_file args fall back to raw text",
+        argsTextOf(rfBad) === '{"offset":3}',
+        "text=" + JSON.stringify(argsTextOf(rfBad)));
+    chk("mismatched bash args fall back to raw text",
+        argsTextOf(bashBad) === '{"cmd":"ls"}',
+        "text=" + JSON.stringify(argsTextOf(bashBad)));
+    // XSS：query/task/label 含 <script> 只能作为文本出现，不产生元素
+    const xssCard = buildToolCard("web_search", JSON.stringify({ query: "<script>alert(1)</script>" }), "完成", "", "ok");
+    const xssArgs = xssCard.querySelector(".tool-args");
+    chk("XSS query stays textContent",
+        xssArgs.textContent.includes("<script>")
+        && xssArgs.querySelector("script") === null
+        && !xssArgs._innerHTML.includes("<script>"),
+        "text=" + JSON.stringify(xssArgs.textContent));
+    const xssDg = buildToolCard("delegate", JSON.stringify({
+      task: "<script>alert(2)</script>", label: "<script>alert(3)</script>", workspace: "/w",
+    }), "完成", "", "ok");
+    const xssDgArgs = xssDg.querySelector(".tool-args");
+    chk("XSS delegate task/label stay textContent",
+        xssDgArgs.textContent.includes("<script>alert(2)</script>")
+        && xssDgArgs.textContent.includes("<script>alert(3)</script>")
+        && xssDgArgs.querySelector("script") === null,
+        "text=" + JSON.stringify(xssDgArgs.textContent));
+    const xssLabelCard = buildToolCard("delegate", JSON.stringify({
+      task: "t", label: "<script>alert(4)</script>", workspace: "/w",
+    }), "完成", "", "ok");
+    chk("XSS delegate label no element",
+        xssLabelCard.querySelector(".tool-args").querySelector("script") === null
+        && xssLabelCard.querySelector(".tool-args").textContent.includes("<script>alert(4)</script>"),
+        "text=" + JSON.stringify(xssLabelCard.querySelector(".tool-args").textContent));
     // 点击展开 → 显示全文；再点收起 → 回到预览
     // 按钮在正文 pre 外面（紧跟其后），不在 pre 内部
     chk("A expand button inside pre",
@@ -1739,6 +1865,209 @@ async function main(){
         && diffRowsOf(rtCard, "diff-add")[0].querySelector(".diff-text").textContent === "BBB"
         && diffRowsOf(rtCard, "diff-add")[0].querySelector(".diff-ln").textContent === "4",
         "cls=" + rtCard.querySelector(".tool-result").className);
+
+    // =====================================================================
+    // 统一结果渲染（renderToolResult）：特殊结果 live + history 双路径一致
+    // =====================================================================
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    const lastResultCard = () => {
+      const cs = elsById["messages"].querySelectorAll("details.tool-card");
+      return cs[cs.length - 1];
+    };
+    const liveToolResult = (name, argsJson, content, isError) => {
+      appendToolCall(name, argsJson, state.acc, null);
+      const c = lastResultCard();
+      appendToolResult(isError || false, content, state.acc, null);
+      return c;
+    };
+    let _histSeq = 0;
+    const histToolResult = (name, argsJson, content, isError) => {
+      const hc = "hrc" + (++_histSeq);
+      const hmap = new Map();
+      renderMessage({ Assistant: { content: "", reasoning: null,
+        tool_calls: [{ id: hc, name, arguments: argsJson }] } }, state.acc, hmap);
+      renderMessage({ Tool: { call_id: hc, name, content, is_error: isError || false } },
+        state.acc, hmap);
+      return lastResultCard();
+    };
+    const resText = (c) => c.querySelector(".tool-result").textContent;
+    const resCls = (c) => c.querySelector(".tool-result").className;
+    // web_search：结果 markdown 化（.tool-markdown），live 与 history 一致
+    for (const [path, c] of [
+      ["live", liveToolResult("web_search", '{"query":"rust"}', "结果：**加粗**", false)],
+      ["history", histToolResult("web_search", '{"query":"rust"}', "结果：**加粗**", false)],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      chk("web_search result markdown (" + path + ")",
+          r.classList.contains("tool-markdown") && r.tag === "div"
+          && r.textContent.includes("加粗")
+          && r.textContent.includes("结果："),
+          "cls=" + r.className + " text=" + JSON.stringify(r.textContent));
+    }
+    // delegate 后台启动回执：后台运行 任务 #N label + 子代理会话
+    for (const [path, c] of [
+      ["live", liveToolResult("delegate", JSON.stringify({ task: "t", workspace: "/w" }),
+        "started background task 7: 看图\nsubagent session: sub-abc", false)],
+      ["history", histToolResult("delegate", JSON.stringify({ task: "t", workspace: "/w" }),
+        "started background task 7: 看图\nsubagent session: sub-abc", false)],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      chk("delegate bg receipt rendered (" + path + ")",
+          r.classList.contains("delegate-result")
+          && resText(c).includes("后台运行") && resText(c).includes("任务 #7 看图")
+          && resText(c).includes("子代理会话 sub-abc"),
+          "cls=" + r.className + " text=" + JSON.stringify(resText(c)));
+    }
+    // delegate 同步完成：子代理会话 + 答案 markdown
+    for (const [path, c] of [
+      ["live", liveToolResult("delegate", JSON.stringify({ task: "t", workspace: "/w", background: false }),
+        "subagent session: sub-xyz\n答案：**完成**", false)],
+      ["history", histToolResult("delegate", JSON.stringify({ task: "t", workspace: "/w", background: false }),
+        "subagent session: sub-xyz\n答案：**完成**", false)],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      chk("delegate sync answer rendered (" + path + ")",
+          r.classList.contains("delegate-result")
+          && resText(c).includes("子代理会话 sub-xyz")
+          && resText(c).includes("答案：完成")
+          && r.querySelector(".tool-markdown") !== null,
+          "cls=" + r.className + " text=" + JSON.stringify(resText(c)));
+    }
+    // delegate 格式不匹配 → 回退原文
+    const dgBad = liveToolResult("delegate", '{"task":"t","workspace":"/w"}', "unexpected output", false);
+    chk("delegate mismatched result falls back to raw text",
+        !dgBad.querySelector(".tool-result").classList.contains("delegate-result")
+        && resText(dgBad) === "unexpected output",
+        "cls=" + resCls(dgBad) + " text=" + JSON.stringify(resText(dgBad)));
+    // delegate 错误正文保持纯文本（完整可复制，不 markdown）
+    const dgErr = liveToolResult("delegate", '{"task":"t","workspace":"/w"}',
+      "subagent failed: boom", true);
+    chk("delegate error stays plain err text",
+        dgErr.querySelector(".tool-result").classList.contains("err")
+        && resText(dgErr) === "subagent failed: boom",
+        "cls=" + resCls(dgErr) + " text=" + JSON.stringify(resText(dgErr)));
+    // get_background_tasks：空状态
+    for (const [path, c] of [
+      ["live", liveToolResult("get_background_tasks", "{}", "No background tasks running.", false)],
+      ["history", histToolResult("get_background_tasks", "{}", "No background tasks running.", false)],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      chk("get_background_tasks empty state (" + path + ")",
+          r.querySelector(".task-empty") !== null
+          && r.querySelector(".task-empty").textContent === "当前没有后台任务",
+          "text=" + JSON.stringify(resText(c)));
+    }
+    // get_background_tasks：标题 + #id/描述行
+    for (const [path, c] of [
+      ["live", liveToolResult("get_background_tasks", "{}",
+        "2 background task(s) running:\n#1: cargo build (bash) [background]\n#3: 看图 (seer)", false)],
+      ["history", histToolResult("get_background_tasks", "{}",
+        "2 background task(s) running:\n#1: cargo build (bash) [background]\n#3: 看图 (seer)", false)],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      const ids = r.querySelectorAll(".task-snapshot-id");
+      const descs = r.querySelectorAll(".task-snapshot-desc");
+      chk("get_background_tasks rows rendered (" + path + ")",
+          r.querySelector(".task-snapshot-head").textContent.includes("2 background task")
+          && ids.length === 2 && ids[0].textContent === "#1" && ids[1].textContent === "#3"
+          && descs[0].textContent === "cargo build (bash) [background]"
+          && descs[1].textContent === "看图 (seer)",
+          "text=" + JSON.stringify(resText(c)));
+    }
+    // get_background_tasks 格式不匹配 → 回退原文
+    const bgtBad = liveToolResult("get_background_tasks", "{}", "weird output", false);
+    chk("get_background_tasks mismatched result falls back to raw text",
+        bgtBad.querySelector(".tool-result").querySelector(".task-empty") === null
+        && resText(bgtBad) === "weird output",
+        "text=" + JSON.stringify(resText(bgtBad)));
+    // read_image：结果保持纯文本摘要
+    for (const [path, c] of [
+      ["live", liveToolResult("read_image", '{"path":"pics/cat.png"}', "一张猫的图片（1024x768）", false)],
+      ["history", histToolResult("read_image", '{"path":"pics/cat.png"}', "一张猫的图片（1024x768）", false)],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      chk("read_image result stays plain summary (" + path + ")",
+          r.tag === "pre" && resText(c).includes("一张猫的图片"),
+          "cls=" + resCls(c) + " text=" + JSON.stringify(resText(c)));
+    }
+    // data-tool-args：属性随 innerHTML 快照往返保留，cardArgs 优先读它
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    appendToolCall("write_file", JSON.stringify({ path: "rt.txt", content: "L1\nL2" }),
+      state.acc, null);
+    const snapCard = lastResultCard();
+    chk("data-tool-args attribute set on card",
+        snapCard.getAttribute("data-tool-args") === JSON.stringify({ path: "rt.txt", content: "L1\nL2" }),
+        "attr=" + String(snapCard.getAttribute("data-tool-args")));
+    const snapHtml = elsById["messages"].innerHTML;
+    elsById["messages"].innerHTML = snapHtml;
+    const rtCard2 = elsById["messages"].querySelector("details.tool-card");
+    chk("data-tool-args survives innerHTML round-trip",
+        rtCard2.getAttribute("data-tool-args") === JSON.stringify({ path: "rt.txt", content: "L1\nL2" }),
+        "attr=" + String(rtCard2.getAttribute("data-tool-args")));
+    chk("cardArgs reads data-tool-args after expando loss",
+        cardArgs(rtCard2) !== null && cardArgs(rtCard2).path === "rt.txt"
+        && cardArgs(rtCard2).content === "L1\nL2",
+        "args=" + JSON.stringify(cardArgs(rtCard2)));
+    state.acc = newAccumulator();
+    state.acc.toolStack.push({ el: rtCard2, filled: false });
+    appendToolResult(false, "file written", state.acc, null);
+    chk("write_file diff after snapshot restore via data-tool-args",
+        rtCard2.querySelector(".tool-result").classList.contains("tool-diff")
+        && diffRowsOf(rtCard2, "diff-add").length === 2
+        && diffRowsOf(rtCard2, "diff-add")[0].querySelector(".diff-text").textContent === "L1",
+        "cls=" + rtCard2.querySelector(".tool-result").className);
+    // get_background_tasks 参数区 hidden 随快照往返保留
+    const bgtHost = el("div");
+    bgtHost.appendChild(buildToolCard("get_background_tasks", "{}", "完成", "", "ok"));
+    chk("get_background_tasks args hidden fresh",
+        bgtHost.querySelector(".tool-args").hidden === true,
+        "hidden=" + bgtHost.querySelector(".tool-args").hidden);
+    const bgtSnap = bgtHost.innerHTML;
+    const bgtHost2 = el("div");
+    bgtHost2.innerHTML = bgtSnap;
+    chk("get_background_tasks args hidden survives round-trip",
+        bgtHost2.querySelector(".tool-args").hidden === true,
+        "hidden=" + bgtHost2.querySelector(".tool-args").hidden);
+
+    // ---- 后台完成（appendBackgroundCompletion）：delegate 完成 vs bash ----
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    const dgComp = appendBackgroundCompletion(7, "看图",
+      "subagent session: sub-abc\n完成：**好**");
+    chk("bg delegate completion rendered",
+        dgComp.classList.contains("delegate-complete")
+        && dgComp.textContent.includes("后台运行")
+        && dgComp.textContent.includes("任务 #7 看图")
+        && dgComp.textContent.includes("子代理会话 sub-abc")
+        && dgComp.textContent.includes("完成：好")
+        && dgComp.querySelector(".tool-markdown") !== null,
+        "text=" + JSON.stringify(dgComp.textContent));
+    const bashComp = appendBackgroundCompletion(9, "cargo", "build ok");
+    chk("bg bash completion keeps notice path",
+        !bashComp.classList.contains("delegate-complete")
+        && bashComp.textContent.includes("后台任务 #9 完成（cargo）")
+        && bashComp.textContent.includes("build ok"),
+        "text=" + JSON.stringify(bashComp.textContent));
+    // history background_completion 条目 → delegate 完成渲染
+    const histComp = renderEntry({ type: "background_completion", id: 5, label: "审图",
+      output: "subagent session: sub-9\n答：**好**" }, state.acc, new Map());
+    chk("history background_completion delegate rendered",
+        histComp.classList.contains("delegate-complete")
+        && histComp.textContent.includes("子代理会话 sub-9")
+        && histComp.textContent.includes("答：好"),
+        "text=" + JSON.stringify(histComp.textContent));
+    // live SSE BackgroundCompleted（delegate 输出）→ 同一渲染路径
+    handleSSEBlock("event: BackgroundCompleted\ndata: {\"type\":\"background_completed\",\"session_id\":\"" + state.sessionId + "\",\"seq\":300,\"id\":11,\"label\":\"审图\",\"output\":\"subagent session: sub-11\\n搞定\\n\"}\n\n",
+      state.sessionId, state.workspace.id, sessionOpenEpoch);
+    const noticesBg = elsById["messages"].querySelectorAll(".notice");
+    const lastNoticeBg = noticesBg[noticesBg.length - 1];
+    chk("live BackgroundCompleted delegate rendered",
+        lastNoticeBg.classList.contains("delegate-complete")
+        && lastNoticeBg.textContent.includes("子代理会话 sub-11")
+        && lastNoticeBg.textContent.includes("搞定"),
+        "text=" + JSON.stringify(lastNoticeBg.textContent));
 
     // ---- B: 消息上限 pruneMessages ----
     const pm = elsById["messages"];
