@@ -267,6 +267,58 @@
   .busy-dot.busy { background: var(--orange); animation: pulse 1.2s infinite; }
   @keyframes pulse { 50% { opacity: 0.3; } }
 
+  /* 侧栏主会话状态：中心点只表示主 agent，环绕红点表示活跃 subagent。
+     固定画布不会随任务数改变行高或挤动标题。 */
+  .busy-dot-wrap {
+    position: relative;
+    width: 28px;
+    height: 20px;
+    flex: 0 0 28px;
+  }
+  .busy-dot-wrap > .busy-dot {
+    position: absolute;
+    left: 10px;
+    top: 10px;
+    transform: translate(-50%, -50%);
+  }
+  .busy-dot-sub {
+    position: absolute;
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--red);
+    box-shadow: 0 0 0 1px var(--base3);
+    animation: subagent-pulse 1.45s ease-in-out infinite;
+  }
+  .busy-dot-sub:nth-of-type(3n) { animation-delay: -0.45s; }
+  .busy-dot-sub:nth-of-type(3n + 1) { animation-delay: -0.9s; }
+  @keyframes subagent-pulse { 50% { opacity: 0.45; } }
+  .busy-dot-wrap .orbit-slot-1 { left: 8px; top: 0; }
+  .busy-dot-wrap .orbit-slot-2 { left: 14px; top: 2px; }
+  .busy-dot-wrap .orbit-slot-3 { left: 16px; top: 8px; }
+  .busy-dot-wrap .orbit-slot-4 { left: 14px; top: 14px; }
+  .busy-dot-wrap .orbit-slot-5 { left: 8px; top: 16px; }
+  .busy-dot-wrap .orbit-slot-6 { left: 2px; top: 14px; }
+  .busy-dot-wrap .orbit-slot-7 { left: 0; top: 8px; }
+  .busy-dot-wrap .orbit-slot-8 { left: 2px; top: 2px; }
+  .busy-dot-overflow {
+    position: absolute;
+    z-index: 1;
+    min-width: 12px;
+    height: 10px;
+    padding: 0 2px;
+    border: 1px solid var(--base3);
+    border-radius: 5px;
+    background: var(--red);
+    color: var(--base3);
+    font-size: 8px;
+    font-weight: bold;
+    line-height: 10px;
+    text-align: center;
+    white-space: nowrap;
+  }
+  .busy-dot-wrap > .busy-dot-overflow { left: 17px; top: 5px; }
+
   .status-chip {
     font-size: 12px;
     padding: 2px 8px;
@@ -1004,7 +1056,9 @@
   }
   @media (prefers-reduced-motion: reduce) {
     .composer-status.busy::before,
-    .composer-status.compacting::before {
+    .composer-status.compacting::before,
+    .busy-dot.busy,
+    .busy-dot-sub {
       animation: none;
     }
   }

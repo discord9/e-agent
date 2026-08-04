@@ -1833,13 +1833,38 @@ function buildTreeRoot(s, kids, wsId) {
   // 后端 running_tasks 分不清 Idle/Busy——live subagent（label 在）只有
   // active=true、busy 恒为 false（apply_subagent_label 只设 active）。
   // 所以 active===true 表示仍在工作流中的子 agent（包括等待输入的 Idle
-  // subagent）。父会话自身忙或存在活跃子会话时，统一显示橙色脉动点。
+  // subagent）。主点只表达父会话自身状态；活跃子 agent 用环绕红点独立表达。
   const busyKidCount = kids.filter((k) => k.active === true).length;
-  const hasActiveKids = kids.some((k) => k.active === true);
-  const dot = el("span", "busy-dot" + ((s.busy || hasActiveKids) ? " busy" : ""));
-  dot.setAttribute("aria-label", hasActiveKids
-    ? busyKidCount + " 个子任务处理中"
-    : (s.busy ? "会话处理中" : "会话空闲"));
+  const hasActiveKids = busyKidCount > 0;
+  const dot = el("span", "busy-dot-wrap");
+  dot.setAttribute("role", "img");
+  dot.setAttribute("aria-label", (s.busy ? "会话处理中" : "会话空闲")
+    + (hasActiveKids ? "，" + busyKidCount + " 个子任务处理中" : ""));
+  const mainDot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
+  mainDot.setAttribute("aria-hidden", "true");
+  dot.appendChild(mainDot);
+
+  // 环上最多画六个红点；更多任务由第七个位置的 +N 汇总，避免
+  // 小尺寸侧栏状态标记过密。位置按当前红点数量均匀选取。
+  const hasOverflow = busyKidCount > 6;
+  const visibleKidDots = Math.min(busyKidCount, 6);
+  const orbitSlots = {
+    1: [1], 2: [1, 5], 3: [1, 4, 6], 4: [1, 3, 5, 7],
+    5: [1, 2, 4, 6, 8], 6: [1, 2, 4, 5, 6, 8],
+  }[visibleKidDots] || [];
+  for (let i = 0; i < visibleKidDots; i++) {
+    const subDot = el("span", "busy-dot-sub orbit-slot-" + orbitSlots[i]);
+    subDot.title = "子任务 " + (i + 1) + "/" + busyKidCount;
+    subDot.setAttribute("aria-hidden", "true");
+    dot.appendChild(subDot);
+  }
+  if (hasOverflow) {
+    const overflow = el("span", "busy-dot-overflow",
+      "+" + (busyKidCount - visibleKidDots));
+    overflow.title = "共 " + busyKidCount + " 个子任务处理中";
+    overflow.setAttribute("aria-hidden", "true");
+    dot.appendChild(overflow);
+  }
   // 有标题：两行（title 行 + 完整 id 行）；无标题：一行完整 id。
   // 单行 ellipsis 截断的长 id 无法区分会话，双行让 title/id 都可见。
   const hasTitle = !!s.title;

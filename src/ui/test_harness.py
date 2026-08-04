@@ -3207,11 +3207,11 @@ async function main(){
     sessionsData = saveWs.dataA; sessionsDataB = saveWs.dataB;
 
     // =====================================================================
-    // 15b) workspace 标识分色 + 父节点 busy 数量徽标 + 子会话分组
+    // 15b) workspace 标识分色 + 父节点 / subagent 分层 busy 点 + 子会话分组
     //     A) 标识按 workspace 下标取色（ws-chip-<n>）：不同 workspace
     //        色类不同；同一 workspace 的列表 chip / 组头 chip / 置顶色条同色。
-    //     B) 父节点显示直接 busy 子会话数量；无 busy 子时，父自身 busy
-    //        保留脉动点，否则为绿色点。父自身与子会话同时 busy 时数字优先。
+    //     B) 父节点中心点只显示自身 busy/idle；每个 active 子会话显示一个
+    //        环绕红点，超过六个显示 +N，父与子状态可同时一眼识别。
     //     C) 展开父节点只直显 busy 子会话，idle（包括 active=true）收进
     //        「历史子会话 (N)」折叠组。
     // =====================================================================
@@ -3230,6 +3230,11 @@ async function main(){
       { id: "d1-child-idle", parent_session_id: "d1", label: "D 子任务闲", status: "Idle", entry_count: 1, busy: false, active: false },
       { id: "f1", status: "Busy", title: "F 主会话", created_at: "2024-04-02T00:00:00Z", entry_count: 1, busy: true, active: true },
       { id: "f1-child-busy", parent_session_id: "f1", label: "F 子任务忙", status: "Busy", entry_count: 1, busy: true, active: true },
+      { id: "g1", status: "Idle", title: "G 主会话", created_at: "2024-04-03T00:00:00Z", entry_count: 1, busy: false, active: true },
+      ...Array.from({ length: 8 }, (_, i) => ({
+        id: "g1-child-" + (i + 1), parent_session_id: "g1", label: "G 子任务 " + (i + 1),
+        status: "Busy", entry_count: 1, busy: true, active: true,
+      })),
     ];
     state.workspaces = [
       { id: "wsA", name: "服务器A", url: "", token: "tok-a" },
@@ -3264,38 +3269,55 @@ async function main(){
     chk("pinned row labels share workspace color",
         pinMarkers15.length === 2 && pinCls15.includes("ws-chip-0") && pinCls15.includes("ws-chip-1"),
         "pins=" + pinCls15.join(","));
-    // B) 数量徽标 / 父自身 busy 点 / idle 绿点的五种组合
+    // B) 主点只表达父状态；环绕点独立表达 active 子会话数量
     const rows15 = elsById["sidebarTree"].querySelectorAll(".tree-row");
-    const dotOf15 = (r) => r.querySelector(".busy-dot");
     const rowByTxt15 = (t) => [...rows15].find((r) => r.textContent.includes(t));
-    const c1Dot = dotOf15(rowByTxt15("C 主会话"));
-    const c2Dot = dotOf15(rowByTxt15("C2 主会话"));
-    const d1Dot = dotOf15(rowByTxt15("D 主会话"));
-    const e1Dot = dotOf15(rowByTxt15("E 主会话"));
-    const f1Dot = dotOf15(rowByTxt15("F 主会话"));
-    chk("red dot when two active children",
-        c1Dot.classList.contains("busy") && !c1Dot.classList.contains("busy-count")
-        && c1Dot.textContent === "",
-        "class=" + c1Dot.className + " text=" + c1Dot.textContent);
-    chk("red dot when one active child, inactive ignored",
-        c2Dot.classList.contains("busy") && !c2Dot.classList.contains("busy-count"),
-        "class=" + c2Dot.className);
-    chk("red dot when parent busy, no active children",
-        d1Dot.classList.contains("busy") && !d1Dot.classList.contains("busy-count")
-        && d1Dot.textContent === "",
-        "class=" + d1Dot.className + " text=" + d1Dot.textContent);
-    chk("green dot when fully idle (no active children, parent idle)",
-        !e1Dot.classList.contains("busy") && !e1Dot.classList.contains("busy-count")
-        && e1Dot.textContent === "",
-        "class=" + e1Dot.className + " text=" + e1Dot.textContent);
-    chk("red dot when parent busy AND active child (OR semantics)",
-        f1Dot.classList.contains("busy") && !f1Dot.classList.contains("busy-count"),
-        "class=" + f1Dot.className);
+    const wrapOf15 = (r) => r.querySelector(".busy-dot-wrap");
+    const mainDotOf15 = (r) => wrapOf15(r).querySelector(".busy-dot");
+    const c1Row = rowByTxt15("C 主会话");
+    const c2Row = rowByTxt15("C2 主会话");
+    const d1Row = rowByTxt15("D 主会话");
+    const e1Row = rowByTxt15("E 主会话");
+    const f1Row = rowByTxt15("F 主会话");
+    const g1Row = rowByTxt15("G 主会话");
+    chk("two active children render two orbit dots",
+        wrapOf15(c1Row).querySelectorAll(".busy-dot-sub").length === 2
+        && !mainDotOf15(c1Row).classList.contains("busy"),
+        "dots=" + wrapOf15(c1Row).querySelectorAll(".busy-dot-sub").length
+        + " main=" + mainDotOf15(c1Row).className);
+    chk("inactive child is ignored by orbit count",
+        wrapOf15(c2Row).querySelectorAll(".busy-dot-sub").length === 1,
+        "dots=" + wrapOf15(c2Row).querySelectorAll(".busy-dot-sub").length);
+    chk("busy parent keeps orange busy main dot with no orbit dots",
+        mainDotOf15(d1Row).classList.contains("busy")
+        && wrapOf15(d1Row).querySelectorAll(".busy-dot-sub").length === 0,
+        "main=" + mainDotOf15(d1Row).className);
+    chk("fully idle parent keeps green main dot with no orbit dots",
+        !mainDotOf15(e1Row).classList.contains("busy")
+        && wrapOf15(e1Row).querySelectorAll(".busy-dot-sub").length === 0,
+        "main=" + mainDotOf15(e1Row).className);
+    chk("busy parent and active child show both status layers",
+        mainDotOf15(f1Row).classList.contains("busy")
+        && wrapOf15(f1Row).querySelectorAll(".busy-dot-sub").length === 1,
+        "main=" + mainDotOf15(f1Row).className
+        + " dots=" + wrapOf15(f1Row).querySelectorAll(".busy-dot-sub").length);
+    chk("more than six children render six dots and overflow count",
+        wrapOf15(g1Row).querySelectorAll(".busy-dot-sub").length === 6
+        && wrapOf15(g1Row).querySelector(".busy-dot-overflow").textContent === "+2",
+        "dots=" + wrapOf15(g1Row).querySelectorAll(".busy-dot-sub").length
+        + " overflow=" + wrapOf15(g1Row).querySelector(".busy-dot-overflow").textContent);
+    chk("busy dot wrapper aria-label combines parent and child status",
+        wrapOf15(c1Row).getAttribute("aria-label") === "会话空闲，2 个子任务处理中"
+        && wrapOf15(d1Row).getAttribute("aria-label") === "会话处理中"
+        && wrapOf15(f1Row).getAttribute("aria-label") === "会话处理中，1 个子任务处理中",
+        "c=" + wrapOf15(c1Row).getAttribute("aria-label")
+        + " d=" + wrapOf15(d1Row).getAttribute("aria-label")
+        + " f=" + wrapOf15(f1Row).getAttribute("aria-label"));
     chk("parent title keeps child-busy hint",
-        rowByTxt15("C 主会话").title.includes("子任务处理中")
-        && rowByTxt15("F 主会话").title.includes("子任务处理中")
-        && !rowByTxt15("E 主会话").title.includes("子任务处理中"),
-        "c=" + rowByTxt15("C 主会话").title + " f=" + rowByTxt15("F 主会话").title);
+        c1Row.title.includes("子任务处理中")
+        && f1Row.title.includes("子任务处理中")
+        && !e1Row.title.includes("子任务处理中"),
+        "c=" + c1Row.title + " f=" + f1Row.title);
     // C) busy 子会话直显；active=true 的 idle 子会话也必须进入默认收起的历史组
     const c2BusyRow = rowByTxt15("C2 子任务忙");
     const c2IdleRow = rowByTxt15("C2 子任务闲");
