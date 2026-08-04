@@ -32,4 +32,7 @@ fn main() {
         println!("cargo:rustc-cfg=web_ui");
     }
     println!("cargo:rerun-if-changed=src/ui/index.html");
+    // Re-run on every commit so the injected hash tracks HEAD.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/");
 }
