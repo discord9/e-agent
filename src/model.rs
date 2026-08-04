@@ -11,7 +11,9 @@ use crate::agent::{
     AssistantMessage, ImagePart, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
 };
 use crate::codex::{
-    CONNECT_RETRY_ATTEMPTS, CONNECT_RETRY_BASE_BACKOFF_MS, CodexModel, retry_backoff_ms,
+    CONNECT_RETRY_ATTEMPTS, CONNECT_RETRY_BASE_BACKOFF_MS, CodexModel, DeltaSink,
+    HTTP_RETRY_ATTEMPTS, HTTP_RETRY_BASE_BACKOFF_MS, is_retryable_http_status,
+    is_stream_decode_error, retry_backoff_ms,
 };
 
 /// The two concrete model wires e-agent supports. Keeping this enum concrete
@@ -221,23 +223,72 @@ impl Model for OpenAiModel {
             tools,
             self.image_store.as_deref(),
         );
-        // Transient gateway/connectivity hiccups before any bytes were
-        // exchanged (e.g. "tls handshake eof", ECONNREFUSED) recover on retry;
-        // same exponential policy as the codex wire: 6 attempts, 0.5s/1s/2s/4s/8s
-        // backoff (~15.5s window). HTTP status errors are not retried here —
-        // the 403 loop below owns those.
+        // Whole-request retry loop, mirroring the codex wire in src/codex.rs:
+        // connect/timeout errors (no bytes exchanged) are retried inside
+        // send_chat() — 8 attempts, 0.5s..32s exponential backoff (~63.5s
+        // window) — while HTTP 403/5xx responses and SSE streams cut short
+        // mid-flight (is_stream_decode_error) restart the whole idempotent
+        // request here (HTTP_RETRY_ATTEMPTS, 0.8/1.6/3.2s backoff). Deltas
+        // streamed to on_delta before a decode failure are discarded — only
+        // the last successful attempt's accumulation is returned.
         let mut attempt = 0u32;
-        let response = loop {
+        loop {
             attempt += 1;
-            let result = self
+            let response = self.send_chat(&request).await?;
+            let status = response.status();
+            if is_retryable_http_status(status) && attempt < HTTP_RETRY_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(retry_backoff_ms(
+                    HTTP_RETRY_BASE_BACKOFF_MS,
+                    attempt,
+                )))
+                .await;
+                continue;
+            }
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "provider returned HTTP {status} (model={} effort={:?} msgs={} tools={}): {}",
+                    self.model,
+                    self.reasoning_effort,
+                    messages.len(),
+                    tools.len(),
+                    preview(&body, 500)
+                );
+            }
+            match consume_stream(response, &mut on_delta).await {
+                Ok(result) => return Ok(result),
+                Err(error) if attempt < HTTP_RETRY_ATTEMPTS && is_stream_decode_error(&error) => {
+                    tokio::time::sleep(Duration::from_millis(retry_backoff_ms(
+                        HTTP_RETRY_BASE_BACKOFF_MS,
+                        attempt,
+                    )))
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+/// Send a chat/completions request, retrying transient connect/timeout errors
+/// (no bytes were exchanged: "tls handshake eof", ECONNREFUSED, TLS decrypt
+/// send failures) with the shared exponential policy — 8 attempts,
+/// 0.5s/1s/2s/4s/8s/16s/32s backoff in production, same as the codex wire.
+/// HTTP status errors are returned to the caller, which owns 403/5xx retries.
+impl OpenAiModel {
+    async fn send_chat(&self, request: &ChatRequest<'_>) -> anyhow::Result<reqwest::Response> {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match self
                 .client
                 .post(format!("{}/chat/completions", self.base_url))
                 .bearer_auth(&self.api_key)
-                .json(&request)
+                .json(request)
                 .send()
-                .await;
-            match result {
-                Ok(response) => break response,
+                .await
+            {
+                Ok(response) => return Ok(response),
                 Err(error)
                     if attempt < CONNECT_RETRY_ATTEMPTS
                         && (error.is_timeout() || error.is_connect() || error.is_request()) =>
@@ -250,109 +301,89 @@ impl Model for OpenAiModel {
                 }
                 Err(error) => return Err(request_error(error)),
             }
-        };
-        let mut response = response;
-        // Providers occasionally rate-limit a burst (main agent + a freshly
-        // spawned subagent firing together) with a bare 403 and no body.
-        // Back off and retry a couple of times before giving up.
-        for attempt in 1..=3 {
-            if response.status() != reqwest::StatusCode::FORBIDDEN {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(800 * attempt)).await;
-            response = self
-                .client
-                .post(format!("{}/chat/completions", self.base_url))
-                .bearer_auth(&self.api_key)
-                .json(&request)
-                .send()
-                .await
-                .map_err(request_error)?;
         }
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "provider returned HTTP {status} (model={} effort={:?} msgs={} tools={}): {}",
-                self.model,
-                self.reasoning_effort,
-                messages.len(),
-                tools.len(),
-                preview(&body, 500)
-            );
+    }
+}
+
+/// Consume a chat/completions SSE stream, accumulating content / reasoning /
+/// tool calls / usage into an assistant message. Returns Err for any stream
+/// failure; the caller decides whether a decode failure is retryable
+/// (`is_stream_decode_error`).
+async fn consume_stream(
+    response: reqwest::Response,
+    on_delta: &mut DeltaSink<'_>,
+) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut usage = None;
+    let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
+    let mut events = response.bytes_stream().eventsource();
+    while let Some(event) = events.next().await {
+        let event = event.context("cannot parse provider event")?;
+        if event.data == "[DONE]" {
+            break;
         }
-        let mut content = String::new();
-        let mut reasoning = String::new();
-        let mut usage = None;
-        let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
-        let mut events = response.bytes_stream().eventsource();
-        while let Some(event) = events.next().await {
-            let event = event.context("cannot parse provider event")?;
-            if event.data == "[DONE]" {
-                break;
-            }
-            let chunk: StreamChunk =
-                serde_json::from_str(&event.data).context("cannot decode provider stream chunk")?;
-            if let Some(error) = chunk.error {
-                anyhow::bail!("provider stream error: {error}");
-            }
-            if let Some(reported) = chunk.usage {
+        let chunk: StreamChunk =
+            serde_json::from_str(&event.data).context("cannot decode provider stream chunk")?;
+        if let Some(error) = chunk.error {
+            anyhow::bail!("provider stream error: {error}");
+        }
+        if let Some(reported) = chunk.usage {
+            usage = Some(reported);
+        }
+        for choice in chunk.choices {
+            if let Some(reported) = choice.usage {
                 usage = Some(reported);
             }
-            for choice in chunk.choices {
-                if let Some(reported) = choice.usage {
-                    usage = Some(reported);
-                }
-                // Providers (kimi k3) interleave empty `content: ""` /
-                // `reasoning_content: ""` chunks into the stream. Forwarding
-                // them would flip the TUI's active stream lane and scatter a
-                // single reasoning/content line into many fragments, so skip
-                // empty deltas at the source.
-                if let Some(delta) = choice.delta.content.filter(|delta| !delta.is_empty()) {
-                    content.push_str(&delta);
-                    if let Some(callback) = &mut on_delta {
-                        callback(
-                            ModelDeltaKind::Content,
-                            &content[content.len() - delta.len()..],
-                        );
-                    }
-                }
-                if let Some(delta) = choice
-                    .delta
-                    .reasoning_content
-                    .filter(|delta| !delta.is_empty())
-                {
-                    reasoning.push_str(&delta);
-                    if let Some(callback) = &mut on_delta {
-                        callback(ModelDeltaKind::Reasoning, &delta);
-                    }
-                }
-                for call in choice.delta.tool_calls.unwrap_or_default() {
-                    while tool_calls.len() <= call.index {
-                        tool_calls.push(AccumulatedToolCall::default());
-                    }
-                    let target = &mut tool_calls[call.index];
-                    if let Some(id) = call.id {
-                        target.id = id;
-                    }
-                    if let Some(name) = call
-                        .function
-                        .as_ref()
-                        .and_then(|function| function.name.as_ref())
-                    {
-                        target.name = name.clone();
-                    }
-                    if let Some(arguments) = call.function.and_then(|function| function.arguments) {
-                        target.arguments.push_str(&arguments);
-                    }
-                }
-                if choice.finish_reason.is_some() {
-                    return build_assistant(content, reasoning, tool_calls, usage);
+            // Providers (kimi k3) interleave empty `content: ""` /
+            // `reasoning_content: ""` chunks into the stream. Forwarding
+            // them would flip the TUI's active stream lane and scatter a
+            // single reasoning/content line into many fragments, so skip
+            // empty deltas at the source.
+            if let Some(delta) = choice.delta.content.filter(|delta| !delta.is_empty()) {
+                content.push_str(&delta);
+                if let Some(callback) = on_delta {
+                    callback(
+                        ModelDeltaKind::Content,
+                        &content[content.len() - delta.len()..],
+                    );
                 }
             }
+            if let Some(delta) = choice
+                .delta
+                .reasoning_content
+                .filter(|delta| !delta.is_empty())
+            {
+                reasoning.push_str(&delta);
+                if let Some(callback) = on_delta {
+                    callback(ModelDeltaKind::Reasoning, &delta);
+                }
+            }
+            for call in choice.delta.tool_calls.unwrap_or_default() {
+                while tool_calls.len() <= call.index {
+                    tool_calls.push(AccumulatedToolCall::default());
+                }
+                let target = &mut tool_calls[call.index];
+                if let Some(id) = call.id {
+                    target.id = id;
+                }
+                if let Some(name) = call
+                    .function
+                    .as_ref()
+                    .and_then(|function| function.name.as_ref())
+                {
+                    target.name = name.clone();
+                }
+                if let Some(arguments) = call.function.and_then(|function| function.arguments) {
+                    target.arguments.push_str(&arguments);
+                }
+            }
+            if choice.finish_reason.is_some() {
+                return build_assistant(content, reasoning, tool_calls, usage);
+            }
         }
-        build_assistant(content, reasoning, tool_calls, usage)
     }
+    build_assistant(content, reasoning, tool_calls, usage)
 }
 
 fn request_error(error: reqwest::Error) -> anyhow::Error {

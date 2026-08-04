@@ -153,7 +153,6 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
         state.factory.root().display(),
         backend_name(state.factory.backend()),
         short_workspace_id(state.factory.root()),
-
         std::process::id()
     );
     let listener = tokio::net::TcpListener::bind((host, port))
