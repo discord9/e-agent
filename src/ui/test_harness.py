@@ -588,7 +588,7 @@ async function main(){
         && firstPin.textContent.trim() === "",
         "html=" + (firstPin ? firstPin.innerHTML.slice(0, 40) : "none"));
     chk("tree row has archive action", firstTreeRow && firstTreeRow.querySelector(".archive-btn") !== null);
-    chk("tree row has delete action", firstTreeRow && firstTreeRow.querySelector(".tree-del") !== null);
+    chk("tree row has no delete button", firstTreeRow !== null && firstTreeRow.querySelector(".tree-del") === null);
     chk("tree filter matches title", treeSessionMatches({ id: "sid-42", title: "标题甲" }, "标题甲"));
     chk("tree filter matches ID when title exists",
         treeSessionMatches({ id: "sid-42", title: "标题甲" }, "SID-42"));
@@ -629,45 +629,16 @@ async function main(){
     chk("status Busy", elsById["chatStatus"].textContent==="处理中", "="+elsById["chatStatus"].textContent);
     chk("cancel enabled when busy", elsById["cancelBtn"].disabled===false);
 
-    // 当前树行真实删除路径：confirm 取消 / DELETE 失败都保留聊天；成功后进入空状态。
+    // 会话行删除按钮已移除（用户决策：pin + archive 已覆盖整理需求，删除
+    // 按钮冗余且不可恢复）：当前树行没有 delete 按钮，DELETE 路径无 UI 入口。
     sessionsData = [{id:"s1",title:"当前会话",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}];
     state.lastList = sessionsData;
     state.workspaceLists[state.workspace.id] = state.lastList;
     renderSidebarTree(true);
-    let currentDelete = elsById["sidebarTree"].querySelector(".tree-del");
-    const deleteFetches = () => FETCHES.filter((u) => u === "/api/sessions/s1").length;
-    const deleteBeforeCancel = deleteFetches();
-    globalThis.confirm = () => false;
-    currentDelete._listeners["click"][0]({ stopPropagation(){} });
-    await flush();
-    chk("current delete confirm cancel sends no DELETE", deleteFetches() === deleteBeforeCancel);
-    chk("current delete confirm cancel keeps chat",
-        state.sessionId === "s1" && !elsById["chatView"].classList.contains("no-session"));
-    globalThis.confirm = () => true;
-
-    sessionDeleteStatus = 500;
-    currentDelete._listeners["click"][0]({ stopPropagation(){} });
-    await flush(); await flush();
-    chk("current delete failure sends DELETE", deleteFetches() === deleteBeforeCancel + 1);
-    chk("current delete failure keeps chat and row",
-        state.sessionId === "s1" && !elsById["chatView"].classList.contains("no-session")
-        && elsById["sidebarTree"].querySelector(".tree-del") !== null);
-    chk("current delete failure shows banner", elsById["bannerText"].textContent.includes("删除失败"));
-
-    sessionDeleteStatus = 204;
-    currentDelete = elsById["sidebarTree"].querySelector(".tree-del");
-    currentDelete._listeners["click"][0]({ stopPropagation(){} });
-    await flush(); await flush();
-    chk("current delete success sends DELETE", deleteFetches() === deleteBeforeCancel + 2);
-    chk("current delete success removes tree row",
-        !state.lastList.some((x) => x.id === "s1") && elsById["sidebarTree"].querySelector(".tree-del") === null);
-    chk("current delete success clears current session", state.sessionId === null);
-    chk("current delete success enters visible empty state",
-        elsById["chatView"].classList.contains("no-session")
-        && !elsById["chatEmpty"].hidden);
-    chk("current delete success hides messages/composer via no-session",
-        elsById["chatView"].classList.contains("no-session"));
-    chk("current delete success opens sidebar", state.sidebar.open === true);
+    chk("current tree row has no delete button",
+        elsById["sidebarTree"].querySelectorAll(".tree-row").length >= 1
+        && elsById["sidebarTree"].querySelector(".tree-del") === null,
+        "del=" + String(elsById["sidebarTree"].querySelector(".tree-del") !== null));
 
     // 还原后续长套件基线。
     sessionsData = [{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}];
@@ -2480,6 +2451,9 @@ async function main(){
     chk("linked subagent still child row",
         !!_subRow && _subRow.classList.contains("tree-row-child"),
         "cls=" + (_subRow && _subRow.className));
+    chk("subagent child row has no delete button",
+        _subRow !== null && _subRow.querySelector(".tree-del") === null,
+        "del=" + String(_subRow && _subRow.querySelector(".tree-del") !== null));
     // composer meta：孤儿 role=main（脏数据）不显示 "· main"；真主会话照常
     state.sessionId = "sub-20260729-200006-ienq";
     updateComposerMeta();
@@ -2868,44 +2842,21 @@ async function main(){
         "A0=" + wsSections[0].querySelector(".tree-node").textContent.slice(0, 40));
 
     // =====================================================================
-    // 10) 删除路由：删除 B 的会话 → 只更新 workspaceLists.B；A 的缓存不动；
-    //     激活=A 时 A 的同名会话缓存/快照不清除（per-ws 键隔离）；
-    //     B 的前端残留（视图缓存 + queue 快照）随删除清理
+    // 10) 会话行删除按钮移除（用户决策：pin + archive 已覆盖整理需求）：
+    //     B 的会话行没有 delete 按钮；组头 ws-del（删除服务器）仍保留
     // =====================================================================
-    state.sessionStates["wsA:b1"] = { html: "cache-A-b1", scrollTop: 0, nextBeforeSeq: null, olderDone: true, draft: "" };
-    state.sessionStates["wsB:b1"] = { html: "cache-B-b1", scrollTop: 0, nextBeforeSeq: null, olderDone: true, draft: "" };
-    state.queues["wsB:b1"] = ["B 排队"];   // B 的 queue 快照残留
-    const aCacheJson = JSON.stringify(state.workspaceLists["wsA"]);
-    const bHadB1 = state.workspaceLists["wsB"].some((x) => x.id === "b1");
     renderSidebarTree(true);
     const bSectionForDelete = [...elsById["sidebarTree"].querySelectorAll(".tree-ws-section")]
       .find((sec) => sec.textContent.includes("服务器B"));
     const bRow = bSectionForDelete && [...bSectionForDelete.querySelectorAll(".tree-row")]
       .find((r) => r.textContent.includes("b1"));
-    chk("agg delete: B row has migrated delete action", bRow !== null && bHadB1
-        && bRow.querySelector(".tree-del") !== null,
-        "row=" + (bRow !== null) + " bHad=" + bHadB1);
-    bRow.querySelector(".tree-del")._listeners["click"][0]({ stopPropagation(){} });
-    await flush();
-    await flush();
-    chk("agg delete: B cache no longer has b1",
-        !state.workspaceLists["wsB"].some((x) => x.id === "b1"),
-        "B=" + JSON.stringify(state.workspaceLists["wsB"].map((x) => x.id)));
-    chk("agg delete: A cache untouched",
-        JSON.stringify(state.workspaceLists["wsA"]) === aCacheJson
-        && state.workspaceLists["wsA"].some((x) => x.id === "a1"),
-        "A=" + JSON.stringify(state.workspaceLists["wsA"].map((x) => x.id)));
-    chk("agg delete: B view cache entry removed (per-ws key)",
-        state.sessionStates["wsB:b1"] === undefined,
-        "st=" + String(state.sessionStates["wsB:b1"] && state.sessionStates["wsB:b1"].html));
-    chk("agg delete: B queue snapshot removed",
-        state.queues["wsB:b1"] === undefined,
-        "q=" + JSON.stringify(state.queues["wsB:b1"]));
-    chk("agg delete: A same-name sessionStates entry untouched (active=A)",
-        state.sessionStates["wsA:b1"] !== undefined
-        && state.sessionStates["wsA:b1"].html === "cache-A-b1",
-        "st=" + String(state.sessionStates["wsA:b1"] && state.sessionStates["wsA:b1"].html));
-    delete state.sessionStates["wsA:b1"];   // 清理测试残留
+    chk("agg no-delete: B session row has no delete button",
+        bRow !== null && bRow.querySelector(".tree-del") === null,
+        "row=" + (bRow !== null));
+    chk("agg no-delete: B group header ws-del (delete server) remains",
+        bSectionForDelete !== null
+        && bSectionForDelete.querySelector(".ws-del") !== null,
+        "sec=" + (bSectionForDelete !== null));
 
     // =====================================================================
     // 11) 非数组 JSON：B 返回 {}（合法 JSON 非数组）→ B 分组显示错误标记、

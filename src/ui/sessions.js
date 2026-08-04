@@ -1784,57 +1784,12 @@ function renderTreeForList(container, list, wsId) {
   }
 }
 
-/* 删除会话：侧边栏是唯一导航，所有会话树行都提供该操作。
-   按 workspace 定位缓存，避免跨服务器同名 session id 误删。 */
-function treeDeleteButton(s, wsId) {
-  const del = el("button", "tree-del danger", "×");
-  del.type = "button";
-  del.title = "删除会话 " + s.id;
-  del.setAttribute("aria-label", del.title);
-  del.addEventListener("click", async (ev) => {
-    ev.stopPropagation();
-    if (!confirm("确认删除会话 " + s.id + " ？")) return;
-    const ws = state.workspaces.find((w) => w.id === wsId);
-    if (!ws) return;
-    del.disabled = true;
-    try {
-      const res = await apiFor(ws, "/api/sessions/" + encodeURIComponent(s.id), { method: "DELETE" });
-      if (res.status === 401 || res.status === 403) {
-        setBanner("⚠ 认证失败：请检查 Token。");
-        return;
-      }
-      if (!res.ok && res.status !== 204) throw new Error("HTTP " + res.status);
-      const list = workspaceListFor(ws);
-      const at = list.findIndex((x) => x.id === s.id);
-      if (at >= 0) list.splice(at, 1);
-      if (ws === state.workspace && state.sessionId === s.id) {
-        // 删除当前会话后不制造另一种导航态：留在聊天空状态，并打开侧边栏。
-        clearCurrentSession();
-        // clearCurrentSession 会先保存离开时视图；删除成功后再清，避免复活缓存。
-      }
-      // 删除成功：清掉该会话的前端残留（视图缓存 + queue 快照），per-ws 键。
-      // 无论删除的会话属于激活 workspace 与否都清理——同名会话按 wsId:sid
-      // 隔离：删 B 的 b1 只清 wsB:b1，A 的同名缓存/快照不受影响。
-      delete state.sessionStates[wsId + ":" + s.id];
-      delete state.queues[wsId + ":" + s.id];
-      removePinOrder(ws.id, s.id);
-      renderSidebarTree(true);
-    } catch (e) {
-      setBanner("⚠ 删除失败：" + e.message);
-    } finally {
-      if (del.isConnected) del.disabled = false;
-    }
-  });
-  return del;
-}
-
 function clearCurrentSession() {
   ++sessionOpenEpoch;
   saveSessionState();
   // 排队条是会话级 UI：清空当前会话 → 同步清空全局 queue（与 openWith
-  // 同款语义，防跨会话串）。这里只清显示、不保存快照：本函数只用于删除
-  // 当前会话（treeDeleteButton），随后会删快照；若在别的场景重开该会话，
-  // 残留快照是「可能过期」的可接受小代价（见 openWith 注释）。
+  // 同款语义，防跨会话串）。这里只清显示、不保存快照：若在别的场景重开
+  // 该会话，残留快照是「可能过期」的可接受小代价（见 openWith 注释）。
   state.queue.length = 0;
   state.queueExpanded = false;
   renderQueueBar();
@@ -1924,7 +1879,7 @@ function buildTreeRoot(s, kids, wsId) {
     const ws = state.workspaces.find((w) => w.id === wsId);
     toggleArchived(s, () => renderSidebarTree(true), ws);
   });
-  row.append(toggle, dot, titleEl, count, pin, archive, treeDeleteButton(s, wsId));
+  row.append(toggle, dot, titleEl, count, pin, archive);
   row.title = (s.title || s.id) + (s.model ? " · " + s.model : "")
     + (s.busy ? "（处理中）" : "")
     + (hasActiveKids ? "（子任务处理中）" : "");
@@ -1998,7 +1953,7 @@ function renderSubagentRows(container, kids, hist, wsId) {
       );
     }
     const badge = el("span", "child-badge", "子");
-    row.append(dot, titleEl, badge, treeDeleteButton(k, wsId));
+    row.append(dot, titleEl, badge);
     // busy 的 subagent：title 提示可发送消息（点击行 openSession 是现有行为，保持不变）
     row.title = (k.label || k.title || k.id) + (k.busy ? "（处理中）· 可发送消息" : "");
     row.addEventListener("click", () => {
