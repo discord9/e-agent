@@ -37,10 +37,13 @@ fn test_read_only_requested() {
 #[test]
 fn test_build_version_is_package_version() {
     assert_eq!(BUILD_VERSION, env!("CARGO_PKG_VERSION"));
-    assert_eq!(
-        version_line(),
-        format!("e-agent {}", env!("CARGO_PKG_VERSION"))
-    );
+    let commit = env!("E_AGENT_COMMIT");
+    let expected = if commit == "unknown" {
+        format!("e-agent {BUILD_VERSION}")
+    } else {
+        format!("e-agent {BUILD_VERSION} ({commit})")
+    };
+    assert_eq!(version_line(), expected);
 }
 
 fn write_skill(base: &std::path::Path, name: &str, content: &str) {
