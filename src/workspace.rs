@@ -332,7 +332,7 @@ impl Workspace {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String> {
     use rustix::fs::{Mode, OFlags, ResolveFlags, mkdirat, openat2};
 
@@ -406,7 +406,7 @@ fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String
         .map_err(|error| format!("write failed: {error}"))
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 fn secure_dir_write(_dir: &Dir, _path: &Path, _content: &[u8]) -> Result<(), String> {
     // Other non-Linux platforms (macOS, BSD, …) keep the original
     // fail-closed behavior: secure directory writes require Linux's
