@@ -773,7 +773,11 @@ impl Agent {
     pub fn background_task_ids(&self) -> &HashSet<u64> {
         &self.running_background
     }
-    pub(crate) fn has_running_background(&self) -> bool {
+    /// Whether this session tracks any background task that must complete
+    /// before the session may finalize. Only non-detached background bash
+    /// tasks are tracked: a detached daemon runs in the shared registry but
+    /// never blocks its spawning session from finishing.
+    pub(crate) fn has_blocking_background(&self) -> bool {
         !self.running_background.is_empty()
     }
 
@@ -953,6 +957,7 @@ impl Agent {
         if result.is_ok()
             && (call.name == "bash" || call.name == "pwsh")
             && is_background_call(call)
+            && !is_detached_background_call(call)
             && let Some(id) = started_task_id(result.as_deref().unwrap_or_default())
         {
             self.running_background.insert(id);
@@ -1228,6 +1233,13 @@ fn is_background_call(call: &ToolCall) -> bool {
     serde_json::from_str::<Value>(&call.arguments)
         .ok()
         .and_then(|value| value.get("background").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn is_detached_background_call(call: &ToolCall) -> bool {
+    serde_json::from_str::<Value>(&call.arguments)
+        .ok()
+        .and_then(|value| value.get("detached").and_then(Value::as_bool))
         .unwrap_or(false)
 }
 

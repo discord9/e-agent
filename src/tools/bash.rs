@@ -135,7 +135,8 @@ impl Tool for Bash {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "shell command"},
-                    "background": {"type": "boolean", "description": "run without blocking; completion is delivered as an event and injected into the next model turn"}
+                    "background": {"type": "boolean", "description": "run without blocking; completion is delivered as an event and injected into the next model turn"},
+                    "detached": {"type": "boolean", "description": "only with background:true — run a daemon, long-lived service, or watcher that must NOT block this session from finishing and whose completion is never delivered. Use the default non-detached background for ordinary async builds/tests/downloads whose completion you want to react to"}
                 },
                 "required": ["command"]
             }),
@@ -144,7 +145,29 @@ impl Tool for Bash {
 
     async fn execute(&self, arguments: Value) -> Result<String, String> {
         let command = required_string(&arguments, "command")?;
-        if optional_bool(&arguments, "background")? {
+        let background = optional_bool(&arguments, "background")?;
+        let detached = optional_bool(&arguments, "detached")?;
+        if detached && !background {
+            return Err(
+                "`detached` requires `background: true`: a detached command runs without \
+                 blocking and never delivers a completion"
+                    .into(),
+            );
+        }
+        if background {
+            if detached {
+                // Daemon / long-lived service / watcher: runs in the shared
+                // registry (task panel stays visible) but never delivers a
+                // completion and never blocks this session from finishing.
+                // Runs under THIS facade's sandbox, like any background
+                // command.
+                return self.background.start_detached(
+                    self.workspace.clone(),
+                    command.to_owned(),
+                    self.protect_git,
+                    self.sandbox.clone(),
+                );
+            }
             // Background commands run under THIS facade's sandbox (possibly a
             // read-only role's narrowed policy), never the shared registry's
             // wider one.

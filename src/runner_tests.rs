@@ -2483,3 +2483,508 @@ async fn prompt_with_image_rejected_then_plain_prompt_succeeds() {
         "rejected image must never be persisted"
     );
 }
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Background bash + FinishWhenIdle (detached vs blocking)
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// Mock bash tool: any background call returns the "started background
+/// task N: label" message (so `Agent::after_tool_entry` tracks the id) and
+/// captures the agent's completion sender so a test can deliver
+/// `BackgroundCompleted` later at its own pace.
+struct MockBackgroundBash {
+    id: u64,
+    label: &'static str,
+    sender: Arc<Mutex<Option<mpsc::UnboundedSender<AgentEvent>>>>,
+}
+
+#[async_trait]
+impl Tool for MockBackgroundBash {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "bash".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<String, String> {
+        Ok(format!(
+            "started background task {}: {}",
+            self.id, self.label
+        ))
+    }
+    fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
+        *self.sender.lock().unwrap() = Some(sender);
+    }
+}
+
+/// Scripted model that records every request context and can block one
+/// designated call (1-based) until released — used to deliver a background
+/// completion while the last model round is still in flight.
+struct BlockingContextCaptureModel {
+    replies: VecDeque<AssistantMessage>,
+    block_call: usize,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+    call_count: usize,
+}
+
+#[async_trait]
+impl Model for BlockingContextCaptureModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.call_count += 1;
+        self.calls.lock().unwrap().push(messages.to_vec());
+        if self.call_count == self.block_call {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok((
+            self.replies.pop_front().expect("unexpected model call"),
+            None,
+        ))
+    }
+}
+
+fn background_bash_call(command: &str, detached: bool) -> ToolCall {
+    let mut arguments = serde_json::json!({"command": command, "background": true});
+    if detached {
+        arguments["detached"] = serde_json::json!(true);
+    }
+    ToolCall {
+        id: "call-1".into(),
+        name: "bash".into(),
+        arguments: arguments.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn unfinished_background_bash_blocks_finish_when_idle_until_completion() {
+    // A non-detached background task keeps the FinishWhenIdle session from
+    // finalizing: the turn ends with an intermediate no-tool-call text, the
+    // runner parks at Idle (not Finished), and only after the completion is
+    // delivered does the model get a new round and the session finalize.
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("cargo build", false)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("build started, waiting".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("build done, final".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        vec![Box::new(MockBackgroundBash {
+            id: 9,
+            label: "cargo build",
+            sender: sender.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "bg-blocks".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("run build".into()));
+
+    // First turn: background tool call + intermediate text. The session
+    // parks at Idle — the unfinished task must block finalization.
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "build started, waiting" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(
+        !matches!(*status.borrow(), SessionStatus::Finished(_)),
+        "an unfinished background task must block FinishWhenIdle"
+    );
+
+    // Deliver the completion: the runner commits it durably, starts a new
+    // model round, and only then finalizes with that round's answer.
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("agent must wire the bash completion sender")
+        .send(AgentEvent::BackgroundCompleted {
+            id: 9,
+            output: "build ok".into(),
+            label: Some("cargo build".into()),
+        })
+        .unwrap();
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "build done, final" => break,
+            AgentEvent::Error(text) => panic!("follow-up turn failed: {text}"),
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("build done, final".into())))
+    );
+    task.join().await.unwrap();
+
+    // The completion entry was persisted before the model's follow-up round.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "bg-blocks")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::BackgroundCompletion { id, output, .. } if *id == 9 && output == "build ok"
+    )));
+}
+
+#[tokio::test]
+async fn detached_daemon_does_not_block_finish_when_idle() {
+    // A detached daemon (background:true, detached:true) runs in the shared
+    // registry but is NOT tracked as a blocking task: the session finalizes
+    // promptly after the final no-tool-call text, and the daemon stays alive
+    // in the registry until explicitly cancelled.
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    let (tools, background) = crate::tools::builtins(workspace, None, false, None);
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("sleep 3600", true)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("daemon started, report done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        tools,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "detached-daemon".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("start daemon".into()));
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "daemon started, report done" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))),
+    )
+    .await
+    .expect("FinishWhenIdle must finalize with a detached daemon running");
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some(
+            "daemon started, report done".into()
+        )))
+    );
+    task.join().await.unwrap();
+
+    // The daemon task is still alive in the shared registry.
+    let daemons = background.running();
+    assert_eq!(daemons.len(), 1, "daemon must stay registered: {daemons:?}");
+    assert_eq!(daemons[0].kind, "bash");
+    // Explicitly cancel to avoid leaking the sleep process past the test.
+    background.cancel(daemons[0].id);
+    assert!(background.running().is_empty());
+}
+
+#[tokio::test]
+async fn content_and_tool_calls_in_same_round_still_block_and_complete() {
+    // An assistant message carrying BOTH content and a background tool call
+    // must not finalize: the content and the tool result are persisted, the
+    // model is called again, and the Completed answer comes from the last
+    // no-tool-call round (after the completion was delivered).
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: Some("plan: start build".into()),
+                    tool_calls: vec![background_bash_call("cargo build", false)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("still waiting".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("final done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        vec![Box::new(MockBackgroundBash {
+            id: 9,
+            label: "cargo build",
+            sender: sender.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "content-calls".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("go".into()));
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "still waiting" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(
+        !matches!(*status.borrow(), SessionStatus::Finished(_)),
+        "content + background tool call must not finalize the session"
+    );
+
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("agent must wire the bash completion sender")
+        .send(AgentEvent::BackgroundCompleted {
+            id: 9,
+            output: "build ok".into(),
+            label: Some("cargo build".into()),
+        })
+        .unwrap();
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "final done" => break,
+            AgentEvent::Error(text) => panic!("follow-up turn failed: {text}"),
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("final done".into())))
+    );
+    task.join().await.unwrap();
+
+    // Both the content-bearing assistant message and the tool result were
+    // persisted; the answer comes from the last no-tool-call round.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "content-calls")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Assistant(message)
+        } if message.content.as_deref() == Some("plan: start build")
+    )));
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Tool { content, .. }
+        } if content == "started background task 9: cargo build"
+    )));
+}
+
+#[tokio::test]
+async fn completion_arriving_during_last_model_round_is_committed_before_finalize() {
+    // The completion arrives while the last model request (which produces
+    // the final no-tool-call text) is still in flight. The runner must
+    // commit the completion and start a model round that responds to it —
+    // never finalize with the pre-completion answer.
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("cargo build", false)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("final answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("reacted to completion".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            block_call: 2,
+            entered: entered.clone(),
+            release: release.clone(),
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![Box::new(MockBackgroundBash {
+            id: 9,
+            label: "cargo build",
+            sender: sender.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "completion-inflight".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("build".into()));
+
+    // Wait until the final model round is in flight, deliver the completion,
+    // then release the round.
+    entered.notified().await;
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("agent must wire the bash completion sender")
+        .send(AgentEvent::BackgroundCompleted {
+            id: 9,
+            output: "build ok".into(),
+            label: Some("cargo build".into()),
+        })
+        .unwrap();
+    release.notify_one();
+
+    // The runner commits the completion first, then starts the responding
+    // model round: the session finalizes with THAT round's answer, proving
+    // it did not finalize with the pre-completion "final answer".
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "reacted to completion" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some(
+            "reacted to completion".into()
+        )))
+    );
+    task.join().await.unwrap();
+
+    // The completion entry was durably committed before the responding
+    // model round ran (the round's context carries it as a user message).
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "completion-inflight")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::BackgroundCompletion { id, output, .. } if *id == 9 && output == "build ok"
+    )));
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "round + completion round: {calls:?}");
+        assert!(
+            calls[2].iter().any(|message| matches!(
+                message,
+                Message::User { content, .. }
+                    if content.contains("[background task 9 completed: cargo build]")
+                        && content.contains("build ok")
+            )),
+            "the responding model round must see the committed completion: {:?}",
+            calls[2]
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_content_without_tool_calls_is_a_natural_turn_end() {
+    // An assistant message with empty content and no tool calls is a
+    // natural turn end: FinishWhenIdle finalizes as Completed(None) —
+    // "pure text" must not be implemented as "non-empty content required".
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![AssistantMessage {
+                content: None,
+                tool_calls: vec![],
+                reasoning: None,
+            }]
+            .into(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "empty-content".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("prompt".into()));
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(None))
+    );
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "empty-content")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Assistant(message)
+        } if message.tool_calls.is_empty()
+    )));
+    task.join().await.unwrap();
+}
