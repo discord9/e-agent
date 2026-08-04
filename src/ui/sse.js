@@ -334,8 +334,9 @@ function applyLiveEvent(name, payload) {
     case "BackgroundCompleted":
     case "BackgroundCompletionNotice": {
       const p = (payload && typeof payload === "object") ? payload : {};
-      const label = p.label ? "（" + p.label + "）" : "";
-      appendNoticeLong("⌛ 后台任务 #" + (p.id ?? "?") + " 完成" + label + "\n",
+      // delegate 后台完成（output 以 "subagent session: " 开头）走专门渲染，
+      // 其余（bash 等）保持 appendNoticeLong 路径
+      appendBackgroundCompletion(p.id ?? "?", p.label,
         pickText(p, ["output", "text", "content"]) || "");
       break;
     }

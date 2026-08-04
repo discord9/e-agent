@@ -64,10 +64,19 @@ function parseEditArguments(args) {
 }
 
 /* buildToolCard 时解析文件工具参数缓存到卡片 expando；innerHTML 快照往返
-   （缓存恢复 / resync 离屏替换）后 expando 丢失，从 .tool-args 的完整 JSON
-   （展开态取 .expand-full 全文，直出取 textContent）重解析 */
+   （缓存恢复 / resync 离屏替换）后 expando 丢失，优先从 data-tool-args
+   （原始参数，属性随快照序列化）重解析；再回退旧 .tool-args 的完整 JSON
+   （展开态取 .expand-full 全文，直出取 textContent——兼容旧版本缓存快照，
+   其 .tool-args 仍是 pretty JSON；新紧凑渲染不是 JSON，解析失败返回 null） */
 function cardArgs(card) {
   if (card._toolArgs) return card._toolArgs;
+  const raw = card.getAttribute("data-tool-args");
+  if (raw != null) {
+    try {
+      const v = JSON.parse(raw);
+      if (v && typeof v === "object") return v;
+    } catch (e) { /* 落到旧 .tool-args 解析 */ }
+  }
   const pre = card.querySelector(".tool-args");
   if (!pre) return null;
   const full = pre.querySelector(".expand-full");
@@ -197,6 +206,266 @@ function renderFileToolResult(resEl, name, args, content) {
     return;
   }
   maybeTruncateEl(resEl, content || "(无输出)", LONG_TEXT_THRESHOLD, null);
+}
+/* =====================================================================
+ * 统一工具结果渲染入口（renderToolResult）+ 统一工具参数渲染
+ * （renderToolArgs）：live（appendToolResult）与 history（renderMessage
+ * 的 m.Tool 分支）共用同一套按工具分派的渲染，保证两种路径行为一致。
+ * 设计约束：不做 renderer 框架，只有普通函数；所有用户内容走 textContent
+ * （防 XSS），格式不匹配时安全回退原文（不丢信息）；不改后端工具协议。
+ * ===================================================================*/
+/* 普通文本结果（含错误）：短直出，长可展开。err 底色由调用方加 .err */
+function renderPlainResult(resEl, content, emptyText) {
+  resEl.textContent = "";
+  resEl.classList.remove("expandable", "expanded");
+  maybeTruncateEl(resEl, content || emptyText, LONG_TEXT_THRESHOLD, null);
+}
+
+/* web_search 结果：直接 markdown 化（renderMarkdown 自带转义 + 安全链接白名单，
+   不做 Exa 结果结构解析）。容器在 buildToolCard 已是 div（.tool-markdown）。 */
+function renderSearchResult(resEl, content) {
+  resEl.classList.add("tool-markdown");
+  resEl.innerHTML = renderMarkdown(String(content == null ? "" : content));
+}
+
+/* delegate 结果：
+   - 后台启动回执 "started background task N: label\nsubagent session: sub-…" →
+     「后台运行 任务 #N label」+ 「子代理会话 sub-…」
+   - 同步完成 "subagent session: sub-…\n<答案>" → 「子代理会话 sub-…」+ 答案 markdown
+   - 不匹配回退原文（错误正文由 isError 分支走 renderPlainResult，保持完整可复制） */
+function renderDelegateResult(resEl, content) {
+  const s = String(content == null ? "" : content);
+  const bg = /^started background task (\d+): ([^\n]*)\nsubagent session: ([^\n]+)$/.exec(s);
+  if (bg) {
+    resEl.classList.add("delegate-result");
+    const wrap = el("div", "delegate-result-wrap");
+    const line = el("div", "delegate-bg-line");
+    line.appendChild(el("span", "delegate-chip", "后台运行"));
+    line.appendChild(el("span", "delegate-label",
+      "任务 #" + bg[1] + (bg[2] ? " " + bg[2] : "")));
+    wrap.appendChild(line);
+    wrap.appendChild(el("div", "delegate-session", "子代理会话 " + bg[3]));
+    resEl.appendChild(wrap);
+    return;
+  }
+  const done = /^subagent session: ([^\n]+)\n?([\s\S]*)$/.exec(s);
+  if (done) {
+    resEl.classList.add("delegate-result");
+    const wrap = el("div", "delegate-result-wrap");
+    wrap.appendChild(el("div", "delegate-session", "子代理会话 " + done[1]));
+    if (done[2]) {
+      const md = el("div", "tool-markdown");
+      md.innerHTML = renderMarkdown(done[2]);
+      wrap.appendChild(md);
+    }
+    resEl.appendChild(wrap);
+    return;
+  }
+  maybeTruncateEl(resEl, s || "(无输出)", LONG_TEXT_THRESHOLD, null);
+}
+
+/* get_background_tasks 结果：
+   - "No background tasks running." → 空状态「当前没有后台任务」
+   - 否则首行标题 + 每行 "#N: desc" 拆成 id/描述行
+   - 不匹配回退原文 */
+const BG_EMPTY_RE = /^No background tasks running\.$/;
+const BG_LINE_RE = /^#(\d+):\s*(.*)$/;
+function renderBackgroundTaskList(resEl, content) {
+  const s = String(content == null ? "" : content);
+  if (s.trim() === "") {   // 空内容：格式不符，回退原文占位
+    maybeTruncateEl(resEl, s || "(无输出)", LONG_TEXT_THRESHOLD, null);
+    return;
+  }
+  if (BG_EMPTY_RE.test(s.trim())) {
+    resEl.appendChild(el("div", "task-empty", "当前没有后台任务"));
+    return;
+  }
+  const lines = s.split("\n");
+  let ok = lines.length >= 1;
+  for (let i = 1; i < lines.length; i++) {
+    if (!BG_LINE_RE.test(lines[i])) { ok = false; break; }
+  }
+  if (!ok) { maybeTruncateEl(resEl, s || "(无输出)", LONG_TEXT_THRESHOLD, null); return; }
+  resEl.classList.add("task-snapshot");
+  const wrap = el("div", "task-snapshot-wrap");
+  wrap.appendChild(el("div", "task-snapshot-head", lines[0]));
+  for (let i = 1; i < lines.length; i++) {
+    const m = BG_LINE_RE.exec(lines[i]);
+    if (!m) continue;   // 空行等：跳过不渲染（结构校验已通过）
+    const row = el("div", "task-snapshot-row");
+    row.appendChild(el("span", "task-snapshot-id", "#" + m[1]));
+    row.appendChild(el("span", "task-snapshot-desc", m[2]));
+    wrap.appendChild(row);
+  }
+  resEl.appendChild(wrap);
+}
+
+/* read_image 结果：后端已剥离 __EA_IMAGE__ marker，这里只有文本摘要；
+   保持现有行为（纯文本，长摘要可展开） */
+function renderImageReceipt(resEl, content) {
+  renderPlainResult(resEl, String(content == null ? "" : content), "(无输出)");
+}
+
+/* 统一结果入口：isError → 纯文本（保持完整可复制）；否则按工具名分派。
+   args 只对文件工具传入（diff 渲染需要）；其余工具结果渲染只依赖 content。 */
+function renderToolResult(resEl, name, args, content, isError) {
+  resEl.textContent = "";
+  resEl.classList.remove("expandable", "expanded");
+  if (isError) { renderPlainResult(resEl, content, "(无错误信息)"); return; }
+  switch (name) {
+    case "read_file":
+    case "write_file":
+    case "edit_file":
+      renderFileToolResult(resEl, name, args, content);
+      return;
+    case "web_search":
+      renderSearchResult(resEl, content);
+      return;
+    case "delegate":
+      renderDelegateResult(resEl, content);
+      return;
+    case "get_background_tasks":
+      renderBackgroundTaskList(resEl, content);
+      return;
+    case "read_image":
+      renderImageReceipt(resEl, content);
+      return;
+    default:
+      renderPlainResult(resEl, content, "(无输出)");
+  }
+}
+/* =====================================================================
+ * 统一工具参数渲染（renderToolArgs）：返回三种值——
+ *   El（结构化紧凑渲染，buildToolCard append 进 .tool-args）
+ *   string（原文回退 / MCP 未知工具 pretty JSON，buildToolCard 走
+ *           maybeTruncateEl 保持长参数可展开）
+ *   null（无参数工具：隐藏参数区，如 get_background_tasks）
+ * 所有用户内容一律 textContent，不拼未转义 HTML。
+ * ===================================================================*/
+/* 文件工具 read_file：📄 path + 可选 chips（offset/limit） */
+function renderReadFileArgs(parsed, rawText) {
+  if (!parsed || typeof parsed !== "object" || typeof parsed.path !== "string") return rawText;
+  const row = el("div", "tool-args-compact");
+  row.appendChild(el("span", "tool-primary", "📄 " + parsed.path));
+  if (parsed.offset != null) row.appendChild(el("span", "tool-chip", "offset " + parsed.offset));
+  if (parsed.limit != null) row.appendChild(el("span", "tool-chip", "limit " + parsed.limit));
+  return row;
+}
+
+/* write_file：✎ path + N 行 + N 字符（完整 content 不显示在参数区，结果 diff 已展示） */
+function renderWriteFileArgs(parsed, rawText) {
+  if (!parsed || typeof parsed !== "object" || typeof parsed.path !== "string"
+      || typeof parsed.content !== "string") return rawText;
+  const row = el("div", "tool-args-compact");
+  row.appendChild(el("span", "tool-primary", "✎ " + parsed.path));
+  row.appendChild(el("span", "tool-chip", parsed.content.split("\n").length + " 行"));
+  row.appendChild(el("span", "tool-chip", parsed.content.length + " 字符"));
+  return row;
+}
+
+/* edit_file：✎ path + 旧 N 行 → 新 M 行（old/new 正文不显示在参数区） */
+function renderEditFileArgs(parsed, rawText) {
+  if (!parsed || typeof parsed !== "object" || typeof parsed.path !== "string"
+      || typeof parsed.old !== "string" || typeof parsed.new !== "string") return rawText;
+  const row = el("div", "tool-args-compact");
+  row.appendChild(el("span", "tool-primary", "✎ " + parsed.path));
+  row.appendChild(el("span", "tool-chip", "旧 " + parsed.old.split("\n").length + " 行"));
+  row.appendChild(el("span", "tool-arrow", "→"));
+  row.appendChild(el("span", "tool-chip", "新 " + parsed.new.split("\n").length + " 行"));
+  return row;
+}
+
+/* web_search：🔎 query */
+function renderSearchArgs(parsed, rawText) {
+  if (!parsed || typeof parsed !== "object" || typeof parsed.query !== "string") return rawText;
+  const row = el("div", "tool-args-compact");
+  row.appendChild(el("span", "tool-query", "🔎 " + parsed.query));
+  return row;
+}
+
+/* delegate：role chip + background chip + label（有才显示）+ task 正文（pre，
+   长任务可展开）+ workspace 行 + resume 行（有才显示）。background 未提供时
+   按 true（后端默认，delegate.rs）。全 textContent。 */
+function renderDelegateArgs(parsed, rawText) {
+  if (!parsed || typeof parsed !== "object" || typeof parsed.task !== "string") return rawText;
+  const wrap = el("div", "delegate-args");
+  const meta = el("div", "delegate-meta");
+  if (parsed.role != null && parsed.role !== "") {
+    meta.appendChild(el("span", "delegate-chip", "role: " + parsed.role));
+  }
+  const bg = parsed.background != null ? !!parsed.background : true;
+  meta.appendChild(el("span", "delegate-chip" + (bg ? " delegate-bg" : ""),
+    bg ? "后台运行" : "前台同步"));
+  if (parsed.label != null && parsed.label !== "") {
+    meta.appendChild(el("span", "delegate-label", String(parsed.label)));
+  }
+  wrap.appendChild(meta);
+  wrap.appendChild(maybeTruncateEl(el("pre", "task-snapshot-body"), parsed.task,
+    LONG_TEXT_THRESHOLD, null));
+  const loc = el("div", "delegate-loc");
+  loc.appendChild(el("div", "delegate-ws",
+    "工作区: " + (parsed.workspace != null ? parsed.workspace : "")));
+  if (parsed.resume != null && parsed.resume !== "") {
+    loc.appendChild(el("div", "delegate-resume", "续接会话: " + parsed.resume));
+  }
+  wrap.appendChild(loc);
+  return wrap;
+}
+
+/* get_background_tasks：无参数 → 隐藏参数区（返回 null）；异常形态回退原文 */
+function renderBackgroundTaskArgs(parsed, rawText) {
+  const empty = String(rawText).trim() === ""
+    || (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0);
+  return empty ? null : rawText;
+}
+
+/* cancel_background_task：取消后台任务 #N */
+function renderCancelBackgroundTaskArgs(parsed, rawText) {
+  if (!parsed || typeof parsed !== "object" || parsed.id == null) return rawText;
+  const row = el("div", "tool-args-compact");
+  row.appendChild(el("span", "tool-primary", "取消后台任务 #" + parsed.id));
+  return row;
+}
+
+/* read_image：🖼 path */
+function renderReadImageArgs(parsed, rawText) {
+  if (!parsed || typeof parsed !== "object" || typeof parsed.path !== "string") return rawText;
+  const row = el("div", "tool-args-compact");
+  row.appendChild(el("span", "tool-primary", "🖼 " + parsed.path));
+  return row;
+}
+
+/* bash / pwsh（Windows 工具名）：$ command + background:true 时追加
+   [background] 徽标；缺 command 字段回退原文 */
+function renderBashArgs(parsed, rawText) {
+  if (!parsed || typeof parsed !== "object" || typeof parsed.command !== "string") return rawText;
+  const row = el("div", "tool-args-compact");
+  row.appendChild(el("span", "tool-primary", "$ " + parsed.command));
+  if (parsed.background === true) {
+    row.appendChild(el("span", "tool-chip tool-bg", "[background]"));
+  }
+  return row;
+}
+
+/* 统一参数入口：按工具名分派；MCP/未知工具保持 pretty JSON（向后兼容，
+   旧快照的 .tool-args 也依赖此形态回退解析） */
+function renderToolArgs(name, parsed, rawText) {
+  switch (name) {
+    case "read_file": return renderReadFileArgs(parsed, rawText);
+    case "write_file": return renderWriteFileArgs(parsed, rawText);
+    case "edit_file": return renderEditFileArgs(parsed, rawText);
+    case "web_search": return renderSearchArgs(parsed, rawText);
+    case "delegate": return renderDelegateArgs(parsed, rawText);
+    case "get_background_tasks": return renderBackgroundTaskArgs(parsed, rawText);
+    case "cancel_background_task": return renderCancelBackgroundTaskArgs(parsed, rawText);
+    case "read_image": return renderReadImageArgs(parsed, rawText);
+    case "bash":
+    case "pwsh":
+      return renderBashArgs(parsed, rawText);
+    default:
+      try { return JSON.stringify(JSON.parse(rawText), null, 2); }
+      catch (e) { return rawText; }
+  }
 }
 /* =====================================================================
  * Markdown 渲染：marked + KaTeX（内嵌，单 HTML 自包含）。
@@ -458,18 +727,17 @@ function appendToolResult(isError, content, acc, callId) {
     const resEl = card.querySelector(".tool-result");
     resEl.classList.remove("pending");
     resEl.classList.toggle("err", isError);
+    // 统一结果渲染（与 history 的 renderMessage 同一条 renderToolResult 路径）。
     // 文件工具（edit/read/write）成功 → 差异化渲染（diff / 行号视图）；
     // 结果要可见，卡片保持展开。其余工具维持原行为：文本 + 收起。
     const name = cardToolName(card);
     const tArgs = (name === "edit_file" || name === "read_file" || name === "write_file")
       ? cardArgs(card) : null;
     const isFileTool = tArgs !== null;
+    renderToolResult(resEl, name, tArgs, content, isError);
     if (isFileTool && !isError) {
-      renderFileToolResult(resEl, name, tArgs, content);
       card.setAttribute("open", "");
     } else {
-      maybeTruncateEl(resEl, content || (isError ? "(无错误信息)" : "(无输出)"),
-        LONG_TEXT_THRESHOLD, null);
       card.removeAttribute("open");   // 结果到达：收起为标题行（默认折叠）
     }
   } else {
@@ -494,30 +762,35 @@ function buildToolCard(name, args, stateText, stateCls, resultText) {
   const st = el("span", "tool-state", stateText);
   head.append(nm, st);
 
-  let argsText = args != null ? String(args) : "";
-  let pretty = argsText;
-  try {
-    const parsed = JSON.parse(argsText);
-    // bash：只显示 command 字段（去掉 {"command": ...} JSON 包装，加 $ 前缀
-    // 更像终端），其余工具保持 pretty JSON。
-    if (name === "bash" && parsed && typeof parsed === "object"
-        && typeof parsed.command === "string") {
-      pretty = "$ " + parsed.command;
-    } else {
-      pretty = JSON.stringify(parsed, null, 2);
-    }
-  } catch (e) { /* 保持原文 */ }
-  // 先 append 到 card（maybeTruncateEl 需要 parentNode 把按钮插到 pre 后面），
-  // 再处理长内容展开
-  const argsEl = el("pre", "tool-args");
-  // 文件工具结果区是结构化 DOM（diff 行 / 行号行），用 div；其余保持 pre 语义
-  const isFileTool = name === "edit_file" || name === "read_file" || name === "write_file";
-  const resEl = el(isFileTool ? "div" : "pre", "tool-result " + stateCls);
+  const argsText = args != null ? String(args) : "";
+  let parsed = null;
+  try { parsed = JSON.parse(argsText); } catch (e) { /* 原文回退 */ }
+  // 结构化结果（diff 行 / markdown / 任务列表）用 div；其余保持 pre 语义。
+  // read_image 结果仍是文本摘要，维持 pre。
+  const structuredResult = name === "edit_file" || name === "read_file"
+    || name === "write_file" || name === "web_search" || name === "delegate"
+    || name === "get_background_tasks";
+  const argsEl = el("div", "tool-args");
+  const resEl = el(structuredResult ? "div" : "pre", "tool-result " + stateCls);
   card.append(head, argsEl, resEl);
-  maybeTruncateEl(argsEl, pretty, LONG_TEXT_THRESHOLD, null, "参数");
+  // 统一参数渲染：null → 隐藏参数区（无参数工具）；string → 原文/pretty JSON
+  // （maybeTruncateEl 保持长参数可展开）；El → 结构化紧凑渲染直接放入
+  const argsNode = renderToolArgs(name, parsed, argsText);
+  if (argsNode === null) {
+    argsEl.hidden = true;
+  } else if (typeof argsNode === "string") {
+    maybeTruncateEl(argsEl, argsNode, LONG_TEXT_THRESHOLD, null, "参数");
+  } else {
+    argsEl.appendChild(argsNode);
+  }
   maybeTruncateEl(resEl,
     resultText != null ? resultText : (stateCls === "pending" ? "等待结果…" : ""),
     LONG_TEXT_THRESHOLD, null, "结果");
+  // 原始参数存 data-tool-args（属性随 innerHTML 快照序列化）：快照往返
+  // （缓存恢复 / resync 离屏替换）后 expando（_toolArgs）丢失，cardArgs
+  // 优先从该属性重解析——文件工具的 .tool-args 已是紧凑渲染（不再含 JSON），
+  // 没有它文件 diff 在快照恢复后会失效。
+  card.setAttribute("data-tool-args", argsText);
   // 文件工具：解析参数供结果到达后的差异化渲染（diff / 行号视图）。
   // expando 在 innerHTML 快照往返后丢失，cardArgs/cardToolName 会从 DOM 重解析。
   card._toolName = name;
@@ -591,6 +864,35 @@ function appendNoticeLong(prefix, text) {
   if (prefix) n.append(prefix);
   const pre = maybeTruncateEl(el("pre", "notice-output"), text, LONG_TEXT_THRESHOLD, null);
   n.append(pre);
+  els.messages.appendChild(n);
+  scrollBottom(false);
+  pruneMessages();
+  return n;
+}
+
+/* 后台任务最终完成（live BackgroundCompleted 事件与 history background_completion
+   条目共用）：output 以 "subagent session: " 开头 → delegate 完成（子代理会话 +
+   markdown 答案）；否则走现有 bash 路径（appendNoticeLong）。 */
+function appendBackgroundCompletion(id, label, output) {
+  const s = String(output == null ? "" : output);
+  const m = /^subagent session: ([^\n]+)\n?([\s\S]*)$/.exec(s);
+  if (!m) {
+    return appendNoticeLong("⌛ 后台任务 #" + (id ?? "?") + " 完成"
+      + (label ? "（" + label + "）" : "") + "\n", s);
+  }
+  freezeAssistant(state.acc);
+  const n = el("div", "notice delegate-complete");
+  const line = el("div", "delegate-bg-line");
+  line.appendChild(el("span", "delegate-chip", "后台运行"));
+  line.appendChild(el("span", "delegate-label",
+    "任务 #" + (id ?? "?") + (label ? " " + label : "")));
+  n.appendChild(line);
+  n.appendChild(el("div", "delegate-session", "子代理会话 " + m[1]));
+  if (m[2]) {
+    const md = el("div", "tool-markdown");
+    md.innerHTML = renderMarkdown(m[2]);
+    n.appendChild(md);
+  }
   els.messages.appendChild(n);
   scrollBottom(false);
   pruneMessages();
@@ -672,9 +974,7 @@ function renderEntry(entry, acc, pendingCards) {
     case "compaction": return appendCompaction(entry.summary);
     case "notice": return appendNotice(entry.text);
     case "background_completion":
-      return appendNoticeLong("⌛ 后台任务 #" + (entry.id ?? "?") + " 完成"
-        + (entry.label ? "（" + entry.label + "）" : "") + "\n",
-        entry.output || "");
+      return appendBackgroundCompletion(entry.id ?? "?", entry.label, entry.output || "");
     case "forked_from":
       els.messages.appendChild(el("div", "forked",
         "分叉自会话 " + shortId(entry.source) + " @ 条目 #" + (entry.at ?? "?")));
@@ -744,13 +1044,9 @@ function renderMessage(m, acc, pendingCards) {
       const name = cardToolName(card);
       const tArgs = (name === "edit_file" || name === "read_file" || name === "write_file")
         ? cardArgs(card) : null;
-      const isFileTool = tArgs !== null;
-      if (isFileTool && !t.is_error) {
-        renderFileToolResult(resEl, name, tArgs, t.content);
-      } else {
-        maybeTruncateEl(resEl, t.content || (t.is_error ? "(无错误信息)" : "(无输出)"),
-          LONG_TEXT_THRESHOLD, null);
-      }
+      // 与 live 路径同一 renderToolResult：特殊结果（web_search / delegate /
+      // get_background_tasks / 文件 diff）在 history 重放时渲染一致
+      renderToolResult(resEl, name, tArgs, t.content, t.is_error);
     } else {
       // 无对应 ToolCall（如历史截断后）：独立卡片
       const card2 = buildToolCard(t.name, "", t.is_error ? "失败" : "完成",
