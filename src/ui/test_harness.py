@@ -1458,6 +1458,18 @@ async function main(){
         && shortCardA.querySelector(".expand-footer") === null
         && argsShortA.textContent === JSON.stringify(JSON.parse('{"cmd":"ls"}'), null, 2),
         "text=" + JSON.stringify(argsShortA.textContent));
+    // bash 的 command 字段直接渲染为 "$ <cmd>"（去掉 JSON 包装，像终端）
+    const bashCard = buildToolCard("bash", '{"command":"cd /tmp && ls"}', "完成", "", "ok");
+    const bashArgs = bashCard.querySelector(".tool-args");
+    chk("bash command rendered as terminal line",
+        bashArgs.textContent === "$ cd /tmp && ls",
+        "text=" + JSON.stringify(bashArgs.textContent));
+    // 非 bash 工具不特殊处理（仍 pretty JSON）
+    const nonBashCard = buildToolCard("read_file", '{"path":"/a","offset":1}', "完成", "", "ok");
+    chk("non-bash tool keeps pretty JSON args",
+        nonBashCard.querySelector(".tool-args").textContent
+          === JSON.stringify(JSON.parse('{"path":"/a","offset":1}'), null, 2),
+        "text=" + JSON.stringify(nonBashCard.querySelector(".tool-args").textContent));
     // 点击展开 → 显示全文；再点收起 → 回到预览
     // 按钮在正文 pre 外面（紧跟其后），不在 pre 内部
     chk("A expand button inside pre",

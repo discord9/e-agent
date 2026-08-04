@@ -496,7 +496,17 @@ function buildToolCard(name, args, stateText, stateCls, resultText) {
 
   let argsText = args != null ? String(args) : "";
   let pretty = argsText;
-  try { pretty = JSON.stringify(JSON.parse(argsText), null, 2); } catch (e) { /* 保持原文 */ }
+  try {
+    const parsed = JSON.parse(argsText);
+    // bash：只显示 command 字段（去掉 {"command": ...} JSON 包装，加 $ 前缀
+    // 更像终端），其余工具保持 pretty JSON。
+    if (name === "bash" && parsed && typeof parsed === "object"
+        && typeof parsed.command === "string") {
+      pretty = "$ " + parsed.command;
+    } else {
+      pretty = JSON.stringify(parsed, null, 2);
+    }
+  } catch (e) { /* 保持原文 */ }
   // 先 append 到 card（maybeTruncateEl 需要 parentNode 把按钮插到 pre 后面），
   // 再处理长内容展开
   const argsEl = el("pre", "tool-args");
