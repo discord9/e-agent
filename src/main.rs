@@ -42,7 +42,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn version_line() -> String {
-    format!("e-agent {BUILD_VERSION}")
+    let commit = env!("E_AGENT_COMMIT");
+    if commit == "unknown" {
+        format!("e-agent {BUILD_VERSION}")
+    } else {
+        format!("e-agent {BUILD_VERSION} ({commit})")
+    }
 }
 
 fn version_requested(arguments: &[String]) -> anyhow::Result<bool> {
