@@ -427,7 +427,16 @@ async fn hard_link_created_with_different_case_inside_root_installs_succeeds() {
     let original = workspace_root.join("original.txt");
     let linked = workspace_root.join("ORIGINAL.TXT");
     std::fs::write(&original, "content").unwrap();
-    std::fs::hard_link(&original, &linked).unwrap();
+    // NTFS is case-insensitive: "ORIGINAL.TXT" in the same directory IS
+    // "original.txt", so hard_link fails with AlreadyExists (os error 183)
+    // — a case-only alias cannot be created on a case-insensitive volume.
+    // That is exactly the scenario the membership check must handle, so
+    // skip when the volume rejects it (e.g. NTFS); on case-sensitive
+    // filesystems the link succeeds and the test runs for real.
+    if let Err(e) = std::fs::hard_link(&original, &linked) {
+        eprintln!("skipping: cannot create case-only hard link: {e}");
+        return;
+    }
 
     // The second alias name differs in case from the first. NTFS preserves
     // the stored case, so membership must be decided with a Windows
@@ -493,9 +502,12 @@ async fn restricted_token_preserves_output_and_nonzero_exit() {
         "set -e; printf out; printf err >&2; exit 7"
     } else {
         // [Console]::Error.WriteLine() is a method invocation — forbidden in
-        // ConstrainedLanguage mode under the restricted token. Write-Error is
-        // a native cmdlet (no method call) and still writes to stderr.
-        "$ErrorActionPreference='Stop'; Write-Output 'out'; Write-Error 'err'; exit 7"
+        // ConstrainedLanguage mode under the restricted token. Write-Error
+        // under $ErrorActionPreference='Stop' aborts the script before
+        // 'exit 7' runs (the process exits 1 instead). cmd's stderr
+        // redirection is native and unaffected by PowerShell's language
+        // mode, and the script continues to the exit.
+        "$ErrorActionPreference='Stop'; Write-Output 'out'; cmd /c echo err 1>&2; exit 7"
     };
     let error = bash.execute(json!({"command": command})).await.unwrap_err();
     assert!(error.contains("exit code: 7"), "{error}");
