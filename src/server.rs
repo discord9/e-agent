@@ -89,6 +89,31 @@ fn tail_snapshot(mut events: Vec<AgentEvent>) -> Vec<AgentEvent> {
 // Startup
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+/// Human-readable session-backend type name for the startup log. Never
+/// Debug-prints the enum: a Greptime conn string may embed credentials.
+fn backend_name(backend: &crate::config::SessionBackend) -> &'static str {
+    match backend {
+        crate::config::SessionBackend::Jsonl => "jsonl",
+        crate::config::SessionBackend::Greptime { .. } => "greptime",
+        crate::config::SessionBackend::Sqlite { .. } => "sqlite",
+    }
+}
+
+/// Short stable hash (FNV-1a 32-bit, hex) of the canonical workspace root —
+/// a compact stand-in for the full `workspace_id` (which is the root path
+/// itself, see `session_greptime::derive_workspace_id`). Lets a startup log
+/// line cross-reference the backend's workspace_id column without repeating
+/// a long path.
+fn short_workspace_id(root: &std::path::Path) -> String {
+    let bytes = root.to_string_lossy();
+    let mut hash = 0x811c_9dc5u32;
+    for &b in bytes.as_bytes() {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{hash:08x}")
+}
+
 /// Bind, authenticate, and serve until Ctrl-C. The factory is resolved once
 /// here and reused by every session `build()`.
 pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Result<()> {
@@ -117,6 +142,17 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
         token_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<no state dir>".to_owned())
+    );
+    // 启动可观测性：canonical workspace root、backend 类型、workspace_id
+    // 短 hash、PID。workspace_id 由 canonical root 派生（见
+    // session_greptime::derive_workspace_id），短 hash 便于多实例日志对照；
+    // 排查「响应来自哪台实例」时不用再对着长路径数。
+    eprintln!(
+        "e-agent: workspace {} backend {} workspace_id {} pid {}",
+        state.factory.root().display(),
+        backend_name(state.factory.backend()),
+        short_workspace_id(state.factory.root()),
+        std::process::id()
     );
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
@@ -214,7 +250,8 @@ fn router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/tasks/{task_id}/output",
             get(task_output),
         )
-        .route_layer(from_fn_with_state(state.clone(), require_auth));
+        .route_layer(from_fn_with_state(state.clone(), require_auth))
+        .layer(from_fn(cache_control_middleware));
     Router::new()
         .route("/", get(index))
         .merge(api)
@@ -263,6 +300,27 @@ async fn cors_middleware(request: Request<Body>, next: Next) -> Response {
     response.headers_mut().insert(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
         header::HeaderValue::from_static("*"),
+    );
+    response
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Cache control
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// Cache-control middleware for every dynamic `/api/*` response. `no-store`
+/// forbids the browser from serving a stale API response out of its HTTP
+/// cache — the exact class of bug that mislabeled pinned sessions across
+/// workspaces (a browser-held response from an old instance / old connection
+/// kept being re-read after the instance died). The static UI already sends
+/// its own `no-store`; this only touches the API sub-router. Preflight
+/// (`OPTIONS`) is answered by `cors_middleware` before reaching here and
+/// carries no data, so it needs no cache header.
+async fn cache_control_middleware(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
     );
     response
 }
@@ -1350,7 +1408,8 @@ async fn cancel_task(
 /// UTF-8). Unlike `/api/tasks`' 2000-char output tail this is the
 /// untruncated full spool (keep-first capped at 16 MiB), so the frontend
 /// can poll it while a task streams. `Cache-Control: no-cache` keeps
-/// polling honest. 404 for an unknown session, a subagent session (its
+/// polling honest (the global API middleware upgrades it to `no-store` on
+/// the wire). 404 for an unknown session, a subagent session (its
 /// tasks live in the parent's registry), or a task with no output spool
 /// (delegate tasks).
 async fn task_output(
@@ -2369,6 +2428,58 @@ mod tests {
                 .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
                 .unwrap(),
             "*"
+        );
+        // 动态 API 响应必须带 Cache-Control: no-store（防浏览器缓存旧实例
+        // 响应 → stale 列表误标；见 cache_control_middleware）。
+        assert_eq!(
+            get.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "authed GET /api/sessions must be no-store"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_responses_are_never_cached() {
+        use tower::util::ServiceExt;
+        let app = router(Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(std::env::temp_dir()),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+        }));
+        // 未认证也带 no-store：401 同样不该被浏览器缓存复用。
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            unauth.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        // 其它动态端点（history）同规约。
+        let history = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/whatever/history")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            history.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "GET /api/sessions/{{id}}/history must be no-store"
         );
     }
 
@@ -4756,7 +4867,8 @@ model = "deepseek-chat"
 
     /// `GET /api/sessions/{id}/tasks/{task_id}/output` serves the full
     /// captured output of a running bash task as text/plain with
-    /// `Cache-Control: no-cache` (proving it is the full spool, not the
+    /// `Cache-Control: no-store` (the global API middleware upgrades the
+    /// handler's `no-cache`; proving it is the full spool, not the
     /// 16 KiB tail `/api/tasks` serves), and 404s for unknown sessions,
     /// subagent sessions (no registry of their own), unknown task ids, and
     /// delegate tasks (no output spool).
@@ -4830,8 +4942,8 @@ model = "deepseek-chat"
             headers
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
-            Some("no-cache"),
-            "polling endpoint must not be cached"
+            Some("no-store"),
+            "polling endpoint must not be cached (global API middleware upgrades the handler's no-cache to no-store)"
         );
         assert_eq!(
             headers

@@ -498,7 +498,10 @@ async function apiFor(ws, path, opts = {}) {
   if (opts.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
   const base = (ws && ws.url) ? ws.url : "";
   const url = base ? base + (path.startsWith("/") ? path : "/" + path) : path;
-  return fetch(url, Object.assign({}, opts, { headers }));
+  // cache: "no-store" 禁止浏览器 HTTP 缓存复用 API 响应：旧实例/旧连接的
+  // 响应一旦被缓存，实例切换/退出后前端仍会读到 stale 数据（多 workspace
+  // 误标根因）。放在 opts 之后合并，调用方无法覆盖。
+  return fetch(url, Object.assign({}, opts, { headers, cache: "no-store" }));
 }
 
 /* 统一请求入口（激活 workspace）：自动附带 Authorization header；路径自动
