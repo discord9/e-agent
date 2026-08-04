@@ -1,24 +1,28 @@
 //! Minimal Windows write sandbox: stable capability ACLs plus a restricted
 //! primary token. This deliberately does not attempt read or network isolation.
 
-use std::ffi::{OsStr, c_void};
+use std::ffi::{OsStr, OsString, c_void};
 use std::mem::{size_of, zeroed};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Globalization::CompareStringOrdinal;
 use windows_sys::Win32::Security::Authorization::*;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
 use windows_sys::Win32::System::Pipes::CreatePipe;
-use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, SE_GROUP_LOGON_ID};
+use windows_sys::Win32::System::SystemServices::{
+    ACCESS_ALLOWED_ACE_TYPE, MAXDWORD, SE_GROUP_LOGON_ID,
+};
 use windows_sys::Win32::System::Threading::*;
 
 use crate::config::Sandbox;
@@ -34,6 +38,19 @@ impl Drop for Handle {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
             unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// Search handle for `FindFirstFileNameW`/`FindNextFileNameW`. Must be
+/// closed with `FindClose`, NOT `CloseHandle`, so the existing [`Handle`]
+/// wrapper (whose drop calls `CloseHandle`) is unusable here.
+struct FindHandle(HANDLE);
+unsafe impl Send for FindHandle {}
+impl Drop for FindHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            unsafe { FindClose(self.0) };
         }
     }
 }
@@ -158,12 +175,18 @@ fn last_error(context: &str) -> String {
     format!("{context}: {}", std::io::Error::last_os_error())
 }
 
-fn stable_sid_key(path: &Path, class: &str) -> Vec<u8> {
+/// Version tag embedded in every capability SID. v4 splits the directory
+/// capability into two explicit ACEs — the full capability mask plus an
+/// inherit-only DELETE carrier — because FILE_DELETE_CHILD alone does not
+/// cover deleting/renaming pre-existing files from the restricted token.
+/// A new version makes the one-time ACL upgrade explicit and leaves v3 ACEs
+/// inert (they never match the v4 structural check).
+const CAPABILITY_VERSION: &[u8] = b"e-agent/windows-write-capability/v4";
+
+fn capability_key(path: &Path, class: &str, version: &[u8]) -> Vec<u8> {
     let path: Vec<u16> = path.as_os_str().encode_wide().collect();
     let class = class.as_bytes();
-    // v3 adds FILE_DELETE_CHILD to directory capabilities. A new stable SID
-    // makes the one-time ACL upgrade explicit and leaves v2 ACEs inert.
-    let mut key = b"e-agent/windows-write-capability/v3".to_vec();
+    let mut key = version.to_vec();
     key.extend_from_slice(&(class.len() as u64).to_le_bytes());
     key.extend_from_slice(class);
     key.extend_from_slice(&(path.len() as u64).to_le_bytes());
@@ -173,8 +196,12 @@ fn stable_sid_key(path: &Path, class: &str) -> Vec<u8> {
     key
 }
 
-fn stable_sid(path: &Path, class: &str) -> String {
-    let digest = Sha256::digest(stable_sid_key(path, class));
+fn stable_sid_key(path: &Path, class: &str) -> Vec<u8> {
+    capability_key(path, class, CAPABILITY_VERSION)
+}
+
+fn sid_from_key(key: &[u8]) -> String {
+    let digest = Sha256::digest(key);
     let mut words = [0u32; 4];
     for (word, bytes) in words.iter_mut().zip(digest.chunks_exact(4)) {
         *word = u32::from_le_bytes(bytes.try_into().expect("four bytes"));
@@ -183,6 +210,13 @@ fn stable_sid(path: &Path, class: &str) -> String {
         "S-1-5-21-{}-{}-{}-{}",
         words[0], words[1], words[2], words[3]
     )
+}
+
+/// Synthetic capability SID for `path`+`class` under the current version.
+/// `pub(super)` so the sibling integration tests can verify the installed
+/// root ACL against the same SID the sandbox would install.
+pub(super) fn stable_sid(path: &Path, class: &str) -> String {
+    sid_from_key(&stable_sid_key(path, class))
 }
 
 fn string_sid(value: &str) -> Result<LocalPtr, String> {
@@ -260,37 +294,67 @@ fn explicit_entry(
     }
 }
 
-unsafe fn acl_has_equivalent_ace(
-    acl: *const ACL,
-    sid: PSID,
-    mask: u32,
-    inheritance: ACE_FLAGS,
-) -> bool {
+const CAPABILITY_MASK: u32 =
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | FILE_DELETE_CHILD;
+const CAPABILITY_INHERITANCE: ACE_FLAGS = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+/// Inheritance flags of the second capability ACE. OBJECT_INHERIT_ACE on a
+/// directory is inherited by direct child files as an effective ACE and by
+/// child directories as an inherit-only ACE (per the documented ACE
+/// inheritance rules), so the root itself never receives DELETE, subdirectories
+/// only carry the ACE onward, and files at any depth eventually get DELETE.
+const DELETE_ACE_INHERITANCE: u8 = (OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE) as u8;
+
+/// Exact structural check for the current (v4) capability layout on a write
+/// root: exactly two non-inherited ACCESS_ALLOWED_ACEs for `sid` — one with
+/// the full capability mask and container/object inheritance, one inherit-only
+/// DELETE carrier — and no other explicit allow/deny ACE for the same SID.
+/// ACE order is deliberately not a matching condition; quantity and content
+/// must match exactly. Inherited ACEs (INHERITED_ACE set) can never satisfy
+/// the explicit install. `pub(super)` so the sibling integration tests can
+/// verify a real installed ACL against the same check.
+///
+/// # Safety
+/// `acl` must point to a valid, readable `ACL` (e.g. one returned by
+/// `GetNamedSecurityInfoW` or built by `InitializeAcl`) and `sid` must be a
+/// valid SID for the lifetime of the call.
+pub(super) unsafe fn v4_ace_layout_matches(acl: *const ACL, sid: PSID) -> bool {
     let count = unsafe { (*acl).AceCount } as u32;
+    let mut main = false;
+    let mut delete = false;
     for index in 0..count {
         let mut raw = null_mut();
         if unsafe { GetAce(acl, index, &mut raw) } == 0 || raw.is_null() {
             continue;
         }
         let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
-        let ace_sid = (&ace.SidStart as *const u32).cast_mut().cast();
-        if ace.Header.AceType == ACCESS_ALLOWED_ACE_TYPE as u8
-            && ace.Header.AceFlags & !INHERITED_ACE as u8 == inheritance as u8
-            && ace.Mask == mask
-            && unsafe { EqualSid(ace_sid, sid) } != 0
+        if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE as u8
+            || ace.Header.AceFlags & INHERITED_ACE as u8 != 0
         {
-            return true;
+            continue;
+        }
+        let ace_sid = (&ace.SidStart as *const u32).cast_mut().cast();
+        if unsafe { EqualSid(ace_sid, sid) } == 0 {
+            continue;
+        }
+        if ace.Mask == CAPABILITY_MASK && ace.Header.AceFlags == CAPABILITY_INHERITANCE as u8 {
+            if main {
+                return false; // duplicate capability ACE
+            }
+            main = true;
+        } else if ace.Mask == DELETE && ace.Header.AceFlags == DELETE_ACE_INHERITANCE {
+            if delete {
+                return false; // duplicate delete ACE
+            }
+            delete = true;
+        } else {
+            return false; // same SID with an unexpected explicit allow/deny
         }
     }
-    false
+    main && delete
 }
 
-const CAPABILITY_MASK: u32 =
-    FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | FILE_DELETE_CHILD;
-const CAPABILITY_INHERITANCE: ACE_FLAGS = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
-
 fn needs_install(acl: *const ACL, sid: PSID) -> bool {
-    !unsafe { acl_has_equivalent_ace(acl, sid, CAPABILITY_MASK, CAPABILITY_INHERITANCE) }
+    !unsafe { v4_ace_layout_matches(acl, sid) }
 }
 
 struct RootAcl {
@@ -300,7 +364,10 @@ struct RootAcl {
     _descriptor: LocalPtr,
 }
 
-fn file_link_count(path: &Path) -> Result<u32, String> {
+/// Open a descendant file and read both its link count and its volume/file
+/// identity. One open keeps the two observations free of a TOCTOU window
+/// between them.
+fn file_identity(path: &Path) -> Result<(u32, FILE_ID_INFO), String> {
     let path_w = wide(path.as_os_str());
     let handle = unsafe {
         CreateFileW(
@@ -327,10 +394,246 @@ fn file_link_count(path: &Path) -> Result<u32, String> {
             path.display()
         )));
     }
-    Ok(information.nNumberOfLinks)
+    let mut identity: FILE_ID_INFO = unsafe { zeroed() };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle.0,
+            FileIdInfo,
+            (&mut identity as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(last_error(&format!(
+            "cannot read file identity for descendant {}",
+            path.display()
+        )));
+    }
+    Ok((information.nNumberOfLinks, identity))
 }
 
-fn scan_descendants(root: &Path) -> Result<(), String> {
+/// Enumerate every hard-link name of `path`. The names are volume-relative
+/// (typically starting with `\`); callers join them onto the volume mount
+/// point. The buffer grows dynamically on ERROR_MORE_DATA; every
+/// FindNextFileNameW call resets the length; only ERROR_HANDLE_EOF ends the
+/// enumeration and any other error fails closed.
+fn enumerate_hard_link_names(path: &Path) -> Result<Vec<Vec<u16>>, String> {
+    let path_w = wide(path.as_os_str());
+    let mut buffer: Vec<u16> = vec![0; 256];
+    let mut length = buffer.len() as u32;
+    let mut search =
+        unsafe { FindFirstFileNameW(path_w.as_ptr(), 0, &mut length, buffer.as_mut_ptr()) };
+    if search == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+            return Err(last_error(&format!(
+                "FindFirstFileNameW failed for {}",
+                path.display()
+            )));
+        }
+        buffer.resize(length as usize + 1, 0);
+        length = buffer.len() as u32;
+        search =
+            unsafe { FindFirstFileNameW(path_w.as_ptr(), 0, &mut length, buffer.as_mut_ptr()) };
+        if search == INVALID_HANDLE_VALUE {
+            return Err(last_error(&format!(
+                "FindFirstFileNameW failed for {}",
+                path.display()
+            )));
+        }
+    }
+    let search = FindHandle(search);
+    let mut names = Vec::new();
+    loop {
+        let mut name = buffer[..(length as usize).min(buffer.len())].to_vec();
+        if name.last() == Some(&0) {
+            name.pop();
+        }
+        names.push(name);
+        length = buffer.len() as u32;
+        let mut found = unsafe { FindNextFileNameW(search.0, &mut length, buffer.as_mut_ptr()) };
+        if found == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+                break;
+            }
+            if error.raw_os_error() == Some(ERROR_MORE_DATA as i32) {
+                buffer.resize(length as usize + 1, 0);
+                length = buffer.len() as u32;
+                found = unsafe { FindNextFileNameW(search.0, &mut length, buffer.as_mut_ptr()) };
+                if found == 0 {
+                    return Err(last_error(&format!(
+                        "FindNextFileNameW failed for {}",
+                        path.display()
+                    )));
+                }
+                continue;
+            }
+            return Err(last_error(&format!(
+                "FindNextFileNameW failed for {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(names)
+}
+
+/// Long form of `path` (also resolves short/8.3 components), or a
+/// fail-closed error when the path no longer exists. Verbatim `\\?\` and
+/// UNC prefixes are normalized to ordinary DOS spelling first so results
+/// compare equal with configured roots.
+fn long_path(path: &Path) -> Result<PathBuf, String> {
+    let path = crate::strip_verbatim_prefix(path);
+    let path_w = wide(path.as_os_str());
+    let needed = unsafe { GetLongPathNameW(path_w.as_ptr(), null_mut(), 0) };
+    if needed == 0 {
+        return Err(last_error(&format!(
+            "cannot resolve long path for {}",
+            path.display()
+        )));
+    }
+    let mut buffer = vec![0u16; needed as usize];
+    let written = unsafe { GetLongPathNameW(path_w.as_ptr(), buffer.as_mut_ptr(), needed) };
+    if written == 0 {
+        return Err(last_error(&format!(
+            "cannot resolve long path for {}",
+            path.display()
+        )));
+    }
+    buffer.truncate(written as usize);
+    Ok(PathBuf::from(OsString::from_wide(&buffer)))
+}
+
+/// Ordinal, Windows case-insensitive component comparison (not a locale
+/// collation and never a lossy `to_lowercase`).
+fn component_equal_ci(left: &OsStr, right: &OsStr) -> bool {
+    let left: Vec<u16> = left.encode_wide().collect();
+    let right: Vec<u16> = right.encode_wide().collect();
+    const CSTR_EQUAL: i32 = 2;
+    unsafe {
+        CompareStringOrdinal(
+            left.as_ptr(),
+            left.len() as i32,
+            right.as_ptr(),
+            right.len() as i32,
+            1, // TRUE: ignore case
+        ) == CSTR_EQUAL
+    }
+}
+
+/// Component-wise containment: `candidate` equals `root` or lies strictly
+/// below it, comparing every component with [`component_equal_ci`] so
+/// `C:\foo` never matches `C:\foobar`.
+fn path_is_within(candidate: &Path, root: &Path) -> bool {
+    let candidate: Vec<_> = candidate.components().collect();
+    let root: Vec<_> = root.components().collect();
+    if candidate.len() < root.len() {
+        return false;
+    }
+    candidate
+        .iter()
+        .zip(&root)
+        .all(|(candidate, root)| component_equal_ci(candidate.as_os_str(), root.as_os_str()))
+}
+
+fn hard_link_outside_error(path: &Path, names: &[PathBuf]) -> String {
+    let mut message = format!(
+        "Windows write-sandbox cannot install a write capability because this hard-linked file has a name outside the configured writable roots.\n\nScanned path:\n  {}\n\nAll hard-link names:\n",
+        path.display()
+    );
+    for name in names {
+        message.push_str(&format!("  {}\n", name.display()));
+    }
+    message.push_str(
+        "\nHard links whose every name is inside the configured writable roots are supported.\nRemove the outside hard link, exclude this file by narrowing the writable root, or explicitly authorize the other location in the user-level sandbox configuration.\nTools such as Cargo may create hard links as part of link-or-copy operations.",
+    );
+    message
+}
+
+/// A descendant file with `link_count > 1` is acceptable only when EVERY one
+/// of its hard-link names lies inside at least one configured write root.
+/// Each enumerated name is rebuilt into a full path (volume mount point +
+/// volume-relative name), re-opened and matched against the scanned inode's
+/// volume serial + file ID, and only then judged for membership; the original
+/// enumeration paths are kept for the error output while the long normalized
+/// paths are used for the judgment.
+fn verify_hard_links(
+    path: &Path,
+    link_count: u32,
+    identity: &FILE_ID_INFO,
+    allowed_roots: &[PathBuf],
+) -> Result<(), String> {
+    let mut volume = vec![0u16; 32768];
+    let path_w = wide(path.as_os_str());
+    if unsafe { GetVolumePathNameW(path_w.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) } == 0
+    {
+        return Err(last_error(&format!(
+            "cannot identify volume for hard-linked descendant {}",
+            path.display()
+        )));
+    }
+    let volume_end = volume
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(volume.len());
+    let volume = PathBuf::from(OsString::from_wide(&volume[..volume_end]));
+
+    let names = enumerate_hard_link_names(path)?;
+    if names.len() as u32 != link_count {
+        return Err(format!(
+            "cannot enumerate/verify all hard-link names for {}: the file reports {link_count} links but only {} names could be enumerated",
+            path.display(),
+            names.len()
+        ));
+    }
+
+    let mut full_paths = Vec::with_capacity(names.len());
+    for name in &names {
+        // Volume-relative names typically start with '\'; strip it so the
+        // join is a plain relative append even for mounted-volume roots.
+        let relative = if name.first() == Some(&(b'\\' as u16)) {
+            &name[1..]
+        } else {
+            &name[..]
+        };
+        let mut full = volume.clone();
+        full.push(OsString::from_wide(relative));
+        let (_, alias_identity) = file_identity(&full).map_err(|error| {
+            format!(
+                "cannot re-open hard-link name {} while verifying {}: {error}",
+                full.display(),
+                path.display()
+            )
+        })?;
+        if alias_identity.VolumeSerialNumber != identity.VolumeSerialNumber
+            || alias_identity.FileId.Identifier != identity.FileId.Identifier
+        {
+            return Err(format!(
+                "hard-link name {} no longer refers to the same file as {} (volume serial or file ID changed); refusing to start",
+                full.display(),
+                path.display()
+            ));
+        }
+        full_paths.push(full);
+    }
+
+    let roots_long: Vec<PathBuf> = allowed_roots
+        .iter()
+        .map(|root| long_path(root))
+        .collect::<Result<_, _>>()?;
+    for full in &full_paths {
+        let alias_long = long_path(full)?;
+        if !roots_long
+            .iter()
+            .any(|root| path_is_within(&alias_long, root))
+        {
+            return Err(hard_link_outside_error(path, &full_paths));
+        }
+    }
+    Ok(())
+}
+
+fn scan_descendants(root: &Path, allowed_roots: &[PathBuf]) -> Result<(), String> {
     let mut directories = vec![root.to_path_buf()];
     while let Some(directory) = directories.pop() {
         let entries = std::fs::read_dir(&directory).map_err(|error| {
@@ -363,11 +666,11 @@ fn scan_descendants(root: &Path) -> Result<(), String> {
             }
             if metadata.is_dir() {
                 directories.push(path);
-            } else if metadata.is_file() && file_link_count(&path)? > 1 {
-                return Err(format!(
-                    "Windows write-sandbox does not support hard-linked descendants: {}",
-                    path.display()
-                ));
+            } else if metadata.is_file() {
+                let (link_count, identity) = file_identity(&path)?;
+                if link_count > 1 {
+                    verify_hard_links(&path, link_count, &identity, allowed_roots)?;
+                }
             }
         }
     }
@@ -544,21 +847,99 @@ fn set_path_ace(root: &RootAcl, sid: PSID) -> Result<(), String> {
     if !root.needs_install {
         return Ok(());
     }
-    // FILE_DELETE_CHILD is meaningful only on directory objects. Propagating
-    // the same bit to files is harmless (it grants no DELETE access on a file)
-    // and one OBJECT+CONTAINER inheritable ACE is sufficient: every descendant
-    // directory can delete/rename its children, while the root itself never
-    // receives DELETE and therefore cannot be deleted through this capability.
-    let entry = explicit_entry(sid, SET_ACCESS, CAPABILITY_MASK, CAPABILITY_INHERITANCE);
-    let mut new_acl = null_mut();
-    let status = unsafe { SetEntriesInAclW(1, &entry, root.old_acl, &mut new_acl) };
-    if status != ERROR_SUCCESS {
-        return Err(format!(
-            "cannot build ACL for {}: win32 error {status}",
-            root.path.display()
-        ));
+    // A directory capability needs two explicit ACEs, and they must be built
+    // by hand: SetEntriesInAclW's SET_ACCESS semantics discard any earlier
+    // info for the same trustee, so two same-SID entries cannot be relied on
+    // to survive (worst case only one ACE remains). The first ACE grants the
+    // full capability mask (including FILE_DELETE_CHILD, which propagates
+    // through every descendant directory) with container+object inheritance.
+    // The second ACE grants DELETE and is OBJECT_INHERIT_ACE|INHERIT_ONLY_ACE:
+    // direct child files receive it as an effective ACE, child directories
+    // inherit it as an inherit-only carrier, the root itself never receives
+    // DELETE, and files at any depth eventually do — FILE_DELETE_CHILD on a
+    // directory alone does not cover deleting/renaming files from the
+    // restricted token.
+    let old_acl = root.old_acl;
+    let mut kept = Vec::new(); // (raw ACE pointer, ACE size) in original order
+    let mut capacity = size_of::<ACL>();
+    let count = unsafe { (*old_acl).AceCount } as u32;
+    for index in 0..count {
+        let mut raw = null_mut();
+        if unsafe { GetAce(old_acl, index, &mut raw) } == 0 || raw.is_null() {
+            return Err(format!(
+                "cannot read existing ACE {index} of {}",
+                root.path.display()
+            ));
+        }
+        let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+        let ace_sid = (&ace.SidStart as *const u32).cast_mut().cast();
+        if unsafe { EqualSid(ace_sid, sid) } != 0 {
+            // Drop every existing ACE for the current capability SID: partial
+            // installs, duplicates, or an accidental root-effective DELETE
+            // must not survive into the rebuilt ACL.
+            continue;
+        }
+        capacity += ace.Header.AceSize as usize;
+        kept.push((raw, ace.Header.AceSize as u32));
     }
-    let _new_acl = LocalPtr(new_acl.cast());
+    let ace_size =
+        size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + unsafe { GetLengthSid(sid) } as usize;
+    capacity += 2 * ace_size;
+
+    let mut buffer = vec![0u8; capacity];
+    if unsafe { InitializeAcl(buffer.as_mut_ptr().cast(), capacity as u32, ACL_REVISION) } == 0 {
+        return Err(last_error(&format!(
+            "cannot initialize new ACL for {}",
+            root.path.display()
+        )));
+    }
+    for (raw, size) in &kept {
+        if unsafe {
+            AddAce(
+                buffer.as_mut_ptr().cast(),
+                ACL_REVISION,
+                MAXDWORD,
+                *raw,
+                *size,
+            )
+        } == 0
+        {
+            return Err(last_error(&format!(
+                "cannot copy existing ACE into new ACL for {}",
+                root.path.display()
+            )));
+        }
+    }
+    if unsafe {
+        AddAccessAllowedAceEx(
+            buffer.as_mut_ptr().cast(),
+            ACL_REVISION,
+            CAPABILITY_INHERITANCE,
+            CAPABILITY_MASK,
+            sid,
+        )
+    } == 0
+    {
+        return Err(last_error(&format!(
+            "cannot add capability ACE for {}",
+            root.path.display()
+        )));
+    }
+    if unsafe {
+        AddAccessAllowedAceEx(
+            buffer.as_mut_ptr().cast(),
+            ACL_REVISION,
+            DELETE_ACE_INHERITANCE as u32,
+            DELETE,
+            sid,
+        )
+    } == 0
+    {
+        return Err(last_error(&format!(
+            "cannot add delete ACE for {}",
+            root.path.display()
+        )));
+    }
     let mut path_w = wide(root.path.as_os_str());
     let status = unsafe {
         SetNamedSecurityInfoW(
@@ -567,7 +948,7 @@ fn set_path_ace(root: &RootAcl, sid: PSID) -> Result<(), String> {
             DACL_SECURITY_INFORMATION,
             null_mut(),
             null_mut(),
-            new_acl,
+            buffer.as_mut_ptr().cast(),
             null_mut(),
         )
     };
@@ -575,6 +956,41 @@ fn set_path_ace(root: &RootAcl, sid: PSID) -> Result<(), String> {
         return Err(format!(
             "cannot set ACL for {}: win32 error {status}; earlier capability ACEs may persist but are inert for ordinary tokens",
             root.path.display()
+        ));
+    }
+    drop(buffer); // SetNamedSecurityInfoW consumed the DACL bytes
+    verify_installed_acl(&root.path, sid)
+}
+
+/// Re-read the root DACL after installation and require the exact two-ACE
+/// v4 layout before the sandbox is allowed to start a process.
+fn verify_installed_acl(path: &Path, sid: PSID) -> Result<(), String> {
+    let mut path_w = wide(path.as_os_str());
+    let mut acl = null_mut();
+    let mut descriptor = null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_w.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut acl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "cannot re-read ACL for {} after installation: win32 error {status}",
+            path.display()
+        ));
+    }
+    let _descriptor = LocalPtr(descriptor);
+    if acl.is_null() || !unsafe { v4_ace_layout_matches(acl, sid) } {
+        return Err(format!(
+            "installed ACL for {} does not have the exact expected two-ACE layout; refusing to start with a partially installed write capability",
+            path.display()
         ));
     }
     Ok(())
@@ -682,7 +1098,28 @@ fn enable_change_notify(token: HANDLE) -> Result<(), String> {
     Ok(())
 }
 
+/// Serializes the entire read/scan/install transaction of [`prepare_token`]
+/// across concurrent first launches (e.g. a foreground command racing a
+/// background task through the same fresh write root). Two installers must
+/// never both observe "not installed" and then interleave ACE writes; the
+/// second caller re-preflights inside the lock and becomes a no-op. The
+/// per-call preflight + ACL read outside the lock is intentionally NOT
+/// cached (no "installed root" registry).
+static INSTALL_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
 fn prepare_token(workspace: &Workspace, policy: &Sandbox) -> Result<Handle, String> {
+    let lock = INSTALL_LOCK.get_or_init(|| std::sync::Mutex::new(()));
+    // Never panic on a poisoned lock (a tool error must not crash the agent
+    // loop). Recovery is safe because the install is idempotent and verified
+    // by re-reading the root DACL.
+    let _guard = match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    prepare_token_locked(workspace, policy)
+}
+
+fn prepare_token_locked(workspace: &Workspace, policy: &Sandbox) -> Result<Handle, String> {
     let roots: Vec<(PathBuf, &'static str)> = policy
         .workspace_writable
         .then(|| (workspace.root().to_path_buf(), "workspace"))
@@ -716,9 +1153,10 @@ fn prepare_token(workspace: &Workspace, policy: &Sandbox) -> Result<Handle, Stri
         .zip(&capability_sids)
         .map(|((path, _), sid)| preflight_root(path, *sid))
         .collect::<Result<_, _>>()?;
+    let allowed_roots: Vec<PathBuf> = roots.iter().map(|(path, _)| path.clone()).collect();
     for root in &root_acls {
         if root.needs_install {
-            scan_descendants(&root.path)?;
+            scan_descendants(&root.path, &allowed_roots)?;
         }
     }
 
@@ -1143,31 +1581,126 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn needs_install_requires_complete_exact_versioned_ace() {
-        let sid = string_sid("S-1-5-21-1-2-3-4").unwrap();
-        let exact = explicit_entry(sid.0, SET_ACCESS, CAPABILITY_MASK, CAPABILITY_INHERITANCE);
-        let mut exact_acl = null_mut();
-        assert_eq!(
-            unsafe { SetEntriesInAclW(1, &exact, null(), &mut exact_acl) },
-            ERROR_SUCCESS
-        );
-        let exact_acl = LocalPtr(exact_acl.cast());
-        assert!(!needs_install(exact_acl.0.cast(), sid.0));
+    /// Builds a DACL exactly the way the sandbox does (InitializeAcl +
+    /// AddAccessAllowedAceEx, not SetEntriesInAclW, whose same-trustee
+    /// SET_ACCESS merge behavior is unreliable). `entries` is (mask, flags).
+    struct TestAcl(Vec<u8>);
+    impl TestAcl {
+        fn build(sid: PSID, entries: &[(u32, u32)]) -> TestAcl {
+            let ace_size = size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>()
+                + unsafe { GetLengthSid(sid) } as usize;
+            let mut buffer = vec![0u8; size_of::<ACL>() + entries.len() * ace_size];
+            assert_ne!(
+                unsafe {
+                    InitializeAcl(
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len() as u32,
+                        ACL_REVISION,
+                    )
+                },
+                0
+            );
+            for (mask, flags) in entries {
+                assert_ne!(
+                    unsafe {
+                        AddAccessAllowedAceEx(
+                            buffer.as_mut_ptr().cast(),
+                            ACL_REVISION,
+                            *flags,
+                            *mask,
+                            sid,
+                        )
+                    },
+                    0
+                );
+            }
+            TestAcl(buffer)
+        }
+        fn acl(&self) -> *const ACL {
+            self.0.as_ptr().cast()
+        }
+    }
 
-        let old = explicit_entry(
-            sid.0,
-            SET_ACCESS,
-            CAPABILITY_MASK & !FILE_DELETE_CHILD,
-            CAPABILITY_INHERITANCE,
+    #[test]
+    fn v4_sid_is_stable_and_differs_from_v3() {
+        let path = Path::new(r"C:\work\游戏");
+        assert_eq!(stable_sid(path, "workspace"), stable_sid(path, "workspace"));
+        let v3 = sid_from_key(&capability_key(
+            path,
+            "workspace",
+            b"e-agent/windows-write-capability/v3",
+        ));
+        assert_ne!(
+            v3,
+            stable_sid(path, "workspace"),
+            "v4 must produce a SID distinct from v3 so v3 ACEs stay inert"
         );
-        let mut old_acl = null_mut();
-        assert_eq!(
-            unsafe { SetEntriesInAclW(1, &old, null(), &mut old_acl) },
-            ERROR_SUCCESS
-        );
-        let old_acl = LocalPtr(old_acl.cast());
-        assert!(needs_install(old_acl.0.cast(), sid.0));
+    }
+
+    #[test]
+    fn v4_layout_requires_exactly_two_matching_aces_in_any_order() {
+        let sid = string_sid("S-1-5-21-1-2-3-4").unwrap();
+        let main = (CAPABILITY_MASK, CAPABILITY_INHERITANCE);
+        let delete = (DELETE, OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE);
+
+        // Both ACEs present, main first: installed.
+        let acl = TestAcl::build(sid.0, &[main, delete]);
+        assert!(unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
+
+        // ACE order must not matter.
+        let acl = TestAcl::build(sid.0, &[delete, main]);
+        assert!(unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
+
+        // A single ACE (either one) is not installed.
+        let acl = TestAcl::build(sid.0, &[main]);
+        assert!(!unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
+        let acl = TestAcl::build(sid.0, &[delete]);
+        assert!(!unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
+        let acl = TestAcl::build(sid.0, &[]);
+        assert!(!unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
+
+        // Wrong DELETE flags: missing INHERIT_ONLY would make DELETE
+        // root-effective, which the model forbids.
+        let root_effective_delete = (DELETE, OBJECT_INHERIT_ACE);
+        let acl = TestAcl::build(sid.0, &[main, root_effective_delete]);
+        assert!(!unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
+
+        // Wrong main mask: a legacy capability ACE without FILE_DELETE_CHILD.
+        let legacy = (CAPABILITY_MASK & !FILE_DELETE_CHILD, CAPABILITY_INHERITANCE);
+        let acl = TestAcl::build(sid.0, &[legacy, delete]);
+        assert!(!unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
+
+        // Duplicates are rejected.
+        let acl = TestAcl::build(sid.0, &[main, main, delete]);
+        assert!(!unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
+        let acl = TestAcl::build(sid.0, &[main, delete, delete]);
+        assert!(!unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
+
+        // Any other explicit ACE for the same SID (stray allow or deny)
+        // invalidates the layout.
+        let stray = (FILE_READ_DATA, 0);
+        let acl = TestAcl::build(sid.0, &[main, delete, stray]);
+        assert!(!unsafe { v4_ace_layout_matches(acl.acl(), sid.0) });
+    }
+
+    #[test]
+    fn inherited_aces_cannot_satisfy_root_install() {
+        let sid = string_sid("S-1-5-21-1-2-3-4").unwrap();
+        let main = (CAPABILITY_MASK, CAPABILITY_INHERITANCE);
+        let delete = (DELETE, OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE);
+
+        // Even the complete two-ACE layout fails once the ACEs are inherited:
+        // only an explicit root install counts.
+        let acl = TestAcl::build(sid.0, &[main, delete]);
+        unsafe {
+            for index in 0..2 {
+                let mut raw = null_mut();
+                assert_ne!(GetAce(acl.acl(), index, &mut raw), 0);
+                let ace = &mut *raw.cast::<ACCESS_ALLOWED_ACE>();
+                ace.Header.AceFlags |= INHERITED_ACE as u8;
+            }
+        }
+        assert!(needs_install(acl.acl(), sid.0));
     }
 
     #[test]
