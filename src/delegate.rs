@@ -766,12 +766,12 @@ impl Tool for Delegate {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"},
+                    "workspace": {"type": "string", "description": "REQUIRED — absolute path of the working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). Must be an absolute path: never pass `.` or a relative path."},
                     "role": role_property,
                     "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
                     "background": {"type": "boolean", "default": true, "description": "run without blocking and deliver the answer as a background completion (default true); pass false to wait for the final answer"},
                     "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
-                    "workspace": {"type": "string", "description": "REQUIRED — absolute path of the working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). Must be an absolute path: never pass `.` or a relative path."}
+                    "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"},
                 },
                 "required": ["task", "workspace"]
             }),
