@@ -1874,7 +1874,7 @@ async fn running_tasks_owner_column_liveness_probe() {
         let conn = session.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT owner FROM running_tasks \
+                "SELECT owner_identity FROM running_tasks \
                  WHERE workspace_id = ?1 AND session_id = ?2 AND task_id = ?3",
                 (session.workspace_id.as_str(), sid.as_str(), 1i64),
             )
@@ -1897,7 +1897,7 @@ async fn running_tasks_owner_column_liveness_probe() {
             {
                 let conn = session.conn.lock().await;
                 conn.execute(
-                    "UPDATE running_tasks SET owner = ?1 \
+                    "UPDATE running_tasks SET owner_identity = ?1 \
                      WHERE workspace_id = ?2 AND session_id = ?3",
                     (
                         format!("2000000000@{hostname}#deadbeef"),
@@ -1921,7 +1921,7 @@ async fn running_tasks_owner_column_liveness_probe() {
             {
                 let conn = session.conn.lock().await;
                 conn.execute(
-                    "UPDATE running_tasks SET owner = ?1 \
+                    "UPDATE running_tasks SET owner_identity = ?1 \
                      WHERE workspace_id = ?2 AND session_id = ?3",
                     (
                         "2000000000@unknown#deadbeef",
@@ -1945,7 +1945,7 @@ async fn running_tasks_owner_column_liveness_probe() {
     {
         let conn = session.conn.lock().await;
         conn.execute(
-            "UPDATE running_tasks SET owner = NULL \
+            "UPDATE running_tasks SET owner_identity = NULL \
              WHERE workspace_id = ?1 AND session_id = ?2",
             (session.workspace_id.as_str(), sid.as_str()),
         )
@@ -2172,7 +2172,7 @@ async fn store_facade_unfinished_owner_all_dead_e2e() {
                     .expect("open db for hand edit");
                 let conn = db.connect().expect("connect for hand edit");
                 conn.execute(
-                    "UPDATE running_tasks SET owner = ?1 \
+                    "UPDATE running_tasks SET owner_identity = ?1 \
                      WHERE workspace_id = ?2 AND session_id = ?3",
                     (
                         format!("2000000000@{hostname}#deadbeef"),
@@ -2197,7 +2197,7 @@ async fn store_facade_unfinished_owner_all_dead_e2e() {
                 .expect("open db for hand edit");
             let conn = db.connect().expect("connect for hand edit");
             conn.execute(
-                "UPDATE running_tasks SET owner = ?1 \
+                "UPDATE running_tasks SET owner_identity = ?1 \
                  WHERE workspace_id = ?2 AND session_id = ?3",
                 ("2000000000@unknown#deadbeef", workspace_id(), sid.as_str()),
             )

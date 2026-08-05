@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS running_tasks (
     label TEXT NOT NULL,
     subagent_session_id TEXT NULL,
     started_at_us INTEGER NOT NULL,
-    owner TEXT NULL,
+    owner_identity TEXT NULL,
     PRIMARY KEY (workspace_id, session_id, task_id)
 )
 "#;
@@ -341,16 +341,19 @@ impl SqliteSession {
                     columns.push(name.clone());
                 }
             }
-            if !columns.iter().any(|c| c == "owner") {
+            if !columns.iter().any(|c| c == "owner_identity") {
                 // NOTE: same turso quirk as the sessions migration — omit
                 // the explicit NULL constraint; ADD COLUMN defaults to
                 // nullable anyway.
                 if let Err(error) = conn
-                    .execute("ALTER TABLE running_tasks ADD COLUMN owner TEXT", ())
+                    .execute(
+                        "ALTER TABLE running_tasks ADD COLUMN owner_identity TEXT",
+                        (),
+                    )
                     .await
                 {
                     eprintln!(
-                        "e-agent: cannot add running_tasks.owner column \
+                        "e-agent: cannot add running_tasks.owner_identity column \
                          (background-task owner liveness unavailable): {error}"
                     );
                 }
@@ -1812,13 +1815,13 @@ impl SqliteSession {
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO running_tasks \
-             (workspace_id, session_id, task_id, label, subagent_session_id, started_at_us, owner) \
+             (workspace_id, session_id, task_id, label, subagent_session_id, started_at_us, owner_identity) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT (workspace_id, session_id, task_id) DO UPDATE SET \
                  label = excluded.label, \
                  subagent_session_id = excluded.subagent_session_id, \
                  started_at_us = excluded.started_at_us, \
-                 owner = excluded.owner",
+                 owner_identity = excluded.owner_identity",
             (
                 self.workspace_id.as_str(),
                 session_id,
@@ -1924,7 +1927,7 @@ impl SqliteSession {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT owner FROM running_tasks \
+                "SELECT owner_identity FROM running_tasks \
                  WHERE workspace_id = ?1 AND session_id = ?2",
                 (self.workspace_id.as_str(), session_id),
             )

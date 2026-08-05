@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS running_tasks (
     label STRING NOT NULL,
     subagent_session_id STRING NULL,
     started_at TIMESTAMP(9) NOT NULL TIME INDEX,
-    owner STRING NULL,
+    owner_identity STRING NULL,
     PRIMARY KEY (workspace_id, session_id, task_id)
 ) WITH (
     sst_format = 'flat',
@@ -268,10 +268,10 @@ impl GreptimeSession {
                 .iter()
                 .map(|row| row.get("column_name"))
                 .collect();
-            if !task_columns.iter().any(|c| c == "owner") {
+            if !task_columns.iter().any(|c| c == "owner_identity") {
                 match client
                     .execute(
-                        "ALTER TABLE running_tasks ADD COLUMN owner STRING NULL",
+                        "ALTER TABLE running_tasks ADD COLUMN owner_identity STRING NULL",
                         &[],
                     )
                     .await
@@ -279,7 +279,7 @@ impl GreptimeSession {
                     Ok(_) => {}
                     Err(error) => {
                         eprintln!(
-                            "e-agent: cannot add running_tasks.owner column \
+                            "e-agent: cannot add running_tasks.owner_identity column \
                              (background-task owner liveness unavailable): {error:#}"
                         );
                     }
@@ -1619,7 +1619,7 @@ impl GreptimeSession {
         self.client
             .execute(
                 "INSERT INTO running_tasks \
-                 (workspace_id, session_id, task_id, label, subagent_session_id, started_at, owner) \
+                 (workspace_id, session_id, task_id, label, subagent_session_id, started_at, owner_identity) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 &[
                     &self.workspace_id,
@@ -1705,14 +1705,14 @@ impl GreptimeSession {
         let rows = self
             .client
             .query(
-                "SELECT owner FROM running_tasks \
+                "SELECT owner_identity FROM running_tasks \
                  WHERE workspace_id = $1 AND session_id = $2",
                 &[&self.workspace_id, &session_id],
             )
             .await
             .context("cannot load unfinished background task owners")?;
         for row in rows.iter() {
-            let owner: Option<String> = row.get("owner");
+            let owner: Option<String> = row.get("owner_identity");
             match owner {
                 None => return Ok(false), // old row without owner: alive
                 Some(owner) => {
@@ -3767,14 +3767,14 @@ mod tests {
         let owners: Vec<Option<String>> = session
             .client
             .query(
-                "SELECT owner FROM running_tasks \
+                "SELECT owner_identity FROM running_tasks \
                  WHERE workspace_id = $1 AND session_id = $2",
                 &[&wid, &sid],
             )
             .await
             .expect("read owner column")
             .iter()
-            .map(|row| row.get("owner"))
+            .map(|row| row.get("owner_identity"))
             .collect();
         assert_eq!(
             owners,
@@ -3791,7 +3791,7 @@ mod tests {
                 session
                     .client
                     .execute(
-                        "UPDATE running_tasks SET owner = $1 \
+                        "UPDATE running_tasks SET owner_identity = $1 \
                          WHERE workspace_id = $2 AND session_id = $3",
                         &[&format!("2000000000@{hostname}#deadbeef"), &wid, &sid],
                     )
@@ -3808,7 +3808,7 @@ mod tests {
                 session
                     .client
                     .execute(
-                        "UPDATE running_tasks SET owner = $1 \
+                        "UPDATE running_tasks SET owner_identity = $1 \
                          WHERE workspace_id = $2 AND session_id = $3",
                         &[&"2000000000@unknown#deadbeef", &wid, &sid],
                     )
@@ -3827,7 +3827,7 @@ mod tests {
         session
             .client
             .execute(
-                "UPDATE running_tasks SET owner = NULL \
+                "UPDATE running_tasks SET owner_identity = NULL \
                  WHERE workspace_id = $1 AND session_id = $2",
                 &[&wid, &sid],
             )
