@@ -60,7 +60,8 @@ The default delegated model can be routed with `[roles] subagent`; named
 role templates can also be routed by role name. Role templates are discovered
 from `$XDG_CONFIG_HOME/e-agent/agents/<role>.md` (falling back to
 `~/.config/e-agent/agents/`) and `<workspace>/agents/<role>.md`, with the
-workspace file winning. This repository includes `designer`; unrouted named
+workspace file winning. This repository includes six role templates —
+`designer`, `explorer`, `fixer`, `main`, `oracle`, and `seer`; unrouted named
 roles fall back to the default subagent model, which itself falls back to the
 main profile:
 
@@ -72,15 +73,18 @@ model = "k2"
 subagent = "kimi/k2"
 ```
 
-A project-local `<workspace>/.e-agent/config.toml` overlays `[models]` and
-`[roles]` onto this global config: models merge by name (a project model
-replaces the same-named global model; global models the project does not
-define keep their definitions; an absent or empty `[models]` keeps all global
-models), and roles merge per key. The project file cannot change `default`,
-`[providers]`, `[mcp]`, `[web_search]`, or `[session]`, and it only takes
-effect when a global config exists (it is an override layer, not a standalone
-config). `[sandbox]`, `[background]`, and `[bash]` project overrides are
-described in the sandbox section below.
+A project-local `<workspace>/.e-agent/config.toml` overlays `[models]`,
+`[roles]`, and `[tui]` onto this global config: models merge by name (a
+project model replaces the same-named global model; global models the
+project does not define keep their definitions; an absent or empty `[models]`
+keeps all global models), roles merge per key, and `[tui]` is replaced
+wholesale (a project `[tui]` section replaces the global one entirely; the
+fields it omits fall back to the built-in defaults, not the global values).
+The project file cannot change `default`, `[providers]`, `[mcp]`,
+`[web_search]`, or `[session]`, and it only takes effect when a global config
+exists (it is an override layer, not a standalone config). `[sandbox]`,
+`[background]`, and `[bash]` project overrides are described in the sandbox
+section below.
 
 ### TUI submit/newline keys
 
@@ -98,8 +102,10 @@ Each field accepts exactly one of `enter`, `alt+enter`, `option+enter` (the
 macOS alias for `alt+enter`), `ctrl+enter`, or `shift+enter`, matched
 literally. `submit` must differ from `newline`; an unsupported key string or
 a `submit == newline` collision is a startup error listing the supported
-keys (no silent fallback). `[tui]` is global-only — it is not merged from
-project configs, since key bindings are personal preference.
+keys (no silent fallback). `[tui]` is normally a global preference, but a
+project-local `<workspace>/.e-agent/config.toml` can override it with its own
+whole-section `[tui]` (omitted fields fall back to the built-in defaults, not
+the global values — see the project-config note above).
 
 **Terminal caveat:** `shift+enter` is unreliable — most terminals do not
 report the Shift modifier and send a bare Enter instead, so a
@@ -256,9 +262,11 @@ cargo run -- "inspect src/main.rs and explain it"
 When no prompt argument is supplied and stdout is a terminal, e-agent starts
 an interactive TUI (scrollback plus an input line with proper Unicode editing);
 use `--repl` for a plain line-based REPL instead. If stdin is piped, the prompt
-is read from standard input. Sessions persist to
-`.e-agent/sessions/<name>.jsonl` in the workspace as an append-only log of
-message and compaction entries. Without `--session`, each launch creates a
+is read from standard input. Sessions persist as an append-only log of
+message and compaction entries; the default JSONL backend writes them to
+`.e-agent/sessions/<name>.jsonl` in the workspace, and `[session] backend`
+can switch persistence to GreptimeDB or SQLite (see the backend sections
+below). Without `--session`, each launch creates a
 fresh unique session ID. History is restored for
 model context on startup, while display projections are replayed in the TUI;
 the model only sees the latest compaction summary and everything after it.
@@ -290,8 +298,27 @@ in the TUI and is never sent to the provider on the model wire. The forked
 session has fresh token accounting (usage counters start at zero) and is
 resumed or forked again like any other session. The new id is printed as
 `e-agent: forked session: <id>`; `--fork` is mutually exclusive with `--session`
-and cannot be combined with `--at` without `--fork`. JSONL and GreptimeDB
-backends behave equivalently.
+and cannot be combined with `--at` without `--fork`. JSONL, GreptimeDB, and
+SQLite backends behave equivalently.
+
+### TUI commands
+
+Slash commands in the TUI input line (the web UI's input exposes the same
+command set through its slash-command menu):
+
+- `/compact` — compress the context (manual compaction).
+- `/rename <标题>` — rename the session.
+- `/btw <问题>` — fork a side subagent for the question.
+- `/fork [N]` — fork a new session from the last (or the N-th) completed
+  turn boundary.
+- `/undo` — undo the most recent file operation (`edit_file` / `write_file`).
+- `/help [命令]` — show the command list, or per-command usage detail
+  (`/help fork`); an unknown command name prints a hint back to the list.
+- `/model <profile>` — switch the session's model at runtime (not listed by
+  bare `/help`; the profile must be resolvable from the config).
+
+The TUI renders with a truecolor (24-bit) Solarized Light palette; terminals
+without truecolor support may render colors incorrectly.
 
 Keys in the TUI: Esc always leaves the current view — it detaches from a
 subagent view, closes the tasks panel, or (at the plain idle prompt) quits
@@ -516,6 +543,58 @@ calls use the latest summary plus everything after it. When a configured model
 profile provides a context window, the agent also compacts automatically at
 80% usage.
 
+## Web UI / headless server
+
+`e-agent --serve` (alias: `e-agent web`) starts a headless HTTP server that
+serves the web UI at `/` and a token-authenticated `/api/*` surface for
+managing live sessions. It binds `127.0.0.1:8766` by default; `--host` and
+`--port` (or `-p`) override:
+
+```sh
+e-agent web                       # http://127.0.0.1:8766
+e-agent --serve --port 9000       # http://127.0.0.1:9000
+```
+
+Every `/api/*` request must authenticate with the server token as
+`Authorization: Bearer <token>` (or `?token=<token>`, the query fallback for
+EventSource-style clients that cannot set headers). The token is generated
+once at first start — 32 random bytes, base64url, written with mode 0600 to
+`$XDG_STATE_HOME/e-agent/server.token` (falling back to
+`~/.local/state/e-agent/server.token` when `XDG_STATE_HOME` is unset) — and
+reused across restarts so browser clients keep working. The startup log
+prints the token and the token file path.
+
+The `/api` surface (JSON except for the SSE endpoint):
+
+| Method | Path | Semantics |
+|--------|------|-----------|
+| GET | `/api/sessions` | list sessions |
+| POST | `/api/sessions` | create a session |
+| GET | `/api/sessions/{id}/events` | SSE: snapshot, then live events |
+| GET | `/api/sessions/{id}/history` | segmented history (head or older) |
+| GET | `/api/sessions/{id}/summary` | per-turn summary cache (desktop pet) |
+| POST | `/api/sessions/{id}/prompt` | queue a prompt |
+| POST | `/api/sessions/{id}/btw` | fork into a persistent subagent |
+| GET | `/api/sessions/{id}/fork-candidates` | turn boundaries to fork at |
+| POST | `/api/sessions/{id}/fork` | fork at a turn boundary into a `fork-…` session |
+| POST | `/api/sessions/{id}/cancel` | cancel the in-flight turn |
+| POST | `/api/sessions/{id}/compact` | request compaction |
+| GET | `/api/models` | switchable model profile names |
+| POST | `/api/sessions/{id}/model` | switch the session's model at runtime |
+| POST | `/api/sessions/{id}/undo` | undo the most recent file operation |
+| PUT | `/api/sessions/{id}/title` | rename a session |
+| PUT | `/api/sessions/{id}/pin` | pin a session |
+| PUT | `/api/sessions/{id}/archive` | archive a session |
+| DELETE | `/api/sessions/{id}` | cancel + remove from the registry |
+| GET | `/api/tasks` | running background tasks, all sessions |
+| DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task |
+| GET | `/api/sessions/{id}/tasks/{task_id}/output` | full output of a running bash task |
+
+SSE connections are kept alive with 15-second heartbeat pings. Ctrl-C shuts
+the server down gracefully: SSE streams self-close on the shutdown signal and
+in-flight requests get a hard 2-second drain deadline before the process
+force-exits; a second Ctrl-C kills it outright.
+
 ## Config hot reload
 
 The headless server (`--serve` / `web`) and the TUI watch the config files
@@ -635,11 +714,51 @@ response: error decoding response body: ...`), and provider HTTP failures
 include a preview of the response body. Provider requests time out after
 600 seconds in total, including the complete streaming response body.
 
+## SQLite session backend
+
+A local SQLite session storage backend is available and compiled in by
+default (`sqlite` is a default cargo feature). It replaces the JSONL file
+backend for session persistence; select it via the TOML config:
+
+```toml
+[session]
+backend = "sqlite"
+path = "/home/you/.local/share/e-agent/sessions.db"
+```
+
+`path` is a path to a SQLite-compatible database file (`:memory:` works for
+tests); it is used as written — `~` is not expanded, and a relative path
+resolves against the process working directory, so an absolute path is
+recommended. The parent directory is created on first connect. Sessions of
+different workspaces are isolated by a `workspace_id` derived from the
+canonical workspace root, so one database file can serve many workspaces.
+
+The database keeps three tables:
+
+- `session_entries` — the append-only transcript log, primary-keyed on
+  `(workspace_id, session_id, seq, event_time_us)` with the same entry kinds
+  and ordering semantics as the other backends.
+- `running_tasks` — in-flight background bash/delegate bookkeeping; a resumed
+  session finds tasks killed by a previous process.
+- `sessions` — a per-session metadata audit log (created_at/model/role/
+  title/pinned/archived/writer) backing the web UI's list/rename/pin/archive
+  views.
+
+Connections use `PRAGMA journal_mode=WAL` and `busy_timeout=5000`, so
+processes sharing one file wait out short writer locks instead of failing.
+The strictly monotonic per-process `event_time_us` keeps seq continuity
+identical to the JSONL/GreptimeDB backends. Like GreptimeDB, SQLite has no
+automatic migration from JSONL and no cross-backend migration; a phased
+switch to SQLite as the default backend (with JSONL staying optional) is
+recorded in the changelog but not yet implemented.
+
 ## GreptimeDB session backend (experimental)
 
 An optional GreptimeDB-backed session storage backend can be selected at
 runtime via the TOML config file. It replaces the JSONL file backend for
-session persistence while keeping background-task bookkeeping in JSONL.
+session persistence; background-task bookkeeping lives in the backend's
+`running_tasks` table (JSONL sidecar files are only used by the JSONL
+backend).
 
 ### Build
 
@@ -849,7 +968,5 @@ GreptimeDB-specific non-goals (when built with `--features greptime`):
   different workspaces are fully isolated by workspace_id
 - No transaction support — atomicity is per multi-row INSERT statement, not
   across statements
-- No background task persistence in GreptimeDB — background bookkeeping stays
-  in JSONL files regardless of backend
 - No distributed/cluster deployment — standalone GreptimeDB only
 - No generic storage abstraction for future third backends

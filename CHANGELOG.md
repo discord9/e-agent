@@ -17,6 +17,26 @@ does not yet follow semantic versioning strictly.
   fails to parse or resolve is rejected and logged, keeping the last good
   config. `[sandbox]`, the `[session]` backend and web-search key changes
   remain restart-only.
+- **`/help <command>` per-command details (TUI + web)** — the TUI's `/help`
+  now accepts an optional command name and shows a 2–4 line usage detail
+  (`/help fork`); unknown names print a hint pointing back at the list. The
+  same details are wired into the web UI's slash-command menu, keeping both
+  surfaces in sync (`src/tui.rs` HELP_DETAILS ↔ `src/ui/sessions.js`).
+- **Project-level `[tui]` config** — a project-local
+  `<workspace>/.e-agent/config.toml` can now set `[tui]` (the submit/newline
+  key mapping); the project section replaces the global one wholesale, and
+  fields it omits fall back to the built-in defaults, not the global values.
+- **TUI submit/newline key mapping (`[tui] submit` / `[tui] newline`)** —
+  the TUI's Enter handling is configurable: each field accepts exactly one
+  of `enter`, `alt+enter` (`option+enter`), `ctrl+enter`, or `shift+enter`,
+  matched literally. `submit` must differ from `newline`; an unsupported key
+  string or a `submit == newline` collision is a startup error listing the
+  supported keys (no silent fallback).
+- **Ctrl-C shutdown deadline (headless server)** — Ctrl-C now starts a
+  graceful drain with a hard 2-second cap (`SHUTDOWN_DRAIN_TIMEOUT`): SSE
+  streams self-close on the shutdown signal so in-flight requests finish in
+  milliseconds, and the process force-exits at the deadline instead of
+  waiting on a hung connection; a second Ctrl-C still kills it outright.
 
 ## [0.1.1] — 2026-08-04
 

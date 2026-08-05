@@ -8,8 +8,10 @@ e-agent is a deliberately minimal Rust coding agent: single crate, streaming
 OpenAI-compatible Chat Completions plus ChatGPT Codex Responses, six always-on
 local tools (`read_file`, `write_file`, `edit_file`, `bash`,
 `get_background_tasks`, `cancel_background_task`) plus conditional
-`web_search` and main-agent-only `delegate`, a text REPL, a ratatui TUI, and
-JSON session persistence. Keep it that way.
+`web_search` and main-agent-only `delegate`, a text REPL, a ratatui TUI, a
+headless HTTP server (`--serve` / `web`) with a token-authenticated `/api`
+and a browser web UI, and session persistence over three backends (JSONL
+default, GreptimeDB, SQLite). Keep it that way.
 
 ## Prime directive: do not over-design
 
@@ -80,17 +82,25 @@ All four must pass before a change is considered done.
 ## Session event semantics (main agent == subagent)
 
 Every session — main or subagent — must observe the SAME event-production
-contract through `Agent::emit` → fanout to `event_handler` + all `observers`:
+contract, and there is exactly one fanout path per session: the runner's
+`Shared::emit_agent` (see `src/runner.rs`). `Agent::emit` only invokes the
+session's single `event_handler` closure, which the runner installs as
+`Shared::emit_agent`; there is no separate observer list on `Agent`. The TUI,
+the web SSE layer, and attached subagent views all observe the same events
+through `Shared`'s broadcast channel.
 
-- ToolCall / ToolResult / AssistantText / Usage always go through `emit`.
-- Streaming deltas (AssistantDelta / ReasoningDelta) in `run_loop` fan out to
-  BOTH the per-turn handler and every session observer — a session with no
-  live subscriber still records them (the log is the source of truth for
-  late attach / snapshot replay).
-- The ONLY intentional asymmetry: `compact()` deltas go to the handler only,
-  because compaction is background maintenance and must not paint over a
-  session's visible scrollback.
-- A runner session with no attached view must still keep filling its shared event log.
+- `Shared::emit` appends the event to the session's shared `log` AND
+  broadcasts it to every live subscriber. ToolCall / ToolResult /
+  AssistantText / Usage / UserPrompt / errors all go through this path.
+- A session with no live subscriber still records every event in its `log` —
+  the log is the source of truth for late attach / snapshot replay
+  (`SessionHandle::attach` atomically clones the log and subscribes).
+- The ONLY intentional asymmetry: while a compaction is streaming,
+  `emit_agent` sends AssistantDelta / ReasoningDelta to the broadcast
+  channel only (`emit_transient`) — they are never appended to the log.
+  After the compaction entry is durably committed, the complete projection is
+  emitted as a single event, so background compaction never paints partial
+  deltas over a session's visible scrollback.
 - A failed turn emits its error as an event too; a session must never fail
   silently into an empty log.
 
