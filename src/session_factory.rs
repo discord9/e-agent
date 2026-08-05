@@ -246,6 +246,16 @@ impl SessionFactory {
         &self.backend
     }
 
+    /// The TUI submit/newline key mapping from `[tui]` (default
+    /// Enter/Alt+Enter when the config or section is absent). Errors on
+    /// unsupported keys or submit == newline; the caller refuses startup.
+    pub fn tui_keys(&self) -> anyhow::Result<crate::config::InputKeys> {
+        match &self.config {
+            Some(config) => config.tui_keys(),
+            None => Ok(crate::config::InputKeys::default()),
+        }
+    }
+
     /// The main model's context window (already cleared when `--model`
     /// overrode the profile's wire model).
     pub fn main_context_window(&self) -> Option<u64> {

@@ -4,6 +4,7 @@ use std::time::Duration;
 use crossterm::event::{KeyEvent, KeyModifiers};
 
 use super::*;
+use crate::config::InputKeys;
 use ratatui::buffer::CellDiffOption;
 
 /// Test helper: attach with default metadata, mirroring the old 3-arg
@@ -4223,4 +4224,59 @@ async fn fork_usage_and_unwired_state_notice_without_creating() {
         state.lines.last().unwrap().text
     );
     assert!(fork_session_file(temp.path()).is_none());
+}
+
+#[test]
+fn swapped_keys_invert_main_view_enter_and_submit() {
+    // [tui] submit = "alt+enter", newline = "enter": bare Enter inserts a
+    // newline, Alt+Enter submits.
+    let mut state = TuiState {
+        keys: InputKeys {
+            submit_modifiers: KeyModifiers::ALT,
+            newline_modifiers: KeyModifiers::NONE,
+        },
+        ..Default::default()
+    };
+    state.input.insert("first");
+    let submitted = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(
+        submitted.is_none(),
+        "Enter must not submit under swapped keys"
+    );
+    assert_eq!(state.input.text, "first\n");
+    let submitted = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+    assert_eq!(submitted, Some("first\n".to_owned()));
+}
+
+#[test]
+fn swapped_keys_apply_to_attached_view() {
+    // The attached view inherits the main state's [tui] mapping: bare
+    // Enter inserts a newline, Alt+Enter steers.
+    let (handle, _sink, mut source) = crate::runner::session_test_channel();
+    let mut state = TuiState {
+        keys: InputKeys {
+            submit_modifiers: KeyModifiers::ALT,
+            newline_modifiers: KeyModifiers::NONE,
+        },
+        ..Default::default()
+    };
+    attach_test(&mut state, 7, "demo task", handle);
+    {
+        let attached = state.attached.as_mut().unwrap();
+        attached.input.insert("please also check");
+    }
+    state.handle_attached_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), 80);
+    assert!(
+        source.try_recv().ok().is_none(),
+        "Enter must not steer under swapped keys"
+    );
+    assert_eq!(
+        state.attached.as_ref().unwrap().input.text,
+        "please also check\n"
+    );
+    state.handle_attached_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), 80);
+    assert!(matches!(
+        source.try_recv().ok(),
+        Some(crate::runner::SessionCommand::Prompt(ref text)) if text == "please also check\n"
+    ));
 }

@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
+use crossterm::event::KeyModifiers;
 use serde::Deserialize;
 
 #[derive(Clone, Deserialize)]
@@ -35,6 +36,11 @@ pub struct Config {
     /// Optional `[bash]` policy (foreground bash timeout).
     #[serde(default)]
     bash: Option<BashConfig>,
+    /// Optional `[tui]` submit/newline key mapping. Global-only: key
+    /// bindings are personal preference and are never merged from project
+    /// configs (see `merged_with_project`).
+    #[serde(default)]
+    tui: Option<TuiConfig>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -64,6 +70,84 @@ pub struct BashConfig {
 
 /// Default foreground bash timeout: 30 seconds.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
+
+/// The `[tui]` config section: submit/newline key mapping for the TUI
+/// input boxes. Only Enter variants are supported; each field accepts
+/// `enter`, `alt+enter` (or its macOS alias `option+enter`), `ctrl+enter`
+/// or `shift+enter`, matched exactly.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct TuiConfig {
+    /// Key that submits the input box. Defaults to `enter`.
+    #[serde(default)]
+    pub submit: Option<String>,
+    /// Key that inserts a newline in the input box. Defaults to `alt+enter`.
+    #[serde(default)]
+    pub newline: Option<String>,
+}
+
+/// The resolved TUI input-box key mapping: which Enter variant submits and
+/// which inserts a newline. The key code is always Enter; only the
+/// modifiers vary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputKeys {
+    pub submit_modifiers: KeyModifiers,
+    pub newline_modifiers: KeyModifiers,
+}
+
+impl Default for InputKeys {
+    /// Absent `[tui]` section: bare Enter submits, Alt+Enter inserts a
+    /// newline (the historical behavior).
+    fn default() -> Self {
+        InputKeys {
+            submit_modifiers: KeyModifiers::NONE,
+            newline_modifiers: KeyModifiers::ALT,
+        }
+    }
+}
+
+/// The whitelist text shared by every unsupported-key error.
+const SUPPORTED_ENTER_KEYS: &str = "enter, alt+enter (option+enter), ctrl+enter, shift+enter";
+
+/// Parse one `[tui]` key string into the Enter-variant modifiers. Exact
+/// match only — no case or whitespace leniency. `option+enter` is the
+/// macOS alias for `alt+enter`.
+fn parse_enter_key(s: &str) -> Option<KeyModifiers> {
+    match s {
+        "enter" => Some(KeyModifiers::NONE),
+        "alt+enter" | "option+enter" => Some(KeyModifiers::ALT),
+        "ctrl+enter" => Some(KeyModifiers::CONTROL),
+        "shift+enter" => Some(KeyModifiers::SHIFT),
+        _ => None,
+    }
+}
+
+/// Human-readable label of an Enter-variant modifier set, for footer hints
+/// ("Enter", "Alt+Enter", "Ctrl+Enter", "Shift+Enter").
+fn enter_key_label(modifiers: KeyModifiers) -> String {
+    if modifiers == KeyModifiers::NONE {
+        "Enter".to_owned()
+    } else if modifiers == KeyModifiers::ALT {
+        "Alt+Enter".to_owned()
+    } else if modifiers == KeyModifiers::CONTROL {
+        "Ctrl+Enter".to_owned()
+    } else if modifiers == KeyModifiers::SHIFT {
+        "Shift+Enter".to_owned()
+    } else {
+        "Enter".to_owned()
+    }
+}
+
+impl InputKeys {
+    /// Human-readable labels of the submit and newline keys, e.g.
+    /// ("Enter", "Alt+Enter") for the defaults. The TUI footer uses the
+    /// submit label so a reconfigured mapping is shown accurately.
+    pub fn describe(&self) -> (String, String) {
+        (
+            enter_key_label(self.submit_modifiers),
+            enter_key_label(self.newline_modifiers),
+        )
+    }
+}
 
 /// Runtime sandbox configuration for the bash tool, from `[sandbox]`.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -344,6 +428,37 @@ impl Config {
             Some(session) => session.backend.clone(),
             None => SessionBackend::default(),
         }
+    }
+
+    /// The TUI submit/newline key mapping from `[tui]`. An absent section
+    /// (or field) falls back to the defaults: submit=Enter, newline=Alt+Enter.
+    /// Unsupported key strings and submit == newline are configuration
+    /// errors — startup refuses rather than silently falling back.
+    pub fn tui_keys(&self) -> anyhow::Result<InputKeys> {
+        let Some(tui) = &self.tui else {
+            return Ok(InputKeys::default());
+        };
+        let submit = tui.submit.as_deref().unwrap_or("enter");
+        let newline = tui.newline.as_deref().unwrap_or("alt+enter");
+        let submit_modifiers = parse_enter_key(submit).ok_or_else(|| {
+            anyhow!(
+                "[tui] submit = \"{submit}\" is not a supported key; expected one of: {SUPPORTED_ENTER_KEYS}"
+            )
+        })?;
+        let newline_modifiers = parse_enter_key(newline).ok_or_else(|| {
+            anyhow!(
+                "[tui] newline = \"{newline}\" is not a supported key; expected one of: {SUPPORTED_ENTER_KEYS}"
+            )
+        })?;
+        if submit_modifiers == newline_modifiers {
+            bail!(
+                "[tui] submit and newline must be different keys; both are configured as \"{submit}\""
+            );
+        }
+        Ok(InputKeys {
+            submit_modifiers,
+            newline_modifiers,
+        })
     }
 
     /// Resolve a single named profile (`provider/model`) to its wire

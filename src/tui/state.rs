@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{AgentEvent, Message, SessionEntry, preview};
+use crate::config::InputKeys;
 use crate::runner::{SessionHandle as RunnerHandle, SessionResult, SessionStatus};
 
 use super::*;
@@ -128,6 +129,10 @@ pub(crate) struct TuiState {
     /// needs.
     pub(crate) root: PathBuf,
     pub(crate) input: InputBuffer,
+    /// Configured submit/newline key mapping for the input boxes (defaults:
+    /// bare Enter submits, Alt+Enter inserts a newline). Attached views
+    /// inherit the same mapping via `attach`.
+    pub(crate) keys: InputKeys,
     pub(crate) lines: Vec<DisplayLine>,
     /// Bounded local rendering window.
     pub(crate) window: ScrollWindow,
@@ -688,6 +693,7 @@ impl TuiState {
             cwd,
             session_id,
             context_window,
+            keys: self.keys,
             ..TuiState::default()
         };
         let mut finished = false;
@@ -772,10 +778,10 @@ impl TuiState {
                 attached.state.collapse_thinking.0 = !attached.state.collapse_thinking.0;
                 attached.state.follow();
             }
-            KeyCode::Enter if key.modifiers == KeyModifiers::ALT => {
+            KeyCode::Enter if key.modifiers == attached.state.keys.newline_modifiers => {
                 attached.input.insert_char('\n');
             }
-            KeyCode::Enter => {
+            KeyCode::Enter if key.modifiers == attached.state.keys.submit_modifiers => {
                 // Finished sessions must not silently swallow the input:
                 // keep the buffer intact, send nothing, and say why.
                 if attached.finished
@@ -918,14 +924,15 @@ impl TuiState {
                 self.collapse_thinking.0 = !self.collapse_thinking.0;
                 self.follow();
             }
-            KeyCode::Enter => {
-                // Alt+Enter inserts a newline (Shift+Enter is not
-                // distinguishable in most terminals).
-                if key.modifiers == KeyModifiers::ALT {
-                    self.input.insert_char('\n');
-                } else {
-                    return self.take_input();
-                }
+            // Enter variants dispatch on the configured [tui] keys: the
+            // newline key inserts, the submit key sends, anything else
+            // falls through to edit_input (no-op). Defaults (no [tui]):
+            // bare Enter submits, Alt+Enter inserts a newline.
+            KeyCode::Enter if key.modifiers == self.keys.newline_modifiers => {
+                self.input.insert_char('\n');
+            }
+            KeyCode::Enter if key.modifiers == self.keys.submit_modifiers => {
+                return self.take_input();
             }
             _ => self.edit_input(key),
         }

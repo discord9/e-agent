@@ -306,6 +306,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             read_only,
             record_in,
             factory.clone(),
+            factory.tui_keys()?,
         )
         .await;
         _tui_report.success = result.is_ok();
