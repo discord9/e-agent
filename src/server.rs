@@ -979,6 +979,11 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSessionBody>,
 ) -> Result<(StatusCode, Json<SessionMeta>), (StatusCode, String)> {
+    // The resume guard below applies only to an EXPLICIT id (a resume). A
+    // generated `web-…` id is fresh by construction and cannot collide with
+    // a running subagent, so it skips the cross-process lookup. Captured
+    // BEFORE the match moves `body.id` out.
+    let explicit_id = body.id.is_some();
     let id = match body.id {
         Some(id) => {
             crate::session::validate_session_name(&id)
@@ -991,6 +996,51 @@ async fn create_session(
         return Err(error(
             StatusCode::CONFLICT,
             format!("session {id} already exists"),
+        ));
+    }
+    // Resume guard (concurrent-write conflicts #46/#49): resuming a
+    // subagent that is still running would build a SECOND runner over the
+    // same session file — both would append, and Greptime/SQLite reject
+    // the out-of-order seq ("database max seq is N but this writer
+    // expected …"). The owning session knows its live subagents, so block
+    // any id that is currently a live handle in some parent's `Sessions`
+    // registry. A handle exists only while the subagent is alive
+    // (DelegateCleanup removes finished ones), so a hit here always means
+    // "still running" — an Idle btw subagent counts too, it still owns
+    // the file. Finished subagents resume normally.
+    if let Some((parent, task_id)) = subagent_is_live(&state, &id) {
+        return Err(error(
+            StatusCode::CONFLICT,
+            format!(
+                "session {id} is a running subagent (spawned by session {parent}, task {task_id}); \
+                 cannot resume it while it runs — wait for it to finish or cancel the task first"
+            ),
+        ));
+    }
+    // Cross-process backstop: a surviving `running_tasks` row for this id
+    // means a delegate task in ANOTHER process still claims the session
+    // (rows are cleared at task completion, so a surviving row = "not
+    // finished yet", or a zombie row left by a dead process). Resuming
+    // would race that owner's writes, so block conservatively — the row is
+    // the only cross-process liveness signal. Zombie rows self-heal:
+    // resuming the owning parent session from the CLI/TUI
+    // (UnfinishedPolicy::Consume) or a delegate `resume` consumes them.
+    let root = state.factory.root();
+    if explicit_id
+        && state
+            .meta_store
+            .label_for_subagent(root, &id)
+            .await
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+            .is_some()
+    {
+        return Err(error(
+            StatusCode::CONFLICT,
+            format!(
+                "session {id} is still claimed by a running delegate task (possibly in another \
+                 e-agent process); cannot resume it while it runs — wait for it to finish, or if \
+                 the owning process died, resume its parent session first"
+            ),
         ));
     }
     let built = build_session(&state.factory, &id).await?;
@@ -1010,7 +1060,6 @@ async fn create_session(
     // 监听任务订阅 runner 的 status watch（不改 runner.rs）；会话删除/运行器
     // 退出（watch sender drop）时自动结束。
     spawn_summary_listener(state.clone(), id.clone(), session.clone());
-    let root = state.factory.root();
     Ok((
         StatusCode::CREATED,
         Json(session_meta(&id, &session, root).await),
@@ -1063,6 +1112,26 @@ fn live(state: &AppState, id: &str) -> Result<SessionRef, (StatusCode, String)> 
         StatusCode::NOT_FOUND,
         format!("session {id} not found"),
     ))
+}
+
+/// True when `id` is a live subagent handle in some live session's
+/// `Sessions` registry — the in-process half of the resume guard
+/// ([`create_session`]). A handle only exists while the subagent is alive
+/// (finished delegates are removed by `DelegateCleanup`), so a hit here
+/// always means "still running": the subagent's runner owns the session
+/// file and a second runner would write it concurrently (#46/#49). An Idle
+/// btw subagent is also still alive and must block resume for the same
+/// reason. Returns the owning parent session id and task id so the caller
+/// can name them in the rejection. Same bounded scan as [`live`].
+fn subagent_is_live(state: &AppState, id: &str) -> Option<(String, u64)> {
+    for (session_id, session) in state.registry.list() {
+        for (task_id, entry) in session.sessions.list() {
+            if entry.session_id == id {
+                return Some((session_id.clone(), task_id));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -2979,6 +3048,171 @@ mod tests {
             serde_json::from_str(r#"{"id": "web-x", "initial_prompt": "go"}"#).unwrap();
         assert_eq!(with_id.id.as_deref(), Some("web-x"));
         assert_eq!(with_id.initial_prompt.as_deref(), Some("go"));
+    }
+
+    /// `POST /api/sessions {id}` — the web resume entry — must never build
+    /// a second live session over a subagent id that is still live in a
+    /// parent's `Sessions` registry (concurrent-write conflicts #46/#49):
+    /// the parent knows its subagents, so resuming a running subagent is
+    /// rejected with 409. A Busy delegate and an Idle btw subagent both
+    /// block (any live handle owns the session file). A finished subagent
+    /// (no handle anywhere) resumes normally; the guard must not touch it.
+    #[tokio::test]
+    async fn create_session_rejects_resuming_live_subagents() {
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(
+                temp.path().to_path_buf(),
+            ),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        let app = router(state.clone());
+
+        // A live parent session in the main registry holding two live
+        // subagents: one Busy (delegate-style), one Idle (btw-style).
+        let (parent_id, parent) = live_session("web-parent");
+        state.registry.insert(parent_id, parent.clone());
+        for (task_id, (sid, status)) in [
+            (1u64, ("sub-busy", SessionStatus::Busy)),
+            (2u64, ("sub-idle", SessionStatus::Idle)),
+        ] {
+            let (handle, emitter, _commands) = crate::runner::session_test_channel();
+            emitter.set_status(status);
+            parent.sessions.insert(
+                task_id,
+                Arc::new(crate::delegate::SessionEntry {
+                    handle,
+                    model: "sub-model".into(),
+                    role: None,
+                    cwd: "/tmp".into(),
+                    session_id: sid.to_owned(),
+                    context_window: None,
+                    store: SessionStore::Jsonl,
+                }),
+            );
+        }
+
+        let resume = |sid: String| {
+            let app = app.clone();
+            let body = format!(r#"{{"id": "{sid}"}}"#);
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/api/sessions")
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        for (sid, expected) in [
+            ("sub-busy".to_owned(), StatusCode::CONFLICT),
+            ("sub-idle".to_owned(), StatusCode::CONFLICT),
+            // No handle anywhere (and no running_tasks row): a finished
+            // subagent resumes through to a fresh build over the id.
+            ("sub-finished".to_owned(), StatusCode::CREATED),
+        ] {
+            let response = resume(sid.clone()).await;
+            assert_eq!(response.status(), expected, "{sid}");
+            if expected == StatusCode::CONFLICT {
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let text = String::from_utf8(body.to_vec()).unwrap();
+                assert!(text.contains("running subagent"), "{text}");
+            }
+        }
+    }
+
+    /// The cross-process half of the resume guard: a surviving
+    /// `running_tasks` record (JSONL `.background.jsonl` line whose
+    /// `session_id` matches) means a delegate task in another process still
+    /// claims the session — resume is rejected with 409 even though no live
+    /// handle exists in this process. Removing the record (task completed /
+    /// zombie cleaned) restores the normal resume path.
+    #[tokio::test]
+    async fn create_session_rejects_resume_claimed_by_running_task_row() {
+        use std::io::Write;
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let sessions_dir = root.join(".e-agent/sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let record_path = sessions_dir.join("web-parent.background.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&record_path)
+            .unwrap();
+        // Exactly the JSONL shape `record_background_start` writes for a
+        // delegate task: label + the subagent's session id.
+        writeln!(
+            file,
+            r#"{{"id": 3, "label": "delegate work", "session_id": "sub-claimed"}}"#
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(root),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        let app = router(state);
+
+        let resume = || {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/api/sessions")
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"id": "sub-claimed"}"#.to_owned()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let response = resume().await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "surviving row blocks"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("claimed by a running delegate task"),
+            "{text}"
+        );
+
+        // Row consumed (task completed / zombie cleaned): same id resumes
+        // normally through to a fresh build over the id.
+        std::fs::remove_file(&record_path).unwrap();
+        let response = resume().await;
+        assert_eq!(response.status(), StatusCode::CREATED, "no row resumes");
     }
 
     #[test]

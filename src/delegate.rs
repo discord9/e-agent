@@ -892,6 +892,28 @@ impl Tool for Delegate {
         // to resume from.
         let resume = match resume {
             Some(id) => {
+                // Resume guard (concurrent-write conflicts #46/#49): never
+                // continue a subagent whose runner is STILL live in this
+                // parent's `Sessions` registry — the resumed runner would
+                // append to the same session file concurrently. A handle
+                // exists only while the subagent is alive (DelegateCleanup
+                // removes finished ones), so a hit here always means "still
+                // running"; the subagent continues on its own and needs no
+                // resume. Cross-process rows are deliberately NOT consulted
+                // here: this path is the zombie-row recovery mechanism
+                // (`take_unfinished_background_for_subagent` below consumes
+                // them), so blocking on a surviving row would deadlock it.
+                if self
+                    .sessions
+                    .list()
+                    .iter()
+                    .any(|(_, entry)| entry.session_id == id)
+                {
+                    return Err(format!(
+                        "cannot resume session `{id}`: it is still running as a live subagent; \
+                         wait for it to finish or cancel its task first"
+                    ));
+                }
                 let root = self
                     .persist_root
                     .clone()
