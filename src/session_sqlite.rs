@@ -17,8 +17,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::agent::{Message, SessionEntry};
-use crate::session_store::SessionMeta;
+use crate::agent::SessionEntry;
+use crate::session_store::{
+    SessionMeta, datetime_to_us, dedup_raw_entries, entry_kind, format_conflict_error, is_error,
+    next_event_time_us, process_identity, us_to_datetime,
+};
+// Public path preserved for symmetry with `session_greptime` (the function
+// was a `pub fn` defined here before the shared-helper extraction).
+pub use crate::session_store::derive_workspace_id;
 
 /// DDL for the session entries table. Idempotent. The primary key carries
 /// `seq` + `event_time_us` so same-seq retries (a new `event_time_us`
@@ -112,104 +118,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     PRIMARY KEY (workspace_id, session_id, last_active_at)
 )
 "#;
-
-/// Derive a stable workspace identifier from the canonical workspace root
-/// path. This mirrors how the JSONL backend uses the root path as a
-/// namespace (different workspaces get different on-disk directories).
-pub fn derive_workspace_id(root: &Path) -> String {
-    root.to_string_lossy().to_string()
-}
-
-/// Process identity for the `sessions.writer` audit column, formatted as
-/// `pid@hostname#nonce`. Computed once per process (module-level
-/// `OnceLock`); every metadata snapshot row is stamped with it at
-/// `insert_meta` time so the sessions audit table records which process
-/// wrote each row, and concurrent-write conflict errors can name the
-/// likely adversary. See `session_greptime::process_identity` for the
-/// full rationale.
-static PROCESS_IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// The current process's identity string (see [`PROCESS_IDENTITY`]).
-fn process_identity() -> &'static str {
-    PROCESS_IDENTITY.get_or_init(|| {
-        let pid = std::process::id();
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "unknown".to_owned());
-        let nonce = {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            // Simple mixing of the timestamp and pid; hex keeps the string
-            // short. Same pid at a different boot time → different nonce.
-            format!("{:x}", (nanos as u64) ^ (pid as u64))
-        };
-        format!("{pid}@{hostname}#{nonce}")
-    })
-}
-
-/// Monotonic real-time microsecond timestamp. Uses wall clock but guarantees
-/// strict ordering within a process: if two entries land in the same
-/// microsecond (or the clock goes backwards), the later one gets prev+1.
-/// Returns microseconds since Unix epoch.
-///
-/// Stored directly as the INTEGER microsecond columns (`event_time_us`,
-/// `last_active_at`, `started_at_us`); converted back to
-/// `chrono::NaiveDateTime` on the read path so callers see the same types
-/// the Greptime backend returns.
-fn next_event_time_us() -> i64 {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static LAST: AtomicI64 = AtomicI64::new(0);
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64;
-    loop {
-        let prev = LAST.load(Ordering::Relaxed);
-        let ts = if now_us > prev { now_us } else { prev + 1 };
-        if LAST
-            .compare_exchange(prev, ts, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return ts;
-        }
-    }
-}
-
-/// Convert microseconds-since-epoch to chrono NaiveDateTime (the type the
-/// Greptime backend returns for every timestamp column).
-fn us_to_datetime(us: i64) -> chrono::NaiveDateTime {
-    chrono::DateTime::from_timestamp(us / 1_000_000, ((us % 1_000_000) * 1000) as u32)
-        .unwrap()
-        .naive_utc()
-}
-
-/// Convert chrono NaiveDateTime to microseconds-since-epoch for storage.
-fn datetime_to_us(dt: chrono::NaiveDateTime) -> i64 {
-    dt.and_utc().timestamp_micros()
-}
-
-/// Classify a SessionEntry for the entry_kind column.
-fn entry_kind(entry: &SessionEntry) -> &'static str {
-    match entry {
-        SessionEntry::Message { .. } => "message",
-        SessionEntry::Compaction { .. } => "compaction",
-        SessionEntry::Notice { .. } => "notice",
-        SessionEntry::BackgroundCompletion { .. } => "background_completion",
-        SessionEntry::ForkedFrom { .. } => "forked_from",
-    }
-}
-
-/// Whether a message is a tool error.
-fn is_error(entry: &SessionEntry) -> bool {
-    match entry {
-        SessionEntry::Message {
-            message: Message::Tool { is_error, .. },
-        } => *is_error,
-        _ => false,
-    }
-}
 
 /// One `backfill_sessions` aggregate row:
 /// `(session_id, entry_count, created_at_us, last_active_at_us)`.
@@ -535,7 +443,7 @@ impl SqliteSession {
                  ORDER BY event_time_us ASC, seq ASC",
             )
             .await?;
-        dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)
+        dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time_us")
     }
 
     /// Run an entry-payload SELECT (first three columns seq, event_time_us,
@@ -634,10 +542,11 @@ impl SqliteSession {
             )
             .await?;
 
-        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)?
-            .into_iter()
-            .map(|(_, e)| e)
-            .collect();
+        let entries =
+            dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time_us")?
+                .into_iter()
+                .map(|(_, e)| e)
+                .collect();
         Ok(entries)
     }
 
@@ -853,10 +762,11 @@ impl SqliteSession {
             prev_comp
         };
 
-        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)?
-            .into_iter()
-            .map(|(_, e)| e)
-            .collect();
+        let entries =
+            dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time_us")?
+                .into_iter()
+                .map(|(_, e)| e)
+                .collect();
         Ok((entries, cursor))
     }
 
@@ -925,10 +835,11 @@ impl SqliteSession {
             )
             .await?;
 
-        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)?
-            .into_iter()
-            .map(|(_, e)| e)
-            .collect();
+        let entries =
+            dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time_us")?
+                .into_iter()
+                .map(|(_, e)| e)
+                .collect();
         Ok((entries, Some(first_comp)))
     }
 
@@ -1002,10 +913,11 @@ impl SqliteSession {
             None => Vec::new(),
         };
 
-        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)?
-            .into_iter()
-            .map(|(_, e)| e)
-            .collect();
+        let entries =
+            dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time_us")?
+                .into_iter()
+                .map(|(_, e)| e)
+                .collect();
         Ok((entries, next_comp))
     }
 
@@ -1090,27 +1002,13 @@ impl SqliteSession {
                 // plain message (the `concurrent write conflict` substring
                 // is preserved — `friendly_failure` depends on it).
                 let writer_hint = self.latest_meta_writer().await;
-                return match writer_hint {
-                    Some(writer) => Err(format!(
-                        "concurrent write conflict on session '{}': database max \
-                         seq is {db_max} but this writer expected to start at seq \
-                         {base_seq}; this session is being written concurrently by \
-                         another client (another e-agent process / TUI / Web \
-                         window). First divergence at seq {seq}. Stop the other \
-                         writer or continue in a fresh session, then retry. \
-                         ; latest metadata writer: {writer}",
-                        self.session_id,
-                    )),
-                    None => Err(format!(
-                        "concurrent write conflict on session '{}': database max \
-                         seq is {db_max} but this writer expected to start at seq \
-                         {base_seq}; this session is being written concurrently by \
-                         another client (another e-agent process / TUI / Web \
-                         window). First divergence at seq {seq}. Stop the other \
-                         writer or continue in a fresh session, then retry.",
-                        self.session_id,
-                    )),
-                };
+                return Err(format_conflict_error(
+                    &self.session_id,
+                    db_max,
+                    base_seq,
+                    seq,
+                    writer_hint.as_deref(),
+                ));
             }
             // The whole overlap matches this batch: it is our own earlier
             // commit (committed-then-errored append whose next_seq never
@@ -2332,83 +2230,6 @@ fn build_multi_row_insert(row_count: usize) -> String {
         ));
     }
     sql
-}
-
-/// Group raw DB entries by seq, keeping only the row(s) with the latest
-/// `event_time` per seq.
-///
-/// - Older event_time rows for the same seq are silently discarded
-///   (they are considered overwritten by the newer write).
-/// - If the latest event_time has multiple physical rows (same microsecond),
-///   their deserialised payloads are compared. All identical → folded;
-///   any divergent → `Err` with diagnostic guidance.
-/// - Output is sorted by the winning event_time ASC, then seq ASC.
-///
-/// Exported as `pub(crate)` for testing without a live DB connection.
-pub(crate) fn dedup_raw_entries(
-    raw: &[(i64, chrono::NaiveDateTime, String)],
-    session_id: &str,
-    workspace_id: &str,
-) -> Result<Vec<(i64, SessionEntry)>, String> {
-    // Group by seq: keep max event_time and all payloads at that max.
-    let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
-        std::collections::HashMap::with_capacity(raw.len().min(64));
-
-    for (seq, et, payload) in raw {
-        let entry = per_seq.entry(*seq).or_insert((*et, Vec::new()));
-        match (*et).cmp(&entry.0) {
-            std::cmp::Ordering::Greater => {
-                // Newer event_time → overwrite older entries entirely.
-                entry.0 = *et;
-                entry.1 = vec![payload.clone()];
-            }
-            std::cmp::Ordering::Equal => {
-                // Same max event_time → accumulate for conflict check.
-                entry.1.push(payload.clone());
-            }
-            std::cmp::Ordering::Less => {
-                // Older event_time → silently discard.
-            }
-        }
-    }
-
-    let mut entries = Vec::with_capacity(per_seq.len());
-    for (seq, (max_et, payloads)) in per_seq {
-        let first_entry: SessionEntry = serde_json::from_str(&payloads[0]).map_err(|e| {
-            format!(
-                "cannot decode session {} (seq {} event_time {}): {e}",
-                session_id, seq, max_et
-            )
-        })?;
-
-        for (i, payload) in payloads.iter().enumerate().skip(1) {
-            let other: SessionEntry = serde_json::from_str(payload).map_err(|e| {
-                format!(
-                    "cannot decode session {} seq {} max_event_time {} (dup {}): {e}",
-                    session_id, seq, max_et, i
-                )
-            })?;
-            if other != first_entry {
-                return Err(format!(
-                    "session '{}' seq {} event_time {} has divergent physical \
-                     duplicates; cannot safely load. Stop writers, inspect with SQL:\n\
-                     SELECT * FROM session_entries \
-                     WHERE workspace_id = '{}' AND session_id = '{}' AND seq = {} \
-                     ORDER BY event_time_us;\n\
-                     Resolve manually (new session or repair) then re-run import.",
-                    session_id, seq, max_et, workspace_id, session_id, seq,
-                ));
-            }
-        }
-
-        entries.push((max_et, seq, first_entry));
-    }
-
-    entries.sort_unstable_by_key(|(event_time, seq, _)| (*event_time, *seq));
-    Ok(entries
-        .into_iter()
-        .map(|(_, seq, entry)| (seq, entry))
-        .collect())
 }
 
 #[cfg(test)]

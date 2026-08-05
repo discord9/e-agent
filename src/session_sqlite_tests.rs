@@ -1437,7 +1437,8 @@ fn dedup_older_overwritten_different_payload() {
         (5i64, et(2000), msg_entry("new")),
         (5i64, et(1000), msg_entry("old")),
     ];
-    let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+    let result =
+        dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time_us").unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].0, 5);
     assert_eq!(
@@ -1453,7 +1454,8 @@ fn dedup_older_overwritten_three_versions() {
         (1i64, et(1000), msg_entry("v1")),
         (1i64, et(2000), msg_entry("v2")),
     ];
-    let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+    let result =
+        dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time_us").unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(
         serde_json::to_string(&result[0].1).unwrap(),
@@ -1467,7 +1469,8 @@ fn dedup_older_overwritten_identical_payload() {
         (5i64, et(2000), msg_entry("hello")),
         (5i64, et(1000), msg_entry("hello")),
     ];
-    let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+    let result =
+        dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time_us").unwrap();
     assert_eq!(result.len(), 1);
 }
 
@@ -1477,7 +1480,8 @@ fn dedup_latest_tie_identical_folded() {
         (3i64, et(500), msg_entry("hello")),
         (3i64, et(500), msg_entry("hello")),
     ];
-    let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+    let result =
+        dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time_us").unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].0, 3);
 }
@@ -1489,7 +1493,8 @@ fn dedup_latest_tie_three_identical_folded() {
         (7i64, et(999), msg_entry("triple")),
         (7i64, et(999), msg_entry("triple")),
     ];
-    let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+    let result =
+        dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time_us").unwrap();
     assert_eq!(result.len(), 1);
 }
 
@@ -1499,7 +1504,8 @@ fn dedup_latest_tie_divergent_rejected() {
         (3i64, et(500), msg_entry("hello")),
         (3i64, et(500), msg_entry("world")),
     ];
-    let err = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap_err();
+    let err =
+        dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time_us").unwrap_err();
     assert!(err.contains("divergent physical duplicates"), "got: {err}");
     assert!(err.contains("seq 3"), "got: {err}");
 }
@@ -1511,7 +1517,8 @@ fn dedup_latest_tie_divergent_with_older_rows() {
         (5i64, et(2000), msg_entry("new_b")), // divergent!
         (5i64, et(1000), msg_entry("old")),
     ];
-    let err = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap_err();
+    let err =
+        dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time_us").unwrap_err();
     assert!(err.contains("divergent physical duplicates"), "got: {err}");
     assert!(err.contains("seq 5"), "got: {err}");
 }
@@ -1523,7 +1530,8 @@ fn dedup_output_winning_event_time_precedes_seq() {
         (5i64, et(1000), msg_entry("five")),
         (1i64, et(2000), msg_entry("one")),
     ];
-    let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+    let result =
+        dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time_us").unwrap();
     assert_eq!(result.len(), 3);
     assert_eq!(result[0].0, 5, "earliest winning event_time first");
     assert_eq!(result[1].0, 1, "middle winning event_time second");
@@ -1536,7 +1544,8 @@ fn dedup_output_seq_tiebreaks_same_event_time() {
         (20i64, et(1000), msg_entry("seq20")),
         (5i64, et(1000), msg_entry("seq5")),
     ];
-    let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+    let result =
+        dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time_us").unwrap();
     assert_eq!(result.len(), 2);
     assert_eq!(result[0].0, 5, "lower seq first");
     assert_eq!(result[1].0, 20, "higher seq second");
@@ -1550,7 +1559,8 @@ fn dedup_versions_use_winning_time_for_canonical_order() {
         (0i64, et(400), msg_entry("seq0-new")), // winning tie folds
         (1i64, et(300), msg_entry("seq1")),
     ];
-    let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+    let result =
+        dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time_us").unwrap();
     assert_eq!(result.len(), 2);
     assert_eq!(result[0].0, 1);
     assert_eq!(result[1].0, 0);
@@ -1562,7 +1572,7 @@ fn dedup_versions_use_winning_time_for_canonical_order() {
 
 #[test]
 fn dedup_empty_input() {
-    let result = dedup_raw_entries(&[], "test-session", "test-workspace").unwrap();
+    let result = dedup_raw_entries(&[], "test-session", "test-workspace", "event_time_us").unwrap();
     assert!(result.is_empty());
 }
 
@@ -1575,7 +1585,8 @@ fn dedup_multi_seq_mixed_older_latest() {
         (3i64, et(150), msg_entry("seq3-only")),
         (3i64, et(150), msg_entry("seq3-only")), // folded: same et, same payload
     ];
-    let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+    let result =
+        dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time_us").unwrap();
     assert_eq!(result.len(), 3);
     assert_eq!(result[0].0, 3);
     assert_eq!(result[1].0, 2);
@@ -2675,6 +2686,119 @@ async fn sessions_meta_list_is_latest_wins() {
     assert!(
         list[0].last_active_at >= list[1].last_active_at,
         "list must be ordered newest-first by last_active_at"
+    );
+}
+
+#[tokio::test]
+async fn sessions_meta_list_same_last_active_tie_keeps_both_rows() {
+    // Two DIFFERENT sessions whose latest snapshots tie on last_active_at
+    // (possible across processes — each process has its own monotonic
+    // clock): list_meta must still return exactly one deduped row per
+    // session, never dropping either on the tie.
+    let (_dir, path) = temp_db();
+    let wid = workspace_id();
+    let sid_a = format!("test-sql-tie-a-{}", crate::session::new_id());
+    let sid_b = format!("test-sql-tie-b-{}", crate::session::new_id());
+    let p = path.to_str().unwrap();
+    let session = SqliteSession::connect(p, &wid, &sid_a).await.unwrap();
+
+    session
+        .create_meta(&sid_a, Some("model-a"), None, None, None, None)
+        .await
+        .unwrap();
+    session
+        .create_meta(&sid_b, Some("model-b"), None, None, None, None)
+        .await
+        .unwrap();
+
+    // Force the tie: stamp both latest snapshots with the SAME
+    // last_active_at (the cross-process scenario where two monotonic
+    // clocks happen to collide).
+    let tie_ts = 1_700_000_000_000_000i64;
+    let conn = session.conn.lock().await;
+    conn.execute("UPDATE sessions SET last_active_at = ?1", (tie_ts,))
+        .await
+        .unwrap();
+    drop(conn);
+
+    let list = session.list_meta().await.unwrap();
+    assert_eq!(list.len(), 2, "tied sessions must both be listed");
+    assert_eq!(
+        list.iter().filter(|m| m.session_id == sid_a).count(),
+        1,
+        "exactly one deduped row per session"
+    );
+    assert_eq!(
+        list.iter().filter(|m| m.session_id == sid_b).count(),
+        1,
+        "exactly one deduped row per session"
+    );
+    assert!(
+        list.iter()
+            .all(|m| datetime_to_us(m.last_active_at) == tie_ts),
+        "both rows carry the tied timestamp"
+    );
+    // The newest-first ordering contract still holds (equal timestamps
+    // satisfy >= in either order).
+    assert!(
+        list.windows(2)
+            .all(|w| w[0].last_active_at >= w[1].last_active_at),
+        "tie must not break newest-first ordering"
+    );
+    let a = list.iter().find(|m| m.session_id == sid_a).unwrap();
+    let b = list.iter().find(|m| m.session_id == sid_b).unwrap();
+    assert_eq!(
+        a.model.as_deref(),
+        Some("model-a"),
+        "dedup keeps A's fields"
+    );
+    assert_eq!(
+        b.model.as_deref(),
+        Some("model-b"),
+        "dedup keeps B's fields"
+    );
+}
+
+#[tokio::test]
+async fn sessions_meta_same_microsecond_insert_collides_loudly() {
+    // The SQLite PK carries last_active_at: two snapshots of the SAME
+    // session at the same microsecond (only possible across processes —
+    // `next_event_time_us` is strictly monotonic within one) must fail
+    // loudly instead of silently overwriting, per the table's documented
+    // contract.
+    let (_dir, session, sid) = fresh_session().await;
+    session
+        .create_meta(&sid, Some("model-x"), None, None, None, None)
+        .await
+        .unwrap();
+
+    // Re-insert a row with the SAME (workspace, session, last_active_at).
+    let tied_ts = datetime_to_us(session.audit_meta(&sid).await.unwrap()[0].last_active_at);
+    let conn = session.conn.lock().await;
+    let dup = conn
+        .execute(
+            "INSERT INTO sessions \
+             (workspace_id, session_id, created_at, last_active_at) \
+             VALUES (?1, ?2, ?3, ?3)",
+            (
+                session.workspace_id.as_str(),
+                session.session_id.as_str(),
+                tied_ts,
+            ),
+        )
+        .await;
+    drop(conn);
+    assert!(
+        dup.is_err(),
+        "same-session same-microsecond snapshot must collide on the PK"
+    );
+
+    // The failed insert changed nothing: the audit trail still holds the
+    // single creation row.
+    assert_eq!(
+        session.audit_meta(&sid).await.unwrap().len(),
+        1,
+        "collision must not mutate the audit trail"
     );
 }
 

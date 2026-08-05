@@ -5,13 +5,17 @@
 //!
 //! Non-goals: no Storage trait, no migration of existing JSONL sessions.
 
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use tokio_postgres::NoTls;
 
-use crate::agent::{Message, SessionEntry};
-use crate::session_store::{SessionMeta, process_identity};
+use crate::agent::SessionEntry;
+use crate::session_store::{
+    SessionMeta, dedup_raw_entries, entry_kind, format_conflict_error, is_error,
+    next_event_time_us, process_identity, us_to_datetime,
+};
+// Public path preserved for `src/bin/import_jsonl.rs` (was a `pub fn`
+// defined here before the shared-helper extraction).
+pub use crate::session_store::derive_workspace_id;
 
 /// DDL for the session table. Idempotent.
 const CREATE_TABLE: &str = r#"
@@ -108,69 +112,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     PRIMARY KEY (workspace_id, session_id)
 )
 "#;
-
-/// Derive a stable workspace identifier from the canonical workspace root
-/// path. This mirrors how the JSONL backend uses the root path as a
-/// namespace (different workspaces get different on-disk directories).
-pub fn derive_workspace_id(root: &Path) -> String {
-    root.to_string_lossy().to_string()
-}
-
-/// Monotonic real-time microsecond timestamp. Uses wall clock but guarantees
-/// strict ordering within a process: if two entries land in the same
-/// microsecond (or the clock goes backwards), the later one gets prev+1.
-/// Returns microseconds since Unix epoch.
-///
-/// Precision note: `TIMESTAMP(9)` stores up to nanosecond precision, but
-/// this function only guarantees microsecond granularity. Timestamps from
-/// this function are stored as microseconds-since-epoch and converted to
-/// nanoseconds for the `chrono::NaiveDateTime` used by tokio-postgres.
-fn next_event_time_us() -> i64 {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static LAST: AtomicI64 = AtomicI64::new(0);
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64;
-    loop {
-        let prev = LAST.load(Ordering::Relaxed);
-        let ts = if now_us > prev { now_us } else { prev + 1 };
-        if LAST
-            .compare_exchange(prev, ts, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return ts;
-        }
-    }
-}
-
-/// Convert microseconds-since-epoch to chrono NaiveDateTime for tokio-postgres.
-fn us_to_datetime(us: i64) -> chrono::NaiveDateTime {
-    chrono::DateTime::from_timestamp(us / 1_000_000, ((us % 1_000_000) * 1000) as u32)
-        .unwrap()
-        .naive_utc()
-}
-
-/// Classify a SessionEntry for the entry_kind column.
-fn entry_kind(entry: &SessionEntry) -> &'static str {
-    match entry {
-        SessionEntry::Message { .. } => "message",
-        SessionEntry::Compaction { .. } => "compaction",
-        SessionEntry::Notice { .. } => "notice",
-        SessionEntry::BackgroundCompletion { .. } => "background_completion",
-        SessionEntry::ForkedFrom { .. } => "forked_from",
-    }
-}
-
-/// Whether a message is a tool error.
-fn is_error(entry: &SessionEntry) -> bool {
-    match entry {
-        SessionEntry::Message {
-            message: Message::Tool { is_error, .. },
-        } => *is_error,
-        _ => false,
-    }
-}
 
 pub struct GreptimeSession {
     client: tokio_postgres::Client,
@@ -447,7 +388,8 @@ impl GreptimeSession {
             })
             .collect();
 
-        dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)
+        dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
+            .map_err(anyhow::Error::msg)
     }
 
     /// Load only the newest compaction segment: the last `Compaction` entry
@@ -505,7 +447,8 @@ impl GreptimeSession {
             })
             .collect();
 
-        dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)
+        dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
+            .map_err(anyhow::Error::msg)
             .map(|v| v.into_iter().map(|(_, e)| e).collect())
     }
 
@@ -725,7 +668,8 @@ impl GreptimeSession {
             prev_comp
         };
 
-        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)?
+        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
+            .map_err(anyhow::Error::msg)?
             .into_iter()
             .map(|(_, e)| e)
             .collect();
@@ -791,7 +735,8 @@ impl GreptimeSession {
             })
             .collect();
 
-        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)?
+        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
+            .map_err(anyhow::Error::msg)?
             .into_iter()
             .map(|(_, e)| e)
             .collect();
@@ -854,7 +799,8 @@ impl GreptimeSession {
             None => Vec::new(),
         };
 
-        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id)?
+        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
+            .map_err(anyhow::Error::msg)?
             .into_iter()
             .map(|(_, e)| e)
             .collect();
@@ -958,27 +904,16 @@ impl GreptimeSession {
                     .ok()
                     .flatten()
                     .and_then(|row| row.get::<_, Option<String>>("writer"));
-                match writer_hint {
-                    Some(writer) => anyhow::bail!(
-                        "concurrent write conflict on session '{}': database max \
-                         seq is {db_max} but this writer expected to start at seq \
-                         {base_seq}; this session is being written concurrently by \
-                         another client (another e-agent process / TUI / Web \
-                         window). First divergence at seq {seq}. Stop the other \
-                         writer or continue in a fresh session, then retry. \
-                         ; latest metadata writer: {writer}",
-                        self.session_id,
-                    ),
-                    None => anyhow::bail!(
-                        "concurrent write conflict on session '{}': database max \
-                         seq is {db_max} but this writer expected to start at seq \
-                         {base_seq}; this session is being written concurrently by \
-                         another client (another e-agent process / TUI / Web \
-                         window). First divergence at seq {seq}. Stop the other \
-                         writer or continue in a fresh session, then retry.",
-                        self.session_id,
-                    ),
-                }
+                anyhow::bail!(
+                    "{}",
+                    format_conflict_error(
+                        &self.session_id,
+                        db_max,
+                        base_seq,
+                        seq,
+                        writer_hint.as_deref(),
+                    )
+                );
             }
             // The whole overlap matches this batch: it is our own earlier
             // commit (committed-then-errored append whose next_seq never
@@ -1806,92 +1741,11 @@ fn build_multi_row_insert(row_count: usize) -> String {
     sql
 }
 
-/// Group raw DB entries by seq, keeping only the row(s) with the latest
-/// `event_time` per seq.
-///
-/// - Older event_time rows for the same seq are silently discarded
-///   (they are considered overwritten by the newer write).
-/// - If the latest event_time has multiple physical rows (same microsecond),
-///   their deserialised payloads are compared.  All identical → folded;
-///   any divergent → `Err` with diagnostic guidance.
-/// - Output is sorted by the winning event_time ASC, then seq ASC.
-///
-/// Exported as `pub(crate)` for testing without a live DB connection.
-pub(crate) fn dedup_raw_entries(
-    raw: &[(i64, chrono::NaiveDateTime, String)],
-    session_id: &str,
-    workspace_id: &str,
-) -> Result<Vec<(i64, SessionEntry)>> {
-    // Group by seq: keep max event_time and all payloads at that max.
-    let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
-        std::collections::HashMap::with_capacity(raw.len().min(64));
-
-    for (seq, et, payload) in raw {
-        let entry = per_seq.entry(*seq).or_insert((*et, Vec::new()));
-        match (*et).cmp(&entry.0) {
-            std::cmp::Ordering::Greater => {
-                // Newer event_time → overwrite older entries entirely.
-                entry.0 = *et;
-                entry.1 = vec![payload.clone()];
-            }
-            std::cmp::Ordering::Equal => {
-                // Same max event_time → accumulate for conflict check.
-                entry.1.push(payload.clone());
-            }
-            std::cmp::Ordering::Less => {
-                // Older event_time → silently discard.
-            }
-        }
-    }
-
-    let mut entries = Vec::with_capacity(per_seq.len());
-    for (seq, (max_et, payloads)) in per_seq {
-        let first_entry: SessionEntry = serde_json::from_str(&payloads[0]).with_context(|| {
-            format!(
-                "cannot decode session {} (seq {} event_time {})",
-                session_id, seq, max_et
-            )
-        })?;
-
-        for (i, payload) in payloads.iter().enumerate().skip(1) {
-            let other: SessionEntry = serde_json::from_str(payload).with_context(|| {
-                format!(
-                    "cannot decode session {} seq {} max_event_time {} (dup {})",
-                    session_id, seq, max_et, i
-                )
-            })?;
-            if other != first_entry {
-                anyhow::bail!(
-                    "session '{}' seq {} event_time {} has divergent physical \
-                     duplicates; cannot safely load. Stop writers, inspect with SQL:\n\
-                     SELECT * FROM session_entries \
-                     WHERE workspace_id = '{}' AND session_id = '{}' AND seq = {} \
-                     ORDER BY event_time;\n\
-                     Resolve manually (new session or repair) then re-run import.",
-                    session_id,
-                    seq,
-                    max_et,
-                    workspace_id,
-                    session_id,
-                    seq,
-                );
-            }
-        }
-
-        entries.push((max_et, seq, first_entry));
-    }
-
-    entries.sort_unstable_by_key(|(event_time, seq, _)| (*event_time, *seq));
-    Ok(entries
-        .into_iter()
-        .map(|(_, seq, entry)| (seq, entry))
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AssistantMessage;
+    use crate::agent::{AssistantMessage, Message};
+    use std::path::Path;
 
     fn conn_str() -> String {
         std::env::var("GREPTIME_PG").unwrap_or_else(|_| {
@@ -3288,7 +3142,8 @@ mod tests {
             (5i64, et(2000), msg_entry("new")),
             (5i64, et(1000), msg_entry("old")),
         ];
-        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        let result =
+            dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time").unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, 5);
         let payload = serde_json::to_string(&result[0].1).unwrap();
@@ -3303,7 +3158,8 @@ mod tests {
             (1i64, et(1000), msg_entry("v1")),
             (1i64, et(2000), msg_entry("v2")),
         ];
-        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        let result =
+            dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time").unwrap();
         assert_eq!(result.len(), 1);
         let payload = serde_json::to_string(&result[0].1).unwrap();
         assert_eq!(payload, msg_entry("v3"));
@@ -3316,7 +3172,8 @@ mod tests {
             (5i64, et(2000), msg_entry("hello")),
             (5i64, et(1000), msg_entry("hello")),
         ];
-        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        let result =
+            dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time").unwrap();
         assert_eq!(result.len(), 1);
     }
 
@@ -3329,7 +3186,8 @@ mod tests {
             (3i64, et(500), msg_entry("hello")),
             (3i64, et(500), msg_entry("hello")),
         ];
-        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        let result =
+            dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time").unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, 3);
     }
@@ -3342,7 +3200,8 @@ mod tests {
             (7i64, et(999), msg_entry("triple")),
             (7i64, et(999), msg_entry("triple")),
         ];
-        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        let result =
+            dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time").unwrap();
         assert_eq!(result.len(), 1);
     }
 
@@ -3355,7 +3214,8 @@ mod tests {
             (3i64, et(500), msg_entry("hello")),
             (3i64, et(500), msg_entry("world")),
         ];
-        let err = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap_err();
+        let err =
+            dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("divergent physical duplicates"), "got: {msg}");
         assert!(msg.contains("seq 3"), "got: {msg}");
@@ -3370,7 +3230,8 @@ mod tests {
             (5i64, et(2000), msg_entry("new_b")), // divergent!
             (5i64, et(1000), msg_entry("old")),
         ];
-        let err = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap_err();
+        let err =
+            dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("divergent physical duplicates"), "got: {msg}");
         assert!(msg.contains("seq 5"), "got: {msg}");
@@ -3387,7 +3248,8 @@ mod tests {
             (5i64, et(1000), msg_entry("five")),
             (1i64, et(2000), msg_entry("one")),
         ];
-        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        let result =
+            dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time").unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].0, 5, "earliest winning event_time first");
         assert_eq!(result[1].0, 1, "middle winning event_time second");
@@ -3401,7 +3263,8 @@ mod tests {
             (20i64, et(1000), msg_entry("seq20")),
             (5i64, et(1000), msg_entry("seq5")),
         ];
-        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        let result =
+            dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time").unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, 5, "lower seq first");
         assert_eq!(result[1].0, 20, "higher seq second");
@@ -3416,7 +3279,8 @@ mod tests {
             (0i64, et(400), msg_entry("seq0-new")), // winning tie folds
             (1i64, et(300), msg_entry("seq1")),
         ];
-        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        let result =
+            dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time").unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, 1);
         assert_eq!(result[1].0, 0);
@@ -3430,7 +3294,8 @@ mod tests {
 
     #[test]
     fn dedup_empty_input() {
-        let result = dedup_raw_entries(&[], "test-session", "test-workspace").unwrap();
+        let result =
+            dedup_raw_entries(&[], "test-session", "test-workspace", "event_time").unwrap();
         assert!(result.is_empty());
     }
 
@@ -3444,7 +3309,8 @@ mod tests {
             (3i64, et(150), msg_entry("seq3-only")),
             (3i64, et(150), msg_entry("seq3-only")), // folded: same et, same payload
         ];
-        let result = dedup_raw_entries(&raw, "test-session", "test-workspace").unwrap();
+        let result =
+            dedup_raw_entries(&raw, "test-session", "test-workspace", "event_time").unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].0, 3);
         assert_eq!(result[1].0, 2);

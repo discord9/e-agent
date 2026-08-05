@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 
-use crate::agent::SessionEntry;
+use crate::agent::{Message, SessionEntry};
 use std::io::{BufRead, Write};
 
 use crate::config::SessionBackend;
@@ -75,6 +75,216 @@ pub(crate) fn process_identity() -> &'static str {
         };
         format!("{pid}@{hostname}#{nonce}")
     })
+}
+
+// ----------------------------------------------------------------------
+// Shared helpers for the GreptimeDB / SQLite backends
+// ----------------------------------------------------------------------
+//
+// These functions are byte-identical between `session_greptime` and
+// `session_sqlite` (each backend historically carried its own copy); they
+// live here so both backends `use` the single shared definition. No trait
+// (see AGENTS.md) — the `SessionStore` facade dispatches to each backend's
+// own methods.
+
+/// Derive a stable workspace identifier from the canonical workspace root
+/// path. This mirrors how the JSONL backend uses the root path as a
+/// namespace (different workspaces get different on-disk directories).
+///
+/// `pub` (not `pub(crate)`) because `src/bin/import_jsonl.rs` imports it as
+/// `e_agent::session_greptime::derive_workspace_id`; each backend module
+/// re-exports it (`pub use`) to preserve that public path.
+pub fn derive_workspace_id(root: &Path) -> String {
+    root.to_string_lossy().to_string()
+}
+
+/// Monotonic real-time microsecond timestamp. Uses wall clock but guarantees
+/// strict ordering within a process: if two entries land in the same
+/// microsecond (or the clock goes backwards), the later one gets prev+1.
+/// Returns microseconds since Unix epoch.
+///
+/// Greptime stores the value as `TIMESTAMP(9)` (converted via
+/// [`us_to_datetime`] for tokio-postgres); SQLite stores it directly as the
+/// INTEGER microsecond columns (`event_time_us`, `last_active_at`,
+/// `started_at_us`).
+pub(crate) fn next_event_time_us() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64;
+    loop {
+        let prev = LAST.load(Ordering::Relaxed);
+        let ts = if now_us > prev { now_us } else { prev + 1 };
+        if LAST
+            .compare_exchange(prev, ts, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return ts;
+        }
+    }
+}
+
+/// Convert microseconds-since-epoch to chrono NaiveDateTime (the type the
+/// Greptime backend returns for every timestamp column).
+///
+/// Input contract: `us` may be negative (pre-1970 timestamps, e.g. -1 µs
+/// = 1969-12-31T23:59:59.999999) — `from_timestamp_micros` handles the
+/// negative sub-second part natively. Values outside chrono's representable
+/// range (roughly year 0000..=9999) panic via the `expect`; the backends
+/// only ever store timestamps produced by `next_event_time_us`, which are
+/// always in range.
+pub(crate) fn us_to_datetime(us: i64) -> chrono::NaiveDateTime {
+    chrono::DateTime::from_timestamp_micros(us)
+        .expect("event_time µs out of range")
+        .naive_utc()
+}
+
+/// Convert chrono NaiveDateTime to microseconds-since-epoch for storage
+/// (SQLite stores INTEGER microseconds; Greptime stores NaiveDateTime
+/// directly and does not need this).
+pub(crate) fn datetime_to_us(dt: chrono::NaiveDateTime) -> i64 {
+    dt.and_utc().timestamp_micros()
+}
+
+/// Classify a SessionEntry for the entry_kind column.
+pub(crate) fn entry_kind(entry: &SessionEntry) -> &'static str {
+    match entry {
+        SessionEntry::Message { .. } => "message",
+        SessionEntry::Compaction { .. } => "compaction",
+        SessionEntry::Notice { .. } => "notice",
+        SessionEntry::BackgroundCompletion { .. } => "background_completion",
+        SessionEntry::ForkedFrom { .. } => "forked_from",
+    }
+}
+
+/// Whether a message is a tool error.
+pub(crate) fn is_error(entry: &SessionEntry) -> bool {
+    match entry {
+        SessionEntry::Message {
+            message: Message::Tool { is_error, .. },
+        } => *is_error,
+        _ => false,
+    }
+}
+
+/// Group raw DB entries by seq, keeping only the row(s) with the latest
+/// `event_time` per seq.
+///
+/// - Older event_time rows for the same seq are silently discarded
+///   (they are considered overwritten by the newer write).
+/// - If the latest event_time has multiple physical rows (same microsecond),
+///   their deserialised payloads are compared. All identical → folded;
+///   any divergent → `Err` with diagnostic guidance.
+/// - Output is sorted by the winning event_time ASC, then seq ASC.
+///
+/// `event_time_col` names the timestamp column in the inspection SQL of the
+/// divergent-duplicates guidance (`event_time` on Greptime,
+/// `event_time_us` on SQLite). Exported as `pub(crate)` for testing without
+/// a live DB connection.
+pub(crate) fn dedup_raw_entries(
+    raw: &[(i64, chrono::NaiveDateTime, String)],
+    session_id: &str,
+    workspace_id: &str,
+    event_time_col: &str,
+) -> Result<Vec<(i64, SessionEntry)>, String> {
+    // Group by seq: keep max event_time and all payloads at that max.
+    let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
+        std::collections::HashMap::with_capacity(raw.len().min(64));
+
+    for (seq, et, payload) in raw {
+        let entry = per_seq.entry(*seq).or_insert((*et, Vec::new()));
+        match (*et).cmp(&entry.0) {
+            std::cmp::Ordering::Greater => {
+                // Newer event_time → overwrite older entries entirely.
+                entry.0 = *et;
+                entry.1 = vec![payload.clone()];
+            }
+            std::cmp::Ordering::Equal => {
+                // Same max event_time → accumulate for conflict check.
+                entry.1.push(payload.clone());
+            }
+            std::cmp::Ordering::Less => {
+                // Older event_time → silently discard.
+            }
+        }
+    }
+
+    let mut entries = Vec::with_capacity(per_seq.len());
+    for (seq, (max_et, payloads)) in per_seq {
+        let first_entry: SessionEntry = serde_json::from_str(&payloads[0]).map_err(|e| {
+            format!(
+                "cannot decode session {} (seq {} event_time {}): {e}",
+                session_id, seq, max_et
+            )
+        })?;
+
+        for (i, payload) in payloads.iter().enumerate().skip(1) {
+            let other: SessionEntry = serde_json::from_str(payload).map_err(|e| {
+                format!(
+                    "cannot decode session {} seq {} max_event_time {} (dup {}): {e}",
+                    session_id, seq, max_et, i
+                )
+            })?;
+            if other != first_entry {
+                return Err(format!(
+                    "session '{}' seq {} event_time {} has divergent physical \
+                     duplicates; cannot safely load. Stop writers, inspect with SQL:\n\
+                     SELECT * FROM session_entries \
+                     WHERE workspace_id = '{}' AND session_id = '{}' AND seq = {} \
+                     ORDER BY {};\n\
+                     Resolve manually (new session or repair) then re-run import.",
+                    session_id, seq, max_et, workspace_id, session_id, seq, event_time_col,
+                ));
+            }
+        }
+
+        entries.push((max_et, seq, first_entry));
+    }
+
+    entries.sort_unstable_by_key(|(event_time, seq, _)| (*event_time, *seq));
+    Ok(entries
+        .into_iter()
+        .map(|(_, seq, entry)| (seq, entry))
+        .collect())
+}
+
+/// Format the concurrent-write conflict error shared by the Greptime and
+/// SQLite append paths (`db_max >= base_seq` and the overlapping rows
+/// diverge from this writer's batch). The `concurrent write conflict`
+/// substring is a contract — `main::friendly_failure` matches on it to
+/// render the friendly Chinese hint. `writer_hint` is the best-effort
+/// "latest metadata writer" read from the sessions audit table (`None` →
+/// the plain message without the hint).
+pub(crate) fn format_conflict_error(
+    session_id: &str,
+    db_max: i64,
+    base_seq: i64,
+    seq: i64,
+    writer_hint: Option<&str>,
+) -> String {
+    match writer_hint {
+        Some(writer) => format!(
+            "concurrent write conflict on session '{}': database max \
+             seq is {db_max} but this writer expected to start at seq \
+             {base_seq}; this session is being written concurrently by \
+             another client (another e-agent process / TUI / Web \
+             window). First divergence at seq {seq}. Stop the other \
+             writer or continue in a fresh session, then retry. \
+             ; latest metadata writer: {writer}",
+            session_id,
+        ),
+        None => format!(
+            "concurrent write conflict on session '{}': database max \
+             seq is {db_max} but this writer expected to start at seq \
+             {base_seq}; this session is being written concurrently by \
+             another client (another e-agent process / TUI / Web \
+             window). First divergence at seq {seq}. Stop the other \
+             writer or continue in a fresh session, then retry.",
+            session_id,
+        ),
+    }
 }
 
 /// Upper bound for [`SessionStore::load_head_page`]: the head segment is
@@ -198,7 +408,7 @@ impl SessionStore {
             SessionBackend::Jsonl => Ok(SessionStore::Jsonl),
             #[cfg(feature = "greptime")]
             SessionBackend::Greptime { conn } => {
-                let workspace_id = crate::session_greptime::derive_workspace_id(root);
+                let workspace_id = derive_workspace_id(root);
                 let session = crate::session_greptime::GreptimeSession::connect(
                     conn,
                     &workspace_id,
@@ -216,7 +426,7 @@ impl SessionStore {
             }
             #[cfg(feature = "sqlite")]
             SessionBackend::Sqlite { path } => {
-                let workspace_id = crate::session_sqlite::derive_workspace_id(root);
+                let workspace_id = derive_workspace_id(root);
                 let session =
                     crate::session_sqlite::SqliteSession::connect(path, &workspace_id, session_id)
                         .await
@@ -244,7 +454,7 @@ impl SessionStore {
             SessionBackend::Jsonl => Ok(SessionStore::Jsonl),
             #[cfg(feature = "greptime")]
             SessionBackend::Greptime { conn } => {
-                let workspace_id = crate::session_greptime::derive_workspace_id(root);
+                let workspace_id = derive_workspace_id(root);
                 let session = crate::session_greptime::GreptimeSession::connect(
                     conn,
                     &workspace_id,
@@ -262,7 +472,7 @@ impl SessionStore {
             }
             #[cfg(feature = "sqlite")]
             SessionBackend::Sqlite { path } => {
-                let workspace_id = crate::session_sqlite::derive_workspace_id(root);
+                let workspace_id = derive_workspace_id(root);
                 let session = crate::session_sqlite::SqliteSession::connect(
                     path,
                     &workspace_id,
@@ -1599,6 +1809,439 @@ fn jsonl_label_for_subagent(root: &Path, subagent_session_id: &str) -> Option<St
     label
 }
 
+// ----------------------------------------------------------------------
+// Direct unit tests for the shared backend helpers extracted from
+// `session_greptime` / `session_sqlite` (P0+P1 refactor). The two backend
+// test files exercise `dedup_raw_entries` end-to-end; this module pins the
+// extracted pure functions themselves so the shared copies stay covered
+// even if one backend's tests are feature-gated away.
+// ----------------------------------------------------------------------
+#[cfg(test)]
+mod shared_helpers {
+    use super::*;
+    use crate::agent::{AssistantMessage, Message};
+
+    // --- us_to_datetime / datetime_to_us --------------------------------
+
+    #[test]
+    fn us_to_datetime_known_fixed_timestamps() {
+        // Epoch and a fractional second.
+        assert_eq!(
+            us_to_datetime(0),
+            chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        );
+        assert_eq!(
+            us_to_datetime(1_000_001),
+            chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .and_hms_micro_opt(0, 0, 1, 1)
+                .unwrap()
+        );
+        // 2000-01-01T00:00:00Z = 946684800s.
+        assert_eq!(
+            us_to_datetime(946_684_800_000_000),
+            chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        );
+        // One second before epoch (negative whole second).
+        assert_eq!(
+            us_to_datetime(-1_000_000),
+            chrono::NaiveDate::from_ymd_opt(1969, 12, 31)
+                .unwrap()
+                .and_hms_opt(23, 59, 59)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn us_datetime_roundtrip_boundaries() {
+        // us → datetime → us is the identity for every value the backends
+        // can produce (all timestamps originate from `next_event_time_us`,
+        // so ≥ 0; negative whole-second values convert losslessly too).
+        let cases = [
+            0i64,
+            1,
+            999_999,
+            1_000_000,
+            946_684_800_000_000,     // 2000-01-01
+            253_402_300_799_999_999, // 9999-12-31T23:59:59.999999 (chrono max)
+            -1,                      // 1969-12-31T23:59:59.999999 (negative sub-second)
+            -999_999,                // 1969-12-31T23:59:59.000001 (negative sub-second floor)
+            -1_000_000,              // 1969-12-31T23:59:59
+            -62_167_219_200_000_000, // 0000-01-01T00:00:00 (chrono min)
+        ];
+        for us in cases {
+            let dt = us_to_datetime(us);
+            assert_eq!(
+                datetime_to_us(dt),
+                us,
+                "us→datetime→us must round-trip for {us}"
+            );
+        }
+    }
+
+    #[test]
+    fn us_to_datetime_negative_subsecond_does_not_panic() {
+        // Regression: the old `us % 1_000_000` formulation wrapped the
+        // negative remainder into a huge u32 nanos, `from_timestamp`
+        // returned None and the unwrap panicked for any negative
+        // sub-second value. `from_timestamp_micros` handles negatives
+        // natively, so -1 (and the -999999 sub-second floor) must convert
+        // and round-trip exactly.
+        let min_one = us_to_datetime(-1);
+        assert_eq!(
+            min_one,
+            chrono::NaiveDate::from_ymd_opt(1969, 12, 31)
+                .unwrap()
+                .and_hms_micro_opt(23, 59, 59, 999_999)
+                .unwrap(),
+            "-1 µs = one microsecond before epoch"
+        );
+        assert_eq!(datetime_to_us(min_one), -1, "round-trip -1");
+
+        let floor = us_to_datetime(-999_999);
+        assert_eq!(
+            datetime_to_us(floor),
+            -999_999,
+            "round-trip -999999 (negative sub-second floor)"
+        );
+        assert!(
+            datetime_to_us(us_to_datetime(-1)) < 0 && datetime_to_us(us_to_datetime(-999_999)) < 0,
+            "negative sub-second inputs must stay negative through the conversion"
+        );
+    }
+
+    // --- next_event_time_us ---------------------------------------------
+
+    #[test]
+    fn next_event_time_us_is_strictly_monotonic() {
+        let mut prev = next_event_time_us();
+        for _ in 0..1000 {
+            let next = next_event_time_us();
+            assert!(next > prev, "must be strictly increasing: {next} <= {prev}");
+            prev = next;
+        }
+    }
+
+    #[test]
+    fn next_event_time_us_monotonic_across_threads() {
+        // The shared AtomicI64 is process-wide by design (one monotonic
+        // clock for every backend caller); hammer it from several threads
+        // and verify the union of returned values is strictly ordered, so
+        // no interleaving can ever produce a non-monotonic pair.
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let mut seq = Vec::with_capacity(50);
+                    for _ in 0..50 {
+                        seq.push(next_event_time_us());
+                    }
+                    seq
+                })
+            })
+            .collect();
+        let mut all: Vec<i64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("thread"))
+            .collect();
+        all.sort_unstable();
+        for pair in all.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "union of concurrent next_event_time_us must be strictly increasing"
+            );
+        }
+    }
+
+    #[test]
+    fn next_event_time_us_composes_with_us_to_datetime() {
+        // Every timestamp the backends store must convert losslessly: the
+        // round-trip through the chrono layer is exact (whole microseconds).
+        for _ in 0..100 {
+            let us = next_event_time_us();
+            let dt = us_to_datetime(us);
+            assert_eq!(
+                datetime_to_us(dt),
+                us,
+                "next_event_time_us output must survive the datetime round-trip"
+            );
+        }
+    }
+
+    // --- derive_workspace_id --------------------------------------------
+
+    #[test]
+    fn derive_workspace_id_is_deterministic_and_distinct() {
+        let a = Path::new("/tmp/e-agent-ws-alpha");
+        let b = Path::new("/tmp/e-agent-ws-beta");
+        assert_eq!(
+            derive_workspace_id(a),
+            derive_workspace_id(a),
+            "same root → same id"
+        );
+        assert_eq!(
+            derive_workspace_id(b),
+            derive_workspace_id(b),
+            "same root → same id"
+        );
+        assert_ne!(
+            derive_workspace_id(a),
+            derive_workspace_id(b),
+            "different roots → different ids"
+        );
+        // Sub-path roots are distinct namespaces (matching the JSONL
+        // on-disk directory isolation).
+        assert_ne!(
+            derive_workspace_id(Path::new("/tmp/ws")),
+            derive_workspace_id(Path::new("/tmp/ws/sub"))
+        );
+    }
+
+    #[test]
+    fn derive_workspace_id_handles_empty_and_special_roots() {
+        // Empty root: must not panic; deterministic.
+        let empty = Path::new("");
+        let first = derive_workspace_id(empty);
+        assert_eq!(first, derive_workspace_id(empty));
+        // Whitespace / unicode / non-UTF8 bytes: lossy conversion is
+        // deterministic and must not panic.
+        let fancy = Path::new("/tmp/会话 dir/ünïcode name");
+        assert_eq!(derive_workspace_id(fancy), derive_workspace_id(fancy));
+        assert!(derive_workspace_id(fancy).contains("会话"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let non_utf8 = std::path::PathBuf::from("/tmp/")
+                .join(std::ffi::OsStr::from_bytes(b"bad-\xff\xfe-name"));
+            assert_eq!(
+                derive_workspace_id(&non_utf8),
+                derive_workspace_id(&non_utf8)
+            );
+        }
+    }
+
+    // --- entry_kind / is_error ------------------------------------------
+
+    fn sample_entries() -> Vec<SessionEntry> {
+        vec![
+            Message::System {
+                content: "sys".into(),
+            }
+            .into(),
+            Message::User {
+                content: "hi".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::Assistant(AssistantMessage {
+                content: Some("answer".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            })
+            .into(),
+            Message::Tool {
+                call_id: "c1".into(),
+                name: "bash".into(),
+                content: "ok".into(),
+                is_error: false,
+                synthetic: false,
+            }
+            .into(),
+            Message::Tool {
+                call_id: "c2".into(),
+                name: "bash".into(),
+                content: "boom".into(),
+                is_error: true,
+                synthetic: false,
+            }
+            .into(),
+            SessionEntry::Compaction {
+                summary: "comp".into(),
+                retained: vec![],
+            },
+            SessionEntry::Notice {
+                text: "notice".into(),
+            },
+            SessionEntry::BackgroundCompletion {
+                id: 7,
+                output: "done".into(),
+                label: None,
+            },
+            SessionEntry::ForkedFrom {
+                source: "src".into(),
+                at: 3,
+                event_time: None,
+                seq: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn entry_kind_classifies_every_variant() {
+        let entries = sample_entries();
+        let kinds: Vec<&str> = entries.iter().map(entry_kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "message",
+                "message",
+                "message",
+                "message",
+                "message", // tool messages are still `message` kind
+                "compaction",
+                "notice",
+                "background_completion",
+                "forked_from",
+            ]
+        );
+    }
+
+    #[test]
+    fn is_error_only_flags_tool_errors() {
+        let entries = sample_entries();
+        let flags: Vec<bool> = entries.iter().map(is_error).collect();
+        assert_eq!(
+            flags,
+            vec![false, false, false, false, true, false, false, false, false]
+        );
+    }
+
+    // --- format_conflict_error ------------------------------------------
+
+    #[test]
+    fn format_conflict_error_keeps_the_main_contract_substring() {
+        // `main::friendly_failure` matches on the fixed substring; every
+        // variant of the message must carry it.
+        let with_writer = format_conflict_error("sess-1", 42, 40, 41, Some("w@h#1"));
+        assert!(
+            with_writer.contains("concurrent write conflict"),
+            "contract substring missing: {with_writer}"
+        );
+        let without_writer = format_conflict_error("sess-1", 42, 40, 41, None);
+        assert!(
+            without_writer.contains("concurrent write conflict"),
+            "contract substring missing: {without_writer}"
+        );
+    }
+
+    #[test]
+    fn format_conflict_error_renders_all_parameters() {
+        let msg = format_conflict_error("sess-abc", 99, 90, 95, Some("pid@host#42"));
+        assert!(msg.contains("session 'sess-abc'"), "session id: {msg}");
+        assert!(msg.contains("max seq is 99"), "db_max: {msg}");
+        assert!(
+            msg.contains("expected to start at seq 90"),
+            "base_seq: {msg}"
+        );
+        assert!(msg.contains("First divergence at seq 95"), "seq: {msg}");
+        assert!(
+            msg.contains("latest metadata writer: pid@host#42"),
+            "writer hint: {msg}"
+        );
+        assert!(
+            msg.contains("Stop the other writer or continue in a fresh session"),
+            "actionable guidance: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_conflict_error_writer_hint_optional() {
+        let plain = format_conflict_error("sess-1", 1, 0, 0, None);
+        assert!(
+            !plain.contains("latest metadata writer"),
+            "no writer hint when lookup failed: {plain}"
+        );
+        // The no-hint variant is otherwise identical to the hint variant
+        // minus the trailing clause.
+        let with_hint = format_conflict_error("sess-1", 1, 0, 0, Some("other@h#9"));
+        assert!(plain.len() < with_hint.len());
+        assert!(
+            plain.starts_with(
+                &with_hint[..with_hint.len() - " ; latest metadata writer: other@h#9".len()]
+            ),
+            "hint must be a pure suffix"
+        );
+    }
+
+    // --- dedup_raw_entries (shared-copy edges not covered by backend
+    //     suites: gapped seqs and the P1a column parameter) ---------------
+
+    fn et(sec: i64) -> chrono::NaiveDateTime {
+        chrono::DateTime::from_timestamp(sec, 0)
+            .unwrap()
+            .naive_utc()
+    }
+
+    fn msg(content: &str) -> String {
+        serde_json::to_string(&SessionEntry::from(Message::User {
+            content: content.to_owned(),
+            images: vec![],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn dedup_gapped_seqs_are_preserved_not_errors() {
+        // Seqs 0, 2, 5 (gaps): every seq survives, ordered by winning
+        // event_time; a missing seq is not an error by itself.
+        let raw = vec![
+            (0i64, et(100), msg("a")),
+            (2i64, et(300), msg("b")),
+            (5i64, et(200), msg("c")),
+        ];
+        let out = dedup_raw_entries(&raw, "s", "w", "event_time").unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].0, 0, "earliest event_time first");
+        assert_eq!(out[1].0, 5, "event_time order, not seq order");
+        assert_eq!(out[2].0, 2);
+    }
+
+    #[test]
+    fn dedup_guidance_renders_the_parameterized_event_time_column() {
+        // P1a: the inspection SQL names each backend's real timestamp
+        // column. The divergent-duplicates guidance must contain exactly
+        // the column the caller passed — and both the session id and the
+        // workspace id must render into the message (they scope the
+        // manual-inspection SQL the user is told to run).
+        let raw = vec![(3i64, et(500), msg("hello")), (3i64, et(500), msg("world"))];
+        let err_greptime =
+            dedup_raw_entries(&raw, "test-sess-1", "test-ws-1", "event_time").unwrap_err();
+        assert!(
+            err_greptime.contains("ORDER BY event_time;"),
+            "greptime column name must appear: {err_greptime}"
+        );
+        assert!(!err_greptime.contains("event_time_us"));
+        assert!(
+            err_greptime.contains("test-sess-1"),
+            "session id must render into the guidance: {err_greptime}"
+        );
+        assert!(
+            err_greptime.contains("test-ws-1"),
+            "workspace id must render into the guidance: {err_greptime}"
+        );
+
+        let err_sqlite =
+            dedup_raw_entries(&raw, "test-sess-1", "test-ws-1", "event_time_us").unwrap_err();
+        assert!(
+            err_sqlite.contains("ORDER BY event_time_us;"),
+            "sqlite column name must appear: {err_sqlite}"
+        );
+        assert!(
+            err_sqlite.contains("test-sess-1"),
+            "session id must render into the guidance: {err_sqlite}"
+        );
+        assert!(
+            err_sqlite.contains("test-ws-1"),
+            "workspace id must render into the guidance: {err_sqlite}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2382,6 +3025,254 @@ mod tests {
                 next,
                 vec![user(5), user(6)],
                 "cut-off head part reachable via cursor"
+            );
+        }
+
+        /// End-to-end: a real tool-call/tool-result session written through
+        /// the store, fully closed, then reopened (simulating a TUI/process
+        /// restart) and replayed — every entry back, in order, with the
+        /// compaction-aware segmented views intact.
+        #[tokio::test]
+        async fn sqlite_e2e_reopen_replays_full_tool_session() {
+            use crate::agent::{AssistantMessage, Message};
+
+            let (_dir, path) = temp_db();
+            let root = std::env::temp_dir();
+            let session = format!("test-e2e-replay-{}", crate::session::new_id());
+
+            let tool_call = Message::Assistant(AssistantMessage {
+                content: Some("let me check".into()),
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    arguments: "ls".into(),
+                }],
+                reasoning: Some("thinking".into()),
+            })
+            .into();
+            let tool_result = Message::Tool {
+                call_id: "call_1".into(),
+                name: "bash".into(),
+                content: "src\n".into(),
+                is_error: false,
+                synthetic: false,
+            }
+            .into();
+            let tool_error = Message::Tool {
+                call_id: "call_2".into(),
+                name: "bash".into(),
+                content: "command not found: nope".into(),
+                is_error: true,
+                synthetic: false,
+            }
+            .into();
+            let entries = vec![
+                Message::System {
+                    content: "You are an agent".into(),
+                }
+                .into(),
+                Message::User {
+                    content: "run ls".into(),
+                    images: vec![],
+                }
+                .into(),
+                tool_call,
+                tool_result,
+                tool_error,
+                SessionEntry::Notice {
+                    text: "background task 3 completed".into(),
+                },
+                // Compaction in the MIDDLE: the head segment = compaction +
+                // everything after it, the older segment = everything before.
+                SessionEntry::Compaction {
+                    summary: "compressed".into(),
+                    retained: vec![],
+                },
+                Message::User {
+                    content: "and now?".into(),
+                    images: vec![],
+                }
+                .into(),
+                Message::Assistant(AssistantMessage {
+                    content: Some("all good".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                })
+                .into(),
+            ];
+
+            // Writer A: connect, append, fully close (drop).
+            {
+                let store = SessionStore::connect(&backend(&path), &root, &session)
+                    .await
+                    .expect("connect e2e store A");
+                store
+                    .append(&root, &session, &entries)
+                    .await
+                    .expect("append e2e session");
+            }
+
+            // Writer B: full reopen on the same file — the TUI/process
+            // restart view. Everything must come back in order.
+            let store = SessionStore::connect(&backend(&path), &root, &session)
+                .await
+                .expect("reconnect e2e store B");
+            let loaded = store.load(&root, &session).await.expect("replay load");
+            assert_eq!(loaded.entries.len(), entries.len(), "no entries lost");
+            for (i, (got, want)) in loaded.entries.iter().zip(entries.iter()).enumerate() {
+                assert_eq!(got, want, "entry {i} must replay identically");
+            }
+
+            // Seq provenance is contiguous 0..n after the restart.
+            let with_seq = store
+                .load_with_seq(&root, &session)
+                .await
+                .expect("load_with_seq after restart");
+            assert_eq!(with_seq.len(), entries.len());
+            for (i, (seq, _)) in with_seq.iter().enumerate() {
+                assert_eq!(*seq, i as i64, "contiguous seq after restart");
+            }
+
+            // Compaction-aware segmentation survives the restart: head =
+            // [compaction .. end], older = [start .. compaction).
+            let head = store
+                .load_head(&root, &session)
+                .await
+                .expect("load_head after restart");
+            assert_eq!(head.entries, entries[6..], "head = compaction + tail");
+            let (older, cursor) = store
+                .load_older(&root, &session, 6, None)
+                .await
+                .expect("load_older after restart");
+            assert_eq!(older, entries[..6], "older = everything before compaction");
+            assert_eq!(cursor, None, "oldest segment reached");
+            assert_eq!(
+                store.head_seq(&root, &session).await.expect("head_seq"),
+                Some(6),
+                "head opens at the compaction seq"
+            );
+        }
+
+        /// End-to-end concurrent writers through the store: two live stores
+        /// on the same file+session both believe they own seq 0; the second
+        /// writer to land wins, the stale one is rejected with the
+        /// `concurrent write conflict` contract substring and writes
+        /// nothing.
+        #[tokio::test]
+        async fn sqlite_e2e_concurrent_writers_through_store_one_rejected() {
+            use crate::agent::Message;
+
+            let (_dir, path) = temp_db();
+            let root = std::env::temp_dir();
+            let session = format!("test-e2e-conflict-{}", crate::session::new_id());
+
+            let writer_a = |prefix: &str| -> Vec<SessionEntry> {
+                vec![
+                    Message::User {
+                        content: format!("{prefix}-1"),
+                        images: vec![],
+                    }
+                    .into(),
+                    Message::User {
+                        content: format!("{prefix}-2"),
+                        images: vec![],
+                    }
+                    .into(),
+                ]
+            };
+
+            // Both connect before anything is written: each derives
+            // next_seq = 0 from the (empty) DB file.
+            let store_a = SessionStore::connect(&backend(&path), &root, &session)
+                .await
+                .expect("connect writer A");
+            let store_b = SessionStore::connect(&backend(&path), &root, &session)
+                .await
+                .expect("connect writer B");
+
+            // B lands first: seqs 0,1 with B's payload.
+            store_b
+                .append(&root, &session, &writer_a("b"))
+                .await
+                .expect("writer B append lands");
+
+            // A is stale (still thinks it owns seq 0) and appends DIFFERENT
+            // content for the same seqs → the concurrent-write detection
+            // must reject it before any INSERT.
+            let err = store_a
+                .append(&root, &session, &writer_a("a"))
+                .await
+                .expect_err("stale writer must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("concurrent write conflict"),
+                "contract substring missing: {msg}"
+            );
+            assert!(msg.contains(&session), "error must name the session: {msg}");
+
+            // The rejected writer wrote nothing: a fresh reopen sees only
+            // B's rows, in order.
+            let store_c = SessionStore::connect(&backend(&path), &root, &session)
+                .await
+                .expect("connect writer C");
+            let loaded = store_c
+                .load(&root, &session)
+                .await
+                .expect("load after rejection");
+            assert_eq!(loaded.entries, writer_a("b"), "only B's rows survive");
+        }
+
+        /// End-to-end background-task recovery across a restart: a task
+        /// recorded by store A (fire-and-forget spawn) is visible to a
+        /// freshly reopened store B (the "killed on exit" report path),
+        /// and after a clear on B a third reopen sees nothing left.
+        #[tokio::test]
+        async fn sqlite_e2e_running_tasks_recovered_after_reopen() {
+            let (_dir, path) = temp_db();
+            let root = std::env::temp_dir();
+            let session = format!("test-e2e-bg-{}", crate::session::new_id());
+
+            // Store A records a task, then is dropped (process dies before
+            // the completion arrives).
+            {
+                let store = SessionStore::connect(&backend(&path), &root, &session)
+                    .await
+                    .expect("connect bg store A");
+                store.record_background_start(&root, &session, 42, "long build", None);
+                // Drop before the task completes — simulated crash.
+            }
+
+            // Reopened store B recovers the unfinished task (consuming it).
+            let store_b = SessionStore::connect(&backend(&path), &root, &session)
+                .await
+                .expect("reconnect bg store B");
+            let recovered = take_unfinished_with_retry(&store_b, &root, &session).await;
+            assert_eq!(
+                recovered,
+                vec![crate::session::format_unfinished(42, "long build", None)],
+                "unfinished task must survive the restart"
+            );
+
+            // B records and clears a task; a third reopen (another restart)
+            // must report nothing.
+            store_b.record_background_start(&root, &session, 43, "run tests", None);
+            for _ in 0..1000 {
+                tokio::task::yield_now().await;
+            }
+            store_b.clear_background_task(&root, &session, 43);
+            for _ in 0..1000 {
+                tokio::task::yield_now().await;
+            }
+            let store_c = SessionStore::connect(&backend(&path), &root, &session)
+                .await
+                .expect("reconnect bg store C");
+            let labels = store_c
+                .take_unfinished_background(&root, &session)
+                .await
+                .expect("take after clear+restart");
+            assert!(
+                labels.is_empty(),
+                "cleared task must not reappear after restart: {labels:?}"
             );
         }
     }
