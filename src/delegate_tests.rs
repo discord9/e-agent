@@ -1007,6 +1007,86 @@ async fn resume_requires_persistence_and_an_existing_session() {
     );
 }
 
+#[tokio::test]
+async fn resume_rejects_a_still_running_subagent_session() {
+    // Resume guard (concurrent-write conflicts #46/#49): a subagent that is
+    // still registered in the parent's `Sessions` registry must not be
+    // resumed — its runner is still appending to the same session file, so
+    // a resumed runner would race it. The session exists on disk (a
+    // finished run would have left it), so the ONLY reason resume fails is
+    // the live handle; the guard fires before any store I/O.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("sessions");
+    crate::session::Session::append(
+        &root,
+        "sub-still-running",
+        &[crate::agent::SessionEntry::from(
+            crate::agent::Message::User {
+                content: "earlier task".into(),
+                images: vec![],
+            },
+        )],
+    )
+    .unwrap();
+
+    // The guard fires before any model call or store I/O, so the first
+    // tool needs no mock server. Clone: the second tool below moves `root`.
+    let mut tool =
+        delegate_with_url(temp.path(), "http://localhost".into()).persist_sessions(root.clone());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+    // Register the live handle exactly like a running spawn would
+    // (`sessions.insert(id, entry)` in the spawn hooks).
+    let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+    tool.sessions.insert(
+        7,
+        Arc::new(SessionEntry {
+            handle,
+            model: "test-model".into(),
+            role: None,
+            cwd: temp.path().display().to_string(),
+            session_id: "sub-still-running".into(),
+            context_window: None,
+            store: SessionStore::Jsonl,
+        }),
+    );
+
+    let error = tool
+        .execute(json!({
+            "task": "follow-up",
+            "resume": "sub-still-running",
+            "workspace": temp.path().to_str().unwrap(),
+            "background": false
+        }))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("still running as a live subagent"),
+        "{error}"
+    );
+
+    // Without the live handle the same id resumes normally: the guard
+    // passes and the subagent continues on the loaded transcript.
+    let mut resumed_tool =
+        delegate_with_url(temp.path(), successful_model_n("finished answer", 1).await)
+            .persist_sessions(root);
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    resumed_tool.set_event_sender(sender);
+    let answer = resumed_tool
+        .execute(json!({
+            "task": "follow-up",
+            "resume": "sub-still-running",
+            "workspace": temp.path().to_str().unwrap(),
+            "background": false
+        }))
+        .await
+        .unwrap();
+    assert!(
+        answer.contains("subagent session: sub-still-running"),
+        "a finished subagent still resumes: {answer}"
+    );
+}
+
 #[test]
 fn resume_loads_the_previous_transcript_as_starting_context() {
     // The core resume invariant: a persisted sub- session can be loaded
