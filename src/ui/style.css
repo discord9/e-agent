@@ -265,6 +265,8 @@
     flex: 0 0 auto;
   }
   .busy-dot.busy { background: var(--orange); animation: pulse 1.2s infinite; }
+  /* 子行绿点：busy:false 但存活的 subagent（活着但空闲/在等） */
+  .busy-dot-green { background: var(--green); }
   @keyframes pulse { 50% { opacity: 0.3; } }
 
   /* 侧栏主会话状态：中心点只表示主 agent，环绕红点表示活跃 subagent。
@@ -290,6 +292,9 @@
     box-shadow: 0 0 0 1px var(--base3);
     animation: subagent-pulse 1.45s ease-in-out infinite;
   }
+  /* 环绕绿点：delegate 任务在等（对应 subagent busy:false，活着但空闲）；
+     尺寸/描边/动画继承 .busy-dot-sub，仅换 Solarized 绿。 */
+  .busy-dot-sub.green { background: var(--green); }
   .busy-dot-sub:nth-of-type(3n) { animation-delay: -0.45s; }
   .busy-dot-sub:nth-of-type(3n + 1) { animation-delay: -0.9s; }
   @keyframes subagent-pulse { 50% { opacity: 0.45; } }
