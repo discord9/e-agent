@@ -1123,6 +1123,80 @@ timeout_secs = 120
 }
 
 #[test]
+fn resolve_finalize_wait_defaults_and_global() {
+    let temp = tempfile::tempdir().unwrap();
+    // No config at all → default 600s.
+    let t = resolve_finalize_wait(None, temp.path()).unwrap();
+    assert_eq!(t, Some(Duration::from_secs(600)));
+
+    // Global config sets a value.
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[delegate]
+finalize_wait_secs = 120
+"#,
+    );
+    let config = Config::from_path(&path).unwrap();
+    let t = resolve_finalize_wait(Some(&config), temp.path()).unwrap();
+    assert_eq!(t, Some(Duration::from_secs(120)));
+}
+
+#[test]
+fn resolve_finalize_wait_workspace_override_and_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[delegate]
+finalize_wait_secs = 120
+"#,
+    );
+    let config = Config::from_path(&path).unwrap();
+
+    // Workspace .e-agent/config.toml overrides global.
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[delegate]\nfinalize_wait_secs = 5\n",
+    )
+    .unwrap();
+    let t = resolve_finalize_wait(Some(&config), &ws).unwrap();
+    assert_eq!(t, Some(Duration::from_secs(5)));
+
+    // finalize_wait_secs = 0 → None (wait indefinitely).
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[delegate]\nfinalize_wait_secs = 0\n",
+    )
+    .unwrap();
+    let t = resolve_finalize_wait(Some(&config), &ws).unwrap();
+    assert_eq!(t, None);
+
+    // Workspace without [delegate] falls back to global.
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[sandbox]\nenabled = true\n",
+    )
+    .unwrap();
+    let t = resolve_finalize_wait(Some(&config), &ws).unwrap();
+    assert_eq!(t, Some(Duration::from_secs(120)));
+}
+
+#[test]
 fn linked_worktree_main_repo_resolves_gitdir_pointer() {
     let temp = tempfile::tempdir().unwrap();
     let main_repo = temp.path().join("main-repo");

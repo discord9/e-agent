@@ -11,6 +11,7 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{
     sync::{broadcast, mpsc, watch},
@@ -379,6 +380,11 @@ pub struct SessionRunner {
     cancelled: bool,
     policy: IdlePolicy,
     last_answer: Option<String>,
+    /// Upper bound for waiting on blocking background tasks before
+    /// finalizing a `FinishWhenIdle` session (`None` = wait indefinitely).
+    /// Resolved from `[delegate] finalize_wait_secs` by the session factory;
+    /// consumed only at the FinishWhenIdle idle point.
+    finalize_wait: Option<Duration>,
     #[cfg(test)]
     before_finalize: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -428,11 +434,20 @@ impl SessionRunner {
                 cancelled: false,
                 policy,
                 last_answer: None,
+                finalize_wait: None,
                 #[cfg(test)]
                 before_finalize: None,
             },
             handle,
         )
+    }
+
+    /// Cap the `FinishWhenIdle` wait for blocking background tasks (see
+    /// `[delegate] finalize_wait_secs`). `None` keeps the historical
+    /// behavior: wait for the background tasks indefinitely.
+    pub fn with_finalize_wait(mut self, wait: Option<Duration>) -> Self {
+        self.finalize_wait = wait;
+        self
     }
 
     pub fn start(mut self, initial_prompt: Option<String>) -> SessionTask {
@@ -841,7 +856,29 @@ impl SessionRunner {
                         continue;
                     }
                 }
-                tokio::select! {
+                // A FinishWhenIdle session that already finished its work
+                // waits here for its blocking background tasks. Cap that
+                // wait: a stuck task (hung I/O, `timeout_secs = 0`, zombie
+                // grandchild inside bwrap) must not keep a delegate
+                // subagent — and its parent task — alive forever. On
+                // timeout the session finalizes as Completed WITHOUT
+                // cancelling the tasks: they keep running in the shared
+                // registry, where the parent agent can still read their
+                // output or cancel them from the task panel; completion
+                // events delivered to this session's now-closed channel
+                // are dropped harmlessly. `None` keeps the historical
+                // wait-indefinitely behavior; a Cancel interruption
+                // (subagent kept alive for follow-ups) never times out.
+                let wait = if self.policy == IdlePolicy::FinishWhenIdle
+                    && self.agent.has_blocking_background()
+                    && !self.cancelled
+                {
+                    self.finalize_wait
+                } else {
+                    None
+                };
+                let sleep = wait.unwrap_or(Duration::ZERO);
+                tokio::select! { biased;
                     command = self.commands.recv() => match command {
                         Some(command) => {
                             let cancelled = self.queue(command);
@@ -860,6 +897,17 @@ impl SessionRunner {
                         if ready { continue; }
                         self.terminate(SessionResult::Closed, Vec::new()).await;
                         return;
+                    }
+                    _ = tokio::time::sleep(sleep), if wait.is_some() => {
+                        let n = self.agent.background_task_ids().len();
+                        self.shared.lock().unwrap().emit(AgentEvent::Notice(format!(
+                            "finalizing with {n} background task(s) still running"
+                        )));
+                        let result = SessionResult::Completed(self.last_answer.clone());
+                        if self.finalize_when_idle(result) {
+                            return;
+                        }
+                        continue;
                     }
                 }
             }

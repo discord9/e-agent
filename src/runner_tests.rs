@@ -2988,3 +2988,178 @@ async fn empty_content_without_tool_calls_is_a_natural_turn_end() {
     )));
     task.join().await.unwrap();
 }
+
+#[tokio::test]
+async fn finish_when_idle_times_out_while_background_task_still_runs() {
+    // A blocking (non-detached) background task keeps a FinishWhenIdle
+    // session from finalizing. With a `finalize_wait` cap, the runner
+    // finalizes as Completed once the wait expires — the work is done —
+    // WITHOUT cancelling the task: it stays registered in the shared
+    // registry (where the parent agent can still read or cancel it), and a
+    // Notice announces the finalize.
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    let (tools, background) = crate::tools::builtins(workspace, None, false, None);
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("sleep 30", false)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("build started, waiting".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        tools,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "finalize-wait-timeout".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let runner = runner.with_finalize_wait(Some(std::time::Duration::from_millis(500)));
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("run build".into()));
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "build started, waiting" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    // The wait cap expires: the runner emits a Notice and finalizes as
+    // Completed with the last answer, never calling the model again.
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text)
+                if text.contains("finalizing with 1 background task(s) still running") =>
+            {
+                break;
+            }
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))),
+    )
+    .await
+    .expect("finalize_wait expiry must finalize the FinishWhenIdle session");
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some(
+            "build started, waiting".into()
+        )))
+    );
+    task.join().await.unwrap();
+
+    // The background task was NOT cancelled: it is still running in the
+    // shared registry after the subagent finalized.
+    let tasks = background.running();
+    assert_eq!(tasks.len(), 1, "task must stay registered: {tasks:?}");
+    assert_eq!(tasks[0].kind, "bash");
+    // Explicitly cancel to avoid leaking the sleep process past the test.
+    background.cancel(tasks[0].id);
+    assert!(background.running().is_empty());
+}
+
+#[tokio::test]
+async fn finish_when_idle_without_finalize_wait_keeps_waiting() {
+    // Control: without a `finalize_wait` (None = disabled), the session
+    // must NOT finalize early while a blocking background task runs; it
+    // only finalizes after the completion is delivered and the model runs
+    // its final round.
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("cargo build", false)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("build started, waiting".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("build done, final".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        vec![Box::new(MockBackgroundBash {
+            id: 9,
+            label: "cargo build",
+            sender: sender.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "finalize-wait-none".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("run build".into()));
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "build started, waiting" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    // A short window must pass without any finalize.
+    let early = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))),
+    )
+    .await;
+    assert!(
+        early.is_err(),
+        "without finalize_wait the session must keep waiting for the background task"
+    );
+
+    // Deliver the completion: normal path resumes and finalizes.
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("agent must wire the bash completion sender")
+        .send(AgentEvent::BackgroundCompleted {
+            id: 9,
+            output: "build ok".into(),
+            label: Some("cargo build".into()),
+        })
+        .unwrap();
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "build done, final" => break,
+            AgentEvent::Error(text) => panic!("follow-up turn failed: {text}"),
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("build done, final".into())))
+    );
+    task.join().await.unwrap();
+}

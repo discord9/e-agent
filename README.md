@@ -85,8 +85,9 @@ the global one, and it participates in the normal priority chain — an
 explicit `--profile` wins over it, and it wins over `[roles] main`. The
 project file cannot change `[providers]`, `[web_search]`, or `[session]`, and
 it only takes effect when a global config exists (it is an override layer,
-not a standalone config). `[sandbox]`, `[background]`, and `[bash]` project
-overrides are described in the sandbox section below.
+not a standalone config). `[sandbox]`, `[background]`, `[bash]`, and
+`[delegate]` project overrides are described in the relevant sections
+below.
 
 The project file is strict: unknown sections (a typo, or a section the
 project file cannot carry) are a startup error naming the offending field
@@ -511,6 +512,14 @@ one-shot mode a still-running task is reported before exit;
 the process then best-effort terminates its process group. Uninjected background
 results are not persisted in sessions.
 
+A `FinishWhenIdle` session (a delegated subagent, or a one-shot CLI session)
+that finished its work waits for its blocking background tasks before
+finalizing. `[delegate] finalize_wait_secs` caps that wait (default 10
+minutes; `0` disables the cap and waits forever). On expiry the session
+finalizes as completed without cancelling the tasks — they keep running in
+the shared registry, where the parent agent can still read their output or
+cancel them from the task panel.
+
 ## Subagents
 
 The `delegate` tool spawns a subagent with a fresh context to work on a
@@ -619,8 +628,8 @@ restarting the process:
   /api/sessions/{id}/model` / TUI `/model` switches, and newly built
   sessions (web `POST /api/sessions`, a fresh CLI session) start with the
   edited default and role routing.
-- `[mcp]`, `[bash]` timeout, `[background]` timeout — applied to sessions
-  built after the reload.
+- `[mcp]`, `[bash]` timeout, `[background]` timeout, `[delegate]`
+  finalize wait — applied to sessions built after the reload.
 - Other sections are carried into the reloaded config but only take effect
   where a runtime read exists.
 

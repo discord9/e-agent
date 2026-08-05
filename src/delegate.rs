@@ -174,6 +174,10 @@ pub struct Delegate {
     /// Session backend configuration for subagent persistence (not a
     /// connected store — each subagent connects its own).
     persist_backend: SessionBackend,
+    /// Upper bound for a `FinishWhenIdle` subagent's wait on its blocking
+    /// background tasks (`None` = wait indefinitely). Resolved from
+    /// `[delegate] finalize_wait_secs` by the session factory.
+    finalize_wait: Option<std::time::Duration>,
 }
 
 /// Where a subagent writes its own session file.
@@ -237,6 +241,7 @@ impl Delegate {
             sandbox: None,
             record_in: None,
             persist_backend: SessionBackend::Jsonl,
+            finalize_wait: None,
         }
     }
 
@@ -294,6 +299,15 @@ impl Delegate {
         self.sandbox.as_ref().map(crate::tools::read_only_sandbox)
     }
 
+    /// Cap a `FinishWhenIdle` subagent's wait on its blocking background
+    /// tasks (see `[delegate] finalize_wait_secs`); `None` waits
+    /// indefinitely. The subagent finalizes on expiry without cancelling
+    /// the tasks, which keep running in the shared registry.
+    pub fn with_finalize_wait(mut self, wait: Option<std::time::Duration>) -> Self {
+        self.finalize_wait = wait;
+        self
+    }
+
     /// Record subagent background tasks in the parent session's record so a
     /// restart can warn about killed subagents alongside killed bash tasks.
     pub fn record_background_tasks_in(
@@ -340,6 +354,7 @@ impl Delegate {
         persist: PersistConfig,
         resume_entries: Option<Vec<crate::agent::SessionEntry>>,
         policy: IdlePolicy,
+        finalize_wait: Option<std::time::Duration>,
     ) -> Result<(SessionHandle, crate::runner::SessionTask), String> {
         let model_name = model.display_name().to_owned();
         let agents_instructions = workspace
@@ -393,6 +408,7 @@ impl Delegate {
             .map_err(|e| format!("subagent failed: {e:#}"))?;
         let (runner, handle) =
             SessionRunner::new(agent, store, persist.root, persist.session_id, policy);
+        let runner = runner.with_finalize_wait(finalize_wait);
         let runner_task = runner.start(Some(task.task));
         Ok((handle, runner_task))
     }
@@ -639,6 +655,9 @@ pub async fn spawn_btw_subagent(
         persist,
         Some(fork_entries),
         IdlePolicy::WaitForInput,
+        // A btw fork never finalizes on its own (WaitForInput), so the
+        // finalize wait does not apply; keep the runner's default.
+        None,
     )
     .await?;
     // Sessions metadata: the subagent's row links back to the parent
@@ -1072,6 +1091,7 @@ impl Tool for Delegate {
             persist,
             resume_entries,
             IdlePolicy::FinishWhenIdle,
+            self.finalize_wait,
         )
         .await?;
         let sessions = self.sessions.clone();
