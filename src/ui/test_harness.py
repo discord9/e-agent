@@ -3460,11 +3460,11 @@ async function main(){
         && wrapOf15(f1Row).querySelectorAll(".orbit-dot").length === 1,
         "main=" + mainDotOf15(f1Row).className
         + " dots=" + wrapOf15(f1Row).querySelectorAll(".orbit-dot").length);
-    chk("more than six children render six dots and overflow count",
-        wrapOf15(g1Row).querySelectorAll(".orbit-dot").length === 6
-        && wrapOf15(g1Row).querySelector(".busy-dot-overflow").textContent === "+2",
+    chk("more than six children render five dots and overflow badge",
+        wrapOf15(g1Row).querySelectorAll(".orbit-dot").length === 5
+        && wrapOf15(g1Row).querySelector(".orbit-badge text").textContent === "+3",
         "dots=" + wrapOf15(g1Row).querySelectorAll(".orbit-dot").length
-        + " overflow=" + wrapOf15(g1Row).querySelector(".busy-dot-overflow").textContent);
+        + " overflow=" + wrapOf15(g1Row).querySelector(".orbit-badge text").textContent);
     chk("busy dot wrapper aria-label combines parent and child status",
         wrapOf15(c1Row).getAttribute("aria-label") === "会话空闲，2 个子任务处理中"
         && wrapOf15(d1Row).getAttribute("aria-label") === "会话处理中"
@@ -3642,11 +3642,11 @@ async function main(){
         && wrapM(m2Row).querySelectorAll(".orbit-dot").length === 1,
         "dots=" + wrapM(m2Row).querySelectorAll(".orbit-dot").length);
     // 10) more than six running children → six dots + overflow
-    chk("m3: more than six running children render six dots and overflow",
-        wrapM(m3Row).querySelectorAll(".orbit-dot").length === 6
-        && wrapM(m3Row).querySelector(".busy-dot-overflow").textContent === "+2",
+    chk("m3: more than six running children render five dots and overflow badge",
+        wrapM(m3Row).querySelectorAll(".orbit-dot").length === 5
+        && wrapM(m3Row).querySelector(".orbit-badge text").textContent === "+3",
         "dots=" + wrapM(m3Row).querySelectorAll(".orbit-dot").length
-        + " overflow=" + wrapM(m3Row).querySelector(".busy-dot-overflow").textContent);
+        + " overflow=" + wrapM(m3Row).querySelector(".orbit-badge text").textContent);
     // 11) busy:false + status:"Busy" → busy:false 权威否定：无红点、
     //     live 直显（active:true），orbit 不计数
     chk("m4: busy:false negates Busy status (no red dot, live direct)",

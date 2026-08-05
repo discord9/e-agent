@@ -299,26 +299,24 @@
   .busy-dot-wrap .orbit-dot:nth-of-type(3n) { animation-delay: -0.45s; }
   .busy-dot-wrap .orbit-dot:nth-of-type(3n + 1) { animation-delay: -0.9s; }
   @keyframes subagent-pulse { 50% { opacity: 0.45; } }
-  .busy-dot-overflow {
-    position: absolute;
-    z-index: 1;
-    min-width: 12px;
-    height: 10px;
-    padding: 0 2px;
-    border: 1px solid var(--base3);
-    border-radius: 5px;
-    background: var(--red);
-    color: var(--base3);
-    font-size: 8px;
-    font-weight: bold;
-    line-height: 10px;
-    text-align: center;
-    white-space: nowrap;
+  /* 「+N」溢出徽章：SVG 圆形，放在右上 60° 环绕槽位（N>6 时环绕点只画 5
+     个、空出此位），作为环的「第 6 个节点」。圆形 + 与圆点同一 viewBox
+     坐标系，比旧 HTML 矩形徽章更协调，且不再压正上/右上环绕点。 */
+  /* 描边式（浅底 + 红描边 + 红字）而非实心红底：徽章是「计数角标」不是
+     状态点，实心红底会让它视觉上像第二个主点、喧宾夺主。浅底红字更低调，
+     与环绕小红点形成「点 vs 标签」的层级区分。 */
+  .busy-dot-wrap .orbit-badge circle {
+    fill: var(--base3);
+    stroke: var(--red);
+    stroke-width: 0.75px;
   }
-  /* 徽章贴容器右上外角：正圆环的 2 点方向（中心约 17.7,6.3）与右上角
-     之间留有净距，徽章压在画布外缘、不与任何环绕点重叠。仅在出现 +N
-     （>6 任务）时显示，平时 24px 画布干净不拥挤。 */
-  .busy-dot-wrap > .busy-dot-overflow { right: 0; top: 0; left: auto; }
+  .busy-dot-wrap .orbit-badge text {
+    fill: var(--red);
+    font-size: 5.5px;
+    font-weight: bold;
+    text-anchor: middle;           /* 水平居中于 x */
+    dominant-baseline: central;    /* 垂直居中于 y */
+  }
 
   .status-chip {
     font-size: 12px;

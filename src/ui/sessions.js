@@ -1915,8 +1915,12 @@ function buildTreeRoot(s, kids, wsId) {
   // 一次性光栅化，任何 DPR/缩放下都严格同心。
   // 环上最多画六个点；更多任务由第七个位置的 +N 汇总，避免
   // 小尺寸侧栏状态标记过密。位置按任务列表顺序均匀选取。
+  // 溢出（任务数 >6）时：环绕点只画 5 个、把右上 60° 槽位让给「+N」徽章
+  // ——徽章作为环的「第 6 个节点」放在该槽位（中心 18.9,8），与圆点同一
+  // viewBox 坐标系、同为 SVG、圆形语言统一，不再像旧 HTML 矩形徽章那样压在
+  // 正上/右上两个环绕点上。N≤6 时 6 个环绕点均匀分布、无徽章。
   const hasOverflow = runningKidCount > 6;
-  const visibleKidDots = Math.min(runningKidCount, 6);
+  const visibleKidDots = hasOverflow ? 5 : Math.min(runningKidCount, 6);
   // R=8 由不重叠约束标定：主点半径 3 + 环绕点半径 2 = 5，中心距 8 留出
   // 3px 净间隙，环绕点与主点清晰分开不粘连；点缘最远 12+8+2=22 ≤ 24 不
   // 溢出 viewBox。正圆上任意 N 个等角点相邻弦长严格相等，环始终匀称不歪。
@@ -1931,30 +1935,36 @@ function buildTreeRoot(s, kids, wsId) {
     // 应用——circle 中心先在 (12,12)，translate(0,-R) 上移到 (12,12-R)，
     // 再绕 viewBox 中心 (12,12) 顺时针转 θ（SVG rotate(a cx cy) 指定旋转
     // 中心，正值顺时针），点中心精确落在半径 R 的圆上。
-    // 单个点: 顶部 (12 点方向)；两个点: 上下对称；N 个点: 均匀环绕。
-    // angle 从 12 点方向起、顺时针（SVG rotate 正值顺时针），单位为度。
-    const angle = (360 * i) / visibleKidDots;
+    // 溢出时环绕点只有 5 个：均匀取 6 槽位中除右上 60° 外的 5 个
+    // （0/120/180/240/300），空出右上给徽章；否则 N 个点均匀环绕。
+    const slotDeg = hasOverflow ? [0, 120, 180, 240, 300][i] : (360 * i) / visibleKidDots;
     const title = parentTasks
       ? taskDotTitle(t, i + 1, runningKidCount)
       : "子任务 " + (i + 1) + "/" + runningKidCount;
     circles += `<circle class="orbit-dot${green ? " green" : ""}" cx="12" cy="12" r="2"` +
-      ` transform="rotate(${angle} 12 12) translate(0 ${-R})"` +
+      ` transform="rotate(${slotDeg} 12 12) translate(0 ${-R})"` +
       ` aria-hidden="true"><title>${escapeHtml(title)}</title></circle>`;
+  }
+  // 「+N」徽章：圆形，放在右上 60° 槽位（中心 = (12,12) + R·(sin60°,−cos60°)
+  // ≈ (18.9,8)），r=4.5（直径 9px）与相邻环绕点净距 +1px 不压点、在 viewBox
+  // 内。SVG <circle> 底 + <text> 数字，与环绕点同坐标系、统一光栅化。
+  if (hasOverflow) {
+    const extra = runningKidCount - 5;   // 未画出的任务数（第 6 个起计入徽章）
+    const a = Math.PI / 3;               // 60°（右上槽位）
+    const bx = 12 + R * Math.sin(a), by = 12 - R * Math.cos(a);
+    const badgeTitle = parentTasks
+      ? "共 " + runningKidCount + " 个任务处理中"
+      : "共 " + runningKidCount + " 个子任务处理中";
+    circles += `<g class="orbit-badge" aria-hidden="true">` +
+      `<circle cx="${bx.toFixed(1)}" cy="${by.toFixed(1)}" r="4"></circle>` +
+      `<text x="${bx.toFixed(1)}" y="${by.toFixed(1)}">+${extra}</text>` +
+      `<title>${escapeHtml(badgeTitle)}</title></g>`;
   }
   // 主点最后画（叠在环绕点之上）：busy → 橙，idle → 绿（class 控制 fill）。
   dot.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">` +
     circles +
     `<circle class="main-dot${s.busy ? " busy" : ""}" cx="12" cy="12" r="3" aria-hidden="true"></circle>` +
     `</svg>`;
-  if (hasOverflow) {
-    const overflow = el("span", "busy-dot-overflow",
-      "+" + (runningKidCount - visibleKidDots));
-    overflow.title = parentTasks
-      ? "共 " + runningKidCount + " 个任务处理中"
-      : "共 " + runningKidCount + " 个子任务处理中";
-    overflow.setAttribute("aria-hidden", "true");
-    dot.appendChild(overflow);
-  }
   // 有标题：两行（title 行 + 完整 id 行）；无标题：一行完整 id。
   // 单行 ellipsis 截断的长 id 无法区分会话，双行让 title/id 都可见。
   const hasTitle = !!s.title;
