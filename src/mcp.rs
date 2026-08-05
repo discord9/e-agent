@@ -28,7 +28,10 @@ const STDERR_LIMIT: usize = 64 * 1024;
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Configuration for one local MCP server, deserialized from the config file.
+/// Unknown keys are a parse error (`deny_unknown_fields`): a misspelled
+/// field inside `[mcp."<name>"]` is refused instead of silently ignored.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     /// Command plus arguments, e.g. `["/path/to/engram", "mcp", "--tools=agent"]`.
     pub command: Vec<String>,
@@ -274,6 +277,7 @@ pub async fn connect_all(
                 }
                 match server.list_tools().await {
                     Ok(list) => {
+                        let mut tool_count = 0usize;
                         for tool in list {
                             let remote_name = tool
                                 .get("name")
@@ -302,7 +306,9 @@ pub async fn connect_all(
                                 remote_name,
                                 spec,
                             }));
+                            tool_count += 1;
                         }
+                        eprintln!("e-agent: mcp server `{name}` connected ({tool_count} tools)");
                     }
                     Err(error) => eprintln!(
                         "e-agent: warning: mcp server `{name}` tools/list failed: {error:#}"

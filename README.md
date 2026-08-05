@@ -72,15 +72,29 @@ model = "k2"
 subagent = "kimi/k2"
 ```
 
-A project-local `<workspace>/.e-agent/config.toml` overlays `[models]` and
-`[roles]` onto this global config: models merge by name (a project model
-replaces the same-named global model; global models the project does not
-define keep their definitions; an absent or empty `[models]` keeps all global
-models), and roles merge per key. The project file cannot change `default`,
-`[providers]`, `[mcp]`, `[web_search]`, or `[session]`, and it only takes
-effect when a global config exists (it is an override layer, not a standalone
-config). `[sandbox]`, `[background]`, and `[bash]` project overrides are
-described in the sandbox section below.
+A project-local `<workspace>/.e-agent/config.toml` overlays `default`,
+`[models]`, `[roles]`, `[mcp]`, and `[tui]` onto this global config: models
+merge by name (a project model replaces the same-named global model; global
+models the project does not define keep their definitions; an absent or empty
+`[models]` keeps all global models), roles merge per key, and MCP servers
+merge by name the same way (a project server replaces the same-named global
+server; servers the project does not define survive). A project `default`
+replaces the global default profile when present; no project `default` keeps
+the global one, and it participates in the normal priority chain — an
+explicit `--profile` wins over it, and it wins over `[roles] main`. The
+project file cannot change `[providers]`, `[web_search]`, or `[session]`, and
+it only takes effect when a global config exists (it is an override layer,
+not a standalone config). `[sandbox]`, `[background]`, and `[bash]` project
+overrides are described in the sandbox section below.
+
+The project file is strict: unknown sections (a typo, or a section the
+project file cannot carry) are a startup error naming the offending field
+instead of being silently ignored. And since a project `[mcp]` server starts
+the command it configures, `<workspace>/.e-agent/config.toml` is trusted
+input — treat it like the global config: only open workspaces you trust,
+because opening a workspace runs the MCP commands that workspace's file
+declares. A global `[mcp."<name>"] enabled = false` is a kill switch that a
+project file cannot re-enable (see the MCP section).
 
 ### TUI submit/newline keys
 
@@ -98,8 +112,10 @@ Each field accepts exactly one of `enter`, `alt+enter`, `option+enter` (the
 macOS alias for `alt+enter`), `ctrl+enter`, or `shift+enter`, matched
 literally. `submit` must differ from `newline`; an unsupported key string or
 a `submit == newline` collision is a startup error listing the supported
-keys (no silent fallback). `[tui]` is global-only — it is not merged from
-project configs, since key bindings are personal preference.
+keys (no silent fallback). A project `[tui]` section replaces the global one
+wholesale — fields the project omits fall back to the built-in defaults, not
+to the global values; no project `[tui]` keeps the global mapping (see the
+project-config paragraph above).
 
 **Terminal caveat:** `shift+enter` is unreliable — most terminals do not
 report the Shift modifier and send a bare Enter instead, so a
@@ -562,6 +578,18 @@ enabled = true        # optional, default true
 # cwd = "/other/dir"  # optional, defaults to the workspace root
 # env = { KEY = "value" }
 ```
+
+A project-level `<workspace>/.e-agent/config.toml` `[mcp]` section overlays
+these servers by name: a project server replaces the same-named global
+server, and servers only the global config defines keep their definitions.
+Because each entry spawns `command`, both the global and the project config
+are trusted inputs — only open workspaces you trust, since opening a repo
+executes the commands its `.e-agent/config.toml` declares. A global
+`[mcp."<name>"] enabled = false` is a kill switch a project file cannot
+re-enable: the merged config keeps the disabled global entry, so a
+same-named project server is skipped (`connect_all` skips disabled servers).
+Project MCP servers apply to subagents too — tools are built from the unified
+effective config, and subagents inherit the workspace's MCP toolset.
 
 Each entry spawns `command` with the workspace as its current directory
 (override with `cwd`), plus optional `env`. Servers are connected one at a
