@@ -1709,3 +1709,21 @@ newline = "enter"
     );
     assert!(error.contains("\"enter\""), "{error}");
 }
+
+#[test]
+fn config_watch_paths_covers_global_candidates_and_project_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let paths = config_watch_paths(&workspace);
+    // The project override is always watched (it may not exist yet).
+    let project = workspace.join(".e-agent/config.toml");
+    assert!(paths.contains(&project));
+    assert_eq!(
+        paths.iter().filter(|p| **p == project).count(),
+        1,
+        "project path appears exactly once"
+    );
+    // At least one global candidate (XDG and/or ~/.config, env-dependent).
+    assert!(paths.iter().any(|p| p.ends_with("e-agent/config.toml")));
+    assert!(paths.windows(2).all(|w| w[0] != w[1]), "no duplicates");
+}

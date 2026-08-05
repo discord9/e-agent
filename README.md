@@ -516,6 +516,37 @@ calls use the latest summary plus everything after it. When a configured model
 profile provides a context window, the agent also compacts automatically at
 80% usage.
 
+## Config hot reload
+
+The headless server (`--serve` / `web`) and the TUI watch the config files
+(the global `config.toml` plus the project override
+`<workspace>/.e-agent/config.toml`) and, when a file changes, re-read and
+atomically swap the effective config. A change takes effect without
+restarting the process:
+
+- `[models]` / `[providers]` / `[roles]` — new profile definitions are
+  immediately available to the web `/model` autocomplete and `POST
+  /api/sessions/{id}/model` / TUI `/model` switches, and newly built
+  sessions (web `POST /api/sessions`, a fresh CLI session) start with the
+  edited default and role routing.
+- `[mcp]`, `[bash]` timeout, `[background]` timeout — applied to sessions
+  built after the reload.
+- Other sections are carried into the reloaded config but only take effect
+  where a runtime read exists.
+
+A reload that fails to parse or resolve (a typo, a missing key file, a
+`chatgpt`-routed profile without a login) is rejected and logged; the
+previous config stays, so editing the config never breaks a running server.
+
+Deliberately NOT hot-reloaded (restart required):
+
+- `[sandbox]` — workspace roots and file capabilities are wired at startup.
+- `[session]` backend — stores are connected at startup.
+- `[web_search]` key changes — the key is injected into the process env once
+  at startup (`std::env::set_var` is only safe single-threaded).
+- `AGENTS.md` / skills instructions and existing sessions' models (existing
+  sessions keep their model until a `/model` switch).
+
 ## MCP (local servers)
 
 e-agent can connect to local MCP servers over stdio and expose their tools
@@ -782,6 +813,13 @@ notifications, `listChanged` refresh, server restart on crash, or concurrent
 server initialization.
 It has one model seam and one tool seam. Main-agent tool rounds are unlimited
 unless `--max-rounds` sets an explicit cap; subagent tool rounds are unlimited.
+Config hot reload is deliberately scoped: `[models]`/`[providers]`/`[roles]`
+(and anything else read at session-build time) hot-reload in the server and
+TUI via mtime polling with validate-before-swap, but `[sandbox]`, the
+`[session]` backend, and web-search key env injection stay startup-fixed and
+require a restart; there is no reload HTTP endpoint, no config diffing, no
+watch(1)/inotify, and no per-section partial reload (a bad edit is rejected
+wholesale and the last good config is kept).
 Reasoning-model `reasoning_content` is persisted in the session for
 display/audit; it is never sent back to the API.
 Web search deliberately has no browser, crawler, URL fetch, citations, domain

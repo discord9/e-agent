@@ -287,7 +287,10 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
         });
         // `/model <profile>` resolves profiles at runtime through the same
         // factory; shadow the factory with an Arc so the TUI can hold it.
+        // The config watcher hot-reloads `[models]`/`[providers]`/`[roles]`
+        // (and any other config the runtime reads) while the TUI runs.
         let factory = std::sync::Arc::new(factory);
+        factory.spawn_config_watcher();
         let result = tui::run(
             built.handle,
             task,
