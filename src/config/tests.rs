@@ -1567,3 +1567,145 @@ fn sandbox_project_readable_path_without_global_sandbox_guides_user() {
     assert!(error.contains("[sandbox].readable_paths"), "{error}");
     assert!(error.contains("project-local"), "{error}");
 }
+
+#[test]
+fn tui_keys_default_to_enter_submit_and_alt_enter_newline() {
+    // No [tui] section: bare Enter submits, Alt+Enter inserts a newline
+    // (historical behavior).
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+"#,
+    );
+    let config = Config::from_path(&path).unwrap();
+    let keys = config.tui_keys().unwrap();
+    assert_eq!(keys.submit_modifiers, KeyModifiers::NONE);
+    assert_eq!(keys.newline_modifiers, KeyModifiers::ALT);
+    assert_eq!(
+        keys.describe(),
+        ("Enter".to_owned(), "Alt+Enter".to_owned())
+    );
+}
+
+#[test]
+fn tui_keys_parse_swapped_submit_and_newline() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[tui]
+submit = "alt+enter"
+newline = "enter"
+"#,
+    );
+    let config = Config::from_path(&path).unwrap();
+    let keys = config.tui_keys().unwrap();
+    assert_eq!(keys.submit_modifiers, KeyModifiers::ALT);
+    assert_eq!(keys.newline_modifiers, KeyModifiers::NONE);
+    assert_eq!(
+        keys.describe(),
+        ("Alt+Enter".to_owned(), "Enter".to_owned())
+    );
+}
+
+#[test]
+fn tui_keys_option_enter_is_an_alias_for_alt_enter() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[tui]
+submit = "option+enter"
+newline = "shift+enter"
+"#,
+    );
+    let config = Config::from_path(&path).unwrap();
+    let keys = config.tui_keys().unwrap();
+    assert_eq!(keys.submit_modifiers, KeyModifiers::ALT);
+    assert_eq!(keys.newline_modifiers, KeyModifiers::SHIFT);
+}
+
+#[test]
+fn tui_keys_reject_unsupported_key() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[tui]
+submit = "foo"
+newline = "enter"
+"#,
+    );
+    let error = Config::from_path(&path)
+        .unwrap()
+        .tui_keys()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("[tui] submit = \"foo\" is not a supported key"),
+        "{error}"
+    );
+    assert!(
+        error.contains("expected one of: enter, alt+enter (option+enter), ctrl+enter, shift+enter"),
+        "{error}"
+    );
+}
+
+#[test]
+fn tui_keys_reject_submit_equal_newline() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[tui]
+submit = "enter"
+newline = "enter"
+"#,
+    );
+    let error = Config::from_path(&path)
+        .unwrap()
+        .tui_keys()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("[tui] submit and newline must be different keys"),
+        "{error}"
+    );
+    assert!(error.contains("\"enter\""), "{error}");
+}

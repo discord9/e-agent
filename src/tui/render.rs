@@ -316,18 +316,19 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
         }
         if let Some(attached) = &mut state.attached {
             let status: String = attached.title_status();
+            let (submit_key, _newline_key) = state.keys.describe();
             let hint = match &*attached.status.borrow() {
                 SessionStatus::Busy | SessionStatus::Compacting => {
-                    "Esc detach  Enter steer  Ctrl-C interrupt"
+                    format!("Esc detach  {submit_key} steer  Ctrl-C interrupt")
                 }
                 SessionStatus::Idle => {
                     if attached.finished {
-                        "Esc detach"
+                        "Esc detach".to_owned()
                     } else {
-                        "Esc detach  Enter steer"
+                        format!("Esc detach  {submit_key} steer")
                     }
                 }
-                SessionStatus::Finished(_) => "Esc detach",
+                SessionStatus::Finished(_) => "Esc detach".to_owned(),
             };
             let block = SOLARIZED_LIGHT
                 .block(format!(

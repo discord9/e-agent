@@ -278,6 +278,7 @@ pub async fn run(
     read_only: bool,
     record_in: Option<crate::session_store::BackgroundRecord>,
     factory: std::sync::Arc<crate::session_factory::SessionFactory>,
+    input_keys: crate::config::InputKeys,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard::new();
@@ -307,6 +308,7 @@ pub async fn run(
         read_only,
         record_in,
         factory,
+        input_keys,
     )
     .await;
     drop(terminal);
@@ -370,6 +372,7 @@ async fn run_inner(
     read_only: bool,
     record_in: Option<crate::session_store::BackgroundRecord>,
     factory: std::sync::Arc<crate::session_factory::SessionFactory>,
+    input_keys: crate::config::InputKeys,
 ) -> anyhow::Result<Option<String>> {
     let (sender, mut inbox) = mpsc::unbounded_channel::<UiEvent>();
     let (snapshot, mut live, mut status) = handle.attach();
@@ -382,7 +385,10 @@ async fn run_inner(
         }
     });
     let mut events = EventStream::new().peekable();
-    let mut state = TuiState::default();
+    let mut state = TuiState {
+        keys: input_keys,
+        ..TuiState::default()
+    };
     for event in snapshot {
         state.push_event(UiEvent { session: 0, event });
     }

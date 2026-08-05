@@ -82,6 +82,31 @@ effect when a global config exists (it is an override layer, not a standalone
 config). `[sandbox]`, `[background]`, and `[bash]` project overrides are
 described in the sandbox section below.
 
+### TUI submit/newline keys
+
+The TUI's input boxes accept a limited set of Enter variants configured in
+the global config under `[tui]` — e.g. swap the roles so Enter inserts a
+newline and Option+Enter submits:
+
+```toml
+[tui]
+submit = "alt+enter"   # default "enter"
+newline = "enter"      # default "alt+enter"
+```
+
+Each field accepts exactly one of `enter`, `alt+enter`, `option+enter` (the
+macOS alias for `alt+enter`), `ctrl+enter`, or `shift+enter`, matched
+literally. `submit` must differ from `newline`; an unsupported key string or
+a `submit == newline` collision is a startup error listing the supported
+keys (no silent fallback). `[tui]` is global-only — it is not merged from
+project configs, since key bindings are personal preference.
+
+**Terminal caveat:** `shift+enter` is unreliable — most terminals do not
+report the Shift modifier and send a bare Enter instead, so a
+`shift+enter` binding behaves like `enter` there. Prefer `alt+enter` (or
+`option+enter`) for the secondary key; it is the only modifier most
+terminals report alongside Enter.
+
 ### Read-only roles
 
 A role template can declare itself read-only with a leading TOML frontmatter
