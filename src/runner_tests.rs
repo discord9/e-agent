@@ -1236,8 +1236,8 @@ async fn completed_tool_result_is_committed_before_stale_cancel() {
             Box::new(CompletingWithCancelTool {
                 commands: commands.clone(),
             }),
-            // Keeps the background-completion channel open so the session
-            // can stay Idle after the cancel (see `recovering_agent`).
+            // Keeps the background-completion channel open (see
+            // `recovering_agent`).
             Box::new(KeepAliveTool { sender: None }),
         ],
     );
@@ -1251,11 +1251,13 @@ async fn completed_tool_result_is_committed_before_stale_cancel() {
     *commands.lock().unwrap() = Some(handle.commands.clone());
     let (_, mut live, mut status) = handle.attach();
     let task = runner.start(Some("prompt".into()));
-    // The tool result is committed before the racing Cancel is processed, and
-    // the Cancel only cancels the turn: the FinishWhenIdle session returns to
-    // Idle and stays alive instead of finalizing (composer cancel must not
-    // kill a delegate subagent). The "turn cancelled" notice is emitted only
-    // after the tool entry commit, so it pins the commit-before-cancel order.
+    // The tool result is committed before the racing release (Cancel) is
+    // processed — the completed output is never lost. The release then
+    // stops the turn: with nothing queued, the FinishWhenIdle session
+    // finalizes Cancelled right here (no "cancelled but waiting forever"
+    // intermediate state). The "turn cancelled" notice is emitted only
+    // after the tool entry commit, so it pins the commit-before-cancel
+    // order.
     loop {
         if matches!(
             live.recv().await.unwrap(),
@@ -1264,8 +1266,8 @@ async fn completed_tool_result_is_committed_before_stale_cancel() {
             break;
         }
     }
-    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
-    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "tool-cancel")
         .await
@@ -1480,10 +1482,11 @@ async fn in_flight_compaction_cancel_has_no_entry_or_projection() {
     let task = runner.start(None);
     entered.notified().await;
     handle.cancel();
-    // The in-flight compaction is cancelled but the Cancel command only
-    // cancels the turn: the FinishWhenIdle session returns to Idle and stays
-    // alive instead of finalizing. The "compaction cancelled" notice is
-    // emitted only after the operation is dropped, pinning the order.
+    // The in-flight compaction is preempted (released): no entry, no
+    // projection. With nothing queued the FinishWhenIdle session finalizes
+    // Cancelled right here — no "cancelled but waiting forever" state. The
+    // "compaction cancelled" notice is emitted only after the operation is
+    // dropped, pinning the order.
     loop {
         if matches!(
             live.recv().await.unwrap(),
@@ -1492,8 +1495,8 @@ async fn in_flight_compaction_cancel_has_no_entry_or_projection() {
             break;
         }
     }
-    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
-    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "compact-in-flight-cancel")
         .await
@@ -1522,8 +1525,8 @@ async fn completed_round_is_committed_before_stale_cancel() {
             reply: Some("completed answer".into()),
             commands: commands.clone(),
         }),
-        // Keeps the background-completion channel open so the session can
-        // stay Idle after the cancel (see `recovering_agent`).
+        // Keeps the background-completion channel open (see
+        // `recovering_agent`).
         vec![Box::new(KeepAliveTool { sender: None })],
     );
     let (runner, handle) = SessionRunner::new(
@@ -1536,20 +1539,25 @@ async fn completed_round_is_committed_before_stale_cancel() {
     *commands.lock().unwrap() = Some(handle.commands.clone());
     let (_, mut live, mut status) = handle.attach();
     let task = runner.start(Some("prompt".into()));
-    // The completed round is committed before the racing Cancel is processed;
-    // the Cancel only cancels the turn, so the FinishWhenIdle session returns
-    // to Idle and stays alive (composer cancel must not kill a delegate). The
-    // "turn cancelled" notice is emitted only after the round commit.
+    // The round completed naturally (final answer, no tool calls) and its
+    // output is committed before the racing release is processed — the
+    // completed result wins, so the session finalizes Completed, never
+    // Cancelled, and no "turn cancelled" notice is emitted (nothing was
+    // preempted).
     loop {
-        if matches!(
-            live.recv().await.unwrap(),
-            AgentEvent::Notice(text) if text == "turn cancelled"
-        ) {
-            break;
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "completed answer" => break,
+            AgentEvent::Notice(text) if text == "turn cancelled" => {
+                panic!("a completed round must not be reported as cancelled")
+            }
+            _ => {}
         }
     }
-    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
-    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("completed answer".into())))
+    );
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "round-cancel")
         .await
@@ -1572,8 +1580,8 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
             reply: Some("completed summary".into()),
             commands: commands.clone(),
         }),
-        // Keeps the background-completion channel open so the session can
-        // stay Idle after the cancel (see `recovering_agent`).
+        // Keeps the background-completion channel open (see
+        // `recovering_agent`).
         vec![Box::new(KeepAliveTool { sender: None })],
     );
     history_for_compaction(&mut agent);
@@ -1588,10 +1596,10 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
     handle.compact();
     let (_, mut live, mut status) = handle.attach();
     let task = runner.start(None);
-    // The completed compaction is committed before the racing Cancel is
-    // processed; the Cancel only cancels the turn, so the FinishWhenIdle
-    // session returns to Idle and stays alive instead of finalizing. The
-    // projection notice pins the commit-before-cancel order.
+    // The completed compaction is durably committed (projection notice
+    // pinned) before the racing release is processed; the release then ends
+    // the FinishWhenIdle session as Cancelled (no queued prompt) — the
+    // committed compaction output is never lost.
     loop {
         if matches!(
             live.recv().await.unwrap(),
@@ -1600,8 +1608,8 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
             break;
         }
     }
-    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
-    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "compact-cancel")
         .await
@@ -1624,156 +1632,6 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
         );
     drop(handle);
     drop(task);
-}
-
-#[tokio::test]
-async fn cancel_keeps_finish_when_idle_session_alive_for_follow_up() {
-    // The composer cancel on a delegate subagent (FinishWhenIdle) must only
-    // cancel the current turn: the session returns to Idle, does NOT
-    // finalize, and still accepts a follow-up message. Natural completion of
-    // that follow-up turn still finalizes.
-    let temp = tempfile::tempdir().unwrap();
-    let (agent, entered, _release) = recovering_agent(
-        vec![
-            // Consumed by the blocked first call, never delivered.
-            Ok(AssistantMessage {
-                content: Some("interrupted".into()),
-                tool_calls: Vec::new(),
-                reasoning: None,
-            }),
-            Ok(AssistantMessage {
-                content: Some("follow-up answer".into()),
-                tool_calls: Vec::new(),
-                reasoning: None,
-            }),
-        ],
-        true,
-    );
-    let (runner, handle) = SessionRunner::new(
-        agent,
-        SessionStore::Jsonl,
-        temp.path().into(),
-        "cancel-alive".into(),
-        IdlePolicy::FinishWhenIdle,
-    );
-    let (_, mut live, mut status) = handle.attach();
-    let task = runner.start(Some("prompt".into()));
-    entered.notified().await;
-    handle.cancel();
-
-    // Cancelled turn -> Idle, not Finished: the delegate stays alive.
-    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
-    assert!(
-        !matches!(*status.borrow(), SessionStatus::Finished(_)),
-        "cancel must not finalize a FinishWhenIdle session"
-    );
-
-    // A follow-up message opens a new turn that completes naturally; with no
-    // queued work left, the session then finalizes as Completed.
-    handle.prompt("follow up");
-    loop {
-        match live.recv().await.unwrap() {
-            AgentEvent::AssistantText(text) if text == "follow-up answer" => break,
-            AgentEvent::Error(_) => panic!("follow-up turn failed"),
-            _ => {}
-        }
-    }
-    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
-    assert_eq!(
-        result,
-        SessionStatus::Finished(SessionResult::Completed(Some("follow-up answer".into())))
-    );
-    task.join().await.unwrap();
-}
-
-#[tokio::test]
-async fn cancel_then_compact_keeps_finish_when_idle_session_alive_for_follow_up() {
-    // A Cancel interruption must survive maintenance work: queuing a Compact
-    // after the cancel must NOT clear the cancel flag (`has_work()` includes
-    // `PendingCommand::Compact`, not just prompts), otherwise the compacted
-    // FinishWhenIdle session would finalize at the next idle point. The flag
-    // is cleared only when a real follow-up prompt opens a new turn, so the
-    // session stays Idle after the compaction and the follow-up message
-    // completes naturally into Finished(Completed).
-    let temp = tempfile::tempdir().unwrap();
-    let (mut agent, entered, _release) = recovering_agent(
-        vec![
-            // Consumed by the blocked first call, never delivered.
-            Ok(AssistantMessage {
-                content: Some("interrupted".into()),
-                tool_calls: Vec::new(),
-                reasoning: None,
-            }),
-            // Compaction call.
-            Ok(AssistantMessage {
-                content: Some("compact summary".into()),
-                tool_calls: Vec::new(),
-                reasoning: None,
-            }),
-            // Follow-up turn.
-            Ok(AssistantMessage {
-                content: Some("follow-up answer".into()),
-                tool_calls: Vec::new(),
-                reasoning: None,
-            }),
-        ],
-        true,
-    );
-    history_for_compaction(&mut agent);
-    let (runner, handle) = SessionRunner::new(
-        agent,
-        SessionStore::Jsonl,
-        temp.path().into(),
-        "cancel-compact-alive".into(),
-        IdlePolicy::FinishWhenIdle,
-    );
-    let (_, mut live, mut status) = handle.attach();
-    let task = runner.start(Some("prompt".into()));
-    entered.notified().await;
-    handle.cancel();
-
-    // Cancelled turn -> Idle, not Finished: the delegate stays alive.
-    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
-    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
-
-    // Compact while the cancel flag is still set: the completed compaction
-    // must return the session to Idle, never finalize it. If the queued
-    // Compact had wrongly cleared the flag, the runner would finalize
-    // right after the projection notice — wait for either state and assert
-    // it parked at Idle instead.
-    handle.compact();
-    loop {
-        match live.recv().await.unwrap() {
-            AgentEvent::Notice(text) if text == "compacted: compact summary" => break,
-            AgentEvent::Error(_) => panic!("compaction failed"),
-            _ => {}
-        }
-    }
-    let after_compact = wait_for_status(&mut status, |s| {
-        matches!(s, SessionStatus::Idle | SessionStatus::Finished(_))
-    })
-    .await;
-    assert!(
-        matches!(after_compact, SessionStatus::Idle),
-        "a Compact queued after Cancel must not finalize the session"
-    );
-
-    // The follow-up prompt opens a new turn that completes naturally; with
-    // no queued work left, the session then finalizes as Completed.
-    handle.prompt("follow up");
-    loop {
-        match live.recv().await.unwrap() {
-            AgentEvent::AssistantText(text) if text == "follow-up answer" => break,
-            AgentEvent::Error(_) => panic!("follow-up turn failed"),
-            _ => {}
-        }
-    }
-    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
-    assert_eq!(
-        result,
-        SessionStatus::Finished(SessionResult::Completed(Some("follow-up answer".into())))
-    );
-    task.join().await.unwrap();
 }
 
 #[tokio::test]
@@ -2526,6 +2384,7 @@ struct BlockingContextCaptureModel {
     block_call: usize,
     entered: Arc<Notify>,
     release: Arc<Notify>,
+    dropped: Option<Arc<Notify>>,
     calls: Arc<Mutex<Vec<Vec<Message>>>>,
     call_count: usize,
 }
@@ -2540,14 +2399,26 @@ impl Model for BlockingContextCaptureModel {
     ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
         self.call_count += 1;
         self.calls.lock().unwrap().push(messages.to_vec());
+        // Pop the reply BEFORE blocking: if the blocked call is preempted
+        // (dropped by a release/cancel), the reply is already consumed and
+        // the next call pops the following one. Popping after the await
+        // would leak the popped reply back into the queue, so the next call
+        // would repeat it (the steer batch test hangs on exactly that).
+        let reply = self.replies.pop_front().expect("unexpected model call");
         if self.call_count == self.block_call {
+            // While blocked, hold a drop probe so a test can wait for the
+            // release (cancel) to actually preempt this in-flight future
+            // before releasing the block — otherwise the round may complete
+            // naturally and the release becomes stale (see the steer batch
+            // test, which needs the preemption path to be deterministic).
+            let _probe = self
+                .dropped
+                .as_ref()
+                .map(|dropped| DropProbe(dropped.clone()));
             self.entered.notify_one();
             self.release.notified().await;
         }
-        Ok((
-            self.replies.pop_front().expect("unexpected model call"),
-            None,
-        ))
+        Ok((reply, None))
     }
 }
 
@@ -2865,6 +2736,7 @@ async fn completion_arriving_during_last_model_round_is_committed_before_finaliz
             block_call: 2,
             entered: entered.clone(),
             release: release.clone(),
+            dropped: None,
             calls: calls.clone(),
             call_count: 0,
         }),
@@ -3162,4 +3034,867 @@ async fn finish_when_idle_without_finalize_wait_keeps_waiting() {
         SessionStatus::Finished(SessionResult::Completed(Some("build done, final".into())))
     );
     task.join().await.unwrap();
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Steering v2 — step 1: lock the new release contract with tests
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// NEW CONTRACT (oracle-approved; step 2 will rework the runner, this step
+// only defines the behavior):
+//
+//   cancel == release. A Cancel command never terminates the subagent and
+//   never leaves a persistent "cancelled" state. It preempts the CURRENT
+//   operation (the in-flight future is dropped) so queued messages are
+//   processed immediately; whether the subagent ends is decided solely by
+//   whether the turns started after the release complete naturally.
+//
+//   1. Busy + queued prompt -> release -> in-flight future dropped (its
+//      output never committed) -> queued prompt durably committed
+//      (PromptConsumed + UserPrompt) -> new turn completes naturally ->
+//      Finished(Completed).
+//   2. Multiple queued prompts are consumed in ONE batch (one model call,
+//      FIFO order).
+//   3. Release racing an operation's own completion: the completed output
+//      is committed first — never lost — and with nothing queued the
+//      FinishWhenIdle session then finalizes (Completed, since the turn
+//      already ended naturally) instead of parking in a stale state.
+//   4. Release during a tool: the interrupted tool call is never committed;
+//      the next provider context synthesizes an error result for it
+//      (repair_tool_pairs), so tool pairs stay legal on the wire.
+//   5. Release during compaction: no Compaction entry, no projection.
+//   6. Release with NO queued prompt: no cross-turn "cancelled keep-alive"
+//      state. WaitForInput returns to Idle (and stays usable); FinishWhenIdle
+//      finalizes Cancelled directly (an emergency cancel must not linger).
+//   7. WaitForInput ("btw") processes queued prompts exactly like
+//      FinishWhenIdle, but returns to Idle afterwards — it never finishes
+//      naturally.
+//   8. Hard termination (DELETE / task-panel cancel) is the runner-task
+//      abort and keeps aborting the in-flight operation immediately
+//      (runner-level pin here; end-to-end pin in
+//      server::delete_subagent_session_aborts_delegate_runner_and_cleans_up).
+//   9. Sync parent abandonment still aborts the child runner (pinned in
+//      delegate_tests::sync_abandon_aborts_runner_and_cleans_session).
+//
+// STATUS under the CURRENT implementation (step 2 implemented: the
+// cross-turn `cancelled` flag is gone — a Cancel is a local release
+// handled at each operation boundary):
+//   * ALL 10 steer_* tests are GREEN, including the three that were RED
+//     under step 1's old keep-alive semantics
+//     (steer_release_*without_queued_prompt_finish_when_idle* and
+//     steer_release_racing_round_completion_*).
+//   * OLD-contract tests removed/reworked in step 2:
+//     - deleted: cancel_keeps_finish_when_idle_session_alive_for_follow_up,
+//       cancel_then_compact_keeps_finish_when_idle_session_alive_for_follow_up
+//       (they asserted "cancel keeps the FinishWhenIdle session alive for
+//       follow-up" — the exact "infinite keep-alive" state step 2 removed).
+//     - reworked to the stale-release contract (commit-before-release
+//       assertions kept, final state changed from "Idle and stays alive" to
+//       Finished): completed_tool_result_is_committed_before_stale_cancel
+//       (Finished(Cancelled)), in_flight_compaction_cancel_has_no_entry_or_projection
+//       (Finished(Cancelled)), completed_round_is_committed_before_stale_cancel
+//       (Finished(Completed) — the round completed naturally, the release is
+//       stale), completed_compaction_is_committed_before_stale_cancel
+//       (Finished(Cancelled)).
+//   * cancel_with_queued_message_keeps_processing_it keeps its observable
+//     behavior and matches contract 1 — kept as-is.
+
+/// Blocks inside the tool until released; used to hold a tool execution in
+/// flight while a release (cancel) is delivered.
+struct BlockingNoopTool {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Tool for BlockingNoopTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "blocker".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<String, String> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok("blocked tool result".into())
+    }
+}
+
+/// Preemptible model: the first call blocks until released while holding a
+/// drop probe, so a test can observe the in-flight future being dropped by
+/// a release (cancel) — proof of preemption. Later calls serve `replies`
+/// normally.
+struct PreemptibleModel {
+    replies: VecDeque<anyhow::Result<AssistantMessage>>,
+    block_first: bool,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    dropped: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for PreemptibleModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        let reply = self.replies.pop_front().expect("unexpected model call");
+        if self.block_first {
+            self.block_first = false;
+            let _probe = DropProbe(self.dropped.clone());
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok((reply?, None))
+    }
+}
+
+#[tokio::test]
+async fn steer_release_preempts_in_flight_round_and_runs_queued_prompt_to_natural_completion() {
+    // Contract 1: Busy + queued prompt -> release -> the in-flight model
+    // future is dropped (preempted, its output never committed) -> the
+    // queued prompt is durably committed with PromptConsumed + UserPrompt ->
+    // the new turn completes naturally -> Finished(Completed).
+    let temp = tempfile::tempdir().unwrap();
+    let (entered, release, dropped) = (
+        Arc::new(Notify::new()),
+        Arc::new(Notify::new()),
+        Arc::new(Notify::new()),
+    );
+    let agent = Agent::new(
+        Box::new(PreemptibleModel {
+            replies: vec![
+                Ok(AssistantMessage {
+                    content: Some("interrupted".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                }),
+                Ok(AssistantMessage {
+                    content: Some("queued answer".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                }),
+            ]
+            .into(),
+            block_first: true,
+            entered: entered.clone(),
+            release: release.clone(),
+            dropped: dropped.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-release-preempt".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+
+    entered.notified().await;
+    handle.prompt("queued prompt");
+    handle.cancel();
+
+    // The release drops the in-flight model future before it can produce
+    // output (the probe notifies exactly when the drop lands).
+    dropped.notified().await;
+    release.notify_one();
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            _ => {}
+        }
+    }
+    // The queued prompt is consumed (PromptConsumed) and committed
+    // (UserPrompt) before the new turn starts.
+    let mut saw_consumed = false;
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::PromptConsumed => saw_consumed = true,
+            AgentEvent::UserPrompt(text) if text == "queued prompt" && saw_consumed => break,
+            AgentEvent::UserPrompt(_) => panic!("UserPrompt arrived before PromptConsumed"),
+            _ => {}
+        }
+    }
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "queued answer" => break,
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("queued answer".into())))
+    );
+    task.join().await.unwrap();
+
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "steer-release-preempt")
+        .await
+        .unwrap();
+    assert!(
+        !loaded.entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Message {
+                message: Message::Assistant(message)
+            } if message.content.as_deref() == Some("interrupted")
+        )),
+        "a preempted round must never commit its output"
+    );
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::User { content, .. }
+        } if content == "queued prompt"
+    )));
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Assistant(message)
+        } if message.content.as_deref() == Some("queued answer")
+    )));
+}
+
+#[tokio::test]
+async fn steer_release_batches_multiple_queued_prompts_into_one_turn() {
+    // Contract 2: several prompts queued while busy are consumed in ONE
+    // batch after the release — one model call whose context joins them in
+    // FIFO order.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let dropped = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![
+                AssistantMessage {
+                    content: Some("interrupted".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("batch answer".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            block_call: 1,
+            entered: entered.clone(),
+            release: release.clone(),
+            dropped: Some(dropped.clone()),
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-batch".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+
+    entered.notified().await;
+    handle.prompt("first queued");
+    handle.prompt("second queued");
+    handle.prompt("third queued");
+    handle.cancel();
+    // Wait until the release has actually dropped the in-flight model
+    // future (the drop probe fires only on preemption) before releasing the
+    // block — otherwise the round could complete naturally and the release
+    // would go stale (no "turn cancelled", wrong path for this contract).
+    dropped.notified().await;
+    release.notify_one(); // the future is gone; harmless
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            _ => {}
+        }
+    }
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "batch answer" => break,
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("batch answer".into())))
+    );
+    task.join().await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        2,
+        "preempted round + one batched turn: {calls:?}"
+    );
+    let users: Vec<&str> = calls[1]
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        users,
+        vec!["initial", "first queued\n\nsecond queued\n\nthird queued"],
+        "all queued prompts must be joined FIFO in a single batch"
+    );
+}
+
+#[tokio::test]
+async fn steer_release_racing_round_completion_commits_answer_then_finalizes() {
+    // Contract 3: when the release races the round's own completion, the
+    // completed output is committed first (never lost). With nothing queued
+    // the FinishWhenIdle session then finalizes with that completed answer
+    // instead of parking in a stale "cancelled" Idle state.
+    let temp = tempfile::tempdir().unwrap();
+    let commands = Arc::new(Mutex::new(None));
+    let agent = Agent::new(
+        Box::new(CompletingWithCancelModel {
+            reply: Some("completed answer".into()),
+            commands: commands.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-race-round".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    *commands.lock().unwrap() = Some(handle.commands.clone());
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("prompt".into()));
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "completed answer" => break,
+            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            _ => {}
+        }
+    }
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))),
+    )
+    .await
+    .expect("FinishWhenIdle must finalize after a stale release with no queued prompt");
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("completed answer".into())))
+    );
+    task.join().await.unwrap();
+
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "steer-race-round")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Assistant(message)
+        } if message.content.as_deref() == Some("completed answer")
+    )));
+}
+
+#[tokio::test]
+async fn steer_release_during_tool_keeps_next_provider_context_legal() {
+    // Contract 4: releasing mid-tool drops the tool future; the interrupted
+    // tool call is never committed, and the next provider context
+    // synthesizes an error result for it (repair_tool_pairs), so the wire
+    // never sees an unpaired tool_call.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call-1".into(),
+                            name: "blocker".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(BlockingNoopTool {
+            entered: entered.clone(),
+            release: release.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-tool-release".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+
+    entered.notified().await; // tool execution in flight
+    handle.prompt("queued after release");
+    handle.cancel();
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            _ => {}
+        }
+    }
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "done" => break,
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
+    );
+    task.join().await.unwrap();
+
+    // The guard is scoped so it is dropped before the awaited reload below.
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "tool round + follow-up round: {calls:?}");
+        let final_context = &calls[1];
+        assert_eq!(
+            repair_tool_pairs(final_context.clone()),
+            *final_context,
+            "derived context must already be a fixed point: {final_context:?}"
+        );
+        let tool_messages: Vec<&Message> = final_context
+            .iter()
+            .filter(|message| matches!(message, Message::Tool { .. }))
+            .collect();
+        assert_eq!(tool_messages.len(), 1);
+        assert!(matches!(
+            tool_messages[0],
+            Message::Tool {
+                call_id,
+                name,
+                content,
+                is_error: true,
+                synthetic: true,
+                ..
+            } if call_id == "call-1"
+                && name == "blocker"
+                && content == "[turn interrupted before a tool result was produced]"
+        ));
+    }
+    // The interrupted tool call never produced a committed tool entry.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "steer-tool-release")
+        .await
+        .unwrap();
+    assert!(!loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Tool { .. }
+        }
+    )));
+}
+
+#[tokio::test]
+async fn steer_release_during_compaction_leaves_no_projection_and_runs_queued_prompt() {
+    // Contract 5: releasing during compaction drops the compaction future —
+    // no Compaction entry, no "compacted:" projection — and the queued
+    // prompt then opens a fresh turn that completes naturally.
+    let temp = tempfile::tempdir().unwrap();
+    let (mut agent, entered, _release) = recovering_agent(
+        vec![
+            Ok(AssistantMessage {
+                content: Some("interrupted summary".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+            Ok(AssistantMessage {
+                content: Some("queued answer".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+        ],
+        true,
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-compact-release".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    handle.compact();
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(None);
+    entered.notified().await;
+    handle.prompt("queued during compaction");
+    handle.cancel();
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == "compaction cancelled" => break,
+            _ => {}
+        }
+    }
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::UserPrompt(text) if text == "queued during compaction" => break,
+            _ => {}
+        }
+    }
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "queued answer" => break,
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("queued answer".into())))
+    );
+    task.join().await.unwrap();
+
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "steer-compact-release")
+        .await
+        .unwrap();
+    assert!(
+        !loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Compaction { .. })),
+        "a released compaction must leave no entry"
+    );
+    assert!(
+        !handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(text) if text.starts_with("compacted:")
+        )),
+        "a released compaction must leave no projection"
+    );
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::User { content, .. }
+        } if content == "queued during compaction"
+    )));
+}
+
+#[tokio::test]
+async fn steer_release_without_queued_prompt_finish_when_idle_finalizes_cancelled() {
+    // Contract 6 (FinishWhenIdle side): a release with nothing queued must
+    // not leave the session parked in a stale cross-turn "cancelled" Idle
+    // state ("infinite keep-alive"). There is no follow-up to wait for, so
+    // the session finalizes Cancelled directly at the release boundary (the
+    // local `Steering::ReleasedIdle` outcome — there is no persistent
+    // cross-turn "cancelled" state).
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, entered, _release) = recovering_agent(
+        vec![Ok(AssistantMessage {
+            content: Some("interrupted".into()),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        })],
+        true,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-release-noqueue".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, _) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+    entered.notified().await;
+    handle.cancel();
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            _ => {}
+        }
+    }
+    let mut status = handle.status();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))),
+    )
+    .await
+    .expect("release with no queued prompt must finalize a FinishWhenIdle session (no infinite keep-alive)");
+    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
+    task.join().await.unwrap();
+
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "steer-release-noqueue")
+        .await
+        .unwrap();
+    assert!(
+        !loaded.entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Message {
+                message: Message::Assistant(_)
+            }
+        )),
+        "no interrupted output may be committed"
+    );
+}
+
+#[tokio::test]
+async fn steer_release_during_tool_without_queued_prompt_finish_when_idle_finalizes_cancelled() {
+    // Contract 6, tool path: the same no-queued-prompt release while a tool
+    // is executing must also finalize Cancelled at the release boundary
+    // instead of lingering at Idle.
+    let temp = tempfile::tempdir().unwrap();
+    let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "blocker".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning: None,
+            }]
+            .into(),
+        }),
+        vec![Box::new(BlockingNoopTool {
+            entered: entered.clone(),
+            release: release.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-tool-noqueue".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, _) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+    entered.notified().await;
+    handle.cancel();
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            _ => {}
+        }
+    }
+    let mut status = handle.status();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))),
+    )
+    .await
+    .expect("release during a tool with no queued prompt must finalize (no infinite keep-alive)");
+    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn steer_release_without_queued_prompt_wait_for_input_returns_to_idle() {
+    // Contract 6 (WaitForInput side): the same release parks the session at
+    // Idle — ready for a future prompt, never Finished — because a
+    // WaitForInput session is long-lived by policy.
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, entered, _release) = recovering_agent(
+        vec![
+            Ok(AssistantMessage {
+                content: Some("interrupted".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+            Ok(AssistantMessage {
+                content: Some("follow-up answer".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+        ],
+        true,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-wfi-noqueue".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+    entered.notified().await;
+    handle.cancel();
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+
+    // The session is alive and waiting: a follow-up prompt still works.
+    handle.prompt("follow up");
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "follow-up answer" => break,
+            AgentEvent::Error(_) => panic!("follow-up turn failed"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+    drop(handle);
+    drop(task);
+}
+
+#[tokio::test]
+async fn steer_btw_wait_for_input_consumes_queued_prompts_then_returns_to_idle() {
+    // Contract 7: a WaitForInput session ("btw") processes queued prompts
+    // after a release exactly like FinishWhenIdle, but returns to Idle
+    // afterwards — it never finishes naturally.
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, entered, _release) = recovering_agent(
+        vec![
+            Ok(AssistantMessage {
+                content: Some("interrupted".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+            Ok(AssistantMessage {
+                content: Some("queued answer".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+            Ok(AssistantMessage {
+                content: Some("follow-up answer".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+        ],
+        true,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-btw".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+    entered.notified().await;
+    handle.prompt("queued while busy");
+    handle.cancel();
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            _ => {}
+        }
+    }
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "queued answer" => break,
+            _ => {}
+        }
+    }
+    // Processed, back at Idle — not finished.
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+
+    // The session is still alive for a plain follow-up prompt.
+    handle.prompt("follow up");
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "follow-up answer" => break,
+            AgentEvent::Error(_) => panic!("follow-up turn failed"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+    drop(handle);
+    drop(task);
+}
+
+#[tokio::test]
+async fn steer_hard_abort_still_drops_in_flight_operation_immediately() {
+    // Contract 8: the DELETE / task-panel hard termination is the runner
+    // task abort — it must keep working unchanged: the in-flight operation
+    // is dropped immediately, its side effects never run, and the handle
+    // stops accepting commands.
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let dropped = Arc::new(Notify::new());
+    let side_effects = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new(
+        Box::new(DropProbeModel {
+            entered: entered.clone(),
+            release: release.clone(),
+            dropped: dropped.clone(),
+            side_effects: side_effects.clone(),
+        }),
+        vec![],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-hard-abort".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let mut task = runner.start(Some("start".into()));
+    entered.notified().await;
+    task.abort();
+    dropped.notified().await;
+    release.notify_one();
+    tokio::task::yield_now().await;
+    assert_eq!(side_effects.load(Ordering::SeqCst), 0);
+    // The handle is closed: further prompts are silently dropped.
+    let before = handle.snapshot();
+    handle.prompt("too late");
+    assert_eq!(handle.snapshot(), before);
+    drop(task);
 }

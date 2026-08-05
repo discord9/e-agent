@@ -20,9 +20,13 @@ use tokio::{
 
 const EVENT_CAPACITY: usize = 256;
 
+/// Outcome of polling an in-flight operation against the command channel.
+/// A `Cancel` command is a *release*: the in-flight future is dropped
+/// (preempted) so queued messages are processed immediately — it never
+/// terminates the session by itself.
 enum WaitOutcome<T> {
     Completed(T),
-    Cancelled,
+    Released,
     Closed,
 }
 
@@ -83,7 +87,7 @@ where
             }
             command = commands.recv() => match command {
                 Some(SessionCommand::Cancel) => {
-                    return WaitResult { outcome: WaitOutcome::Cancelled, pending };
+                    return WaitResult { outcome: WaitOutcome::Released, pending };
                 }
                 Some(command) => pending.push(command),
                 None => return WaitResult { outcome: WaitOutcome::Closed, pending },
@@ -352,9 +356,28 @@ impl CompactionSource {
     }
 }
 
+/// Local outcome of steering a release (`Cancel` command) — computed at an
+/// operation boundary and never stored on the runner across turns. A Cancel
+/// preempts the in-flight operation; what happens next is decided right
+/// here by whether prompts are queued and by the idle policy. There is no
+/// cross-turn "cancelled" state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Steering {
+    /// No release happened; continue the turn normally.
+    None,
+    /// A release happened and prompts are queued: end the current turn so
+    /// the outer loop consumes the queued batch immediately; the new turn
+    /// decides the session end naturally.
+    ReleasedWithPrompts,
+    /// A release happened with no prompts queued: WaitForInput returns to
+    /// Idle; FinishWhenIdle finalizes `Cancelled` right here (no
+    /// "cancelled but waiting forever" intermediate state).
+    ReleasedIdle,
+}
+
 enum OperationFlow {
-    Done,
-    Cancelled,
+    Done(Steering),
+    Released(Steering),
     Finished,
 }
 
@@ -377,7 +400,6 @@ pub struct SessionRunner {
     shared: Arc<Mutex<Shared>>,
     commands: mpsc::UnboundedReceiver<SessionCommand>,
     pending: VecDeque<PendingCommand>,
-    cancelled: bool,
     policy: IdlePolicy,
     last_answer: Option<String>,
     /// Upper bound for waiting on blocking background tasks before
@@ -431,7 +453,6 @@ impl SessionRunner {
                 shared,
                 commands,
                 pending: VecDeque::new(),
-                cancelled: false,
                 policy,
                 last_answer: None,
                 finalize_wait: None,
@@ -594,7 +615,10 @@ impl SessionRunner {
         }
     }
 
-    fn queue(&mut self, command: SessionCommand) -> bool {
+    /// Queue a steering command, returning the local release outcome (see
+    /// `Steering`). `Cancel` is a release: it is not queued, and the result
+    /// reflects whether prompts are already pending.
+    fn queue(&mut self, command: SessionCommand) -> Steering {
         match command {
             SessionCommand::Prompt(prompt) => {
                 self.pending.push_back(PendingCommand::Prompt {
@@ -602,7 +626,7 @@ impl SessionRunner {
                     queued: true,
                     image: None,
                 });
-                false
+                Steering::None
             }
             SessionCommand::PromptWithImage { text, image } => {
                 self.pending.push_back(PendingCommand::Prompt {
@@ -610,22 +634,19 @@ impl SessionRunner {
                     queued: true,
                     image: Some(image),
                 });
-                false
+                Steering::None
             }
             SessionCommand::Compact => {
                 self.pending.push_back(PendingCommand::Compact);
-                false
+                Steering::None
             }
             SessionCommand::SwitchModel(model) => {
                 // Instant, not queued: the new model applies to the next
                 // model call (a call already in flight keeps its model).
                 self.agent.set_model(model);
-                false
+                Steering::None
             }
-            SessionCommand::Cancel => {
-                self.cancelled = true;
-                true
-            }
+            SessionCommand::Cancel => self.release_steering(),
         }
     }
     async fn commit_backgrounds(&mut self) -> anyhow::Result<bool> {
@@ -639,20 +660,58 @@ impl SessionRunner {
         Ok(any)
     }
 
-    fn drain_ready_commands(&mut self) -> bool {
-        let mut cancelled = false;
-        while let Ok(command) = self.commands.try_recv() {
-            cancelled |= self.queue(command);
-        }
-        cancelled
+    fn has_prompt_work(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|command| matches!(command, PendingCommand::Prompt { .. }))
     }
 
-    fn intake_after_operation(&mut self, pending: Vec<SessionCommand>) -> bool {
-        let mut cancelled = false;
-        for command in pending {
-            cancelled |= self.queue(command);
+    fn release_steering(&self) -> Steering {
+        if self.has_prompt_work() {
+            Steering::ReleasedWithPrompts
+        } else {
+            Steering::ReleasedIdle
         }
-        self.drain_ready_commands() || cancelled
+    }
+
+    fn drain_ready_commands(&mut self) -> Steering {
+        let mut released = false;
+        while let Ok(command) = self.commands.try_recv() {
+            released |= matches!(command, SessionCommand::Cancel);
+            self.queue(command);
+        }
+        if released {
+            self.release_steering()
+        } else {
+            Steering::None
+        }
+    }
+
+    fn intake_after_operation(&mut self, pending: Vec<SessionCommand>) -> Steering {
+        let mut released = false;
+        for command in pending {
+            released |= matches!(command, SessionCommand::Cancel);
+            self.queue(command);
+        }
+        released |= self.drain_ready_commands() != Steering::None;
+        if released {
+            self.release_steering()
+        } else {
+            Steering::None
+        }
+    }
+
+    /// Combine two partial steering results (e.g. a single queued command
+    /// plus whatever a subsequent drain picked up): any release wins, and
+    /// its classification is recomputed from the final queue state so a
+    /// prompt arriving after the cancel is still counted as
+    /// `ReleasedWithPrompts`.
+    fn merge_steering(&self, a: Steering, b: Steering) -> Steering {
+        if a == Steering::None && b == Steering::None {
+            Steering::None
+        } else {
+            self.release_steering()
+        }
     }
 
     /// Apply `SwitchModel` commands cached while an operation was in flight,
@@ -706,39 +765,42 @@ impl SessionRunner {
         (prompts.join("\n\n"), image, consumed)
     }
 
-    /// Handle a cancelled turn or an idle moment. `cancelled_by_command`
-    /// distinguishes a `SessionCommand::Cancel` interruption (external — the
-    /// composer cancel button) from a natural end. Only a natural end under
-    /// `FinishWhenIdle` with no running background finalizes; a Cancel-command
-    /// interruption returns the session to Idle so a delegate subagent stays
-    /// alive for follow-up messages (the "true kill" is the task-panel cancel,
-    /// which aborts the runner directly and never goes through this path).
-    fn finish_cancelled_or_idle(&mut self, cancelled_by_command: bool) -> bool {
-        if !cancelled_by_command
-            && self.policy == IdlePolicy::FinishWhenIdle
-            && !self.agent.has_blocking_background()
-        {
-            self.finalize_when_idle(SessionResult::Cancelled)
-        } else {
-            self.status(SessionStatus::Idle);
-            false
+    /// Handle a release that preempted an in-flight operation (or arrived at
+    /// an idle moment), decided from the local `Steering` — there is no
+    /// persistent "cancelled" state to carry across turns.
+    ///
+    /// Returns `true` when the runner must return (FinishWhenIdle finalized
+    /// `Cancelled`); `false` means the caller should end the current turn
+    /// (`ReleasedWithPrompts`) or just continue (`ReleasedIdle` under
+    /// WaitForInput, which returns to Idle and stays alive for future
+    /// input).
+    fn release_after_preempt(&mut self, steering: Steering) -> bool {
+        match steering {
+            Steering::None => unreachable!("release_after_preempt requires a release"),
+            Steering::ReleasedWithPrompts => {
+                // The queued batch is consumed by the outer loop on the next
+                // iteration; the turn(s) started from it decide the session
+                // end naturally.
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .emit(AgentEvent::Notice("processing queued prompts".into()));
+                false
+            }
+            Steering::ReleasedIdle => {
+                if self.policy == IdlePolicy::FinishWhenIdle {
+                    // Emergency cancel with nothing queued: finalize right
+                    // here — no "cancelled but waiting forever" state. The
+                    // last `finalize_when_idle` check still gives a
+                    // concurrently queued prompt the chance to open a new
+                    // turn instead.
+                    self.finalize_when_idle(SessionResult::Cancelled)
+                } else {
+                    self.status(SessionStatus::Idle);
+                    false
+                }
+            }
         }
-    }
-
-    fn stop_turn_for_cancel(&mut self) -> bool {
-        if !self.cancelled {
-            return false;
-        }
-        self.shared
-            .lock()
-            .unwrap()
-            .emit(AgentEvent::Notice("turn cancelled".into()));
-        if self.has_work() {
-            self.status(SessionStatus::Idle);
-        } else {
-            self.finish_cancelled_or_idle(true);
-        }
-        true
     }
 
     async fn compact_operation(&mut self, source: CompactionSource) -> OperationFlow {
@@ -759,9 +821,9 @@ impl SessionRunner {
                 // deltas were sent live-only while the operation was in flight.
                 self.shared.lock().unwrap().emit(projection);
                 self.agent.apply_usage(usage, false);
-                self.intake_after_operation(waited.pending);
+                let steering = self.intake_after_operation(waited.pending);
                 self.status(source.resume_status());
-                OperationFlow::Done
+                OperationFlow::Done(steering)
             }
             WaitOutcome::Completed(Err(error)) => {
                 self.agent.reset_auto_compact_request();
@@ -773,18 +835,21 @@ impl SessionRunner {
                 self.shared.lock().unwrap().emit(event);
                 self.intake_after_operation(waited.pending);
                 self.status(source.resume_status());
-                OperationFlow::Done
+                OperationFlow::Done(Steering::None)
             }
-            WaitOutcome::Cancelled => {
-                self.cancelled = true;
+            WaitOutcome::Released => {
+                // The in-flight compaction future was dropped: no entry, no
+                // projection. The release is known (the Cancel was consumed
+                // by wait_for_operation); classify from what is now queued.
                 self.intake_after_operation(waited.pending);
+                let steering = self.release_steering();
                 self.agent.reset_auto_compact_request();
                 self.shared.lock().unwrap().emit(AgentEvent::Notice(format!(
                     "{}compaction cancelled",
                     source.prefix()
                 )));
                 self.status(source.resume_status());
-                OperationFlow::Cancelled
+                OperationFlow::Released(steering)
             }
             WaitOutcome::Closed => {
                 self.terminate(SessionResult::Closed, waited.pending).await;
@@ -810,17 +875,30 @@ impl SessionRunner {
                     return;
                 }
             }
-            let cancelled = self.drain_ready_commands();
-            if cancelled && !self.has_work() && self.finish_cancelled_or_idle(true) {
+            let steering = self.drain_ready_commands();
+            // A release with nothing queued (no prompts) is handled right
+            // here by the policy — even if maintenance (Compact) is pending,
+            // an emergency cancel on FinishWhenIdle finalizes Cancelled.
+            // ReleasedWithPrompts falls through: the queued batch is consumed
+            // below and the turn(s) started from it decide the end naturally.
+            if steering == Steering::ReleasedIdle && self.release_after_preempt(steering) {
                 return;
             }
             if matches!(self.pending.front(), Some(PendingCommand::Compact)) {
                 self.pending.pop_front();
                 match self.compact_operation(CompactionSource::Manual).await {
-                    OperationFlow::Done => {}
-                    OperationFlow::Cancelled if self.has_work() => continue,
-                    OperationFlow::Cancelled if self.finish_cancelled_or_idle(true) => return,
-                    OperationFlow::Cancelled => continue,
+                    OperationFlow::Done(steering) => {
+                        if steering != Steering::None && self.release_after_preempt(steering) {
+                            return;
+                        }
+                    }
+                    OperationFlow::Released(steering) => {
+                        if self.release_after_preempt(steering) {
+                            return;
+                        }
+                        // Queued prompts (if any) are consumed by the outer
+                        // loop on the next iteration.
+                    }
                     OperationFlow::Finished => return,
                 }
                 continue;
@@ -829,32 +907,25 @@ impl SessionRunner {
                 // An operation may complete in the same scheduling turn as a sender
                 // queues follow-up work. Drain every command already ready before
                 // applying FinishWhenIdle.
-                let cancelled = self.drain_ready_commands();
+                let steering = self.drain_ready_commands();
                 if self.has_work() {
                     continue;
                 }
-                if cancelled {
-                    if self.finish_cancelled_or_idle(true) {
+                if steering != Steering::None {
+                    if self.release_after_preempt(steering) {
                         return;
                     }
-                } else {
-                    self.status(SessionStatus::Idle);
-                    if self.policy == IdlePolicy::FinishWhenIdle
-                        && !self.agent.has_blocking_background()
-                        && !self.cancelled
-                    {
-                        // `self.cancelled` means a Cancel command interrupted
-                        // the last turn: the delegate subagent stays alive
-                        // (Idle) for follow-up messages instead of finalizing
-                        // here. The flag is cleared only when a real prompt
-                        // opens a new turn (just below `take_prompt_batch`),
-                        // so a later natural completion still finalizes.
-                        let result = SessionResult::Completed(self.last_answer.clone());
-                        if self.finalize_when_idle(result) {
-                            return;
-                        }
-                        continue;
+                    continue;
+                }
+                self.status(SessionStatus::Idle);
+                if self.policy == IdlePolicy::FinishWhenIdle
+                    && !self.agent.has_blocking_background()
+                {
+                    let result = SessionResult::Completed(self.last_answer.clone());
+                    if self.finalize_when_idle(result) {
+                        return;
                     }
+                    continue;
                 }
                 // A FinishWhenIdle session that already finished its work
                 // waits here for its blocking background tasks. Cap that
@@ -867,11 +938,12 @@ impl SessionRunner {
                 // output or cancel them from the task panel; completion
                 // events delivered to this session's now-closed channel
                 // are dropped harmlessly. `None` keeps the historical
-                // wait-indefinitely behavior; a Cancel interruption
-                // (subagent kept alive for follow-ups) never times out.
+                // wait-indefinitely behavior; steering v2 has no
+                // cross-turn "cancelled" keep-alive state to carve out
+                // (a release either starts a new turn or finalizes
+                // immediately at the operation boundary).
                 let wait = if self.policy == IdlePolicy::FinishWhenIdle
                     && self.agent.has_blocking_background()
-                    && !self.cancelled
                 {
                     self.finalize_wait
                 } else {
@@ -881,10 +953,14 @@ impl SessionRunner {
                 tokio::select! { biased;
                     command = self.commands.recv() => match command {
                         Some(command) => {
-                            let cancelled = self.queue(command);
-                            let cancelled = self.drain_ready_commands() || cancelled;
-                            if cancelled && !self.has_work() {
-                                self.status(SessionStatus::Idle);
+                            let first = self.queue(command);
+                            let drained = self.drain_ready_commands();
+                            let steering = self.merge_steering(first, drained);
+                            if steering != Steering::None
+                                && !self.has_prompt_work()
+                                && self.release_after_preempt(steering)
+                            {
+                                return;
                             }
                             continue;
                         }
@@ -912,13 +988,6 @@ impl SessionRunner {
                 }
             }
             let (prompt, image, consumed) = self.take_prompt_batch();
-            // A Cancel command interrupted the previous turn; the flag is
-            // cleared only now that a real prompt opens a new turn. Pending
-            // maintenance work (e.g. Compact) must not clear it, otherwise a
-            // FinishWhenIdle session would finalize as soon as the
-            // maintenance completes (see the `!self.cancelled` guard at the
-            // idle point).
-            self.cancelled = false;
             self.status(SessionStatus::Busy);
             if !prompt.is_empty() {
                 let image_rejected = image.is_some() && !self.agent.supports_vision();
@@ -964,14 +1033,20 @@ impl SessionRunner {
                         ));
                         break 'turn; // 外层循环自然回 Idle
                     }
-                    WaitOutcome::Cancelled => {
-                        self.cancelled = true;
+                    WaitOutcome::Released => {
+                        // The in-flight model future was dropped (preempted):
+                        // its output is never committed. Queued prompts are
+                        // consumed by the outer loop; with none queued the
+                        // policy decides right here. (The Cancel itself was
+                        // consumed by wait_for_operation, so the release is
+                        // known: classify from what is now queued.)
                         self.intake_after_operation(waited.pending);
+                        let steering = self.release_steering();
                         self.shared
                             .lock()
                             .unwrap()
                             .emit(AgentEvent::Notice("turn cancelled".into()));
-                        if !self.has_work() && self.finish_cancelled_or_idle(true) {
+                        if self.release_after_preempt(steering) {
                             return;
                         }
                         break 'turn;
@@ -995,11 +1070,27 @@ impl SessionRunner {
                     return;
                 }
                 self.agent.apply_usage(usage, true);
-                self.intake_after_operation(waited.pending);
+                let steering = self.intake_after_operation(waited.pending);
                 if !streamed && let Some(text) = content.filter(|text| !text.is_empty()) {
                     self.agent.emit_event(AgentEvent::AssistantText(text));
                 }
-                if self.stop_turn_for_cancel() {
+                if steering != Steering::None && calls.is_empty() {
+                    // Stale release: the round completed naturally (final
+                    // answer, no tool calls) and its output is committed —
+                    // the committed result wins over the racing cancel
+                    // (contract: completed output is never lost). Ignore the
+                    // release; the outer loop finalizes normally.
+                } else if steering != Steering::None {
+                    // The round was committed but the turn still had work
+                    // (tool calls / more rounds): the release stops it here.
+                    // Queued prompts (if any) are consumed by the outer loop.
+                    self.shared
+                        .lock()
+                        .unwrap()
+                        .emit(AgentEvent::Notice("turn cancelled".into()));
+                    if self.release_after_preempt(steering) {
+                        return;
+                    }
                     break 'turn;
                 }
                 if self.agent.take_auto_compact_request() {
@@ -1008,17 +1099,29 @@ impl SessionRunner {
                         .unwrap()
                         .emit(AgentEvent::Notice("──── auto-compacting… ────".into()));
                     match self.compact_operation(CompactionSource::Auto).await {
-                        OperationFlow::Done => {}
-                        OperationFlow::Cancelled => {
-                            if !self.has_work() && self.finish_cancelled_or_idle(true) {
+                        OperationFlow::Done(steering) => {
+                            if steering != Steering::None {
+                                // The compaction completed (its projection was
+                                // committed), but the release still stops the
+                                // turn here; queued prompts (if any) are
+                                // consumed by the outer loop.
+                                self.shared
+                                    .lock()
+                                    .unwrap()
+                                    .emit(AgentEvent::Notice("turn cancelled".into()));
+                                if self.release_after_preempt(steering) {
+                                    return;
+                                }
+                                break 'turn;
+                            }
+                        }
+                        OperationFlow::Released(steering) => {
+                            if self.release_after_preempt(steering) {
                                 return;
                             }
                             break 'turn;
                         }
                         OperationFlow::Finished => return,
-                    }
-                    if self.stop_turn_for_cancel() {
-                        break 'turn;
                     }
                 }
                 if calls.is_empty() {
@@ -1032,14 +1135,21 @@ impl SessionRunner {
                     let waited = await_tool(&mut self.agent, &call, &mut self.commands).await;
                     let result = match waited.outcome {
                         WaitOutcome::Completed(result) => result,
-                        WaitOutcome::Cancelled => {
-                            self.cancelled = true;
+                        WaitOutcome::Released => {
+                            // The in-flight tool future was dropped; the
+                            // interrupted tool call is never committed (the
+                            // next provider context synthesizes an error
+                            // result via repair_tool_pairs). The release is
+                            // known (the Cancel was consumed by
+                            // wait_for_operation); classify from what is now
+                            // queued.
                             self.intake_after_operation(waited.pending);
+                            let steering = self.release_steering();
                             self.shared
                                 .lock()
                                 .unwrap()
                                 .emit(AgentEvent::Notice("turn cancelled".into()));
-                            if !self.has_work() && self.finish_cancelled_or_idle(true) {
+                            if self.release_after_preempt(steering) {
                                 return;
                             }
                             break 'turn;
@@ -1108,8 +1218,19 @@ impl SessionRunner {
                             return;
                         }
                     }
-                    self.intake_after_operation(pending);
-                    if self.stop_turn_for_cancel() {
+                    // A release that raced the tool's own completion: the
+                    // tool result was committed above (contract: completed
+                    // output is never lost), but the release stops the turn
+                    // here — the committed result stays in history.
+                    let steering = self.intake_after_operation(pending);
+                    if steering != Steering::None {
+                        self.shared
+                            .lock()
+                            .unwrap()
+                            .emit(AgentEvent::Notice("turn cancelled".into()));
+                        if self.release_after_preempt(steering) {
+                            return;
+                        }
                         break 'turn;
                     }
                 }

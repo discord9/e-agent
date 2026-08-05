@@ -1499,12 +1499,14 @@ async fn delete_session(
     //
     // A live subagent is truly terminated through its parent's
     // `BackgroundTasks::cancel(task_id)` instead of a plain
-    // `handle().cancel()`: the latter only interrupts the current turn and
-    // the delegate runner now stays alive (Idle) for follow-up messages, so
-    // it could never end the session on its own. The abort drops the
-    // delegate wrapper, whose captured cleanup removes the `Sessions` entry
-    // and the running_tasks row, and dropping the wrapper's runner handle
-    // aborts the subagent runner (SessionTask::drop). This is the same path
+    // `handle().cancel()`: the latter is a *release* — it preempts the
+    // in-flight operation and (for a FinishWhenIdle subagent with nothing
+    // queued) finalizes the runner as Cancelled, but it does not remove the
+    // `Sessions` registry entry / running_tasks row or abort a runner that
+    // is parked at an idle select. The abort drops the delegate wrapper,
+    // whose captured cleanup removes the `Sessions` entry and the
+    // running_tasks row, and dropping the wrapper's runner handle aborts
+    // the subagent runner (SessionTask::drop). This is the same path
     // the task-panel cancel (`DELETE /api/sessions/{parent}/tasks/{id}`)
     // uses. The transcript stays in its session file either way.
     if let Ok(session) = live(&state, &id) {
@@ -4424,12 +4426,15 @@ model = "deepseek-chat"
 
     /// Regression (interrupt-no-longer-kills-delegate): `DELETE
     /// /api/sessions/{id}` on a live delegate subagent must TRULY terminate
-    /// it. A plain `handle().cancel()` only interrupts the current turn — a
-    /// FinishWhenIdle delegate now returns to Idle and stays alive for
-    /// follow-up messages — so the endpoint routes through the parent's
-    /// `BackgroundTasks::cancel(task_id)` instead: the delegate wrapper is
-    /// aborted, its captured cleanup removes the `Sessions` entry, and
-    /// dropping the wrapper's runner handle aborts the subagent runner.
+    /// it. A plain `handle().cancel()` is a *release* — it preempts the
+    /// in-flight operation and (for a FinishWhenIdle subagent with nothing
+    /// queued) finalizes the runner as Cancelled, but it does not remove
+    /// the `Sessions` registry entry / running_tasks row or abort a runner
+    /// parked at an idle select — so the endpoint routes through the
+    /// parent's `BackgroundTasks::cancel(task_id)` instead: the delegate
+    /// wrapper is aborted, its captured cleanup removes the `Sessions`
+    /// entry, and dropping the wrapper's runner handle aborts the subagent
+    /// runner.
     #[tokio::test]
     async fn delete_subagent_session_aborts_delegate_runner_and_cleans_up() {
         use async_trait::async_trait;
