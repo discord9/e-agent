@@ -860,7 +860,8 @@ async fn delegate_requires_workspace_parameter() {
         .unwrap_err();
     assert_eq!(
         error,
-        "delegate requires a workspace parameter: absolute path of the working directory"
+        "delegate requires a workspace parameter: path of the working directory \
+         (absolute, or relative to this workspace's root)"
     );
 
     // An empty/whitespace workspace is equally a missing parameter.
@@ -870,18 +871,86 @@ async fn delegate_requires_workspace_parameter() {
         .unwrap_err();
     assert_eq!(
         error,
-        "delegate requires a workspace parameter: absolute path of the working directory"
+        "delegate requires a workspace parameter: path of the working directory \
+         (absolute, or relative to this workspace's root)"
+    );
+}
+
+#[tokio::test]
+async fn delegate_resolves_relative_workspace_against_caller_root() {
+    let parent = tempfile::tempdir().unwrap();
+    let custom = parent.path().join("custom");
+    std::fs::create_dir(&custom).unwrap();
+    std::fs::create_dir(custom.join("nested")).unwrap();
+
+    // Relative path inside the caller's workspace → resolved against the
+    // caller root, accepted; the subagent only fails later on the dummy
+    // model connection (never on the workspace).
+    for workspace in ["custom", "custom/nested"] {
+        let tool = delegate(parent.path());
+        let error = tool
+            .execute(json!({
+                "task": "irrelevant",
+                "workspace": workspace,
+                "background": false
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("\nsubagent failed:"),
+            "relative in-workspace path {workspace:?} must resolve, got: {error}"
+        );
+        assert!(
+            !error.contains("invalid `workspace`"),
+            "valid relative workspace {workspace:?} must not produce a workspace error, got: {error}"
+        );
+    }
+
+    // `.` resolves to the caller's own workspace root.
+    let tool = delegate(parent.path());
+    let error = tool
+        .execute(json!({
+            "task": "irrelevant",
+            "workspace": ".",
+            "background": false
+        }))
+        .await
+        .unwrap_err();
+    assert!(
+        !error.contains("invalid `workspace`"),
+        "`.` must resolve to the caller's workspace root, got: {error}"
     );
 
-    // `.` is no longer silently reinterpreted as the parent workspace: it
-    // is a relative path and reroot() rejects it.
+    // Escaping the caller's workspace with `..` is rejected (reroot refuses
+    // ParentDir segments outright — same as for absolute paths).
+    let tool = delegate(parent.path());
     let error = tool
-        .execute(json!({"task": "hello", "workspace": ".", "background": false}))
+        .execute(json!({
+            "task": "irrelevant",
+            "workspace": "../escape",
+            "background": false
+        }))
         .await
         .unwrap_err();
     assert!(
         error.contains("invalid `workspace`"),
-        "`.` must be rejected as a non-absolute workspace, got: {error}"
+        "`..` escape must be rejected, got: {error}"
+    );
+
+    // A relative path that does not exist is rejected just like an
+    // absolute one (reroot's canonicalize requires an existing directory).
+    let tool = delegate(parent.path());
+    let error = tool
+        .execute(json!({
+            "task": "irrelevant",
+            "workspace": "does-not-exist",
+            "background": false
+        }))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("invalid `workspace`"),
+        "nonexistent relative workspace must be rejected, got: {error}"
     );
 }
 

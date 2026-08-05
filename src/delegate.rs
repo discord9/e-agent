@@ -756,7 +756,8 @@ pub async fn spawn_btw_subagent(
 impl Tool for Delegate {
     fn spec(&self) -> ToolSpec {
         let mut description =
-            "The first argument MUST be workspace: emit its absolute path before writing task. \
+            "The first argument MUST be workspace: emit its path (absolute, or relative to \
+                your own workspace root — e.g. `.e-agent/worktrees/wt-x`) before writing task. \
                 Spawn a subagent with a fresh context to work on a task. Use this for \
                 self-contained subtasks (searching, reading many files, focused edits) whose \
                 intermediate steps would clutter your own context. The subagent has the file and \
@@ -800,7 +801,7 @@ impl Tool for Delegate {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "workspace": {"type": "string", "description": "REQUIRED — absolute path of the working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). Must be an absolute path: never pass `.` or a relative path."},
+                    "workspace": {"type": "string", "description": "REQUIRED — working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). May be absolute or relative: relative paths are resolved against YOUR workspace root (e.g. `.e-agent/worktrees/wt-x`) and must stay inside it or an authorized external directory."},
                     "role": role_property,
                     "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
                     "background": {"type": "boolean", "default": true, "description": "run without blocking and deliver the answer as a background completion (default true); pass false to wait for the final answer"},
@@ -1001,8 +1002,12 @@ impl Tool for Delegate {
         let label = task_label(raw_label, role.as_deref(), &task);
 
         // Resolve the (required) workspace: the subagent's working directory
-        // is an explicit parameter — there is no parent-workspace fallback
-        // (reroot() rejects non-absolute paths like `.`/`./`).
+        // is an explicit parameter — there is no parent-workspace fallback.
+        // Absolute paths are used as-is; relative paths are resolved against
+        // the CALLER's workspace root before reroot() canonicalizes and
+        // enforces authorization (the resolved path must stay inside the
+        // caller's workspace or an authorized writable external directory;
+        // reroot() rejects non-absolute paths itself, hence the join here).
         let workspace_arg: Option<String> = arguments
             .as_object()
             .and_then(|args| args.get("workspace"))
@@ -1011,13 +1016,22 @@ impl Tool for Delegate {
             .filter(|s| !s.is_empty());
         let Some(workspace_arg) = workspace_arg else {
             return Err(
-                "delegate requires a workspace parameter: absolute path of the working directory"
+                "delegate requires a workspace parameter: path of the working directory \
+                 (absolute, or relative to this workspace's root)"
                     .into(),
             );
         };
+        // Join relative inputs with the caller's root up front; reroot's
+        // canonicalize then resolves any `.`/`..` segments while refusing
+        // escapes out of the authorized tree.
+        let workspace_path = if std::path::Path::new(&workspace_arg).is_absolute() {
+            std::path::PathBuf::from(&workspace_arg)
+        } else {
+            self.workspace.root().join(&workspace_arg)
+        };
         let workspace = self
             .workspace
-            .reroot(&workspace_arg)
+            .reroot(&workspace_path)
             .map_err(|error| format!("invalid `workspace` path `{workspace_arg}`: {error}"))?;
 
         let model_name = model.display_name().to_string();
@@ -1045,7 +1059,9 @@ impl Tool for Delegate {
         let session_id = persist.session_id.clone();
         // Build structured display metadata for the F2 task panel. Background
         // reflects the effective execution mode; workspace is always explicit
-        // (required parameter). The subagent session id lets the web task
+        // (required parameter). The workspace shown is the user's ORIGINAL
+        // input (relative stays relative — friendlier in the panel than the
+        // resolved absolute path). The subagent session id lets the web task
         // panel jump straight to the subagent's transcript without label
         // matching (labels are lost once the Greptime `running_tasks` row is
         // cleared at completion).
