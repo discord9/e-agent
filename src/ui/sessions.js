@@ -1727,6 +1727,36 @@ function isSubagentRunning(s) {
     && (s.busy === true || (s.busy === undefined && isRunningStatus(s.status)));
 }
 
+/* delegate 任务是否「在等」→ 环绕绿点：对应 subagent 会话 busy:false
+   （权威否定，活着但空闲/在等）；bash 任务 / busy:true / 找不到会话 →
+   红点。kids 优先（当前父节点的子会话），miss 时回退 state.lastList
+   （旧后端 label 匹配解析出的 id 可能在列表缓存里）。 */
+function taskIsWaitingGreen(t, kids) {
+  if (!t || t.kind !== "delegate") return false;
+  const subId = resolveSubagentSessionId(t);
+  if (!subId) return false;
+  const sub = (kids || []).find((k) => k.id === subId)
+    || (state.lastList || []).find((k) => k.id === subId);
+  return !!sub && sub.busy === false;
+}
+
+/* subagent 是否还有对应的 delegate 后台任务（任务面板条目仍在：delegate
+   在等后台任务 / 会话存活时条目未清）。 */
+function hasDelegateTask(k) {
+  return (state.tasks.list || []).some((t) => t.kind === "delegate"
+    && resolveSubagentSessionId(t) === k.id);
+}
+
+/* 环绕点 hover 标题：任务 N/M（bash: label / subagent: label）；超长
+   命令截断保持简洁。 */
+function taskDotTitle(t, n, total) {
+  const kind = t.kind === "delegate"
+    ? "subagent: " + (t.label || t.subagent_session_id || "子代理")
+    : "bash: " + (t.full_command || t.label || "后台命令");
+  const text = "任务 " + n + "/" + total + "（" + kind + "）";
+  return text.length > 60 ? text.slice(0, 60) + "…" : text;
+}
+
 /* 单个 workspace 的树渲染（原 renderSidebarTree 主体，抽出来按 ws 复用）：
    roots/orphans/MAX_TREE_ROOTS/hist-groups 全部按本列表判定；wsId 用于
    expanded 键限定（wsId:sid）与 .current 高亮（只高亮激活 workspace 内
@@ -1855,23 +1885,30 @@ function buildTreeRoot(s, kids, wsId) {
       toggleSidebarNode(wsId + ":" + s.id, toggle, kids, wsId);
     });
   }
-  // 环绕红点只看直接子会话（subagent 通常一层，孙会话不计），且只统计
-  // 正在运行的子 agent（isSubagentRunning：busy===true，或旧 server 无
-  // busy 字段时由 status 回退 Busy/Compacting）；Idle 但存活的 live
-  // subagent 不点亮红点（busy:false 是权威否定）。主点只表达父会话自身
-  // 状态；正在运行的子 agent 用环绕红点独立表达。
-  const runningKidCount = kids.filter(isSubagentRunning).length;
+  // 环绕点数量 = 该父会话的全部后台任务数（/api/tasks：bash 后台任务 +
+  // delegate subagent 任务，与任务面板 2s 轮询对齐）；任务面板未加载
+  // （state.tasks.list 为 undefined，侧边栏先渲染）时回退 running 子会话
+  // 计数，避免闪烁。主点只表达父会话自身状态；每个环绕点对应一个任务：
+  // bash 任务恒红（一直在跑），delegate 任务按对应 subagent 会话的 busy
+  // 判定——busy:true 红点，busy:false（Idle 在等）绿点。
+  const tasksLoaded = state.tasks && Array.isArray(state.tasks.list);
+  const parentTasks = tasksLoaded
+    ? state.tasks.list.filter((t) => t.session_id === s.id)
+    : null;   // 未加载 → 回退 kids 计数
+  const runningKidCount = parentTasks === null
+    ? kids.filter(isSubagentRunning).length
+    : parentTasks.length;
   const hasRunningKids = runningKidCount > 0;
   const dot = el("span", "busy-dot-wrap");
   dot.setAttribute("role", "img");
   dot.setAttribute("aria-label", (s.busy ? "会话处理中" : "会话空闲")
-    + (hasRunningKids ? "，" + runningKidCount + " 个子任务处理中" : ""));
+    + (hasRunningKids ? "，" + runningKidCount + " 个任务处理中" : ""));
   const mainDot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
   mainDot.setAttribute("aria-hidden", "true");
   dot.appendChild(mainDot);
 
-  // 环上最多画六个红点；更多任务由第七个位置的 +N 汇总，避免
-  // 小尺寸侧栏状态标记过密。位置按当前红点数量均匀选取。
+  // 环上最多画六个点；更多任务由第七个位置的 +N 汇总，避免
+  // 小尺寸侧栏状态标记过密。位置按任务列表顺序均匀选取。
   const hasOverflow = runningKidCount > 6;
   const visibleKidDots = Math.min(runningKidCount, 6);
   const orbitSlots = {
@@ -1879,15 +1916,24 @@ function buildTreeRoot(s, kids, wsId) {
     5: [1, 2, 4, 6, 8], 6: [1, 2, 4, 5, 6, 8],
   }[visibleKidDots] || [];
   for (let i = 0; i < visibleKidDots; i++) {
-    const subDot = el("span", "busy-dot-sub orbit-slot-" + orbitSlots[i]);
-    subDot.title = "子任务 " + (i + 1) + "/" + runningKidCount;
+    const t = parentTasks ? parentTasks[i] : null;
+    // delegate 任务在等（对应 subagent busy:false）→ 绿点；其余（bash /
+    // busy:true / 找不到会话）→ 红点。回退模式（tasks 未加载）全红。
+    const green = t !== null && taskIsWaitingGreen(t, kids);
+    const subDot = el("span", "busy-dot-sub" + (green ? " green" : "")
+      + " orbit-slot-" + orbitSlots[i]);
+    subDot.title = parentTasks
+      ? taskDotTitle(t, i + 1, runningKidCount)
+      : "子任务 " + (i + 1) + "/" + runningKidCount;
     subDot.setAttribute("aria-hidden", "true");
     dot.appendChild(subDot);
   }
   if (hasOverflow) {
     const overflow = el("span", "busy-dot-overflow",
       "+" + (runningKidCount - visibleKidDots));
-    overflow.title = "共 " + runningKidCount + " 个子任务处理中";
+    overflow.title = parentTasks
+      ? "共 " + runningKidCount + " 个任务处理中"
+      : "共 " + runningKidCount + " 个子任务处理中";
     overflow.setAttribute("aria-hidden", "true");
     dot.appendChild(overflow);
   }
@@ -1933,7 +1979,7 @@ function buildTreeRoot(s, kids, wsId) {
   row.append(toggle, dot, titleEl, count, pin, archive);
   row.title = (s.title || s.id) + (s.model ? " · " + s.model : "")
     + (s.busy ? "（处理中）" : "")
-    + (hasRunningKids ? "（子任务处理中）" : "");
+    + (hasRunningKids ? "（任务处理中）" : "");
   row.addEventListener("click", (ev) => {
     if (row.classList.contains("pin-drag-click-block")) {
       if (ev) { ev.preventDefault(); ev.stopPropagation(); }
@@ -1992,7 +2038,13 @@ function renderSubagentRows(container, kids, hist, wsId) {
     const running = isSubagentRunning(k);
     const row = el("div", "tree-row tree-row-child" + (hist ? " tree-hist" : "") +
       (state.workspace.id === wsId && state.sessionId === k.id ? " current" : ""));
-    const dot = el("span", "busy-dot" + (running ? " busy" : ""));
+    // 子行状态点：running → 橙红 busy 点；busy:false 但活着（active !==
+    // false，或任务面板里还有对应 delegate 任务——delegate 在等后台任务
+    // 时条目仍在）→ 绿色 busy-dot-green（活着但空闲/在等）；inactive 历史
+    // 行（无任务、无 live）不点亮（现状）。
+    const idleAlive = !running && k.busy === false
+      && (isSessionLive(k) || hasDelegateTask(k));
+    const dot = el("span", "busy-dot" + (running ? " busy" : idleAlive ? " busy-dot-green" : ""));
     // label 优先：subagent 的任务面板标题最友好；旧 server 无 label → 回退 title/id
     // 有 label/title：两行（label/title 行 + 完整 id 行）；无则一行完整 id。
     const hasTitle = !!(k.label || k.title);
