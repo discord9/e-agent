@@ -3732,6 +3732,72 @@ async fn steer_release_during_tool_without_queued_prompt_finish_when_idle_finali
 }
 
 #[tokio::test]
+async fn steer_release_with_queued_compact_finish_when_idle_drops_the_compact() {
+    // Contract 6 variant: a Compact queued behind an in-flight round is an
+    // internal maintenance command, not a user message. When the release
+    // finalizes the FinishWhenIdle session as Cancelled (nothing queued
+    // user-side), the queued Compact is dropped without ever running —
+    // cancel = flush applies to queued messages only.
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, entered, _release) = recovering_agent(
+        vec![Ok(AssistantMessage {
+            content: Some("interrupted".into()),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        })],
+        true,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-compact-drop".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, _) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+    entered.notified().await; // round in flight
+    handle.compact(); // queued, never started
+    handle.cancel(); // release
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            _ => {}
+        }
+    }
+    let mut status = handle.status();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))),
+    )
+    .await
+    .expect("release with a queued Compact and no prompts must finalize a FinishWhenIdle session");
+    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
+    task.join().await.unwrap();
+
+    // The queued Compact never ran: no Compaction entry, no projection.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "steer-compact-drop")
+        .await
+        .unwrap();
+    assert!(
+        !loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Compaction { .. })),
+        "a release-dropped queued Compact must leave no Compaction entry"
+    );
+    assert!(
+        !handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(text) if text.starts_with("compacted:")
+        )),
+        "a release-dropped queued Compact must leave no projection"
+    );
+}
+
+#[tokio::test]
 async fn steer_release_without_queued_prompt_wait_for_input_returns_to_idle() {
     // Contract 6 (WaitForInput side): the same release parks the session at
     // Idle — ready for a future prompt, never Finished — because a

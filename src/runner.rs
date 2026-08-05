@@ -878,7 +878,11 @@ impl SessionRunner {
             let steering = self.drain_ready_commands();
             // A release with nothing queued (no prompts) is handled right
             // here by the policy — even if maintenance (Compact) is pending,
-            // an emergency cancel on FinishWhenIdle finalizes Cancelled.
+            // an emergency cancel on FinishWhenIdle finalizes Cancelled and
+            // the queued Compact is dropped without running (cancel = flush
+            // applies to queued user messages, not to internal maintenance
+            // commands; pinned by
+            // steer_release_with_queued_compact_finish_when_idle_drops_the_compact).
             // ReleasedWithPrompts falls through: the queued batch is consumed
             // below and the turn(s) started from it decide the end naturally.
             if steering == Steering::ReleasedIdle && self.release_after_preempt(steering) {
@@ -956,6 +960,18 @@ impl SessionRunner {
                             let first = self.queue(command);
                             let drained = self.drain_ready_commands();
                             let steering = self.merge_steering(first, drained);
+                            // A release at the idle select. `merge_steering`
+                            // recomputes the classification from the final
+                            // queue state, so a release with prompts queued
+                            // is `ReleasedWithPrompts` and falls through
+                            // below — the outer loop consumes the queued
+                            // batch and the turns started from it decide the
+                            // end naturally. Only the no-prompts
+                            // (`ReleasedIdle`) case is finalized right here
+                            // (emergency cancel on FinishWhenIdle), so
+                            // `!has_prompt_work()` is the exact discriminator
+                            // and there is no released-with-prompts branch to
+                            // run at this site.
                             if steering != Steering::None
                                 && !self.has_prompt_work()
                                 && self.release_after_preempt(steering)

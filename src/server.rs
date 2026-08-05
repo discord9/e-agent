@@ -1492,6 +1492,15 @@ async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // Known limitation (pre-existing, unrelated to the steering rework):
+    // for a WaitForInput web session this can leave an idle runner behind.
+    // `handle().cancel()` is a *release* that parks a WaitForInput session
+    // at Idle, and any other holder of the `Arc<LiveSession>` (e.g. an
+    // in-flight request) keeps the registry entry's `SessionTask` alive
+    // past `registry.remove` — an unaddressable idle runner that only ends
+    // when the last Arc drops or the process exits. Fixing this is tracked
+    // separately; the transcript stays and a later resume still works.
+    //
     // Live session: cancel + remove from the registry. Dropping the
     // registry entry (and with it the SessionTask) aborts the runner;
     // in-flight SSE streams notice the closed event/status channels and
