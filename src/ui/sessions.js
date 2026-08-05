@@ -1911,17 +1911,17 @@ function buildTreeRoot(s, kids, wsId) {
   // 小尺寸侧栏状态标记过密。位置按任务列表顺序均匀选取。
   const hasOverflow = runningKidCount > 6;
   const visibleKidDots = Math.min(runningKidCount, 6);
-  const orbitSlots = {
-    1: [1], 2: [1, 5], 3: [1, 4, 6], 4: [1, 3, 5, 7],
-    5: [1, 2, 4, 6, 8], 6: [1, 2, 4, 5, 6, 8],
-  }[visibleKidDots] || [];
+  const RX = 9, RY = 7, CX = 10, CY = 10;   // 主点 (10,10)，椭圆半径
   for (let i = 0; i < visibleKidDots; i++) {
     const t = parentTasks ? parentTasks[i] : null;
     // delegate 任务在等（对应 subagent busy:false）→ 绿点；其余（bash /
     // busy:true / 找不到会话）→ 红点。回退模式（tasks 未加载）全红。
     const green = t !== null && taskIsWaitingGreen(t, kids);
-    const subDot = el("span", "busy-dot-sub" + (green ? " green" : "")
-      + " orbit-slot-" + orbitSlots[i]);
+    // 单个点: 顶部 (12 点方向)；两个点: 上下对称；N 个点: 均匀环绕。
+    const angle = -Math.PI / 2 + (2 * Math.PI * i) / visibleKidDots;
+    const subDot = el("span", "busy-dot-sub" + (green ? " green" : ""));
+    subDot.style.left = (CX + Math.cos(angle) * RX).toFixed(1) + "px";
+    subDot.style.top = (CY + Math.sin(angle) * RY).toFixed(1) + "px";
     subDot.title = parentTasks
       ? taskDotTitle(t, i + 1, runningKidCount)
       : "子任务 " + (i + 1) + "/" + runningKidCount;

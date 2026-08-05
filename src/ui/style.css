@@ -298,14 +298,6 @@
   .busy-dot-sub:nth-of-type(3n) { animation-delay: -0.45s; }
   .busy-dot-sub:nth-of-type(3n + 1) { animation-delay: -0.9s; }
   @keyframes subagent-pulse { 50% { opacity: 0.45; } }
-  .busy-dot-wrap .orbit-slot-1 { left: 8px; top: 0; }
-  .busy-dot-wrap .orbit-slot-2 { left: 14px; top: 2px; }
-  .busy-dot-wrap .orbit-slot-3 { left: 16px; top: 8px; }
-  .busy-dot-wrap .orbit-slot-4 { left: 14px; top: 14px; }
-  .busy-dot-wrap .orbit-slot-5 { left: 8px; top: 16px; }
-  .busy-dot-wrap .orbit-slot-6 { left: 2px; top: 14px; }
-  .busy-dot-wrap .orbit-slot-7 { left: 0; top: 8px; }
-  .busy-dot-wrap .orbit-slot-8 { left: 2px; top: 2px; }
   .busy-dot-overflow {
     position: absolute;
     z-index: 1;
