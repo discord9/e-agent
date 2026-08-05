@@ -2125,7 +2125,7 @@ async fn store_facade_unfinished_owner_all_dead_e2e() {
     let sid = format!("test-sql-store-owner-{}", crate::session::new_id());
     let store = SessionStore::connect(
         &crate::config::SessionBackend::Sqlite {
-            path: path.to_string_lossy().into_owned(),
+            path: Some(path.to_string_lossy().into_owned()),
         },
         root,
         &sid,
