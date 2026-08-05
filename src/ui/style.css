@@ -270,17 +270,19 @@
   @keyframes pulse { 50% { opacity: 0.3; } }
 
   /* 侧栏主会话状态：中心点只表示主 agent，环绕红点表示活跃 subagent。
-     固定画布不会随任务数改变行高或挤动标题。 */
+     固定画布不会随任务数改变行高或挤动标题。
+     24×24 正方形画布：环绕点绕几何中心作正圆（非椭圆），任何任务数下
+     相邻点等距、环与主点同心，避免 RX≠RY 造成的疏密歪斜。 */
   .busy-dot-wrap {
     position: relative;
-    width: 36px;
-    height: 28px;
-    flex: 0 0 36px;
+    width: 24px;
+    height: 24px;
+    flex: 0 0 24px;
   }
   .busy-dot-wrap > .busy-dot {
     position: absolute;
-    left: 18px;
-    top: 14px;
+    left: 12px;
+    top: 12px;
     transform: translate(-50%, -50%);
   }
   .busy-dot-sub {
@@ -289,7 +291,9 @@
     height: 4px;
     border-radius: 50%;
     background: var(--red);
-    box-shadow: 0 0 0 1px var(--base3);
+    /* 0.5px 发丝光环：24px 紧凑画布内 1px 白边会让 Ø4 点视觉胀成 Ø6
+       并显得偏离轨道；细描边既从行背景托起红点又不改变视觉尺寸。 */
+    box-shadow: 0 0 0 0.5px var(--base3);
     animation: subagent-pulse 1.45s ease-in-out infinite;
   }
   /* 环绕绿点：delegate 任务在等（对应 subagent busy:false，活着但空闲）；
@@ -314,9 +318,10 @@
     text-align: center;
     white-space: nowrap;
   }
-  /* 徽章贴容器右缘、垂直居中偏上，避开环绕椭圆（右点中心 18,10）——
-     原 left:17 top:5 与 N>6 时右上环绕点重叠，移动端小屏更明显。 */
-  .busy-dot-wrap > .busy-dot-overflow { right: 0; top: 1px; left: auto; }
+  /* 徽章贴容器右上外角：正圆环的 2 点方向（中心约 17.7,6.3）与右上角
+     之间留有净距，徽章压在画布外缘、不与任何环绕点重叠。仅在出现 +N
+     （>6 任务）时显示，平时 24px 画布干净不拥挤。 */
+  .busy-dot-wrap > .busy-dot-overflow { right: 0; top: 0; left: auto; }
 
   .status-chip {
     font-size: 12px;
@@ -1432,7 +1437,10 @@
   .tree-toggle:disabled { cursor: default; }
   .tree-toggle:disabled::before { content: none; }   /* 无子会话：仅占位，不画箭头 */
   .tree-toggle.open { transform: rotate(90deg); }
-  .tree-row .busy-dot { width: 7px; height: 7px; flex: 0 0 auto; }
+  /* 树行状态点 Ø6：主会话环心点 + 子会话行内点统一 6px。环心主点 6px
+     与 Ø4 环绕点相差 2px 足以读作「中心」，同时在 24px 画布内给正圆环
+     让出间隙；子行单点同行高对齐。 */
+  .tree-row .busy-dot { width: 6px; height: 6px; flex: 0 0 auto; }
   .tree-id {
     flex: 1;
     min-width: 0;

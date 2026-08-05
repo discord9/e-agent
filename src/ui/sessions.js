@@ -1914,12 +1914,14 @@ function buildTreeRoot(s, kids, wsId) {
   // 小尺寸侧栏状态标记过密。位置按任务列表顺序均匀选取。
   const hasOverflow = runningKidCount > 6;
   const visibleKidDots = Math.min(runningKidCount, 6);
-  // 环绕半径按"点中心围绕主点中心 (18,14)、且 4px 点不溢出 36×28 容器"标定：
-  // left/top 是点左上角，须减点半径 2 让点中心落在椭圆上——否则环视觉中心
-  // 偏右下，移动端窄行高下主点明显不在环心。RX=12：右点中心 30、右缘 32 ≤ 36，
-  // 给右侧 +N 徽章留位；RY=10：底点中心 24、底缘 26 ≤ 28 不溢出。主点 8px
-  // 半径 4 + 环绕点半径 2 = 6，中心距 ≥10px，环绕点与主点清晰分开不重叠。
-  const RX = 12, RY = 10, CX = 18, CY = 14;   // 主点中心 (18,14)，椭圆半径
+  // 环绕点绕主点中心作正圆（RX=RY=R）：椭圆 (RX≠RY) 会让等角分布的点在
+  // 主轴/副轴上间距不一，视觉上"这边挤那边松"而显歪；正圆上任意 N 个
+  // 等角点的相邻弦长严格相等，环始终匀称。24×24 正方形画布几何中心即
+  // (12,12)，与主点中心重合——环与主点同心，不偏不歪。
+  // R=8 由不重叠约束标定：主点半径 3 + 环绕点半径 2 = 5，中心距 8 留出
+  // 3px 净间隙，环绕点与主点清晰分开不粘连；点缘最远 12+8+2=22 ≤ 24 不
+  // 溢出画布。left/top 是点左上角，须减点半径 2 让点中心落在圆上。
+  const R = 8, CX = 12, CY = 12;   // 主点中心 (12,12)，正圆半径
   for (let i = 0; i < visibleKidDots; i++) {
     const t = parentTasks ? parentTasks[i] : null;
     // delegate 任务在等（对应 subagent busy:false）→ 绿点；其余（bash /
@@ -1928,8 +1930,8 @@ function buildTreeRoot(s, kids, wsId) {
     // 单个点: 顶部 (12 点方向)；两个点: 上下对称；N 个点: 均匀环绕。
     const angle = -Math.PI / 2 + (2 * Math.PI * i) / visibleKidDots;
     const subDot = el("span", "busy-dot-sub" + (green ? " green" : ""));
-    subDot.style.left = (CX + Math.cos(angle) * RX - 2).toFixed(1) + "px";
-    subDot.style.top = (CY + Math.sin(angle) * RY - 2).toFixed(1) + "px";
+    subDot.style.left = (CX + Math.cos(angle) * R - 2).toFixed(1) + "px";
+    subDot.style.top = (CY + Math.sin(angle) * R - 2).toFixed(1) + "px";
     subDot.title = parentTasks
       ? taskDotTitle(t, i + 1, runningKidCount)
       : "子任务 " + (i + 1) + "/" + runningKidCount;
