@@ -3964,3 +3964,415 @@ async fn steer_hard_abort_still_drops_in_flight_operation_immediately() {
     assert_eq!(handle.snapshot(), before);
     drop(task);
 }
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Steering v2 — step 3: idle-select blind spots (B1/B2a/B3/B4)
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#[tokio::test]
+async fn steer_cancel_while_idle_waiting_on_blocking_background_finalizes_cancelled_immediately() {
+    // B1: a FinishWhenIdle session parked at the idle select waiting for a
+    // blocking background task (finalize_wait cap set) must finalize
+    // Cancelled IMMEDIATELY on a cancel — it must not keep sleeping out the
+    // finalize_wait cap. The background task is NOT cancelled (it stays in
+    // the shared registry), and no "finalizing with N task(s)" timeout
+    // Notice is emitted: the session ends through the release path, not the
+    // timeout path.
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    let (tools, background) = crate::tools::builtins(workspace, None, false, None);
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("sleep 30", false)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("build started, waiting".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        tools,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-bg-cancel".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    // Long cap: the test proves the cancel finalizes LONG before this cap
+    // could expire (a timeout finalize would emit the "finalizing with …"
+    // Notice and would take the whole cap).
+    let runner = runner.with_finalize_wait(Some(std::time::Duration::from_secs(60)));
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("run build".into()));
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "build started, waiting" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    // The session parks at Idle: the unfinished blocking background task
+    // prevents natural finalization and the finalize_wait cap is far away.
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    handle.cancel();
+
+    // The release finalizes Cancelled immediately (well under the 60s cap).
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))),
+    )
+    .await
+    .expect("cancel at the idle select must finalize Cancelled immediately, not sleep out finalize_wait");
+    assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
+    task.join().await.unwrap();
+
+    // No "finalizing with N background task(s)" Notice: the session ended
+    // through the release path, not the finalize_wait timeout path.
+    assert!(
+        !handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(text) if text.contains("finalizing with")
+        )),
+        "the release path must not emit the finalize_wait timeout Notice"
+    );
+    // The background task was NOT cancelled: it is still registered in the
+    // shared registry after the subagent finalized.
+    let tasks = background.running();
+    assert_eq!(tasks.len(), 1, "task must stay registered: {tasks:?}");
+    assert_eq!(tasks[0].kind, "bash");
+    // Explicitly cancel to avoid leaking the sleep process past the test.
+    background.cancel(tasks[0].id);
+    assert!(background.running().is_empty());
+}
+
+#[tokio::test]
+async fn steer_cancel_then_prompt_at_idle_with_blocking_background_runs_queued_turn_then_bg_completion_round()
+ {
+    // B1 variant: cancel + prompt in the same tick at the idle select while
+    // a blocking background task runs. The release is recomputed as
+    // ReleasedWithPrompts (merge_steering classifies from the final queue
+    // state, and the idle-select site only finalizes the no-prompts case),
+    // so the queued prompt opens a fresh turn that completes naturally; the
+    // later background completion then injects the empty synthetic prompt
+    // and drives a final round — the session finalizes Completed through
+    // that round, never via the finalize_wait timeout.
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("cargo build", false)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("build started, waiting".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("queued follow-up answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("bg done, final".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        vec![Box::new(MockBackgroundBash {
+            id: 9,
+            label: "cargo build",
+            sender: sender.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-bg-cancel-prompt".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    // Long cap: if the release wrongly fell through to the timeout path the
+    // session would finalize as Completed("build started, waiting") with
+    // the "finalizing with …" Notice instead of running the queued turn.
+    let runner = runner.with_finalize_wait(Some(std::time::Duration::from_secs(60)));
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("run build".into()));
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "build started, waiting" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    // cancel + prompt back-to-back (single-threaded test runtime: both land
+    // in the channel before the runner polls again): the release classifies
+    // as ReleasedWithPrompts and the queued prompt runs as a fresh turn.
+    handle.cancel();
+    handle.prompt("follow up");
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::UserPrompt(text) if text == "follow up" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "queued follow-up answer" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+
+    // The blocking background task completes: the runner commits the
+    // completion and injects the empty synthetic prompt, driving a final
+    // model round whose answer finalizes the session.
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("agent must wire the bash completion sender")
+        .send(AgentEvent::BackgroundCompleted {
+            id: 9,
+            output: "build ok".into(),
+            label: Some("cargo build".into()),
+        })
+        .unwrap();
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "bg done, final" => break,
+            AgentEvent::Error(text) => panic!("follow-up turn failed: {text}"),
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("bg done, final".into())))
+    );
+    task.join().await.unwrap();
+    // Neither the release nor the completion path used the timeout Notice.
+    assert!(
+        !handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(text) if text.contains("finalizing with")
+        )),
+        "the session must finalize through the completion round, not the finalize_wait timeout"
+    );
+}
+
+#[tokio::test]
+async fn steer_cancel_then_prompt_at_idle_select_wait_for_input_opens_new_turn_and_double_cancel_is_noop()
+ {
+    // B2a + B3: a WaitForInput session parked at the idle select receives a
+    // Cancel (release) — it returns to Idle (never Finished) — then an
+    // immediate follow-up prompt opens a fresh turn that completes normally
+    // (pins the merge_steering recompute at the idle-select command intake
+    // and the release-returns-to-Idle path under WaitForInput). B3 rides
+    // along: a second Cancel sent while Idle is a no-op — the session state
+    // stays Idle, unchanged.
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, _entered, _release) = recovering_agent(
+        vec![
+            Ok(AssistantMessage {
+                content: Some("first answer".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+            Ok(AssistantMessage {
+                content: Some("follow-up answer".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+        ],
+        false, // no blocking: the first turn completes naturally
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-wfi-idle-cancel".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+
+    // First turn completes naturally -> the runner parks at the idle select.
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "first answer" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    // B3 first: a Cancel at the idle select is a release that returns to
+    // Idle; a second Cancel right behind it is a no-op — the session state
+    // stays Idle, never Finished.
+    handle.cancel();
+    handle.cancel();
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await; // let the runner consume both cancels
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(
+        !matches!(*status.borrow(), SessionStatus::Finished(_)),
+        "double cancel must not change the WaitForInput session state"
+    );
+
+    // B2a: the prompt that follows the cancels opens a fresh turn that
+    // completes normally.
+    handle.prompt("follow up");
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "follow-up answer" => break,
+            AgentEvent::Error(text) => panic!("follow-up turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+    drop(handle);
+    drop(task);
+}
+
+#[tokio::test]
+async fn steer_fifo_queued_compact_prompt_cancel_runs_compact_before_prompt() {
+    // B4: [Compact, prompt, cancel] queued while a round is in flight. The
+    // cancel releases the round; the pending queue keeps its FIFO order, so
+    // the outer loop runs the Compact FIRST (the compact-first branch only
+    // pops when Compact is at the front) and the queued prompt SECOND — the
+    // Compaction entry lands before the prompt's User entry, and the prompt
+    // turn then completes naturally.
+    let temp = tempfile::tempdir().unwrap();
+    let (mut agent, entered, _release) = recovering_agent(
+        vec![
+            Ok(AssistantMessage {
+                content: Some("interrupted".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+            Ok(AssistantMessage {
+                content: Some("compact summary".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+            Ok(AssistantMessage {
+                content: Some("queued answer".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }),
+        ],
+        true,
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "steer-fifo".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+
+    entered.notified().await; // round in flight
+    handle.compact();
+    handle.prompt("queued prompt");
+    handle.cancel();
+
+    // The release preempts the round ("turn cancelled"), then the queue is
+    // drained in FIFO order: compact first (compacted: projection Notice),
+    // prompt second (UserPrompt).
+    let mut order: Vec<String> = Vec::new();
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text)
+                if text == "turn cancelled" || text.starts_with("compacted:") =>
+            {
+                order.push(text);
+            }
+            AgentEvent::UserPrompt(text) if text == "queued prompt" => {
+                order.push("user:queued prompt".into());
+                break;
+            }
+            _ => {}
+        }
+    }
+    let cancelled = order
+        .iter()
+        .position(|text| text == "turn cancelled")
+        .expect("the release must emit 'turn cancelled'");
+    let compact = order
+        .iter()
+        .position(|text| text.starts_with("compacted:"))
+        .expect("the queued Compact must run before the prompt (FIFO)");
+    assert!(
+        cancelled < compact,
+        "release first, then compact: {order:?}"
+    );
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "queued answer" => break,
+            AgentEvent::Error(text) => panic!("queued turn failed: {text}"),
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("queued answer".into())))
+    );
+    task.join().await.unwrap();
+
+    // Durable FIFO proof: in the session file the Compaction entry precedes
+    // the queued prompt's User entry.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "steer-fifo")
+        .await
+        .unwrap();
+    let compact_idx = loaded
+        .entries
+        .iter()
+        .position(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+        .expect("compaction must run before the prompt");
+    let prompt_idx = loaded
+        .entries
+        .iter()
+        .position(|entry| {
+            matches!(
+                entry,
+                SessionEntry::Message {
+                    message: Message::User { content, .. }
+                } if content == "queued prompt"
+            )
+        })
+        .expect("queued prompt must run after the compaction");
+    assert!(
+        compact_idx < prompt_idx,
+        "FIFO: Compaction entry ({compact_idx}) must precede the queued prompt ({prompt_idx})"
+    );
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Compaction { summary, .. } if summary == "compact summary"
+    )));
+}

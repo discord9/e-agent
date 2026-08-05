@@ -4632,6 +4632,189 @@ model = "deepseek-chat"
         ));
     }
 
+    /// `POST /api/sessions/{id}/cancel` on a REAL runner — the endpoint was
+    /// zero-tested (the /cancel route only ever exercised the fake
+    /// `session_test_channel` handles). A FinishWhenIdle session Busy inside
+    /// a blocking model call receives the cancel through the HTTP endpoint:
+    /// 202 Accepted, the SSE stream the frontend consumes carries the
+    /// "turn cancelled" Notice, the in-flight model future is preempted
+    /// (drop probe), and with no prompt queued the runner finalizes
+    /// Finished(Cancelled) — no "processing queued prompts" release branch,
+    /// no prompt ever committed.
+    #[tokio::test]
+    async fn session_cancel_endpoint_releases_real_runner_and_finish_when_idle_finalizes_cancelled()
+    {
+        use async_trait::async_trait;
+        use axum::http::Request;
+        use futures_util::StreamExt;
+        use tokio::sync::Notify;
+        use tower::util::ServiceExt;
+
+        use crate::agent::{Agent, AssistantMessage, ModelDeltaKind, ToolSpec, Usage};
+        use crate::runner::{SessionResult, SessionRunner};
+
+        // Blocks inside complete() until the cancel releases (drops) the
+        // in-flight future; the drop probe proves the preemption landed.
+        struct BlockingModel {
+            entered: Arc<Notify>,
+            dropped: Arc<Notify>,
+        }
+        struct DropProbe(Arc<Notify>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        #[async_trait]
+        impl Model for BlockingModel {
+            async fn complete(
+                &mut self,
+                _: &[Message],
+                _: &[ToolSpec],
+                _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+            ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+                let _probe = DropProbe(self.dropped.clone());
+                self.entered.notify_one();
+                std::future::pending::<()>().await;
+                Ok((
+                    AssistantMessage {
+                        content: Some("too late".into()),
+                        tool_calls: Vec::new(),
+                        reasoning: None,
+                    },
+                    None,
+                ))
+            }
+        }
+
+        let state = test_app_state("sekrit");
+        let temp = tempfile::tempdir().unwrap();
+        let entered = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let agent = Agent::new(
+            Box::new(BlockingModel {
+                entered: entered.clone(),
+                dropped: dropped.clone(),
+            }),
+            vec![],
+        );
+        let (runner, handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            "web-cancel".into(),
+            IdlePolicy::FinishWhenIdle,
+        );
+        // Wrap the REAL runner in a LiveSession exactly like `create_session`
+        // does (real task, not the fake `session_test_channel` spawn).
+        let runner_task = runner.start(Some("initial".into()));
+        let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
+        let (_tools, background) = crate::tools::builtins(workspace, None, false, None);
+        let session = Arc::new(LiveSession {
+            handle: handle.clone(),
+            task: runner_task,
+            store: SessionStore::Jsonl,
+            background,
+            sessions: Sessions::default(),
+            model_name: Mutex::new("test-model".into()),
+            role_name: None,
+            created_at: chrono::Utc::now(),
+        });
+        state.registry.insert("web-cancel".into(), session);
+
+        // The runner is Busy inside its model call before either HTTP call.
+        entered.notified().await;
+        let app = router(state.clone());
+
+        // SSE subscriber first: the stream must carry the "turn cancelled"
+        // Notice the frontend renders when a user hits the cancel button.
+        let sse = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/web-cancel/events")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse.status(), StatusCode::OK);
+        let mut sse_body = sse.into_body().into_data_stream();
+
+        // POST /cancel -> 202 Accepted.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/web-cancel/cancel")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        // The release preempts the in-flight model future (drop probe).
+        dropped.notified().await;
+
+        // The SSE stream carries the "turn cancelled" Notice.
+        let mut buffered = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, sse_body.next()).await {
+                Err(_) => panic!("SSE stream timeout before 'turn cancelled'"),
+                Ok(None) => panic!("SSE stream ended before 'turn cancelled'"),
+                Ok(Some(Err(error))) => panic!("SSE stream error: {error}"),
+                Ok(Some(Ok(bytes))) => {
+                    buffered.push_str(&String::from_utf8_lossy(&bytes));
+                    if buffered.contains("turn cancelled") {
+                        break;
+                    }
+                }
+            }
+        }
+        // FWI + no queued prompt: the session finalizes Cancelled.
+        let mut status = handle.status();
+        let result = loop {
+            let value = status.borrow().clone();
+            if matches!(value, SessionStatus::Finished(_)) {
+                break value;
+            }
+            status.changed().await.unwrap();
+        };
+        assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
+
+        // The cancel never took the ReleasedWithPrompts path: no "processing
+        // queued prompts" Notice and no committed prompt beyond the initial
+        // one.
+        assert!(
+            !handle.snapshot().iter().any(|event| matches!(
+                event,
+                AgentEvent::Notice(text) if text == "processing queued prompts"
+            )),
+            "no queued prompt: the release must not take the prompts branch"
+        );
+        let loaded = SessionStore::Jsonl
+            .load(temp.path(), "web-cancel")
+            .await
+            .unwrap();
+        assert!(
+            !loaded.entries.iter().any(|entry| matches!(
+                entry,
+                SessionEntry::Message {
+                    message: Message::User { content, .. }
+                } if content != "initial"
+            )),
+            "no prompt may be committed after the cancel"
+        );
+        drop(sse_body);
+        state.registry.remove("web-cancel");
+    }
+
     /// The frontend contract (contract item 5): `SessionEntry` is internally
     /// tagged with `type` and `Message` stays externally tagged, so a history
     /// page serializes as `{type:"message", message:{User:{content,images?}}}`.
