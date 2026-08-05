@@ -124,12 +124,17 @@ pub fn builtins_with_bash_timeout(
 /// write-sandbox MVP rejects the mode before execution, so a role with
 /// `protect_git = false` is how a fixer/subagent gets a working shell under
 /// the Windows sandbox.
+///
+/// `self_session_id` is the calling session's own id (`Some` for subagents,
+/// `None` otherwise): it lets `get_background_tasks` annotate the delegate
+/// entry that represents the caller itself.
 pub fn builtins_with_background(
     workspace: Workspace,
     background: BackgroundTasks,
     sandbox: Option<crate::config::Sandbox>,
     read_only: bool,
     protect_git: bool,
+    self_session_id: Option<String>,
 ) -> Vec<Box<dyn Tool>> {
     // Subagents have no loaded global Config; apply the workspace `[bash]`
     // override plus the default (mirrors `builtins`).
@@ -145,6 +150,7 @@ pub fn builtins_with_background(
         protect_git,
         read_only,
         bash_timeout,
+        self_session_id,
     )
 }
 
@@ -166,6 +172,8 @@ fn builtins_with_exa_key(
         false,
         read_only,
         bash_timeout,
+        // The main agent has no own session id to annotate.
+        None,
     );
     (tools, background)
 }
@@ -183,6 +191,7 @@ pub(crate) fn read_only_sandbox(sandbox: &crate::config::Sandbox) -> crate::conf
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tools_with_background_and_exa_key(
     workspace: Workspace,
     background: BackgroundTasks,
@@ -191,6 +200,7 @@ fn tools_with_background_and_exa_key(
     protect_git: bool,
     read_only: bool,
     bash_timeout: Option<Duration>,
+    self_session_id: Option<String>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools = if read_only {
         // Read-only roles get no write/edit tools at all.
@@ -202,6 +212,7 @@ fn tools_with_background_and_exa_key(
     };
     tools.push(Box::new(GetBackgroundTasks {
         background: background.clone(),
+        self_session_id,
     }));
     tools.push(Box::new(CancelBackgroundTask {
         background: background.clone(),

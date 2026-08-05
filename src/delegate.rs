@@ -352,6 +352,10 @@ impl Delegate {
             task.sandbox,
             task.read_only,
             task.protect_git,
+            // The subagent itself is a delegate task in the parent's shared
+            // registry; pass its own session id so get_background_tasks can
+            // annotate which entry is "itself".
+            Some(persist.session_id.clone()),
         );
         let mut agent = Agent::new(Box::new(model), tools);
         if let Some(window) = context_window {

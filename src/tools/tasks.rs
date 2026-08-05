@@ -6,6 +6,11 @@ use super::background::BackgroundTasks;
 
 pub(super) struct GetBackgroundTasks {
     pub(super) background: BackgroundTasks,
+    /// The calling session's own id (subagents only). A running delegate
+    /// task whose `display_meta.subagent_session_id` matches is the calling
+    /// subagent itself and is annotated as such in the output. The main
+    /// agent (and any caller without a session id) passes `None`.
+    pub(super) self_session_id: Option<String>,
 }
 
 #[async_trait]
@@ -49,9 +54,22 @@ impl Tool for GetBackgroundTasks {
                     t
                 })
                 .unwrap_or_default();
+            // A delegate task whose subagent_session_id matches the calling
+            // subagent's own session id IS the caller (the subagent itself
+            // appears in the parent's shared registry as a delegate entry).
+            let self_marker = if task
+                .display_meta
+                .as_ref()
+                .and_then(|meta| meta.subagent_session_id.as_deref())
+                .is_some_and(|sid| self.self_session_id.as_deref() == Some(sid))
+            {
+                " [self]"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "#{}: {} ({}){}\n",
-                task.id, task.label, role, tags
+                "#{}: {} ({}){}{}\n",
+                task.id, task.label, role, tags, self_marker
             ));
         }
         out.truncate(out.trim_end().len());

@@ -1872,6 +1872,7 @@ async fn get_background_tasks_lists_running_tasks() {
     let background = bash.background.clone();
     let tool = GetBackgroundTasks {
         background: background.clone(),
+        self_session_id: None,
     };
 
     // No tasks running initially.
@@ -1938,6 +1939,7 @@ async fn get_background_tasks_shows_delegate_tasks_as_delegate_not_bash() {
 
     let tool = GetBackgroundTasks {
         background: background.clone(),
+        self_session_id: None,
     };
 
     // Spawn a delegate-style task (no role, no output slot) via spawn().
@@ -1972,6 +1974,7 @@ async fn get_background_tasks_shows_roled_delegate_with_role_name() {
 
     let tool = GetBackgroundTasks {
         background: background.clone(),
+        self_session_id: None,
     };
 
     // A delegate with a known role (e.g. "explorer").
@@ -1989,6 +1992,71 @@ async fn get_background_tasks_shows_roled_delegate_with_role_name() {
         output,
         "1 background task(s) running:\n#1: search the logs (explorer)"
     );
+}
+
+#[tokio::test]
+async fn get_background_tasks_marks_the_calling_subagent_itself() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, _receiver) = background_bash(&temp, Duration::from_secs(10));
+    let background = bash.background.clone();
+
+    // The subagent's own session id: its delegate entry in the parent's
+    // shared registry carries this in display_meta.subagent_session_id.
+    let self_session_id = "sub-12345";
+    let tool = GetBackgroundTasks {
+        background: background.clone(),
+        self_session_id: Some(self_session_id.into()),
+    };
+
+    // A delegate entry that IS the caller (matching subagent_session_id)…
+    background
+        .spawn_with_id(
+            "fix the lints".into(),
+            Some("fixer".into()),
+            None,
+            Some(TaskDisplayMeta {
+                background: true,
+                workspace: None,
+                subagent_session_id: Some(self_session_id.into()),
+                resume: None,
+            }),
+            |_| {},
+            || async { "done".into() },
+        )
+        .unwrap();
+    // …plus a delegate entry that is NOT (different subagent).
+    background
+        .spawn_with_id(
+            "search codebase".into(),
+            None,
+            None,
+            Some(TaskDisplayMeta {
+                background: true,
+                workspace: None,
+                subagent_session_id: Some("sub-other".into()),
+                resume: None,
+            }),
+            |_| {},
+            || async { "done".into() },
+        )
+        .unwrap();
+
+    let output = tool.execute(json!({})).await.unwrap();
+    assert_eq!(
+        output,
+        "2 background task(s) running:\n\
+         #1: fix the lints (fixer) [background] [self]\n\
+         #2: search codebase (delegate) [background]"
+    );
+
+    // The main agent (self_session_id = None) never annotates any entry,
+    // even one whose subagent_session_id would match a subagent.
+    let main_tool = GetBackgroundTasks {
+        background: background.clone(),
+        self_session_id: None,
+    };
+    let output = main_tool.execute(json!({})).await.unwrap();
+    assert!(!output.contains("[self]"));
 }
 
 #[tokio::test]
