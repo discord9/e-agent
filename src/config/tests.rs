@@ -1575,6 +1575,459 @@ newline = "shift+enter"
 }
 
 #[test]
+fn merged_with_project_project_default_overrides_global() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "global/a"
+[providers.global]
+base_url = "https://global.test/v1"
+api_key_file = "key"
+[providers.project]
+base_url = "https://project.test/v1"
+api_key_file = "key"
+[models."global/a"]
+model = "a-global"
+[models."project/c"]
+model = "c-project"
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        r#"
+default = "project/c"
+"#,
+    )
+    .unwrap();
+
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+    assert_eq!(merged.resolve(None).unwrap().display, "project/c");
+    // The global default profile still resolves by name.
+    assert_eq!(
+        merged.resolve(Some("global/a")).unwrap().display,
+        "global/a"
+    );
+}
+
+#[test]
+fn merged_with_project_without_project_default_keeps_global() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "global/a"
+[providers.global]
+base_url = "https://global.test/v1"
+api_key_file = "key"
+[models."global/a"]
+model = "a-global"
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    // Project file exists but has no `default`: the global default must
+    // survive the merge untouched.
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[models.\"global/a\"]\nmodel = \"a-project\"\n",
+    )
+    .unwrap();
+
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+    assert_eq!(merged.resolve(None).unwrap().display, "global/a");
+}
+
+#[test]
+fn merged_with_project_project_default_missing_profile_errors_clearly() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "global/a"
+[providers.global]
+base_url = "https://global.test/v1"
+api_key_file = "key"
+[models."global/a"]
+model = "a-global"
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    // Project `default` names a profile the merged config does not define.
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        r#"
+default = "nope/missing"
+"#,
+    )
+    .unwrap();
+
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+    let error = merged.resolve(None).unwrap_err().to_string();
+    assert!(
+        error.contains("model profile `nope/missing` is not defined"),
+        "{error}"
+    );
+}
+
+#[test]
+fn merged_with_project_mcp_merges_by_name() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[mcp.engram]
+command = ["/global/engram", "mcp"]
+[mcp."global-only"]
+command = ["/global/other", "serve"]
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        r#"
+[mcp.engram]
+command = ["/project/engram", "mcp"]
+env = { PROJECT = "1" }
+[mcp."project-only"]
+command = ["/project/other", "serve"]
+"#,
+    )
+    .unwrap();
+
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+
+    // Same-name global server replaced by the project definition.
+    let engram = merged.mcp.get("engram").unwrap();
+    assert_eq!(engram.command, vec!["/project/engram", "mcp"]);
+    assert_eq!(engram.env.get("PROJECT").map(String::as_str), Some("1"));
+
+    // Global-only server survives, project-only server is added.
+    assert_eq!(
+        merged.mcp.get("global-only").unwrap().command,
+        vec!["/global/other", "serve"]
+    );
+    assert_eq!(
+        merged.mcp.get("project-only").unwrap().command,
+        vec!["/project/other", "serve"]
+    );
+    assert_eq!(merged.mcp.len(), 3);
+}
+
+#[test]
+fn merged_with_project_without_mcp_keeps_global_mcp() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[mcp.engram]
+command = ["/global/engram", "mcp"]
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    // Project file exists but has no [mcp]: global servers survive.
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[models.\"kimi/k3\"]\nmodel = \"k3-project\"\n",
+    )
+    .unwrap();
+
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+    assert_eq!(
+        merged.mcp.get("engram").unwrap().command,
+        vec!["/global/engram", "mcp"]
+    );
+    assert_eq!(merged.mcp.len(), 1);
+}
+
+#[test]
+fn project_config_rejects_unknown_sections() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    for source in [
+        // Wholly unknown section.
+        "[foo]\nx = 1\n",
+        // Misspelled legal section (roles).
+        "[modles]\nmain = \"kimi/k3\"\n",
+        // Misspelled legal section (models).
+        "[model]\n\"kimi/k3\" = { model = \"k3\" }\n",
+        // Unknown key inside a [models] profile (deny_unknown_fields on
+        // ModelProfile).
+        "[models.\"kimi/k3\"]\nmodel = \"k3\"\nfutur = \"max\"\n",
+        // Unknown key inside an [mcp] server (deny_unknown_fields on
+        // McpServerConfig).
+        "[mcp.engram]\ncommad = [\"/bin/engram\"]\n",
+    ] {
+        std::fs::write(ws.join(".e-agent/config.toml"), source).unwrap();
+        let error = Config::from_path(&global)
+            .unwrap()
+            .merged_with_project(&ws)
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("cannot parse project config"), "{error}");
+        assert!(error.contains("unknown field"), "{error}");
+    }
+}
+
+#[test]
+fn project_config_white_lists_global_only_sections() {
+    // `[providers]`, `[web_search]` and `[session]` are legal TOML
+    // sections that a project file must not carry — but they were silently
+    // ignored before deny_unknown_fields, so they stay white-listed
+    // (parsed, never merged) instead of breaking existing project files.
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        r#"
+# Global-only sections: parse OK, but ignored by the project layer.
+[providers.project]
+base_url = "https://project.test/v1"
+api_key_file = "key"
+[web_search]
+api_key_file = "key"
+[session]
+backend = "jsonl"
+"#,
+    )
+    .unwrap();
+
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+
+    // The project's providers are NOT merged: the effective config still
+    // serves the global provider only.
+    assert_eq!(
+        merged.resolve(None).unwrap().base_url,
+        "https://test.test/v1"
+    );
+    assert!(!merged.providers.contains_key("project"));
+    // Global web_search / session are untouched (they were absent).
+    assert!(merged.web_search_key().unwrap().is_none());
+    assert!(matches!(merged.session_backend(), SessionBackend::Jsonl));
+}
+
+#[test]
+fn merged_with_project_global_disabled_mcp_is_kill_switch() {
+    // A global `enabled = false` server must survive a same-named project
+    // definition: project MCP servers spawn commands, so the global kill
+    // switch is the trust boundary against untrusted project files.
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[mcp.engram]
+command = ["/global/engram", "mcp"]
+enabled = false
+[mcp."global-only"]
+command = ["/global/other", "serve"]
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    // The project tries to (re)define the globally-disabled server plus a
+    // brand-new one.
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        r#"
+[mcp.engram]
+command = ["/project/engram", "mcp"]
+[mcp."project-only"]
+command = ["/project/other", "serve"]
+"#,
+    )
+    .unwrap();
+
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+
+    // The disabled global entry wins: the project cannot re-enable it.
+    let engram = merged.mcp.get("engram").unwrap();
+    assert_eq!(engram.command, vec!["/global/engram", "mcp"]);
+    assert!(!engram.enabled);
+
+    // Unrelated names still merge normally.
+    assert_eq!(
+        merged.mcp.get("global-only").unwrap().command,
+        vec!["/global/other", "serve"]
+    );
+    assert_eq!(
+        merged.mcp.get("project-only").unwrap().command,
+        vec!["/project/other", "serve"]
+    );
+    assert_eq!(merged.mcp.len(), 3);
+}
+
+#[test]
+fn project_config_accepts_all_legal_sections() {
+    // Every legal project section at once must parse and merge without
+    // being rejected by deny_unknown_fields.
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "global/a"
+[providers.global]
+base_url = "https://global.test/v1"
+api_key_file = "key"
+[providers.project]
+base_url = "https://project.test/v1"
+api_key_file = "key"
+[models."global/a"]
+model = "a-global"
+[models."project/c"]
+model = "c-project"
+[mcp.engram]
+command = ["/global/engram"]
+[roles]
+main = "global/a"
+[tui]
+submit = "enter"
+newline = "shift+enter"
+[sandbox]
+enabled = true
+[bash]
+timeout_secs = 5
+[background]
+timeout_secs = 7
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        r#"
+default = "project/c"
+[models."project/c"]
+model = "c-project"
+[mcp.engram]
+command = ["/project/engram"]
+[roles]
+main = "project/c"
+[tui]
+submit = "alt+enter"
+newline = "enter"
+[sandbox]
+enabled = false
+[bash]
+timeout_secs = 9
+[background]
+timeout_secs = 11
+"#,
+    )
+    .unwrap();
+
+    let config = Config::from_path(&global).unwrap();
+    let merged = config.merged_with_project(&ws).unwrap();
+
+    // default: project wins.
+    assert_eq!(merged.resolve(None).unwrap().display, "project/c");
+    // mcp: same-name project server replaces the global one.
+    assert_eq!(
+        merged.mcp.get("engram").unwrap().command,
+        vec!["/project/engram"]
+    );
+    // roles: project main wins.
+    assert_eq!(
+        merged.resolve_role("main").unwrap().unwrap().display,
+        "project/c"
+    );
+    // tui: whole-section replacement.
+    let keys = merged.tui_keys().unwrap();
+    assert_eq!(keys.submit_modifiers, KeyModifiers::ALT);
+    assert_eq!(keys.newline_modifiers, KeyModifiers::NONE);
+    // sandbox / bash / background: still resolved by their own resolvers.
+    let sandbox = merged.sandbox(&ws).unwrap();
+    assert!(
+        !sandbox.enabled,
+        "project sandbox enabled=false overrides global"
+    );
+    assert_eq!(
+        resolve_bash_timeout(Some(&merged), &ws).unwrap(),
+        Some(Duration::from_secs(9))
+    );
+    assert_eq!(
+        resolve_background_timeout(Some(&merged), &ws).unwrap(),
+        Some(Duration::from_secs(11))
+    );
+}
+
+#[test]
 fn sandbox_project_scalar_fields_override_global() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("ws");

@@ -6,7 +6,7 @@ use anyhow::{Context, anyhow, bail};
 use crossterm::event::KeyModifiers;
 use serde::Deserialize;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     default: Option<String>,
     #[serde(default)]
@@ -73,9 +73,11 @@ pub struct BashConfig {
 /// Default foreground bash timeout: 30 seconds.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 
-/// The `[tui]` section: submit/newline key mapping. Global-only: key
-/// bindings are personal preference and are never merged from project
-/// configs (see `merged_with_project`).
+/// The `[tui]` section: submit/newline key mapping. A project-level
+/// `[tui]` section replaces the global one wholesale (see
+/// `merged_with_project`): fields the project omits fall back to the
+/// built-in defaults, not to the global values. No project `[tui]` keeps
+/// the global section.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct TuiConfig {
     /// Key string that submits the prompt (default `"enter"`).
@@ -213,13 +215,13 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct WebSearch {
     api_key_file: Option<PathBuf>,
     api_key_env: Option<String>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct Provider {
     auth: Option<String>,
     base_url: Option<String>,
@@ -227,7 +229,8 @@ struct Provider {
     api_key_env: Option<String>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ModelProfile {
     model: Option<String>,
     reasoning_effort: Option<String>,
@@ -299,10 +302,20 @@ impl Config {
     /// file is absent the global config is returned unchanged.
     ///
     /// Merged sections:
+    /// - `default`: scalar override — a project `default` replaces the
+    ///   global default profile; no project `default` keeps the global one.
     /// - `[models."<name>"]`: merged **by model name** — a project model
     ///   replaces the same-named global model; models the project does not
     ///   define keep their global definitions. An absent or empty `[models]`
     ///   table keeps every global model.
+    /// - `[mcp."<name>"]`: merged **by server name**, same as `[models]` —
+    ///   a project server replaces the same-named global server; servers
+    ///   the project does not define keep their global definitions. A
+    ///   global server with `enabled = false` is a kill switch: a
+    ///   same-named project server does NOT re-enable it — the disabled
+    ///   global entry is kept, because project MCP servers spawn commands
+    ///   and the global `enabled = false` is the trust boundary against
+    ///   untrusted project files.
     /// - `[roles]`: merged per key — a project role replaces the same-named
     ///   global role; other roles survive.
     /// - `[tui]`: replaced **wholesale** — a project `[tui]` section
@@ -313,9 +326,14 @@ impl Config {
     /// `[sandbox]`, `[background]` and `[bash]` are not merged here: they
     /// keep their workspace-aware resolvers (`resolve_sandbox`,
     /// `resolve_background_timeout`, `resolve_bash_timeout`), which read
-    /// the project file themselves and apply per-key overrides. All other
-    /// sections (`default`, `providers`, `mcp`, `web_search`, `session`)
-    /// stay global-only.
+    /// the project file themselves and apply per-key overrides. The
+    /// remaining sections (`providers`, `web_search`, `session`) stay
+    /// global-only — a project file that carries them is accepted for
+    /// compatibility but the sections are ignored.
+    ///
+    /// The project file is parsed with `deny_unknown_fields` (see
+    /// [`ProjectConfig`]): an unknown section is a parse error, refusing
+    /// startup rather than being silently dropped.
     ///
     /// The merged config keeps the global config's file path, so relative
     /// `api_key_file` paths keep resolving against the global config
@@ -325,8 +343,28 @@ impl Config {
             return Ok(self.clone());
         };
         let mut merged = self.clone();
+        if let Some(default) = project.default {
+            merged.default = Some(default);
+        }
         if let Some(models) = project.models {
             merged.models.extend(models);
+        }
+        if let Some(project_mcp) = project.mcp {
+            for (name, server) in project_mcp {
+                // Global `enabled = false` is a kill switch: a same-named
+                // project server must not re-enable a server the user
+                // disabled globally (project MCP servers spawn commands, so
+                // this is the trust boundary against untrusted project
+                // files). Otherwise the project server replaces the
+                // same-named global one, and new names are added.
+                let globally_disabled = merged
+                    .mcp
+                    .get(&name)
+                    .is_some_and(|existing| !existing.enabled);
+                if !globally_disabled {
+                    merged.mcp.insert(name, server);
+                }
+            }
         }
         if let Some(roles) = project.roles {
             merged.roles.extend(roles);
@@ -766,21 +804,60 @@ pub fn resolve_background_timeout(
     }
 }
 
-/// Project-level `[models]` / `[roles]` / `[tui]` overrides parsed from
-/// `<workspace>/.e-agent/config.toml` (see [`project_config`]).
+/// Project-level overrides parsed from `<workspace>/.e-agent/config.toml`
+/// (see [`project_config`]).
+///
+/// `#[serde(deny_unknown_fields)]` makes an unknown section (a typo, or a
+/// section the project file cannot carry) a hard parse error instead of a
+/// silent ignore — the file is an override layer, so a misspelled section
+/// would otherwise be silently dropped. Every legal section is declared
+/// below: the merged ones (`default`, `[models]`, `[mcp]`, `[roles]`,
+/// `[tui]`) are applied by `merged_with_project`; `[sandbox]`, `[bash]`
+/// and `[background]` are consumed by their own workspace-aware
+/// resolvers; and `[providers]`, `[web_search]`, `[session]` are
+/// white-listed for compatibility — they parse but stay global-only and
+/// are silently ignored by the project layer (a project file that carried
+/// them before this strictness was added keeps starting).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProjectConfig {
+    /// Default model profile override; replaces the global `default` when
+    /// present (scalar override, absent keeps the global value). It
+    /// participates in the normal resolve priority chain — an explicit
+    /// `--profile` wins over it, and it wins over `[roles] main`.
+    default: Option<String>,
     models: Option<HashMap<String, ModelProfile>>,
+    /// Project `[mcp."<name>"]` servers, merged by name (see
+    /// `merged_with_project`). Project MCP servers start the commands they
+    /// configure, so `<workspace>/.e-agent/config.toml` is trusted input
+    /// (documented in the README).
+    mcp: Option<HashMap<String, crate::mcp::McpServerConfig>>,
     roles: Option<HashMap<String, String>>,
+    /// `[sandbox]` per-key overrides, consumed by `resolve_sandbox`.
+    sandbox: Option<ProjectSandbox>,
+    /// `[bash]` override, consumed by `resolve_bash_timeout`.
+    bash: Option<BashConfig>,
+    /// `[background]` override, consumed by `resolve_background_timeout`.
+    background: Option<BackgroundConfig>,
     /// Whole-section `[tui]` replacement; absent keeps the global section.
     tui: Option<TuiConfig>,
+    /// Global-only sections white-listed for compatibility: parsed so the
+    /// project file does not fail `deny_unknown_fields`, but never merged
+    /// into the effective config (see the struct doc).
+    #[allow(dead_code)]
+    providers: Option<HashMap<String, Provider>>,
+    #[allow(dead_code)]
+    web_search: Option<WebSearch>,
+    #[allow(dead_code)]
+    session: Option<SessionConfig>,
 }
 
-/// Read the project-level `[models]` / `[roles]` / `[tui]` overrides from
+/// Read the project-level overrides from
 /// `<workspace>/.e-agent/config.toml` (same pattern as `project_sandbox`);
-/// `None` when the file is absent. Unknown sections (`[background]`,
-/// `[bash]`, `[sandbox]`, `[providers]`, …) are ignored — each resolver
-/// picks up the sections it owns.
+/// `None` when the file is absent. Unknown sections are a parse error
+/// (`deny_unknown_fields`, see [`ProjectConfig`]); the merged sections are
+/// applied by `merged_with_project`, and `[sandbox]` / `[bash]` /
+/// `[background]` are picked up by their own resolvers.
 fn project_config(workspace: &Path) -> anyhow::Result<Option<ProjectConfig>> {
     let path = workspace.join(".e-agent/config.toml");
     let source = match std::fs::read_to_string(&path) {
@@ -796,10 +873,6 @@ fn project_config(workspace: &Path) -> anyhow::Result<Option<ProjectConfig>> {
 /// Read `[background]` from `<workspace>/.e-agent/config.toml` (same
 /// pattern as `project_sandbox`); `None` when absent or unparseable-free.
 fn project_background(workspace: &Path) -> anyhow::Result<Option<BackgroundConfig>> {
-    #[derive(Deserialize)]
-    struct ProjectConfig {
-        background: Option<BackgroundConfig>,
-    }
     let path = workspace.join(".e-agent/config.toml");
     let source = match std::fs::read_to_string(&path) {
         Ok(source) => source,
@@ -833,10 +906,6 @@ pub fn resolve_bash_timeout(
 /// Read `[bash]` from `<workspace>/.e-agent/config.toml` (same pattern as
 /// `project_background`); `None` when absent.
 fn project_bash(workspace: &Path) -> anyhow::Result<Option<BashConfig>> {
-    #[derive(Deserialize)]
-    struct ProjectConfig {
-        bash: Option<BashConfig>,
-    }
     let path = workspace.join(".e-agent/config.toml");
     let source = match std::fs::read_to_string(&path) {
         Ok(source) => source,
@@ -849,10 +918,6 @@ fn project_bash(workspace: &Path) -> anyhow::Result<Option<BashConfig>> {
 }
 
 fn project_sandbox(workspace: &Path) -> anyhow::Result<Option<ProjectSandbox>> {
-    #[derive(Deserialize)]
-    struct ProjectConfig {
-        sandbox: Option<ProjectSandbox>,
-    }
     let path = workspace.join(".e-agent/config.toml");
     let source = match std::fs::read_to_string(&path) {
         Ok(source) => source,
