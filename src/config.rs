@@ -209,25 +209,31 @@ impl Default for Sandbox {
 }
 
 /// Backend selection for session persistence.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "backend", rename_all = "lowercase")]
 pub enum SessionBackend {
-    /// JSONL file backend (default).
-    #[default]
+    /// Local SQLite/turso database file backend (default). `path` is a path
+    /// to a SQLite-compatible database file (e.g. "~/.local/share/e-agent/
+    /// sessions.db"; ":memory:" works for tests). `None` resolves to
+    /// `<workspace>/.e-agent/sessions.db`. Requires the `sqlite` feature.
+    Sqlite { path: Option<String> },
+    /// JSONL file backend (legacy default, still selectable).
     Jsonl,
     /// GreptimeDB backend. `conn` is a tokio-postgres connection string
     /// (e.g. "host=127.0.0.1 port=4002 dbname=public"). Requires the `greptime` feature.
     Greptime { conn: String },
-    /// Local SQLite/turso database file backend. `path` is a path to a
-    /// SQLite-compatible database file (e.g. "~/.local/share/e-agent/sessions.db";
-    /// ":memory:" works for tests). Requires the `sqlite` feature.
-    Sqlite { path: String },
+}
+
+impl Default for SessionBackend {
+    fn default() -> Self {
+        SessionBackend::Sqlite { path: None }
+    }
 }
 
 /// The `[session]` config section.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct SessionConfig {
-    /// Backend type: `"jsonl"` (default), `"greptime"` or `"sqlite"`.
+    /// Backend type: `"sqlite"` (default), `"jsonl"` or `"greptime"`.
     #[serde(flatten)]
     pub backend: SessionBackend,
 }
@@ -488,7 +494,8 @@ impl Config {
         resolve_sandbox(Some(self), workspace)
     }
 
-    /// The session backend from `[session] backend`, defaulting to Jsonl.
+    /// The session backend from `[session] backend`, defaulting to Sqlite
+    /// (`<workspace>/.e-agent/sessions.db`).
     pub fn session_backend(&self) -> SessionBackend {
         match &self.session {
             Some(session) => session.backend.clone(),

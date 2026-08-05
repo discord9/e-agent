@@ -24,7 +24,10 @@ model = "k3"
 "#,
     );
     let config = Config::from_path(&path).unwrap();
-    assert!(matches!(config.session_backend(), SessionBackend::Jsonl));
+    assert!(matches!(
+        config.session_backend(),
+        SessionBackend::Sqlite { path: None }
+    ));
 
     // Explicit jsonl
     let path = write_config(
@@ -1943,7 +1946,10 @@ backend = "jsonl"
     assert!(!merged.providers.contains_key("project"));
     // Global web_search / session are untouched (they were absent).
     assert!(merged.web_search_key().unwrap().is_none());
-    assert!(matches!(merged.session_backend(), SessionBackend::Jsonl));
+    assert!(matches!(
+        merged.session_backend(),
+        SessionBackend::Sqlite { path: None }
+    ));
 }
 
 #[test]

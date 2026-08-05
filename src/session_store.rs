@@ -248,6 +248,22 @@ pub fn derive_workspace_id(root: &Path) -> String {
     root.to_string_lossy().to_string()
 }
 
+/// Resolve the SQLite database path for a session store. An explicit
+/// `[session] backend = "sqlite"` path wins; `None` (the default backend,
+/// or a config that omits `path`) resolves to `<workspace>/.e-agent/
+/// sessions.db` — alongside the legacy JSONL `sessions/` directory, so a
+/// workspace's session data stays inside the workspace.
+pub(crate) fn resolve_sqlite_path(root: &Path, path: Option<&str>) -> String {
+    match path {
+        Some(p) if !p.trim().is_empty() => p.to_owned(),
+        _ => root
+            .join(".e-agent")
+            .join("sessions.db")
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
 /// Monotonic real-time microsecond timestamp. Uses wall clock but guarantees
 /// strict ordering within a process: if two entries land in the same
 /// microsecond (or the clock goes backwards), the later one gets prev+1.
@@ -577,8 +593,9 @@ impl SessionStore {
             #[cfg(feature = "sqlite")]
             SessionBackend::Sqlite { path } => {
                 let workspace_id = derive_workspace_id(root);
+                let path = resolve_sqlite_path(root, path.as_deref());
                 let session =
-                    crate::session_sqlite::SqliteSession::connect(path, &workspace_id, session_id)
+                    crate::session_sqlite::SqliteSession::connect(&path, &workspace_id, session_id)
                         .await
                         .map_err(anyhow::Error::msg)?;
                 Ok(SessionStore::Sqlite {
@@ -623,8 +640,9 @@ impl SessionStore {
             #[cfg(feature = "sqlite")]
             SessionBackend::Sqlite { path } => {
                 let workspace_id = derive_workspace_id(root);
+                let path = resolve_sqlite_path(root, path.as_deref());
                 let session = crate::session_sqlite::SqliteSession::connect(
-                    path,
+                    &path,
                     &workspace_id,
                     META_STORE_SENTINEL,
                 )
@@ -653,7 +671,9 @@ impl SessionStore {
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { conn, .. } => SessionBackend::Greptime { conn: conn.clone() },
             #[cfg(feature = "sqlite")]
-            SessionStore::Sqlite { path, .. } => SessionBackend::Sqlite { path: path.clone() },
+            SessionStore::Sqlite { path, .. } => SessionBackend::Sqlite {
+                path: Some(path.clone()),
+            },
         }
     }
 
@@ -2823,7 +2843,7 @@ mod tests {
 
         fn backend(path: &Path) -> SessionBackend {
             SessionBackend::Sqlite {
-                path: path.to_string_lossy().into_owned(),
+                path: Some(path.to_string_lossy().into_owned()),
             }
         }
 
