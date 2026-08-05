@@ -135,6 +135,7 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
         meta_store,
         summaries: Arc::new(Mutex::new(HashMap::new())),
         summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+        shutdown: watch::channel(()).0,
     });
     eprintln!(
         "e-agent: serving on http://{host}:{port} (token: {}; also at {})",
@@ -158,29 +159,47 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .with_context(|| format!("cannot bind {host}:{port}"))?;
-    // Ctrl-C triggers graceful shutdown: axum stops accepting new
-    // connections and lets in-flight handlers finish (their synchronous
-    // persistence writes already landed before the response). Long-lived
-    // SSE connections are NOT waited for — a dropped connection is fine,
-    // data was written by the handler. After Ctrl-C, a short drain
-    // timeout forces the process out even if a handler is stuck; a second
-    // Ctrl-C also kills outright via the default handler. The timeout
-    // must live INSIDE the shutdown future so the server never exits
-    // while serving normally.
-    let shutdown = async {
-        shutdown_signal().await;
-        tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT).await;
+    // Ctrl-C 触发 graceful shutdown：axum 停 accept，放行 in-flight 请求收尾
+    // （持久化写入在 handler 响应前已同步落盘，drain 截断不影响数据安全）。
+    // 但 graceful shutdown 会无限等待 in-flight 连接——浏览器标签页挂着的
+    // /api/sessions/{id}/events SSE 流永不结束（15s ping 保活），所以给整个
+    // serve future 一条"从 Ctrl-C 起算"的硬截止线：Ctrl-C 立刻停 accept 并
+    // 开始 drain（idle 连接秒关），drain 自然完成就立即退出；超过
+    // SHUTDOWN_DRAIN_TIMEOUT 仍未完成则强制退出。第二次 Ctrl-C 仍由默认
+    // handler 直接强杀。方案 B：Ctrl-C 同时通知 SSE 流自关闭（见 AppState
+    // 的 shutdown watch），让 drain 毫秒级完成，2s 截止线退化为纯兜底。
+    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_tx = state.shutdown.clone();
+    let shutdown = async move {
+        shutdown_signal().await; // Ctrl-C
+        let _ = shutdown_tx.send(()); // 方案 B：SSE 流自感知 shutdown
+        let _ = drain_started_tx.send(()); // 硬截止线从现在开始计时
     };
-    axum::serve(listener, router(state))
+    // `with_graceful_shutdown` 只实现 `IntoFuture`（非 `Future`），先转换为
+    // 真正的 future 再 pin，这样 select 的两个分支都能 `&mut serve` 轮询。
+    let serve = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
-        .await
-        .context("server error")?;
-    Ok(())
+        .into_future();
+    tokio::pin!(serve);
+    tokio::select! {
+        // drain 自然完成（没有 in-flight / SSE 已自关闭）→ 正常退出。
+        result = &mut serve => Ok(result.context("server error")?),
+        // Ctrl-C 已按下：给 in-flight 请求至多 SHUTDOWN_DRAIN_TIMEOUT 收尾。
+        // 提前完成立即退出；到期强制退出——挂着的 SSE 流也不能无限拖住进程。
+        _ = drain_started_rx => {
+            match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, &mut serve).await {
+                Ok(result) => result.context("server error")?,
+                Err(_elapsed) => {} // 到期：强制退出
+            }
+            Ok(())
+        }
+    }
 }
 
-/// How long graceful shutdown waits before exiting regardless of lingering
-/// connections. Persistence is synchronous inside request handlers, so this
-/// only covers a stuck handler, not data durability.
+/// Ctrl-C 后允许 drain 的硬上限：graceful shutdown 开始后，in-flight 请求
+/// 至多再享有这么多时间收尾，到期进程强制退出。持久化在 handler 响应前已
+/// 同步落盘，所以这只覆盖一个卡住的 handler / 挂着的 SSE 流，不涉及数据
+/// 持久性。
 const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 async fn shutdown_signal() {
@@ -224,6 +243,11 @@ pub struct AppState {
     /// session_id -> in-flight on-demand generation (desktop pet click on a
     /// cold cache): prevents duplicate generation calls.
     pub summary_pending: Arc<SummaryPending>,
+    /// 服务器 shutdown 信号（方案 B）：Ctrl-C 时 `send(())`，SSE 流
+    /// (`forward_events`) 收到后立即自关闭，连接随之关闭，graceful drain
+    /// 毫秒级完成——`SHUTDOWN_DRAIN_TIMEOUT` 硬截止线因此只是兜底。
+    /// 每个 SSE 连接通过 `subscribe()` 取自己的接收端。
+    pub shutdown: watch::Sender<()>,
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -2047,12 +2071,14 @@ async fn session_events(
     let session = live(&state, &id)?;
     let (snapshot, live, status) = session.handle().attach();
     let (tx, rx) = mpsc::channel::<Result<Event, Error>>(SSE_CHANNEL_CAPACITY);
+    let shutdown = state.shutdown.subscribe();
     tokio::spawn(forward_events(
         state,
         id,
         tail_snapshot(snapshot),
         live,
         status,
+        shutdown,
         tx,
     ));
     let mut response = Sse::new(SseReceiver(rx)).into_response();
@@ -2080,6 +2106,7 @@ async fn forward_events(
     snapshot: Vec<AgentEvent>,
     mut events: broadcast::Receiver<AgentEvent>,
     mut status: watch::Receiver<SessionStatus>,
+    mut shutdown: watch::Receiver<()>,
     tx: mpsc::Sender<Result<Event, Error>>,
 ) {
     // Bounded queue: a full queue means the client is too slow to keep up —
@@ -2096,6 +2123,11 @@ async fn forward_events(
     tick.tick().await; // interval's first tick fires immediately; skip it
     loop {
         tokio::select! {
+            // 服务器 shutdown（Ctrl-C）：流立即自关闭，SSE 连接随之断开，
+            // graceful drain 毫秒级完成（SHUTDOWN_DRAIN_TIMEOUT 只是兜底）。
+            // sender 持有在 AppState 里，正常运行时不会 Err；真掉了也当
+            // shutdown 处理，直接结束。
+            _ = shutdown.changed() => return,
             changed = status.changed() => match changed {
                 Ok(_) => {
                     if !send(status_event(&status.borrow().clone())) {
@@ -2501,6 +2533,7 @@ mod tests {
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
             summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
         }));
         // Preflight: answered without auth, 204 + CORS headers.
         let preflight = app
@@ -2563,6 +2596,7 @@ mod tests {
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
             summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
         }));
         // 未认证也带 no-store：401 同样不该被浏览器缓存复用。
         let unauth = app
@@ -3033,6 +3067,7 @@ subagent = "deepseek/high"
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
             summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
         });
         let app = router(state);
         let response = app
@@ -3071,6 +3106,7 @@ subagent = "deepseek/high"
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
             summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
         }));
         let empty = no_config_app
             .clone()
@@ -3147,6 +3183,7 @@ model = "deepseek-chat"
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
             summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
         });
         let app = router(state);
         let request = |uri: String, body: String| {
@@ -3340,6 +3377,7 @@ model = "deepseek-chat"
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
             summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
         }));
         let response = app
             .oneshot(
@@ -3445,6 +3483,7 @@ model = "deepseek-chat"
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
             summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
         })
     }
 
@@ -3945,6 +3984,7 @@ model = "deepseek-chat"
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
             summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
         });
         state.registry.insert(parent_id, parent);
         // Combination 7b: a second parent-linked main-registry session with
@@ -4491,6 +4531,7 @@ model = "deepseek-chat"
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
             summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
         });
         let app = router(state);
         let response = app
@@ -4583,6 +4624,7 @@ model = "deepseek-chat"
             meta_store: SessionStore::Jsonl,
             summaries: Arc::new(Mutex::new(HashMap::new())),
             summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
         });
         (state, root)
     }
@@ -5002,6 +5044,7 @@ model = "deepseek-chat"
             tail_snapshot(snapshot),
             live,
             status,
+            state.shutdown.subscribe(),
             tx,
         ));
 
@@ -5052,18 +5095,66 @@ model = "deepseek-chat"
         // the stream ends.
         let (tx, _rx) = mpsc::channel::<Result<Event, Error>>(1);
         let _ = tx.try_send(Ok(Event::default().comment("prefill")));
+        let shutdown = state.shutdown.subscribe();
         let task = tokio::spawn(forward_events(
             state,
             id,
             tail_snapshot(snapshot),
             live,
             status,
+            shutdown,
             tx,
         ));
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await
             .expect("forward_events must end when the queue is full")
             .expect("forward_events task must not panic");
+    }
+
+    /// Ctrl-C shutdown（方案 B）：shutdown watch 一旦触发，`forward_events`
+    /// 必须自己结束流——SSE 连接随之关闭，graceful drain 毫秒级完成，
+    /// SHUTDOWN_DRAIN_TIMEOUT 硬截止线只是兜底，而不是每次 Ctrl-C 都要等满
+    /// 2s（浏览器标签页挂着的 /events 流也关得掉）。
+    #[tokio::test]
+    async fn forward_events_ends_stream_on_shutdown() {
+        let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+        let (id, session) = live_session("web-shutdown");
+        let state = test_app_state("sekrit");
+        state.registry.insert(id.clone(), session.clone());
+        let (snapshot, live, status) = handle.attach();
+
+        let (tx, mut rx) = mpsc::channel::<Result<Event, Error>>(16);
+        let shutdown_rx = state.shutdown.subscribe();
+        let task = tokio::spawn(forward_events(
+            state.clone(),
+            id,
+            tail_snapshot(snapshot),
+            live,
+            status,
+            shutdown_rx,
+            tx,
+        ));
+
+        // 流活着：初始 snapshot + status 两帧先到（session_events 的既定
+        // 帧序），都消费掉再触发 shutdown。
+        let first = event_to_text(rx.recv().await.unwrap().unwrap()).await;
+        assert!(first.contains("event: snapshot"), "{first}");
+        let second = event_to_text(rx.recv().await.unwrap().unwrap()).await;
+        assert!(second.contains("event: status"), "{second}");
+
+        // 触发 shutdown（Ctrl-C 时 `run` 里的 shutdown future 会 send 同一
+        // 个 sender）：流必须立即自结束，而不是等会话被删。
+        let _ = state.shutdown.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("forward_events must end its stream once shutdown is signaled")
+            .expect("forward_events task must not panic");
+        // 响应流也随之结束：tx 已随 forward_events 返回而 drop，缓冲清空后
+        // recv 返回 None。
+        assert!(
+            rx.recv().await.is_none(),
+            "SSE stream must be closed after shutdown"
+        );
     }
 
     /// M5 contract (frontend): each live SSE frame must pair the CamelCase
