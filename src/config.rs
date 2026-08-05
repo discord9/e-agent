@@ -36,9 +36,11 @@ pub struct Config {
     /// Optional `[bash]` policy (foreground bash timeout).
     #[serde(default)]
     bash: Option<BashConfig>,
-    /// Optional `[tui]` submit/newline key mapping. Global-only: key
-    /// bindings are personal preference and are never merged from project
-    /// configs (see `merged_with_project`).
+    /// Optional `[tui]` submit/newline key mapping. A project-level
+    /// `[tui]` section replaces this one wholesale (fields the project
+    /// omits fall back to the built-in defaults, not to these values); no
+    /// project `[tui]` keeps this global section (see
+    /// `merged_with_project`).
     #[serde(default)]
     tui: Option<TuiConfig>,
     #[serde(skip)]
@@ -305,6 +307,10 @@ impl Config {
     ///   table keeps every global model.
     /// - `[roles]`: merged per key — a project role replaces the same-named
     ///   global role; other roles survive.
+    /// - `[tui]`: replaced **wholesale** — a project `[tui]` section
+    ///   replaces the global section entirely; fields the project omits
+    ///   fall back to the built-in defaults, not the global values. No
+    ///   project `[tui]` keeps the global section.
     ///
     /// `[sandbox]`, `[background]` and `[bash]` are not merged here: they
     /// keep their workspace-aware resolvers (`resolve_sandbox`,
@@ -326,6 +332,9 @@ impl Config {
         }
         if let Some(roles) = project.roles {
             merged.roles.extend(roles);
+        }
+        if let Some(tui) = project.tui {
+            merged.tui = Some(tui);
         }
         Ok(merged)
     }
@@ -759,15 +768,17 @@ pub fn resolve_background_timeout(
     }
 }
 
-/// Project-level `[models]` / `[roles]` overrides parsed from
+/// Project-level `[models]` / `[roles]` / `[tui]` overrides parsed from
 /// `<workspace>/.e-agent/config.toml` (see [`project_config`]).
 #[derive(Deserialize)]
 struct ProjectConfig {
     models: Option<HashMap<String, ModelProfile>>,
     roles: Option<HashMap<String, String>>,
+    /// Whole-section `[tui]` replacement; absent keeps the global section.
+    tui: Option<TuiConfig>,
 }
 
-/// Read the project-level `[models]` / `[roles]` overrides from
+/// Read the project-level `[models]` / `[roles]` / `[tui]` overrides from
 /// `<workspace>/.e-agent/config.toml` (same pattern as `project_sandbox`);
 /// `None` when the file is absent. Unknown sections (`[background]`,
 /// `[bash]`, `[sandbox]`, `[providers]`, …) are ignored — each resolver
