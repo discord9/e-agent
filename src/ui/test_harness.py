@@ -2929,8 +2929,8 @@ async function main(){
     // 侧边栏环绕点：A 组的 a1 与 B 组的 b1 各匹配到自己的任务（全量消费）
     renderSidebarTree(true);
     wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
-    const aDotN = wsSections[0].querySelectorAll(".busy-dot-sub").length;
-    const bDotN = wsSections[1].querySelectorAll(".busy-dot-sub").length;
+    const aDotN = wsSections[0].querySelectorAll(".orbit-dot").length;
+    const bDotN = wsSections[1].querySelectorAll(".orbit-dot").length;
     chk("task agg: sidebar dots for both workspaces",
         aDotN === 1 && bDotN === 1,
         "A=" + aDotN + " B=" + bDotN);
@@ -3429,7 +3429,7 @@ async function main(){
     const rows15 = elsById["sidebarTree"].querySelectorAll(".tree-row");
     const rowByTxt15 = (t) => [...rows15].find((r) => r.textContent.includes(t));
     const wrapOf15 = (r) => r.querySelector(".busy-dot-wrap");
-    const mainDotOf15 = (r) => wrapOf15(r).querySelector(".busy-dot");
+    const mainDotOf15 = (r) => wrapOf15(r).querySelector(".main-dot");
     const c1Row = rowByTxt15("C 主会话");
     const c2Row = rowByTxt15("C2 主会话");
     const d1Row = rowByTxt15("D 主会话");
@@ -3437,33 +3437,33 @@ async function main(){
     const f1Row = rowByTxt15("F 主会话");
     const g1Row = rowByTxt15("G 主会话");
     chk("two running children render two orbit dots",
-        wrapOf15(c1Row).querySelectorAll(".busy-dot-sub").length === 2
+        wrapOf15(c1Row).querySelectorAll(".orbit-dot").length === 2
         && !mainDotOf15(c1Row).classList.contains("busy"),
-        "dots=" + wrapOf15(c1Row).querySelectorAll(".busy-dot-sub").length
+        "dots=" + wrapOf15(c1Row).querySelectorAll(".orbit-dot").length
         + " main=" + mainDotOf15(c1Row).className);
     chk("inactive child is ignored by orbit count",
-        wrapOf15(c2Row).querySelectorAll(".busy-dot-sub").length === 1,
-        "dots=" + wrapOf15(c2Row).querySelectorAll(".busy-dot-sub").length);
+        wrapOf15(c2Row).querySelectorAll(".orbit-dot").length === 1,
+        "dots=" + wrapOf15(c2Row).querySelectorAll(".orbit-dot").length);
     chk("live idle child is not counted by orbit count",
-        wrapOf15(c1Row).querySelectorAll(".busy-dot-sub").length === 2,
-        "dots=" + wrapOf15(c1Row).querySelectorAll(".busy-dot-sub").length);
+        wrapOf15(c1Row).querySelectorAll(".orbit-dot").length === 2,
+        "dots=" + wrapOf15(c1Row).querySelectorAll(".orbit-dot").length);
     chk("busy parent keeps orange busy main dot with no orbit dots",
         mainDotOf15(d1Row).classList.contains("busy")
-        && wrapOf15(d1Row).querySelectorAll(".busy-dot-sub").length === 0,
+        && wrapOf15(d1Row).querySelectorAll(".orbit-dot").length === 0,
         "main=" + mainDotOf15(d1Row).className);
     chk("fully idle parent keeps green main dot with no orbit dots",
         !mainDotOf15(e1Row).classList.contains("busy")
-        && wrapOf15(e1Row).querySelectorAll(".busy-dot-sub").length === 0,
+        && wrapOf15(e1Row).querySelectorAll(".orbit-dot").length === 0,
         "main=" + mainDotOf15(e1Row).className);
     chk("busy parent and active child show both status layers",
         mainDotOf15(f1Row).classList.contains("busy")
-        && wrapOf15(f1Row).querySelectorAll(".busy-dot-sub").length === 1,
+        && wrapOf15(f1Row).querySelectorAll(".orbit-dot").length === 1,
         "main=" + mainDotOf15(f1Row).className
-        + " dots=" + wrapOf15(f1Row).querySelectorAll(".busy-dot-sub").length);
+        + " dots=" + wrapOf15(f1Row).querySelectorAll(".orbit-dot").length);
     chk("more than six children render six dots and overflow count",
-        wrapOf15(g1Row).querySelectorAll(".busy-dot-sub").length === 6
+        wrapOf15(g1Row).querySelectorAll(".orbit-dot").length === 6
         && wrapOf15(g1Row).querySelector(".busy-dot-overflow").textContent === "+2",
-        "dots=" + wrapOf15(g1Row).querySelectorAll(".busy-dot-sub").length
+        "dots=" + wrapOf15(g1Row).querySelectorAll(".orbit-dot").length
         + " overflow=" + wrapOf15(g1Row).querySelector(".busy-dot-overflow").textContent);
     chk("busy dot wrapper aria-label combines parent and child status",
         wrapOf15(c1Row).getAttribute("aria-label") === "会话空闲，2 个子任务处理中"
@@ -3626,26 +3626,26 @@ async function main(){
         "dot=" + (m1Compact && kidM(m1Compact).className));
     // orbit count for m1 = 3 running (m1-run, m1-legacy-run, m1-compact)
     chk("m1 orbit counts only running children",
-        wrapM(m1Row).querySelectorAll(".busy-dot-sub").length === 3,
-        "dots=" + wrapM(m1Row).querySelectorAll(".busy-dot-sub").length);
+        wrapM(m1Row).querySelectorAll(".orbit-dot").length === 3,
+        "dots=" + wrapM(m1Row).querySelectorAll(".orbit-dot").length);
     // 8) Busy parent + Busy child → both layers
     chk("m2: busy parent and busy child show both status layers",
         mainM(m2Row).classList.contains("busy")
-        && wrapM(m2Row).querySelectorAll(".busy-dot-sub").length === 1
+        && wrapM(m2Row).querySelectorAll(".orbit-dot").length === 1
         && kidM(m2Run).classList.contains("busy"),
         "main=" + mainM(m2Row).className
-        + " dots=" + wrapM(m2Row).querySelectorAll(".busy-dot-sub").length);
+        + " dots=" + wrapM(m2Row).querySelectorAll(".orbit-dot").length);
     // 9) Busy parent + Idle live child → center dot only, child in live group
     chk("m2: idle live child under busy parent stays in live group without red dot",
         !kidM(m2Idle).classList.contains("busy")
         && !m2Idle.classList.contains("tree-hist") && m2Idle.parentNode.hidden === false
-        && wrapM(m2Row).querySelectorAll(".busy-dot-sub").length === 1,
-        "dots=" + wrapM(m2Row).querySelectorAll(".busy-dot-sub").length);
+        && wrapM(m2Row).querySelectorAll(".orbit-dot").length === 1,
+        "dots=" + wrapM(m2Row).querySelectorAll(".orbit-dot").length);
     // 10) more than six running children → six dots + overflow
     chk("m3: more than six running children render six dots and overflow",
-        wrapM(m3Row).querySelectorAll(".busy-dot-sub").length === 6
+        wrapM(m3Row).querySelectorAll(".orbit-dot").length === 6
         && wrapM(m3Row).querySelector(".busy-dot-overflow").textContent === "+2",
-        "dots=" + wrapM(m3Row).querySelectorAll(".busy-dot-sub").length
+        "dots=" + wrapM(m3Row).querySelectorAll(".orbit-dot").length
         + " overflow=" + wrapM(m3Row).querySelector(".busy-dot-overflow").textContent);
     // 11) busy:false + status:"Busy" → busy:false 权威否定：无红点、
     //     live 直显（active:true），orbit 不计数
@@ -3662,8 +3662,8 @@ async function main(){
         + " dot=" + (m4FoldedRun && kidM(m4FoldedRun).className));
     // orbit：只计 busy 的（m4-folded-run），busy:false + status:"Busy" 不计数
     chk("m4 orbit counts only busy children (busy:false negates status)",
-        wrapM(m4Row).querySelectorAll(".busy-dot-sub").length === 1,
-        "dots=" + wrapM(m4Row).querySelectorAll(".busy-dot-sub").length);
+        wrapM(m4Row).querySelectorAll(".orbit-dot").length === 1,
+        "dots=" + wrapM(m4Row).querySelectorAll(".orbit-dot").length);
     // ---- 点击路由：live 直开（不 POST resume），inactive 才 POST resume ----
     const bodyAfter = (n) => FETCH_BODIES.slice(n);
     sessionsPostCustom = { id: "m1-stale", status: "Idle", active: true };

@@ -271,45 +271,33 @@
 
   /* 侧栏主会话状态：中心点只表示主 agent，环绕红点表示活跃 subagent。
      固定画布不会随任务数改变行高或挤动标题。
-     24×24 正方形画布：环绕点绕几何中心作正圆（非椭圆），任何任务数下
-     相邻点等距、环与主点同心，避免 RX≠RY 造成的疏密歪斜。 */
+     24×24 正方形画布，内部一个 SVG（viewBox 0 0 24 24）：主点 + 环绕点
+     同为 <circle>、共享同一坐标系（中心 12,12），浏览器统一光栅化，任何
+     DPR/缩放下严格同心——根治 HTML 元素各自 snap 物理像素导致的半像素错位。 */
   .busy-dot-wrap {
     position: relative;
     width: 24px;
     height: 24px;
     flex: 0 0 24px;
   }
-  .busy-dot-wrap > .busy-dot {
-    position: absolute;
-    left: 12px;
-    top: 12px;
-    transform: translate(-50%, -50%);
-  }
-  .busy-dot-sub {
-    position: absolute;
-    width: 4px;
-    height: 4px;
-    /* 初始定位到主点中心 (12,12)：left/top 是点左上角，减去点半径 2 让点
-       中心落在画布几何中心。transform-origin:50% 50% 把旋转轴设在点中心
-       （即主点中心），JS 的 rotate(θ) translateY(-R) 便绕主点中心精确
-       旋转——点中心始终落在半径 R 的正圆上，与主点共用同一套 transform
-       居中机制，任何 DPR 下都严格同心（不再有 left vs transform 两套机制
-       的亚像素错位）。点半径只在 top/left 各出现一次，无散落魔法数。 */
-    left: 10px;                /* 12 − 2（点半径） */
-    top: 10px;
-    transform-origin: 50% 50%;
-    border-radius: 50%;
-    background: var(--red);
-    /* 0.5px 发丝光环：24px 紧凑画布内 1px 白边会让 Ø4 点视觉胀成 Ø6
-       并显得偏离轨道；细描边既从行背景托起红点又不改变视觉尺寸。 */
-    box-shadow: 0 0 0 0.5px var(--base3);
+  .busy-dot-wrap > svg { display: block; }   /* 去 SVG 底部基线空隙 */
+  /* 主点：idle 绿 / busy 橙（pulse 呼吸），fill 继承现有色板 */
+  .busy-dot-wrap .main-dot { fill: var(--green); }
+  .busy-dot-wrap .main-dot.busy { fill: var(--orange); animation: pulse 1.2s infinite; }
+  /* 环绕点：红（bash / busy delegate），绿（idle delegate 在等）。
+     SVG circle 无盒模型，无法用 box-shadow 描边；用 stroke 给 0.5px 光环。 */
+  .busy-dot-wrap .orbit-dot {
+    fill: var(--red);
+    stroke: var(--base3);
+    stroke-width: 0.5px;
     animation: subagent-pulse 1.45s ease-in-out infinite;
   }
-  /* 环绕绿点：delegate 任务在等（对应 subagent busy:false，活着但空闲）；
-     尺寸/描边/动画继承 .busy-dot-sub，仅换 Solarized 绿。 */
-  .busy-dot-sub.green { background: var(--green); }
-  .busy-dot-sub:nth-of-type(3n) { animation-delay: -0.45s; }
-  .busy-dot-sub:nth-of-type(3n + 1) { animation-delay: -0.9s; }
+  .busy-dot-wrap .orbit-dot.green { fill: var(--green); }
+  /* 环绕点错峰呼吸（circle 是 SVG 子元素，nth-of-type 按元素类型计数——
+     同为 circle 类型含主点，故主点也占用序号；用 nth-of-type 仍可从 1 起
+     给环绕点错峰，主点在列表最后、动画不同不影响视觉错峰） */
+  .busy-dot-wrap .orbit-dot:nth-of-type(3n) { animation-delay: -0.45s; }
+  .busy-dot-wrap .orbit-dot:nth-of-type(3n + 1) { animation-delay: -0.9s; }
   @keyframes subagent-pulse { 50% { opacity: 0.45; } }
   .busy-dot-overflow {
     position: absolute;
@@ -1110,7 +1098,7 @@
     .composer-status.busy::before,
     .composer-status.compacting::before,
     .busy-dot.busy,
-    .busy-dot-sub {
+    .busy-dot-wrap .orbit-dot {
       animation: none;
     }
   }

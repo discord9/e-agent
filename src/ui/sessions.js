@@ -1906,46 +1906,46 @@ function buildTreeRoot(s, kids, wsId) {
   dot.setAttribute("role", "img");
   dot.setAttribute("aria-label", (s.busy ? "会话处理中" : "会话空闲")
     + (hasRunningKids ? "，" + runningKidCount + " 个任务处理中" : ""));
-  const mainDot = el("span", "busy-dot" + (s.busy ? " busy" : ""));
-  mainDot.setAttribute("aria-hidden", "true");
-  dot.appendChild(mainDot);
 
+  // 整个状态点用一个 SVG 矢量渲染：主点 + 环绕点同为 <circle>，共享
+  // viewBox 坐标系（中心 (12,12)），数学上严格同心，浏览器统一光栅化——
+  // 根治此前「主点 translate(-50%) 居中、环绕点 transform-origin 居中」
+  // 两套机制下 4px/6px 偶数点在非整数 DPR（如 1.25×）各自独立 snap 到物理
+  // 像素网格产生的半像素错位（放大后可见为环相对主点偏移）。SVG 内所有点
+  // 一次性光栅化，任何 DPR/缩放下都严格同心。
   // 环上最多画六个点；更多任务由第七个位置的 +N 汇总，避免
   // 小尺寸侧栏状态标记过密。位置按任务列表顺序均匀选取。
   const hasOverflow = runningKidCount > 6;
   const visibleKidDots = Math.min(runningKidCount, 6);
-  // 环绕点绕主点中心作正圆（R 为半径）：rotate + translateY 方案。
-  // 每个环绕点的定位/旋转轴由 CSS 固定在主点中心 (12,12)（left/top:10px
-  // 让点中心对齐，transform-origin:50% 50% 把旋转轴设在点中心）；这里只
-  // 用 transform 把点沿径向推出去——
-  //   transform: rotate(θ) translateY(-R)
-  // CSS transform 列表从右往左应用：先 translateY(-R) 沿自身 Y 轴上移 R，
-  // 再 rotate(θ) 绕点中心（=主点中心）顺时针转 θ，点中心精确落在半径 R 的
-  // 圆上。因为旋转轴就是主点中心，点与主点共用同一套 transform 居中机制，
-  // 任何任务数、任何 DPR（含 1.25/1.5 非整数缩放）下都严格同心——不再有
-  // 「主点 transform 居中、环绕点 left 居中」两套机制的亚像素错位，也不再
-  // 手工 cos/sin、硬编码减点半径。
   // R=8 由不重叠约束标定：主点半径 3 + 环绕点半径 2 = 5，中心距 8 留出
   // 3px 净间隙，环绕点与主点清晰分开不粘连；点缘最远 12+8+2=22 ≤ 24 不
-  // 溢出画布。正圆上任意 N 个等角点相邻弦长严格相等，环始终匀称不歪。
+  // 溢出 viewBox。正圆上任意 N 个等角点相邻弦长严格相等，环始终匀称不歪。
   const R = 8;   // 正圆半径（主点中心到环绕点中心的距离）
+  let circles = "";
   for (let i = 0; i < visibleKidDots; i++) {
     const t = parentTasks ? parentTasks[i] : null;
     // delegate 任务在等（对应 subagent busy:false）→ 绿点；其余（bash /
     // busy:true / 找不到会话）→ 红点。回退模式（tasks 未加载）全红。
     const green = t !== null && taskIsWaitingGreen(t, kids);
+    // SVG transform="rotate(θ 12 12) translate(0 -R)"：与 CSS 相同从右往左
+    // 应用——circle 中心先在 (12,12)，translate(0,-R) 上移到 (12,12-R)，
+    // 再绕 viewBox 中心 (12,12) 顺时针转 θ（SVG rotate(a cx cy) 指定旋转
+    // 中心，正值顺时针），点中心精确落在半径 R 的圆上。
     // 单个点: 顶部 (12 点方向)；两个点: 上下对称；N 个点: 均匀环绕。
-    // angle 从 12 点方向起、顺时针（CSS rotate 正值为顺时针，与"从顶部顺
-    // 时针均匀分布"天然吻合），与旧 cos/sin 布局逐点重合。
-    const angle = (2 * Math.PI * i) / visibleKidDots;
-    const subDot = el("span", "busy-dot-sub" + (green ? " green" : ""));
-    subDot.style.transform = `rotate(${angle}rad) translateY(${-R}px)`;
-    subDot.title = parentTasks
+    // angle 从 12 点方向起、顺时针（SVG rotate 正值顺时针），单位为度。
+    const angle = (360 * i) / visibleKidDots;
+    const title = parentTasks
       ? taskDotTitle(t, i + 1, runningKidCount)
       : "子任务 " + (i + 1) + "/" + runningKidCount;
-    subDot.setAttribute("aria-hidden", "true");
-    dot.appendChild(subDot);
+    circles += `<circle class="orbit-dot${green ? " green" : ""}" cx="12" cy="12" r="2"` +
+      ` transform="rotate(${angle} 12 12) translate(0 ${-R})"` +
+      ` aria-hidden="true"><title>${escapeHtml(title)}</title></circle>`;
   }
+  // 主点最后画（叠在环绕点之上）：busy → 橙，idle → 绿（class 控制 fill）。
+  dot.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">` +
+    circles +
+    `<circle class="main-dot${s.busy ? " busy" : ""}" cx="12" cy="12" r="3" aria-hidden="true"></circle>` +
+    `</svg>`;
   if (hasOverflow) {
     const overflow = el("span", "busy-dot-overflow",
       "+" + (runningKidCount - visibleKidDots));
