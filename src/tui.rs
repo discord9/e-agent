@@ -612,8 +612,8 @@ async fn handle_pressed_key(
             handle.compact();
         } else if prompt == "/undo" {
             handle_undo(state);
-        } else if prompt == "/help" {
-            state.push_agent_event(AgentEvent::Notice(HELP_TEXT.to_string()));
+        } else if let Some(command) = parse_help(&prompt) {
+            handle_help(command, state);
         } else if let Some(command) = parse_model(&prompt) {
             handle_model(command, state, handle);
         } else if let Some(command) = parse_rename(&prompt) {
@@ -641,6 +641,88 @@ const HELP_TEXT: &str = "\
 /btw <问题> - fork 旁路 subagent
 /fork - 从历史消息 fork
 /undo - 撤销文件操作";
+
+/// Detailed per-command help, shown by `/help <命令>` (kept in sync with
+/// the web UI's `/help <命令>` in `src/ui/sessions.js`). Each entry is
+/// 2-4 lines: purpose + usage example + notes.
+const HELP_DETAILS: &[(&str, &str)] = &[
+    (
+        "compact",
+        "/compact - 压缩上下文（触发上下文压缩），释放 token 继续长对话。\n用法：/compact（无参数）。",
+    ),
+    (
+        "rename",
+        "/rename <标题> - 重命名当前会话。\n用法：/rename 新标题；/rename（无参数）显示用法；/rename 后只跟空白则清除标题。",
+    ),
+    (
+        "btw",
+        "/btw <问题> - fork 旁路 subagent 继续探讨。\n用法：/btw 为什么……？\n注意：主会话不受影响，新 subagent 可在 F2 任务面板 attach。",
+    ),
+    (
+        "fork",
+        "/fork [N] - 从历史消息 fork 出新会话。\n用法：/fork（最近完成的回合边界）或 /fork N（从最新往上第 N 个完成的回合边界）。\n注意：TUI 不能运行时切换会话，新会话用 --session <id> 在新终端打开。",
+    ),
+    (
+        "undo",
+        "/undo - 撤销最近一次文件操作（edit_file / write_file）。\n用法：/undo（无参数）。\n注意：撤销后该操作不可重做；连续 /undo 可逐条向前撤销。",
+    ),
+    (
+        "help",
+        "/help [命令] - 显示帮助。\n用法：/help（命令列表）或 /help <命令>（如 /help fork）。",
+    ),
+];
+
+/// Look up the detailed help text for a known command name (without the
+/// leading slash). Returns `None` for anything unknown.
+fn help_detail(command: &str) -> Option<&'static str> {
+    HELP_DETAILS
+        .iter()
+        .find(|(name, _)| *name == command)
+        .map(|(_, detail)| *detail)
+}
+
+/// A parsed `/help` command from the input line.
+#[derive(Debug, PartialEq, Eq)]
+enum HelpCommand {
+    /// Bare `/help` (or `/help ` with only whitespace) — show the list.
+    List,
+    /// `/help <command>` — show that command's detail.
+    Detail(&'static str),
+    /// `/help <unknown>` — the argument is not a known command.
+    Unknown(String),
+}
+
+/// Parse a `/help` command. Returns `None` for any other input so the
+/// caller falls through to the normal prompt path. Command matching is
+/// strict (`/help` plus a space separator): `/helpxxx` stays a prompt.
+fn parse_help(prompt: &str) -> Option<HelpCommand> {
+    if prompt == "/help" {
+        return Some(HelpCommand::List);
+    }
+    let rest = prompt.strip_prefix("/help ")?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        Some(HelpCommand::List)
+    } else {
+        Some(match help_detail(rest) {
+            Some(detail) => HelpCommand::Detail(detail),
+            None => HelpCommand::Unknown(rest.to_string()),
+        })
+    }
+}
+
+/// Run a `/help` command: show the command list (bare `/help`) or the
+/// detail of one command, both surfaced as a display-only Notice (same as
+/// `/rename` and `/btw`). Unknown command names get a hint pointing back
+/// at the list.
+fn handle_help(command: HelpCommand, state: &mut TuiState) {
+    let text = match command {
+        HelpCommand::List => HELP_TEXT.to_string(),
+        HelpCommand::Detail(detail) => detail.to_string(),
+        HelpCommand::Unknown(cmd) => format!("未知命令：{cmd}，可用 /help 查看命令列表"),
+    };
+    state.push_agent_event(AgentEvent::Notice(text));
+}
 
 fn route_idle_events(
     state: &mut TuiState,
@@ -1124,5 +1206,88 @@ mod model_tests {
         assert_eq!(parse_model("/modelx gpt"), None);
         assert_eq!(parse_model("/compact"), None);
         assert_eq!(parse_model("hello"), None);
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+
+    #[test]
+    fn parse_help_commands() {
+        // Bare `/help` (or whitespace-only args) shows the list.
+        assert_eq!(parse_help("/help"), Some(HelpCommand::List));
+        assert_eq!(parse_help("/help "), Some(HelpCommand::List));
+        assert_eq!(parse_help("/help   "), Some(HelpCommand::List));
+        // `/help <command>` resolves the known command's detail.
+        assert_eq!(
+            parse_help("/help fork"),
+            Some(HelpCommand::Detail(help_detail("fork").unwrap()))
+        );
+        assert_eq!(
+            parse_help("/help  btw"),
+            Some(HelpCommand::Detail(help_detail("btw").unwrap()))
+        );
+        assert_eq!(
+            parse_help("/help help"),
+            Some(HelpCommand::Detail(help_detail("help").unwrap()))
+        );
+        // Unknown command names get the Unknown hint.
+        assert_eq!(
+            parse_help("/help nosuch"),
+            Some(HelpCommand::Unknown("nosuch".to_string()))
+        );
+        assert_eq!(
+            parse_help("/help  nosuch  "),
+            Some(HelpCommand::Unknown("nosuch".to_string()))
+        );
+        // Non-help input falls through to the normal prompt path.
+        assert_eq!(parse_help("/helpxxx"), None);
+        assert_eq!(parse_help("/helping"), None);
+        assert_eq!(parse_help("/compact"), None);
+        assert_eq!(parse_help("/fork 2"), None);
+        assert_eq!(parse_help("hello"), None);
+    }
+
+    #[test]
+    fn help_dispatch_pushes_the_command_list() {
+        let mut state = TuiState::default();
+        handle_help(parse_help("/help").unwrap(), &mut state);
+        let last = state.lines.last().unwrap();
+        assert_eq!(last.text, HELP_TEXT);
+        assert_eq!(last.kind, LineKind::Dim);
+    }
+
+    #[test]
+    fn help_dispatch_pushes_the_command_detail() {
+        // Every known command's detail Notice mentions the command itself
+        // and carries a usage line.
+        for (name, detail) in HELP_DETAILS {
+            let mut state = TuiState::default();
+            handle_help(parse_help(&format!("/help {name}")).unwrap(), &mut state);
+            let last = state.lines.last().unwrap();
+            assert_eq!(last.text, *detail);
+            assert!(
+                last.text.contains(&format!("/{name}")),
+                "detail for /{name} should mention the command: {}",
+                last.text
+            );
+            assert!(
+                last.text.contains("用法"),
+                "detail for /{name} should carry a usage line: {}",
+                last.text
+            );
+        }
+    }
+
+    #[test]
+    fn help_dispatch_unknown_command_hints_at_the_list() {
+        let mut state = TuiState::default();
+        handle_help(parse_help("/help nosuch").unwrap(), &mut state);
+        let last = state.lines.last().unwrap();
+        assert!(last.text.contains("未知命令"));
+        assert!(last.text.contains("nosuch"));
+        assert!(last.text.contains("/help"));
+        assert_eq!(last.kind, LineKind::Dim);
     }
 }

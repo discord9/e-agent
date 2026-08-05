@@ -692,7 +692,7 @@ const SLASH_COMMANDS = [
   { name: "/btw", desc: "fork 旁路 subagent 继续探讨", args: "<问题>" },
   { name: "/fork", desc: "从历史消息 fork 出新会话", args: "" },
   { name: "/undo", desc: "撤销最近的文件操作", args: "" },
-  { name: "/help", desc: "显示所有命令及用法", args: "" },
+  { name: "/help", desc: "显示所有命令及用法", args: "[命令]" },
 ];
 
 const slashMenu = {
@@ -1012,15 +1012,31 @@ async function sendPrompt() {
     autosizeInput();
     return;
   }
-  if (raw === "/help") {
-    // 命令列表较长，走 scrollback Notice（pre-wrap 多行）而非顶部 banner
-    appendNotice([
-      "/compact - 压缩上下文",
-      "/rename <标题> - 重命名会话",
-      "/btw <问题> - fork 旁路 subagent",
-      "/fork - 从历史消息 fork",
-      "/undo - 撤销文件操作",
-    ].join("\n"));
+  if (raw === "/help" || raw.startsWith("/help ")) {
+    const cmd = raw === "/help" ? "" : raw.slice("/help ".length).trim();
+    // 命令详情与 TUI 的 HELP_DETAILS（src/tui.rs）保持同步
+    const HELP_DETAILS = {
+      compact: "/compact - 压缩上下文（触发上下文压缩），释放 token 继续长对话。\n用法：/compact（无参数）。",
+      rename: "/rename <标题> - 重命名当前会话。\n用法：/rename 新标题；/rename（无参数）显示用法；/rename 后只跟空白则清除标题。",
+      btw: "/btw <问题> - fork 旁路 subagent 继续探讨。\n用法：/btw 为什么……？\n注意：主会话不受影响，新 subagent 可在侧边栏切换。",
+      fork: "/fork [N] - 从历史消息 fork 出新会话。\n用法：/fork（默认最近完成的回合边界）或 /fork N（从最新往上第 N 个完成的回合边界）。\n注意：网页端 /fork 会弹出面板选择 fork 边界。",
+      undo: "/undo - 撤销最近一次文件操作（edit_file / write_file）。\n用法：/undo（无参数）。\n注意：撤销后该操作不可重做；连续 /undo 可逐条向前撤销。",
+      help: "/help [命令] - 显示帮助。\n用法：/help（命令列表）或 /help <命令>（如 /help fork）。",
+    };
+    if (!cmd) {
+      // 命令列表较长，走 scrollback Notice（pre-wrap 多行）而非顶部 banner
+      appendNotice([
+        "/compact - 压缩上下文",
+        "/rename <标题> - 重命名会话",
+        "/btw <问题> - fork 旁路 subagent",
+        "/fork - 从历史消息 fork",
+        "/undo - 撤销文件操作",
+      ].join("\n"));
+    } else if (HELP_DETAILS[cmd]) {
+      appendNotice(HELP_DETAILS[cmd]);
+    } else {
+      setBanner("未知命令：" + cmd + "，可用 /help 查看命令列表", true);
+    }
     els.promptInput.value = "";
     autosizeInput();
     return;
