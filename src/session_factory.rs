@@ -32,23 +32,26 @@ use crate::workspace::Workspace;
 /// What to do with background-task records left behind by a previous run
 /// when building a session.
 ///
-/// The store cannot tell whether the process that owned those tasks is
-/// still alive, so the *caller* decides:
+/// The caller decides based on what it knows about the previous owner:
 ///
-/// - [`UnfinishedPolicy::Consume`]: process-level startup (CLI/TUI/REPL).
-///   The old process is known dead, so its tasks really were killed with
-///   it: take the running-task records and inject a "tasks were killed"
-///   notice into the resumed history.
+/// - [`UnfinishedPolicy::Consume`]: process-level startup (CLI/TUI/REPL),
+///   and server lazy attach after the owner-liveness probe
+///   ([`SessionStore::unfinished_owner_all_dead`]) proved every previous
+///   owner dead. The old process is known dead, so its tasks really were
+///   killed with it: take the running-task records and inject a "tasks
+///   were killed" notice into the resumed history.
 /// - [`UnfinishedPolicy::Preserve`]: a server lazily attaching to a session
-///   that may still be alive in another process. Do not read the records
-///   and do not inject any notice; the owning process clears them itself
-///   via `ack_background_entry` → `clear_background_task` when it finishes.
+///   that may still be alive in another process (a live owner, an old
+///   record without an owner, or an unjudgeable identity). Do not read
+///   the records and do not inject any notice; the owning process clears
+///   them itself via `ack_background_entry` → `clear_background_task`
+///   when it finishes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnfinishedPolicy {
-    /// Process-level startup: the previous owner is dead; consume the
-    /// records and announce that its tasks were killed.
+    /// The previous owner is dead; consume the records and announce that
+    /// its tasks were killed.
     Consume,
-    /// Server-side lazy attach to a possibly-live session: leave the
+    /// The session may still be live in another process: leave the
     /// records untouched for the owning process to acknowledge.
     Preserve,
 }
@@ -491,9 +494,11 @@ impl SessionFactory {
     /// `id` is the requested session id; `fork_from` is `(source session,
     /// optional 1-based entry index)` and replaces `id` with a fresh
     /// `fork-…` id. `unfinished` selects how leftover background-task
-    /// records are handled: `Consume` (process-level startup; see
-    /// [`UnfinishedPolicy`]) takes them and injects a "killed with the
-    /// process" notice, `Preserve` (server lazy attach) leaves them for
+    /// records are handled: `Consume` (process-level startup, or server
+    /// attach after the owner-liveness probe; see [`UnfinishedPolicy`])
+    /// takes them and injects a "killed with the process" notice,
+    /// `Preserve` (server lazy attach to a possibly-live session, or a
+    /// fork, which has no records of its own) leaves them for
     /// the owning process. The caller still chooses when to
     /// `runner.start(...)` with its initial prompt.
     pub async fn build(

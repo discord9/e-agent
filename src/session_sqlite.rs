@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS running_tasks (
     label TEXT NOT NULL,
     subagent_session_id TEXT NULL,
     started_at_us INTEGER NOT NULL,
+    owner TEXT NULL,
     PRIMARY KEY (workspace_id, session_id, task_id)
 )
 "#;
@@ -303,6 +304,54 @@ impl SqliteSession {
                     eprintln!(
                         "e-agent: cannot add sessions.{name} column ({feature} unavailable): \
                          {error}"
+                    );
+                }
+            }
+        }
+
+        // Same probe-then-ALTER migration for the `owner` column of the
+        // `running_tasks` table (the process identity of the process that
+        // started each background task, added after the table shipped).
+        // Pre-existing databases need the ALTER; fresh databases already
+        // have the column via CREATE_TABLE_RUNNING_TASKS above. Old rows
+        // read the column back as NULL, which the liveness probe treats
+        // as "alive" (conservative). A failed ALTER does NOT block the
+        // connection: the feature degrades — `unfinished_owner_all_dead`
+        // and `record_task_start` fail loudly with context, transcript
+        // operations are unaffected (same philosophy as the sessions
+        // migration above).
+        {
+            let mut rows = conn
+                .query("PRAGMA table_info(running_tasks)", ())
+                .await
+                .map_err(|e| format!("cannot inspect running_tasks table schema: {e}"))?;
+            let mut columns: Vec<String> = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| format!("cannot inspect running_tasks table schema: {e}"))?
+            {
+                // PRAGMA table_info columns: cid, name, type, notnull,
+                // dflt_value, pk — the name is index 1.
+                if let Some(name) = row
+                    .get_value(1)
+                    .map_err(|e| format!("cannot inspect running_tasks table schema: {e}"))?
+                    .as_text()
+                {
+                    columns.push(name.clone());
+                }
+            }
+            if !columns.iter().any(|c| c == "owner") {
+                // NOTE: same turso quirk as the sessions migration — omit
+                // the explicit NULL constraint; ADD COLUMN defaults to
+                // nullable anyway.
+                if let Err(error) = conn
+                    .execute("ALTER TABLE running_tasks ADD COLUMN owner TEXT", ())
+                    .await
+                {
+                    eprintln!(
+                        "e-agent: cannot add running_tasks.owner column \
+                         (background-task owner liveness unavailable): {error}"
                     );
                 }
             }
@@ -1763,12 +1812,13 @@ impl SqliteSession {
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO running_tasks \
-             (workspace_id, session_id, task_id, label, subagent_session_id, started_at_us) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             (workspace_id, session_id, task_id, label, subagent_session_id, started_at_us, owner) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT (workspace_id, session_id, task_id) DO UPDATE SET \
                  label = excluded.label, \
                  subagent_session_id = excluded.subagent_session_id, \
-                 started_at_us = excluded.started_at_us",
+                 started_at_us = excluded.started_at_us, \
+                 owner = excluded.owner",
             (
                 self.workspace_id.as_str(),
                 session_id,
@@ -1776,6 +1826,7 @@ impl SqliteSession {
                 label,
                 subagent_session_id,
                 started_at,
+                crate::session_store::process_identity(),
             ),
         )
         .await
@@ -1857,6 +1908,49 @@ impl SqliteSession {
             .map_err(|e| format!("cannot clear unfinished background tasks: {e}"))?;
         }
         Ok(labels)
+    }
+
+    /// True when every unfinished-task row for `session_id` was recorded
+    /// by a now-dead process (the server-attach probe that decides between
+    /// `Consume` — inject the "killed with the process" notice — and
+    /// `Preserve` — leave the records for a possibly-live owning process).
+    ///
+    /// Conservative: any uncertainty reports false — a NULL `owner` (an
+    /// old row written before the column shipped) counts as alive, as does
+    /// a live owner or an unjudgeable identity (see
+    /// [`crate::session_store::owner_alive`]). No rows → true (nothing to
+    /// consume; the Consume path is a no-op).
+    pub async fn unfinished_owner_all_dead(&self, session_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT owner FROM running_tasks \
+                 WHERE workspace_id = ?1 AND session_id = ?2",
+                (self.workspace_id.as_str(), session_id),
+            )
+            .await
+            .map_err(|e| format!("cannot load unfinished background task owners: {e}"))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot load unfinished background task owners: {e}"))?
+        {
+            let owner = row
+                .get_value(0)
+                .map_err(|e| format!("cannot load unfinished background task owners: {e}"))?
+                .as_text()
+                .cloned();
+            match owner {
+                None => return Ok(false), // old row without owner: alive
+                Some(owner) => {
+                    if crate::session_store::owner_alive(&owner) {
+                        return Ok(false); // owner still alive
+                    }
+                }
+            }
+        }
+        // No rows, or every row's owner is dead.
+        Ok(true)
     }
 
     /// Same as [`Self::take_unfinished_tasks`] but keyed by

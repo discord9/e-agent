@@ -268,6 +268,7 @@ impl Session {
         let mut record = serde_json::json!({
             "id": id,
             "label": label,
+            "owner": crate::session_store::process_identity(),
         });
         if let Some(sid) = session_id {
             record["session_id"] = serde_json::json!(sid);
@@ -339,6 +340,49 @@ impl Session {
         }
         let _ = std::fs::remove_file(&path);
         labels
+    }
+
+    /// True when every unfinished-task record for `session` was left by a
+    /// now-dead process — i.e. the tasks really were killed with their
+    /// owning process, so the caller may safely consume the records and
+    /// inject the "killed with the process" notice (the TUI/CLI restart
+    /// behavior; the server attaches lazily and may find a session that is
+    /// still live in another process, which is why it probes first).
+    ///
+    /// Conservative: any uncertainty reports false ("not all dead"), so
+    /// the caller keeps `Preserve` and never injects a false notice —
+    /// a record without an `owner` field (written by an older version), an
+    /// unparsable line, a live owner, an unreachable probe, or a read
+    /// error all count as alive. Only a record file where EVERY line
+    /// carries an owner that is definitely dead returns true. A
+    /// missing/unreadable file returns true: no records means nothing to
+    /// consume (the Consume path is a no-op).
+    pub fn unfinished_owner_all_dead(root: &Path, session: &str) -> bool {
+        let Ok(path) = background_record_path(root, session) else {
+            return true;
+        };
+        let Ok(file) = std::fs::File::open(&path) else {
+            return true;
+        };
+        for line in std::io::BufReader::new(file).lines() {
+            let Ok(line) = line else { return false }; // read error: cannot judge
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                return false; // unparsable line: cannot judge
+            };
+            match record["owner"].as_str() {
+                None => return false, // old-format line without owner: alive
+                Some(owner) => {
+                    if crate::session_store::owner_alive(owner) {
+                        return false; // owner still alive
+                    }
+                }
+            }
+        }
+        // No records, or every record's owner is dead.
+        true
     }
 }
 
@@ -602,6 +646,141 @@ mod tests {
                 .join(".e-agent/sessions/a.background.jsonl")
                 .exists()
         );
+    }
+
+    /// Every recorded task line carries the recording process's identity
+    /// (`pid@hostname#nonce`), so a later launch can probe whether the
+    /// owner died with the task.
+    #[test]
+    fn background_record_carries_owner_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        Session::record_background_start(temp.path(), "owner-test", 1, "sleep 100", None).unwrap();
+        let raw = std::fs::read_to_string(
+            temp.path()
+                .join(".e-agent/sessions/owner-test.background.jsonl"),
+        )
+        .unwrap();
+        let record: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(
+            record["owner"].as_str(),
+            Some(crate::session_store::process_identity()),
+            "record must carry the recording process identity"
+        );
+        // The label/id round-trip is unchanged by the new field.
+        assert_eq!(record["id"].as_u64(), Some(1));
+        assert_eq!(record["label"].as_str(), Some("sleep 100"));
+        assert_eq!(
+            Session::take_unfinished_background(temp.path(), "owner-test"),
+            vec!["task 1: sleep 100".to_string()]
+        );
+    }
+
+    /// `unfinished_owner_all_dead` is the server-attach probe: true only
+    /// when EVERY record was left by a definitely-dead process. Missing
+    /// file / no records → true (Consume is a no-op); a live owner, an
+    /// old-format line without an owner, or a malformed line → false
+    /// (conservative Preserve).
+    #[test]
+    fn unfinished_owner_all_dead_is_conservative() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // No record file → nothing unfinished → all dead (vacuously).
+        assert!(Session::unfinished_owner_all_dead(
+            temp.path(),
+            "dead-probe"
+        ));
+
+        // Records written by THIS process (still alive) → not all dead.
+        Session::record_background_start(temp.path(), "dead-probe", 1, "sleep 100", None).unwrap();
+        assert!(!Session::unfinished_owner_all_dead(
+            temp.path(),
+            "dead-probe"
+        ));
+
+        // Rewrite the record with a definitely-dead owner → all dead.
+        // Reachable only with an exported hostname: with none, the owner's
+        // hostname falls back to "unknown" and the record is unjudgeable
+        // → alive (P2-2), which the else-branch asserts instead.
+        let path = temp
+            .path()
+            .join(".e-agent/sessions/dead-probe.background.jsonl");
+        let probeable = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .ok()
+            .filter(|h| !h.is_empty() && h != "unknown");
+        match probeable {
+            Some(hostname) => {
+                let dead = format!("2000000000@{hostname}#deadbeef");
+                std::fs::write(
+                    &path,
+                    format!("{{\"id\":1,\"label\":\"sleep 100\",\"owner\":\"{dead}\"}}\n"),
+                )
+                .unwrap();
+                assert!(Session::unfinished_owner_all_dead(
+                    temp.path(),
+                    "dead-probe"
+                ));
+
+                // Mixed: one dead owner + one live owner → not all dead.
+                std::fs::write(
+                    &path,
+                    format!(
+                        "{{\"id\":1,\"label\":\"a\",\"owner\":\"{dead}\"}}\n{{\"id\":2,\"label\":\"b\",\"owner\":\"{}\"}}\n",
+                        crate::session_store::process_identity()
+                    ),
+                )
+                .unwrap();
+                assert!(!Session::unfinished_owner_all_dead(
+                    temp.path(),
+                    "dead-probe"
+                ));
+            }
+            None => {
+                // No exported hostname: an "unknown"-hostname owner is
+                // unjudgeable → alive → not all dead, even for a dead pid.
+                std::fs::write(
+                    &path,
+                    "{\"id\":1,\"label\":\"sleep 100\",\"owner\":\"2000000000@unknown#deadbeef\"}\n",
+                )
+                .unwrap();
+                assert!(!Session::unfinished_owner_all_dead(
+                    temp.path(),
+                    "dead-probe"
+                ));
+            }
+        }
+
+        // A foreign hostname owner cannot be judged → alive → false.
+        let foreign = format!(
+            "{{\"id\":1,\"label\":\"x\",\"owner\":\"{}@elsewhere#n\"}}\n",
+            std::process::id()
+        );
+        std::fs::write(&path, foreign).unwrap();
+        assert!(!Session::unfinished_owner_all_dead(
+            temp.path(),
+            "dead-probe"
+        ));
+
+        // Old-format line WITHOUT an owner field → treated as alive.
+        std::fs::write(&path, "{\"id\":1,\"label\":\"old task\"}\n").unwrap();
+        assert!(!Session::unfinished_owner_all_dead(
+            temp.path(),
+            "dead-probe"
+        ));
+
+        // Malformed JSON line → cannot judge → false.
+        std::fs::write(&path, "not json\n").unwrap();
+        assert!(!Session::unfinished_owner_all_dead(
+            temp.path(),
+            "dead-probe"
+        ));
+
+        // Empty file (all lines consumed by a racing clear) → true.
+        std::fs::write(&path, "").unwrap();
+        assert!(Session::unfinished_owner_all_dead(
+            temp.path(),
+            "dead-probe"
+        ));
     }
 
     #[test]

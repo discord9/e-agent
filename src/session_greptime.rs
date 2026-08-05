@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS running_tasks (
     label STRING NOT NULL,
     subagent_session_id STRING NULL,
     started_at TIMESTAMP(9) NOT NULL TIME INDEX,
+    owner STRING NULL,
     PRIMARY KEY (workspace_id, session_id, task_id)
 ) WITH (
     sst_format = 'flat',
@@ -240,6 +241,48 @@ impl GreptimeSession {
                         "e-agent: cannot add sessions.writer column (writer audit unavailable): \
                          {error:#}"
                     );
+                }
+            }
+        }
+
+        // Same probe-then-ALTER migration for the `owner` column of the
+        // `running_tasks` table (the process identity of the process that
+        // started each background task, added after the table shipped).
+        // Pre-existing databases need the ALTER; fresh databases already
+        // have the column via CREATE_TABLE_RUNNING_TASKS above. Old rows
+        // read the column back as NULL, which the liveness probe treats
+        // as "alive" (conservative). A failed ALTER does NOT block the
+        // connection: the feature degrades — `unfinished_owner_all_dead`
+        // and `record_task_start` fail loudly with context, transcript
+        // operations are unaffected (same philosophy as the sessions
+        // migration above).
+        {
+            let task_columns: Vec<String> = client
+                .query(
+                    "SELECT column_name FROM information_schema.columns \
+                     WHERE table_name = 'running_tasks'",
+                    &[],
+                )
+                .await
+                .context("cannot inspect running_tasks table schema")?
+                .iter()
+                .map(|row| row.get("column_name"))
+                .collect();
+            if !task_columns.iter().any(|c| c == "owner") {
+                match client
+                    .execute(
+                        "ALTER TABLE running_tasks ADD COLUMN owner STRING NULL",
+                        &[],
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "e-agent: cannot add running_tasks.owner column \
+                             (background-task owner liveness unavailable): {error:#}"
+                        );
+                    }
                 }
             }
         }
@@ -1576,8 +1619,8 @@ impl GreptimeSession {
         self.client
             .execute(
                 "INSERT INTO running_tasks \
-                 (workspace_id, session_id, task_id, label, subagent_session_id, started_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                 (workspace_id, session_id, task_id, label, subagent_session_id, started_at, owner) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 &[
                     &self.workspace_id,
                     &session_id,
@@ -1585,6 +1628,7 @@ impl GreptimeSession {
                     &label,
                     &subagent_session_id,
                     &started_at,
+                    &crate::session_store::process_identity(),
                 ],
             )
             .await
@@ -1645,6 +1689,41 @@ impl GreptimeSession {
                 .context("cannot clear unfinished background tasks")?;
         }
         Ok(labels)
+    }
+
+    /// True when every unfinished-task row for `session_id` was recorded
+    /// by a now-dead process (the server-attach probe that decides between
+    /// `Consume` — inject the "killed with the process" notice — and
+    /// `Preserve` — leave the records for a possibly-live owning process).
+    ///
+    /// Conservative: any uncertainty reports false — a NULL `owner` (an
+    /// old row written before the column shipped) counts as alive, as does
+    /// a live owner or an unjudgeable identity (see
+    /// [`crate::session_store::owner_alive`]). No rows → true (nothing to
+    /// consume; the Consume path is a no-op).
+    pub async fn unfinished_owner_all_dead(&self, session_id: &str) -> Result<bool> {
+        let rows = self
+            .client
+            .query(
+                "SELECT owner FROM running_tasks \
+                 WHERE workspace_id = $1 AND session_id = $2",
+                &[&self.workspace_id, &session_id],
+            )
+            .await
+            .context("cannot load unfinished background task owners")?;
+        for row in rows.iter() {
+            let owner: Option<String> = row.get("owner");
+            match owner {
+                None => return Ok(false), // old row without owner: alive
+                Some(owner) => {
+                    if crate::session_store::owner_alive(&owner) {
+                        return Ok(false); // owner still alive
+                    }
+                }
+            }
+        }
+        // No rows, or every row's owner is dead.
+        Ok(true)
     }
 
     /// Same as [`Self::take_unfinished_tasks`] but keyed by
@@ -3646,6 +3725,147 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The `owner` column (process identity of the recording process) and
+    /// `unfinished_owner_all_dead` (the server-attach probe): true only
+    /// when EVERY surviving row was left by a definitely-dead process;
+    /// NULL owner (old row) / live owner → false. Mirrors the SQLite
+    /// backend test; requires a live GREPTIME_PG, otherwise skipped.
+    #[tokio::test]
+    async fn running_tasks_owner_column_liveness_probe() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-owner-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // No rows → all dead (vacuously: Consume would take nothing).
+        assert!(
+            session
+                .unfinished_owner_all_dead(&sid)
+                .await
+                .expect("probe on empty table")
+        );
+
+        // A row recorded by THIS process (still alive) → not all dead,
+        // and the owner column holds our process identity.
+        session
+            .record_task_start(&sid, 1, "sleep 100", None)
+            .await
+            .unwrap();
+        assert!(
+            !session
+                .unfinished_owner_all_dead(&sid)
+                .await
+                .expect("probe with live owner"),
+            "a live owner must keep the probe conservative (false)"
+        );
+        let owners: Vec<Option<String>> = session
+            .client
+            .query(
+                "SELECT owner FROM running_tasks \
+                 WHERE workspace_id = $1 AND session_id = $2",
+                &[&wid, &sid],
+            )
+            .await
+            .expect("read owner column")
+            .iter()
+            .map(|row| row.get("owner"))
+            .collect();
+        assert_eq!(
+            owners,
+            vec![Some(crate::session_store::process_identity().to_owned())],
+            "record must carry the recording process identity"
+        );
+
+        // Rewrite the owner to a definitely-dead pid → all rows dead →
+        // true. Only provable with an exported hostname: with none, the
+        // owner's hostname falls back to "unknown" and stays unjudgeable
+        // → alive (P2-2), which the else-branch asserts instead.
+        match probeable_hostname() {
+            Some(hostname) => {
+                session
+                    .client
+                    .execute(
+                        "UPDATE running_tasks SET owner = $1 \
+                         WHERE workspace_id = $2 AND session_id = $3",
+                        &[&format!("2000000000@{hostname}#deadbeef"), &wid, &sid],
+                    )
+                    .await
+                    .expect("rewrite owner to dead pid");
+                assert!(
+                    session
+                        .unfinished_owner_all_dead(&sid)
+                        .await
+                        .expect("probe with dead owner")
+                );
+            }
+            None => {
+                session
+                    .client
+                    .execute(
+                        "UPDATE running_tasks SET owner = $1 \
+                         WHERE workspace_id = $2 AND session_id = $3",
+                        &[&"2000000000@unknown#deadbeef", &wid, &sid],
+                    )
+                    .await
+                    .expect("rewrite owner to unjudgeable pid");
+                assert!(
+                    !session
+                        .unfinished_owner_all_dead(&sid)
+                        .await
+                        .expect("probe with unjudgeable owner")
+                );
+            }
+        }
+
+        // NULL owner (a row written before the column shipped) → alive.
+        session
+            .client
+            .execute(
+                "UPDATE running_tasks SET owner = NULL \
+                 WHERE workspace_id = $1 AND session_id = $2",
+                &[&wid, &sid],
+            )
+            .await
+            .expect("null out owner");
+        assert!(
+            !session
+                .unfinished_owner_all_dead(&sid)
+                .await
+                .expect("probe with NULL owner"),
+            "a NULL owner (old row) must be treated as alive"
+        );
+
+        // Consuming the rows still works unchanged (take → empty table →
+        // all dead again).
+        assert_eq!(session.take_unfinished_tasks(&sid).await.unwrap().len(), 1);
+        assert!(
+            session
+                .unfinished_owner_all_dead(&sid)
+                .await
+                .expect("probe after consume")
+        );
+    }
+
+    /// The current hostname exactly as `process_identity` computes it, for
+    /// hand-built owner identities in tests.
+    fn hostname_now() -> String {
+        std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "unknown".to_owned())
+    }
+
+    /// The environment's exported hostname, when there is one: only then
+    /// can a hand-built owner identity reach the pid-probe path (P2-2
+    /// makes an unset hostname unjudgeable → conservative alive).
+    fn probeable_hostname() -> Option<String> {
+        let host = hostname_now();
+        (host != "unknown").then_some(host)
     }
 
     #[tokio::test]

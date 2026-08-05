@@ -77,6 +77,156 @@ pub(crate) fn process_identity() -> &'static str {
     })
 }
 
+/// Whether the process that wrote an `identity` string
+/// (`pid@hostname#nonce`, see [`process_identity`]) is still alive.
+///
+/// Deliberately conservative: any failure to determine liveness reports
+/// **true** ("alive"), so callers keep the safe `Preserve` behavior
+/// (leave the unfinished-task records for the owning process) instead of
+/// wrongly consuming them and injecting a "killed with the process"
+/// notice. Only a *definite* dead owner returns false:
+///
+/// - malformed identity (no `@`/`#`, unparsable pid) → true
+/// - hostname differs from the current process's → true (a record from
+///   another machine cannot be probed here)
+/// - either hostname fell back to `"unknown"` (no HOSTNAME/COMPUTERNAME
+///   on one machine) → true: the machines cannot be compared, and probing
+///   a foreign pid risks a false "dead" across machines
+/// - the probe itself fails (e.g. `kill` missing) → true
+/// - unix (Linux and other /proc platforms): `kill -0 <pid>` — exit 0
+///   means alive; a non-zero exit is ESRCH (definitely dead) OR EPERM
+///   (alive but owned by another user — sudo-launched agent, systemd
+///   service, container), so it is disambiguated via the world-readable
+///   `/proc/{pid}` directory: present → alive, absent → dead. EPERM can
+///   therefore never report dead.
+/// - macOS (no /proc): the same two non-zero-exit cases are
+///   disambiguated by reading `kill -0`'s stderr, where the kernel names
+///   the reason — "Operation not permitted" (EPERM) → alive,
+///   "No such process" (ESRCH) → dead, any other message → alive
+///   (conservative, see [`classify_kill_stderr`]).
+/// - windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)` —
+///   a valid handle means alive (closed right away); NULL with
+///   `ERROR_ACCESS_DENIED` means the process exists but belongs to
+///   another user → alive, any other NULL error means truly absent.
+///
+/// The `nonce` is deliberately ignored: liveness is per pid+hostname, and
+/// a reused pid answers "some process with that pid is alive", which is
+/// exactly the conservative outcome.
+pub(crate) fn owner_alive(identity: &str) -> bool {
+    let Some((pid_str, rest)) = identity.split_once('@') else {
+        return true; // malformed: cannot judge
+    };
+    let Some((hostname, _nonce)) = rest.split_once('#') else {
+        return true; // malformed: cannot judge
+    };
+    let hostname_now = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown".to_owned());
+    // Either side falling back to "unknown" makes the two machines
+    // incomparable: the record could be from a different machine whose
+    // hostname env is also unset, and probing its pid there could report
+    // a live process as dead. Sacrifice the same-machine notice in a bare
+    // environment to eliminate that cross-machine misreport.
+    if hostname == "unknown" || hostname_now == "unknown" {
+        return true; // cannot judge: conservative
+    }
+    if hostname != hostname_now {
+        return true; // record from another machine: cannot judge
+    }
+    let Ok(pid) = pid_str.parse::<u32>() else {
+        return true; // unparsable pid: cannot judge
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No new dependency (no libc): probe via the `kill` command.
+        // `kill -0` never signals; it only checks existence + permission.
+        // stdout/stderr are silenced: a dead pid makes `kill` print
+        // "No such process" to stderr, which would be noise on every
+        // server restart that consumes zombie records.
+        match std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => true, // alive and signalable
+            Ok(_) => {
+                // Non-zero exit: ESRCH (no such process — definitely
+                // dead) or EPERM (alive but owned by another user).
+                // /proc is world-readable on Linux, so its existence is
+                // authoritative regardless of permissions: present →
+                // alive (EPERM), absent → dead (ESRCH). This closes the
+                // one real false-dead path.
+                std::path::Path::new(&format!("/proc/{pid}")).exists()
+            }
+            Err(_) => true, // probe failed: conservative
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS has no /proc, so a non-zero exit cannot be disambiguated
+        // via the filesystem. `kill -0`'s stderr names the reason,
+        // though: "Operation not permitted" (EPERM — the process is
+        // alive but owned by another user) vs "No such process" (ESRCH —
+        // definitely dead). Read it; anything unclassifiable falls back
+        // to conservative alive. stdout stays null (unused).
+        match std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(out) if out.status.success() => true, // alive and signalable
+            Ok(out) => classify_kill_stderr(&String::from_utf8_lossy(&out.stderr)),
+            Err(_) => true, // probe failed: conservative
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // ERROR_ACCESS_DENIED: the process exists but belongs to
+            // another user (cross-user server attach) — alive, not dead.
+            // Any other NULL error means the pid truly does not exist.
+            return unsafe { GetLastError() == ERROR_ACCESS_DENIED };
+        }
+        unsafe {
+            CloseHandle(handle);
+        }
+        true
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        true
+    }
+}
+
+/// Classify the stderr of a failed `kill -0` on platforms without /proc
+/// (macOS): the kernel names the reason, which disambiguates ESRCH
+/// (definitely dead) from EPERM (alive but owned by another user) —
+/// the exact EPERM-false-dead path `/proc` closes on Linux. Anything
+/// unclassifiable is conservative **alive**, so a weird locale or a
+/// future macOS message can never report a live process as dead.
+///
+/// Compiled on macOS (where `owner_alive` calls it) and in test builds
+/// on every platform so the pure classifier stays unit-testable.
+#[cfg(any(target_os = "macos", test))]
+fn classify_kill_stderr(stderr: &str) -> bool {
+    if stderr.contains("Operation not permitted") {
+        true // EPERM: the process exists but is owned by another user
+    } else if stderr.contains("No such process") {
+        false // ESRCH: definitely dead
+    } else {
+        true // unclassifiable: conservative alive
+    }
+}
+
 // ----------------------------------------------------------------------
 // Shared helpers for the GreptimeDB / SQLite backends
 // ----------------------------------------------------------------------
@@ -1358,6 +1508,47 @@ impl SessionStore {
         }
     }
 
+    /// Probe whether every unfinished background-task record for `session`
+    /// was left by a now-dead process. Server attach uses this to choose
+    /// between `Consume` (inject the "killed with the process" notice,
+    /// exactly like TUI/CLI restart) and `Preserve` (the session may still
+    /// be live in another process, which clears its own records): the
+    /// notice is only injected when the previous owner is definitely dead.
+    /// Conservative: any uncertainty (a live owner, an old record without
+    /// an owner, a probe failure) reports false → the caller keeps
+    /// `Preserve` and never misreports. No records → true (Consume is a
+    /// no-op).
+    pub async fn unfinished_owner_all_dead(&self, root: &Path, session: &str) -> Result<bool> {
+        match self {
+            SessionStore::Jsonl => Ok(Session::unfinished_owner_all_dead(root, session)),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                let session_id = session.to_owned();
+                greptime_session
+                    .lock()
+                    .await
+                    .unfinished_owner_all_dead(&session_id)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: sqlite_session,
+                ..
+            } => {
+                let session_id = session.to_owned();
+                sqlite_session
+                    .lock()
+                    .await
+                    .unfinished_owner_all_dead(&session_id)
+                    .await
+                    .map_err(anyhow::Error::msg)
+            }
+        }
+    }
+
     /// Like [`Self::take_unfinished_background`] but scoped to rows whose
     /// `subagent_session_id` matches — used when resuming a subagent
     /// session so it learns what died with its background delegates. The
@@ -2246,6 +2437,118 @@ mod shared_helpers {
 mod tests {
     use super::*;
 
+    /// `owner_alive` liveness probe: the current process's own identity is
+    /// alive; huge non-existent pids are definitely dead; anything that
+    /// cannot be judged (foreign hostname, "unknown" hostname, malformed
+    /// identity) is alive (conservative — the caller keeps Preserve
+    /// instead of misreporting).
+    #[test]
+    fn owner_alive_is_conservative_and_spot_checks_liveness() {
+        // Our own identity: pid exists, hostname matches → alive
+        // (kill -0 succeeds on the same uid).
+        let me = process_identity();
+        assert!(
+            owner_alive(me),
+            "the current process must probe as alive: {me}"
+        );
+
+        // The dead-pid probe path (`kill -0` ESRCH + no /proc entry) is
+        // only reachable when the environment exports a real hostname:
+        // with no HOSTNAME/COMPUTERNAME either side is "unknown" and
+        // owner_alive is unjudgeable → alive (P2-2). Assert the
+        // deterministic conservative outcome in that case, and the real
+        // probe (kill -0 + /proc fallback) when a hostname is exported
+        // (CI runners and most dev shells).
+        if let Some(hostname) = probeable_hostname() {
+            // Pids that cannot exist (well-formed `pid@hostname#nonce`
+            // shape, but far above any real pid_max): `kill -0` reports
+            // ESRCH and /proc has no such directory → definitely dead.
+            let dead = format!("2000000000@{hostname}#deadbeef");
+            assert!(!owner_alive(&dead), "impossible pid must probe as dead");
+            let dead2 = format!("3999999999@{hostname}#cafebabe");
+            assert!(
+                !owner_alive(&dead2),
+                "well-formed but non-existent pid must probe as dead"
+            );
+        } else {
+            assert!(
+                owner_alive("2000000000@unknown#deadbeef"),
+                "unprobeable hostname keeps even a dead pid conservative"
+            );
+        }
+
+        // Different hostname (even with our own pid) → cannot judge → alive.
+        let foreign = format!("{}@some-other-machine#deadbeef", std::process::id());
+        assert!(
+            owner_alive(&foreign),
+            "foreign hostname must be conservative (alive)"
+        );
+
+        // A hostname that fell back to "unknown" (either side) cannot be
+        // compared across machines → conservative alive, even for a pid
+        // that would otherwise probe dead. Sacrificing the bare-environment
+        // same-machine notice eliminates the cross-machine false-dead.
+        assert!(
+            owner_alive(&format!("{}@unknown#nonce", std::process::id())),
+            "record-side unknown hostname must be conservative (alive)"
+        );
+        assert!(
+            owner_alive("2000000000@unknown#deadbeef"),
+            "unknown hostname wins over a dead pid (conservative)"
+        );
+
+        // Malformed identities → cannot judge → alive.
+        assert!(owner_alive(""), "empty identity is conservative");
+        assert!(
+            owner_alive("not-an-identity"),
+            "no @ separator is conservative"
+        );
+        assert!(
+            owner_alive("12345@hostname-without-nonce"),
+            "no # separator is conservative"
+        );
+        assert!(
+            owner_alive("abc@myhost#nonce"),
+            "unparsable pid is conservative"
+        );
+    }
+
+    /// The macOS stderr-discrimination logic (the no-/proc EPERM-vs-ESRCH
+    /// disambiguation) as a pure classifier. Exercised on Linux under
+    /// `#[cfg(test)]`; on macOS it is the live probe path. The guarantee
+    /// under test: EPERM (alive but other-uid) must never read as dead,
+    /// ESRCH is the ONLY way to get false, and any unclassifiable stderr
+    /// falls back to conservative alive.
+    #[test]
+    fn classify_kill_stderr_disambiguates_eperm_from_esrch() {
+        // EPERM — process alive but owned by another user → alive.
+        assert!(classify_kill_stderr("kill: 123: Operation not permitted"));
+        assert!(classify_kill_stderr("kill: 456: Operation not permitted\n"));
+        // ESRCH — the only definite-dead answer.
+        assert!(!classify_kill_stderr("kill: 2000000000: No such process"));
+        assert!(!classify_kill_stderr("No such process"));
+        // Unclassifiable → conservative alive, never dead.
+        assert!(classify_kill_stderr(""));
+        assert!(classify_kill_stderr("kill: 123: something else"));
+        assert!(classify_kill_stderr("zsh: killed"));
+        // EPERM is checked before the substring "permitted" could ever
+        // collide with an ESRCH message; order is fixed and conservative.
+        assert!(classify_kill_stderr(
+            "Operation not permitted and No such process"
+        ));
+    }
+
+    /// The environment's exported hostname, when there is one: only then
+    /// can a hand-built identity match `owner_alive`'s hostname check and
+    /// reach the pid-probe path (P2-2 makes an unset hostname unjudgeable
+    /// → conservative alive).
+    fn probeable_hostname() -> Option<String> {
+        let host = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .ok()?;
+        (!host.is_empty() && host != "unknown").then_some(host)
+    }
+
     /// JSONL `load_older` pages by ABSOLUTE position (there is no seq
     /// column): `before_seq` is the 0-based file position, the returned
     /// slice is `[max(0, before-limit), before)`, and the cursor is the
@@ -2874,6 +3177,44 @@ mod tests {
                 .await
                 .expect("by-session take after subagent consume");
             assert!(labels.is_empty());
+        }
+
+        /// The probe's Err contract through the facade: when the
+        /// `running_tasks` query hard-fails (table dropped behind the
+        /// store's back), `unfinished_owner_all_dead` returns Err instead
+        /// of panicking — this is exactly the error the server's
+        /// `build_session` catches and degrades to Preserve (P1-2), so the
+        /// session build never 500s over a broken probe.
+        #[tokio::test]
+        async fn sqlite_unfinished_owner_all_dead_probe_error_propagates() {
+            let (_dir, path) = temp_db();
+            let root = std::env::temp_dir();
+            let session = format!("test-store-owner-err-{}", crate::session::new_id());
+            let store = SessionStore::connect(&backend(&path), &root, &session)
+                .await
+                .expect("connect sqlite store");
+
+            // Break the running_tasks table from a second raw connection.
+            let db = turso::Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .expect("open db");
+            let conn = db.connect().expect("connect raw");
+            conn.execute("DROP TABLE running_tasks", ())
+                .await
+                .expect("drop running_tasks table");
+            drop(conn);
+            drop(db);
+
+            let err = store
+                .unfinished_owner_all_dead(&root, &session)
+                .await
+                .expect_err("probe must error on a broken table");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("cannot load unfinished background task owners"),
+                "probe error must carry context: {message}"
+            );
         }
 
         /// `load_head_page` on the SQLite store: the bounded head page

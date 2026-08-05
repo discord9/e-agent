@@ -1072,18 +1072,46 @@ async fn build_session(
     factory: &SessionFactory,
     id: &str,
 ) -> Result<SessionBuild, (StatusCode, String)> {
-    // Lazy server attach: the session may still be live in another process,
-    // so do NOT consume its unfinished-background records or inject a
-    // "killed with the process" notice — the owning process clears them
-    // itself via ack_background_entry → clear_background_task.
+    // Lazy server attach: the session may still be live in another process
+    // (the server restarts far more often than its sessions die), so the
+    // unfinished-background records are NOT blindly consumed. Probe whether
+    // every record was left by a now-dead process: only then is it safe to
+    // use Consume — take the records and inject the "killed with the
+    // process" notice, exactly like a TUI/CLI restart. Any uncertainty
+    // (a live owner, an old record without an owner, a probe failure)
+    // keeps Preserve: the owning process may still be alive and clears its
+    // own records via ack_background_entry → clear_background_task. No
+    // records → Consume is a harmless no-op, so the probe reports true.
+    let unfinished = {
+        let root = factory.root();
+        // One throwaway store for the probe (build() connects its own);
+        // JSONL is a zero-cost marker, Greptime/SQLite just open a second
+        // short-lived connection bound to the same session id.
+        let store = SessionStore::connect(factory.backend(), root, id)
+            .await
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        match store.unfinished_owner_all_dead(root, id).await {
+            // Every owner dead (or no records): safe to consume and
+            // inject the "killed with the process" notice.
+            Ok(true) => UnfinishedPolicy::Consume,
+            // Some owner is alive or unjudgeable: leave the records for
+            // the owning process.
+            Ok(false) => UnfinishedPolicy::Preserve,
+            // Probe failure must not take the whole session build down —
+            // the session itself is perfectly usable. Degrade to the
+            // conservative Preserve (matching the migration-failure
+            // degradation style elsewhere: eprintln + keep running).
+            Err(e) => {
+                eprintln!(
+                    "e-agent: cannot probe unfinished background-task owners, \
+                     keeping Preserve: {e:#}"
+                );
+                UnfinishedPolicy::Preserve
+            }
+        }
+    };
     factory
-        .build(
-            id,
-            None,
-            None,
-            IdlePolicy::WaitForInput,
-            UnfinishedPolicy::Preserve,
-        )
+        .build(id, None, None, IdlePolicy::WaitForInput, unfinished)
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
 }
@@ -1829,6 +1857,13 @@ async fn session_fork(
             Some((id.clone(), Some(at))),
             None,
             IdlePolicy::WaitForInput,
+            // Deliberately NOT the owner-liveness probe of `build_session`:
+            // this builds a brand-new `fork-…` session. Unfinished
+            // background-task records are scoped to the SOURCE session id,
+            // so this fork's own record file/rows are always empty —
+            // Consume would take nothing, and injecting a "killed with the
+            // process" notice into a fresh fork would be wrong. The source
+            // keeps its records untouched either way (fork only reads).
             UnfinishedPolicy::Preserve,
         )
         .await
