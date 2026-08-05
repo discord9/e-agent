@@ -16,18 +16,21 @@
  * 统一轮询 pollTasks()（2s 常驻）：一次 GET /api/tasks 更新面板。
  * ===================================================================*/
 /* GET /api/tasks → 任务数组；失败/无 token 返回 null（调用方决定如何处理）。
+   ws 指定目标 workspace（apiFor 按 ws 的 base/token 发请求）：多 workspace
+   聚合轮询时每个 workspace 各自拉取，单 workspace / 未配置时即激活服务器。
    注意：/api/tasks 的行数是 wrapper 任务存活指标（backend wrapper 进程/
    后台任务是否还在），与 orbit 环绕红点的 subagent Busy 语义不同——二者
    各自独立表达，不做换算（oracle#95）。
-   注意：任务面板保持「激活 workspace」单服务器作用域——聚合多服务器任务
-   超出本轮范围（任务行已带 [workspace:] 参数标签可区分），侧边栏聚合的是
-   会话而非任务。 */
-async function fetchTasks() {
-  if (!state.token) return null;
+   注意：聚合只发生在前端数据层（state.tasks.list 合并 + _ws 标记），
+   composer 面板仍保持「激活 workspace」作用域（renderComposerTasks 按
+   _ws 过滤），侧边栏环绕点消费全量列表。 */
+async function fetchTasks(ws) {
+  if (!workspaceToken(ws)) return null;
   try {
-    const res = await api("/api/tasks");
+    const res = await apiFor(ws, "/api/tasks");
     if (res.status === 401 || res.status === 403) {
-      setBanner("⚠ 认证失败：请检查 Token。");
+      // 认证失败只对激活 workspace 弹 banner（背景 workspace 静默，不刷屏）
+      if (ws === state.workspace) setBanner("⚠ 认证失败：请检查 Token。");
       return null;
     }
     if (!res.ok) throw new Error("HTTP " + res.status);
@@ -38,12 +41,33 @@ async function fetchTasks() {
   }
 }
 
-/* 统一任务轮询（防重入：seq 竞态序号只应用最新一次响应）。 */
+/* 统一任务轮询（防重入：seq 竞态序号只应用最新一次响应）。
+   多 workspace 聚合：遍历 state.workspaces，每个 workspace 经 apiFor 各自
+   拉 /api/tasks（与 pollAllWorkspaces 同款语义），合并成一份全量列表存
+   state.tasks.list——侧边栏环绕点按 session_id 匹配父会话，需要全量。
+   每个任务打 _ws 标记（所属 workspace id）供面板/侧边栏按 workspace 过滤；
+   单 workspace / 未配置时行为与旧版一致（只拉激活 workspace 一份）。
+   某 workspace 拉取失败 → 保留其旧缓存（stale，与单服务器语义一致），
+   不参与本轮合并。 */
 async function pollTasks() {
   const seq = ++state.tasks.seq;
-  const tasks = await fetchTasks();
-  if (tasks === null || seq !== state.tasks.seq) return;  // 过期响应丢弃
-  state.tasks.list = tasks;
+  const wss = (state.workspaces || []).slice();
+  if (!wss.length && state.workspace) wss.push(state.workspace);   // 兜底
+  const results = await Promise.all(wss.map(async (ws) => ({ ws, tasks: await fetchTasks(ws) })));
+  if (seq !== state.tasks.seq) return;   // 过期响应丢弃
+  const all = [];
+  for (const { ws, tasks } of results) {
+    if (tasks === null) {
+      // 拉取失败：保留该 workspace 的旧缓存（stale），避免任务闪烁消失
+      const old = state.tasks.byWorkspace[ws.id];
+      if (old) all.push(...old);
+      continue;
+    }
+    const tagged = tasks.map((t) => Object.assign({}, t, { _ws: ws.id }));
+    state.tasks.byWorkspace[ws.id] = tagged;
+    all.push(...tagged);
+  }
+  state.tasks.list = all;
   renderComposerTasks();
 }
 
@@ -93,6 +117,9 @@ function tasksRenderSig(list) {
 let lastTasksRenderedSig = "";
 
 /* composer 上方折叠条 + 面板：计数即徽标；有任务时高亮，无任务整条隐藏。
+   面板只显示激活 workspace 的任务：state.tasks.list 是多 workspace 聚合的
+   全量列表（每任务带 _ws 标记），这里按 state.workspace.id 过滤——其他
+   workspace 的任务只供侧边栏环绕点消费，不混入本 workspace 的面板/徽标。
    面板内容仅在展开时渲染（收起时只更新计数/箭头/高亮，不触碰 DOM）。
    签名去重：数据未变且面板已渲染 → 跳过 renderTaskList，保留已展开的卡片
    DOM 与进行中的 output 轮询/SSE 流（2s 轮询不再每轮销毁重建）。 */
@@ -100,7 +127,9 @@ function renderComposerTasks() {
   const bar = els.tasksToggleBar;
   if (!bar) return;
   const panel = els.composerTasks;
-  const list = state.tasks.list || [];
+  const wsId = state.workspace ? state.workspace.id : null;
+  // 过滤到激活 workspace；无 _ws 的旧数据（switchWorkspace 清空等）视为当前
+  const list = (state.tasks.list || []).filter((t) => !t._ws || t._ws === wsId);
   const n = list.length;
   const sig = tasksRenderSig(list);
   bar.hidden = n === 0;

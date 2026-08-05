@@ -227,6 +227,11 @@ for(const id of ["topActions","backParentBtn","connState","banner","bannerText",
   "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks","forkMenu",
   "workspaceSelect","workspaceAddBtn","workspaceRemoveBtn","workspaceEditor",
   "wsNameInput","wsUrlInput","wsTokenInput","wsSaveBtn","wsCancelBtn"]) elsById[id]=new El(id);
+// 任务折叠条的计数徽标 span（index.html 里的 .tasks-toggle-label）——
+// 面板计数断言需要它；其余 stub 元素都是裸 El，不建子树。
+const _togLabel = new El("span");
+_togLabel._classes.add("tasks-toggle-label");
+elsById["tasksToggleBar"].appendChild(_togLabel);
 
 const _ls={};
 globalThis.localStorage={ getItem:k=>_ls[k]??null, setItem:(k,v)=>{_ls[k]=v;}, removeItem:k=>{delete _ls[k];} };
@@ -370,6 +375,8 @@ function abortable(promise, signal){
 }
 // 任务输出块测试用：/api/tasks 响应与 output 端点文本（测试中可变）
 let tasksData = [];
+// 聚合模式：第二台服务器（http://b.local）的独立 /api/tasks 数据源
+let tasksDataB = [];
 let taskOutputText = "";
 // perf 回归测试：output 端点延迟（手动 resolve）——验证 500ms 轮询防重入
 let taskOutputDelayed = false;
@@ -477,6 +484,7 @@ globalThis.fetch=(url,opts={})=>{
         return resp(200, sessionsData, signal);
   }
   // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
+  if(url==="http://b.local/api/tasks") return resp(200, tasksDataB, signal);
   if(url==="http://b.local/api/sessions"&&m==="GET") {
     if (bGetDelayed) return abortable(new Promise((resolve) => { bGetResolve = resolve; }), signal);
     if (sessionsPDelayed) return abortable(new Promise((resolve) => { sessionsPResolve = resolve; }), signal);
@@ -2879,6 +2887,78 @@ async function main(){
         && wsSections[1].textContent.includes("无法连接"),
         "err=" + String(wsSections[1].querySelector(".ws-err") && wsSections[1].querySelector(".ws-err").textContent));
     sessionsBFail = false;
+
+    // =====================================================================
+    // 任务聚合：多 workspace 下 pollTasks 拉全量（侧边栏环绕点）+ 面板过滤
+    // wsA 激活（上面已切回）。A 的 /api/tasks（tasksData）与 B 的独立
+    // 数据源（tasksDataB）应合并进 state.tasks.list（各带 _ws 标记）；
+    // composer 面板只显示激活 workspace 的任务；侧边栏环绕点两个分组
+    // 各自的父会话都能匹配到自己的任务。
+    // =====================================================================
+    tasksData = [{ session_id: "a1", id: 1, kind: "bash", label: "A 构建",
+      full_command: "cargo build", output: "", role: null }];
+    tasksDataB = [{ session_id: "b1", id: 1, kind: "delegate", label: "B 子代理",
+      role: "seer", subagent_session_id: "sub-b1" }];
+    await pollTasks();
+    await flush();
+    chk("task agg: merged list has both ws tasks",
+        state.tasks.list.length === 2
+        && state.tasks.list.some((t) => t._ws === "wsA" && t.session_id === "a1")
+        && state.tasks.list.some((t) => t._ws === "wsB" && t.session_id === "b1"),
+        "n=" + state.tasks.list.length
+        + " ws=" + JSON.stringify(state.tasks.list.map((t) => t._ws)));
+    chk("task agg: byWorkspace split",
+        state.tasks.byWorkspace["wsA"].length === 1
+        && state.tasks.byWorkspace["wsB"].length === 1
+        && state.tasks.byWorkspace["wsA"][0]._ws === "wsA"
+        && state.tasks.byWorkspace["wsB"][0]._ws === "wsB",
+        "A=" + state.tasks.byWorkspace["wsA"].length
+        + " B=" + state.tasks.byWorkspace["wsB"].length);
+    // 面板（激活 wsA）：只渲染 A 的任务，计数徽标只数 A
+    state.tasks.composerOpen = true;
+    renderComposerTasks();
+    let taskRows = elsById["composerTasks"].querySelectorAll(".task-row");
+    chk("task agg: panel shows only active ws tasks",
+        taskRows.length === 1 && taskRows[0].textContent.includes("cargo build"),
+        "n=" + taskRows.length
+        + " text=" + (taskRows[0] && taskRows[0].textContent.slice(0, 40)));
+    chk("task agg: badge counts active ws only",
+        elsById["tasksToggleBar"].querySelector(".tasks-toggle-label")
+          .textContent.includes("(1)"),
+        "label=" + elsById["tasksToggleBar"].querySelector(".tasks-toggle-label").textContent);
+    // 侧边栏环绕点：A 组的 a1 与 B 组的 b1 各匹配到自己的任务（全量消费）
+    renderSidebarTree(true);
+    wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const aDotN = wsSections[0].querySelectorAll(".busy-dot-sub").length;
+    const bDotN = wsSections[1].querySelectorAll(".busy-dot-sub").length;
+    chk("task agg: sidebar dots for both workspaces",
+        aDotN === 1 && bDotN === 1,
+        "A=" + aDotN + " B=" + bDotN);
+    // 切到 B：面板只显示 B 的任务（聚合列表不变，过滤随激活切换）
+    switchWorkspace("wsB");
+    await flush();
+    await pollTasks();
+    await flush();
+    state.tasks.composerOpen = true;
+    renderComposerTasks();
+    taskRows = elsById["composerTasks"].querySelectorAll(".task-row");
+    chk("task agg: after switch panel shows B tasks",
+        state.tasks.list.length === 2
+        && taskRows.length === 1 && taskRows[0].textContent.includes("B 子代理"),
+        "n=" + taskRows.length
+        + " text=" + (taskRows[0] && taskRows[0].textContent.slice(0, 40)));
+    // 还原：清空任务 + 切回 A
+    tasksData = [];
+    tasksDataB = [];
+    switchWorkspace("wsA");
+    await flush();
+    await pollTasks();
+    await flush();
+    chk("task agg: empty clears widget",
+        state.tasks.list.length === 0
+        && elsById["tasksToggleBar"].hidden === true,
+        "n=" + state.tasks.list.length + " hidden=" + elsById["tasksToggleBar"].hidden);
+    state.tasks.composerOpen = false;
 
     // =====================================================================
     // 7) 跨服务器 resume 竞态：B 的 resume POST 挂起期间用户切回 A →

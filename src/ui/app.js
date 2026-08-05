@@ -75,7 +75,11 @@ const state = {
   tasks: {                   // 运行中任务（composer 折叠条/面板 + 消息列表输出块）
     seq: 0,                  // 统一轮询竞态序号：只应用最新一次响应
     timer: null,             // 统一轮询定时器（2s 常驻；替代原徽标/面板双轮询）
-    list: [],                // 最近一次 /api/tasks 结果（两处渲染共用）
+    list: [],                // 多 workspace 聚合的最近一次 /api/tasks 全量结果
+                             //（每任务带 _ws 标记；面板按激活 workspace 过滤，
+                             //  侧边栏环绕点消费全量）
+    byWorkspace: {},         // workspaceId -> task[]：各 workspace 独立的 /api/tasks
+                             // 缓存（聚合轮询的 stale 保留 + 面板过滤数据源）
     cancelling: new Set(),   // 正在取消的任务 id（防重复点击）
     composerOpen: false,     // composer 任务面板展开状态（默认收起）
     pollers: new Map(),      // 展开中 bash 行的 output 轮询句柄（key=session_id:id → interval id）
@@ -312,6 +316,7 @@ async function switchWorkspace(id, epoch) {
   state.deepLink.probing = false;    // 切换即终止深链 attempt（标记清掉，防残留污染后续 404 分类）
   state.deepLink.attemptEpoch = -1;
   state.tasks.list = [];
+  state.tasks.byWorkspace = {};   // 聚合缓存随 workspace 切换重置：下一轮 pollTasks 重新拉全量
   state.tasks.cancelling = new Set();
   state.tasks.pollers = new Map();
   state.tasks.streams = new Map();
