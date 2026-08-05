@@ -240,7 +240,7 @@ impl Delegate {
             roles_root: None,
             sandbox: None,
             record_in: None,
-            persist_backend: SessionBackend::Jsonl,
+            persist_backend: SessionBackend::default(),
             finalize_wait: None,
         }
     }

@@ -275,10 +275,10 @@ When no prompt argument is supplied and stdout is a terminal, e-agent starts
 an interactive TUI (scrollback plus an input line with proper Unicode editing);
 use `--repl` for a plain line-based REPL instead. If stdin is piped, the prompt
 is read from standard input. Sessions persist as an append-only log of
-message and compaction entries; the default JSONL backend writes them to
-`.e-agent/sessions/<name>.jsonl` in the workspace, and `[session] backend`
-can switch persistence to GreptimeDB or SQLite (see the backend sections
-below). Without `--session`, each launch creates a
+message and compaction entries; the default SQLite backend persists them
+to `.e-agent/sessions.db` in the workspace (JSONL remains selectable via
+`[session] backend = "jsonl"`), and `[session] backend` can switch
+persistence to GreptimeDB as well (see the backend sections below). Without `--session`, each launch creates a
 fresh unique session ID. History is restored for
 model context on startup, while display projections are replayed in the TUI;
 the model only sees the latest compaction summary and everything after it.
@@ -780,9 +780,9 @@ Connections use `PRAGMA journal_mode=WAL` and `busy_timeout=5000`, so
 processes sharing one file wait out short writer locks instead of failing.
 The strictly monotonic per-process `event_time_us` keeps seq continuity
 identical to the JSONL/GreptimeDB backends. Like GreptimeDB, SQLite has no
-automatic migration from JSONL and no cross-backend migration; a phased
-switch to SQLite as the default backend (with JSONL staying optional) is
-recorded in the changelog but not yet implemented.
+automatic migration from JSONL and no cross-backend migration. SQLite is
+the default backend since 0.1.1+ (absent `[session]` resolves to
+`.e-agent/sessions.db`); JSONL stays selectable for legacy workspaces.
 
 ## GreptimeDB session backend (experimental)
 

@@ -213,9 +213,9 @@ impl Default for Sandbox {
 #[serde(tag = "backend", rename_all = "lowercase")]
 pub enum SessionBackend {
     /// Local SQLite/turso database file backend (default). `path` is a path
-    /// to a SQLite-compatible database file (e.g. "~/.local/share/e-agent/
-    /// sessions.db"; ":memory:" works for tests). `None` resolves to
-    /// `<workspace>/.e-agent/sessions.db`. Requires the `sqlite` feature.
+    /// to a SQLite-compatible database file (e.g. "/data/sessions.db";
+    /// ":memory:" works for tests; `~` is NOT expanded). `None` resolves
+    /// to `<workspace>/.e-agent/sessions.db`. Requires the `sqlite` feature.
     Sqlite { path: Option<String> },
     /// JSONL file backend (legacy default, still selectable).
     Jsonl,

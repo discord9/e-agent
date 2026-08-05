@@ -90,8 +90,9 @@ does not yet follow semantic versioning strictly.
 
 ### Changed
 
-- Version bumped to 0.1.1; storage-backend default decision recorded in
-  TODO (phased switch to SQLite, JSONL stays optional — not yet
-  implemented).
+- Version bumped to 0.1.1; the default session backend is now SQLite/turso
+  (`<workspace>/.e-agent/sessions.db`), JSONL stays selectable, Greptime
+  remains optional. No migration from existing JSONL workspaces (legacy
+  files keep working via explicit `backend = "jsonl"`).
 
 [0.1.1]: https://github.com/GreptimeTeam/e-agent/releases/tag/v0.1.1

@@ -2236,6 +2236,29 @@ mod shared_helpers {
         }
     }
 
+    #[test]
+    fn resolve_sqlite_path_resolves_default_inside_workspace() {
+        let root = Path::new("/tmp/ws");
+        // None (default backend / no path) -> <root>/.e-agent/sessions.db
+        assert_eq!(
+            resolve_sqlite_path(root, None),
+            "/tmp/ws/.e-agent/sessions.db"
+        );
+        // Explicit path wins verbatim (no ~ expansion, no rewriting).
+        assert_eq!(
+            resolve_sqlite_path(root, Some("/data/custom.db")),
+            "/data/custom.db"
+        );
+        // Empty/whitespace path behaves like None (default).
+        assert_eq!(
+            resolve_sqlite_path(root, Some("   ")),
+            "/tmp/ws/.e-agent/sessions.db"
+        );
+        // Relative explicit path is kept as-is (caller's responsibility);
+        // only the default is derived from the workspace root.
+        assert_eq!(resolve_sqlite_path(root, Some("rel.db")), "rel.db");
+    }
+
     // --- entry_kind / is_error ------------------------------------------
 
     fn sample_entries() -> Vec<SessionEntry> {

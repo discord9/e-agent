@@ -183,13 +183,14 @@ impl SessionFactory {
             .as_ref()
             .map(|c| c.session_backend())
             .unwrap_or_default();
-        // Migrate pre-session-id files only when using the JSONL backend;
-        // GreptimeDB has its own session namespace and does not need file
-        // migration.
-        if matches!(backend, crate::config::SessionBackend::Jsonl) {
-            for (old, new) in crate::session::migrate_legacy(&root) {
-                eprintln!("e-agent: migrated session {old} -> {new}");
-            }
+        // Migrate pre-session-id JSONL files unconditionally: the
+        // migration is idempotent and only touches `.e-agent/sessions/
+        // *.jsonl` legacy files, so it is harmless (and keeps the data
+        // bridge alive) for users on the SQLite/Greptime backends. The
+        // default backend is SQLite now, but a workspace may still hold
+        // legacy JSONL files from before the switch.
+        for (old, new) in crate::session::migrate_legacy(&root) {
+            eprintln!("e-agent: migrated session {old} -> {new}");
         }
         // Web search reads EXA_API_KEY from the process env (tools.rs and
         // subagents pick it up there). When unset, fall back to the

@@ -48,7 +48,7 @@
 
 ## 会话后端
 
-- **JSONL 默认**：`[session]` 不配置时走 jsonl 文件后端，transcript 落盘 `<workspace>/.e-agent/sessions/…`（或等价 root）
+- **SQLite 默认**：`[session]` 不配置时走 sqlite/turso 后端，transcript 落盘 `<workspace>/.e-agent/sessions.db`（JSONL 经 `backend = "jsonl"` 显式选择）
 - **Greptime**：`config.toml` 写
   ```toml
   [session]

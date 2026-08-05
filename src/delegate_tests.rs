@@ -109,7 +109,10 @@ fn delegate_with_url(workspace: &std::path::Path, base_url: String) -> Delegate 
             .unwrap(),
     );
     let (_, background) = builtins(workspace.clone(), None, false, None);
+    // Tests assert JSONL file semantics (resume files, scrollback, labels);
+    // pin the JSONL backend explicitly — production defaults to SQLite.
     Delegate::new(model, workspace, background)
+        .with_persist_store(crate::config::SessionBackend::Jsonl)
 }
 
 fn delegate(workspace: &std::path::Path) -> Delegate {
