@@ -1457,6 +1457,124 @@ model = "k3-project"
 }
 
 #[test]
+fn merged_with_project_tui_replaces_global_wholesale() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[tui]
+submit = "enter"
+newline = "shift+enter"
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        r#"
+[tui]
+submit = "alt+enter"
+newline = "enter"
+"#,
+    )
+    .unwrap();
+
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+    let keys = merged.tui_keys().unwrap();
+    assert_eq!(keys.submit_modifiers, KeyModifiers::ALT);
+    assert_eq!(keys.newline_modifiers, KeyModifiers::NONE);
+    assert_eq!(
+        keys.describe(),
+        ("Alt+Enter".to_owned(), "Enter".to_owned())
+    );
+}
+
+#[test]
+fn merged_with_project_without_tui_keeps_global_tui() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[tui]
+submit = "alt+enter"
+newline = "ctrl+enter"
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    // Project file exists but has no [tui] section: the global mapping
+    // must survive the merge untouched.
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[models.\"kimi/k3\"]\nmodel = \"k3-project\"\n",
+    )
+    .unwrap();
+
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+    let keys = merged.tui_keys().unwrap();
+    assert_eq!(keys.submit_modifiers, KeyModifiers::ALT);
+    assert_eq!(keys.newline_modifiers, KeyModifiers::CONTROL);
+}
+
+#[test]
+fn merged_with_project_partial_tui_uses_defaults_not_global() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+[tui]
+submit = "enter"
+newline = "shift+enter"
+"#,
+    );
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    // Project [tui] sets only submit: whole-section replacement means the
+    // omitted newline falls back to the built-in default (alt+enter), NOT
+    // the global shift+enter.
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[tui]\nsubmit = \"ctrl+enter\"\n",
+    )
+    .unwrap();
+
+    let merged = Config::from_path(&global)
+        .unwrap()
+        .merged_with_project(&ws)
+        .unwrap();
+    let keys = merged.tui_keys().unwrap();
+    assert_eq!(keys.submit_modifiers, KeyModifiers::CONTROL);
+    assert_eq!(keys.newline_modifiers, KeyModifiers::ALT);
+}
+
+#[test]
 fn sandbox_project_scalar_fields_override_global() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("ws");
