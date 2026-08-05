@@ -597,7 +597,7 @@ The `/api` surface (JSON except for the SSE endpoint):
 | POST | `/api/sessions/{id}/btw` | fork into a persistent subagent |
 | GET | `/api/sessions/{id}/fork-candidates` | turn boundaries to fork at |
 | POST | `/api/sessions/{id}/fork` | fork at a turn boundary into a `fork-…` session |
-| POST | `/api/sessions/{id}/cancel` | cancel the in-flight turn |
+| POST | `/api/sessions/{id}/cancel` | release: preempt the in-flight turn without terminating the session (with no queued messages a WaitForInput session returns to Idle and stays usable) |
 | POST | `/api/sessions/{id}/compact` | request compaction |
 | GET | `/api/models` | switchable model profile names |
 | POST | `/api/sessions/{id}/model` | switch the session's model at runtime |
@@ -614,6 +614,14 @@ SSE connections are kept alive with 15-second heartbeat pings. Ctrl-C shuts
 the server down gracefully: SSE streams self-close on the shutdown signal and
 in-flight requests get a hard 2-second drain deadline before the process
 force-exits; a second Ctrl-C kills it outright.
+
+A known limitation of `DELETE /api/sessions/{id}` (pre-existing, tracked
+separately): for a WaitForInput web session it can leave an idle runner
+behind. `cancel` is a *release* that parks a WaitForInput session at Idle,
+and any other holder of the live session (e.g. an in-flight request) keeps
+the session's runner task alive past its removal from the registry — an
+unaddressable idle runner that only ends when the last holder drops it or
+the process exits. The transcript stays; a later resume still works.
 
 ## Config hot reload
 
@@ -952,6 +960,12 @@ loading is workspace-root-only: there is no parent/nested discovery or merging.
 Subagents exist but are deliberately minimal: no agent-to-agent messaging,
 no delegation deeper than 1 level, and no process-level isolation yet
 (subagents are runtime tasks, not subprocesses).
+Cancellation is a *release*, not a termination: `cancel` preempts the
+in-flight operation and never ends the session — the only hard termination
+is `DELETE /api/sessions/{id}` or the tasks-panel cancel (which aborts a
+subagent through its parent's background-task registry). Idle-runner
+lifecycle management (idle timeouts / GC for parked sessions) is not in
+scope.
 Windows restricted-token MVP is only an accident-prevention write restriction:
 no read isolation, network isolation, Job Object, AppContainer, broker/IPC,
 ConPTY, dedicated user, protected-git shell execution, or bwrap-equivalent

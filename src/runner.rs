@@ -204,6 +204,17 @@ impl SessionHandle {
             shared.commands_open = false;
         }
     }
+    /// Cancel == release: sends `SessionCommand::Cancel` through the command
+    /// channel, consumed at the next operation boundary (round, tool,
+    /// compaction, or idle). It preempts the in-flight operation but does
+    /// NOT terminate the session. With prompts queued, the outer loop drains
+    /// the batch into a fresh turn that ends naturally; with none queued, a
+    /// FinishWhenIdle runner finalizes `Cancelled` right here, and a
+    /// WaitForInput runner returns to Idle and stays usable.
+    ///
+    /// To hard-terminate a session use `DELETE /api/sessions/{id}` or the
+    /// tasks-panel cancel (which aborts a subagent through its parent's
+    /// background-task registry); `cancel` never ends the session.
     pub fn cancel(&self) {
         let mut shared = self.shared.lock().unwrap();
         if shared.commands_open
