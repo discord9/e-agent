@@ -1914,11 +1914,12 @@ function buildTreeRoot(s, kids, wsId) {
   // 小尺寸侧栏状态标记过密。位置按任务列表顺序均匀选取。
   const hasOverflow = runningKidCount > 6;
   const visibleKidDots = Math.min(runningKidCount, 6);
-  // 环绕半径按"点中心围绕主点中心 (10,10)、且 4px 点不溢出 28×20 容器"标定：
+  // 环绕半径按"点中心围绕主点中心 (18,14)、且 4px 点不溢出 36×28 容器"标定：
   // left/top 是点左上角，须减点半径 2 让点中心落在椭圆上——否则环视觉中心
-  // 偏右下，移动端窄行高下主点明显不在环心。RX=8：右点中心 18，给右侧 +N
-  // 徽章（贴容器右缘）留位；RY=6：底点中心 16、底缘 18 ≤ 20 不溢出。
-  const RX = 8, RY = 6, CX = 10, CY = 10;   // 主点中心 (10,10)，椭圆半径
+  // 偏右下，移动端窄行高下主点明显不在环心。RX=12：右点中心 30、右缘 32 ≤ 36，
+  // 给右侧 +N 徽章留位；RY=10：底点中心 24、底缘 26 ≤ 28 不溢出。主点 8px
+  // 半径 4 + 环绕点半径 2 = 6，中心距 ≥10px，环绕点与主点清晰分开不重叠。
+  const RX = 12, RY = 10, CX = 18, CY = 14;   // 主点中心 (18,14)，椭圆半径
   for (let i = 0; i < visibleKidDots; i++) {
     const t = parentTasks ? parentTasks[i] : null;
     // delegate 任务在等（对应 subagent busy:false）→ 绿点；其余（bash /

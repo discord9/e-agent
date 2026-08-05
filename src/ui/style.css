@@ -273,14 +273,14 @@
      固定画布不会随任务数改变行高或挤动标题。 */
   .busy-dot-wrap {
     position: relative;
-    width: 28px;
-    height: 20px;
-    flex: 0 0 28px;
+    width: 36px;
+    height: 28px;
+    flex: 0 0 36px;
   }
   .busy-dot-wrap > .busy-dot {
     position: absolute;
-    left: 10px;
-    top: 10px;
+    left: 18px;
+    top: 14px;
     transform: translate(-50%, -50%);
   }
   .busy-dot-sub {
