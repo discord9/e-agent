@@ -4,6 +4,20 @@ All notable changes to e-agent are tracked here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 does not yet follow semantic versioning strictly.
 
+## [Unreleased]
+
+### Added
+
+- **配置热重载 (config hot reload)** — the headless server and the TUI now
+  poll the config files (`config.toml` + project `.e-agent/config.toml`)
+  and, on a valid change, atomically swap the effective config: edited
+  `[models]` / `[providers]` / `[roles]` become available to `/model`
+  switches immediately and to newly built sessions; `[mcp]`, `[bash]` and
+  `[background]` apply to sessions built after the reload. A reload that
+  fails to parse or resolve is rejected and logged, keeping the last good
+  config. `[sandbox]`, the `[session]` backend and web-search key changes
+  remain restart-only.
+
 ## [0.1.1] — 2026-08-04
 
 ### Fixed

@@ -73,32 +73,34 @@ pub struct BashConfig {
 /// Default foreground bash timeout: 30 seconds.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 
-/// The `[tui]` config section: submit/newline key mapping for the TUI
-/// input boxes. Only Enter variants are supported; each field accepts
-/// `enter`, `alt+enter` (or its macOS alias `option+enter`), `ctrl+enter`
-/// or `shift+enter`, matched exactly.
+/// The `[tui]` section: submit/newline key mapping. Global-only: key
+/// bindings are personal preference and are never merged from project
+/// configs (see `merged_with_project`).
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct TuiConfig {
-    /// Key that submits the input box. Defaults to `enter`.
+    /// Key string that submits the prompt (default `"enter"`).
     #[serde(default)]
     pub submit: Option<String>,
-    /// Key that inserts a newline in the input box. Defaults to `alt+enter`.
+    /// Key string that inserts a newline (default `"alt+enter"`).
     #[serde(default)]
     pub newline: Option<String>,
 }
 
-/// The resolved TUI input-box key mapping: which Enter variant submits and
-/// which inserts a newline. The key code is always Enter; only the
-/// modifiers vary.
+/// Every `[tui]` key string `parse_enter_key` accepts, listed in the
+/// unsupported-key error so the user sees the full vocabulary at once.
+pub const SUPPORTED_ENTER_KEYS: &str = "enter, alt+enter (option+enter), ctrl+enter, shift+enter";
+
+/// Resolved TUI submit/newline key mapping (from `Config::tui_keys`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputKeys {
+    /// Modifiers that submit the prompt. `NONE` = bare Enter.
     pub submit_modifiers: KeyModifiers,
+    /// Modifiers that insert a newline. `NONE` = bare Enter.
     pub newline_modifiers: KeyModifiers,
 }
 
 impl Default for InputKeys {
-    /// Absent `[tui]` section: bare Enter submits, Alt+Enter inserts a
-    /// newline (the historical behavior).
+    /// Bare Enter submits, Alt+Enter inserts a newline (historical default).
     fn default() -> Self {
         InputKeys {
             submit_modifiers: KeyModifiers::NONE,
@@ -107,28 +109,18 @@ impl Default for InputKeys {
     }
 }
 
-/// The whitelist text shared by every unsupported-key error.
-const SUPPORTED_ENTER_KEYS: &str = "enter, alt+enter (option+enter), ctrl+enter, shift+enter";
-
-/// Parse one `[tui]` key string into the Enter-variant modifiers. Exact
-/// match only — no case or whitespace leniency. `option+enter` is the
-/// macOS alias for `alt+enter`.
-fn parse_enter_key(s: &str) -> Option<KeyModifiers> {
-    match s {
-        "enter" => Some(KeyModifiers::NONE),
-        "alt+enter" | "option+enter" => Some(KeyModifiers::ALT),
-        "ctrl+enter" => Some(KeyModifiers::CONTROL),
-        "shift+enter" => Some(KeyModifiers::SHIFT),
-        _ => None,
+impl InputKeys {
+    /// Human-readable labels for the TUI hint bar: `(submit, newline)`.
+    pub fn describe(&self) -> (String, String) {
+        (
+            describe_enter_key(self.submit_modifiers),
+            describe_enter_key(self.newline_modifiers),
+        )
     }
 }
 
-/// Human-readable label of an Enter-variant modifier set, for footer hints
-/// ("Enter", "Alt+Enter", "Ctrl+Enter", "Shift+Enter").
-fn enter_key_label(modifiers: KeyModifiers) -> String {
-    if modifiers == KeyModifiers::NONE {
-        "Enter".to_owned()
-    } else if modifiers == KeyModifiers::ALT {
+fn describe_enter_key(modifiers: KeyModifiers) -> String {
+    if modifiers == KeyModifiers::ALT {
         "Alt+Enter".to_owned()
     } else if modifiers == KeyModifiers::CONTROL {
         "Ctrl+Enter".to_owned()
@@ -139,17 +131,23 @@ fn enter_key_label(modifiers: KeyModifiers) -> String {
     }
 }
 
-impl InputKeys {
-    /// Human-readable labels of the submit and newline keys, e.g.
-    /// ("Enter", "Alt+Enter") for the defaults. The TUI footer uses the
-    /// submit label so a reconfigured mapping is shown accurately.
-    pub fn describe(&self) -> (String, String) {
-        (
-            enter_key_label(self.submit_modifiers),
-            enter_key_label(self.newline_modifiers),
-        )
+/// Parse a `[tui]` key string (matched literally) into the modifier set for
+/// a bare Enter. `option+enter` is the macOS alias for `alt+enter`.
+fn parse_enter_key(key: &str) -> Option<KeyModifiers> {
+    match key {
+        "enter" => Some(KeyModifiers::NONE),
+        "alt+enter" => Some(KeyModifiers::ALT),
+        "option+enter" => Some(KeyModifiers::ALT),
+        "ctrl+enter" => Some(KeyModifiers::CONTROL),
+        "shift+enter" => Some(KeyModifiers::SHIFT),
+        _ => None,
     }
 }
+
+/// How often the config hot-reload watcher polls the config files for mtime
+/// changes (server and TUI). A poll is a stat on one or two small files, so
+/// 2s keeps edits feel near-instant without any load.
+pub const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Runtime sandbox configuration for the bash tool, from `[sandbox]`.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -1001,6 +999,20 @@ fn config_paths() -> Vec<PathBuf> {
         if !paths.contains(&fallback) {
             paths.push(fallback);
         }
+    }
+    paths
+}
+
+/// Every file that feeds the effective config of a workspace: the global
+/// candidates ([`config_paths`], the first existing one wins) plus the
+/// project override `<workspace>/.e-agent/config.toml`. The hot-reload
+/// watcher polls these for mtime changes; a path may not exist yet (a
+/// config created while the server runs is picked up too).
+pub fn config_watch_paths(workspace: &Path) -> Vec<PathBuf> {
+    let mut paths = config_paths();
+    let project = workspace.join(".e-agent/config.toml");
+    if !paths.contains(&project) {
+        paths.push(project);
     }
     paths
 }

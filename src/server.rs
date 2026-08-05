@@ -117,6 +117,11 @@ fn short_workspace_id(root: &std::path::Path) -> String {
 /// Bind, authenticate, and serve until Ctrl-C. The factory is resolved once
 /// here and reused by every session `build()`.
 pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Result<()> {
+    // Config hot reload: a background task polls the config files and, on a
+    // valid change, atomically swaps the factory's config so new sessions
+    // and `/model` switches pick up edited `[models]`/`[providers]`/`[roles]`
+    // without restarting the server.
+    factory.spawn_config_watcher();
     let token = load_or_create_token()?;
     // Sessions-metadata store, connected once at bootstrap. Greptime/
     // SQLite: create the audit table and run the one-time backfill of

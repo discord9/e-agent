@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use anyhow::{Context, anyhow};
 
@@ -55,10 +57,11 @@ pub enum UnfinishedPolicy {
 pub struct SessionFactory {
     workspace: Workspace,
     root: PathBuf,
-    /// Unified TOML config. Kept so `build()` can read the MCP server
-    /// definitions; a fresh set of MCP servers is spawned per build exactly
-    /// like `main.rs` did (sharing the spawned connections is Phase 2).
-    config: Option<Config>,
+    /// Runtime-reloadable state: the unified TOML config plus everything
+    /// derived from it that session builds consume. Swapped atomically by
+    /// the config watcher ([`SessionFactory::spawn_config_watcher`]); every
+    /// runtime read takes a short lock and clones what it needs.
+    reloadable: Arc<RwLock<ReloadableState>>,
     backend: crate::config::SessionBackend,
     main_model: ConfiguredModel,
     main_context_window: Option<u64>,
@@ -66,9 +69,9 @@ pub struct SessionFactory {
     subagent_context_window: Option<u64>,
     role_models: HashMap<String, ConfiguredModel>,
     role_context_windows: HashMap<String, Option<u64>>,
-    /// ChatGPT auth resolved at startup; runtime `/model` switches reuse it
-    /// so `chatgpt` profiles keep working after startup.
-    auth: Option<CodexAuth>,
+    /// `--profile` override, kept so hot reloads and `build()` re-resolve
+    /// the same main profile the process started with.
+    profile: Option<String>,
     /// `--base-url` override, honored by runtime `/model` switches exactly
     /// like it is for the main model at startup.
     base_url: Option<String>,
@@ -76,7 +79,9 @@ pub struct SessionFactory {
     /// it is for the main model at startup (the wire model replaces the
     /// profile's).
     model: Option<String>,
-    /// Already-resolved bwrap policy (`None` = sandbox disabled).
+    /// Already-resolved bwrap policy (`None` = sandbox disabled). Fixed at
+    /// startup: `[sandbox]` changes require a restart (workspace roots and
+    /// file capabilities are wired at construction).
     sandbox: Option<Sandbox>,
     read_only: bool,
     agents_instructions: Option<String>,
@@ -84,6 +89,56 @@ pub struct SessionFactory {
     /// Print startup/session announcements to stderr (`false` for the TUI,
     /// whose alternate screen must stay clean).
     announce: bool,
+}
+
+/// The subset of factory state a config hot reload can replace. Stored
+/// behind an `Arc<RwLock<..>>` so the reload watcher can swap it while the
+/// server/TUI keep resolving models from a consistent snapshot.
+struct ReloadableState {
+    /// The effective config (global + project merge). `None` = no config.
+    config: Option<Config>,
+    /// ChatGPT auth, loaded when any resolved profile uses
+    /// `auth = "chatgpt"`; re-loaded on reload when the new config needs
+    /// it. Kept here (not re-read per build) so chatgpt profiles keep
+    /// working exactly like they do at startup.
+    auth: Option<CodexAuth>,
+    /// Models re-resolved from `config` (main / subagent role / all routed
+    /// roles). Pre-resolved at swap time so `build()` stays infallible on
+    /// config resolution and a bad config edit is rejected once, at reload,
+    /// instead of failing every new session build. `None` when there is no
+    /// config (builds then fall back to the startup-resolved fields).
+    models: Option<RuntimeModels>,
+}
+
+/// Every switchable model of the effective config, resolved to wire models.
+#[derive(Clone)]
+struct RuntimeModels {
+    main: ConfiguredModel,
+    main_context_window: Option<u64>,
+    subagent: Option<ConfiguredModel>,
+    subagent_context_window: Option<u64>,
+    roles: HashMap<String, ConfiguredModel>,
+    role_context_windows: HashMap<String, Option<u64>>,
+}
+
+/// Profiles resolved without building wire models: the shared input of
+/// startup, reload validation and [`build_runtime_models`].
+struct ProfilesResolved {
+    main: ResolvedModel,
+    subagent: Option<ResolvedModel>,
+    roles: HashMap<String, ResolvedModel>,
+}
+
+/// Outcome of one config reload attempt.
+#[derive(Debug)]
+pub enum ReloadResult {
+    /// Nothing changed (watcher tick with no mtime change).
+    NoChange,
+    /// The new config parsed, validated and was swapped in.
+    Reloaded,
+    /// The new config failed to parse or resolve; the previous config is
+    /// kept. Carries the reason for logging.
+    Rejected(String),
 }
 
 /// One fully constructed session, ready for the caller to
@@ -145,66 +200,59 @@ impl SessionFactory {
         {
             unsafe { std::env::set_var("EXA_API_KEY", key) };
         }
-        let (main_resolved, role_resolved, all_roles) = match &config {
-            Some(config) => (
-                Some(config.resolve(profile)?),
-                config
-                    .resolve_role("subagent")
-                    .context("cannot resolve [roles] subagent profile")?,
-                config
-                    .resolve_roles()
-                    .context("cannot resolve [roles] profiles")?,
-            ),
-            None => (None, None, HashMap::new()),
+        let (runtime, auth) = match &config {
+            Some(config) => {
+                let resolved = resolved_profiles(config, profile)?;
+                // `--base-url` cannot combine with a chatgpt-routed main
+                // profile; checked before auth load so this message wins
+                // over an auth error. Also enforced by reload validation
+                // (`apply_reloaded_config`).
+                if matches!(resolved.main.auth, AuthMode::ChatGpt) && base_url.is_some() {
+                    return Err(anyhow!(
+                        "--base-url cannot be used with a provider using auth = `chatgpt`"
+                    ));
+                }
+                let needs_chatgpt = resolved.main.auth == AuthMode::ChatGpt
+                    || resolved
+                        .roles
+                        .values()
+                        .any(|value| value.auth == AuthMode::ChatGpt);
+                let auth = needs_chatgpt.then(CodexAuth::load).transpose()?;
+                let models = build_runtime_models(resolved, auth.as_ref(), &base_url, &model)?;
+                (Some(models), auth)
+            }
+            None => (None, None),
         };
-        let mut main_context_window = main_resolved.as_ref().and_then(|r| r.context_window);
-        // When --model overrides the profile's wire model, the profile's
-        // context window is no longer valid for the unknown model.
-        let model_override = model.is_some();
-        if matches!(
-            main_resolved.as_ref().map(|value| value.auth),
-            Some(AuthMode::ChatGpt)
-        ) && base_url.is_some()
-        {
-            return Err(anyhow!(
-                "--base-url cannot be used with a provider using auth = `chatgpt`"
-            ));
-        }
-        let needs_chatgpt = main_resolved
-            .as_ref()
-            .is_some_and(|value| value.auth == AuthMode::ChatGpt)
-            || all_roles
-                .values()
-                .any(|value| value.auth == AuthMode::ChatGpt);
-        let auth = needs_chatgpt.then(CodexAuth::load).transpose()?;
-        // The startup overrides are consumed by `configured_model` below;
-        // keep clones so runtime `/model` switches honor the same flags.
+        // The startup overrides stay stored so runtime `/model` switches and
+        // hot reloads honor the same flags the main model was built with.
         let base_url_override = base_url.clone();
         let model_override_flag = model.clone();
-        let main_model = match main_resolved {
-            Some(configured) => configured_model(configured, auth.as_ref(), base_url, model)?,
+        let (
+            main_model,
+            main_context_window,
+            subagent_model,
+            subagent_context_window,
+            role_models,
+            role_context_windows,
+        ) = match &runtime {
+            Some(models) => (
+                models.main.clone(),
+                models.main_context_window,
+                models.subagent.clone(),
+                models.subagent_context_window,
+                models.roles.clone(),
+                models.role_context_windows.clone(),
+            ),
             None => {
                 if profile.is_some() {
                     return Err(anyhow!(
                         "--profile requires a config file at $XDG_CONFIG_HOME/e-agent/config.toml or $HOME/.config/e-agent/config.toml"
                     ));
                 }
-                ConfiguredModel::chat(OpenAiModel::from_env(base_url, model)?)
+                let main_model = ConfiguredModel::chat(OpenAiModel::from_env(base_url, model)?);
+                (main_model, None, None, None, HashMap::new(), HashMap::new())
             }
         };
-        if model_override {
-            main_context_window = None;
-        }
-        let subagent_context_window = role_resolved.as_ref().and_then(|r| r.context_window);
-        let subagent_model = role_resolved
-            .map(|resolved| configured_model(resolved, auth.as_ref(), None, None))
-            .transpose()?;
-        let mut role_models = HashMap::new();
-        let mut role_context_windows = HashMap::new();
-        for (role, resolved) in all_roles {
-            role_context_windows.insert(role.clone(), resolved.context_window);
-            role_models.insert(role, configured_model(resolved, auth.as_ref(), None, None)?);
-        }
         // Resolve one shared canonical policy. `enabled` controls only bwrap;
         // file capabilities remain active independently.
         let resolved_policy = resolve_sandbox(config.as_ref(), &root)?;
@@ -218,7 +266,11 @@ impl SessionFactory {
         Ok(Self {
             workspace,
             root,
-            config,
+            reloadable: Arc::new(RwLock::new(ReloadableState {
+                config,
+                auth,
+                models: runtime,
+            })),
             backend,
             main_model,
             main_context_window,
@@ -226,7 +278,7 @@ impl SessionFactory {
             subagent_context_window,
             role_models,
             role_context_windows,
-            auth,
+            profile: profile.map(str::to_owned),
             base_url: base_url_override,
             model: model_override_flag,
             sandbox,
@@ -249,8 +301,11 @@ impl SessionFactory {
     /// The TUI submit/newline key mapping from `[tui]` (default
     /// Enter/Alt+Enter when the config or section is absent). Errors on
     /// unsupported keys or submit == newline; the caller refuses startup.
+    /// Live: resolves against the CURRENT (possibly hot-reloaded) config,
+    /// like `main_model()` and the other runtime reads.
     pub fn tui_keys(&self) -> anyhow::Result<crate::config::InputKeys> {
-        match &self.config {
+        let state = self.reloadable.read().unwrap();
+        match &state.config {
             Some(config) => config.tui_keys(),
             None => Ok(crate::config::InputKeys::default()),
         }
@@ -259,31 +314,45 @@ impl SessionFactory {
     /// The main model's context window (already cleared when `--model`
     /// overrode the profile's wire model).
     pub fn main_context_window(&self) -> Option<u64> {
-        self.main_context_window
+        let state = self.reloadable.read().unwrap();
+        state
+            .models
+            .as_ref()
+            .map(|models| models.main_context_window)
+            .unwrap_or(self.main_context_window)
     }
 
     /// The main model, shared by every built session. The btw fork entry
     /// (`delegate::spawn_btw_subagent`) runs the subagent on the source
-    /// session's own model, so the server passes this through.
-    pub fn main_model(&self) -> &ConfiguredModel {
-        &self.main_model
+    /// session's own model, so the server passes this through. Live: after a
+    /// config hot reload swapped in a new default model this returns the
+    /// reloaded model (falling back to the startup snapshot with no config).
+    pub fn main_model(&self) -> ConfiguredModel {
+        let state = self.reloadable.read().unwrap();
+        state
+            .models
+            .as_ref()
+            .map(|models| models.main.clone())
+            .unwrap_or_else(|| self.main_model.clone())
     }
 
     /// Resolve a config profile (`provider/model`) to a configured model at
     /// runtime, for the web/TUI `/model <profile>` switch. Honors the same
-    /// `--base-url`/`--model` overrides the main model was built with. Errors
+    /// `--base-url`/`--model` overrides the main model was built with and
+    /// resolves against the CURRENT (possibly hot-reloaded) config. Errors
     /// when there is no config or the profile is unknown — the caller turns
     /// that into a 400. Note: a runtime switch does not touch the agent's
-    /// context window (that stays the startup `main_context_window`).
+    /// context window (that stays the build-time `main_context_window`).
     pub fn resolve_profile(&self, profile: &str) -> anyhow::Result<ConfiguredModel> {
-        let config = self
+        let state = self.reloadable.read().unwrap();
+        let config = state
             .config
             .as_ref()
             .ok_or_else(|| anyhow!("no config file; cannot resolve model profile `{profile}`"))?;
         let resolved = config.resolve_profile(profile)?;
         configured_model(
             resolved,
-            self.auth.as_ref(),
+            state.auth.as_ref(),
             self.base_url.clone(),
             self.model.clone(),
         )
@@ -291,9 +360,13 @@ impl SessionFactory {
 
     /// Every switchable model profile name (`[models]` keys + `[roles]`
     /// values, deduplicated and sorted), for the web `/model` autocomplete
-    /// (`GET /api/models`). Empty when there is no config.
+    /// (`GET /api/models`). Empty when there is no config. Live: reflects
+    /// hot-reloaded `[models]` / `[roles]`.
     pub fn model_profiles(&self) -> Vec<String> {
-        self.config
+        self.reloadable
+            .read()
+            .unwrap()
+            .config
             .as_ref()
             .map(crate::config::Config::model_profiles)
             .unwrap_or_default()
@@ -302,11 +375,95 @@ impl SessionFactory {
     /// The summarizer model for cheap per-turn session summaries (desktop
     /// pet). Routed via `[roles] summarizer` (e.g. deepseek/flash with
     /// thinking off); falls back to the main model when not configured.
+    /// Live: uses the current (possibly hot-reloaded) role routing.
     pub fn summarizer_model(&self) -> ConfiguredModel {
-        self.role_models
-            .get("summarizer")
-            .cloned()
-            .unwrap_or_else(|| self.main_model.clone())
+        let state = self.reloadable.read().unwrap();
+        match &state.models {
+            Some(models) => models
+                .roles
+                .get("summarizer")
+                .cloned()
+                .unwrap_or_else(|| models.main.clone()),
+            None => self
+                .role_models
+                .get("summarizer")
+                .cloned()
+                .unwrap_or_else(|| self.main_model.clone()),
+        }
+    }
+
+    /// Snapshot of the current (possibly hot-reloaded) config. Runtime
+    /// readers that render config-driven UI (e.g. the TUI's key bindings)
+    /// re-read this when they want live config instead of the startup copy.
+    pub fn current_config(&self) -> Option<Config> {
+        self.reloadable.read().unwrap().config.clone()
+    }
+
+    /// Re-read the config files for this workspace and, when they changed
+    /// and the new config parses + resolves, atomically swap it in. Returns
+    /// the outcome for logging. Never fails the process: a bad edit keeps
+    /// the previous config and is reported via [`ReloadResult::Rejected`].
+    pub fn reload_config(&self) -> ReloadResult {
+        reload_config_at(
+            &self.reloadable,
+            &self.root,
+            self.profile.as_deref(),
+            &self.base_url,
+            &self.model,
+        )
+    }
+
+    /// Spawn a detached task that polls the config files
+    /// ([`crate::config::config_watch_paths`]) every
+    /// [`crate::config::CONFIG_POLL_INTERVAL`] and hot-reloads on change.
+    /// One per long-running frontend (headless server, TUI). Reload
+    /// announcements go to stderr only when `announce` is set (the server);
+    /// the TUI keeps its alternate screen clean and surfaces nothing.
+    pub fn spawn_config_watcher(&self) {
+        let announce = self.announce;
+        let root = self.root.clone();
+        let reloadable = self.reloadable.clone();
+        let profile = self.profile.clone();
+        let base_url = self.base_url.clone();
+        let model = self.model.clone();
+        tokio::spawn(async move {
+            let mut mtimes: HashMap<PathBuf, Option<SystemTime>> =
+                crate::config::config_watch_paths(&root)
+                    .into_iter()
+                    .map(|path| {
+                        let mtime = config_file_mtime(&path);
+                        (path, mtime)
+                    })
+                    .collect();
+            let mut ticker = tokio::time::interval(crate::config::CONFIG_POLL_INTERVAL);
+            // The first tick fires immediately; startup already loaded the
+            // config, so consume it without checking.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if !watch_paths_changed(&mut mtimes) {
+                    continue;
+                }
+                match reload_config_at(&reloadable, &root, profile.as_deref(), &base_url, &model) {
+                    ReloadResult::Reloaded => {
+                        if announce {
+                            eprintln!(
+                                "e-agent: config reloaded: new sessions and `/model` switches use the updated config; \
+                                 [sandbox] / [session] backend / web-search key changes still need a restart"
+                            );
+                        }
+                    }
+                    ReloadResult::Rejected(reason) => {
+                        if announce {
+                            eprintln!(
+                                "e-agent: config reload rejected (keeping the previous config): {reason}"
+                            );
+                        }
+                    }
+                    ReloadResult::NoChange => {}
+                }
+            }
+        });
     }
 
     /// The workspace every session works in; btw fork subagents inherit it.
@@ -402,11 +559,43 @@ impl SessionFactory {
             eprintln!("e-agent: forked session: {new_id}");
             session = new_id;
         }
+        // Snapshot the reloadable state once: the config watcher may swap it
+        // between awaits, so everything below uses one consistent view. The
+        // models are pre-resolved at construction/reload (a bad edit never
+        // reaches here), so this block is infallible.
+        let (config, models) = {
+            let state = self.reloadable.read().unwrap();
+            (state.config.clone(), state.models.clone())
+        };
+        let (
+            main_model,
+            subagent_model,
+            role_models,
+            role_context_windows,
+            subagent_context_window,
+            main_context_window,
+        ) = match &models {
+            Some(models) => (
+                models.main.clone(),
+                models.subagent.clone(),
+                models.roles.clone(),
+                models.role_context_windows.clone(),
+                models.subagent_context_window,
+                models.main_context_window,
+            ),
+            None => (
+                self.main_model.clone(),
+                self.subagent_model.clone(),
+                self.role_models.clone(),
+                self.role_context_windows.clone(),
+                self.subagent_context_window,
+                self.main_context_window,
+            ),
+        };
         let background_timeout =
-            crate::config::resolve_background_timeout(self.config.as_ref(), &self.root)
-                .unwrap_or(None);
+            crate::config::resolve_background_timeout(config.as_ref(), &self.root).unwrap_or(None);
         let bash_timeout =
-            crate::config::resolve_bash_timeout(self.config.as_ref(), &self.root).unwrap_or(None);
+            crate::config::resolve_bash_timeout(config.as_ref(), &self.root).unwrap_or(None);
         let (mut tools, background) = builtins_with_bash_timeout(
             self.workspace.clone(),
             self.sandbox.clone(),
@@ -421,28 +610,24 @@ impl SessionFactory {
         let (mcp_tools, mcp_instructions) = if self.read_only {
             (Vec::new(), Vec::new())
         } else {
-            let mcp_servers = self
-                .config
-                .as_ref()
-                .map(|c| c.mcp.clone())
-                .unwrap_or_default();
+            let mcp_servers = config.as_ref().map(|c| c.mcp.clone()).unwrap_or_default();
             mcp::connect_all(mcp_servers, &self.root).await
         };
         tools.extend(mcp_tools);
         let mut delegate = Delegate::new(
-            self.main_model.clone(),
+            main_model.clone(),
             self.workspace.clone(),
             background.clone(),
         )
         .persist_sessions(self.root.clone())
-        .with_role_models(self.role_models.clone())
-        .with_role_context_windows(self.role_context_windows.clone())
-        .with_subagent_context_window(self.subagent_context_window)
+        .with_role_models(role_models.clone())
+        .with_role_context_windows(role_context_windows.clone())
+        .with_subagent_context_window(subagent_context_window)
         .with_roles_root(self.root.clone())
         .with_sandbox(self.sandbox.clone())
         .record_background_tasks_in(self.root.clone(), &session, store.clone())
         .with_persist_store(self.backend.clone());
-        if let Some(subagent_model) = &self.subagent_model {
+        if let Some(subagent_model) = &subagent_model {
             let name = subagent_model.display_name().to_owned();
             delegate = delegate.with_subagent_model(subagent_model.clone());
             if self.announce {
@@ -451,7 +636,7 @@ impl SessionFactory {
         }
         let subagent_sessions = delegate.sessions();
         tools.push(Box::new(delegate));
-        let mut agent = Agent::new(Box::new(self.main_model.clone()), tools);
+        let mut agent = Agent::new(Box::new(main_model.clone()), tools);
         let mut context = Vec::new();
         // The main agent's orchestrator template (.e-agent/agents/main.md)
         // leads; it tells the model to decompose work and delegate to the
@@ -511,11 +696,11 @@ impl SessionFactory {
             store.rewrite(&self.root, &session, agent.history()).await?;
         }
 
-        if let Some(window) = self.main_context_window {
+        if let Some(window) = main_context_window {
             agent.set_context_window(window);
         }
 
-        let model_name = self.main_model.display_name().to_owned();
+        let model_name = main_model.display_name().to_owned();
         // Sessions metadata: write the creation snapshot for a brand-new
         // session (model/role from the factory configuration; parent links
         // are None for main sessions). A resumed session (`--session`,
@@ -579,7 +764,11 @@ impl SessionFactory {
         Self {
             workspace,
             root,
-            config,
+            reloadable: Arc::new(RwLock::new(ReloadableState {
+                config,
+                auth: None,
+                models: None,
+            })),
             backend: crate::config::SessionBackend::Jsonl,
             main_model,
             main_context_window: None,
@@ -587,7 +776,7 @@ impl SessionFactory {
             subagent_context_window: None,
             role_models: HashMap::new(),
             role_context_windows: HashMap::new(),
-            auth: None,
+            profile: None,
             base_url: None,
             model: None,
             sandbox: None,
@@ -807,5 +996,403 @@ fn configured_model(
             cm.display = display;
             Ok(cm)
         }
+    }
+}
+
+/// Resolve every profile the factory routes on, without building wire
+/// models: the main profile (honoring the startup `--profile`), the
+/// `subagent` role and every routed role. Shared by the constructor, reload
+/// validation and `build_runtime_models`.
+fn resolved_profiles(config: &Config, profile: Option<&str>) -> anyhow::Result<ProfilesResolved> {
+    let main = config.resolve(profile)?;
+    let subagent = config
+        .resolve_role("subagent")
+        .context("cannot resolve [roles] subagent profile")?;
+    let roles = config
+        .resolve_roles()
+        .context("cannot resolve [roles] profiles")?;
+    Ok(ProfilesResolved {
+        main,
+        subagent,
+        roles,
+    })
+}
+
+/// Turn resolved profiles into wire models, mirroring the constructor's
+/// startup resolution exactly: `--base-url` cannot combine with a
+/// chatgpt-routed main profile, and a `--model` override invalidates the
+/// profile's context window. Shared by the constructor, reload validation
+/// and the reloaded state (so `build()` and the runtime resolution helpers
+/// always see the same resolution rules).
+fn build_runtime_models(
+    resolved: ProfilesResolved,
+    auth: Option<&CodexAuth>,
+    base_url: &Option<String>,
+    model: &Option<String>,
+) -> anyhow::Result<RuntimeModels> {
+    if matches!(resolved.main.auth, AuthMode::ChatGpt) && base_url.is_some() {
+        return Err(anyhow!(
+            "--base-url cannot be used with a provider using auth = `chatgpt`"
+        ));
+    }
+    // A `--model` override replaces the wire model, so the profile's
+    // context window is no longer valid for the unknown model.
+    let main_context_window = if model.is_some() {
+        None
+    } else {
+        resolved.main.context_window
+    };
+    let main = configured_model(resolved.main, auth, base_url.clone(), model.clone())?;
+    let subagent_context_window = resolved.subagent.as_ref().and_then(|r| r.context_window);
+    let subagent = resolved
+        .subagent
+        .map(|resolved| configured_model(resolved, auth, None, None))
+        .transpose()?;
+    let mut roles = HashMap::new();
+    let mut role_context_windows = HashMap::new();
+    for (role, resolved) in resolved.roles {
+        role_context_windows.insert(role.clone(), resolved.context_window);
+        roles.insert(role, configured_model(resolved, auth, None, None)?);
+    }
+    Ok(RuntimeModels {
+        main,
+        main_context_window,
+        subagent,
+        subagent_context_window,
+        roles,
+        role_context_windows,
+    })
+}
+
+/// Validate a freshly loaded config and, when it is good, atomically swap it
+/// (plus its re-resolved models and needed ChatGPT auth) into the reloadable
+/// state. A config that fails to parse or resolve — a bad edit, a missing
+/// key file, a chatgpt-routed profile with no login — is rejected and the
+/// previous config stays, so a running server never breaks on a config edit.
+fn apply_reloaded_config(
+    state: &mut ReloadableState,
+    loaded: Option<Config>,
+    profile: Option<&str>,
+    base_url: &Option<String>,
+    model: &Option<String>,
+) -> ReloadResult {
+    let Some(config) = loaded else {
+        // The global config was deleted (or never existed): fall back to the
+        // no-config behavior exactly like startup with no config file.
+        state.config = None;
+        state.auth = None;
+        state.models = None;
+        return ReloadResult::Reloaded;
+    };
+    // Mirror the startup web-search gate: when EXA_API_KEY is not set, a
+    // malformed `[web_search]` section is a config error. The key value
+    // itself is NOT re-injected at runtime — `std::env::set_var` is only
+    // safe at startup (single-threaded), so web-search key changes still
+    // need a restart.
+    if std::env::var_os("EXA_API_KEY").is_none()
+        && let Err(error) = config.web_search_key()
+    {
+        return ReloadResult::Rejected(format!("{error:#}"));
+    }
+    let resolved = match resolved_profiles(&config, profile) {
+        Ok(resolved) => resolved,
+        Err(error) => return ReloadResult::Rejected(format!("{error:#}")),
+    };
+    let needs_chatgpt = resolved.main.auth == AuthMode::ChatGpt
+        || resolved
+            .roles
+            .values()
+            .any(|value| value.auth == AuthMode::ChatGpt);
+    let auth = if needs_chatgpt {
+        match &state.auth {
+            Some(auth) => Some(auth.clone()),
+            None => match CodexAuth::load() {
+                Ok(auth) => Some(auth),
+                Err(error) => {
+                    return ReloadResult::Rejected(format!(
+                        "the new config routes a profile to auth = `chatgpt` but ChatGPT login is not initialized: {error:#}"
+                    ));
+                }
+            },
+        }
+    } else {
+        None
+    };
+    match build_runtime_models(resolved, auth.as_ref(), base_url, model) {
+        Ok(models) => {
+            state.config = Some(config);
+            state.auth = auth;
+            state.models = Some(models);
+            ReloadResult::Reloaded
+        }
+        Err(error) => ReloadResult::Rejected(format!("{error:#}")),
+    }
+}
+
+/// Load the effective config for `root` and apply it through
+/// [`apply_reloaded_config`]. The shared core of [`SessionFactory::reload_config`]
+/// and the watcher task (which holds the reloadable cell, not the factory).
+fn reload_config_at(
+    reloadable: &RwLock<ReloadableState>,
+    root: &Path,
+    profile: Option<&str>,
+    base_url: &Option<String>,
+    model: &Option<String>,
+) -> ReloadResult {
+    match Config::load_for_workspace(root) {
+        Ok(loaded) => apply_reloaded_config(
+            &mut reloadable.write().unwrap(),
+            loaded,
+            profile,
+            base_url,
+            model,
+        ),
+        Err(error) => ReloadResult::Rejected(format!("{error:#}")),
+    }
+}
+
+/// The config file's mtime, or `None` when the file does not exist (yet).
+/// A missing file and a `modified()` failure both read as `None`-stable, so
+/// a stat error never turns into a reload every tick.
+fn config_file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH))
+}
+
+/// Whether any watched config file appeared, changed or disappeared since
+/// the last check. Updates the seen mtimes in place, so a rejection (bad
+/// edit) is not retried until the file changes again.
+fn watch_paths_changed(mtimes: &mut HashMap<PathBuf, Option<SystemTime>>) -> bool {
+    let mut changed = false;
+    for (path, seen) in mtimes.iter_mut() {
+        let now = config_file_mtime(path);
+        if now != *seen {
+            *seen = now;
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod hot_reload_tests {
+    use super::*;
+
+    /// A minimal valid config: one ApiKey profile resolving via the `PATH`
+    /// env var (always set), so validation needs no key files.
+    fn test_config(default: &str, extra_models: &str) -> Config {
+        let source = format!(
+            r#"default = "{default}"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+
+[models."p1/m1"]
+model = "m1"
+{extra_models}
+"#
+        );
+        toml::from_str(&source).expect("test config parses")
+    }
+
+    #[test]
+    fn reload_swaps_config_and_updates_runtime_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(test_config("p1/m1", "")),
+        );
+        assert_eq!(factory.model_profiles(), vec!["p1/m1"]);
+        assert_eq!(factory.main_model().display_name(), "test-model"); // models not pre-resolved by the test factory
+
+        let second = test_config(
+            "p1/m1",
+            r#"[models."p2/m2"]
+model = "m2"
+[providers.p2]
+base_url = "http://two"
+api_key_env = "PATH"
+"#,
+        );
+        let result = {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(&mut state, Some(second), None, &None, &None)
+        };
+        assert!(matches!(result, ReloadResult::Reloaded), "{result:?}");
+
+        // The swapped config feeds every runtime resolution path.
+        assert_eq!(factory.model_profiles(), vec!["p1/m1", "p2/m2"]);
+        // `resolve_profile` proves the new profile is now resolvable; the
+        // display name is the short form (after the last '/'), per
+        // `ConfiguredModel::display_name`.
+        assert_eq!(
+            factory.resolve_profile("p2/m2").unwrap().display_name(),
+            "m2"
+        );
+        assert_eq!(factory.main_model().display_name(), "m1");
+        assert_eq!(
+            factory.current_config().unwrap().model_profiles(),
+            vec!["p1/m1", "p2/m2"]
+        );
+    }
+
+    #[test]
+    fn reload_rejects_bad_config_and_keeps_previous() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(test_config("p1/m1", "")),
+        );
+        // The default points at a profile that does not exist.
+        let broken = test_config("nope/nope", "");
+        let result = {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(&mut state, Some(broken), None, &None, &None)
+        };
+        assert!(
+            matches!(result, ReloadResult::Rejected(_)),
+            "expected rejection, got {result:?}"
+        );
+        // Previous config stays untouched.
+        assert_eq!(factory.model_profiles(), vec!["p1/m1"]);
+        assert!(factory.resolve_profile("p1/m1").is_ok());
+    }
+
+    #[test]
+    fn reload_without_config_resets_to_no_config_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(test_config("p1/m1", "")),
+        );
+        let result = {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(&mut state, None, None, &None, &None)
+        };
+        assert!(matches!(result, ReloadResult::Reloaded));
+        assert!(factory.current_config().is_none());
+        assert!(factory.model_profiles().is_empty());
+        // No config → resolve_profile errors instead of panicking.
+        assert!(factory.resolve_profile("p1/m1").is_err());
+    }
+
+    #[test]
+    fn watch_paths_changed_detects_create_modify_and_remove() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let mut mtimes = HashMap::from([(path.clone(), config_file_mtime(&path))]);
+        assert!(!watch_paths_changed(&mut mtimes), "absent → absent");
+        std::fs::write(&path, "default = \"p1/m1\"").unwrap();
+        assert!(watch_paths_changed(&mut mtimes), "file appeared");
+        assert!(!watch_paths_changed(&mut mtimes), "stable mtime");
+        // Writes within the same mtime-granularity tick would be invisible
+        // to pure mtime polling; pace the test writes like real edits.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "default = \"p2/m2\"").unwrap();
+        assert!(watch_paths_changed(&mut mtimes), "file modified");
+        assert!(!watch_paths_changed(&mut mtimes));
+        std::fs::remove_file(&path).unwrap();
+        assert!(watch_paths_changed(&mut mtimes), "file removed");
+    }
+
+    #[test]
+    fn profile_override_is_preserved_through_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut factory = SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(test_config("p1/m1", "")),
+        );
+        factory.profile = Some("p1/m1".to_owned());
+        let second = test_config(
+            "p1/m1",
+            r#"[models."p2/m2"]
+model = "m2"
+[providers.p2]
+base_url = "http://two"
+api_key_env = "PATH"
+"#,
+        );
+        let result = {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(
+                &mut state,
+                Some(second),
+                factory.profile.as_deref(),
+                &None,
+                &None,
+            )
+        };
+        assert!(matches!(result, ReloadResult::Reloaded), "{result:?}");
+        assert_eq!(
+            factory.resolve_profile("p2/m2").unwrap().display_name(),
+            "m2"
+        );
+    }
+
+    #[test]
+    fn reload_config_reloads_from_edited_file_end_to_end() {
+        // Env isolation: serialize with the roles/delegate tests that mutate
+        // the shared XDG_CONFIG_HOME env var (same lock they use).
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg");
+        let config_dir = xdg.join("e-agent");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_file = config_dir.join("config.toml");
+        let write_config = |contents: &str| {
+            std::fs::write(&config_file, contents).unwrap();
+            // Pace writes like real edits: two writes within the same
+            // mtime-granularity tick would be invisible to mtime polling.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        write_config(
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+
+[models."p1/m1"]
+model = "m1"
+"#,
+        );
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+        // A factory whose reloadable cell starts empty: reload_config() must
+        // pick the file up from disk, exactly like the watcher does.
+        let factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        assert!(factory.current_config().is_none());
+        assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        assert_eq!(factory.model_profiles(), vec!["p1/m1"]);
+        assert_eq!(factory.main_model().display_name(), "m1");
+
+        // Edit the file: the reload picks the new profile up.
+        write_config(
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+
+[providers.p2]
+base_url = "http://two"
+api_key_env = "PATH"
+
+[models."p1/m1"]
+model = "m1"
+
+[models."p2/m2"]
+model = "m2"
+"#,
+        );
+        assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        assert_eq!(factory.model_profiles(), vec!["p1/m1", "p2/m2"]);
+        assert!(factory.resolve_profile("p2/m2").is_ok());
+
+        // A broken edit is rejected and the previous config stays.
+        write_config("default = \"nope/nope\"\n");
+        assert!(matches!(factory.reload_config(), ReloadResult::Rejected(_)));
+        assert_eq!(factory.model_profiles(), vec!["p1/m1", "p2/m2"]);
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 }
