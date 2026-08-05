@@ -314,7 +314,9 @@
     text-align: center;
     white-space: nowrap;
   }
-  .busy-dot-wrap > .busy-dot-overflow { left: 17px; top: 5px; }
+  /* 徽章贴容器右缘、垂直居中偏上，避开环绕椭圆（右点中心 18,10）——
+     原 left:17 top:5 与 N>6 时右上环绕点重叠，移动端小屏更明显。 */
+  .busy-dot-wrap > .busy-dot-overflow { right: 0; top: 1px; left: auto; }
 
   .status-chip {
     font-size: 12px;

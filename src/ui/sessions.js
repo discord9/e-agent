@@ -1891,9 +1891,12 @@ function buildTreeRoot(s, kids, wsId) {
   // 计数，避免闪烁。主点只表达父会话自身状态；每个环绕点对应一个任务：
   // bash 任务恒红（一直在跑），delegate 任务按对应 subagent 会话的 busy
   // 判定——busy:true 红点，busy:false（Idle 在等）绿点。
+  // state.tasks.list 是多 workspace 聚合全量：按 session_id 匹配父会话即
+  // 覆盖所有 workspace（session id 全局唯一），_ws 标记再按本 workspace
+  // 精确过滤（防御跨 workspace 同 id 的极端情况）。
   const tasksLoaded = state.tasks && Array.isArray(state.tasks.list);
   const parentTasks = tasksLoaded
-    ? state.tasks.list.filter((t) => t.session_id === s.id)
+    ? state.tasks.list.filter((t) => t.session_id === s.id && (!t._ws || t._ws === wsId))
     : null;   // 未加载 → 回退 kids 计数
   const runningKidCount = parentTasks === null
     ? kids.filter(isSubagentRunning).length
@@ -1911,7 +1914,11 @@ function buildTreeRoot(s, kids, wsId) {
   // 小尺寸侧栏状态标记过密。位置按任务列表顺序均匀选取。
   const hasOverflow = runningKidCount > 6;
   const visibleKidDots = Math.min(runningKidCount, 6);
-  const RX = 9, RY = 7, CX = 10, CY = 10;   // 主点 (10,10)，椭圆半径
+  // 环绕半径按"点中心围绕主点中心 (10,10)、且 4px 点不溢出 28×20 容器"标定：
+  // left/top 是点左上角，须减点半径 2 让点中心落在椭圆上——否则环视觉中心
+  // 偏右下，移动端窄行高下主点明显不在环心。RX=8：右点中心 18，给右侧 +N
+  // 徽章（贴容器右缘）留位；RY=6：底点中心 16、底缘 18 ≤ 20 不溢出。
+  const RX = 8, RY = 6, CX = 10, CY = 10;   // 主点中心 (10,10)，椭圆半径
   for (let i = 0; i < visibleKidDots; i++) {
     const t = parentTasks ? parentTasks[i] : null;
     // delegate 任务在等（对应 subagent busy:false）→ 绿点；其余（bash /
@@ -1920,8 +1927,8 @@ function buildTreeRoot(s, kids, wsId) {
     // 单个点: 顶部 (12 点方向)；两个点: 上下对称；N 个点: 均匀环绕。
     const angle = -Math.PI / 2 + (2 * Math.PI * i) / visibleKidDots;
     const subDot = el("span", "busy-dot-sub" + (green ? " green" : ""));
-    subDot.style.left = (CX + Math.cos(angle) * RX).toFixed(1) + "px";
-    subDot.style.top = (CY + Math.sin(angle) * RY).toFixed(1) + "px";
+    subDot.style.left = (CX + Math.cos(angle) * RX - 2).toFixed(1) + "px";
+    subDot.style.top = (CY + Math.sin(angle) * RY - 2).toFixed(1) + "px";
     subDot.title = parentTasks
       ? taskDotTitle(t, i + 1, runningKidCount)
       : "子任务 " + (i + 1) + "/" + runningKidCount;
