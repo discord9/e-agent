@@ -1914,24 +1914,32 @@ function buildTreeRoot(s, kids, wsId) {
   // 小尺寸侧栏状态标记过密。位置按任务列表顺序均匀选取。
   const hasOverflow = runningKidCount > 6;
   const visibleKidDots = Math.min(runningKidCount, 6);
-  // 环绕点绕主点中心作正圆（RX=RY=R）：椭圆 (RX≠RY) 会让等角分布的点在
-  // 主轴/副轴上间距不一，视觉上"这边挤那边松"而显歪；正圆上任意 N 个
-  // 等角点的相邻弦长严格相等，环始终匀称。24×24 正方形画布几何中心即
-  // (12,12)，与主点中心重合——环与主点同心，不偏不歪。
+  // 环绕点绕主点中心作正圆（R 为半径）：rotate + translateY 方案。
+  // 每个环绕点的定位/旋转轴由 CSS 固定在主点中心 (12,12)（left/top:10px
+  // 让点中心对齐，transform-origin:50% 50% 把旋转轴设在点中心）；这里只
+  // 用 transform 把点沿径向推出去——
+  //   transform: rotate(θ) translateY(-R)
+  // CSS transform 列表从右往左应用：先 translateY(-R) 沿自身 Y 轴上移 R，
+  // 再 rotate(θ) 绕点中心（=主点中心）顺时针转 θ，点中心精确落在半径 R 的
+  // 圆上。因为旋转轴就是主点中心，点与主点共用同一套 transform 居中机制，
+  // 任何任务数、任何 DPR（含 1.25/1.5 非整数缩放）下都严格同心——不再有
+  // 「主点 transform 居中、环绕点 left 居中」两套机制的亚像素错位，也不再
+  // 手工 cos/sin、硬编码减点半径。
   // R=8 由不重叠约束标定：主点半径 3 + 环绕点半径 2 = 5，中心距 8 留出
   // 3px 净间隙，环绕点与主点清晰分开不粘连；点缘最远 12+8+2=22 ≤ 24 不
-  // 溢出画布。left/top 是点左上角，须减点半径 2 让点中心落在圆上。
-  const R = 8, CX = 12, CY = 12;   // 主点中心 (12,12)，正圆半径
+  // 溢出画布。正圆上任意 N 个等角点相邻弦长严格相等，环始终匀称不歪。
+  const R = 8;   // 正圆半径（主点中心到环绕点中心的距离）
   for (let i = 0; i < visibleKidDots; i++) {
     const t = parentTasks ? parentTasks[i] : null;
     // delegate 任务在等（对应 subagent busy:false）→ 绿点；其余（bash /
     // busy:true / 找不到会话）→ 红点。回退模式（tasks 未加载）全红。
     const green = t !== null && taskIsWaitingGreen(t, kids);
     // 单个点: 顶部 (12 点方向)；两个点: 上下对称；N 个点: 均匀环绕。
-    const angle = -Math.PI / 2 + (2 * Math.PI * i) / visibleKidDots;
+    // angle 从 12 点方向起、顺时针（CSS rotate 正值为顺时针，与"从顶部顺
+    // 时针均匀分布"天然吻合），与旧 cos/sin 布局逐点重合。
+    const angle = (2 * Math.PI * i) / visibleKidDots;
     const subDot = el("span", "busy-dot-sub" + (green ? " green" : ""));
-    subDot.style.left = (CX + Math.cos(angle) * R - 2).toFixed(1) + "px";
-    subDot.style.top = (CY + Math.sin(angle) * R - 2).toFixed(1) + "px";
+    subDot.style.transform = `rotate(${angle}rad) translateY(${-R}px)`;
     subDot.title = parentTasks
       ? taskDotTitle(t, i + 1, runningKidCount)
       : "子任务 " + (i + 1) + "/" + runningKidCount;

@@ -289,6 +289,15 @@
     position: absolute;
     width: 4px;
     height: 4px;
+    /* 初始定位到主点中心 (12,12)：left/top 是点左上角，减去点半径 2 让点
+       中心落在画布几何中心。transform-origin:50% 50% 把旋转轴设在点中心
+       （即主点中心），JS 的 rotate(θ) translateY(-R) 便绕主点中心精确
+       旋转——点中心始终落在半径 R 的正圆上，与主点共用同一套 transform
+       居中机制，任何 DPR 下都严格同心（不再有 left vs transform 两套机制
+       的亚像素错位）。点半径只在 top/left 各出现一次，无散落魔法数。 */
+    left: 10px;                /* 12 − 2（点半径） */
+    top: 10px;
+    transform-origin: 50% 50%;
     border-radius: 50%;
     background: var(--red);
     /* 0.5px 发丝光环：24px 紧凑画布内 1px 白边会让 Ø4 点视觉胀成 Ø6
