@@ -114,21 +114,79 @@ fn short_workspace_id(root: &std::path::Path) -> String {
     format!("{hash:08x}")
 }
 
+/// 一条「随进程被杀」汇总 Notice 的文本。`own` 是该会话自己的死行
+/// （已格式化的 `task {id}: {label}` 行）；`killed_subagents` 是
+/// （子会话 label, 该子会话的死 delegate 行数）列表——父会话把被杀子
+/// 会话汇总成一行。两者都为空 → `None`（扫描跳过，不注入空 Notice）。
+/// 头部 N 统计自己的任务 + 各子会话的 delegate 行数（每条 delegate 行
+/// 就是一个被杀的后台任务）。纯函数，便于单测。
+fn killed_notice_text(own: &[String], killed_subagents: &[(String, usize)]) -> Option<String> {
+    if own.is_empty() && killed_subagents.is_empty() {
+        return None;
+    }
+    let n = own.len()
+        + killed_subagents
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<usize>();
+    let mut text = format!(
+        "[e-agent exited with {n} background task(s) still running; they were killed with the process. Re-run them if still needed:]"
+    );
+    if !own.is_empty() {
+        text.push('\n');
+        text.push_str(&own.join("\n"));
+    }
+    if !killed_subagents.is_empty() {
+        text.push('\n');
+        text.push_str("被杀子会话: ");
+        text.push_str(
+            &killed_subagents
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>()
+                .join("、"),
+        );
+    }
+    Some(text)
+}
+
 /// 启动时的僵尸后台任务扫描：上次进程退出时被杀的后台任务在重启后
-/// 静默消失（`/api/tasks` 只列 live registry，重启后恒空）。遍历所有
-/// 会话（含 subagent 会话——running_tasks 行可能记在子会话名下），对
-/// 每个会话探测其未完成记录的全部 owner 是否已死
-/// （`unfinished_owner_all_dead`，任何不确定性保守 false）；全死 → 消费
-/// 记录并注入「随进程被杀」Notice 到该会话的存储（append，不建 live
-/// agent；会话下次 resume/attach 时 `restore_history` 自然读到）。任何
-/// 单会话失败只 eprintln，不阻塞启动、不 panic。
+/// 静默消失（`/api/tasks` 只列 live registry，重启后恒空）。遍历
+/// list_meta 所有会话，探测未完成记录的全部 owner 是否已死
+/// （`unfinished_owner_all_dead`，任何不确定性保守 false）；**只往父
+/// 会话注入一条汇总 Notice，绝不复活子会话**（不向子会话 append 任何
+/// entry、不改 last_active_at、不留新内容）。
 ///
-/// 幂等性：注入与 resume 的 Consume 共用 `inject_killed_notice`，take 是
-/// 原子消费——启动扫描先执行则 resume 时行已清空、不再注入；resume 先
-/// 执行则扫描 take 为空、跳过。探测用 workspace 级 meta store（session
-/// id 是参数，零额外连接）；只有需要消费+注入时才按会话 connect 一个
-/// store（append 需要绑定该会话的游标/序列）。
-async fn scan_zombie_background_tasks(
+/// 两遍扫描：
+/// - 第一遍（只读探测，不消费）：每个会话的行组（`session_id = 该会话`）
+///   是否全死。parent_session_id 为空 → 父会话（死组记入 dead_main）；
+///   非空 → 子会话（死组记入 dead_child——通常为空，子会话只有被
+///   resume 后跑过 bash 才可能留下自己的行）。
+/// - 第二遍（消费 + 汇总）：
+///   1. 子会话名下的死 delegate 行（`subagent_session_id = 子会话`，
+///      物理上记在父会话的行组里）：父会话行组全死（dead_main）→ 这些
+///      行随父一起死，用 `take_unfinished_background_for_subagent` 消费
+///      （label 从侧边栏自然消失），label + 数量汇总到父会话；父会话
+///      已删（不在 list_meta）→ 该子会话的死行单独消费、无处汇总
+///      （eprintln 记录）。
+///   2. 子会话自己的死行组（dead_child）：take 消费，不注入任何 entry。
+///   3. 父会话（dead_main）：先 take 自己的死行（子会话的 delegate 行
+///      已被第 1 步消费，剩下的是自己的 bash 行 + 已删子会话的 delegate
+///      行），再拼上第 1 步的汇总 → 一条 Notice append。自己的死行与
+///      子会话汇总都为空 → 跳过。
+///
+/// 幂等性：所有消费都是原子 take（SQLite/Greptime DELETE、JSONL 删记录
+/// 文件），消费后下次扫描 take 为空、不再触发；与并发 resume 的竞态
+/// （两遍之间 resume 抢先把行消费掉）可接受——谁先 take 谁生效，与
+/// 现有幂等语义一致。探测用 workspace 级 meta store（session id 是参数，
+/// 零额外连接）；只有需要消费+注入时才按会话 connect 一个 store。
+///
+/// JSONL 没有按 subagent_session_id 的消费原语
+/// （`take_unfinished_background_for_subagent` 恒空），子会话的 delegate
+/// 行随父会话自己的 take 一并消费，以旧格式 `(session: …)` 内联在父
+/// 会话的 Notice 里；「不注入子会话、label 消失、父会话单条 Notice」
+/// 的语义不变。任何单会话失败只 eprintln，不阻塞启动、不 panic。
+pub(crate) async fn scan_zombie_background_tasks(
     meta_store: &SessionStore,
     backend: &crate::config::SessionBackend,
     root: &std::path::Path,
@@ -140,38 +198,148 @@ async fn scan_zombie_background_tasks(
             return;
         }
     };
-    let mut injected = 0usize;
+    // 第一遍：只读探测，不消费任何行。
+    let mut all: HashSet<&str> = HashSet::new();
+    let mut dead_main: Vec<&str> = Vec::new(); // parent 为空（父会话）
+    let mut dead_child: Vec<&str> = Vec::new(); // parent 非空（子会话）
     for meta in &metas {
-        let session = &meta.session_id;
-        match meta_store.unfinished_owner_all_dead(root, session).await {
-            Ok(true) => {
-                let store = match SessionStore::connect(backend, root, session).await {
-                    Ok(store) => store,
-                    Err(error) => {
-                        eprintln!(
-                            "e-agent: zombie scan: cannot connect session {session}: {error:#}"
-                        );
-                        continue;
-                    }
-                };
-                match crate::session_factory::inject_killed_notice(&store, root, session).await {
-                    Ok(Some(_entry)) => {
-                        injected += 1;
-                        eprintln!(
-                            "e-agent: zombie scan: injected killed-task notice into session {session}"
-                        );
-                    }
-                    Ok(None) => {} // 记录已被并发 resume 消费：幂等，跳过
-                    Err(error) => {
-                        eprintln!(
-                            "e-agent: zombie scan: cannot inject notice into session {session}: {error:#}"
-                        );
-                    }
-                }
-            }
+        all.insert(meta.session_id.as_str());
+        match meta_store
+            .unfinished_owner_all_dead(root, &meta.session_id)
+            .await
+        {
+            Ok(true) => match meta.parent_session_id {
+                None => dead_main.push(&meta.session_id),
+                Some(_) => dead_child.push(&meta.session_id),
+            },
             Ok(false) => {} // 仍有存活 owner 或无法判定：留给 owner/Preserve 自行清理
             Err(error) => {
-                eprintln!("e-agent: zombie scan: cannot probe session {session}: {error:#}");
+                eprintln!(
+                    "e-agent: zombie scan: cannot probe session {}: {error:#}",
+                    meta.session_id
+                );
+            }
+        }
+    }
+    // 第二遍 (1)：子会话名下的死 delegate 行。父会话行组全死 → 随父一起
+    // 死，消费并汇总到父；父会话已删（不在 list_meta）→ 单独消费、无处
+    // 汇总（eprintln 记录）。父会话在 list_meta 但行组未全死 → 跳过，
+    // 行留给 live 进程自行清理。
+    let dead_main_set: HashSet<&str> = dead_main.iter().copied().collect();
+    let mut children_summary: HashMap<&str, Vec<(String, usize)>> = HashMap::new();
+    for meta in &metas {
+        let Some(parent) = meta.parent_session_id.as_deref() else {
+            continue; // 父会话（parent 为空）在 (3) 处理
+        };
+        let parent_dead = dead_main_set.contains(parent);
+        if !parent_dead && all.contains(parent) {
+            continue;
+        }
+        let store = match SessionStore::connect(backend, root, &meta.session_id).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!(
+                    "e-agent: zombie scan: cannot connect session {}: {error:#}",
+                    meta.session_id
+                );
+                continue;
+            }
+        };
+        // 先取 label（消费后 label 查询就空了），再消费死行。
+        let label = match store.label_for_subagent(root, &meta.session_id).await {
+            Ok(label) => label.unwrap_or_else(|| meta.session_id.clone()),
+            Err(error) => {
+                eprintln!(
+                    "e-agent: zombie scan: cannot look up subagent label for session {}: {error:#}",
+                    meta.session_id
+                );
+                meta.session_id.clone()
+            }
+        };
+        let rows = match store
+            .take_unfinished_background_for_subagent(root, &meta.session_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!(
+                    "e-agent: zombie scan: cannot consume subagent tasks for session {}: {error:#}",
+                    meta.session_id
+                );
+                continue;
+            }
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        if parent_dead {
+            children_summary
+                .entry(parent)
+                .or_default()
+                .push((label, rows.len()));
+        } else {
+            eprintln!(
+                "e-agent: zombie scan: consumed {} killed delegate task(s) of orphan subagent {} (parent {} is gone from the session list)",
+                rows.len(),
+                meta.session_id,
+                parent
+            );
+        }
+    }
+    // 第二遍 (2)：子会话自己的死行组。消费（清理 label 与记录），但
+    // 不注入任何 entry——子会话不被复活。
+    for child in &dead_child {
+        let store = match SessionStore::connect(backend, root, child).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("e-agent: zombie scan: cannot connect session {child}: {error:#}");
+                continue;
+            }
+        };
+        if let Err(error) = store.take_unfinished_background(root, child).await {
+            eprintln!(
+                "e-agent: zombie scan: cannot consume own tasks of subagent session {child}: {error:#}"
+            );
+        }
+    }
+    // 第二遍 (3)：父会话。自己的死行 + 子会话汇总 → 一条 Notice。
+    let mut injected = 0usize;
+    for parent in dead_main {
+        let store = match SessionStore::connect(backend, root, parent).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("e-agent: zombie scan: cannot connect session {parent}: {error:#}");
+                continue;
+            }
+        };
+        let own = match store.take_unfinished_background(root, parent).await {
+            Ok(own) => own,
+            Err(error) => {
+                eprintln!(
+                    "e-agent: zombie scan: cannot consume own tasks of session {parent}: {error:#}"
+                );
+                continue;
+            }
+        };
+        let killed_subagents = children_summary.remove(parent).unwrap_or_default();
+        let Some(text) = killed_notice_text(&own, &killed_subagents) else {
+            continue; // 自己的死行与子会话汇总都为空：跳过
+        };
+        let entry = SessionEntry::Notice { text };
+        match store
+            .append(root, parent, std::slice::from_ref(&entry))
+            .await
+        {
+            Ok(()) => {
+                injected += 1;
+                eprintln!(
+                    "e-agent: zombie scan: injected killed-task notice into session {parent}"
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "e-agent: zombie scan: cannot inject notice into session {parent}: {error:#}"
+                );
             }
         }
     }
@@ -229,10 +397,11 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
     );
     // 僵尸后台任务扫描：spawn 一个异步任务，启动即扫（不等第一次请求）。
     // 上次进程退出时被杀的后台任务重启后静默消失（/api/tasks 只列 live
-    // registry），这里把「N 个后台任务随进程被杀」Notice 注入到对应会话的
-    // 存储，用户下次打开任何会话都能看到提示。不阻塞启动；与用户首次
-    // resume 同一会话的竞态可接受（take 原子消费，谁先执行谁注入，天然
-    // 幂等——见 scan_zombie_background_tasks 的文档）。
+    // registry），这里把「N 个后台任务随进程被杀」汇总 Notice 只注入到
+    // 父会话（子会话只消费不注入、不复活），用户下次打开父会话就能看到
+    // 提示。不阻塞启动；与用户首次 resume 同一会话的竞态可接受（take
+    // 原子消费，谁先执行谁生效，天然幂等——见
+    // scan_zombie_background_tasks 的文档）。
     {
         let scan_meta_store = state.meta_store.clone();
         let scan_backend = state.factory.backend().clone();
@@ -2722,6 +2891,56 @@ mod tests {
             "existing token must be reused, not regenerated"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn killed_notice_text_skips_when_nothing_died() {
+        // 自己的死行与子会话汇总都为空 → None：扫描跳过，不注入空 Notice。
+        assert_eq!(killed_notice_text(&[], &[]), None);
+        assert_eq!(killed_notice_text(&[], &[]), None);
+    }
+
+    #[test]
+    fn killed_notice_text_counts_own_and_subagent_tasks() {
+        // 父会话自己的 2 个死 bash 行 + 2 个子会话（分别 2 / 1 条死
+        // delegate 行）→ 一条汇总：N = 2 + 2 + 1 = 5，自己的任务逐行列出，
+        // 子会话 label 以「、」连接成一行。
+        let own = vec![
+            "task 1: npm run dev".to_owned(),
+            "task 2: sleep 100".to_owned(),
+        ];
+        let killed = vec![
+            ("btw: 分析日志".to_owned(), 2usize),
+            ("task: 修 bug".to_owned(), 1usize),
+        ];
+        let text = killed_notice_text(&own, &killed).expect("non-empty notice");
+        assert!(
+            text.starts_with(
+                "[e-agent exited with 5 background task(s) still running; \
+                 they were killed with the process. Re-run them if still needed:]"
+            ),
+            "got: {text}"
+        );
+        assert!(text.contains("task 1: npm run dev"));
+        assert!(text.contains("task 2: sleep 100"));
+        assert!(text.contains("被杀子会话: btw: 分析日志、task: 修 bug"));
+    }
+
+    #[test]
+    fn killed_notice_text_handles_only_subagents_or_only_own() {
+        // 只有子会话被杀：N 只计子会话的 delegate 行数。
+        let only_subagents =
+            killed_notice_text(&[], &[("sub-label".to_owned(), 3usize)]).expect("non-empty notice");
+        assert!(
+            only_subagents.starts_with("[e-agent exited with 3 background task(s) still running")
+        );
+        assert!(only_subagents.contains("被杀子会话: sub-label"));
+        // 只有自己的死行：与旧格式完全一致（inject_killed_notice 的行为）。
+        let only_own =
+            killed_notice_text(&["task 7: cargo test".to_owned()], &[]).expect("non-empty notice");
+        assert!(only_own.starts_with("[e-agent exited with 1 background task(s) still running"));
+        assert!(only_own.contains("task 7: cargo test"));
+        assert!(!only_own.contains("被杀子会话"));
     }
 
     #[test]

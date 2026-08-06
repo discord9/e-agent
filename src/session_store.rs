@@ -3527,10 +3527,11 @@ mod tests {
             );
         }
 
-        /// `inject_killed_notice` 的端到端契约（server 启动僵尸扫描与
-        /// build_session 的 Consume 路径共用）：dead-owner 的 running_tasks
-        /// 行 → 消费 + Notice 追加到存储（无 live agent 也能注入，这是启动
-        /// 扫描的场景）；再次调用幂等返回 None。与 resume 路径同源，天然幂等。
+        /// `inject_killed_notice` 的端到端契约（build_session 的 Consume
+        /// 路径；server 启动僵尸扫描已改为两遍汇总、只往父会话注入，不再
+        /// 调用它——见 server.rs `scan_zombie_background_tasks`）：dead-owner
+        /// 的 running_tasks 行 → 消费 + Notice 追加到存储（无 live agent 也能
+        /// 注入）；再次调用幂等返回 None。与 resume 路径同源，天然幂等。
         #[tokio::test]
         async fn sqlite_inject_killed_notice_consumes_and_appends_without_live_agent() {
             let (_dir, path) = temp_db();
