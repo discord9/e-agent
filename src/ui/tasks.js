@@ -524,10 +524,10 @@ function buildTaskRow(t, key, restoreExpanded) {
       for (const tag of tags) tagBox.appendChild(tag);
       line.appendChild(tagBox);
     }
-    // 会话标识：delegate 任务显示 subagent 自己的会话（点击跳转的目标），
-    // 其余任务显示父会话。bash 任务优先显示父会话的 title（从会话列表缓存
-    // 查，hover 放完整 id + title），无 title / 查不到才回退「会话 <id>」；
-    // delegate 任务无 title 概念（显示 subagent session id，点击跳转）。
+    // 会话标识：delegate 任务显示 subagent 自己的会话 id（点击跳转的目标；
+    // 它的 title 就是 task-label，已在上面显示，不再重复）。bash 任务显示
+    // 父会话——优先显示父会话的 title（从会话列表缓存查，hover 放完整 id +
+    // title），无 title / 查不到才回退「会话 <id>」。
     const sidShown = isDelegate ? (t.subagent_session_id || t.session_id) : t.session_id;
     if (sidShown) {
       let sidLabel = "会话 " + sidShown;
