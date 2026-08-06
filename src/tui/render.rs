@@ -974,6 +974,7 @@ mod format_task_label_tests {
             kind: "delegate".into(),
             output: vec![],
             display_meta,
+            owner_session: None,
         }
     }
 
@@ -1049,6 +1050,7 @@ mod format_task_label_tests {
             kind: "bash".into(),
             output: vec![],
             display_meta: None,
+            owner_session: None,
         };
         assert_eq!(format_task_label(&task, "", 40), "  #10: echo hi");
     }

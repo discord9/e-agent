@@ -2647,6 +2647,73 @@ async function main(){
         && prow.querySelectorAll(".tsid").length === 1,
         "parent=" + String(prow.querySelector(".tparent")));
 
+    // ---- 任务行发起者（owner_session）：bash 任务显示发起者而非 registry 所属会话 ----
+    // subagent 里跑的后台 bash：t.session_id 是父会话（registry 所属），
+    // t.owner_session 是 subagent 自己的会话 id。会话标识应查 owner_session
+    // 的 title/label（subagent 的 title 可能为空，label 优先），而不是父会话。
+    // (a) owner_session 的会话有 title → 显示发起者 title，hover 带完整标题 + id
+    state.workspaceLists[parentListKey] = [
+      { id: "s1", title: "主会话标题", status: "Idle", active: true },
+      { id: "sub-9", parent_session_id: "s1", title: "子代理标题", label: "子任务标签",
+        status: "Idle", active: true },
+    ];
+    renderTaskList([{ session_id: "s1", id: 89, kind: "bash", label: "构建",
+      full_command: "cargo build", output: "", role: null, owner_session: "sub-9" }],
+      elsById["composerTasks"]);
+    let qrow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    let qtsid =  qrow.querySelectorAll(".tsid");
+    chk("bash row shows owner title for subagent bash task",
+       qtsid.length === 1 && qtsid[0].textContent === "子代理标题",
+        "tsid=" + qtsid.map((e) => e.textContent).join("|"));
+    chk("owner title hover carries full title + id",
+       qtsid.length === 1 && qtsid[0].title === "sub-9: 子代理标题",
+        "title=" + ( qtsid[0] ? qtsid[0].title : ""));
+    // (b) 发起者 title 为空、只有 label → label 优先显示（不是主会话 title，也不是 id）
+    state.workspaceLists[parentListKey] = [
+      { id: "s1", title: "主会话标题", status: "Idle", active: true },
+      { id: "sub-8", parent_session_id: "s1", title: null, label: "子任务标签",
+        status: "Idle", active: true },
+    ];
+    renderTaskList([{ session_id: "s1", id: 91, kind: "bash", label: "测试",
+      full_command: "cargo test", output: "", role: null, owner_session: "sub-8" }],
+      elsById["composerTasks"]);
+    qrow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+   qtsid = qrow.querySelectorAll(".tsid");
+    chk("bash row falls back to owner label when title empty",
+       qtsid.length === 1 && qtsid[0].textContent === "子任务标签",
+        "tsid=" + qtsid.map((e) => e.textContent).join("|"));
+    // (c) owner_session === session_id（主会话任务）→ 保持旧行为：显示主会话 title
+    renderTaskList([{ session_id: "s1", id: 92, kind: "bash", label: "主构建",
+      full_command: "make", output: "", role: null, owner_session: "s1" }],
+      elsById["composerTasks"]);
+    qrow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+   qtsid = qrow.querySelectorAll(".tsid");
+    chk("bash row with owner==session keeps main session title",
+       qtsid.length === 1 && qtsid[0].textContent === "主会话标题",
+        "tsid=" + qtsid.map((e) => e.textContent).join("|"));
+    // (d) owner_session 查不到（列表未刷新/已删）→ 回退「会话 <owner_id>」
+    state.workspaceLists[parentListKey] = [
+      { id: "s1", title: "主会话标题", status: "Idle", active: true },
+    ];
+    renderTaskList([{ session_id: "s1", id: 93, kind: "bash", label: "孤儿发起",
+      full_command: "ls", output: "", role: null, owner_session: "sub-ghost" }],
+      elsById["composerTasks"]);
+    qrow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+   qtsid = qrow.querySelectorAll(".tsid");
+    chk("bash row falls back to owner id when owner missing from list",
+       qtsid.length === 1 && qtsid[0].textContent === "会话 sub-ghost",
+        "tsid=" + qtsid.map((e) => e.textContent).join("|"));
+    // (e) 无 owner_session（旧后端/未知）→ 回退 session_id 查主会话 title
+    renderTaskList([{ session_id: "s1", id: 94, kind: "bash", label: "老数据",
+      full_command: "ls", output: "", role: null }],
+      elsById["composerTasks"]);
+    qrow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+   qtsid = qrow.querySelectorAll(".tsid");
+    chk("bash row without owner_session keeps old session_id display",
+       qtsid.length === 1 && qtsid[0].textContent === "主会话标题",
+        "tsid=" + qtsid.map((e) => e.textContent).join("|"));
+    state.workspaceLists[parentListKey] = savedParentList;   // 还原
+
     // ---- 任务行序号：#<id>（后端 TaskMeta.id）----
     // 有 id → badge 后、label 前显示 #<id>；无 id → 安静省略
     renderTaskList([{ session_id: "s1", id: 90, kind: "delegate", label: "序号任务",

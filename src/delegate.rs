@@ -395,6 +395,13 @@ impl Delegate {
                 "\n\nThis role is read-only: no write_file/edit_file; bash, when present, runs in a read-only sandbox with network disabled.",
             );
         }
+        // 后台 bash 任务完成时会自动以 `[background task N completed]` 消息注入
+        // 到本会话（普通 delegate 与 btw fork 的 runner 都走这条路径），无需轮询：
+        // dispatch 后台任务后继续其它工作或直接等待即可，不要反复调用
+        // get_background_tasks / sleep 重查。
+        instructions.push_str(
+            "\n\n后台任务（background bash）完成时会自动以 `[background task N completed]` 消息注入，无需轮询：dispatch 后台任务后继续其它工作或直接等待即可，不要反复调用 get_background_tasks / sleep 重查。",
+        );
         if let Some(content) = agents_instructions {
             instructions.push_str("\n\n## AGENTS.md\n\n");
             instructions.push_str(&content);
@@ -406,6 +413,13 @@ impl Delegate {
         let store = SessionStore::connect(&persist.backend, &persist.root, &persist.session_id)
             .await
             .map_err(|e| format!("subagent failed: {e:#}"))?;
+        // 把 subagent 的后台 bash 任务记到它自己的 session 名下：after_tool_entry
+        // 借此登记 subagent 的 bash 任务（此前 background_record 为 None，subagent
+        // 的 bash 任务既不进 running_tasks 重启后丢失，面板也定位不到发起者）。
+        // store 是 subagent 自己的（persist 绑定 session_id），root 同 workspace；
+        // take_unfinished_background 按 session 消费（服务器僵尸扫描对子会话行组
+        // 单独消费），与主会话路径兼容。
+        agent.record_background_tasks_in(persist.root.clone(), &persist.session_id, store.clone());
         let (runner, handle) =
             SessionRunner::new(agent, store, persist.root, persist.session_id, policy);
         let runner = runner.with_finalize_wait(finalize_wait);

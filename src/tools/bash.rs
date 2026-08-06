@@ -25,6 +25,7 @@ pub fn bash_tool(
     sandbox: Option<crate::config::Sandbox>,
     protect_git: bool,
     timeout: Option<Duration>,
+    self_session_id: Option<String>,
 ) -> Result<Box<dyn Tool>, String> {
     let shell = Shell::detect()?;
     Ok(Box::new(Bash {
@@ -35,6 +36,10 @@ pub fn bash_tool(
         sandbox,
         protect_git,
         shell,
+        // 发起者会话：subagent 传自己的 session id（None = 主会话/未知）。
+        // 后台 bash 任务记到共享 registry 时带它，任务面板才能显示真正的
+        // 发起者而非 registry 所属会话。
+        owner_session: self_session_id,
     }))
 }
 
@@ -53,6 +58,9 @@ pub(super) struct Bash {
     pub(super) protect_git: bool,
     /// Resolved platform shell (pwsh on Windows, bash elsewhere).
     pub(super) shell: Shell,
+    /// 发起者会话 id（subagent 为它自己的 session id，主会话为 None）：
+    /// 后台 bash 任务在共享 registry 里用它标注发起者。
+    pub(super) owner_session: Option<String>,
 }
 
 #[async_trait]
@@ -169,6 +177,7 @@ impl Tool for Bash {
                     command.to_owned(),
                     self.protect_git,
                     self.sandbox.clone(),
+                    self.owner_session.clone(),
                 );
             }
             // Background commands run under THIS facade's sandbox (possibly a
@@ -180,6 +189,7 @@ impl Tool for Bash {
                 self.protect_git,
                 self.sender.clone(),
                 self.sandbox.clone(),
+                self.owner_session.clone(),
             );
         }
         run_bash(

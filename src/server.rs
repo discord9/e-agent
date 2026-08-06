@@ -973,6 +973,11 @@ pub struct TaskMeta {
     pub subagent_session_id: Option<String>,
     /// The resumed subagent session id (delegate tasks); `None` otherwise.
     pub resume: Option<String>,
+    /// The session that started this task; `None`/unknown falls back to
+    /// `session_id` (the registry owner). For a subagent's bash task this
+    /// is the subagent's own session id — the task panel shows the true
+    /// initiator instead of the parent session.
+    pub owner_session: Option<String>,
 }
 
 /// Cap for `TaskMeta.output`. The per-task output tail is already capped at
@@ -1012,6 +1017,10 @@ fn task_meta(session_id: &str, info: BackgroundTaskInfo) -> TaskMeta {
             .as_ref()
             .and_then(|meta| meta.resume.clone()),
         workspace: info.display_meta.and_then(|meta| meta.workspace),
+        // 发起者：live registry 记了 owner_session（subagent 的 bash）就透出，
+        // None（主会话任务 / 未知）回退 session_id——前端用 owner_session 显示
+        // 发起者 title，主会话任务与旧行为一致（session_id 查 title）。
+        owner_session: info.owner_session.or_else(|| Some(session_id.to_owned())),
     }
 }
 
@@ -6130,8 +6139,10 @@ model = "deepseek-chat"
 
     /// The `task_meta` field mapping: bash output becomes lossy UTF-8
     /// truncated at `TASK_OUTPUT_LIMIT` chars, and delegate display metadata
-    /// is flattened into `background` + `workspace` + `subagent_session_id`
-    /// + `resume` (all empty for non-delegate tasks).
+    /// is flattened into `background`, `workspace`, `subagent_session_id`
+    /// and `resume` (all empty for non-delegate tasks). `owner_session` comes
+    /// straight from `BackgroundTaskInfo`; `None` falls back to the listing
+    /// `session_id` so the frontend always has an initiator id.
     #[test]
     fn task_meta_maps_fields_and_truncates_output() {
         let long = task_meta(
@@ -6144,6 +6155,7 @@ model = "deepseek-chat"
                 kind: "bash".into(),
                 output: vec![b'a'; 5000],
                 display_meta: None,
+                owner_session: None,
             },
         );
         assert_eq!(long.session_id, "web-x");
@@ -6157,6 +6169,11 @@ model = "deepseek-chat"
         assert_eq!(long.workspace, None);
         assert_eq!(long.subagent_session_id, None);
         assert_eq!(long.resume, None);
+        assert_eq!(
+            long.owner_session.as_deref(),
+            Some("web-x"),
+            "unknown owner falls back to the listing session id"
+        );
         // Invalid UTF-8 becomes the lossy replacement character; short
         // output passes through untruncated.
         let lossy = task_meta(
@@ -6169,6 +6186,7 @@ model = "deepseek-chat"
                 kind: "bash".into(),
                 output: vec![0xff, 0xfe],
                 display_meta: None,
+                owner_session: None,
             },
         );
         assert_eq!(lossy.output, "\u{FFFD}\u{FFFD}");
@@ -6189,6 +6207,7 @@ model = "deepseek-chat"
                     subagent_session_id: Some("sub-abc".into()),
                     resume: Some("sub-resume-1".into()),
                 }),
+                owner_session: None,
             },
         );
         assert_eq!(delegate.kind, "delegate");
@@ -6196,6 +6215,26 @@ model = "deepseek-chat"
         assert_eq!(delegate.workspace.as_deref(), Some("/tmp/w"));
         assert_eq!(delegate.subagent_session_id.as_deref(), Some("sub-abc"));
         assert_eq!(delegate.resume.as_deref(), Some("sub-resume-1"));
+        // A subagent's bash task carries its own session id as the owner,
+        // which wins over the registry owner (`session_id`).
+        let subagent_bash = task_meta(
+            "web-parent",
+            BackgroundTaskInfo {
+                id: 10,
+                label: "build".into(),
+                full_command: Some("cargo build".into()),
+                role: None,
+                kind: "bash".into(),
+                output: Vec::new(),
+                display_meta: None,
+                owner_session: Some("sub-xyz".into()),
+            },
+        );
+        assert_eq!(
+            subagent_bash.owner_session.as_deref(),
+            Some("sub-xyz"),
+            "subagent bash task exposes its own session as the initiator"
+        );
     }
 
     /// `GET /api/tasks` on an empty registry (and on sessions with no
@@ -6455,7 +6494,7 @@ model = "deepseek-chat"
         let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
         session_a
             .background
-            .start(workspace, "sleep 30".to_string(), false)
+            .start(workspace.clone(), "sleep 30".to_string(), false)
             .expect("bash background task starts");
         // A delegate task with display metadata (background + workspace).
         session_b
@@ -6511,6 +6550,10 @@ model = "deepseek-chat"
         assert_eq!(bash["output"], "");
         assert_eq!(bash["background"], false);
         assert_eq!(bash["workspace"], serde_json::Value::Null);
+        assert_eq!(
+            bash["owner_session"], "web-a",
+            "unknown owner falls back to the registry session id"
+        );
         let delegate = &tasks[1];
         assert_eq!(delegate["id"], 1);
         assert_eq!(delegate["kind"], "delegate");
@@ -6520,6 +6563,57 @@ model = "deepseek-chat"
         assert_eq!(delegate["background"], true);
         assert_eq!(delegate["workspace"], "/tmp/dw");
         assert_eq!(delegate["resume"], serde_json::Value::Null);
+        assert_eq!(
+            delegate["owner_session"], "web-b",
+            "delegate tasks have no separate owner; falls back to the parent session"
+        );
+
+        // A subagent's bash task carries its own session id as the owner:
+        // the wire exposes it (the registry owner stays the parent). The
+        // test registry's own sender is not reachable (private field on an
+        // Arc), so pass a placeholder — the task is cancelled before it
+        // completes, and completion delivery is not under test here.
+        let (spare_tx, _spare_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::agent::AgentEvent>();
+        session_a
+            .background
+            .start_with_sender(
+                workspace,
+                "sleep 30".to_string(),
+                false,
+                Some(spare_tx),
+                None,
+                Some("sub-a1".into()),
+            )
+            .expect("subagent bash background task starts");
+        let subagent_bash = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(subagent_bash.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let tasks: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let owned = tasks
+            .iter()
+            .find(|task| task["id"] == 2 && task["session_id"] == "web-a")
+            .expect("subagent-owned bash task is listed");
+        assert_eq!(owned["kind"], "bash");
+        assert_eq!(owned["session_id"], "web-a", "registry owner is the parent");
+        assert_eq!(
+            owned["owner_session"], "sub-a1",
+            "initiator is the subagent"
+        );
+        // Cancel the subagent-owned task so the later `running().is_empty()`
+        // assertion (after cancelling task 1) stays exact.
+        session_a.background.cancel(2);
 
         // Cancel the bash task via the endpoint: 204, task gone, and a
         // second cancel 404s.

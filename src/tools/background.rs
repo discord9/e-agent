@@ -292,6 +292,10 @@ struct RunningTask {
     output: Option<OutputSlot>,
     spool: Option<Arc<TaskSpool>>,
     display_meta: Option<TaskDisplayMeta>,
+    /// The session that started this task (`Some` for subagent bash tasks,
+    /// `None` = unknown / main session). The registry is shared across
+    /// sessions, so the listing session id is not the initiator.
+    owner_session: Option<String>,
     completion: Completion,
 }
 
@@ -327,6 +331,10 @@ pub struct BackgroundTaskInfo {
     pub output: Vec<u8>,
     /// Delegate-specific display metadata; `None` for non-delegate tasks.
     pub display_meta: Option<TaskDisplayMeta>,
+    /// The session that started this task (`Some` for subagent bash tasks,
+    /// `None` = unknown / main session). Differs from the listing
+    /// `session_id` (the registry owner) when a subagent ran the command.
+    pub owner_session: Option<String>,
 }
 
 impl BackgroundTasks {
@@ -379,6 +387,7 @@ impl BackgroundTasks {
                     .map(|slot| slot.lock().unwrap().clone())
                     .unwrap_or_default(),
                 display_meta: task.display_meta.clone(),
+                owner_session: task.owner_session.clone(),
             })
             .collect()
     }
@@ -445,6 +454,7 @@ impl BackgroundTasks {
             protect_git,
             self.sender.lock().unwrap().clone(),
             self.sandbox.clone(),
+            None,
         )
     }
 
@@ -455,6 +465,11 @@ impl BackgroundTasks {
     /// registry's: a subagent's Bash tool passes its own (possibly read-only
     /// narrowed) sandbox so background commands cannot escape into the
     /// parent's wider policy. `start()` passes the registry's default.
+    ///
+    /// `owner_session` is the session that started the task (`Some` for a
+    /// subagent's bash, `None` for the main session / unknown): the registry
+    /// is shared, so the task panel needs it to show the true initiator
+    /// instead of the registry owner.
     pub fn start_with_sender(
         &self,
         workspace: Workspace,
@@ -462,6 +477,7 @@ impl BackgroundTasks {
         protect_git: bool,
         sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
         sandbox: Option<crate::config::Sandbox>,
+        owner_session: Option<String>,
     ) -> Result<String, String> {
         let sender = sender
             .filter(|sender| !sender.is_closed())
@@ -474,6 +490,7 @@ impl BackgroundTasks {
             command,
             protect_git,
             sandbox,
+            owner_session,
             move |id, output| {
                 let _ = sender.send(AgentEvent::BackgroundCompleted {
                     id,
@@ -491,15 +508,28 @@ impl BackgroundTasks {
     /// (FinishWhenIdle ignores it), and no completion is promised to a
     /// session that may already have ended. The task leaves the registry
     /// when it finishes on its own.
+    ///
+    /// `owner_session` is the session that started the task (`Some` for a
+    /// subagent's bash, `None` for the main session / unknown), see
+    /// [`Self::start_with_sender`].
     pub fn start_detached(
         &self,
         workspace: Workspace,
         command: String,
         protect_git: bool,
         sandbox: Option<crate::config::Sandbox>,
+        owner_session: Option<String>,
     ) -> Result<String, String> {
         let label = preview(&command, 100);
-        self.spawn_bash_command(label, workspace, command, protect_git, sandbox, |_, _| {})
+        self.spawn_bash_command(
+            label,
+            workspace,
+            command,
+            protect_git,
+            sandbox,
+            owner_session,
+            |_, _| {},
+        )
     }
 
     /// Shared bash background spawn: register the task, run the command
@@ -515,6 +545,7 @@ impl BackgroundTasks {
         command: String,
         protect_git: bool,
         sandbox: Option<crate::config::Sandbox>,
+        owner_session: Option<String>,
         on_complete: impl FnOnce(u64, String) + Send + 'static,
     ) -> Result<String, String> {
         let shell = Shell::detect()?;
@@ -533,6 +564,7 @@ impl BackgroundTasks {
             None,
             Some(process_group),
             None, // display_meta
+            owner_session,
             move |id| {
                 let mut running = running.running.lock().unwrap();
                 if let Some(task) = running.iter_mut().find(|task| task.id == id) {
@@ -631,6 +663,10 @@ impl BackgroundTasks {
             role,
             process_group,
             display_meta,
+            // Delegate tasks are spawned by the main session's Delegate tool
+            // (subagents never delegate); the listing session id is already
+            // the initiator, so no separate owner.
+            None,
             on_id,
             work,
             move |id, output| {
@@ -665,6 +701,7 @@ impl BackgroundTasks {
             role,
             process_group,
             display_meta,
+            None,
             on_id,
             work,
             |_, _| {},
@@ -678,6 +715,7 @@ impl BackgroundTasks {
         role: Option<String>,
         process_group: Option<Arc<AtomicI32>>,
         display_meta: Option<TaskDisplayMeta>,
+        owner_session: Option<String>,
         on_id: impl FnOnce(u64),
         work: F,
         on_complete: impl FnOnce(u64, String) + Send + 'static,
@@ -729,6 +767,7 @@ impl BackgroundTasks {
             output: None,
             spool: None,
             display_meta,
+            owner_session,
             completion,
         });
         on_id(id);
@@ -772,5 +811,49 @@ impl Drop for BackgroundRegistry {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `start`（主会话便捷入口）owner 为 None；`start_with_sender` 显式传
+    /// `owner_session`（subagent 的 bash）时 `running()` 原样透出——任务面板
+    /// 据此显示真正的发起者，而不是 registry 所属会话。
+    #[tokio::test]
+    async fn start_owner_session_shows_in_running() {
+        let mut background = BackgroundTasks::new(None, None);
+        let (sender, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        background.set_event_sender(sender);
+        let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
+        background
+            .start(workspace.clone(), "sleep 30".to_string(), false)
+            .expect("main-session background bash task starts");
+        background
+            .start_with_sender(
+                workspace,
+                "sleep 30".to_string(),
+                false,
+                background.sender.lock().unwrap().clone(),
+                None,
+                Some("sub-abc".into()),
+            )
+            .expect("subagent background bash task starts");
+        let running = background.running();
+        assert_eq!(running.len(), 2);
+        assert_eq!(
+            running[0].owner_session, None,
+            "main-session task has no owner"
+        );
+        assert_eq!(
+            running[1].owner_session.as_deref(),
+            Some("sub-abc"),
+            "subagent task carries its own session id"
+        );
+        for task in &running {
+            background.cancel(task.id);
+        }
+        assert!(background.running().is_empty());
     }
 }

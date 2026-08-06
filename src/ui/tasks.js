@@ -87,6 +87,7 @@ function taskKeySig(t) {
     t.session_id || "", t.id != null ? t.id : "", t.kind || "", t.label || "",
     t.role || "", t.full_command || "", t.subagent_session_id || "",
     t.background === true ? 1 : 0, t.workspace || "", t.resume || "",
+    t.owner_session || "",
   ]);
 }
 
@@ -565,9 +566,11 @@ function buildTaskRow(t, key, restoreExpanded) {
     }
     // 会话标识：delegate 任务显示 subagent 自己的会话 id（点击跳转的目标；
     // 它的 title 就是 task-label，已在上面显示，不再重复）。bash 任务显示
-    // 父会话——优先显示父会话的 title（从会话列表缓存查，hover 放完整 id +
-    // title），无 title / 查不到才回退「会话 <id>」。
-    const sidShown = isDelegate ? (t.subagent_session_id || t.session_id) : t.session_id;
+    // 发起者——owner_session（subagent 的 bash = subagent 会话 id）有值时查
+    // 发起者的 title/label（subagent 的 title 可能为空，label 优先），
+    // None/主会话任务回退 session_id（查主会话 title，无则「会话 <id>」）。
+    const ownerId = t.owner_session || t.session_id;
+    const sidShown = isDelegate ? (t.subagent_session_id || t.session_id) : ownerId;
     if (sidShown) {
       let sidLabel = "会话 " + sidShown;
       let sidTitle = "";
@@ -575,11 +578,15 @@ function buildTaskRow(t, key, restoreExpanded) {
         const wsId = state.workspace ? state.workspace.id : null;
         const plist = (wsId && state.workspaceLists[wsId] !== undefined)
           ? state.workspaceLists[wsId] : state.lastList;
-        const parent = (plist || []).find((s) => s && s.id === t.session_id) || null;
-        const parentTitle = parent && parent.title != null ? String(parent.title) : "";
-        if (parentTitle.trim() !== "") {
-          sidLabel = truncate(parentTitle, 40);
-          sidTitle = t.session_id + ": " + parentTitle;   // 悬停完整 id + title
+        const owner = (plist || []).find((s) => s && s.id === ownerId) || null;
+        const ownerTitle = owner
+          ? (owner.title != null && String(owner.title).trim() !== ""
+              ? String(owner.title)
+              : (owner.label != null ? String(owner.label) : ""))
+          : "";
+        if (ownerTitle.trim() !== "") {
+          sidLabel = truncate(ownerTitle, 40);
+          sidTitle = ownerId + ": " + ownerTitle;   // 悬停完整 id + title
         }
       }
       const tag = el("span", "task-meta tsid", sidLabel);

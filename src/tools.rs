@@ -212,7 +212,8 @@ fn tools_with_background_and_exa_key(
     };
     tools.push(Box::new(GetBackgroundTasks {
         background: background.clone(),
-        self_session_id,
+        // clone：bash_tool 后面还要用 self_session_id 标注后台任务发起者。
+        self_session_id: self_session_id.clone(),
     }));
     tools.push(Box::new(CancelBackgroundTask {
         background: background.clone(),
@@ -232,6 +233,10 @@ fn tools_with_background_and_exa_key(
             bash_sandbox,
             protect_git,
             bash_timeout,
+            // 发起者会话：subagent 传自己的 session id（None = 主会话/未知），
+            // bash 后台任务在共享 registry 里标注真正的发起者。GetBackgroundTasks
+            // 后面还要用 self_session_id，这里 clone。
+            self_session_id.clone(),
         )
     {
         tools.push(tool);
