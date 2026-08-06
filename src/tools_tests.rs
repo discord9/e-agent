@@ -1890,11 +1890,14 @@ async fn get_background_tasks_lists_running_tasks() {
     assert_eq!(tasks[0].id, 1);
     assert_eq!(tasks[0].kind, "bash");
 
-    // The tool reports the running task with correct id, label, and role.
+    // The tool reports the running task with correct id, label, and role,
+    // plus the full command on its own continuation line (the label is the
+    // same here because the command is short — see the long-command test
+    // below for the truncated-label case).
     let output = tool.execute(json!({})).await.unwrap();
     assert_eq!(
         output,
-        "1 background task(s) running:\n#1: echo hello; sleep 30 (bash)"
+        "1 background task(s) running:\n#1: echo hello; sleep 30 (bash)\n    command: echo hello; sleep 30"
     );
 
     // Start a second background task (id=2).
@@ -1908,7 +1911,7 @@ async fn get_background_tasks_lists_running_tasks() {
     let output = tool.execute(json!({})).await.unwrap();
     assert_eq!(
         output,
-        "2 background task(s) running:\n#1: echo hello; sleep 30 (bash)\n#2: echo world; sleep 30 (bash)"
+        "2 background task(s) running:\n#1: echo hello; sleep 30 (bash)\n    command: echo hello; sleep 30\n#2: echo world; sleep 30 (bash)\n    command: echo world; sleep 30"
     );
 
     // Cancel the first task (id=1).
@@ -1919,7 +1922,7 @@ async fn get_background_tasks_lists_running_tasks() {
     let output = tool.execute(json!({})).await.unwrap();
     assert_eq!(
         output,
-        "1 background task(s) running:\n#2: echo world; sleep 30 (bash)"
+        "1 background task(s) running:\n#2: echo world; sleep 30 (bash)\n    command: echo world; sleep 30"
     );
 
     // Cleanup.
@@ -1929,6 +1932,57 @@ async fn get_background_tasks_lists_running_tasks() {
         tool.execute(json!({})).await.unwrap(),
         "No background tasks running."
     );
+}
+
+#[tokio::test]
+async fn get_background_tasks_shows_full_command_beyond_truncated_label() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+    let background = bash.background.clone();
+    let tool = GetBackgroundTasks {
+        background: background.clone(),
+        self_session_id: None,
+    };
+
+    // A command longer than the 100-char label budget: the label is
+    // preview-truncated, but the tool's `command:` line must carry the
+    // UNTRUNCATED original so the agent/UI can act on the full command.
+    let long = "cargo build --release --features very-long-feature-name-here \
+                --target x86_64-unknown-linux-gnu --jobs 8 --verbose";
+    assert!(
+        long.chars().count() > 100,
+        "test command must exceed the label budget"
+    );
+    bash.execute(json!({"command": long, "background": true}))
+        .await
+        .unwrap();
+
+    let output = tool.execute(json!({})).await.unwrap();
+    // First line keeps the truncated label (backward compatible), the
+    // continuation line carries the full command verbatim.
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "1 background task(s) running:");
+    let label_line = lines[1];
+    assert!(
+        label_line.starts_with("#1: ") && label_line.ends_with(" (bash)"),
+        "entry header unchanged: {label_line}"
+    );
+    assert!(
+        label_line.contains('\u{2026}'),
+        "label must be truncated with an ellipsis: {label_line}"
+    );
+    assert!(
+        label_line != format!("#1: {long} (bash)"),
+        "label must not be the full command"
+    );
+    assert_eq!(
+        lines[2],
+        format!("    command: {long}"),
+        "command line carries the untruncated original"
+    );
+
+    background.cancel(1);
+    let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
 }
 
 #[tokio::test]

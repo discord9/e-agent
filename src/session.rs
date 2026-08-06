@@ -249,11 +249,18 @@ impl Session {
     /// surviving line always means "the process died with this running".
     /// Records are scoped per session: a task started in session A is only
     /// reported back when session A is resumed, never to another session.
+    ///
+    /// `label` 是源头截断的 100 字符预览（给「被杀」Notice 用）；`full_command`
+    /// 是完整命令原文（bash 任务传 `Some`，delegate 任务无命令传 `None`），
+    /// 持久化在 JSONL 的 `"full_command"` 字段里，旧记录没有该字段 → 读回
+    /// `None`（兼容）。`take_unfinished_background` 消费时仍只回 label
+    /// （Notice 文本不变），完整命令通过 [`Self::task_full_command`] 单独取。
     pub fn record_background_start(
         root: &Path,
         session: &str,
         id: u64,
         label: &str,
+        full_command: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let path = background_record_path(root, session)?;
@@ -270,6 +277,9 @@ impl Session {
             "label": label,
             "owner": crate::session_store::process_identity(),
         });
+        if let Some(command) = full_command {
+            record["full_command"] = serde_json::json!(command);
+        }
         if let Some(sid) = session_id {
             record["session_id"] = serde_json::json!(sid);
         }
@@ -340,6 +350,35 @@ impl Session {
         }
         let _ = std::fs::remove_file(&path);
         labels
+    }
+
+    /// Look up one surviving background-task record's full command by id
+    /// (the "另取" path promised by [`Self::record_background_start`]: the
+    /// consuming `take_unfinished_background` returns labels unchanged,
+    /// this reads the persisted `"full_command"` separately). Old records
+    /// written before the field shipped have no `full_command` → `None`
+    /// (nothing to fill). Used by the server's `/api/tasks` fallback when
+    /// the live registry lacks a full command.
+    pub fn task_full_command(root: &Path, session: &str, task_id: u64) -> Option<String> {
+        let Ok(path) = background_record_path(root, session) else {
+            return None;
+        };
+        let Ok(file) = std::fs::File::open(&path) else {
+            return None;
+        };
+        for line in std::io::BufReader::new(file).lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if record["id"].as_u64() == Some(task_id) {
+                return record["full_command"].as_str().map(str::to_owned);
+            }
+        }
+        None
     }
 
     /// True when every unfinished-task record for `session` was left by a
@@ -625,8 +664,8 @@ mod tests {
         // Nothing recorded: nothing to report.
         assert!(Session::take_unfinished_background(temp.path(), "a").is_empty());
 
-        Session::record_background_start(temp.path(), "a", 1, "sleep 100", None).unwrap();
-        Session::record_background_start(temp.path(), "a", 2, "cargo build", None).unwrap();
+        Session::record_background_start(temp.path(), "a", 1, "sleep 100", None, None).unwrap();
+        Session::record_background_start(temp.path(), "a", 2, "cargo build", None, None).unwrap();
         // Records are scoped per session: session b sees none of a's tasks.
         assert!(Session::take_unfinished_background(temp.path(), "b").is_empty());
         // Task 1 completes while we are alive: only task 2 stays on record.
@@ -638,7 +677,7 @@ mod tests {
         // take consumes the file: a second launch has nothing to report.
         assert!(Session::take_unfinished_background(temp.path(), "a").is_empty());
         // Clearing the last recorded task removes the file entirely.
-        Session::record_background_start(temp.path(), "a", 3, "x", None).unwrap();
+        Session::record_background_start(temp.path(), "a", 3, "x", None, None).unwrap();
         Session::clear_background_task(temp.path(), "a", 3);
         assert!(
             !temp
@@ -654,7 +693,8 @@ mod tests {
     #[test]
     fn background_record_carries_owner_identity() {
         let temp = tempfile::tempdir().unwrap();
-        Session::record_background_start(temp.path(), "owner-test", 1, "sleep 100", None).unwrap();
+        Session::record_background_start(temp.path(), "owner-test", 1, "sleep 100", None, None)
+            .unwrap();
         let raw = std::fs::read_to_string(
             temp.path()
                 .join(".e-agent/sessions/owner-test.background.jsonl"),
@@ -675,6 +715,86 @@ mod tests {
         );
     }
 
+    /// `record_background_start` persists the FULL command (not just the
+    /// truncated label) under `"full_command"`; `task_full_command` reads
+    /// it back by id. Consuming (`take_unfinished_background`) still
+    /// returns only labels, so the "killed on exit" notice text is
+    /// unchanged; the full command stays retrievable separately until the
+    /// record is consumed.
+    #[test]
+    fn background_record_persists_full_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let long = "cargo build --release --features very-long-feature-name --target x86_64-unknown-linux-gnu";
+        Session::record_background_start(
+            temp.path(),
+            "cmd-store",
+            1,
+            "cargo build …",
+            Some(long),
+            None,
+        )
+        .unwrap();
+        // Delegate-style record: no command.
+        Session::record_background_start(temp.path(), "cmd-store", 2, "delegate work", None, None)
+            .unwrap();
+
+        // The raw JSON line carries the full command verbatim.
+        let raw = std::fs::read_to_string(
+            temp.path()
+                .join(".e-agent/sessions/cmd-store.background.jsonl"),
+        )
+        .unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["full_command"].as_str(), Some(long));
+        assert!(
+            lines[1].get("full_command").is_none(),
+            "delegate record has no command"
+        );
+
+        // Lookup by id returns the persisted full command; a missing id or
+        // a record without the field returns None.
+        assert_eq!(
+            Session::task_full_command(temp.path(), "cmd-store", 1).as_deref(),
+            Some(long)
+        );
+        assert_eq!(
+            Session::task_full_command(temp.path(), "cmd-store", 2),
+            None
+        );
+        assert_eq!(
+            Session::task_full_command(temp.path(), "cmd-store", 99),
+            None
+        );
+
+        // Old-format records (no `full_command` field) read back as None —
+        // backwards compatible with records written before the field shipped.
+        let dir = temp.path().join(".e-agent/sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("legacy.background.jsonl"),
+            "{\"id\":5,\"label\":\"old task\",\"owner\":\"x@y#z\"}\n",
+        )
+        .unwrap();
+        assert_eq!(Session::task_full_command(temp.path(), "legacy", 5), None);
+
+        // The consumption path is unchanged: labels only.
+        assert_eq!(
+            Session::take_unfinished_background(temp.path(), "cmd-store"),
+            vec![
+                "task 1: cargo build …".to_string(),
+                "task 2: delegate work".to_string()
+            ]
+        );
+        // Records consumed → lookup gone with the file.
+        assert_eq!(
+            Session::task_full_command(temp.path(), "cmd-store", 1),
+            None
+        );
+    }
+
     /// `unfinished_owner_all_dead` is the server-attach probe: true only
     /// when EVERY record was left by a definitely-dead process. Missing
     /// file / no records → true (Consume is a no-op); a live owner, an
@@ -691,7 +811,8 @@ mod tests {
         ));
 
         // Records written by THIS process (still alive) → not all dead.
-        Session::record_background_start(temp.path(), "dead-probe", 1, "sleep 100", None).unwrap();
+        Session::record_background_start(temp.path(), "dead-probe", 1, "sleep 100", None, None)
+            .unwrap();
         assert!(!Session::unfinished_owner_all_dead(
             temp.path(),
             "dead-probe"

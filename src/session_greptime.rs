@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS running_tasks (
     session_id STRING NOT NULL,
     task_id BIGINT NOT NULL,
     label STRING NOT NULL,
+    full_command STRING NULL,
     subagent_session_id STRING NULL,
     started_at TIMESTAMP(9) NOT NULL TIME INDEX,
     owner_identity STRING NULL,
@@ -312,6 +313,33 @@ impl GreptimeSession {
                         eprintln!(
                             "e-agent: cannot add running_tasks.owner_identity column \
                              (background-task owner liveness unavailable): {error:#}"
+                        );
+                    }
+                }
+            }
+            // Same probe-then-ALTER for the `full_command` column (the
+            // full untruncated bash command, added after the table shipped
+            // so the UI can show it after a restart). Pre-existing
+            // databases need the ALTER; fresh databases already have the
+            // column via CREATE_TABLE_RUNNING_TASKS above. Old rows read
+            // the column back as NULL, which `task_full_command` reports
+            // as `None`. A failed ALTER does NOT block the connection: the
+            // feature degrades — `record_task_start` fails loudly on the
+            // missing column, transcript operations are unaffected (same
+            // philosophy as the owner_identity migration above).
+            if !task_columns.iter().any(|c| c == "full_command") {
+                match client
+                    .execute(
+                        "ALTER TABLE running_tasks ADD COLUMN full_command STRING NULL",
+                        &[],
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "e-agent: cannot add running_tasks.full_command column \
+                             (background-task full-command persistence unavailable): {error:#}"
                         );
                     }
                 }
@@ -1723,11 +1751,16 @@ impl GreptimeSession {
 
     /// Record a freshly started background task so a later launch can tell
     /// the user what died with the previous process.
+    ///
+    /// `full_command` 是完整命令原文（bash 任务传 `Some`，delegate 无命令传
+    /// `None`），持久化到 `running_tasks.full_command`，供 `/api/tasks`
+    /// 在 live registry 缺失时回退取用。
     pub async fn record_task_start(
         &self,
         session_id: &str,
         task_id: u64,
         label: &str,
+        full_command: Option<&str>,
         subagent_session_id: Option<&str>,
     ) -> Result<()> {
         let started_at = us_to_datetime(next_event_time_us());
@@ -1736,13 +1769,14 @@ impl GreptimeSession {
         self.client
             .execute(
                 "INSERT INTO running_tasks \
-                 (workspace_id, session_id, task_id, label, subagent_session_id, started_at, owner_identity) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                 (workspace_id, session_id, task_id, label, full_command, subagent_session_id, started_at, owner_identity) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
                     &self.workspace_id,
                     &session_id,
                     &task_id,
                     &label,
+                    &full_command,
                     &subagent_session_id,
                     &started_at,
                     &crate::session_store::process_identity(),
@@ -1766,6 +1800,32 @@ impl GreptimeSession {
             .await
             .context("cannot clear background task")?;
         Ok(())
+    }
+
+    /// Look up one surviving row's full command by task id (the `/api/tasks`
+    /// fallback when the live registry lacks it). `None` when the row is
+    /// gone (consumed/completed) or its `full_command` is NULL (delegate
+    /// rows, pre-migration rows — 缺失 → None 兼容旧数据).
+    pub async fn task_full_command(
+        &self,
+        session_id: &str,
+        task_id: u64,
+    ) -> Result<Option<String>> {
+        let task_id =
+            i64::try_from(task_id).context("background task id does not fit in BIGINT")?;
+        let rows = self
+            .client
+            .query(
+                "SELECT full_command FROM running_tasks \
+                 WHERE workspace_id = $1 AND session_id = $2 AND task_id = $3",
+                &[&self.workspace_id, &session_id, &task_id],
+            )
+            .await
+            .context("cannot load background task full command")?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        Ok(rows[0].get("full_command"))
     }
 
     /// Tasks recorded by a previous process that died before their
@@ -3824,11 +3884,11 @@ mod tests {
         );
 
         session
-            .record_task_start(&sid, 1, "sleep 100", None)
+            .record_task_start(&sid, 1, "sleep 100", None, None)
             .await
             .unwrap();
         session
-            .record_task_start(&sid, 2, "cargo build", Some("sub-probe"))
+            .record_task_start(&sid, 2, "cargo build", None, Some("sub-probe"))
             .await
             .unwrap();
 
@@ -3861,7 +3921,7 @@ mod tests {
         // Task ids restart per process: re-inserting id 1 after the delete
         // tombstone must remain visible (fresh started_at wins).
         session
-            .record_task_start(&sid, 1, "restarted", None)
+            .record_task_start(&sid, 1, "restarted", None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -3888,11 +3948,11 @@ mod tests {
         let parent_a = format!("parent-a-{}", crate::session::new_id());
         let parent_b = format!("parent-b-{}", crate::session::new_id());
         session
-            .record_task_start(&parent_a, 10, "probe a", Some(&subagent))
+            .record_task_start(&parent_a, 10, "probe a", None, Some(&subagent))
             .await
             .unwrap();
         session
-            .record_task_start(&parent_b, 11, "probe b", Some(&subagent))
+            .record_task_start(&parent_b, 11, "probe b", None, Some(&subagent))
             .await
             .unwrap();
 
@@ -3963,7 +4023,7 @@ mod tests {
         // A row recorded by THIS process (still alive) → not all dead,
         // and the owner column holds our process identity.
         session
-            .record_task_start(&sid, 1, "sleep 100", None)
+            .record_task_start(&sid, 1, "sleep 100", None, None)
             .await
             .unwrap();
         assert!(
@@ -4098,11 +4158,11 @@ mod tests {
         // Two delegate tasks for the same subagent; the newest started_at wins.
         let parent = format!("parent-label-{}", crate::session::new_id());
         session
-            .record_task_start(&parent, 20, "first label", Some(&subagent))
+            .record_task_start(&parent, 20, "first label", None, Some(&subagent))
             .await
             .unwrap();
         session
-            .record_task_start(&parent, 21, "latest label", Some(&subagent))
+            .record_task_start(&parent, 21, "latest label", None, Some(&subagent))
             .await
             .unwrap();
         assert_eq!(
@@ -4148,11 +4208,11 @@ mod tests {
         // wins (record_task_start timestamps are strictly increasing).
         let parent = format!("parent-all-labels-{}", crate::session::new_id());
         session
-            .record_task_start(&parent, 20, "first label", Some(&subagent))
+            .record_task_start(&parent, 20, "first label", None, Some(&subagent))
             .await
             .unwrap();
         session
-            .record_task_start(&parent, 21, "latest label", Some(&subagent))
+            .record_task_start(&parent, 21, "latest label", None, Some(&subagent))
             .await
             .unwrap();
         let labels = session.all_subagent_labels().await.unwrap();
@@ -4166,11 +4226,11 @@ mod tests {
         // subagent id never leak into it.
         let other = format!("other-all-labels-{}", crate::session::new_id());
         session
-            .record_task_start(&parent, 30, "other label", Some(&other))
+            .record_task_start(&parent, 30, "other label", None, Some(&other))
             .await
             .unwrap();
         session
-            .record_task_start(&parent, 40, "no subagent", None)
+            .record_task_start(&parent, 40, "no subagent", None, None)
             .await
             .unwrap();
         let labels = session.all_subagent_labels().await.unwrap();

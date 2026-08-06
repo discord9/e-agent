@@ -716,7 +716,7 @@ async fn list_scans_sidecars_only_and_ignores_background_records() {
     assert!(list.iter().any(|m| m.session_id == "orphan-xyz"));
 
     // Background record files are never sessions.
-    Session::record_background_start(temp.path(), &a, 1, "build", None).unwrap();
+    Session::record_background_start(temp.path(), &a, 1, "build", None, None).unwrap();
     let list = store.list_meta(temp.path()).await.unwrap();
     assert_eq!(list.len(), 2, "background records must not be listed");
     assert!(list.iter().any(|m| m.session_id == a));
@@ -818,8 +818,15 @@ async fn label_for_subagent_reads_background_records() {
     );
 
     // A surviving delegate record with a matching session_id → its label.
-    Session::record_background_start(temp.path(), &parent, 1, "delegate: draft plan", Some(&sub))
-        .unwrap();
+    Session::record_background_start(
+        temp.path(),
+        &parent,
+        1,
+        "delegate: draft plan",
+        None,
+        Some(&sub),
+    )
+    .unwrap();
     assert_eq!(
         store
             .label_for_subagent(temp.path(), &sub)
@@ -831,9 +838,16 @@ async fn label_for_subagent_reads_background_records() {
 
     // Non-matching records (other subagents, plain bash) are ignored.
     let other_sub = format!("sub-{}", crate::session::new_id());
-    Session::record_background_start(temp.path(), &parent, 2, "other task", Some(&other_sub))
-        .unwrap();
-    Session::record_background_start(temp.path(), &parent, 3, "plain bash", None).unwrap();
+    Session::record_background_start(
+        temp.path(),
+        &parent,
+        2,
+        "other task",
+        None,
+        Some(&other_sub),
+    )
+    .unwrap();
+    Session::record_background_start(temp.path(), &parent, 3, "plain bash", None, None).unwrap();
     assert_eq!(
         store
             .label_for_subagent(temp.path(), &sub)
@@ -845,8 +859,15 @@ async fn label_for_subagent_reads_background_records() {
     );
 
     // A later record for the same subagent wins (newest label).
-    Session::record_background_start(temp.path(), &parent, 4, "delegate: revise plan", Some(&sub))
-        .unwrap();
+    Session::record_background_start(
+        temp.path(),
+        &parent,
+        4,
+        "delegate: revise plan",
+        None,
+        Some(&sub),
+    )
+    .unwrap();
     assert_eq!(
         store
             .label_for_subagent(temp.path(), &sub)

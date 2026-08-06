@@ -725,6 +725,7 @@ pub async fn spawn_btw_subagent(
                     &record.session,
                     id,
                     &record_label,
+                    None,
                     Some(&record_session_id),
                 );
             }
@@ -1152,6 +1153,7 @@ impl Tool for Delegate {
                             &record.session,
                             id,
                             &record_label,
+                            None,
                             Some(&record_session_id),
                         );
                     }

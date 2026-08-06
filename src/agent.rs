@@ -984,6 +984,7 @@ impl Agent {
                     &record.session,
                     id,
                     &label,
+                    Some(&command),
                     None,
                 );
             }

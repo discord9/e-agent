@@ -2083,8 +2083,15 @@ async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
         )
         .unwrap();
     let id = background.running()[0].id;
-    crate::session::Session::record_background_start(temp.path(), "cancel-store", id, "task", None)
-        .unwrap();
+    crate::session::Session::record_background_start(
+        temp.path(),
+        "cancel-store",
+        id,
+        "task",
+        None,
+        None,
+    )
+    .unwrap();
     let mut state = TuiState {
         background: Some(background),
         cwd: temp.path().display().to_string(),

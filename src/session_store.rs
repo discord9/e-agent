@@ -1487,19 +1487,29 @@ impl SessionStore {
 
     /// Record a freshly started background task so a later launch can tell
     /// the user what died with the previous process.
+    ///
+    /// `label` 是源头截断的 100 字符预览（「被杀」Notice 用）；`full_command`
+    /// 是完整命令原文（bash 任务传 `Some`，delegate 无命令传 `None`），
+    /// 持久化后供 UI/`task_full_command` 取用。旧记录缺该字段 → 读回 `None`。
     pub fn record_background_start(
         &self,
         root: &Path,
         session: &str,
         id: u64,
         label: &str,
+        full_command: Option<&str>,
         subagent_session_id: Option<&str>,
     ) {
         match self {
             SessionStore::Jsonl => {
-                if let Err(error) =
-                    Session::record_background_start(root, session, id, label, subagent_session_id)
-                {
+                if let Err(error) = Session::record_background_start(
+                    root,
+                    session,
+                    id,
+                    label,
+                    full_command,
+                    subagent_session_id,
+                ) {
                     eprintln!("e-agent: cannot record background task: {error:#}");
                 }
             }
@@ -1511,6 +1521,7 @@ impl SessionStore {
                 let greptime = greptime_session.clone();
                 let session_id = session.to_owned();
                 let label = label.to_owned();
+                let full_command = full_command.map(str::to_owned);
                 let subagent = subagent_session_id.map(str::to_owned);
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle) => {
@@ -1518,7 +1529,13 @@ impl SessionStore {
                             if let Err(error) = greptime
                                 .lock()
                                 .await
-                                .record_task_start(&session_id, id, &label, subagent.as_deref())
+                                .record_task_start(
+                                    &session_id,
+                                    id,
+                                    &label,
+                                    full_command.as_deref(),
+                                    subagent.as_deref(),
+                                )
                                 .await
                             {
                                 eprintln!("e-agent: cannot record background task: {error:#}");
@@ -1538,6 +1555,7 @@ impl SessionStore {
                 let sqlite = sqlite_session.clone();
                 let session_id = session.to_owned();
                 let label = label.to_owned();
+                let full_command = full_command.map(str::to_owned);
                 let subagent = subagent_session_id.map(str::to_owned);
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle) => {
@@ -1545,7 +1563,13 @@ impl SessionStore {
                             if let Err(error) = sqlite
                                 .lock()
                                 .await
-                                .record_task_start(&session_id, id, &label, subagent.as_deref())
+                                .record_task_start(
+                                    &session_id,
+                                    id,
+                                    &label,
+                                    full_command.as_deref(),
+                                    subagent.as_deref(),
+                                )
                                 .await
                             {
                                 eprintln!("e-agent: cannot record background task: {error:#}");
@@ -1719,6 +1743,49 @@ impl SessionStore {
                 .take_unfinished_tasks_for_subagent(_subagent_session_id)
                 .await
                 .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Look up one surviving background-task record's full command by
+    /// (session, task_id) — the server's `/api/tasks` fallback when the
+    /// live registry's `BackgroundTaskInfo.full_command` is `None`
+    /// (restart-stale rows, old-format records): the DB/JSONL has the
+    /// persisted command, so the UI can still show it. `None` when the
+    /// record is gone (consumed/completed) or was written without a
+    /// `full_command` (delegate rows, pre-migration records).
+    pub async fn task_full_command(
+        &self,
+        root: &Path,
+        session: &str,
+        task_id: u64,
+    ) -> Result<Option<String>> {
+        match self {
+            SessionStore::Jsonl => Ok(Session::task_full_command(root, session, task_id)),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                let session_id = session.to_owned();
+                greptime_session
+                    .lock()
+                    .await
+                    .task_full_command(&session_id, task_id)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: sqlite_session,
+                ..
+            } => {
+                let session_id = session.to_owned();
+                sqlite_session
+                    .lock()
+                    .await
+                    .task_full_command(&session_id, task_id)
+                    .await
+                    .map_err(anyhow::Error::msg)
+            }
         }
     }
 
@@ -3094,12 +3161,19 @@ mod tests {
         // Batch labels: one scan resolves every subagent. Two parents each
         // record a delegate; the second record for the same subagent
         // (newest line) wins.
-        Session::record_background_start(&root, "parent-a", 1, "delegate one", Some("sub-1"))
+        Session::record_background_start(&root, "parent-a", 1, "delegate one", None, Some("sub-1"))
             .unwrap();
-        Session::record_background_start(&root, "parent-b", 2, "delegate two", Some("sub-2"))
+        Session::record_background_start(&root, "parent-b", 2, "delegate two", None, Some("sub-2"))
             .unwrap();
-        Session::record_background_start(&root, "parent-a", 3, "delegate one v2", Some("sub-1"))
-            .unwrap();
+        Session::record_background_start(
+            &root,
+            "parent-a",
+            3,
+            "delegate one v2",
+            None,
+            Some("sub-1"),
+        )
+        .unwrap();
         let all = store.all_subagent_labels(&root).await.unwrap().unwrap();
         assert_eq!(all.get("sub-1"), Some(&Some("delegate one v2".to_owned())));
         assert_eq!(all.get("sub-2"), Some(&Some("delegate two".to_owned())));
@@ -3402,7 +3476,7 @@ mod tests {
                 .expect("connect sqlite store");
 
             // Sync facade: record spawns onto the current runtime.
-            store.record_background_start(&root, &session, 7, "build project", None);
+            store.record_background_start(&root, &session, 7, "build project", None, None);
             let labels = take_unfinished_with_retry(&store, &root, &session).await;
             assert_eq!(
                 labels,
@@ -3413,7 +3487,7 @@ mod tests {
             // next take reports nothing. Both record and clear are
             // fire-and-forget spawns on the current runtime; give each
             // spawn a yield window to run to completion before asserting.
-            store.record_background_start(&root, &session, 8, "run tests", None);
+            store.record_background_start(&root, &session, 8, "run tests", None, None);
             let landed = take_unfinished_with_retry(&store, &root, &session).await;
             assert_eq!(
                 landed,
@@ -3422,7 +3496,7 @@ mod tests {
 
             // Record again, let it land, clear, let the clear land, then
             // nothing may be reported.
-            store.record_background_start(&root, &session, 8, "run tests", None);
+            store.record_background_start(&root, &session, 8, "run tests", None, None);
             for _ in 0..1000 {
                 tokio::task::yield_now().await;
             }
@@ -3441,7 +3515,14 @@ mod tests {
             // non-consuming label_for_subagent reports it first, then the
             // consuming take_unfinished_background_for_subagent resolves it
             // cross-session.
-            store.record_background_start(&root, &session, 9, "delegate work", Some("sub-123"));
+            store.record_background_start(
+                &root,
+                &session,
+                9,
+                "delegate work",
+                None,
+                Some("sub-123"),
+            );
             let sub_store = SessionStore::connect(&backend(&path), &root, "other-session")
                 .await
                 .expect("connect other-session store");
@@ -3991,7 +4072,7 @@ mod tests {
                 let store = SessionStore::connect(&backend(&path), &root, &session)
                     .await
                     .expect("connect bg store A");
-                store.record_background_start(&root, &session, 42, "long build", None);
+                store.record_background_start(&root, &session, 42, "long build", None, None);
                 // Drop before the task completes — simulated crash.
             }
 
@@ -4008,7 +4089,7 @@ mod tests {
 
             // B records and clears a task; a third reopen (another restart)
             // must report nothing.
-            store_b.record_background_start(&root, &session, 43, "run tests", None);
+            store_b.record_background_start(&root, &session, 43, "run tests", None, None);
             for _ in 0..1000 {
                 tokio::task::yield_now().await;
             }

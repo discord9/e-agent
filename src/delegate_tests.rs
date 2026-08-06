@@ -270,6 +270,7 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
                     "parent",
                     id,
                     "probe",
+                    None,
                     Some("sub-probe"),
                 )
                 .unwrap();
@@ -340,6 +341,7 @@ async fn background_cancel_before_first_yield_cleans_everything() {
                     "parent",
                     id,
                     "probe",
+                    None,
                     Some("sub-probe"),
                 )
                 .unwrap();
@@ -401,6 +403,7 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
                     "parent",
                     id,
                     "probe",
+                    None,
                     Some("sub-probe"),
                 )
                 .unwrap();
