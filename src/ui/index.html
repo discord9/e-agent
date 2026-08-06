@@ -5,15 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>e-agent · Web UI</title>
 <!-- favicon：内联 SVG data URI（零路由改动、无额外请求）。「e_」标记 =
-     e-agent 的 e + 终端光标/输入提示符的下划线。e 用 <path> 圆弧画成
-     真正的曲线小写 e——矩形像素拼法只能逼近大写 E（左竖+三横），拼不出
-     小写 e 的右侧圆弧开口，故弃用。64×64 viewBox，Solarized 绿
-     （#859900）4.2px 圆头描边：一条 3/4 圆弧（A 11.4，右下 50°–125° 留
-     口）作 e 的字碗，加一条 y=23 的横画（偏上，小写 e 的中横特征），右
-     端收入弧内、不套环以免像 IE。其下留隙，Solarized 橙（#cb4b16，与
-     品牌 busy dot 同色）5px 下划线收尾，落在 base2（#eee8d5）圆角底
-     上。笔画 ≥4px、开口张角 75°，16px 下开口仍 ≥2px、不糊成团。 -->
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2214%22%20fill%3D%22%23eee8d5%22%2F%3E%3Cg%20fill%3D%22none%22%20stroke%3D%22%23859900%22%20stroke-width%3D%224.2%22%20stroke-linecap%3D%22round%22%3E%3Cpath%20d%3D%22M27.5%2034.8A11.4%2011.4%200%201%201%2041.3%2034.2%22%2F%3E%3Cpath%20d%3D%22M22.4%2023H41.1%22%2F%3E%3C%2Fg%3E%3Cpath%20d%3D%22M20%2049H48%22%20stroke%3D%22%23cb4b16%22%20stroke-width%3D%225%22%20stroke-linecap%3D%22round%22%2F%3E%3C%2Fsvg%3E">
+     e-agent 的 e + 终端光标/输入提示符的下划线。小写 e 不再手绘——手绘
+     圆弧+横线在 16px 下会被读成「套环的大写 A」，矩形拼法又像大写 E。
+     本版用 fontTools 从 DejaVuSans-Bold.ttf（Bitstream Vera 系，自由字
+     体）提取 U+0065「e」的真实字形轮廓转成 SVG path：它是字体里雕刻的
+     小写 e 本身（横杠、上部内眼、右侧开口、无环），所以任何尺寸下都
+     100% 是小写 e。字形缩放到宽 42 单位、居中于 64×64 viewBox、基线
+     y=41.2（顶部留 0.1 单位），填充 Solarized 绿（#859900）；正下方
+     留约 4 单位间隙，Solarized 橙（#cb4b16，与品牌 busy dot 同色）
+     5px 圆头下划线收尾，落在 base2（#eee8d5）圆角底上。已用 pycairo
+     栅格化验证：256px 与 16px（最近邻放大读图）下 e 的横杠/内眼/开口
+     均清晰可辨。 -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2214%22%20fill%3D%22%23eee8d5%22%2F%3E%3Cpath%20d%3D%22M53%2020.51V24.08H23.75Q24.21%2028.48%2026.93%2030.68Q29.66%2032.88%2034.55%2032.88Q38.5%2032.88%2042.64%2031.71Q46.78%2030.54%2051.15%2028.17V37.81Q46.71%2039.49%2042.27%2040.34Q37.84%2041.2%2033.4%2041.2Q22.78%2041.2%2016.89%2035.8Q11%2030.4%2011%2020.65Q11%2011.08%2016.78%205.59Q22.57%200.11%2032.7%200.11Q41.92%200.11%2047.46%205.66Q53%2011.22%2053%2020.51ZM40.14%2016.36Q40.14%2012.79%2038.06%2010.61Q35.98%208.42%2032.63%208.42Q29%208.42%2026.72%2010.47Q24.45%2012.51%2023.89%2016.36Z%22%20fill%3D%22%23859900%22%2F%3E%3Cpath%20d%3D%22M20%2050H44%22%20fill%3D%22none%22%20stroke%3D%22%23cb4b16%22%20stroke-width%3D%225%22%20stroke-linecap%3D%22round%22%2F%3E%3C%2Fsvg%3E">
 <style>/*__KATEX_CSS__*/
 /*__CSS__*/</style>
 </head>
