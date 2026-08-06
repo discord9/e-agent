@@ -1353,6 +1353,111 @@ async function main(){
     chk("main session hides back-to-parent",
         elsById["backParentBtn"].hidden === true,
         "hidden=" + elsById["backParentBtn"].hidden);
+    // ---- delegate/btw 行内常显「结束」按钮（修复交互矛盾：这类行的点击
+    // 是「跳转会话」而非展开，展开区取消按钮永远不可见，btw 无法结束）----
+    // (a) 行内按钮不展开即存在、非 hidden；(b) 点击 → confirm + cancelTask
+    //     发出 DELETE /api/sessions/{父}/tasks/{id}，且 stopPropagation
+    //     不触发行点击的 openSession 跳转；(c) btw（delegate+resume）同样有；
+    //     bash 行无行内按钮（展开区取消照旧）。
+    state.lastList = [];   // 不依赖 label 匹配：subagent_session_id 直连
+    state.tasks.composerOpen = true;   // openSession 会强制收起面板：重开以渲染行
+    tasksData = [
+      { session_id: "s1", id: 20, kind: "delegate", label: "子任务X", role: "explore",
+        subagent_session_id: "sub-20" },
+      { session_id: "s1", id: 21, kind: "delegate", label: "btw 对话", role: "btw",
+        subagent_session_id: "sub-21", resume: "sub-21" },
+      { session_id: "s1", id: 22, kind: "bash", label: "cargo check",
+        full_command: "cargo check", output: "", role: null },
+    ];
+    await pollTasks();
+    await flush();
+    const drows = elsById["composerTasks"].querySelectorAll(".task-row");
+    chk("delegate+btw+bash rows rendered", drows.length === 3, "n=" + drows.length);
+    const drow20 = drows[0], drow21 = drows[1], drow22 = drows[2];
+    const dbtn20 = drow20.querySelector(".task-cancel-inline");
+    const dbtn21 = drow21.querySelector(".task-cancel-inline");
+    chk("delegate row has visible inline end button",
+        dbtn20 !== null && dbtn20.hidden === false && dbtn20.textContent === "结束",
+        "btn=" + String(dbtn20 !== null) + " hidden=" + (dbtn20 && dbtn20.hidden)
+        + " text=" + (dbtn20 && dbtn20.textContent));
+    chk("btw row has visible inline end button",
+        dbtn21 !== null && dbtn21.hidden === false && dbtn21.textContent === "结束",
+        "btn=" + String(dbtn21 !== null) + " hidden=" + (dbtn21 && dbtn21.hidden));
+    chk("bash row has no inline end button",
+        drow22.querySelector(".task-cancel-inline") === null,
+        "btn=" + String(drow22.querySelector(".task-cancel-inline") !== null));
+    // 按钮在行尾、状态点之后（task-line 内）
+    chk("inline end button inside task-line",
+        dbtn20 !== null && dbtn20.parentNode !== null
+        && dbtn20.parentNode._classes.has("task-line")
+        && dbtn20.parentNode._children.indexOf(dbtn20)
+           > dbtn20.parentNode._children.indexOf(drow20.querySelector(".task-stream-status")),
+        "parent=" + (dbtn20 && dbtn20.parentNode && dbtn20.parentNode.className));
+    // (b) 点击按钮：stopPropagation 置位（不触发行点击跳转）+ confirm + DELETE 发出
+    const delFetchBefore = FETCH_HEADERS.filter((f) => f.method === "DELETE"
+        && f.url.indexOf("/tasks/") !== -1).length;
+    const evInline = { _stopped: false, stopPropagation() { this._stopped = true; } };
+    dbtn20._listeners["click"][0](evInline);   // async：flush 后断言 DELETE
+    chk("inline end button stops propagation", evInline._stopped === true,
+        "stopped=" + evInline._stopped);
+    await flush();
+    const delFetches = FETCH_HEADERS.filter((f) => f.method === "DELETE"
+        && f.url.indexOf("/tasks/") !== -1);
+    chk("inline end click issues DELETE task cancel",
+        delFetches.length === delFetchBefore + 1
+        && delFetches.some((f) => f.url === "/api/sessions/s1/tasks/20"),
+        "delta=" + (delFetches.length - delFetchBefore)
+        + " urls=" + JSON.stringify(delFetches.map((f) => f.url)));
+    chk("inline end click did not navigate (session unchanged)",
+        state.sessionId === "s1", "sid=" + state.sessionId);
+    // btw 按钮同样发 DELETE（结束 btw 对话 = cancel task）
+    dbtn21._listeners["click"][0]({ _stopped: false, stopPropagation() { this._stopped = true; } });
+    await flush();
+    chk("btw inline end issues DELETE task cancel",
+        FETCH_HEADERS.some((f) => f.method === "DELETE" && f.url === "/api/sessions/s1/tasks/21"),
+        "urls=" + JSON.stringify(FETCH_HEADERS.filter((f) => f.method === "DELETE").map((f) => f.url)));
+    // 后端取消成功 → 任务从轮询列表消失（模拟后端 registry 已清理）
+    tasksData = [{ session_id: "s1", id: 22, kind: "bash", label: "cargo check",
+      full_command: "cargo check", output: "", role: null }];
+    await pollTasks();
+    await flush();
+    // (c) 防回归：delegate 行点击仍是跳转会话（subagent_session_id 直连）
+    tasksData = [{ session_id: "s1", id: 23, kind: "delegate", label: "子任务Y", role: "explore",
+      subagent_session_id: "sub-23" }];
+    await pollTasks();
+    await flush();
+    const drow23 = elsById["composerTasks"].querySelector(".task-row");
+    drow23._listeners["click"][0]();
+    await flush();
+    chk("delegate row click still navigates to subagent session",
+        state.sessionId === "sub-23", "sid=" + state.sessionId);
+    openSession("s1");
+    await flush();
+    // (d) 防回归：bash 展开区取消按钮照旧（隐藏 → 展开显示 → 点击 confirm+DELETE）
+    state.tasks.composerOpen = true;   // openSession 强制收起面板：重开渲染行
+    tasksData = [{ session_id: "s1", id: 24, kind: "bash", label: "cargo test",
+      full_command: "cargo test", output: "running", role: null }];
+    taskOutputText = "running";
+    await pollTasks();
+    await flush();
+    const brow24 = elsById["composerTasks"].querySelector(".task-row");
+    const insideCancel24 = brow24.querySelector(".task-cancel-inside");
+    chk("bash inside cancel hidden by default",
+        insideCancel24 !== null && insideCancel24.hidden === true,
+        "hidden=" + (insideCancel24 && insideCancel24.hidden));
+    brow24._listeners["click"][0]();
+    chk("bash inside cancel shown after expand", insideCancel24.hidden === false,
+        "hidden=" + insideCancel24.hidden);
+    insideCancel24._listeners["click"][0]({ stopPropagation() {} });
+    await flush();
+    chk("bash inside cancel issues DELETE task cancel",
+        FETCH_HEADERS.some((f) => f.method === "DELETE" && f.url === "/api/sessions/s1/tasks/24"),
+        "urls=" + JSON.stringify(FETCH_HEADERS.filter((f) => f.method === "DELETE").map((f) => f.url)));
+    // 还原：面板清空（后续 Bug C 等测试从空任务面板继续）
+    tasksData = [];
+    await pollTasks();
+    await flush();
+
     // ---- Bug C：任务面板直连跳转 subagent，lastList 还没包含该会话
     // （新后端 subagent_session_id 直连路径，轮询未刷新）：
     // openSession 在 cur 查不到时不得把「← 主会话」误藏（保持现状，

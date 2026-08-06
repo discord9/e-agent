@@ -587,6 +587,21 @@ function buildTaskRow(t, key, restoreExpanded) {
     const status = el("span", "task-stream-status", "● 流式输出中…");
     status.hidden = true;   // 仅轮询/流进行中显示（轻量视觉提示）
     line.appendChild(status);
+    // delegate（含 btw）行内常显「结束」按钮：这类行的点击语义是「跳转到
+    // 子代理会话」而非就地展开，展开区取消按钮（task-cancel-inside）永远
+    // 不可见——btw 的「结束对话」= cancel task（cancel 取消 WaitForInput
+    // runner，DelegateCleanup 清理注册），必须给一个不用展开就能点的入口。
+    // 放状态点之后（task-line 行尾）：muted 小字，hover 才变红，避免误触。
+    if (isDelegate) {
+      const endBtn = el("button", "task-cancel-inline", "结束");
+      endBtn.title = "结束该子代理对话（取消任务 " + (t.id != null ? t.id : "") + "）";
+      endBtn.addEventListener("click", async (ev) => {
+        ev.stopPropagation();          // 不触发行点击的跳转会话
+        if (!window.confirm("确认结束子代理对话 " + shortTaskLabel(t) + "？")) return;
+        await cancelTask(t);           // 复用统一取消路径（DELETE /tasks/{id}）
+      });
+      line.appendChild(endBtn);
+    }
     row.appendChild(line);
 
     let pre = null, streamEl = null, cmdEl = null;

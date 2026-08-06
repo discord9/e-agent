@@ -1776,6 +1776,22 @@
   }
   .task-cancel:hover:not(:disabled) { background: var(--red); color: var(--base3); border-color: var(--red); }
   .task-cancel:disabled { opacity: 0.4; cursor: not-allowed; }
+  /* delegate 行内常显「结束」按钮（ml-auto 把状态点之后的它推到行尾）：
+     与展开区 .task-cancel-inside 区分——muted 灰字灰边小按钮，hover 才变红，
+     既可见又不与跳转会话的行点击争抢注意力（防误触）。 */
+  .task-cancel-inline {
+    margin-left: auto;
+    flex: 0 0 auto;
+    padding: 0 8px;
+    font-size: 11px;
+    color: var(--base01);
+    border: 1px solid var(--base1);
+    border-radius: 3px;
+    background: transparent;
+    cursor: pointer;
+  }
+  .task-cancel-inline:hover:not(:disabled) { color: var(--red); border-color: var(--red); }
+  .task-cancel-inline:disabled { opacity: 0.4; cursor: not-allowed; }
   /* 展开输出区内的取消按钮（行内默认不再显示，防误触）：
      位于输出下方，红字红边与 .task-cancel 一致，略大一点点击区 */
   .task-cancel-inside {
