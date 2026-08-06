@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use crate::agent::SessionEntry;
 use crate::session_store::{
-    SessionMeta, datetime_to_us, dedup_raw_entries, entry_kind, format_conflict_error, is_error,
-    next_event_time_us, process_identity, us_to_datetime,
+    SessionMeta, UsageRow, datetime_to_us, dedup_raw_entries, entry_kind, format_conflict_error,
+    is_error, next_event_time_us, process_identity, us_to_datetime,
 };
 // Public path preserved for symmetry with `session_greptime` (the function
 // was a `pub fn` defined here before the shared-helper extraction).
@@ -118,6 +118,34 @@ CREATE TABLE IF NOT EXISTS sessions (
     archived INTEGER NULL,
     writer TEXT NULL,
     PRIMARY KEY (workspace_id, session_id, last_active_at)
+)
+"#;
+
+/// DDL for the token-usage statistics table. Idempotent. One row per model
+/// call whose usage is worth accounting (regular turns, compactions, the
+/// desktop-pet summarizer), scoped to (workspace, session) like
+/// `session_entries`. The primary key carries only `(workspace_id,
+/// session_id, seq)` (no `event_time_us`): `seq` is a strictly monotonic
+/// per-process microsecond timestamp (see [`next_event_time_us`]) reused
+/// as the row sequence, so within one process no two rows of the same
+/// session can collide. Across processes sharing one database file a
+/// same-microsecond write would collide loudly (a real INSERT error) — the
+/// write is best-effort and the runner is single-writer per session, so
+/// this is acceptable, exactly like the `sessions` snapshot PK.
+///
+/// The read path is a plain `GROUP BY session_id, model, kind` aggregate
+/// ([`Self::usage_summary`]); no per-seq dedup is needed.
+const CREATE_TABLE_USAGE: &str = r#"
+CREATE TABLE IF NOT EXISTS usage_entries (
+    workspace_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    event_time_us INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, session_id, seq)
 )
 "#;
 
@@ -225,6 +253,9 @@ impl SqliteSession {
         conn.execute(CREATE_TABLE_SESSIONS, ())
             .await
             .map_err(|e| format!("cannot create sessions table: {e}"))?;
+        conn.execute(CREATE_TABLE_USAGE, ())
+            .await
+            .map_err(|e| format!("cannot create usage_entries table: {e}"))?;
 
         // Idempotent schema migration for the `title`, `pinned`,
         // `archived` and `writer` columns — a table-structure evolution:
@@ -1124,6 +1155,105 @@ impl SqliteSession {
         *self.next_seq.lock().unwrap() = final_cursor;
 
         Ok(())
+    }
+
+    /// Insert one token-usage row into the `usage_entries` table. `kind`
+    /// is one of "regular" | "compact" | "summarizer". `seq` reuses the
+    /// strictly monotonic per-process microsecond clock (see
+    /// [`next_event_time_us`]), which doubles as the row's `event_time_us`
+    /// — no separate per-session usage seq state is needed, and the
+    /// primary key `(workspace_id, session_id, seq)` stays collision-free
+    /// within one process (see the `CREATE_TABLE_USAGE` comment).
+    ///
+    /// `workspace_id`/`session_id` are explicit parameters (not the bound
+    /// session's) so the workspace-scoped meta store can record usage for
+    /// any session id, and the store facade passes them through.
+    pub async fn append_usage(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        model: &str,
+        kind: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<(), String> {
+        let seq = next_event_time_us();
+        self.conn
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO usage_entries \
+                 (workspace_id, session_id, seq, event_time_us, model, kind, input_tokens, output_tokens) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    workspace_id,
+                    session_id,
+                    seq,
+                    seq,
+                    model,
+                    kind,
+                    input_tokens as i64,
+                    output_tokens as i64,
+                ),
+            )
+            .await
+            .map_err(|e| format!("cannot insert token usage: {e}"))?;
+        Ok(())
+    }
+
+    /// Aggregate token usage per (session_id, model, kind) for this
+    /// workspace: totals plus the first/last event timestamps (µs since
+    /// epoch) of each group, newest activity first.
+    pub async fn usage_summary(&self) -> Result<Vec<UsageRow>, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT session_id, model, kind, \
+                        SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, \
+                        MIN(event_time_us) AS first_ts, MAX(event_time_us) AS last_ts \
+                 FROM usage_entries \
+                 WHERE workspace_id = ?1 \
+                 GROUP BY session_id, model, kind \
+                 ORDER BY last_ts DESC",
+                (self.workspace_id.as_str(),),
+            )
+            .await
+            .map_err(|e| format!("cannot query token usage: {e}"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot query token usage: {e}"))?
+        {
+            let text_at = |index: usize, label: &str| {
+                row.get_value(index)
+                    .map_err(|e| format!("cannot query token usage: {e}"))?
+                    .as_text()
+                    .cloned()
+                    .ok_or_else(|| format!("cannot query token usage: {label} is not text"))
+            };
+            let int_at = |index: usize, label: &str| {
+                row.get_value(index)
+                    .map_err(|e| format!("cannot query token usage: {e}"))?
+                    .as_integer()
+                    .copied()
+                    .ok_or_else(|| format!("cannot query token usage: {label} is not an integer"))
+            };
+            out.push(UsageRow {
+                session_id: text_at(0, "session_id")?,
+                model: text_at(1, "model")?,
+                kind: text_at(2, "kind")?,
+                input_tokens: u64::try_from(int_at(3, "input_tokens")?).map_err(|_| {
+                    "cannot query token usage: input_tokens is negative".to_string()
+                })?,
+                output_tokens: u64::try_from(int_at(4, "output_tokens")?).map_err(|_| {
+                    "cannot query token usage: output_tokens is negative".to_string()
+                })?,
+                first_ts: int_at(5, "first_ts")?,
+                last_ts: int_at(6, "last_ts")?,
+            });
+        }
+        Ok(out)
     }
 
     /// Insert prepped rows in one multi-row INSERT. SQLite has no

@@ -831,7 +831,28 @@ impl SessionRunner {
                 // Publish the complete projection only after durable commit. Streaming
                 // deltas were sent live-only while the operation was in flight.
                 self.shared.lock().unwrap().emit(projection);
-                self.agent.apply_usage(usage, false);
+                // 压缩用量落盘（kind="compact"）。与 agent.rs 的 `Agent::compact`
+                // （直接调用路径，无 store 访问权）不是同一事件：runner 走的是
+                // `prepare_compaction`，生产环境压缩只经此处落盘，不会重复写入。
+                if let Some(usage) = usage {
+                    let input_tokens = usage.input_tokens;
+                    let output_tokens = usage.output_tokens;
+                    self.agent.apply_usage(Some(usage), false);
+                    if let Err(error) = self
+                        .store
+                        .append_usage(
+                            &self.root,
+                            &self.session,
+                            &self.agent.model_name(),
+                            "compact",
+                            input_tokens,
+                            output_tokens,
+                        )
+                        .await
+                    {
+                        eprintln!("e-agent: cannot record compaction usage: {error:#}");
+                    }
+                }
                 let steering = self.intake_after_operation(waited.pending);
                 self.status(source.resume_status());
                 OperationFlow::Done(steering)
@@ -1096,7 +1117,26 @@ impl SessionRunner {
                         .await;
                     return;
                 }
-                self.agent.apply_usage(usage, true);
+                // 正常轮用量落盘（kind="regular"）；持久化失败只告警，不影响会话。
+                if let Some(usage) = usage {
+                    let input_tokens = usage.input_tokens;
+                    let output_tokens = usage.output_tokens;
+                    self.agent.apply_usage(Some(usage), true);
+                    if let Err(error) = self
+                        .store
+                        .append_usage(
+                            &self.root,
+                            &self.session,
+                            &self.agent.model_name(),
+                            "regular",
+                            input_tokens,
+                            output_tokens,
+                        )
+                        .await
+                    {
+                        eprintln!("e-agent: cannot record usage: {error:#}");
+                    }
+                }
                 let steering = self.intake_after_operation(waited.pending);
                 if !streamed && let Some(text) = content.filter(|text| !text.is_empty()) {
                     self.agent.emit_event(AgentEvent::AssistantText(text));

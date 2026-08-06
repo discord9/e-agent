@@ -546,6 +546,23 @@ pub enum SessionStore {
     },
 }
 
+/// One aggregate row of token-usage statistics: totals per
+/// (session_id, model, kind) plus the first/last event timestamps
+/// (microseconds since epoch, see [`next_event_time_us`]) of that group.
+/// Produced by [`SessionStore::usage_summary`] from the `usage_entries`
+/// table (Greptime/SQLite backends only; JSONL has no usage table).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageRow {
+    pub session_id: String,
+    pub model: String,
+    /// "regular" | "compact" | "summarizer"
+    pub kind: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub first_ts: i64,
+    pub last_ts: i64,
+}
+
 /// Where a live agent records its in-flight background tasks: the workspace
 /// root, the session name the record belongs to, and the store that owns
 /// the record. Carried by the main agent (`agent.background_record`) and
@@ -1041,6 +1058,81 @@ impl SessionStore {
                 .lock()
                 .await
                 .append(entries)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Record one token-usage row in the `usage_entries` table. `kind` is
+    /// one of "regular" (normal turn), "compact" (compaction) or
+    /// "summarizer" (desktop-pet summary model).
+    ///
+    /// For `Jsonl` this is a silent no-op: the file backend has no usage
+    /// table, so token statistics are only available on the Greptime/
+    /// SQLite backends (the CLI `usage` subcommand prints a hint when the
+    /// workspace uses the JSONL backend).
+    #[allow(unused_variables)]
+    pub async fn append_usage(
+        &self,
+        root: &Path,
+        session_id: &str,
+        model: &str,
+        kind: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => Ok(()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                let workspace_id = derive_workspace_id(root);
+                session
+                    .lock()
+                    .await
+                    .append_usage(
+                        &workspace_id,
+                        session_id,
+                        model,
+                        kind,
+                        input_tokens,
+                        output_tokens,
+                    )
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => {
+                let workspace_id = derive_workspace_id(root);
+                session
+                    .lock()
+                    .await
+                    .append_usage(
+                        &workspace_id,
+                        session_id,
+                        model,
+                        kind,
+                        input_tokens,
+                        output_tokens,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)
+            }
+        }
+    }
+
+    /// Aggregate token usage per (session, model, kind) for the workspace.
+    /// `Jsonl` returns an empty vector (no usage table on the file
+    /// backend).
+    #[allow(unused_variables)]
+    pub async fn usage_summary(&self, root: &Path) -> Result<Vec<UsageRow>> {
+        match self {
+            SessionStore::Jsonl => Ok(Vec::new()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session.lock().await.usage_summary().await,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .usage_summary()
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -3433,6 +3525,107 @@ mod tests {
                 message.contains("cannot load unfinished background task owners"),
                 "probe error must carry context: {message}"
             );
+        }
+
+        /// `inject_killed_notice` 的端到端契约（server 启动僵尸扫描与
+        /// build_session 的 Consume 路径共用）：dead-owner 的 running_tasks
+        /// 行 → 消费 + Notice 追加到存储（无 live agent 也能注入，这是启动
+        /// 扫描的场景）；再次调用幂等返回 None。与 resume 路径同源，天然幂等。
+        #[tokio::test]
+        async fn sqlite_inject_killed_notice_consumes_and_appends_without_live_agent() {
+            let (_dir, path) = temp_db();
+            let root = std::env::temp_dir();
+            let session = format!("test-store-inject-{}", crate::session::new_id());
+            let store = SessionStore::connect(&backend(&path), &root, &session)
+                .await
+                .expect("connect sqlite store");
+
+            // 只在一个可探测的 hostname 环境下才能构造「确定已死」的 owner
+            // （无 HOSTNAME/COMPUTERNAME 时 owner_alive 保守 alive，探测不可
+            // 达）；否则断言保守行为：不注入。
+            let Some(hostname) = probeable_hostname() else {
+                let injected =
+                    crate::session_factory::inject_killed_notice(&store, &root, &session)
+                        .await
+                        .expect("inject with unprobeable hostname");
+                assert!(injected.is_none(), "unprobeable hostname must not inject");
+                return;
+            };
+            let dead_owner = format!("2000000000@{hostname}#deadbeef");
+
+            // 直接插两条 owner 全死的 running_tasks 行（record_background_start
+            // 写的是当前进程的存活 identity，这里要模拟上次进程的死记录）。
+            let workspace_id = derive_workspace_id(&root);
+            let db = turso::Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .expect("open db");
+            let conn = db.connect().expect("connect raw");
+            for (task_id, label) in [(1u64, "sleep 100"), (2, "cargo build")] {
+                conn.execute(
+                    "INSERT INTO running_tasks \
+                     (workspace_id, session_id, task_id, label, subagent_session_id, \
+                      started_at_us, owner_identity) \
+                     VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5)",
+                    (
+                        workspace_id.as_str(),
+                        session.as_str(),
+                        task_id as i64,
+                        label,
+                        dead_owner.as_str(),
+                    ),
+                )
+                .await
+                .expect("insert dead-owner running_tasks row");
+            }
+            drop(conn);
+            drop(db);
+
+            // 探测：全部 owner 已死。
+            assert!(
+                store
+                    .unfinished_owner_all_dead(&root, &session)
+                    .await
+                    .expect("probe"),
+                "dead-owner rows must probe all-dead"
+            );
+
+            // 注入：无 live agent（没有 Agent，只有 store）也能拿到 Notice。
+            let entry = crate::session_factory::inject_killed_notice(&store, &root, &session)
+                .await
+                .expect("inject killed notice")
+                .expect("rows must inject a notice");
+            let SessionEntry::Notice { text } = &entry else {
+                panic!("injected entry must be a Notice, got {entry:?}");
+            };
+            assert!(
+                text.contains("2 background task(s)"),
+                "count in notice: {text}"
+            );
+            assert!(text.contains("sleep 100"), "label in notice: {text}");
+            assert!(text.contains("cargo build"), "label in notice: {text}");
+
+            // 记录已被消费：再 take 为空、再注入为 None（幂等）。
+            let labels = store
+                .take_unfinished_background(&root, &session)
+                .await
+                .expect("take after inject");
+            assert!(labels.is_empty(), "rows must be consumed: {labels:?}");
+            let again = crate::session_factory::inject_killed_notice(&store, &root, &session)
+                .await
+                .expect("second inject");
+            assert!(again.is_none(), "second inject must be a no-op");
+
+            // Notice 已持久化：会话下次加载（resume/attach 的 restore_history）
+            // 能看到它——不依赖任何 live agent。
+            let loaded = store.load(&root, &session).await.expect("load session");
+            let notices: Vec<&SessionEntry> = loaded
+                .entries
+                .iter()
+                .filter(|e| matches!(e, SessionEntry::Notice { .. }))
+                .collect();
+            assert_eq!(notices.len(), 1, "exactly one persisted Notice");
+            assert_eq!(notices[0], &entry, "persisted Notice is the injected one");
         }
 
         /// `load_head_page` on the SQLite store: the bounded head page

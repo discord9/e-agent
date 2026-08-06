@@ -630,6 +630,13 @@ impl Agent {
         self.model = model;
     }
 
+    /// The current model's wire name ([`Model::name`]; the display name is
+    /// only reachable on the concrete `ConfiguredModel` wrapper, not
+    /// through the `dyn Model` seam). Used for token-usage accounting.
+    pub(crate) fn model_name(&self) -> String {
+        self.model.name().to_owned()
+    }
+
     /// Whether the session's current model accepts image input. Non-vision
     /// models cannot consume `Message::User` image parts — the vision gate
     /// (`ensure_vision_supported`) would reject every later model call and
@@ -863,6 +870,11 @@ impl Agent {
         let prepared = self.prepare_compaction().await?;
         let summary = prepared.summary;
         self.apply_entry(prepared.entry);
+        // 直接调用 Agent 的路径（测试/直连 API 使用者）没有 store 访问权
+        // （`background_record` 仅用于后台任务登记，且测试中为 None），这里
+        // 不落盘 usage；生产路径的压缩统一走 runner 的 compact_operation
+        // （runner.rs 的 apply_usage 落盘点，kind="compact"），与该处不是
+        // 同一事件，不会重复写入。
         self.apply_usage(prepared.usage, false);
         Ok(summary)
     }

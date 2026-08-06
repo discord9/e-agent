@@ -114,6 +114,72 @@ fn short_workspace_id(root: &std::path::Path) -> String {
     format!("{hash:08x}")
 }
 
+/// 启动时的僵尸后台任务扫描：上次进程退出时被杀的后台任务在重启后
+/// 静默消失（`/api/tasks` 只列 live registry，重启后恒空）。遍历所有
+/// 会话（含 subagent 会话——running_tasks 行可能记在子会话名下），对
+/// 每个会话探测其未完成记录的全部 owner 是否已死
+/// （`unfinished_owner_all_dead`，任何不确定性保守 false）；全死 → 消费
+/// 记录并注入「随进程被杀」Notice 到该会话的存储（append，不建 live
+/// agent；会话下次 resume/attach 时 `restore_history` 自然读到）。任何
+/// 单会话失败只 eprintln，不阻塞启动、不 panic。
+///
+/// 幂等性：注入与 resume 的 Consume 共用 `inject_killed_notice`，take 是
+/// 原子消费——启动扫描先执行则 resume 时行已清空、不再注入；resume 先
+/// 执行则扫描 take 为空、跳过。探测用 workspace 级 meta store（session
+/// id 是参数，零额外连接）；只有需要消费+注入时才按会话 connect 一个
+/// store（append 需要绑定该会话的游标/序列）。
+async fn scan_zombie_background_tasks(
+    meta_store: &SessionStore,
+    backend: &crate::config::SessionBackend,
+    root: &std::path::Path,
+) {
+    let metas = match meta_store.list_meta(root).await {
+        Ok(metas) => metas,
+        Err(error) => {
+            eprintln!("e-agent: zombie scan: cannot list sessions: {error:#}");
+            return;
+        }
+    };
+    let mut injected = 0usize;
+    for meta in &metas {
+        let session = &meta.session_id;
+        match meta_store.unfinished_owner_all_dead(root, session).await {
+            Ok(true) => {
+                let store = match SessionStore::connect(backend, root, session).await {
+                    Ok(store) => store,
+                    Err(error) => {
+                        eprintln!(
+                            "e-agent: zombie scan: cannot connect session {session}: {error:#}"
+                        );
+                        continue;
+                    }
+                };
+                match crate::session_factory::inject_killed_notice(&store, root, session).await {
+                    Ok(Some(_entry)) => {
+                        injected += 1;
+                        eprintln!(
+                            "e-agent: zombie scan: injected killed-task notice into session {session}"
+                        );
+                    }
+                    Ok(None) => {} // 记录已被并发 resume 消费：幂等，跳过
+                    Err(error) => {
+                        eprintln!(
+                            "e-agent: zombie scan: cannot inject notice into session {session}: {error:#}"
+                        );
+                    }
+                }
+            }
+            Ok(false) => {} // 仍有存活 owner 或无法判定：留给 owner/Preserve 自行清理
+            Err(error) => {
+                eprintln!("e-agent: zombie scan: cannot probe session {session}: {error:#}");
+            }
+        }
+    }
+    if injected > 0 {
+        eprintln!("e-agent: zombie scan: injected {injected} killed-task notice(s)");
+    }
+}
+
 /// Bind, authenticate, and serve until Ctrl-C. The factory is resolved once
 /// here and reused by every session `build()`.
 pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Result<()> {
@@ -161,6 +227,20 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
         short_workspace_id(state.factory.root()),
         std::process::id()
     );
+    // 僵尸后台任务扫描：spawn 一个异步任务，启动即扫（不等第一次请求）。
+    // 上次进程退出时被杀的后台任务重启后静默消失（/api/tasks 只列 live
+    // registry），这里把「N 个后台任务随进程被杀」Notice 注入到对应会话的
+    // 存储，用户下次打开任何会话都能看到提示。不阻塞启动；与用户首次
+    // resume 同一会话的竞态可接受（take 原子消费，谁先执行谁注入，天然
+    // 幂等——见 scan_zombie_background_tasks 的文档）。
+    {
+        let scan_meta_store = state.meta_store.clone();
+        let scan_backend = state.factory.backend().clone();
+        let scan_root = state.factory.root().to_path_buf();
+        tokio::spawn(async move {
+            scan_zombie_background_tasks(&scan_meta_store, &scan_backend, &scan_root).await;
+        });
+    }
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .with_context(|| format!("cannot bind {host}:{port}"))?;
@@ -2021,11 +2101,32 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
             images: Vec::new(),
         },
     ];
-    let Ok(Ok((assistant, _))) =
+    let Ok(Ok((assistant, usage))) =
         tokio::time::timeout(SUMMARY_TIMEOUT, model.complete(&messages, &[], None)).await
     else {
         return; // 模型失败/超时：静默，不阻塞会话
     };
+    // summarizer 调用的 token 用量落盘（kind="summarizer"）：走 workspace
+    // 级 meta_store（与 sessions 表同 scope），session 维度用该会话 id；
+    // JSONL 后端静默跳过，失败只告警不影响总结。model 名用 summarizer
+    // 角色的 display_name（profile 短名，与 create_meta 存 model 的取法一致）。
+    if let Some(usage) = usage {
+        let model_name = state.factory.summarizer_model().display_name().to_owned();
+        if let Err(error) = state
+            .meta_store
+            .append_usage(
+                state.factory.root(),
+                id,
+                &model_name,
+                "summarizer",
+                usage.input_tokens,
+                usage.output_tokens,
+            )
+            .await
+        {
+            eprintln!("e-agent: cannot record summarizer usage: {error:#}");
+        }
+    }
     let Some(text) = assistant.content else {
         return;
     };

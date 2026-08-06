@@ -10,6 +10,7 @@ use e_agent::codex_auth::{login, logout};
 use e_agent::runner::{IdlePolicy, SessionHandle, SessionResult, SessionStatus, SessionTask};
 use e_agent::session_factory::{SessionFactory, UnfinishedPolicy};
 use e_agent::tui;
+use unicode_width::UnicodeWidthStr;
 
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -105,6 +106,9 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if raw_arguments.first().map(String::as_str) == Some("usage") {
+        return usage_command(raw_arguments).await;
+    }
     let mut base_url = None;
     let mut model = None;
     let mut profile = None;
@@ -166,7 +170,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             "--read-only" => {} // consumed via read_only_requested above
             "--help" | "-h" => {
                 println!(
-                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent --serve [--host ADDR] [--port PORT] [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--read-only]\n       e-agent web [-p PORT] [--host ADDR] [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--read-only]\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--fork SESSION] [--at N] [--max-rounds N] [--read-only] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup);\npass --fork <id> to start a new session from a completed turn of an existing one\n(--at N forks at the N-th entry, 1-based and inclusive, and must be a turn boundary);\n--read-only applies the read-only role policy to the main session only (no write/edit tools, no MCP tools, narrowed bash sandbox); delegated subagents keep their full default toolset and can write — give their role template read_only = true to make them read-only too;\nthe web subcommand starts a headless HTTP server (default http://127.0.0.1:8766);\n--serve runs a headless HTTP server (default http://127.0.0.1:8766) with a token-authenticated /api and a web UI"
+                    "usage: e-agent --version|-V\n       e-agent login|logout\n       e-agent usage [--workspace PATH]\n       e-agent --serve [--host ADDR] [--port PORT] [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--read-only]\n       e-agent web [-p PORT] [--host ADDR] [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--read-only]\n       e-agent [--profile PROFILE] [--base-url URL] [--model MODEL] [--workspace PATH] [--session|-s ID] [--fork SESSION] [--at N] [--max-rounds N] [--read-only] [--repl] [PROMPT]\n\nwithout --session a fresh unique session id is created every launch;\npass --session <id> to resume it (ids print on startup);\npass --fork <id> to start a new session from a completed turn of an existing one\n(--at N forks at the N-th entry, 1-based and inclusive, and must be a turn boundary);\n--read-only applies the read-only role policy to the main session only (no write/edit tools, no MCP tools, narrowed bash sandbox); delegated subagents keep their full default toolset and can write — give their role template read_only = true to make them read-only too;\nthe web subcommand starts a headless HTTP server (default http://127.0.0.1:8766);\n--serve runs a headless HTTP server (default http://127.0.0.1:8766) with a token-authenticated /api and a web UI;\nthe usage subcommand prints token-usage statistics per session/model/kind (Greptime/SQLite backends only)"
                 );
                 return Ok(());
             }
@@ -330,6 +334,142 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
         }
         Ok(())
     }
+}
+
+/// `e-agent usage [--workspace PATH]` — token-usage statistics.
+///
+/// Aggregates the `usage_entries` table (Greptime/SQLite backends) per
+/// (session, model, kind) and prints an aligned table: total input/output
+/// tokens, 日均 (total / days since the session was created) and 平均速率
+/// (total / seconds of session lifetime, shown per hour). A session with
+/// no metadata row (or created in the last 24h) shows "-" for 日均/速率.
+/// The JSONL backend has no usage table and prints a hint instead.
+async fn usage_command(arguments: Vec<String>) -> anyhow::Result<()> {
+    let mut workspace = None;
+    let mut arguments = arguments.into_iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--workspace" => workspace = Some(next_value(&mut arguments, "--workspace")?),
+            "--help" | "-h" => {
+                println!("usage: e-agent usage [--workspace PATH]");
+                return Ok(());
+            }
+            value => {
+                return Err(anyhow!("e-agent usage does not accept argument {value:?}"));
+            }
+        }
+    }
+    let root = match workspace {
+        Some(path) => PathBuf::from(path),
+        None => std::env::current_dir()?,
+    };
+    let config = e_agent::config::Config::load_for_workspace(&root)?;
+    let backend = config
+        .as_ref()
+        .map(|c| c.session_backend())
+        .unwrap_or_default();
+    let store = e_agent::session_store::SessionStore::connect_meta(&backend, &root).await?;
+    let rows = store.usage_summary(&root).await?;
+    if rows.is_empty() {
+        println!(
+            "工作区 {} 暂无 token 用量记录（JSONL 后端不记录用量，或还没有产生用量）。",
+            root.display()
+        );
+        return Ok(());
+    }
+    // 会话创建/最近活跃时间（sessions 元数据表），用于日均与速率。
+    let metas = store.list_meta(&root).await?;
+    let meta_of: std::collections::HashMap<&str, &e_agent::session_store::SessionMeta> = metas
+        .iter()
+        .map(|meta| (meta.session_id.as_str(), meta))
+        .collect();
+
+    // 对齐打印：中文（CJK 双宽）按 2 列计。
+    fn pad(text: &str, width: usize) -> String {
+        let mut out = text.to_owned();
+        let w = UnicodeWidthStr::width(text);
+        if w < width {
+            out.push_str(&" ".repeat(width - w));
+        }
+        out
+    }
+
+    let header = [
+        "会话",
+        "模型",
+        "类型",
+        "输入 tokens",
+        "输出 tokens",
+        "合计",
+        "日均",
+        "速率/小时",
+    ];
+    let mut lines: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let total = row.input_tokens + row.output_tokens;
+        let (daily, rate) = match meta_of.get(row.session_id.as_str()) {
+            Some(meta) => {
+                let now = chrono::Utc::now().naive_utc();
+                let days = (now - meta.created_at).num_days();
+                let daily = if days > 0 {
+                    format!("{}", total / days as u64)
+                } else {
+                    "-".to_owned()
+                };
+                let secs = (meta.last_active_at - meta.created_at).num_seconds();
+                let rate = if secs > 0 {
+                    format!(
+                        "{}",
+                        ((total as f64) / (secs as f64 / 3600.0)).round() as u64
+                    )
+                } else {
+                    "-".to_owned()
+                };
+                (daily, rate)
+            }
+            None => ("-".to_owned(), "-".to_owned()),
+        };
+        lines.push(vec![
+            preview(&row.session_id, 24),
+            row.model.clone(),
+            row.kind.clone(),
+            row.input_tokens.to_string(),
+            row.output_tokens.to_string(),
+            total.to_string(),
+            daily,
+            rate,
+        ]);
+    }
+    let mut widths = [0usize; 8];
+    for (i, head) in header.iter().enumerate() {
+        widths[i] = UnicodeWidthStr::width(*head);
+    }
+    for line in &lines {
+        for (i, cell) in line.iter().enumerate() {
+            widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+        }
+    }
+    let render = |cells: &[String]| {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| pad(cell, widths[i]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let header: Vec<String> = header.iter().map(|head| head.to_string()).collect();
+    println!("{}", render(&header));
+    for line in &lines {
+        println!("{}", render(line));
+    }
+    let total_input: u64 = rows.iter().map(|row| row.input_tokens).sum();
+    let total_output: u64 = rows.iter().map(|row| row.output_tokens).sum();
+    println!(
+        "\n合计: 输入 {total_input} tokens, 输出 {total_output} tokens, 共 {} tokens（{} 行分组）",
+        total_input + total_output,
+        rows.len()
+    );
+    Ok(())
 }
 
 /// Lines printed by TuiSessionReport Drop (pure for testability).

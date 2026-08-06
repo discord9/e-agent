@@ -1734,6 +1734,151 @@ async fn advance_next_seq_rewind_rejected_and_toctou_refresh() {
 }
 
 // ----------------------------------------------------------------------
+// usage_entries — token-usage statistics table
+// ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn usage_entries_append_and_summarize() {
+    let (_dir, session, sid) = fresh_session().await;
+    let wid = workspace_id();
+
+    // 空表 → 空汇总。
+    assert!(session.usage_summary().await.unwrap().is_empty());
+
+    // 同一 (session, model, kind) 多行聚合；不同 model/kind 维度分行。
+    session
+        .append_usage(&wid, &sid, "model-a", "regular", 100, 50)
+        .await
+        .unwrap();
+    session
+        .append_usage(&wid, &sid, "model-a", "regular", 200, 30)
+        .await
+        .unwrap();
+    session
+        .append_usage(&wid, &sid, "model-a", "compact", 1000, 200)
+        .await
+        .unwrap();
+    session
+        .append_usage(&wid, &sid, "model-b", "regular", 10, 5)
+        .await
+        .unwrap();
+
+    let rows = session.usage_summary().await.unwrap();
+    assert_eq!(rows.len(), 3);
+    let regular_a = rows
+        .iter()
+        .find(|r| r.model == "model-a" && r.kind == "regular")
+        .expect("regular/model-a group");
+    assert_eq!(regular_a.session_id, sid);
+    assert_eq!(regular_a.input_tokens, 300);
+    assert_eq!(regular_a.output_tokens, 80);
+    assert!(regular_a.first_ts <= regular_a.last_ts);
+    let compact_a = rows
+        .iter()
+        .find(|r| r.model == "model-a" && r.kind == "compact")
+        .expect("compact/model-a group");
+    assert_eq!(compact_a.input_tokens, 1000);
+    assert_eq!(compact_a.output_tokens, 200);
+    let regular_b = rows
+        .iter()
+        .find(|r| r.model == "model-b" && r.kind == "regular")
+        .expect("regular/model-b group");
+    assert_eq!(regular_b.input_tokens, 10);
+    assert_eq!(regular_b.output_tokens, 5);
+}
+
+#[tokio::test]
+async fn usage_entries_are_scoped_by_workspace() {
+    let (_dir, session, sid) = fresh_session().await;
+    // 写入别的 workspace_id：本 workspace 的汇总查不到。
+    session
+        .append_usage("other-workspace", &sid, "m", "regular", 1, 1)
+        .await
+        .unwrap();
+    assert!(session.usage_summary().await.unwrap().is_empty());
+    // 同 workspace 的其他 session：汇总可见（usage_summary 按 workspace
+    // 聚合，每行携带各自的 session_id）。
+    session
+        .append_usage(&workspace_id(), "other-session", "m", "regular", 2, 2)
+        .await
+        .unwrap();
+    let rows = session.usage_summary().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id, "other-session");
+    assert_eq!(rows[0].input_tokens, 2);
+}
+
+#[tokio::test]
+async fn usage_entries_persist_across_reconnect() {
+    let (_dir, path) = temp_db();
+    let wid = workspace_id();
+    let sid = format!("test-sql-{}", crate::session::new_id());
+    {
+        let session = SqliteSession::connect(path.to_str().unwrap(), &wid, &sid)
+            .await
+            .expect("connect");
+        session
+            .append_usage(&wid, &sid, "m", "regular", 7, 3)
+            .await
+            .unwrap();
+    }
+    let session = SqliteSession::connect(path.to_str().unwrap(), &wid, &sid)
+        .await
+        .expect("reconnect");
+    let rows = session.usage_summary().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].model, "m");
+    assert_eq!(rows[0].kind, "regular");
+    assert_eq!(rows[0].input_tokens, 7);
+    assert_eq!(rows[0].output_tokens, 3);
+}
+
+#[tokio::test]
+async fn store_facade_usage_append_summary_and_jsonl_noop() {
+    use crate::session_store::SessionStore;
+
+    // SQLite facade：append_usage → usage_summary 走通。
+    let (_dir, path) = temp_db();
+    let root = std::path::Path::new("/tmp/e-agent-test-sqlite");
+    let sid = format!("test-sql-store-usage-{}", crate::session::new_id());
+    let store = SessionStore::connect(
+        &crate::config::SessionBackend::Sqlite {
+            path: Some(path.to_string_lossy().into_owned()),
+        },
+        root,
+        &sid,
+    )
+    .await
+    .expect("connect sqlite store");
+    store
+        .append_usage(root, &sid, "m", "regular", 5, 6)
+        .await
+        .expect("append usage via facade");
+    let rows = store
+        .usage_summary(root)
+        .await
+        .expect("usage summary via facade");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id, sid);
+    assert_eq!(rows[0].input_tokens, 5);
+    assert_eq!(rows[0].output_tokens, 6);
+
+    // JSONL facade：静默跳过（不报错、无记录）。
+    let jsonl = SessionStore::Jsonl;
+    jsonl
+        .append_usage(root, &sid, "m", "regular", 1, 1)
+        .await
+        .expect("jsonl append_usage is a silent no-op");
+    assert!(
+        jsonl
+            .usage_summary(root)
+            .await
+            .expect("jsonl summary")
+            .is_empty()
+    );
+}
+
+// ----------------------------------------------------------------------
 // running_tasks — background-task state table
 // ----------------------------------------------------------------------
 

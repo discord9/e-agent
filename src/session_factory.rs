@@ -56,6 +56,45 @@ pub enum UnfinishedPolicy {
     Preserve,
 }
 
+/// 消费一个会话的未完成后台任务记录并注入「随进程被杀」Notice。
+/// 原子消费（`take_unfinished_background`：SQLite/Greptime 是 DELETE、
+/// JSONL 是删记录文件）→ 非空则把 Notice 追加到该会话的存储并返回
+/// `Some(entry)`（已持久化）；无记录返回 `None`。build_session 的
+/// Consume 路径与 server 启动时的僵尸扫描共用，保证两处提示逻辑单一
+/// 来源、不漂移。
+///
+/// 只写存储、不要求 live agent：Notice 是普通持久化条目，会话下次
+/// `restore_history` 时自然读到。调用方若手头有刚建好的 agent（build
+/// 路径），应把返回的 entry `push_entry` 进内存历史，让首轮 prompt
+/// 立即看到；启动扫描没有 live agent，直接丢弃返回值即可。
+///
+/// 幂等性：记录被消费后 take 再取为空，重复调用返回 `None`；与并发
+/// resume 的竞态由消费的原子性保证——谁先 take 谁注入。
+pub(crate) async fn inject_killed_notice(
+    store: &SessionStore,
+    root: &Path,
+    session: &str,
+) -> anyhow::Result<Option<SessionEntry>> {
+    let unfinished = store.take_unfinished_background(root, session).await?;
+    if unfinished.is_empty() {
+        return Ok(None);
+    }
+    let notice = format!(
+        "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
+        unfinished.len(),
+        unfinished.join("\n")
+    );
+    let entry = SessionEntry::Notice {
+        text: notice.clone(),
+    };
+    // 立即持久化：注入后进程崩溃也不会在下次启动时重复注入（记录已被
+    // 消费，take 再取为空——天然幂等）。
+    store
+        .append(root, session, std::slice::from_ref(&entry))
+        .await?;
+    Ok(Some(entry))
+}
+
 /// Everything resolved once at startup and shared by every built session.
 pub struct SessionFactory {
     workspace: Workspace,
@@ -680,24 +719,10 @@ impl SessionFactory {
             // entirely — the server may be attaching to a session that is
             // still live in another process, and that owner clears its own
             // records via ack_background_entry → clear_background_task.
-            let unfinished = store
-                .take_unfinished_background(&self.root, &session)
-                .await?;
-            if !unfinished.is_empty() {
-                let notice = format!(
-                    "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
-                    unfinished.len(),
-                    unfinished.join("\n")
-                );
-                let entry = crate::agent::SessionEntry::Notice {
-                    text: notice.clone(),
-                };
-                // Persist immediately so a crash-before-first-turn cannot inject
-                // the same notice again on the next launch.
-                store
-                    .append(&self.root, &session, std::slice::from_ref(&entry))
-                    .await?;
-                // Append (NOT restore_history, which would wipe the resumed history).
+            if let Some(entry) = inject_killed_notice(&store, &self.root, &session).await? {
+                // 共享函数已把 Notice 持久化到存储；这里再 push 进刚建好的
+                // agent 内存历史（不是 restore_history，避免清掉恢复的历史），
+                // 让首轮 prompt 立即看到。
                 agent.push_entry(entry);
             }
         }

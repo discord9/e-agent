@@ -829,6 +829,64 @@ async fn prompt_accepted_before_round_failure_is_persisted_before_failure() {
 }
 
 #[tokio::test]
+async fn regular_turn_persists_usage_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let sid = format!("runner-usage-{}", crate::session::new_id());
+    let store = SessionStore::connect(
+        &crate::config::SessionBackend::Sqlite { path: None },
+        temp.path(),
+        &sid,
+    )
+    .await
+    .expect("connect sqlite store");
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: VecDeque::from([(
+                AssistantMessage {
+                    content: Some("hi".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+                Some(Usage {
+                    input_tokens: 111,
+                    output_tokens: 22,
+                }),
+            )]),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+        vec![],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        store.clone(),
+        temp.path().into(),
+        sid.clone(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("hello".into()));
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert!(matches!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some(answer))) if answer == "hi"
+    ));
+    task.join().await.unwrap();
+
+    // 正常轮 usage 已通过 runner 落盘（kind="regular"）。
+    let rows = store
+        .usage_summary(temp.path())
+        .await
+        .expect("usage summary");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id, sid);
+    assert_eq!(rows[0].kind, "regular");
+    // ScriptedContextCaptureModel 未覆写 name() → 默认 "?"。
+    assert_eq!(rows[0].model, "?");
+    assert_eq!(rows[0].input_tokens, 111);
+    assert_eq!(rows[0].output_tokens, 22);
+}
+
+#[tokio::test]
 async fn prompt_after_round_failure_has_no_projection_or_persistence() {
     let temp = tempfile::tempdir().unwrap();
     let (agent, _, _) = controlled(vec![Err(anyhow::anyhow!("round failed"))], false);
