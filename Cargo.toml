@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io
 toml = "0.9"
 unicode-width = "0.2.2"
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"], optional = true }
-turso = { version = "=0.4.4", optional = true }
+turso = { version = "=0.7.2", optional = true }
 url = "2"
 webbrowser = "1"
 
