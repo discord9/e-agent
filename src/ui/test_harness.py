@@ -6688,4 +6688,11 @@ for _sel, _bgvar in [
     if _cr < 4.5:
         _contrast_ok = False
     print(("PASS" if _cr >= 4.5 else "FAIL") + " contrast %.2f:1 %s" % (_cr, _sel))
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _empty_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok else 1)
+# favicon：index.html 的 <head> 必须有内联 SVG data URI 图标（gjs 不渲染页面，
+# 因此与上面的 CSS 段一样做静态断言）；data URI 中的 # 必须已转义为 %23，
+# 否则浏览器把 # 当 fragment 截断，图标静默失效。
+_html = open(os.path.join(HERE, 'index.html'), encoding='utf-8').read()
+_icon_m = re.search(r'<link\s+rel="icon"\s+type="image/svg\+xml"\s+href="(data:image/svg\+xml,[^"]+)"', _html)
+_icon_ok = bool(_icon_m and '%23' in _icon_m.group(1) and '#' not in _icon_m.group(1))
+print(("PASS" if _icon_ok else "FAIL") + " inline SVG favicon data URI in index.html head")
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _empty_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _icon_ok else 1)
