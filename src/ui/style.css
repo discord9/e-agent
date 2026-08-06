@@ -1797,6 +1797,21 @@
     color: var(--base02);
   }
   .task-output.empty { color: var(--base01); font-style: italic; }
+  /* bash 展开区顶部命令行：完整命令原文（不截断、等宽、自动换行），
+     与 .task-output 同基调、同开同关 */
+  .task-command {
+    margin: 6px 0 0;
+    padding: 6px 8px;
+    background: var(--base2);
+    border: 1px solid var(--base1);
+    border-radius: 3px;
+    font-family: monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    color: var(--base02);
+  }
   /* delegate 内嵌 SSE 流式区：就地输出（与 .task-output 同基调；
      monospace、限高 30vh 滚动，避免撑爆 composer） */
   .task-stream {
