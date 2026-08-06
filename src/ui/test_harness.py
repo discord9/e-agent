@@ -124,6 +124,22 @@ function parseHtml(html){
   return roots;
 }
 function matchSel(el, sel){
+  // 支持后代组合器（"a b"）：末段须命中 el，前面各段按从近到远依次命中
+  // el 的祖先链（真实 DOM querySelector 语义）。无空格时行为与旧版一致
+  // （.a.b 多类 / tag.class 单段）。fake DOM 只被这两个 .orbit-badge text
+  // 断言用到后代选择器，其余选择器均为单段，互不影响。
+  const sels = String(sel).trim().split(/\s+/);
+  if (sels.length > 1) {
+    const last = sels[sels.length - 1];
+    if (!matchSel(el, last)) return false;
+    let anc = el._parent;
+    for (let i = sels.length - 2; i >= 0; i--) {
+      while (anc && !matchSel(anc, sels[i])) anc = anc._parent;
+      if (!anc) return false;
+      anc = anc._parent;
+    }
+    return true;
+  }
   const parts = String(sel).split(".");
   let tag = parts[0];
   const classes = parts.slice(1).filter(Boolean);
@@ -2645,14 +2661,17 @@ async function main(){
     state.sessionId = "s1";
     elsById["promptInput"].value = "跨ws草稿";
     elsById["wsSaveBtn"]._listeners["click"][0]();
-    // 同步断言：清空立即生效（轮询响应尚未回来，不会污染这些字段）
-    chk("ws switch clears session state",
+    // 同步断言：清空立即生效（轮询响应尚未回来，不会污染这些字段）；
+    // 聚合任务缓存 tasks.list 保留（每项带 _ws 标记、按 ws 过滤）→ 切换瞬间
+    // 侧边栏 busy dot 与 subagent 展开状态不消失；轮询资源（pollers）仍清空。
+    chk("ws switch keeps aggregated task cache",
         state.sessionId === null
         && state.lastList.length === 0
-        && state.tasks.list.length === 0 && state.tasks.pollers.size === 0
+        && state.tasks.list.length > 0 && state.tasks.pollers.size === 0
         && elsById["messages"].innerHTML === "",
         "sid=" + state.sessionId
-        + " lastList=" + state.lastList.length);
+        + " lastList=" + state.lastList.length
+        + " tasks=" + state.tasks.list.length);
     // Bug 1：切 ws 不再清空 sessionStates；当前会话草稿按 per-ws 键
     // （default:s1）保留——切回默认 ws 重开 s1 时不丢。
     chk("ws switch keeps per-ws draft cache",
@@ -3410,6 +3429,27 @@ async function main(){
     await flush();
     await flush();
     console.log("DBG 15 lastList=" + JSON.stringify(state.lastList.map((x) => [x.id, x.title, x.pinned])));
+    // orbit-dot 数据源 = state.tasks.list 按 session_id+_ws 过滤的父会话任务
+    // 数（tasksLoaded=true 时空数组也算 loaded → 全 0，本段此前未注入任务
+    // 数据导致所有环绕点计数为 0）。按 workspace 各自数据源注入：c1×2 /
+    // c2×1 属 wsA（tasksData）；f1×1 / g1×8 属 wsB（tasksDataB——放
+    // tasksData 会被 _ws 过滤掉，实测 dots=0）。c1-child-idle-live
+    // （busy:false 在等）无任务，保证 c1 恰 2 点；d1 / e1 无任务（0 点）。
+    tasksData = [
+      { session_id: "c1", id: 1, kind: "delegate", label: "C 子任务忙一", role: "seer", subagent_session_id: "c1-child-busy-1" },
+      { session_id: "c1", id: 2, kind: "delegate", label: "C 子任务忙二", role: "seer", subagent_session_id: "c1-child-busy-2" },
+      { session_id: "c2", id: 1, kind: "delegate", label: "C2 子任务忙", role: "seer", subagent_session_id: "c2-child-busy" },
+    ];
+    tasksDataB = [
+      { session_id: "f1", id: 1, kind: "delegate", label: "F 子任务忙", role: "seer", subagent_session_id: "f1-child-busy" },
+      ...Array.from({ length: 8 }, (_, i) => ({
+        session_id: "g1", id: i + 1, kind: "delegate",
+        label: "G 子任务 " + (i + 1), role: "seer",
+        subagent_session_id: "g1-child-" + (i + 1),
+      })),
+    ];
+    await pollTasks();
+    await flush();
     renderSidebarTree(true);
     const sec15 = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
     // 组头 chip：A=ws-chip-0，B=ws-chip-1（数组下标取色，互不相同）
@@ -3466,16 +3506,16 @@ async function main(){
         "dots=" + wrapOf15(g1Row).querySelectorAll(".orbit-dot").length
         + " overflow=" + wrapOf15(g1Row).querySelector(".orbit-badge text").textContent);
     chk("busy dot wrapper aria-label combines parent and child status",
-        wrapOf15(c1Row).getAttribute("aria-label") === "会话空闲，2 个子任务处理中"
+        wrapOf15(c1Row).getAttribute("aria-label") === "会话空闲，2 个任务处理中"
         && wrapOf15(d1Row).getAttribute("aria-label") === "会话处理中"
-        && wrapOf15(f1Row).getAttribute("aria-label") === "会话处理中，1 个子任务处理中",
+        && wrapOf15(f1Row).getAttribute("aria-label") === "会话处理中，1 个任务处理中",
         "c=" + wrapOf15(c1Row).getAttribute("aria-label")
         + " d=" + wrapOf15(d1Row).getAttribute("aria-label")
         + " f=" + wrapOf15(f1Row).getAttribute("aria-label"));
     chk("parent title keeps child-busy hint",
-        c1Row.title.includes("子任务处理中")
-        && f1Row.title.includes("子任务处理中")
-        && !e1Row.title.includes("子任务处理中"),
+        c1Row.title.includes("任务处理中")
+        && f1Row.title.includes("任务处理中")
+        && !e1Row.title.includes("任务处理中"),
         "c=" + c1Row.title + " f=" + f1Row.title);
     // C) live 子会话（active !== false，含 Idle 存活）直显；inactive
     //    （active === false）收进默认收起的历史组
@@ -3565,6 +3605,29 @@ async function main(){
     state.sidebar.showAllWs = new Set();
     state.sidebar.expanded = new Set(["wsA:m1", "wsA:m2", "wsA:m3", "wsA:m4"]);
     state.renameActive = false;
+    // 15b2 的 orbit 计数同样以任务数据为准（tasksLoaded 时空数组算 loaded
+    // → 0 点）：m1×3（m1-run / m1-legacy-run / m1-compact）、m2×1（m2-run）、
+    // m3×8（m3-run-1..8 → 5 点 + "+3" 徽章）、m4×1（m4-folded-run）。
+    // 本段单 workspace（wsA），全部注入 tasksData；tasksDataB 置空。
+    // label 用中性串：orbit-dot 的 <title> 文本会进入父行 textContent，
+    // 若 label 等于子会话 label（"M1 运行中"/"M2 忙"…）会让 rowM() 先命中
+    // 父行（无 .busy-dot）导致子行断言崩溃——label 仅影响 <title> 文案，
+    // 断言只数 dots，不查文案。
+    tasksData = [
+      { session_id: "m1", id: 1, kind: "delegate", label: "delegate-1", role: "seer", subagent_session_id: "m1-run" },
+      { session_id: "m1", id: 2, kind: "delegate", label: "delegate-2", role: "seer", subagent_session_id: "m1-legacy-run" },
+      { session_id: "m1", id: 3, kind: "delegate", label: "delegate-3", role: "seer", subagent_session_id: "m1-compact" },
+      { session_id: "m2", id: 1, kind: "delegate", label: "delegate-4", role: "seer", subagent_session_id: "m2-run" },
+      ...Array.from({ length: 8 }, (_, i) => ({
+        session_id: "m3", id: i + 1, kind: "delegate",
+        label: "delegate-" + (5 + i), role: "seer",
+        subagent_session_id: "m3-run-" + (i + 1),
+      })),
+      { session_id: "m4", id: 1, kind: "delegate", label: "delegate-13", role: "seer", subagent_session_id: "m4-folded-run" },
+    ];
+    tasksDataB = [];
+    await pollTasks();
+    await flush();
     await pollAllWorkspaces();
     await flush();
     await flush();
@@ -3572,7 +3635,7 @@ async function main(){
     const rowsM = elsById["sidebarTree"].querySelectorAll(".tree-row");
     const rowM = (t) => [...rowsM].find((r) => r.textContent.includes(t));
     const wrapM = (r) => r.querySelector(".busy-dot-wrap");
-    const mainM = (r) => wrapM(r).querySelector(".busy-dot");
+    const mainM = (r) => wrapM(r).querySelector(".main-dot");
     const kidM = (r) => r.querySelector(".busy-dot");
     const m1Row = rowM("M1 主会话");
     const m2Row = rowM("M2 主会话");
