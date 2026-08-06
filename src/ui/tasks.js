@@ -587,21 +587,26 @@ function buildTaskRow(t, key, restoreExpanded) {
     const status = el("span", "task-stream-status", "● 流式输出中…");
     status.hidden = true;   // 仅轮询/流进行中显示（轻量视觉提示）
     line.appendChild(status);
-    // delegate（含 btw）行内常显「结束」按钮：这类行的点击语义是「跳转到
-    // 子代理会话」而非就地展开，展开区取消按钮（task-cancel-inside）永远
-    // 不可见——btw 的「结束对话」= cancel task（cancel 取消 WaitForInput
-    // runner，DelegateCleanup 清理注册），必须给一个不用展开就能点的入口。
-    // 放状态点之后（task-line 行尾）：muted 小字，hover 才变红，避免误触。
-    if (isDelegate) {
-      const endBtn = el("button", "task-cancel-inline", "结束");
-      endBtn.title = "结束该子代理对话（取消任务 " + (t.id != null ? t.id : "") + "）";
-      endBtn.addEventListener("click", async (ev) => {
-        ev.stopPropagation();          // 不触发行点击的跳转会话
+    // 行尾常显取消按钮（bash/delegate/btw 统一 .task-cancel-inline，状态点
+    // 之后、margin-left:auto 推到行尾）：不用展开就能取消。delegate 的点击
+    // 语义是「跳转到子代理会话」、btw 的「结束对话」= cancel task（cancel
+    // 取消 WaitForInput runner，DelegateCleanup 清理注册），本就没有可展开
+    // 的取消入口；bash 虽然行点击是展开输出区，但展开区按钮（原
+    // task-cancel-inside）已移除——统一成行尾一个取消入口，避免一行两个
+    // 取消按钮。muted 小字，hover 才变红，避免误触；stopPropagation 保证
+    // 不触发行点击（bash 展开 / delegate 跳转会话）。
+    const endBtn = el("button", "task-cancel-inline", isDelegate ? "结束" : "取消");
+    endBtn.title = isDelegate
+      ? "结束该子代理对话（取消任务 " + (t.id != null ? t.id : "") + "）"
+      : "取消任务 " + (t.id != null ? t.id : "");
+    endBtn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();            // 不触发行点击（跳转会话/展开输出）
+      if (isDelegate) {
         if (!window.confirm("确认结束子代理对话 " + shortTaskLabel(t) + "？")) return;
-        await cancelTask(t);           // 复用统一取消路径（DELETE /tasks/{id}）
-      });
-      line.appendChild(endBtn);
-    }
+      } else if (!window.confirm("确认取消任务 " + shortTaskLabel(t) + "？")) return;
+      await cancelTask(t);             // 复用统一取消路径（DELETE /tasks/{id}）
+    });
+    line.appendChild(endBtn);
     row.appendChild(line);
 
     let pre = null, streamEl = null, cmdEl = null;
@@ -625,17 +630,8 @@ function buildTaskRow(t, key, restoreExpanded) {
       pre.hidden = true;
       row.appendChild(pre);
     }
-    // 取消按钮默认不显示，藏进展开的输出/流式区（防误触）：展开时才出现，
-    // 点击需 confirm 确认后才真正取消。
-    const cancel = el("button", "task-cancel task-cancel-inside", "取消");
-    cancel.title = "取消任务 " + (t.id != null ? t.id : "");
-    cancel.hidden = true;
-    cancel.addEventListener("click", async (ev) => {
-      ev.stopPropagation();
-      if (!window.confirm("确认取消任务 " + shortTaskLabel(t) + "？")) return;
-      await cancelTask(t);
-    });
-    row.appendChild(cancel);
+    // 取消入口已统一为行尾常显按钮（见上 .task-cancel-inline），原展开区
+    // 隐藏取消按钮（task-cancel-inside）已移除，避免一行两个取消按钮。
     // 就地展开/收起（bash 点击主路径；delegate 解析不到 subagent 会话时的回退）
     const toggleRow = () => {
       const showing = isDelegate ? !streamEl.hidden : !pre.hidden;
@@ -651,7 +647,6 @@ function buildTaskRow(t, key, restoreExpanded) {
           state.tasks.degraded.delete(key);   // 收起即重置：重新展开时重新尝试轮询
         }
         status.hidden = true;
-        cancel.hidden = true;
       } else {                       // 当前收起 → 展开：启动轮询/流
         if (isDelegate) {
           streamEl.hidden = false;
@@ -663,7 +658,6 @@ function buildTaskRow(t, key, restoreExpanded) {
             startOutputPoller(key, t, pre, (phase) => { status.hidden = phase !== "start"; });
           }
         }
-        cancel.hidden = false;
       }
     };
     row.addEventListener("click", () => {
@@ -703,7 +697,6 @@ function buildTaskRow(t, key, restoreExpanded) {
           startOutputPoller(key, t, pre, (phase) => { status.hidden = phase !== "start"; });
         }
       }
-      cancel.hidden = false;
     }
     return row;
 }

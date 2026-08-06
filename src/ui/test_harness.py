@@ -1353,12 +1353,11 @@ async function main(){
     chk("main session hides back-to-parent",
         elsById["backParentBtn"].hidden === true,
         "hidden=" + elsById["backParentBtn"].hidden);
-    // ---- delegate/btw 行内常显「结束」按钮（修复交互矛盾：这类行的点击
-    // 是「跳转会话」而非展开，展开区取消按钮永远不可见，btw 无法结束）----
+    // ---- 行尾常显取消按钮（bash/delegate/btw 统一 .task-cancel-inline） ----
     // (a) 行内按钮不展开即存在、非 hidden；(b) 点击 → confirm + cancelTask
     //     发出 DELETE /api/sessions/{父}/tasks/{id}，且 stopPropagation
     //     不触发行点击的 openSession 跳转；(c) btw（delegate+resume）同样有；
-    //     bash 行无行内按钮（展开区取消照旧）。
+    //     bash 行有同款行尾「取消」按钮（展开区 task-cancel-inside 已移除）。
     state.lastList = [];   // 不依赖 label 匹配：subagent_session_id 直连
     state.tasks.composerOpen = true;   // openSession 会强制收起面板：重开以渲染行
     tasksData = [
@@ -1383,9 +1382,12 @@ async function main(){
     chk("btw row has visible inline end button",
         dbtn21 !== null && dbtn21.hidden === false && dbtn21.textContent === "结束",
         "btn=" + String(dbtn21 !== null) + " hidden=" + (dbtn21 && dbtn21.hidden));
-    chk("bash row has no inline end button",
-        drow22.querySelector(".task-cancel-inline") === null,
-        "btn=" + String(drow22.querySelector(".task-cancel-inline") !== null));
+    chk("bash row has visible trailing cancel button",
+        drow22.querySelector(".task-cancel-inline") !== null
+        && drow22.querySelector(".task-cancel-inline").hidden === false
+        && drow22.querySelector(".task-cancel-inline").textContent === "取消",
+        "btn=" + String(drow22.querySelector(".task-cancel-inline") !== null)
+        + " text=" + (drow22.querySelector(".task-cancel-inline") || {}).textContent);
     // 按钮在行尾、状态点之后（task-line 内）
     chk("inline end button inside task-line",
         dbtn20 !== null && dbtn20.parentNode !== null
@@ -1433,7 +1435,10 @@ async function main(){
         state.sessionId === "sub-23", "sid=" + state.sessionId);
     openSession("s1");
     await flush();
-    // (d) 防回归：bash 展开区取消按钮照旧（隐藏 → 展开显示 → 点击 confirm+DELETE）
+    // (d) bash 行尾常显「取消」按钮（与 delegate「结束」同款
+    // .task-cancel-inline）：不展开即存在；点击 stopPropagation（不触发
+    // 展开）+ confirm + DELETE；展开区不再有第二个取消按钮
+    // （task-cancel-inside 已移除，行尾按钮统一替代）。
     state.tasks.composerOpen = true;   // openSession 强制收起面板：重开渲染行
     tasksData = [{ session_id: "s1", id: 24, kind: "bash", label: "cargo test",
       full_command: "cargo test", output: "running", role: null }];
@@ -1441,18 +1446,47 @@ async function main(){
     await pollTasks();
     await flush();
     const brow24 = elsById["composerTasks"].querySelector(".task-row");
-    const insideCancel24 = brow24.querySelector(".task-cancel-inside");
-    chk("bash inside cancel hidden by default",
-        insideCancel24 !== null && insideCancel24.hidden === true,
-        "hidden=" + (insideCancel24 && insideCancel24.hidden));
-    brow24._listeners["click"][0]();
-    chk("bash inside cancel shown after expand", insideCancel24.hidden === false,
-        "hidden=" + insideCancel24.hidden);
-    insideCancel24._listeners["click"][0]({ stopPropagation() {} });
+    const tbtn24 = brow24.querySelector(".task-cancel-inline");
+    chk("bash trailing cancel visible without expand",
+        tbtn24 !== null && tbtn24.hidden === false && tbtn24.textContent === "取消",
+        "btn=" + String(tbtn24 !== null) + " hidden=" + (tbtn24 && tbtn24.hidden)
+        + " text=" + (tbtn24 && tbtn24.textContent));
+    chk("bash trailing cancel title has task id",
+        tbtn24 !== null && tbtn24.title === "取消任务 24",
+        "title=" + (tbtn24 && tbtn24.title));
+    chk("bash row has no inside cancel button",
+        brow24.querySelector(".task-cancel-inside") === null
+        && brow24.querySelectorAll(".task-cancel-inline").length === 1,
+        "inside=" + String(brow24.querySelector(".task-cancel-inside") !== null)
+        + " inline n=" + brow24.querySelectorAll(".task-cancel-inline").length);
+    const bpre24 = brow24.querySelector(".task-output");
+    const delBefore24 = FETCH_HEADERS.filter((f) => f.method === "DELETE"
+        && f.url.indexOf("/tasks/") !== -1).length;
+    const evTrail24 = { _stopped: false, stopPropagation() { this._stopped = true; } };
+    tbtn24._listeners["click"][0](evTrail24);   // async：flush 后断言 DELETE
+    chk("bash trailing cancel stops propagation", evTrail24._stopped === true,
+        "stopped=" + evTrail24._stopped);
     await flush();
-    chk("bash inside cancel issues DELETE task cancel",
-        FETCH_HEADERS.some((f) => f.method === "DELETE" && f.url === "/api/sessions/s1/tasks/24"),
-        "urls=" + JSON.stringify(FETCH_HEADERS.filter((f) => f.method === "DELETE").map((f) => f.url)));
+    const delFetches24 = FETCH_HEADERS.filter((f) => f.method === "DELETE"
+        && f.url.indexOf("/tasks/") !== -1);
+    chk("bash trailing cancel issues DELETE task cancel",
+        delFetches24.length === delBefore24 + 1
+        && delFetches24.some((f) => f.url === "/api/sessions/s1/tasks/24"),
+        "delta=" + (delFetches24.length - delBefore24)
+        + " urls=" + JSON.stringify(delFetches24.map((f) => f.url)));
+    chk("bash trailing cancel click did not expand row",
+        bpre24.hidden === true && !state.tasks.pollers.has("s1:24"),
+        "hidden=" + bpre24.hidden
+        + " pollers=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    // 行点击展开输出后也不会出现第二个取消按钮（展开区按钮已移除）
+    brow24._listeners["click"][0]();
+    chk("bash row click still expands after trailing cancel",
+        bpre24.hidden === false, "hidden=" + bpre24.hidden);
+    chk("no second cancel button after expand",
+        brow24.querySelector(".task-cancel-inside") === null
+        && brow24.querySelectorAll(".task-cancel-inline").length === 1,
+        "inside=" + String(brow24.querySelector(".task-cancel-inside") !== null)
+        + " inline n=" + brow24.querySelectorAll(".task-cancel-inline").length);
     // 还原：面板清空（后续 Bug C 等测试从空任务面板继续）
     tasksData = [];
     await pollTasks();

@@ -1766,19 +1766,11 @@
     color: var(--cyan);
     background: transparent;
   }
-  .task-cancel {
-    padding: 1px 10px;
-    font-size: 12px;
-    color: var(--red);
-    border-color: var(--red);
-    flex: 0 0 auto;
-    margin-left: auto;
-  }
-  .task-cancel:hover:not(:disabled) { background: var(--red); color: var(--base3); border-color: var(--red); }
-  .task-cancel:disabled { opacity: 0.4; cursor: not-allowed; }
-  /* delegate 行内常显「结束」按钮（ml-auto 把状态点之后的它推到行尾）：
-     与展开区 .task-cancel-inside 区分——muted 灰字灰边小按钮，hover 才变红，
-     既可见又不与跳转会话的行点击争抢注意力（防误触）。 */
+  /* 行尾常显取消按钮（bash/delegate 共用，ml-auto 把状态点之后的它推到
+     行尾）：muted 灰字灰边小按钮，hover 才变红，既可见又不与行点击
+     （bash 展开输出 / delegate 跳转会话）争抢注意力（防误触）。
+     原展开区 .task-cancel-inside 已移除（行尾按钮统一替代，避免一行
+     两个取消按钮）。 */
   .task-cancel-inline {
     margin-left: auto;
     flex: 0 0 auto;
@@ -1792,13 +1784,6 @@
   }
   .task-cancel-inline:hover:not(:disabled) { color: var(--red); border-color: var(--red); }
   .task-cancel-inline:disabled { opacity: 0.4; cursor: not-allowed; }
-  /* 展开输出区内的取消按钮（行内默认不再显示，防误触）：
-     位于输出下方，红字红边与 .task-cancel 一致，略大一点点击区 */
-  .task-cancel-inside {
-    display: block;
-    margin: 8px 0 0 auto;   /* 与输出间距 8px，右对齐 */
-    padding: 2px 12px;
-  }
   .task-output {
     margin: 6px 0 0;
     padding: 6px 8px;
