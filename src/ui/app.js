@@ -52,6 +52,10 @@ const state = {
   sse: { ctrl: null, retryTimer: null, stopped: false },
   acc: null,                 // 增量渲染累积器（见 newAccumulator）
   nextBeforeSeq: null,       // 历史分页游标：下一段更早历史的 before_seq（loadHistory 响应里取；null=没有更多）
+  sessionUsage: null,        // 当前会话持久化累计用量 {input_tokens, output_tokens}（含子会话，重启不清零）；
+                             // 打开会话时拉 /usage 填充，切换/关闭时置 null；null → 用量行回退 live 进程计数
+  lastUsage: null,           // 最近一次 live Usage 事件（applyUsage 记录）：context_input/context_window 来源；
+                             // /usage 响应到达时 refreshUsageLine 按它重刷；切换/关闭会话时置 null
   loadingOlder: false,       // 是否正在加载更早历史（防重入）
   olderDone: false,          // 更早历史已全部加载（next_before_seq 为 null）
   lastList: [],              // 最近一次轮询拿到的激活 workspace 会话缓存
@@ -308,6 +312,8 @@ async function switchWorkspace(id, epoch) {
   // "wsId:s.id" 前缀，跨 ws 不冲突。保留后侧边栏 busy dot 与 subagent 展开状态
   // 在切换瞬间不消失，等 pollTasks/pollSessions 刷新。
   state.sessionId = null;
+  state.sessionUsage = null;   // 累计用量不跨 workspace 携带
+  state.lastUsage = null;      // live Usage 缓存同样不跨 workspace 携带
   state.lastList = (state.workspaceLists[ws.id] !== undefined) ? state.workspaceLists[ws.id] : [];
   state.queue.length = 0;
   state.queueExpanded = false;

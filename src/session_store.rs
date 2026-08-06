@@ -1138,6 +1138,34 @@ impl SessionStore {
         }
     }
 
+    /// Aggregate token usage restricted to the given session ids (a
+    /// session plus its subagent children) — the persisted source of the
+    /// web UI's per-session usage line (`GET /api/sessions/{id}/usage`),
+    /// which must survive a server restart (live in-process counters do
+    /// not). `Jsonl` returns an empty vector (no usage table on the file
+    /// backend); an empty `session_ids` slice short-circuits to empty.
+    #[allow(unused_variables)]
+    pub async fn usage_for_sessions(
+        &self,
+        root: &Path,
+        session_ids: &[String],
+    ) -> Result<Vec<UsageRow>> {
+        match self {
+            SessionStore::Jsonl => Ok(Vec::new()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session.lock().await.usage_for_sessions(session_ids).await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .usage_for_sessions(session_ids)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     /// Rewrite the entire session log (used for legacy migration).
     ///
     /// For JSONL this replaces the file atomically. For Greptime/SQLite it

@@ -1279,6 +1279,76 @@ impl SqliteSession {
         Ok(out)
     }
 
+    /// Aggregate token usage per (session_id, model, kind) restricted to
+    /// the given session ids (the session itself plus its subagent
+    /// children, for the web UI's persisted usage line). Same row shape as
+    /// [`usage_summary`]; an empty `session_ids` slice short-circuits to
+    /// an empty vector (no query).
+    pub async fn usage_for_sessions(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Vec<UsageRow>, String> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 占位符数量随会话数展开（绑定参数，无注入面）；同会话+子会话
+        // 只有个位数 id，语句很短。
+        let placeholders = vec!["?"; session_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT session_id, model, kind, \
+                    SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, \
+                    MIN(event_time_us) AS first_ts, MAX(event_time_us) AS last_ts \
+             FROM usage_entries \
+             WHERE workspace_id = ?1 AND session_id IN ({placeholders}) \
+             GROUP BY session_id, model, kind \
+             ORDER BY last_ts DESC"
+        );
+        let mut params: Vec<turso::Value> = vec![turso::Value::Text(self.workspace_id.clone())];
+        for id in session_ids {
+            params.push(turso::Value::Text(id.clone()));
+        }
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(&sql, turso::params_from_iter(params))
+            .await
+            .map_err(|e| format!("cannot query token usage: {e}"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot query token usage: {e}"))?
+        {
+            let text_at = |index: usize, label: &str| {
+                row.get_value(index)
+                    .map_err(|e| format!("cannot query token usage: {e}"))?
+                    .as_text()
+                    .cloned()
+                    .ok_or_else(|| format!("cannot query token usage: {label} is not text"))
+            };
+            let int_at = |index: usize, label: &str| {
+                row.get_value(index)
+                    .map_err(|e| format!("cannot query token usage: {e}"))?
+                    .as_integer()
+                    .copied()
+                    .ok_or_else(|| format!("cannot query token usage: {label} is not an integer"))
+            };
+            out.push(UsageRow {
+                session_id: text_at(0, "session_id")?,
+                model: text_at(1, "model")?,
+                kind: text_at(2, "kind")?,
+                input_tokens: u64::try_from(int_at(3, "input_tokens")?).map_err(|_| {
+                    "cannot query token usage: input_tokens is negative".to_string()
+                })?,
+                output_tokens: u64::try_from(int_at(4, "output_tokens")?).map_err(|_| {
+                    "cannot query token usage: output_tokens is negative".to_string()
+                })?,
+                first_ts: int_at(5, "first_ts")?,
+                last_ts: int_at(6, "last_ts")?,
+            });
+        }
+        Ok(out)
+    }
+
     /// Insert prepped rows in one multi-row INSERT. SQLite has no
     /// 65535-bound-parameter limit (and real turns are far below any
     /// variable-count limit), so — unlike the Greptime backend — a single

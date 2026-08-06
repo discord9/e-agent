@@ -11,6 +11,7 @@
 //! | GET    | `/api/sessions/{id}/events`       | SSE: snapshot, then live events    |
 //! | GET    | `/api/sessions/{id}/history`      | segmented history (head or older)  |
 //! | GET    | `/api/sessions/{id}/summary`     | per-turn summary cache (desktop pet) |
+//! | GET    | `/api/sessions/{id}/usage`        | persisted token usage (session + subagents) |
 //! | POST   | `/api/sessions/{id}/prompt`       | queue a prompt                     |
 //! | POST   | `/api/sessions/{id}/btw`          | fork into a persistent subagent    |
 //! | GET    | `/api/sessions/{id}/fork-candidates` | turn boundaries to fork at (at/seq/preview) |
@@ -510,6 +511,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/sessions/{id}/history", get(session_history))
         .route("/api/sessions/{id}/summary", get(session_summary))
+        .route("/api/sessions/{id}/usage", get(session_usage))
         .route("/api/sessions/{id}/prompt", post(session_prompt))
         .route("/api/sessions/{id}/btw", post(session_btw))
         .route("/api/sessions/{id}/fork-candidates", get(fork_candidates))
@@ -2472,6 +2474,76 @@ async fn session_summary(
     };
     let at = chrono::DateTime::<chrono::Utc>::from(entry.at).to_rfc3339();
     Ok(Json(serde_json::json!({ "summary": entry.text, "at": at })))
+}
+
+/// One aggregate usage row in the `GET /api/sessions/{id}/usage` response:
+/// totals per (session_id, model, kind) from the persisted `usage_entries`
+/// table (Greptime/SQLite).
+#[derive(Serialize)]
+struct UsageRowJson {
+    session_id: String,
+    model: String,
+    kind: String,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+/// `GET /api/sessions/{id}/usage` — the web UI usage line's persisted
+/// half: token totals for the session PLUS its subagent children (sessions
+/// whose `parent_session_id` = `{id}`, found via `list_meta`), aggregated
+/// from the `usage_entries` table so the numbers survive a server restart
+/// (the live SSE `Usage` event only carries in-process counters).
+///
+/// Response: `{"input_tokens": N, "output_tokens": M, "rows": [...]}` with
+/// the totals summed over every returned row. The session need not be live
+/// or even known: unknown ids return `200` with zero totals (the frontend
+/// then falls back to live-only counters) — the route answers a storage
+/// question, so an unknown id is an empty answer, not an error. JSONL
+/// backend: no usage table → always zero totals.
+async fn session_usage(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let root = state.factory.root();
+    // 子会话集合：元数据里 parent_session_id == id 的会话（含已结束的）。
+    // list_meta 失败降级为只查本会话——用量行不应因元数据问题整体消失。
+    let mut ids = vec![id.clone()];
+    match state.meta_store.list_meta(root).await {
+        Ok(metas) => {
+            for meta in metas {
+                if meta.parent_session_id.as_deref() == Some(id.as_str()) {
+                    ids.push(meta.session_id);
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("e-agent: cannot list session metadata for usage: {error:#}");
+        }
+    }
+    let rows = match state.meta_store.usage_for_sessions(root, &ids).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!("e-agent: cannot query session usage: {error:#}");
+            Vec::new()
+        }
+    };
+    let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+    let output: u64 = rows.iter().map(|r| r.output_tokens).sum();
+    let rows_json: Vec<UsageRowJson> = rows
+        .into_iter()
+        .map(|r| UsageRowJson {
+            session_id: r.session_id,
+            model: r.model,
+            kind: r.kind,
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+        })
+        .collect();
+    Json(serde_json::json!({
+        "input_tokens": input,
+        "output_tokens": output,
+        "rows": rows_json,
+    }))
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

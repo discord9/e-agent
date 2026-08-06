@@ -1172,6 +1172,61 @@ impl GreptimeSession {
         Ok(out)
     }
 
+    /// Aggregate token usage per (session_id, model, kind) restricted to
+    /// the given session ids (the session itself plus its subagent
+    /// children, for the web UI's persisted usage line). Same row shape as
+    /// [`usage_summary`]; an empty `session_ids` slice short-circuits to
+    /// an empty vector (no query).
+    pub async fn usage_for_sessions(&self, session_ids: &[String]) -> Result<Vec<UsageRow>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // $1 = workspace_id，$2.. 依次绑定各会话 id（绑定参数，无注入面）；
+        // 同会话+子会话只有个位数 id，语句很短。
+        let mut placeholders = String::new();
+        for i in 0..session_ids.len() {
+            if i > 0 {
+                placeholders.push_str(", ");
+            }
+            placeholders.push_str(&format!("${}", i + 2));
+        }
+        let sql = format!(
+            "SELECT session_id, model, kind, \
+                    SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, \
+                    MIN(event_time) AS first_ts, MAX(event_time) AS last_ts \
+             FROM usage_entries \
+             WHERE workspace_id = $1 AND session_id IN ({placeholders}) \
+             GROUP BY session_id, model, kind \
+             ORDER BY last_ts DESC"
+        );
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            Vec::with_capacity(1 + session_ids.len());
+        params.push(&self.workspace_id);
+        for id in session_ids {
+            params.push(id);
+        }
+        let rows = self
+            .client
+            .query(&sql, &params)
+            .await
+            .context("cannot query token usage")?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(UsageRow {
+                session_id: row.get("session_id"),
+                model: row.get("model"),
+                kind: row.get("kind"),
+                input_tokens: u64::try_from(row.get::<_, i64>("input_tokens"))
+                    .context("cannot query token usage: input_tokens is negative")?,
+                output_tokens: u64::try_from(row.get::<_, i64>("output_tokens"))
+                    .context("cannot query token usage: output_tokens is negative")?,
+                first_ts: datetime_to_us(row.get::<_, chrono::NaiveDateTime>("first_ts")),
+                last_ts: datetime_to_us(row.get::<_, chrono::NaiveDateTime>("last_ts")),
+            });
+        }
+        Ok(out)
+    }
+
     /// Compare the DB rows already present in the overlapping seq window
     /// `[base_seq, overlap_hi]` against this batch's prepped rows for the
     /// same seqs.

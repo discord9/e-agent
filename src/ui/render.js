@@ -1288,23 +1288,48 @@ function applyStatus(status) {
   }
 }
 
-function applyUsage(usage) {
-  if (!usage || typeof usage !== "object") return;
-  const s = usage.session || {};
+/* 合并渲染用量行：上下文用最近一次 live Usage 事件的 context_input/
+   context_window（当前进程值）；输入/输出优先用 state.sessionUsage 的
+   持久化累计（usage_entries 表，含子会话，重启不清零），未拉到（旧后端/
+   JSONL/请求失败）回退 live 的进程累计。formatUsageLine 是纯函数（测试可
+   直接断言）；applyUsage 在 SSE Usage 事件时调用，refreshUsageLine 在
+   /usage 响应到达时重刷同一行。 */
+function formatUsageLine(live, persisted) {
   const parts = [];
   let pct = null;
+  const l = live || {};
   // context_window 配置了才显示百分比（TUI 同语义：>=80% 标红提示接近压缩阈值）
-  if (usage.context_input != null && usage.context_window) {
-    pct = Math.round(usage.context_input / usage.context_window * 100);
-    parts.push("上下文 " + usage.context_input + "/" + usage.context_window + " tok (" + pct + "%)");
-  } else if (usage.context_input != null) {
-    parts.push("上下文 " + usage.context_input + " tok");
+  if (l.context_input != null && l.context_window) {
+    pct = Math.round(l.context_input / l.context_window * 100);
+    parts.push("上下文 " + l.context_input + "/" + l.context_window + " tok (" + pct + "%)");
+  } else if (l.context_input != null) {
+    parts.push("上下文 " + l.context_input + " tok");
   }
-  if (s.input_tokens != null) parts.push("输入 " + s.input_tokens);
-  if (s.output_tokens != null) parts.push("输出 " + s.output_tokens);
-  if (parts.length) {
-    els.usageInfo.textContent = "用量: " + parts.join(" · ");
-    // >=80% 接近自动压缩阈值：标红提醒
-    els.usageInfo.classList.toggle("usage-high", pct !== null && pct >= 80);
-  }
+  const s = l.session || {};
+  const inTok = persisted ? persisted.input_tokens : s.input_tokens;
+  const outTok = persisted ? persisted.output_tokens : s.output_tokens;
+  if (inTok != null) parts.push("输入 " + inTok);
+  if (outTok != null) parts.push("输出 " + outTok);
+  return { text: parts.length ? "用量: " + parts.join(" · ") : "", high: pct !== null && pct >= 80 };
+}
+
+function renderUsageLine(live) {
+  const line = formatUsageLine(live, state.sessionUsage);
+  if (!line.text) return;
+  els.usageInfo.textContent = line.text;
+  // >=80% 接近自动压缩阈值：标红提醒
+  els.usageInfo.classList.toggle("usage-high", line.high);
+}
+
+function applyUsage(usage) {
+  if (!usage || typeof usage !== "object") return;
+  state.lastUsage = usage;   // 记下最近一次 live 值：/usage 响应到达时按它重刷
+  renderUsageLine(usage);
+}
+
+/* /usage 历史累计到达后重刷用量行（context 沿用最近 live 值，输入/输出
+   换成累计）；尚无 live Usage 事件时 context 段不显示（与旧行为一致：
+   无数据不强行渲染空行）。 */
+function refreshUsageLine() {
+  renderUsageLine(state.lastUsage || null);
 }

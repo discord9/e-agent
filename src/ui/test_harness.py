@@ -446,6 +446,14 @@ let a1StreamManual = false;
 let a1StreamReadResolve = null;
 // SSE 404 语义测试：命中这些 id 的 /events 返回 404（模拟历史/已结束会话无流）
 let sse404Ids = new Set();
+// 持久化用量测试：/api/sessions/{id}/usage 响应（id → body；null → 404，
+// 模拟旧后端无此端点，前端静默回退 live 计数）
+let usageData = {
+  "s1": { input_tokens: 300, output_tokens: 150,
+          rows: [{ session_id: "s1", model: "kimi", kind: "regular", input_tokens: 200, output_tokens: 100 },
+                 { session_id: "sub-s1", model: "kimi", kind: "regular", input_tokens: 100, output_tokens: 50 }] },
+  "s2": { input_tokens: 21, output_tokens: 7, rows: [] },
+};
 // 深链测试开关：A 的 /api/sessions GET 失败（500）、POST /api/sessions 自定义
 // 响应（resume 断言）、history 响应覆盖（id → {status,body}|{netfail}|{hang}|{delay}）、
 // /events 200 集合（live 流）、延迟 history 手动 resolve
@@ -567,6 +575,12 @@ globalThis.fetch=(url,opts={})=>{
   // restored 回归测试：空 SSE 流（snapshot 应被 history 替换路径跳过）
   if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty(), signal);
+  // 持久化用量端点（本分支新增）：usageData 命中 → 200；置 null → 404 旧后端
+  const _mUsage = /^\/api\/sessions\/([^/]+)\/usage$/.exec(url);
+  if (_mUsage) {
+    const u = usageData[_mUsage[1]];
+    return u === undefined || u === null ? resp(404, {}, signal) : resp(200, u, signal);
+  }
   if(url==="/api/sessions/s1/fork-candidates") {
     if (forkCandidatesDelayed) return new Promise((resolve) => { forkCandidatesResolve = resolve; });
     return resp(200, forkCandidatesData, signal);
@@ -690,6 +704,44 @@ async function main(){
     chk("live notice", t.includes("系统提示行"));
     chk("live error", t.includes("错误: 回合失败"));
     chk("usage shown", elsById["usageInfo"].textContent.includes("1234"), "="+elsById["usageInfo"].textContent);
+
+    // ---- 持久化用量行（/api/sessions/{id}/usage + live Usage 合并） ----
+    // 打开 s1 时已拉 /usage：输入/输出显示历史累计（含子会话合计），
+    // 而不是 live 进程计数（100/50）；上下文仍用 live 值。
+    chk("usage fetch on open", FETCHES.includes("/api/sessions/s1/usage"));
+    chk("persisted usage totals shown",
+        elsById["usageInfo"].textContent === "用量: 上下文 1234 tok · 输入 300 · 输出 150",
+        "=" + elsById["usageInfo"].textContent);
+    chk("sessionUsage state filled",
+        state.sessionUsage && state.sessionUsage.input_tokens === 300
+        && state.sessionUsage.output_tokens === 150,
+        "=" + JSON.stringify(state.sessionUsage));
+    // 新的 live Usage 事件：context 更新为最新值，输入/输出保持累计不回退。
+    applyUsage({ type: "usage", session_id: "s1", seq: 11, context_input: 2000,
+                 context_window: 4000, session: { input_tokens: 130, output_tokens: 60 } });
+    chk("usage live+history merge",
+        elsById["usageInfo"].textContent === "用量: 上下文 2000/4000 tok (50%) · 输入 300 · 输出 150",
+        "=" + elsById["usageInfo"].textContent);
+    // 旧后端 /usage 404：回退 live 进程计数（state.sessionUsage 保持 null）。
+    usageData["s1"] = null;
+    openSession("s2");          // 切走：s1 的累计不串会话
+    await flush(); await flush();
+    chk("sessionUsage reset on switch", state.sessionUsage
+        && state.sessionUsage.input_tokens === 21, "=" + JSON.stringify(state.sessionUsage));
+    chk("s2 persisted usage shown",
+        elsById["usageInfo"].textContent === "用量: 上下文 1234 tok · 输入 21 · 输出 7",
+        "=" + elsById["usageInfo"].textContent);
+    openSession("s1");
+    await flush(); await flush();
+    chk("sessionUsage null when /usage 404", state.sessionUsage === null);
+    applyUsage({ type: "usage", session_id: "s1", seq: 12, context_input: 2100,
+                 session: { input_tokens: 140, output_tokens: 70 } });
+    chk("usage falls back to live counters",
+        elsById["usageInfo"].textContent === "用量: 上下文 2100 tok · 输入 140 · 输出 70",
+        "=" + elsById["usageInfo"].textContent);
+    usageData["s1"] = { input_tokens: 300, output_tokens: 150, rows: [] };   // 还原，防串后续断言
+    openSession("s1");
+    await flush(); await flush();
 
     elsById["promptInput"].value = "第二条消息";
     await sendPrompt();
