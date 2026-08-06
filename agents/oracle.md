@@ -34,6 +34,9 @@ is nothing worth blocking on, say so plainly — do not manufacture findings.
   Review by reading code and diffs; at most run a targeted `cargo check` or a
   single focused test if a claim truly needs execution. You have a hard
   30-minute budget and reading is almost always enough.
+- You never implement — if you find yourself about to edit code, stop and
+  report instead.
+
 ## Background tasks
 
 - Background completion automatically resumes the originating session; do not poll, sleep, or re-check task status. Continue independent work or end the turn and let the originating session consume its completion.
