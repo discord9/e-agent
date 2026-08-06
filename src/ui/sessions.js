@@ -1445,6 +1445,7 @@ function enablePinnedPointerDrag(row, node, wsId, sid) {
   };
   const begin = (ev) => {
     dragging = true;
+    state.sidebar.draggingPin = true;   // 拖拽期间轮询树重绘暂停（renderSidebarTree 非 force 直接返回）
     node.classList.add("pin-dragging");
     row.setAttribute("aria-grabbed", "true");
     if (row.setPointerCapture) {
@@ -1544,6 +1545,7 @@ function enablePinnedPointerDrag(row, node, wsId, sid) {
     clearDrop();
     node.classList.remove("pin-dragging");
     row.setAttribute("aria-grabbed", "false");
+    state.sidebar.draggingPin = false;   // 先清标志再早退：pointercancel 路径也不能冻结轮询重绘
     press = null;
     if (!dragging && !wasScrolling) return;
     suppressClick = true;
@@ -1554,6 +1556,7 @@ function enablePinnedPointerDrag(row, node, wsId, sid) {
     row.classList.add("pin-drag-click-block");
     window.setTimeout(() => row.classList.remove("pin-drag-click-block"), 0);
     if (chosen) movePinnedSession(wsId, sid, chosen.wsId, chosen.sid, chosen.before);
+    else renderSidebarTree(true);   // 落位已由 movePinnedSession 强制重绘；否则此处补齐拖拽期间跳过的最新画面
   };
   row.addEventListener("pointerup", finish);
   row.addEventListener("pointercancel", finish);
@@ -1599,6 +1602,7 @@ function renderSidebarTree(force) {
   if (!tree) return;
   const sig = sidebarTreeSig();
   if (state.renameActive && !force) return;  // 保留正在编辑的标题输入框
+  if (state.sidebar.draggingPin && !force) return;   // 拖拽中暂停轮询重建：被 capture 的行节点被替换会打断拖拽（同 renameActive 保护；不更新 lastTreeSig，finish 里 force 补齐）
   if (!force && sig === lastTreeSig) return;   // 数据未变：保留展开/滚动状态
   lastTreeSig = sig;
   const prevScroll = tree.scrollTop;

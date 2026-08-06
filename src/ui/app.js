@@ -71,6 +71,7 @@ const state = {
     expanded: new Set(),     // 已展开的主会话 id（会话树；重绘时保留）
     filter: "",              // 筛选关键词（已小写化）；空 = 默认显示
     showAllWs: new Set(),   // 每 workspace 独立：已展开全部主会话的 wsId 集合（超出 15 条限制时）
+    draggingPin: false,      // 置顶拖拽进行中：轮询期间跳过树重绘，防被 capture 的行节点被重建打断（同 renameActive）
   },
   tasks: {                   // 运行中任务（composer 折叠条/面板 + 消息列表输出块）
     seq: 0,                  // 统一轮询竞态序号：只应用最新一次响应

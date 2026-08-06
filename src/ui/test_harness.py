@@ -3450,6 +3450,73 @@ async function main(){
         && JSON.parse(localStorage.getItem(PIN_ORDER_KEY)).some((x) => x.wsId === "wsA" && x.sid === "pa1"),
         "stored=" + localStorage.getItem(PIN_ORDER_KEY));
     localStorage.removeItem(PIN_ORDER_KEY);
+
+    // 15c) 置顶拖拽期间轮询重建暂停（draggingPin 契约）：两条 2s 轮询会
+    //     改 entry_count / 任务状态 → 签名变 → 全量重建树，被 capture 的
+    //     行节点被移除会隐式释放 pointer capture、打断拖拽（finish 收不到
+    //     pointerup → 排序不生效）。拖拽中 renderSidebarTree 非 force 直接
+    //     返回（同 renameActive 保护），finish 统一清标志并 force 补齐画面。
+    //     走真实 begin/finish 路径（pointer 事件模拟），state 标志即本修复
+    //     的核心契约。
+    localStorage.removeItem(PIN_ORDER_KEY);
+    renderSidebarTree(true);   // 数据已是 15a 末尾态（pa1 / pa-new 置顶、pa1-child 跟随），重建出带拖拽监听的新行
+    const pinBody15c = elsById["sidebarTree"].querySelector(".tree-ws-section.pinned .tree-ws-body");
+    const dragNode15c = pinBody15c.children[0];
+    const dragRow15c = dragNode15c.querySelector(".tree-row");
+    chk("pin drag guard: pinned row is draggable",
+        dragRow15c.classList.contains("pin-draggable")
+        && dragNode15c.getAttribute("data-pin-sid") === "pa1",
+        "cls=" + dragRow15c.className + " sid=" + dragNode15c.getAttribute("data-pin-sid"));
+    const dragEv15c = (type, x, y) => Object.assign({
+      type, pointerId: 1, pointerType: "mouse", button: 0,
+      clientX: x, clientY: y, target: dragRow15c,
+      preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {},
+    });
+    const fireDrag15c = (type, x, y) => {
+      for (const fn of dragRow15c._listeners[type] || []) fn(dragEv15c(type, x, y));
+    };
+    fireDrag15c("pointerdown", 10, 10);
+    fireDrag15c("pointermove", 12, 40);   // 距离 > 5 阈值 → begin：置位 draggingPin + 进入拖拽
+    chk("pin drag guard: begin sets draggingPin via real pointer path",
+        state.sidebar.draggingPin === true
+        && dragNode15c.classList.contains("pin-dragging"),
+        "flag=" + state.sidebar.draggingPin);
+    // 模拟一轮轮询后的数据变化（活跃会话 entry_count 每轮 +1）→ 签名已变
+    state.workspaceLists["wsA"].find((x) => x.id === "pa1").entry_count += 1;
+    renderSidebarTree();   // 非 force：拖拽中必须跳过重建（DOM 引用不变）
+    chk("pin drag guard: poll-time render does not rebuild tree while dragging",
+        elsById["sidebarTree"].querySelector(".tree-ws-section.pinned .tree-ws-body").children[0] === dragNode15c
+        && dragNode15c.classList.contains("pin-dragging"),
+        "rebuilt=" + (elsById["sidebarTree"].querySelector(".tree-ws-section.pinned .tree-ws-body").children[0] !== dragNode15c));
+    renderSidebarTree(true);   // force 路径（筛选输入/打开侧边栏）拖拽中仍允许重建
+    const forceNode15c = elsById["sidebarTree"].querySelector(".tree-ws-section.pinned .tree-ws-body").children[0];
+    chk("pin drag guard: force render still rebuilds while dragging",
+        forceNode15c !== dragNode15c,
+        "same=" + (forceNode15c === dragNode15c));
+    // 再开一次拖拽后 pointercancel：标志也必须清掉（不冻结重绘）——finish
+    // 内 chosen=null → renderSidebarTree(true) 兜底补齐画面。
+    const cancelNode15c = elsById["sidebarTree"].querySelector(".tree-ws-section.pinned .tree-ws-body").children[0];
+    const cancelRow15c = cancelNode15c.querySelector(".tree-row");
+    for (const fn of cancelRow15c._listeners["pointerdown"] || []) fn(dragEv15c("pointerdown", 10, 10));
+    for (const fn of cancelRow15c._listeners["pointermove"] || []) fn(dragEv15c("pointermove", 12, 40));
+    const cancelSig15c = sidebarTreeSig();
+    for (const fn of cancelRow15c._listeners["pointercancel"] || []) fn(dragEv15c("pointercancel", 12, 40));
+    chk("pin drag guard: pointercancel clears flag and force-refreshes",
+        state.sidebar.draggingPin === false
+        && elsById["sidebarTree"].querySelector(".tree-ws-section.pinned .tree-ws-body").children[0] !== cancelNode15c,
+        "flag=" + state.sidebar.draggingPin);
+    chk("pin drag guard: drag-end refresh has latest data",
+        sidebarTreeSig() !== cancelSig15c || cancelSig15c.includes(",4,"),
+        "sig=" + cancelSig15c.slice(0, 120));
+    // 拖拽结束后再轮询：非 force 重建恢复（数据已反映 → 新 DOM 引用）
+    const prePollNode15c = elsById["sidebarTree"].querySelector(".tree-ws-section.pinned .tree-ws-body").children[0];
+    state.workspaceLists["wsA"].find((x) => x.id === "pa1").entry_count += 1;
+    renderSidebarTree();   // 非 force：签名变化必须生效
+    chk("pin drag guard: poll-time render rebuilds again after drag ends",
+        elsById["sidebarTree"].querySelector(".tree-ws-section.pinned .tree-ws-body").children[0] !== prePollNode15c,
+        "rebuilt=" + (elsById["sidebarTree"].querySelector(".tree-ws-section.pinned .tree-ws-body").children[0] !== prePollNode15c));
+    state.sidebar.draggingPin = false;   // 兜底还原（防后续段污染）
+
     // 还原聚合状态（workspaces/workspaceLists/workspaceErrors/sidebar/数据源）
     state.workspaces = saveWs.workspaces; state.workspace = saveWs.workspace; state.token = saveWs.token;
     state.workspaceLists = saveWs.lists; state.workspaceErrors = saveWs.errors; state.lastList = saveWs.lastList;
