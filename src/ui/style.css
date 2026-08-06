@@ -465,6 +465,24 @@
   .msg-user .who { color: var(--cyan); }
   .msg-user .msg-body { color: var(--base02); }
 
+  /* read_image / /image 附带的用户消息图片（appendUserImages）：缩略图
+     限宽 + 圆角边框，点击整图在新标签打开原图（href 指向 /api/images/…） */
+  .attached-image-link {
+    flex-shrink: 0;
+    display: block;
+    width: fit-content;
+    max-width: 100%;
+    margin: 2px 0;
+  }
+  .attached-image {
+    display: block;
+    max-width: 100%;
+    max-height: 420px;   /* 合理上限：不撑爆一屏，点击可看原图 */
+    border-radius: 6px;
+    border: 1px solid var(--base1);
+    background: var(--base2);
+  }
+
   .msg-assistant .who { color: var(--green); }
 
   .msg-system { color: var(--base01); font-size: 12px; }

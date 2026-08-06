@@ -26,6 +26,7 @@
 //! | GET    | `/api/tasks`                        | running background tasks, all sessions |
 //! | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task          |
 //! | GET    | `/api/sessions/{id}/tasks/{task_id}/output` | full output of a running bash task |
+//! | GET    | `/api/images/{hash}`               | content-addressed image bytes for `<img>` rendering |
 //!
 //! Authentication: a random token generated at startup (written to
 //! `$XDG_STATE_HOME/e-agent/server.token` or `~/.local/state/e-agent/server.token`,
@@ -531,6 +532,7 @@ fn router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/tasks/{task_id}/output",
             get(task_output),
         )
+        .route("/api/images/{hash}", get(serve_image))
         .route_layer(from_fn_with_state(state.clone(), require_auth))
         .layer(from_fn(cache_control_middleware));
     Router::new()
@@ -1922,6 +1924,65 @@ async fn task_output(
             format!("task {task_id} not found in session {id}"),
         )),
     }
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Images
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// `GET /api/images/{hash}` 的查询参数：可选 `mime`（前端把
+/// [`crate::agent::ImagePart`] 的 mime 带回；白名单之外一律回退
+/// `application/octet-stream`）。
+#[derive(Deserialize)]
+pub struct ImageParams {
+    pub mime: Option<String>,
+}
+
+/// MIME 白名单：与 [`crate::agent::image_mime_from_extension`] 的产出集合
+/// 一致（read_image 的 marker 只会带这四种），杜绝把任意字符串写进
+/// Content-Type header（header 注入面）。
+const IMAGE_MIME_WHITELIST: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// `GET /api/images/{hash}` — 内容寻址图片存取：返回 `read_image` 存入全局
+/// image store 的图片字节（`<image store>/<hash>`，见
+/// [`crate::agent::image_store_dir`]）。会话数据只存 `hash + mime`（无字节），
+/// 前端渲染 `<img>` 时通过本端点取回字节。
+///
+/// 安全：`hash` 必须是 64 位小写十六进制（SHA-256 hex——文件名即 hash，
+/// 内容寻址，无路径拼接；格式校验杜绝路径穿越 / 畸形文件名）；文件不存在
+/// 404。认证与其它 `/api/*` 一致（require_auth）；`<img>` 标签无法带
+/// Authorization header，前端用 `?token=`（authorized 支持 query token）。
+async fn serve_image(
+    Path(hash): Path<String>,
+    Query(params): Query<ImageParams>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // [0-9a-f]{64}：仅小写 hex（image_sha256 的产出格式）。大写或含其它
+    // 字符一律 400。
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid image hash"));
+    }
+    let Some(store) = crate::agent::image_store_dir() else {
+        return Err(error(StatusCode::NOT_FOUND, "image store not configured"));
+    };
+    let Some(bytes) = crate::agent::load_image_bytes(Some(&store), &hash) else {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!("image {hash} not found"),
+        ));
+    };
+    // 内容寻址文件写入时已受 IMAGE_MAX_BYTES 限制；此处防御性兜底。
+    if bytes.len() > crate::agent::IMAGE_MAX_BYTES {
+        return Err(error(StatusCode::NOT_FOUND, "image exceeds size limit"));
+    }
+    let mime = params
+        .mime
+        .filter(|m| IMAGE_MIME_WHITELIST.contains(&m.as_str()))
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    Ok(([(header::CONTENT_TYPE, mime)], bytes))
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -6469,6 +6530,125 @@ model = "deepseek-chat"
         // Clean up the running tasks so the test leaks no processes.
         session.background.cancel(1);
         session.background.cancel(2);
+    }
+
+    /// `GET /api/images/{hash}`：内容寻址图片存取。测试用临时目录构造
+    /// image store——`image_store_dir()` 读 `XDG_STATE_HOME` 环境变量，
+    /// 测试把它指向临时目录（roles/tests.rs 同款 unsafe set_var 惯例；
+    /// 无其它测试读该变量，无并行干扰），再按 `store_image_bytes` 的
+    /// 布局（`<xdg>/e-agent/images/<hash>`）写入图片字节。
+    #[tokio::test]
+    async fn serve_image_serves_stored_bytes_and_validates_hash() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("e-agent-server-images-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("e-agent/images");
+        std::fs::create_dir_all(&store).unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+
+        let bytes = b"fake-png-bytes";
+        let hash = crate::agent::image_sha256(bytes);
+        std::fs::write(store.join(&hash), bytes).unwrap();
+
+        let app = router(test_app_state("sekrit"));
+
+        // 无 token → 401（require_auth 对图片端点同样生效）。
+        let noauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/images/{hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(noauth.status(), StatusCode::UNAUTHORIZED);
+
+        // 文件存在：200 + 白名单 mime + 字节内容（?token= 供 <img> 使用）。
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/images/{hash}?mime=image/png&token=sekrit"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(
+            ok.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        let body = axum::body::to_bytes(ok.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], bytes);
+
+        // 白名单之外的 mime → octet-stream 兜底（header 注入面为零）。
+        let odd = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/images/{hash}?mime=text/html&token=sekrit"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(odd.status(), StatusCode::OK);
+        assert_eq!(
+            odd.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+
+        // 非法 hash 格式（非 64 位小写 hex，含路径穿越串）→ 400：直接调
+        // handler 验证校验逻辑，不经 URL 规范化（`..` 段在真实请求里会被
+        // 路由层先行处理，这里只关心 hash 校验本身）。
+        let bad_hashes: [String; 6] = [
+            String::new(),
+            "abc".into(),
+            "deadbeef".into(),
+            "a".repeat(63),
+            "A".repeat(64),
+            "../etc/passwd".into(),
+        ];
+        for bad in bad_hashes {
+            let result = serve_image(Path(bad.clone()), Query(ImageParams { mime: None })).await;
+            let Err((status, _)) = result else {
+                panic!("hash {bad:?} must be rejected");
+            };
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "hash {bad:?} must be rejected"
+            );
+        }
+
+        // 合法格式（64 位小写 hex）但文件不存在 → 404。
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/images/{}?token=sekrit", "0".repeat(64)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `GET /api/tasks` lists running bash and delegate tasks across

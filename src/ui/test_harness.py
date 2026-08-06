@@ -2137,6 +2137,61 @@ async function main(){
         "cls=" + rtCard.querySelector(".tool-result").className);
 
     // =====================================================================
+    // 用户消息附带图片（read_image / /image）：renderMessage 渲染 <img>，
+    // src 指向 /api/images/<hash>（激活 workspace base + token query）；
+    // 无图片消息不渲染任何 <img>
+    // =====================================================================
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    renderMessage({ User: { content: "看图", images: [
+      { hash: "a".repeat(64), mime: "image/png" },
+      { hash: "b".repeat(64), mime: "image/webp" },
+    ] } }, state.acc, new Map());
+    const imgEls = elsById["messages"].querySelectorAll("img.attached-image");
+    chk("user images render img tags",
+        imgEls.length === 2,
+        "n=" + imgEls.length);
+    const firstSrc = imgEls[0] && imgEls[0].getAttribute("src");
+    chk("image src points at images endpoint with hash+mime+token",
+        firstSrc === "/api/images/" + "a".repeat(64) + "?mime=image%2Fpng&token=test-token",
+        "src=" + firstSrc);
+    const firstHref = elsById["messages"].querySelector("a.attached-image-link")
+      && elsById["messages"].querySelector("a.attached-image-link").getAttribute("href");
+    chk("image link opens full image in new tab",
+        firstHref === firstSrc && imgEls[0].getAttribute("loading") === "lazy",
+        "href=" + firstHref);
+    // 多 workspace：激活 workspace 带 base url → src 前缀该 base
+    const _wsBase = state.workspace.url;
+    state.workspace.url = "http://b.local";
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    renderMessage({ User: { content: "跨实例", images: [
+      { hash: "c".repeat(64), mime: "image/gif" },
+    ] } }, state.acc, new Map());
+    const crossSrc = elsById["messages"].querySelector("img.attached-image")
+      && elsById["messages"].querySelector("img.attached-image").getAttribute("src");
+    chk("image src prefixes active workspace base url",
+        crossSrc === "http://b.local/api/images/" + "c".repeat(64) + "?mime=image%2Fgif&token=test-token",
+        "src=" + crossSrc);
+    state.workspace.url = _wsBase;
+    // 无图片：不渲染 <img>，正文照常
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    renderMessage({ User: { content: "纯文本", images: [] } }, state.acc, new Map());
+    chk("user message without images renders no img",
+        elsById["messages"].querySelectorAll("img.attached-image").length === 0
+        && elsById["messages"].querySelector(".msg-user") !== null,
+        "imgs=" + elsById["messages"].querySelectorAll("img.attached-image").length);
+    // 缺字段防御：hash 缺失的条目被跳过，不抛错
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    renderMessage({ User: { content: "残缺", images: [null, { mime: "image/png" }] } },
+      state.acc, new Map());
+    chk("malformed image entries are skipped",
+        elsById["messages"].querySelectorAll("img.attached-image").length === 0,
+        "imgs=" + elsById["messages"].querySelectorAll("img.attached-image").length);
+
+    // =====================================================================
     // 统一结果渲染（renderToolResult）：特殊结果 live + history 双路径一致
     // =====================================================================
     elsById["messages"].innerHTML = "";

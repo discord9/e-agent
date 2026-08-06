@@ -675,6 +675,41 @@ function appendUserMsg(text) {
   pruneMessages();
 }
 
+/* 用户消息附带的图片（read_image / /image 附加的 ImagePart {hash, mime}）：
+   渲染成可点开大图的 <img>，URL 指向「当前会话所在 workspace」的
+   /api/images/<hash>（多 workspace 下图片字节存于会话所在实例，即激活
+   workspace 的 base url）。<img> 标签无法带 Authorization header，
+   require_auth 支持 ?token= query，所以 URL 带 token query；mime 一并带回
+   （服务端白名单校验）。URL 用 encodeURIComponent 转义（hash 是服务端
+   生成的 64 位 hex、mime 来自白名单，转义是防御性的）；属性一律
+   setAttribute，不拼 innerHTML。 */
+function appendUserImages(images) {
+  if (!images || !images.length) return;
+  const base = (state.workspace && state.workspace.url) ? state.workspace.url : "";
+  const token = workspaceToken(state.workspace);
+  for (const img of images) {
+    if (!img || !img.hash) continue;
+    let url = base + "/api/images/" + encodeURIComponent(img.hash);
+    const params = [];
+    if (img.mime) params.push("mime=" + encodeURIComponent(img.mime));
+    if (token) params.push("token=" + encodeURIComponent(token));
+    if (params.length) url += "?" + params.join("&");
+    // 点击在新标签打开原图；缩略与限宽由 .attached-image 样式负责。
+    const link = el("a", "attached-image-link");
+    link.setAttribute("href", url);
+    link.setAttribute("target", "_blank");
+    link.setAttribute("rel", "noopener");
+    const imgEl = el("img", "attached-image");
+    imgEl.setAttribute("src", url);
+    imgEl.setAttribute("loading", "lazy");
+    imgEl.setAttribute("alt", "附带图片");
+    link.appendChild(imgEl);
+    els.messages.appendChild(link);
+  }
+  scrollBottom(false);
+  pruneMessages();
+}
+
 function appendSystemMsg(text) {
   freezeAssistant(state.acc);
   const msg = el("div", "msg msg-system");
@@ -1063,8 +1098,7 @@ function renderMessage(m, acc, pendingCards) {
   if (!m) return;
   if (m.User) {
     appendUserMsg(m.User.content || "");
-    const nImg = (m.User.images || []).length;
-    if (nImg > 0) appendNotice("📷 附带 " + nImg + " 张图片");
+    appendUserImages(m.User.images || []);
     return;
   }
   if (m.System) { appendSystemMsg(m.System.content || ""); return; }
