@@ -1818,15 +1818,37 @@ async fn delete_session(
 /// transcript without label matching.
 async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<TaskMeta>> {
     let mut tasks: Vec<TaskMeta> = Vec::new();
+    let root = state.factory.root();
     for (session_id, session) in state.registry.list() {
         for info in session.background.running() {
-            tasks.push(task_meta(&session_id, info));
+            let mut meta = task_meta(&session_id, info);
+            // live registry 缺 full_command 时（delegate 任务、旧版本启动的
+            // 任务、注册瞬间等），从 running_tasks 的 full_command 列回退
+            // 补上——数据持久化在 DB，重启后 UI 仍能显示完整命令。查不到
+            // （行已消费/该字段缺失/NULL）保持 None，与旧行为一致。
+            if meta.full_command.is_none() {
+                match state
+                    .meta_store
+                    .task_full_command(root, &session_id, meta.id)
+                    .await
+                {
+                    Ok(Some(command)) => meta.full_command = Some(command),
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "e-agent: cannot look up background task full command \
+                             for session {session_id} task {}: {error:#}",
+                            meta.id
+                        );
+                    }
+                }
+            }
+            tasks.push(meta);
         }
     }
     tasks.sort_by(|a, b| (&a.session_id, a.id).cmp(&(&b.session_id, b.id)));
     Json(tasks)
 }
-
 /// `DELETE /api/sessions/{id}/tasks/{task_id}` — cancel one running
 /// background task. 204 when cancelled; 404 for an unknown session or an
 /// unknown task id in that session.

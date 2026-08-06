@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS running_tasks (
     session_id TEXT NOT NULL,
     task_id INTEGER NOT NULL,
     label TEXT NOT NULL,
+    full_command TEXT NULL,
     subagent_session_id TEXT NULL,
     started_at_us INTEGER NOT NULL,
     owner_identity TEXT NULL,
@@ -389,6 +390,28 @@ impl SqliteSession {
                          (background-task owner liveness unavailable): {error}"
                     );
                 }
+            }
+            // Same probe-then-ALTER for the `full_command` column of the
+            // `running_tasks` table (the full untruncated bash command,
+            // added after the table shipped so the UI can show it after a
+            // restart). Pre-existing databases need the ALTER; fresh
+            // databases already have the column via
+            // CREATE_TABLE_RUNNING_TASKS above. Old rows read the column
+            // back as NULL, which `task_full_command` reports as `None`
+            // ("no full command on record"). A failed ALTER does NOT block
+            // the connection: the feature degrades — `record_task_start`
+            // fails loudly on the missing column, transcript operations
+            // are unaffected (same philosophy as the owner_identity
+            // migration above).
+            if !columns.iter().any(|c| c == "full_command")
+                && let Err(error) = conn
+                    .execute("ALTER TABLE running_tasks ADD COLUMN full_command TEXT", ())
+                    .await
+            {
+                eprintln!(
+                    "e-agent: cannot add running_tasks.full_command column \
+                     (background-task full-command persistence unavailable): {error}"
+                );
             }
         }
 
@@ -1967,6 +1990,7 @@ impl SqliteSession {
         session_id: &str,
         task_id: u64,
         label: &str,
+        full_command: Option<&str>,
         subagent_session_id: Option<&str>,
     ) -> Result<(), String> {
         let started_at = next_event_time_us();
@@ -1975,10 +1999,11 @@ impl SqliteSession {
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO running_tasks \
-             (workspace_id, session_id, task_id, label, subagent_session_id, started_at_us, owner_identity) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             (workspace_id, session_id, task_id, label, full_command, subagent_session_id, started_at_us, owner_identity) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
              ON CONFLICT (workspace_id, session_id, task_id) DO UPDATE SET \
                  label = excluded.label, \
+                 full_command = excluded.full_command, \
                  subagent_session_id = excluded.subagent_session_id, \
                  started_at_us = excluded.started_at_us, \
                  owner_identity = excluded.owner_identity",
@@ -1987,6 +2012,7 @@ impl SqliteSession {
                 session_id,
                 task_id,
                 label,
+                full_command,
                 subagent_session_id,
                 started_at,
                 crate::session_store::process_identity(),
@@ -2010,6 +2036,41 @@ impl SqliteSession {
         .await
         .map_err(|e| format!("cannot clear background task: {e}"))?;
         Ok(())
+    }
+
+    /// Look up one surviving row's full command by task id (the `/api/tasks`
+    /// fallback when the live registry lacks it). `None` when the row is
+    /// gone (consumed/completed) or its `full_command` is NULL (delegate
+    /// rows, pre-migration rows — "缺失 → None" 兼容旧数据).
+    pub async fn task_full_command(
+        &self,
+        session_id: &str,
+        task_id: u64,
+    ) -> Result<Option<String>, String> {
+        let task_id =
+            i64::try_from(task_id).map_err(|_| "background task id does not fit in BIGINT")?;
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT full_command FROM running_tasks \
+                 WHERE workspace_id = ?1 AND session_id = ?2 AND task_id = ?3",
+                (self.workspace_id.as_str(), session_id, task_id),
+            )
+            .await
+            .map_err(|e| format!("cannot load background task full command: {e}"))?;
+        let mut command = None;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot load background task full command: {e}"))?
+        {
+            command = row
+                .get_value(0)
+                .map_err(|e| format!("cannot load background task full command: {e}"))?
+                .as_text()
+                .cloned();
+        }
+        Ok(command)
     }
 
     /// Tasks recorded by a previous process that died before their

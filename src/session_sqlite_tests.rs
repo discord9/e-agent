@@ -1895,11 +1895,11 @@ async fn running_tasks_lifecycle() {
     );
 
     session
-        .record_task_start(&sid, 1, "sleep 100", None)
+        .record_task_start(&sid, 1, "sleep 100", None, None)
         .await
         .unwrap();
     session
-        .record_task_start(&sid, 2, "cargo build", Some("sub-probe"))
+        .record_task_start(&sid, 2, "cargo build", None, Some("sub-probe"))
         .await
         .unwrap();
 
@@ -1932,7 +1932,7 @@ async fn running_tasks_lifecycle() {
     // Task ids restart per process: re-inserting id 1 after the delete
     // tombstone must remain visible (fresh started_at wins).
     session
-        .record_task_start(&sid, 1, "restarted", None)
+        .record_task_start(&sid, 1, "restarted", None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -1946,7 +1946,7 @@ async fn running_tasks_rerecord_same_key_overwrites() {
     let (_dir, session, sid) = fresh_session().await;
 
     session
-        .record_task_start(&sid, 42, "first label", None)
+        .record_task_start(&sid, 42, "first label", None, None)
         .await
         .unwrap();
     // Re-record the SAME (workspace, session, task_id) without deleting:
@@ -1954,7 +1954,7 @@ async fn running_tasks_rerecord_same_key_overwrites() {
     // overwrites the existing row instead of erroring on the primary-key
     // conflict.
     session
-        .record_task_start(&sid, 42, "second label", Some("sub-overwrite"))
+        .record_task_start(&sid, 42, "second label", None, Some("sub-overwrite"))
         .await
         .unwrap();
 
@@ -1986,6 +1986,175 @@ async fn running_tasks_rerecord_same_key_overwrites() {
     );
 }
 
+/// `record_task_start` 持久化完整命令（`full_command` 列，bash 任务传
+/// `Some`、delegate 传 `None`）；`task_full_command` 按 id 读回。消费路径
+/// （`take_unfinished_tasks`）仍只回 label（「被杀」Notice 文本不变），
+/// 完整命令作为独立读取路径供 UI/`/api/tasks` 回退取用。
+#[tokio::test]
+async fn running_tasks_persists_full_command() {
+    let (_dir, session, sid) = fresh_session().await;
+    let long = "cargo build --release --features very-long-feature-name \
+                --target x86_64-unknown-linux-gnu --jobs 8";
+
+    // Bash-style record: full command persisted.
+    session
+        .record_task_start(&sid, 1, "cargo build …", Some(long), None)
+        .await
+        .unwrap();
+    // Delegate-style record: no command → NULL column.
+    session
+        .record_task_start(&sid, 2, "delegate work", None, Some("sub-probe"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.task_full_command(&sid, 1).await.unwrap().as_deref(),
+        Some(long),
+        "full command survives the write"
+    );
+    assert_eq!(
+        session.task_full_command(&sid, 2).await.unwrap(),
+        None,
+        "delegate row has no full command"
+    );
+    assert_eq!(
+        session.task_full_command(&sid, 99).await.unwrap(),
+        None,
+        "unknown task id → None"
+    );
+
+    // The consumption path is unchanged: labels only.
+    assert_eq!(
+        session.take_unfinished_tasks(&sid).await.unwrap(),
+        vec![
+            "task 1: cargo build …".to_string(),
+            "task 2: delegate work (session: sub-probe)".to_string(),
+        ]
+    );
+    // Consumed rows are gone → lookup returns None.
+    assert_eq!(
+        session.task_full_command(&sid, 1).await.unwrap(),
+        None,
+        "row consumed → no full command on record"
+    );
+
+    // Re-record overwrites the full command too (last-write-wins).
+    session
+        .record_task_start(&sid, 1, "new label", Some("echo new"), None)
+        .await
+        .unwrap();
+    session
+        .record_task_start(&sid, 1, "new label", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.task_full_command(&sid, 1).await.unwrap(),
+        None,
+        "re-record without a command clears the previous full command"
+    );
+}
+
+/// 老库（running_tasks 表没有 full_command 列）在 connect 时自动
+/// ALTER 补列；老行读回 full_command = NULL（`task_full_command` 返回
+/// None，兼容旧数据），新写入（record_task_start 带 full_command）落新列。
+#[tokio::test]
+async fn connect_migrates_legacy_running_tasks_table_missing_full_command() {
+    let (dir, path) = temp_db();
+    let wid = workspace_id();
+    let p = path.to_str().unwrap();
+
+    // 手工建一个「旧版」running_tasks 表：没有 full_command 列（也没有
+    // owner_identity——连迁移探测本身也走老路径），并写入一条旧行。
+    let legacy_ddl = r#"
+        CREATE TABLE running_tasks (
+            workspace_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            task_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            subagent_session_id TEXT NULL,
+            started_at_us INTEGER NOT NULL,
+            PRIMARY KEY (workspace_id, session_id, task_id)
+        )
+    "#;
+    {
+        let db = turso::Builder::new_local(p)
+            .build()
+            .await
+            .expect("open legacy db");
+        let conn = db.connect().expect("connect legacy db");
+        conn.execute(legacy_ddl, ())
+            .await
+            .expect("create legacy running_tasks table");
+        conn.execute(
+            "INSERT INTO running_tasks \
+             (workspace_id, session_id, task_id, label, started_at_us) \
+             VALUES (?1, ?2, ?3, ?4, 1)",
+            (wid.as_str(), "legacy-task-session", 1i64, "old build"),
+        )
+        .await
+        .expect("insert legacy running_tasks row");
+    }
+
+    // connect 自动探测 + ALTER 补 full_command（和 owner_identity）列。
+    let session = SqliteSession::connect(p, &wid, "legacy-task-session")
+        .await
+        .expect("connect migrates the legacy table");
+
+    // 老行：full_command 缺失 → NULL → task_full_command 返回 None。
+    assert_eq!(
+        session
+            .task_full_command("legacy-task-session", 1)
+            .await
+            .expect("read legacy row full command"),
+        None,
+        "pre-migration rows have no full command"
+    );
+    // 老行的 label 仍可正常消费（消费路径不受新列影响）。
+    assert_eq!(
+        session
+            .take_unfinished_tasks("legacy-task-session")
+            .await
+            .expect("consume legacy row"),
+        vec!["task 1: old build".to_string()]
+    );
+
+    // 新写入落 full_command 列：record_task_start 带命令 + 读回成功。
+    session
+        .record_task_start(
+            "legacy-task-session",
+            7,
+            "new build",
+            Some("cargo build"),
+            None,
+        )
+        .await
+        .expect("write full command after migration");
+    assert_eq!(
+        session
+            .task_full_command("legacy-task-session", 7)
+            .await
+            .expect("read migrated full command")
+            .as_deref(),
+        Some("cargo build"),
+        "post-migration writes persist the full command"
+    );
+
+    // 迁移幂等：再 connect 一次，探测发现列已存在、不重复 ALTER，一切正常。
+    drop(session);
+    let session2 = SqliteSession::connect(p, &wid, "legacy-task-session")
+        .await
+        .expect("reconnect on migrated db");
+    assert_eq!(
+        session2
+            .task_full_command("legacy-task-session", 7)
+            .await
+            .expect("read after reconnect")
+            .as_deref(),
+        Some("cargo build")
+    );
+    drop((dir, session2));
+}
+
 /// The `owner` column records the process identity of the process that
 /// started each task, and `unfinished_owner_all_dead` (the server-attach
 /// probe) only reports true when EVERY surviving row was left by a
@@ -2005,7 +2174,7 @@ async fn running_tasks_owner_column_liveness_probe() {
     // A row recorded by THIS process (still alive) → not all dead, and
     // the owner column holds our process identity.
     session
-        .record_task_start(&sid, 1, "sleep 100", None)
+        .record_task_start(&sid, 1, "sleep 100", None, None)
         .await
         .unwrap();
     assert!(
@@ -2107,7 +2276,7 @@ async fn running_tasks_owner_column_liveness_probe() {
 
     // Mixed dead + live owners → not all dead.
     session
-        .record_task_start(&sid, 2, "cargo build", None)
+        .record_task_start(&sid, 2, "cargo build", None, None)
         .await
         .unwrap();
     assert!(
@@ -2207,7 +2376,7 @@ async fn connect_migrates_legacy_running_tasks_table_missing_owner_column() {
         "legacy row without owner must probe as alive"
     );
     session
-        .record_task_start(&sid, 8, "new task", None)
+        .record_task_start(&sid, 8, "new task", None, None)
         .await
         .unwrap();
     assert!(
@@ -2288,7 +2457,7 @@ async fn store_facade_unfinished_owner_all_dead_e2e() {
 
     // record（fire-and-forget 落到当前 runtime）：owner = 当前进程（活着）
     // → 轮询直到记录落地，probe 为 false。
-    store.record_background_start(root, &sid, 7, "build project", None);
+    store.record_background_start(root, &sid, 7, "build project", None, None);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if !store
@@ -2383,11 +2552,11 @@ async fn running_tasks_subagent_lookup_crosses_parent_sessions() {
     let parent_a = format!("parent-a-{}", crate::session::new_id());
     let parent_b = format!("parent-b-{}", crate::session::new_id());
     session
-        .record_task_start(&parent_a, 10, "probe a", Some(&subagent))
+        .record_task_start(&parent_a, 10, "probe a", None, Some(&subagent))
         .await
         .unwrap();
     session
-        .record_task_start(&parent_b, 11, "probe b", Some(&subagent))
+        .record_task_start(&parent_b, 11, "probe b", None, Some(&subagent))
         .await
         .unwrap();
 
@@ -2444,11 +2613,11 @@ async fn running_tasks_label_for_subagent_returns_latest() {
     // Two delegate tasks for the same subagent; the newest started_at wins.
     let parent = format!("parent-label-{}", crate::session::new_id());
     session
-        .record_task_start(&parent, 20, "first label", Some(&subagent))
+        .record_task_start(&parent, 20, "first label", None, Some(&subagent))
         .await
         .unwrap();
     session
-        .record_task_start(&parent, 21, "latest label", Some(&subagent))
+        .record_task_start(&parent, 21, "latest label", None, Some(&subagent))
         .await
         .unwrap();
     assert_eq!(
@@ -2486,11 +2655,11 @@ async fn running_tasks_all_subagent_labels_returns_latest_per_subagent() {
     let subagent = format!("sub-batch-{}", crate::session::new_id());
     let parent = format!("parent-batch-{}", crate::session::new_id());
     session
-        .record_task_start(&parent, 20, "first label", Some(&subagent))
+        .record_task_start(&parent, 20, "first label", None, Some(&subagent))
         .await
         .unwrap();
     session
-        .record_task_start(&parent, 21, "latest label", Some(&subagent))
+        .record_task_start(&parent, 21, "latest label", None, Some(&subagent))
         .await
         .unwrap();
     let labels = session.all_subagent_labels().await.unwrap();
@@ -2504,11 +2673,11 @@ async fn running_tasks_all_subagent_labels_returns_latest_per_subagent() {
     // subagent id never leak into it.
     let other = format!("other-batch-{}", crate::session::new_id());
     session
-        .record_task_start(&parent, 30, "other label", Some(&other))
+        .record_task_start(&parent, 30, "other label", None, Some(&other))
         .await
         .unwrap();
     session
-        .record_task_start(&parent, 40, "no subagent", None)
+        .record_task_start(&parent, 40, "no subagent", None, None)
         .await
         .unwrap();
     let labels = session.all_subagent_labels().await.unwrap();
@@ -3515,19 +3684,19 @@ async fn zombie_scan_consumes_dead_rows_and_injects_one_parent_notice() {
         .await
         .expect("connect parent session");
     parent_session
-        .record_task_start(&parent, 1, "npm run dev", None)
+        .record_task_start(&parent, 1, "npm run dev", None, None)
         .await
         .unwrap();
     parent_session
-        .record_task_start(&parent, 2, "sleep 100", None)
+        .record_task_start(&parent, 2, "sleep 100", None, None)
         .await
         .unwrap();
     parent_session
-        .record_task_start(&parent, 11, "btw: 分析日志", Some(&child_a))
+        .record_task_start(&parent, 11, "btw: 分析日志", None, Some(&child_a))
         .await
         .unwrap();
     parent_session
-        .record_task_start(&parent, 12, "task: 修 bug", Some(&child_b))
+        .record_task_start(&parent, 12, "task: 修 bug", None, Some(&child_b))
         .await
         .unwrap();
     // 把 owner 改成确定已死的 pid@hostname，让扫描的 liveness 探测通过。

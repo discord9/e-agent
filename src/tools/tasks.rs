@@ -71,6 +71,12 @@ impl Tool for GetBackgroundTasks {
                 "#{}: {} ({}){}{}\n",
                 task.id, task.label, role, tags, self_marker
             ));
+            // 完整命令原文：label 是源头截断的 100 字符预览，这里给模型
+            // 未被截断的原始命令（bash 任务才有；delegate 任务无命令，
+            // 省略该行——向后兼容旧格式，首行 `#id: label (role)` 不变）。
+            if let Some(command) = &task.full_command {
+                out.push_str(&format!("    command: {command}\n"));
+            }
         }
         out.truncate(out.trim_end().len());
         Ok(out)
