@@ -27,7 +27,12 @@
 async function fetchTasks(ws) {
   if (!workspaceToken(ws)) return null;
   try {
-    const res = await apiFor(ws, "/api/tasks");
+    // fetchWithTimeout（sessions.js）：10s 上限 + AbortController。裸 apiFor
+    // 无超时，任一 workspace 的 /api/tasks 永久 pending 会拖住 pollTasks 整轮
+    // Promise.all——其它健康 workspace 的响应也进不了缓存，面板「加载不出来」。
+    // 超时 → AbortError → 下方 catch 返回 null → 该 ws 保留旧缓存（stale），
+    // 下轮 2s 轮询自动恢复。
+    const res = await fetchWithTimeout(ws, "/api/tasks");
     if (res.status === 401 || res.status === 403) {
       // 认证失败只对激活 workspace 弹 banner（背景 workspace 静默，不刷屏）
       if (ws === state.workspace) setBanner("⚠ 认证失败：请检查 Token。");

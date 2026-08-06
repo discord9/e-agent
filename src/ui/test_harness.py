@@ -393,6 +393,9 @@ function abortable(promise, signal){
 let tasksData = [];
 // 聚合模式：第二台服务器（http://b.local）的独立 /api/tasks 数据源
 let tasksDataB = [];
+// 任务轮询超时测试：B 的 /api/tasks 永不 resolve（挂起，只能被 abort 打断）
+// ——验证 fetchTasks 带 fetchWithTimeout 后挂起的 ws 不拖住整轮 Promise.all
+let tasksBHang = false;
 let taskOutputText = "";
 // perf 回归测试：output 端点延迟（手动 resolve）——验证 500ms 轮询防重入
 let taskOutputDelayed = false;
@@ -500,7 +503,10 @@ globalThis.fetch=(url,opts={})=>{
         return resp(200, sessionsData, signal);
   }
   // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
-  if(url==="http://b.local/api/tasks") return resp(200, tasksDataB, signal);
+  if(url==="http://b.local/api/tasks") {
+    if (tasksBHang) return abortable(new Promise(() => {}), signal);   // 永久 pending，仅 abort 可打断
+    return resp(200, tasksDataB, signal);
+  }
   if(url==="http://b.local/api/sessions"&&m==="GET") {
     if (bGetDelayed) return abortable(new Promise((resolve) => { bGetResolve = resolve; }), signal);
     if (sessionsPDelayed) return abortable(new Promise((resolve) => { sessionsPResolve = resolve; }), signal);
@@ -5207,6 +5213,118 @@ async function main(){
         "timer=" + String(state.pollTimer) + " gen=" + state.pollGen);
     afterPollRound = i1apr;
     stopPolling();
+
+    // =====================================================================
+    // 任务轮询超时（fetchTasks 复用 fetchWithTimeout）：一个 workspace 的
+    //   /api/tasks 永久 pending（tasksBHang，仅 abort 可打断）不得拖住
+    //   pollTasks 整轮 Promise.all——旧 bug：裸 apiFor 无超时，挂起 ws 让
+    //   健康 ws 的响应也进不了缓存，聚合 list 卡上一帧，面板「加载不出来」。
+    //   断言：挂起期间整轮不完成但健康 ws 已进 byWorkspace、list 保持上一帧；
+    //   手动触发 fetchWithTimeout 的 abort 定时器（gjs 定时器不自动触发，
+    //   参照 issue8/deeplink 超时模式）→ 整轮完成：挂起 ws stale 保留 +
+    //   健康 ws fresh 合并、面板渲染；恢复后下一轮数据回来。
+    // =====================================================================
+    state.workspaces = [
+      { id: "wsA", name: "A", url: "", token: "t" },
+      { id: "wsB", name: "B", url: "http://b.local", token: "t" },
+    ];
+    state.workspace = state.workspaces[0];
+    state.token = "t";
+    state.tasks.byWorkspace = {};
+    state.tasks.list = [];
+    state.tasks.composerOpen = true;
+    lastTasksSig = "";
+    lastTasksRenderedSig = "";
+    // 基线一轮：A/B 各有任务（byWorkspace 预置 B 的 stale 快照）
+    tasksData = [{ session_id: "a1", id: 1, kind: "bash", label: "A 任务",
+      full_command: "a", output: "", role: null }];
+    tasksDataB = [{ session_id: "b1", id: 1, kind: "bash", label: "B 任务",
+      full_command: "b", output: "", role: null }];
+    await pollTasks();
+    await flush();
+    chk("task timeout baseline merged",
+        state.tasks.list.length === 2
+        && state.tasks.byWorkspace["wsA"].length === 1
+        && state.tasks.byWorkspace["wsB"].length === 1,
+        "n=" + state.tasks.list.length);
+    // B 挂起：整轮不完成（Promise.all 等挂起 ws），但 A 的响应已进缓存，
+    // 聚合 list 不被中途破坏（保持上一帧）
+    tasksBHang = true;
+    tasksData = [{ session_id: "a1", id: 1, kind: "bash", label: "A 任务",
+      full_command: "a", output: "", role: null },
+      { session_id: "a1", id: 2, kind: "bash", label: "A 任务v2",
+        full_command: "a2", output: "", role: null }];
+    const ttoT0 = scheduledTimeouts.length;
+    let ttoDone = false;
+    const ttoP = pollTasks().then(() => { ttoDone = true; });
+    await flush();
+    chk("task timeout: hung ws stalls whole round", ttoDone === false, "done=" + ttoDone);
+    // 挂起期间健康 ws 的 fetch 正常完成（不被挂起的 ws 拖死）：
+    // 计数 +1 后再发一个 sentinel fetch，能拿到本轮新数据即证明 A 的请求
+    // 通道在挂起期间是通的（旧 bug 下谈不上——因为根本没有超时会整轮卡死，
+    // 见下一条「abort 后整轮完成」）；byWorkspace 旧缓存保持完整。
+    const ttoF0 = FETCHES.filter((u) => u === "/api/tasks").length;
+    const ttoAResp = await apiFor(state.workspaces[0], "/api/tasks");
+    const ttoAList = await ttoAResp.json();
+    chk("task timeout: healthy ws fetch completes while hung",
+        FETCHES.filter((u) => u === "/api/tasks").length === ttoF0 + 1
+        && ttoAList.length === 2 && ttoAList[1].id === 2,
+        "fetches=" + (FETCHES.filter((u) => u === "/api/tasks").length - ttoF0)
+        + " ids=" + JSON.stringify(ttoAList.map((t) => t.id)));
+    chk("task timeout: healthy ws cache intact while hung",
+        state.tasks.byWorkspace["wsA"].length === 1
+        && state.tasks.byWorkspace["wsA"][0].id === 1,
+        "cache=" + JSON.stringify(state.tasks.byWorkspace["wsA"].map((t) => t.id)));
+    chk("task timeout: aggregated list keeps last frame while hung",
+        state.tasks.list.length === 2
+        && state.tasks.list.some((t) => t._ws === "wsA" && t.id === 1)
+        && state.tasks.list.some((t) => t._ws === "wsB" && t.id === 1),
+        "list=" + JSON.stringify(state.tasks.list.map((t) => t._ws + ":" + t.id)));
+    let ttoAbort = null;   // A 的响应先到：finally clearTimeout 撤掉 A 的定时器，
+    for (let i = scheduledTimeouts.length - 1; i >= ttoT0; i--) {   // 剩下非 null 的即 B 的
+      if (scheduledTimeouts[i]) { ttoAbort = scheduledTimeouts[i]; break; }
+    }
+    chk("task timeout: abort timer armed for hung ws", ttoAbort !== null, "none");
+    ttoAbort();   // 触发 10s 超时 → ctrl.abort() → B 的 pending fetch reject AbortError
+    await ttoP;
+    await flush();
+    chk("task timeout: round completes after abort",
+        ttoDone === true, "done=" + ttoDone);
+    chk("task timeout: abort merges fresh A + stale B",
+        state.tasks.list.length === 3
+        && state.tasks.list.some((t) => t._ws === "wsA" && t.id === 2)
+        && state.tasks.list.some((t) => t._ws === "wsB" && t.id === 1),
+        "list=" + JSON.stringify(state.tasks.list.map((t) => t._ws + ":" + t.id)));
+    chk("task timeout: hung ws stale cache untouched",
+        state.tasks.byWorkspace["wsB"].length === 1
+        && state.tasks.byWorkspace["wsB"][0].id === 1,
+        "id=" + (state.tasks.byWorkspace["wsB"][0] && state.tasks.byWorkspace["wsB"][0].id));
+    // 面板渲染（激活 wsA 过滤后两行，含 fresh 的 id=2 任务）
+    chk("task timeout: panel renders after abort",
+        elsById["composerTasks"].querySelectorAll(".task-row").length === 2
+        && [...elsById["composerTasks"].querySelectorAll(".task-row")]
+          .some((r) => r.getAttribute("data-task") === "a1:2"),
+        "rows=" + [...elsById["composerTasks"].querySelectorAll(".task-row")]
+          .map((r) => r.getAttribute("data-task")).join(","));
+    // 恢复：B 的下一轮数据回来（fresh 覆盖 stale）
+    tasksBHang = false;
+    tasksDataB = [{ session_id: "b1", id: 2, kind: "bash", label: "B 任务v2",
+      full_command: "b2", output: "", role: null }];
+    await pollTasks();
+    await flush();
+    chk("task timeout: next round recovers hung ws",
+        state.tasks.list.length === 3
+        && state.tasks.list.some((t) => t._ws === "wsA" && t.id === 2)
+        && state.tasks.list.some((t) => t._ws === "wsB" && t.id === 2),
+        "list=" + JSON.stringify(state.tasks.list.map((t) => t._ws + ":" + t.id)));
+    // 还原：清任务，避免泄漏到后续测试段
+    tasksData = [];
+    tasksDataB = [];
+    state.tasks.byWorkspace = {};
+    state.tasks.list = [];
+    state.tasks.composerOpen = false;
+    lastTasksSig = "";
+    lastTasksRenderedSig = "";
 
     // =====================================================================
     // Issue 2 (高): 任务面板收起期间数据变化 → 重开必须重建（不显示旧行/旧闭包）
