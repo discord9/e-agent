@@ -69,6 +69,8 @@ async function pollTasks() {
   }
   state.tasks.list = all;
   renderComposerTasks();
+  renderSidebarTree();   // 任务数据恢复后主动触发侧边栏重绘（dot 数据源变化，
+                         // 不再依赖 sessionId 变化碰巧打破 sidebarTreeSig 去重）
 }
 
 /* 任务元数据签名（整列表/单行两级去重用）：决定任务列表/卡片是否需要重建。

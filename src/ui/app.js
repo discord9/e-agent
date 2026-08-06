@@ -302,6 +302,10 @@ async function switchWorkspace(id, epoch) {
   saveSessionState();        // 切 workspace 前保存当前会话视图/草稿（per-ws 键，
                              // 跨 workspace 保留；须在 stopSSE 后、清空 sessionId 前）
   // ---- 清空当前工作区的会话/聊天状态（其它 workspace 的聚合缓存保留） ----
+  // tasks.list / tasks.byWorkspace / sidebar.expanded 保留：聚合任务缓存每项带
+  // _ws 标记，面板与侧边栏环绕点均按激活 ws 过滤，跨 ws 不污染；expanded 键是
+  // "wsId:s.id" 前缀，跨 ws 不冲突。保留后侧边栏 busy dot 与 subagent 展开状态
+  // 在切换瞬间不消失，等 pollTasks/pollSessions 刷新。
   state.sessionId = null;
   state.lastList = (state.workspaceLists[ws.id] !== undefined) ? state.workspaceLists[ws.id] : [];
   state.queue.length = 0;
@@ -315,8 +319,6 @@ async function switchWorkspace(id, epoch) {
   state.deepLink.handled = true;
   state.deepLink.probing = false;    // 切换即终止深链 attempt（标记清掉，防残留污染后续 404 分类）
   state.deepLink.attemptEpoch = -1;
-  state.tasks.list = [];
-  state.tasks.byWorkspace = {};   // 聚合缓存随 workspace 切换重置：下一轮 pollTasks 重新拉全量
   state.tasks.cancelling = new Set();
   state.tasks.pollers = new Map();
   state.tasks.streams = new Map();
@@ -325,7 +327,6 @@ async function switchWorkspace(id, epoch) {
   state.tasks.composerOpen = false;
   lastTasksSig = "";              // 任务面板签名跟随 workspace 重置（DOM 已清空）
   lastTasksRenderedSig = "";
-  state.sidebar.expanded = new Set();
   state.sidebar.filter = "";
   state.sidebar.showAllWs = new Set();
   // ---- 切换激活 workspace；state.token 派生跟随（全局 token 独立不变） ----

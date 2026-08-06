@@ -1584,7 +1584,8 @@ function sidebarTreeSig() {
         s.archived === true ? 1 : 0, s.model || "",
       ])));
   }
-  return state.sessionId + "|" + JSON.stringify(readPinOrder()) + "|" + parts.join("|");
+  return state.sessionId + "|" + JSON.stringify(readPinOrder()) + "|" + parts.join("|")
+    + "|" + tasksListSig(state.tasks.list);   // tasks.list 纳入签名：任务数据变化（dot 数据源）才能触发侧边栏重绘
 }
 
 /* force=true 时无视签名强制重绘（筛选输入、展开全部按钮、切换 workspace）
