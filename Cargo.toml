@@ -60,3 +60,8 @@ windows-sys = { version = "0.61", features = [
 default = ["greptime", "sqlite"]
 greptime = ["dep:tokio-postgres"]
 sqlite = ["dep:turso"]
+
+[profile.release]
+# 保留函数名以便 panic backtrace 可读（默认 strip=debuginfo 会把符号表剥掉，
+# 崩溃日志全是 <unknown>）。debug=1 只留 line table，体积/性能影响极小。
+debug = 1
