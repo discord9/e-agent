@@ -5,15 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>e-agent · Web UI</title>
 <!-- favicon：内联 SVG data URI（零路由改动、无额外请求）。「e_」标记 =
-     e-agent 的 e + 终端光标/输入提示符的下划线。像素风：64×64 viewBox
-     按 4 单位/格铺成 16×16 网格，16px 渲染时每格恰好 1 物理像素、无抗
-     锯齿模糊。Solarized 绿（#859900）小写 e 居中偏上为主体：左竖 +
-     顶/中/底三横，顶/底横右端出头 1 格、中横短 2 格（右侧上下双开口，
-     读作小写 e、刻意避开圆环以免像 IE）；其下留 1 格间隙，Solarized 橙
-     （#cb4b16，与品牌 busy dot 同色）1 格高、与 e 等宽的下划线收尾，
-     整体垂直居中。全部矩形构成，落在 base2（#eee8d5）圆角底上；
-     16px 小尺寸下 e 的开口与下划线均可辨识、互不粘连。 -->
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http://www.w3.org/2000/svg%27%20viewBox%3D%270%200%2064%2064%27%3E%3Crect%20width%3D%2764%27%20height%3D%2764%27%20rx%3D%2714%27%20fill%3D%27%23eee8d5%27/%3E%3Cg%20fill%3D%27%23859900%27%3E%3Crect%20x%3D%2720%27%20y%3D%2712%27%20width%3D%2732%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2716%27%20width%3D%274%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2720%27%20width%3D%274%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2724%27%20width%3D%2724%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2728%27%20width%3D%274%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2732%27%20width%3D%274%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2736%27%20width%3D%2732%27%20height%3D%274%27/%3E%3C/g%3E%3Cg%20fill%3D%27%23cb4b16%27%3E%3Crect%20x%3D%2716%27%20y%3D%2744%27%20width%3D%2732%27%20height%3D%274%27/%3E%3C/g%3E%3C/svg%3E">
+     e-agent 的 e + 终端光标/输入提示符的下划线。e 用 <path> 圆弧画成
+     真正的曲线小写 e——矩形像素拼法只能逼近大写 E（左竖+三横），拼不出
+     小写 e 的右侧圆弧开口，故弃用。64×64 viewBox，Solarized 绿
+     （#859900）4.2px 圆头描边：一条 3/4 圆弧（A 11.4，右下 50°–125° 留
+     口）作 e 的字碗，加一条 y=23 的横画（偏上，小写 e 的中横特征），右
+     端收入弧内、不套环以免像 IE。其下留隙，Solarized 橙（#cb4b16，与
+     品牌 busy dot 同色）5px 下划线收尾，落在 base2（#eee8d5）圆角底
+     上。笔画 ≥4px、开口张角 75°，16px 下开口仍 ≥2px、不糊成团。 -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2214%22%20fill%3D%22%23eee8d5%22%2F%3E%3Cg%20fill%3D%22none%22%20stroke%3D%22%23859900%22%20stroke-width%3D%224.2%22%20stroke-linecap%3D%22round%22%3E%3Cpath%20d%3D%22M27.5%2034.8A11.4%2011.4%200%201%201%2041.3%2034.2%22%2F%3E%3Cpath%20d%3D%22M22.4%2023H41.1%22%2F%3E%3C%2Fg%3E%3Cpath%20d%3D%22M20%2049H48%22%20stroke%3D%22%23cb4b16%22%20stroke-width%3D%225%22%20stroke-linecap%3D%22round%22%2F%3E%3C%2Fsvg%3E">
 <style>/*__KATEX_CSS__*/
 /*__CSS__*/</style>
 </head>
