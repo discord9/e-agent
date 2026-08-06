@@ -14,6 +14,7 @@
 //!
 //! Non-goals: no Storage trait, no migration of existing JSONL sessions.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -358,6 +359,27 @@ impl SqliteSession {
                     );
                 }
             }
+        }
+
+        // Index for the batched subagent-label lookup: `/api/sessions`
+        // resolves every subagent label with ONE `all_subagent_labels`
+        // query instead of a per-subagent N+1, and without an index that
+        // query is a full table scan. Idempotent; a failed CREATE INDEX
+        // does NOT block the connection — the feature degrades back to the
+        // per-item `label_for_subagent` loop (same philosophy as the ALTER
+        // migrations above).
+        if let Err(error) = conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_running_tasks_subagent \
+                 ON running_tasks (workspace_id, subagent_session_id)",
+                (),
+            )
+            .await
+        {
+            eprintln!(
+                "e-agent: cannot create running_tasks subagent index \
+                 (batched subagent-label lookup unavailable): {error}"
+            );
         }
 
         // Cache the session's latest metadata snapshot (if any) so later
@@ -2060,6 +2082,55 @@ impl SqliteSession {
                 .ok_or_else(|| "cannot look up subagent task label: not text".to_string()),
             None => Ok(None),
         }
+    }
+
+    /// The batched form of [`Self::label_for_subagent`], used by the
+    /// sessions list to resolve every subagent label in ONE query instead
+    /// of a per-subagent N+1. Returns the full
+    /// `subagent_session_id → label` map in a single scan. A subagent can
+    /// have several rows (one per delegate task, possibly from different
+    /// parents); rows are inserted oldest→newest so each later insert
+    /// overwrites the previous one and `ORDER BY started_at_us ASC` makes
+    /// the newest label the final (winning) value — the same "newest
+    /// wins" rule as the per-session lookup. Non-destructive (unlike the
+    /// `take_unfinished_*` lookups) — called from `/api/sessions`
+    /// listing. A subagent with no live delegate task is simply absent
+    /// from the map (the caller reads it as `None`).
+    pub async fn all_subagent_labels(&self) -> Result<HashMap<String, Option<String>>, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT subagent_session_id, label FROM running_tasks \
+                 WHERE workspace_id = ?1 AND subagent_session_id IS NOT NULL \
+                 ORDER BY started_at_us ASC",
+                (self.workspace_id.as_str(),),
+            )
+            .await
+            .map_err(|e| format!("cannot load all subagent task labels: {e}"))?;
+        let mut labels = HashMap::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot load all subagent task labels: {e}"))?
+        {
+            let Some(subagent_session_id) = row
+                .get_value(0)
+                .map_err(|e| format!("cannot load all subagent task labels: {e}"))?
+                .as_text()
+                .cloned()
+            else {
+                // NULL subagent_session_id is excluded by the WHERE clause;
+                // skip defensively instead of failing the whole batch.
+                continue;
+            };
+            let label = row
+                .get_value(1)
+                .map_err(|e| format!("cannot load all subagent task labels: {e}"))?
+                .as_text()
+                .cloned();
+            labels.insert(subagent_session_id, label);
+        }
+        Ok(labels)
     }
 
     /// Rewrite the entire session log (used for legacy migration). A no-op

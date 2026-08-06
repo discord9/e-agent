@@ -1679,10 +1679,9 @@ impl SessionStore {
     /// — sync file I/O must never block the executor), returning the full
     /// `subagent_session_id → label` map.
     ///
-    /// Greptime/SQLite: `Ok(None)` — no batched query exists on those
-    /// backends, and the per-item [`Self::label_for_subagent`] lookup is a
-    /// cheap indexed query (not a file scan), so the caller falls back to
-    /// the loop there.
+    /// Greptime/SQLite: one indexed query over `running_tasks`, returning
+    /// the same full map — the batched form of their per-item
+    /// [`Self::label_for_subagent`].
     pub async fn all_subagent_labels(
         &self,
         root: &Path,
@@ -1696,9 +1695,17 @@ impl SessionStore {
                     .map(Some)
             }
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { .. } => Ok(None),
+            SessionStore::Greptime { session, .. } => {
+                session.lock().await.all_subagent_labels().await.map(Some)
+            }
             #[cfg(feature = "sqlite")]
-            SessionStore::Sqlite { .. } => Ok(None),
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .all_subagent_labels()
+                .await
+                .map_err(anyhow::Error::msg)
+                .map(Some),
         }
     }
 }

@@ -2328,6 +2328,52 @@ async fn running_tasks_label_for_subagent_returns_latest() {
     assert_eq!(session.label_for_subagent(&subagent).await.unwrap(), None);
 }
 
+#[tokio::test]
+async fn running_tasks_all_subagent_labels_returns_latest_per_subagent() {
+    let (_dir, session, _sid) = fresh_session().await;
+    assert!(
+        session.all_subagent_labels().await.unwrap().is_empty(),
+        "no rows yet → empty map"
+    );
+
+    // Two delegate tasks for the same subagent; the newest started_at wins
+    // (record_task_start timestamps are strictly increasing).
+    let subagent = format!("sub-batch-{}", crate::session::new_id());
+    let parent = format!("parent-batch-{}", crate::session::new_id());
+    session
+        .record_task_start(&parent, 20, "first label", Some(&subagent))
+        .await
+        .unwrap();
+    session
+        .record_task_start(&parent, 21, "latest label", Some(&subagent))
+        .await
+        .unwrap();
+    let labels = session.all_subagent_labels().await.unwrap();
+    assert_eq!(
+        labels.get(&subagent).and_then(|label| label.as_deref()),
+        Some("latest label"),
+        "newest running_tasks row wins"
+    );
+
+    // Another subagent's rows are in the map too, and rows without a
+    // subagent id never leak into it.
+    let other = format!("other-batch-{}", crate::session::new_id());
+    session
+        .record_task_start(&parent, 30, "other label", Some(&other))
+        .await
+        .unwrap();
+    session
+        .record_task_start(&parent, 40, "no subagent", None)
+        .await
+        .unwrap();
+    let labels = session.all_subagent_labels().await.unwrap();
+    assert_eq!(
+        labels.get(&other).and_then(|label| label.as_deref()),
+        Some("other label")
+    );
+    assert_eq!(labels.len(), 2, "rows without a subagent id are excluded");
+}
+
 // ----------------------------------------------------------------------
 // sessions — metadata audit table
 // ----------------------------------------------------------------------

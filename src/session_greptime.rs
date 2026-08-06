@@ -6,6 +6,7 @@
 //! Non-goals: no Storage trait, no migration of existing JSONL sessions.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use tokio_postgres::NoTls;
 
 use crate::agent::SessionEntry;
@@ -1793,6 +1794,43 @@ impl GreptimeSession {
             .await
             .context("cannot look up subagent task label")?;
         Ok(row.map(|row| row.get("label")))
+    }
+
+    /// The batched form of [`Self::label_for_subagent`], used by the
+    /// sessions list to resolve every subagent label in ONE query instead
+    /// of a per-subagent N+1. Returns the full
+    /// `subagent_session_id → label` map in a single scan. A subagent can
+    /// have several rows (one per delegate task, possibly from different
+    /// parents); rows are inserted oldest→newest so each later insert
+    /// overwrites the previous one and `ORDER BY started_at ASC` makes
+    /// the newest label the final (winning) value — the same "newest
+    /// wins" rule as the per-session lookup. Non-destructive (unlike the
+    /// `take_unfinished_*` lookups) — called from `/api/sessions`
+    /// listing. A subagent with no live delegate task is simply absent
+    /// from the map (the caller reads it as `None`).
+    pub async fn all_subagent_labels(&self) -> Result<HashMap<String, Option<String>>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT subagent_session_id, label FROM running_tasks \
+                 WHERE workspace_id = $1 AND subagent_session_id IS NOT NULL \
+                 ORDER BY started_at ASC",
+                &[&self.workspace_id],
+            )
+            .await
+            .context("cannot load all subagent task labels")?;
+        let mut labels = HashMap::new();
+        for row in rows {
+            let Some(subagent_session_id) = row.get::<_, Option<String>>("subagent_session_id")
+            else {
+                // NULL subagent_session_id is excluded by the WHERE clause;
+                // skip defensively instead of failing the whole batch.
+                continue;
+            };
+            let label = row.get::<_, Option<String>>("label");
+            labels.insert(subagent_session_id, label);
+        }
+        Ok(labels)
     }
 }
 
@@ -3924,6 +3962,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.label_for_subagent(&subagent).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn running_tasks_all_subagent_labels_returns_latest_per_subagent() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let subagent = format!("sub-all-labels-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &subagent)
+            .await
+            .unwrap();
+        assert!(
+            session.all_subagent_labels().await.unwrap().is_empty(),
+            "no rows yet → empty map"
+        );
+
+        // Two delegate tasks for the same subagent; the newest started_at
+        // wins (record_task_start timestamps are strictly increasing).
+        let parent = format!("parent-all-labels-{}", crate::session::new_id());
+        session
+            .record_task_start(&parent, 20, "first label", Some(&subagent))
+            .await
+            .unwrap();
+        session
+            .record_task_start(&parent, 21, "latest label", Some(&subagent))
+            .await
+            .unwrap();
+        let labels = session.all_subagent_labels().await.unwrap();
+        assert_eq!(
+            labels.get(&subagent).and_then(|label| label.as_deref()),
+            Some("latest label"),
+            "newest running_tasks row wins"
+        );
+
+        // Another subagent's rows are in the map too, and rows without a
+        // subagent id never leak into it.
+        let other = format!("other-all-labels-{}", crate::session::new_id());
+        session
+            .record_task_start(&parent, 30, "other label", Some(&other))
+            .await
+            .unwrap();
+        session
+            .record_task_start(&parent, 40, "no subagent", None)
+            .await
+            .unwrap();
+        let labels = session.all_subagent_labels().await.unwrap();
+        assert_eq!(
+            labels.get(&other).and_then(|label| label.as_deref()),
+            Some("other label")
+        );
+        assert_eq!(labels.len(), 2, "rows without a subagent id are excluded");
     }
 
     // ------------------------------------------------------------------
