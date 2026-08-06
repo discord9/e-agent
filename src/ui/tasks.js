@@ -335,17 +335,23 @@ function stopTaskRows() {
   updateJumpBottomPosition();   // 面板已强制收起：「回到底部」按钮回位
 }
 
-/* 「回到底部」按钮随任务面板浮动：面板打开时它会盖住 absolute 钉在聊天区
-   右下（bottom:110px）的按钮，用户点「回到底部」会误触任务行的「结束/
-   取消」。这里在面板显隐时按面板实际高度动态上移按钮（面板高 + 8px 间隙），
-   面板关闭/无任务时清掉内联 bottom 回默认 110px。不用固定 calc(30vh+…)：
-   面板高度随任务数变化，固定上限值在任务少时按钮悬空过高。 */
+/* 「回到底部」按钮随 composer 任务区（折叠条 + 面板）浮动：任务区会盖住
+   absolute 钉在聊天区右下（bottom:110px）的按钮，用户点「回到底部」会误触
+   折叠条或任务行的「结束/取消」。布局上折叠条在面板之上、且面板打开时两者
+   同时可见，所以避让必须算整体高度：折叠条可见时计入其高度，面板打开时再
+   叠加面板高度（+ 8px 间隙）；任务清空（整个组件消失）时清掉内联 bottom
+   回默认 110px。不用固定 calc(30vh+…)：面板高度随任务数变化，固定上限值
+   在任务少时按钮悬空过高。 */
 function updateJumpBottomPosition() {
   const btn = els.jumpBottomBtn;
   if (!btn) return;
+  const bar = els.tasksToggleBar;
   const panel = els.composerTasks;
+  // 面板打开时才避让（折叠条 + 面板整体之上）；面板关闭时折叠条单独
+  // 可见但位于 bottom:110px 之上方、本就不挡按钮 → 回默认。避免「折叠条
+  // 可见但面板收起」时按钮悬在 148px 的过度避让。
   const h = (state.tasks.composerOpen && panel && !panel.hidden)
-    ? (panel.offsetHeight || 0) : 0;
+    ? ((bar && !bar.hidden ? (bar.offsetHeight || 0) : 0) + (panel.offsetHeight || 0)) : 0;
   if (h > 0) btn.style.bottom = (110 + h + 8) + "px";
   else btn.style.bottom = "";   // 回默认 110px（style.css .jump-bottom）
 }

@@ -5683,15 +5683,17 @@ async function main(){
     taskOutput404 = false;
 
     // =====================================================================
-    // 「回到底部」按钮随任务面板浮动（误触修复）：面板打开 → 按钮按面板实际
-    //   高度上移（bottom = 110 + offsetHeight + 8）；面板关闭 / 任务清空 /
-    //   面板消失（stopTaskRows）→ 清掉内联 bottom 回默认 110px。
-    // fake DOM 限制：无真实布局，面板高度靠覆写 elsById["composerTasks"]
-    //   .offsetHeight（setter 写入 _offsetHeight，getter 在 hidden 时强制
-    //   返回 0，与浏览器 hidden → offsetHeight 0 的语义一致）。断言的是
-    //   「面板显隐 → 按钮 bottom 设置/清除」的联动逻辑与高度换算公式。
+    // 「回到底部」按钮随 composer 任务区浮动（误触修复）：避让的是「折叠条
+    //   + 面板」整体——折叠条可见时计入其高度（bottom = 110 + 折叠条高 + 8），
+    //   面板打开时再叠加面板高度；任务清空（组件消失）/ 面板消失
+    //   （stopTaskRows）→ 清掉内联 bottom 回默认 110px。
+    // fake DOM 限制：无真实布局，两元素高度靠覆写 elsById[...].offsetHeight
+    //   （setter 写入 _offsetHeight，getter 在 hidden 时强制返回 0，与浏览器
+    //   hidden → offsetHeight 0 的语义一致）。断言的是「折叠条/面板显隐 →
+    //   按钮 bottom 设置/清除」的联动逻辑与整体高度换算公式。
     // =====================================================================
     elsById["composerTasks"].innerHTML = "";
+    elsById["tasksToggleBar"].offsetHeight = 30;   // mock 折叠条布局高度
     elsById["composerTasks"].offsetHeight = 120;   // mock 面板打开后的布局高度
     state.tasks.composerOpen = true;
     state.tasks.byWorkspace = {};
@@ -5702,10 +5704,10 @@ async function main(){
       full_command: "jb", output: "", role: null }];
     await pollTasks();                 // 面板已打开 → 渲染后按钮应上移
     await flush();
-    chk("jump-bottom floats above open tasks panel",
-        elsById["jumpBottomBtn"].style.bottom === "238px",   // 110 + 120 + 8
+    chk("jump-bottom floats above toggle bar + open panel",
+        elsById["jumpBottomBtn"].style.bottom === "268px",   // 110 + 30 + 120 + 8
         "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
-    state.tasks.composerOpen = false;  // 收起面板 → 按钮回默认位（清内联样式）
+    state.tasks.composerOpen = false;  // 收起面板：折叠条仍可见 → 只避开折叠条
     renderComposerTasks();
     chk("jump-bottom returns when panel collapsed",
         elsById["jumpBottomBtn"].style.bottom === "",
@@ -5713,13 +5715,14 @@ async function main(){
     state.tasks.composerOpen = true;   // 重开面板，再验证「任务清空」路径
     renderComposerTasks();
     chk("jump-bottom floats again on reopen",
-        elsById["jumpBottomBtn"].style.bottom === "238px",
+        elsById["jumpBottomBtn"].style.bottom === "268px",
         "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
-    tasksData = [];                    // 任务清空 → 整个组件消失 + 强制收起
+    tasksData = [];                    // 任务清空 → 整个组件（折叠条+面板）消失
     await pollTasks();
     await flush();
     chk("jump-bottom returns when tasks list empties",
         elsById["jumpBottomBtn"].style.bottom === ""
+        && elsById["tasksToggleBar"].hidden === true
         && elsById["composerTasks"].hidden === true,
         "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
     // 行展开改变面板高度 → toggleRow / 渲染循环都会重算按钮位置
@@ -5727,7 +5730,7 @@ async function main(){
       full_command: "jb2", output: "x", role: null }];
     await pollTasks();                 // 新任务：面板保持收起（清空时被强制收起）
     await flush();
-    chk("jump-bottom stays default while panel collapsed with tasks",
+    chk("jump-bottom stays default with collapsed panel and tasks",
         elsById["jumpBottomBtn"].style.bottom === "",
         "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
     state.tasks.composerOpen = true;
@@ -5737,13 +5740,14 @@ async function main(){
     jbRow._listeners["click"][0]();    // 展开输出行：toggleRow 内即时重算按钮位置
     renderComposerTasks();             // 2s 轮询渲染同样每轮重算（兜底刷新）
     chk("jump-bottom tracks panel height after row expand",
-        elsById["jumpBottomBtn"].style.bottom === "318px",   // 110 + 200 + 8
+        elsById["jumpBottomBtn"].style.bottom === "348px",   // 110 + 30 + 200 + 8
         "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
     // 收尾还原：面板收起、任务清空、mock 高度复位，避免污染后续测试
     stopTaskRows();
     chk("jump-bottom returns after stopTaskRows",
         elsById["jumpBottomBtn"].style.bottom === "",
         "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
+    elsById["tasksToggleBar"].offsetHeight = 0;
     elsById["composerTasks"].offsetHeight = 0;
     tasksData = [];
     state.tasks.byWorkspace = {};
