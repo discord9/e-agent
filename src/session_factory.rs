@@ -60,8 +60,9 @@ pub enum UnfinishedPolicy {
 /// 原子消费（`take_unfinished_background`：SQLite/Greptime 是 DELETE、
 /// JSONL 是删记录文件）→ 非空则把 Notice 追加到该会话的存储并返回
 /// `Some(entry)`（已持久化）；无记录返回 `None`。build_session 的
-/// Consume 路径与 server 启动时的僵尸扫描共用，保证两处提示逻辑单一
-/// 来源、不漂移。
+/// Consume 路径使用；server 启动时的僵尸扫描已改为两遍汇总设计（只往
+/// 父会话注入、子会话只消费不注入，见 server.rs `scan_zombie_background_tasks`），
+/// 不再调用本函数。
 ///
 /// 只写存储、不要求 live agent：Notice 是普通持久化条目，会话下次
 /// `restore_history` 时自然读到。调用方若手头有刚建好的 agent（build
