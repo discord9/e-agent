@@ -153,6 +153,9 @@ class El {
     this._className=""; this._text=""; this._innerHTML=""; this.hidden=false;
     this.disabled=false; this.value=""; this.title=""; this.type=""; this.style={};
     this.scrollHeight=0; this.scrollTop=0; this.clientHeight=0; this.offsetParent=null;
+    /* fake DOM 无真实布局：offsetHeight 恒 0，测试可覆写（隐藏时强制 0，
+       与浏览器 hidden → offsetHeight 0 的语义一致）。 */
+    this._offsetHeight=0;
     this._parent=null; this._listeners={}; this._attrs={};
     this.classList={ add:(...c)=>c.forEach(x=>this._classes.add(x)),
       remove:(...c)=>c.forEach(x=>this._classes.delete(x)),
@@ -234,6 +237,8 @@ class El {
   blur(){}
   setPointerCapture(){}
   getBoundingClientRect(){ return { top: 0, bottom: 32, height: 32 }; }
+  get offsetHeight(){ return this.hidden ? 0 : this._offsetHeight; }
+  set offsetHeight(v){ this._offsetHeight=v; }
 }
 const elsById={};
 for(const id of ["topActions","backParentBtn","connState","banner","bannerText","bannerClose","tokenInput","tokenToggle","chatView","chatEmpty",
@@ -5676,6 +5681,74 @@ async function main(){
         "degraded=" + state.tasks.degraded.has("s1:600")
         + " pollers=" + JSON.stringify([...state.tasks.pollers.keys()]));
     taskOutput404 = false;
+
+    // =====================================================================
+    // 「回到底部」按钮随任务面板浮动（误触修复）：面板打开 → 按钮按面板实际
+    //   高度上移（bottom = 110 + offsetHeight + 8）；面板关闭 / 任务清空 /
+    //   面板消失（stopTaskRows）→ 清掉内联 bottom 回默认 110px。
+    // fake DOM 限制：无真实布局，面板高度靠覆写 elsById["composerTasks"]
+    //   .offsetHeight（setter 写入 _offsetHeight，getter 在 hidden 时强制
+    //   返回 0，与浏览器 hidden → offsetHeight 0 的语义一致）。断言的是
+    //   「面板显隐 → 按钮 bottom 设置/清除」的联动逻辑与高度换算公式。
+    // =====================================================================
+    elsById["composerTasks"].innerHTML = "";
+    elsById["composerTasks"].offsetHeight = 120;   // mock 面板打开后的布局高度
+    state.tasks.composerOpen = true;
+    state.tasks.byWorkspace = {};
+    state.tasks.list = [];
+    lastTasksSig = "";
+    lastTasksRenderedSig = "";
+    tasksData = [{ session_id: "s1", id: 700, kind: "bash", label: "jb",
+      full_command: "jb", output: "", role: null }];
+    await pollTasks();                 // 面板已打开 → 渲染后按钮应上移
+    await flush();
+    chk("jump-bottom floats above open tasks panel",
+        elsById["jumpBottomBtn"].style.bottom === "238px",   // 110 + 120 + 8
+        "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
+    state.tasks.composerOpen = false;  // 收起面板 → 按钮回默认位（清内联样式）
+    renderComposerTasks();
+    chk("jump-bottom returns when panel collapsed",
+        elsById["jumpBottomBtn"].style.bottom === "",
+        "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
+    state.tasks.composerOpen = true;   // 重开面板，再验证「任务清空」路径
+    renderComposerTasks();
+    chk("jump-bottom floats again on reopen",
+        elsById["jumpBottomBtn"].style.bottom === "238px",
+        "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
+    tasksData = [];                    // 任务清空 → 整个组件消失 + 强制收起
+    await pollTasks();
+    await flush();
+    chk("jump-bottom returns when tasks list empties",
+        elsById["jumpBottomBtn"].style.bottom === ""
+        && elsById["composerTasks"].hidden === true,
+        "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
+    // 行展开改变面板高度 → toggleRow / 渲染循环都会重算按钮位置
+    tasksData = [{ session_id: "s1", id: 701, kind: "bash", label: "jb2",
+      full_command: "jb2", output: "x", role: null }];
+    await pollTasks();                 // 新任务：面板保持收起（清空时被强制收起）
+    await flush();
+    chk("jump-bottom stays default while panel collapsed with tasks",
+        elsById["jumpBottomBtn"].style.bottom === "",
+        "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
+    state.tasks.composerOpen = true;
+    renderComposerTasks();
+    const jbRow = elsById["composerTasks"].querySelector(".task-row");
+    elsById["composerTasks"].offsetHeight = 200;   // 行展开使面板变高（120→200）
+    jbRow._listeners["click"][0]();    // 展开输出行：toggleRow 内即时重算按钮位置
+    renderComposerTasks();             // 2s 轮询渲染同样每轮重算（兜底刷新）
+    chk("jump-bottom tracks panel height after row expand",
+        elsById["jumpBottomBtn"].style.bottom === "318px",   // 110 + 200 + 8
+        "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
+    // 收尾还原：面板收起、任务清空、mock 高度复位，避免污染后续测试
+    stopTaskRows();
+    chk("jump-bottom returns after stopTaskRows",
+        elsById["jumpBottomBtn"].style.bottom === "",
+        "bottom=" + JSON.stringify(elsById["jumpBottomBtn"].style.bottom));
+    elsById["composerTasks"].offsetHeight = 0;
+    tasksData = [];
+    state.tasks.byWorkspace = {};
+    state.tasks.list = [];
+    state.tasks.composerOpen = false;
 
     // =====================================================================
     // Issue 5: 树签名含 model（树行 tooltip 渲染 model）

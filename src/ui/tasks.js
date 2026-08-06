@@ -156,6 +156,7 @@ function renderComposerTasks() {
   if (label) label.textContent = "运行中任务 (" + n + ")";
   if (panel) {
     panel.hidden = !state.tasks.composerOpen;
+    updateJumpBottomPosition();   // 面板显隐后移动「回到底部」按钮，避免盖住面板
     if (state.tasks.composerOpen) {
       // 数据签名与已渲染签名分开：收起期间数据变化 → 重开时 sig ≠ 已渲染
       // 签名 → 重建（不显示旧行/旧闭包）；数据未变 → 跳过（DOM 仍最新）。
@@ -331,6 +332,22 @@ function stopTaskRows() {
     els.composerTasks.hidden = true;
     els.composerTasks.innerHTML = "";
   }
+  updateJumpBottomPosition();   // 面板已强制收起：「回到底部」按钮回位
+}
+
+/* 「回到底部」按钮随任务面板浮动：面板打开时它会盖住 absolute 钉在聊天区
+   右下（bottom:110px）的按钮，用户点「回到底部」会误触任务行的「结束/
+   取消」。这里在面板显隐时按面板实际高度动态上移按钮（面板高 + 8px 间隙），
+   面板关闭/无任务时清掉内联 bottom 回默认 110px。不用固定 calc(30vh+…)：
+   面板高度随任务数变化，固定上限值在任务少时按钮悬空过高。 */
+function updateJumpBottomPosition() {
+  const btn = els.jumpBottomBtn;
+  if (!btn) return;
+  const panel = els.composerTasks;
+  const h = (state.tasks.composerOpen && panel && !panel.hidden)
+    ? (panel.offsetHeight || 0) : 0;
+  if (h > 0) btn.style.bottom = (110 + h + 8) + "px";
+  else btn.style.bottom = "";   // 回默认 110px（style.css .jump-bottom）
 }
 
 /* 整体替换流式区文本（snapshot 重放 / AssistantText / 404 提示） */
@@ -659,6 +676,7 @@ function buildTaskRow(t, key, restoreExpanded) {
           }
         }
       }
+      updateJumpBottomPosition();   // 行展开/收起改变面板高度：同步移动按钮
     };
     row.addEventListener("click", () => {
       if (isDelegate) {

@@ -419,6 +419,9 @@
     justify-content: center;
     padding: 0;
     line-height: 1;
+    /* 任务面板展开/收起时 bottom 由 JS 动态调整（tasks.js
+       updateJumpBottomPosition）：跟随平滑过渡，避免按钮瞬移闪跳 */
+    transition: bottom 0.15s;
   }
   .jump-bottom:hover { color: var(--blue); border-color: var(--blue); }
 
