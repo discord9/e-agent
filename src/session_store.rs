@@ -18,6 +18,7 @@
 //! [`SessionStore::clear_background_task`] /
 //! [`SessionStore::take_unfinished_background`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "greptime", feature = "sqlite"))]
 use std::sync::Arc;
@@ -707,6 +708,35 @@ impl SessionStore {
                     legacy: false,
                 })
             }
+        }
+    }
+
+    /// Entry count for one session WITHOUT loading or parsing the whole
+    /// transcript (the sessions list calls this for every live session on
+    /// every poll — a full `load` per session is a synchronous transcript
+    /// parse that blocks the executor).
+    ///
+    /// JSONL: line-counts `<id>.jsonl` on a blocking thread (zero parse,
+    /// [`jsonl_count_transcript_entries`]) so the sync file I/O never
+    /// blocks the tokio executor. Greptime/SQLite: the store's in-memory
+    /// `next_seq` (= `MAX(seq)+1`, maintained on every append) — no DB
+    /// query; the sessions-table `entry_count` snapshot can lag until the
+    /// next touch, which the list is tolerant of.
+    pub async fn count_entries(&self, root: &Path, session_id: &str) -> Result<i64> {
+        match self {
+            SessionStore::Jsonl => {
+                let root = root.to_owned();
+                let session_id = session_id.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    jsonl_count_transcript_entries(&root, &session_id)
+                })
+                .await
+                .map_err(anyhow::Error::from)?
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => Ok(session.lock().await.entry_count()),
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => Ok(session.lock().await.entry_count()),
         }
     }
 
@@ -1639,6 +1669,38 @@ impl SessionStore {
                 .map_err(anyhow::Error::msg),
         }
     }
+
+    /// The batched form of [`Self::label_for_subagent`], used by the
+    /// sessions list to resolve every subagent label in ONE scan instead
+    /// of a per-item N+1.
+    ///
+    /// JSONL: one `read_dir` + one pass over every surviving
+    /// `<id>.background.jsonl` record file (spawned on a blocking thread
+    /// — sync file I/O must never block the executor), returning the full
+    /// `subagent_session_id → label` map.
+    ///
+    /// Greptime/SQLite: `Ok(None)` — no batched query exists on those
+    /// backends, and the per-item [`Self::label_for_subagent`] lookup is a
+    /// cheap indexed query (not a file scan), so the caller falls back to
+    /// the loop there.
+    pub async fn all_subagent_labels(
+        &self,
+        root: &Path,
+    ) -> Result<Option<HashMap<String, Option<String>>>> {
+        match self {
+            SessionStore::Jsonl => {
+                let root = root.to_owned();
+                tokio::task::spawn_blocking(move || jsonl_all_subagent_labels(&root))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .map(Some)
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { .. } => Ok(None),
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { .. } => Ok(None),
+        }
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -2018,6 +2080,55 @@ fn jsonl_label_for_subagent(root: &Path, subagent_session_id: &str) -> Option<St
         }
     }
     label
+}
+
+/// Batch `jsonl_label_for_subagent`: ONE `read_dir` + one pass over every
+/// surviving `<id>.background.jsonl` record file, building the full
+/// `subagent_session_id → label` map in a single scan. Files are scanned
+/// in sorted name order and lines in append order, so a later match
+/// overwrites an earlier one — "newest wins", exactly the per-session
+/// rule. A subagent with no surviving delegate line is simply absent from
+/// the map (the caller reads it as `None`). Non-destructive, like the
+/// per-session version; replaces the per-item N+1 read_dir + file parse
+/// the sessions list used to do.
+fn jsonl_all_subagent_labels(root: &Path) -> HashMap<String, Option<String>> {
+    let directory = root.join(".e-agent/sessions");
+    let mut labels: HashMap<String, Option<String>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return labels;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().ends_with(".background.jsonl"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    for file in files {
+        let Ok(reader) = std::fs::File::open(&file) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(reader)
+            .lines()
+            .map_while(|line| line.ok())
+        {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if let Some(subagent_id) = record["session_id"].as_str()
+                && let Some(text) = record["label"].as_str()
+            {
+                labels.insert(subagent_id.to_owned(), Some(text.to_owned()));
+            }
+        }
+    }
+    labels
 }
 
 // ----------------------------------------------------------------------
@@ -2847,6 +2958,63 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(cursor, Some(4));
+    }
+
+    /// JSONL `count_entries` and `all_subagent_labels` (the sessions-list
+    /// hot path): counts are line-counts without a transcript parse, and
+    /// the batch label map matches the per-session lookup, newest wins.
+    #[tokio::test]
+    async fn jsonl_count_entries_and_all_subagent_labels() {
+        use crate::agent::Message;
+        use crate::session::Session;
+
+        let root = std::env::temp_dir();
+        let session = format!("test-jsonl-meta-{}", crate::session::new_id());
+        let store = SessionStore::Jsonl;
+
+        // No transcript yet → 0, no parse.
+        assert_eq!(
+            store.count_entries(&root, &session).await.unwrap(),
+            0,
+            "missing transcript counts as 0"
+        );
+
+        // Appended entries are counted; an unrelated `.meta.jsonl` sidecar
+        // must not inflate the count (only `<id>.jsonl` is scanned).
+        let entries: Vec<SessionEntry> = (0..3)
+            .map(|i| SessionEntry::Message {
+                message: Message::User {
+                    content: format!("m{i}"),
+                    images: vec![],
+                },
+            })
+            .collect();
+        Session::append(&root, &session, &entries).unwrap();
+        assert_eq!(store.count_entries(&root, &session).await.unwrap(), 3);
+
+        // Batch labels: one scan resolves every subagent. Two parents each
+        // record a delegate; the second record for the same subagent
+        // (newest line) wins.
+        Session::record_background_start(&root, "parent-a", 1, "delegate one", Some("sub-1"))
+            .unwrap();
+        Session::record_background_start(&root, "parent-b", 2, "delegate two", Some("sub-2"))
+            .unwrap();
+        Session::record_background_start(&root, "parent-a", 3, "delegate one v2", Some("sub-1"))
+            .unwrap();
+        let all = store.all_subagent_labels(&root).await.unwrap().unwrap();
+        assert_eq!(all.get("sub-1"), Some(&Some("delegate one v2".to_owned())));
+        assert_eq!(all.get("sub-2"), Some(&Some("delegate two".to_owned())));
+        assert_eq!(all.get("sub-missing"), None, "absent = no label");
+
+        // The batch map agrees with the per-session lookup.
+        assert_eq!(
+            store.label_for_subagent(&root, "sub-1").await.unwrap(),
+            Some("delegate one v2".to_owned())
+        );
+        assert_eq!(
+            store.label_for_subagent(&root, "sub-2").await.unwrap(),
+            Some("delegate two".to_owned())
+        );
     }
 
     /// Full-stack SessionStore tests for the SQLite backend: exercise the

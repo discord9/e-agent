@@ -692,10 +692,16 @@ async function cancelTask(t) {
     state.tasks.cancelling.delete(t.id);
   }
 }
-/* 统一任务轮询定时器（2s 常驻）：composer 折叠条/面板共用一次 /api/tasks */
+/* 统一任务轮询定时器（2s 常驻）：composer 折叠条/面板共用一次 /api/tasks。
+   与 pollSessions 的 2s 链错峰：首轮延迟 1000ms 再进入 2s 周期，避免两条
+   轮询同帧各自 Promise.all(5) 打出 10 个并发请求（相位偏移 1000ms）。 */
+const TASKS_POLL_OFFSET_MS = 1000;
+
 function startTasksPolling() {
   stopTasksPolling();
-  state.tasks.timer = setInterval(pollTasks, 2000);
+  state.tasks.timer = setTimeout(() => {
+    state.tasks.timer = setInterval(pollTasks, 2000);
+  }, TASKS_POLL_OFFSET_MS);
 }
 function stopTasksPolling() {
   if (state.tasks.timer) { clearInterval(state.tasks.timer); state.tasks.timer = null; }

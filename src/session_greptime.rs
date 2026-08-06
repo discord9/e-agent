@@ -381,6 +381,14 @@ impl GreptimeSession {
         Ok(())
     }
 
+    /// The session's live entry count (`next_seq` = `MAX(seq)+1`,
+    /// maintained in memory on every append). Cheap metadata for the
+    /// sessions list — no DB query, unlike the sessions-table
+    /// `entry_count` snapshot which only refreshes on touch.
+    pub fn entry_count(&self) -> i64 {
+        self.next_seq
+    }
+
     /// Load all entries for this session, deduplicated by seq (latest
     /// event_time wins) and sorted by winning event_time ASC, then seq ASC.
     /// Delegates to `load_with_seq`.

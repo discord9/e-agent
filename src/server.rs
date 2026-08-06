@@ -651,11 +651,15 @@ pub struct SessionMeta {
 async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -> SessionMeta {
     let status = session.handle.status();
     let status = status.borrow().clone();
+    // Entry count WITHOUT loading/parsing the whole transcript: JSONL
+    // line-counts the file on a blocking thread (a full `load` per live
+    // session per poll is the sync parse that blocked the executor);
+    // Greptime/SQLite read the store's in-memory next_seq (no DB query).
     let entry_count = session
         .store
-        .load(root, id)
+        .count_entries(root, id)
         .await
-        .map(|loaded| loaded.entries.len())
+        .map(|count| count.max(0) as usize)
         .unwrap_or(0);
     SessionMeta {
         id: id.to_owned(),
@@ -894,22 +898,31 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
     let mut merged = merge_session_metas(active, historical);
     // Subagent items carry the task-panel label of their delegate task,
     // which lives in `running_tasks` (the sessions metadata table has no
-    // label column). One lookup per subagent item — fine in practice
-    // because only a handful of delegates run at once; a batched
-    // `subagent_session_id = ANY(...)` query stays premature until that
-    // assumption breaks.
-    let mut labels: std::collections::HashMap<String, Option<String>> =
-        std::collections::HashMap::new();
-    for meta in &merged {
-        if meta.parent_session_id.is_some() {
-            match state.meta_store.label_for_subagent(root, &meta.id).await {
-                Ok(label) => {
-                    labels.insert(meta.id.clone(), label);
-                }
-                Err(error) => {
-                    eprintln!("e-agent: cannot look up subagent label: {error:#}");
+    // label column). JSONL resolves ALL labels in one directory scan (one
+    // read_dir + one pass over the record files, on a blocking thread) —
+    // the per-item loop was an N+1 that re-scanned the directory per
+    // subagent. Greptime/SQLite have no batched query, so they keep the
+    // per-item loop: each lookup is a cheap indexed query, not a file
+    // scan.
+    let mut labels: HashMap<String, Option<String>> = HashMap::new();
+    match state.meta_store.all_subagent_labels(root).await {
+        Ok(Some(all)) => labels = all,
+        Ok(None) => {
+            for meta in &merged {
+                if meta.parent_session_id.is_some() {
+                    match state.meta_store.label_for_subagent(root, &meta.id).await {
+                        Ok(label) => {
+                            labels.insert(meta.id.clone(), label);
+                        }
+                        Err(error) => {
+                            eprintln!("e-agent: cannot look up subagent label: {error:#}");
+                        }
+                    }
                 }
             }
+        }
+        Err(error) => {
+            eprintln!("e-agent: cannot look up subagent labels: {error:#}");
         }
     }
     // Live subagent handles live in their parent session's `Sessions`

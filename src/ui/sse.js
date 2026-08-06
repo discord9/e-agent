@@ -563,6 +563,21 @@ function init() {
   // 折叠条/面板（无 token 时 fetchTasks 静默跳过；填 token 后下一轮生效）
   startTasksPolling();
   pollTasks();
+  // 页面隐藏（切标签页/最小化）时暂停两条 2s 轮询（会话 + 任务）：后台
+  // 标签页无需拉取，避免 5 workspace × 2 条轮询持续打服务器；重新可见时
+  // 立即补一轮再重启定时器（序列与 init/switchWorkspace 的启动一致）。
+  // 只挂一次：init 是唯一启动入口。
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopPolling();
+      stopTasksPolling();
+    } else {
+      startPolling();
+      pollSessions();
+      startTasksPolling();
+      pollTasks();
+    }
+  });
 }
 
 init();
