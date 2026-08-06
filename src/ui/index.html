@@ -4,14 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>e-agent · Web UI</title>
-<!-- favicon：内联 SVG data URI（零路由改动、无额外请求）。「>e」标记 =
-     终端提示符 > + e-agent 的 e。像素风：64×64 viewBox 按 4 单位/格铺成
-     16×16 网格，16px 渲染时每格恰好 1 物理像素、无抗锯齿模糊。Solarized
-     蓝（#268bd2）> 在左（45° 阶梯臂、尖端独行）；Solarized 绿（#859900）
-     e 在右（顶/中/底三横 + 左竖，右侧上下双开口），与 > 间隔 3 格。
-     全部矩形构成，落在 base2（#eee8d5）圆角底上；刻意避开圆环/同心圆
-     （不像 IE），16px 小尺寸仍可辨识。 -->
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http://www.w3.org/2000/svg%27%20viewBox%3D%270%200%2064%2064%27%3E%3Crect%20width%3D%2764%27%20height%3D%2764%27%20rx%3D%2714%27%20fill%3D%27%23eee8d5%27/%3E%3Cg%20fill%3D%27%23268bd2%27%3E%3Crect%20x%3D%278%27%20y%3D%2720%27%20width%3D%278%27%20height%3D%274%27/%3E%3Crect%20x%3D%2712%27%20y%3D%2724%27%20width%3D%278%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2728%27%20width%3D%278%27%20height%3D%274%27/%3E%3Crect%20x%3D%2712%27%20y%3D%2732%27%20width%3D%278%27%20height%3D%274%27/%3E%3Crect%20x%3D%278%27%20y%3D%2736%27%20width%3D%278%27%20height%3D%274%27/%3E%3C/g%3E%3Cg%20fill%3D%27%23859900%27%3E%3Crect%20x%3D%2740%27%20y%3D%2720%27%20width%3D%2716%27%20height%3D%274%27/%3E%3Crect%20x%3D%2740%27%20y%3D%2724%27%20width%3D%274%27%20height%3D%274%27/%3E%3Crect%20x%3D%2740%27%20y%3D%2728%27%20width%3D%2712%27%20height%3D%274%27/%3E%3Crect%20x%3D%2740%27%20y%3D%2732%27%20width%3D%274%27%20height%3D%274%27/%3E%3Crect%20x%3D%2740%27%20y%3D%2736%27%20width%3D%2716%27%20height%3D%274%27/%3E%3C/g%3E%3C/svg%3E">
+<!-- favicon：内联 SVG data URI（零路由改动、无额外请求）。「e_」标记 =
+     e-agent 的 e + 终端光标/输入提示符的下划线。像素风：64×64 viewBox
+     按 4 单位/格铺成 16×16 网格，16px 渲染时每格恰好 1 物理像素、无抗
+     锯齿模糊。Solarized 绿（#859900）小写 e 居中偏上为主体：左竖 +
+     顶/中/底三横，顶/底横右端出头 1 格、中横短 2 格（右侧上下双开口，
+     读作小写 e、刻意避开圆环以免像 IE）；其下留 1 格间隙，Solarized 橙
+     （#cb4b16，与品牌 busy dot 同色）1 格高、与 e 等宽的下划线收尾，
+     整体垂直居中。全部矩形构成，落在 base2（#eee8d5）圆角底上；
+     16px 小尺寸下 e 的开口与下划线均可辨识、互不粘连。 -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http://www.w3.org/2000/svg%27%20viewBox%3D%270%200%2064%2064%27%3E%3Crect%20width%3D%2764%27%20height%3D%2764%27%20rx%3D%2714%27%20fill%3D%27%23eee8d5%27/%3E%3Cg%20fill%3D%27%23859900%27%3E%3Crect%20x%3D%2720%27%20y%3D%2712%27%20width%3D%2732%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2716%27%20width%3D%274%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2720%27%20width%3D%274%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2724%27%20width%3D%2724%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2728%27%20width%3D%274%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2732%27%20width%3D%274%27%20height%3D%274%27/%3E%3Crect%20x%3D%2720%27%20y%3D%2736%27%20width%3D%2732%27%20height%3D%274%27/%3E%3C/g%3E%3Cg%20fill%3D%27%23cb4b16%27%3E%3Crect%20x%3D%2716%27%20y%3D%2744%27%20width%3D%2732%27%20height%3D%274%27/%3E%3C/g%3E%3C/svg%3E">
 <style>/*__KATEX_CSS__*/
 /*__CSS__*/</style>
 </head>
