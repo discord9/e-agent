@@ -2468,6 +2468,71 @@ async function main(){
         idRow.querySelector(".task-meta.tid") === null,
         "tid=" + String(idRow.querySelector(".task-meta.tid")));
 
+    // ---- bash 展开区顶部命令行（.task-command）：完整命令原文 ----
+    // 行内 .task-label 仍截断到 80 字符；展开区在 .task-output 之前多一行
+    // 「命令: <full_command>」（不截断、textContent 安全渲染），与输出区
+    // 同开同关；full_command 缺失/空白 → 不渲染该元素。
+    const longCmd = 'echo "start" && RUST_LOG=debug cargo run --bin e-agent -- --serve 127.0.0.1:8080 --token abcdef0123456789 --verbose';
+    chk("long command fixture exceeds label truncation limit",
+        longCmd.length > 80, "len=" + longCmd.length);
+    renderTaskList([{ session_id: "s1", id: 95, kind: "bash", label: "长命令任务",
+      full_command: longCmd, output: "编译中…", role: null }], elsById["composerTasks"]);
+    const crow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    const clabel = crow.querySelector(".task-label");
+    // (a) task-label 截断显示（80 字符 + 省略标记），不含完整命令原文
+    chk("bash label truncated while full command reserved",
+        clabel.textContent.indexOf(longCmd) === -1
+        && clabel.textContent.includes("…"),
+        "label=" + JSON.stringify(clabel.textContent));
+    const ccmd = crow.querySelector(".task-command");
+    chk("bash row renders command line before output",
+        ccmd !== null && ccmd.nextSibling === crow.querySelector(".task-output"),
+        "cmd=" + String(ccmd));
+    // (b) 收起时 task-command 隐藏（与 .task-output 同步收起）
+    chk("bash command line collapsed by default",
+        ccmd.hidden === true && crow.querySelector(".task-output").hidden === true,
+        "cmd.hidden=" + ccmd.hidden);
+    // (c) 展开后 task-command 可见且含完整命令原文（>80 字符全在）
+    crow._listeners["click"][0]();
+    chk("bash expand reveals full command verbatim",
+        ccmd.hidden === false && ccmd.textContent === "命令: " + longCmd,
+        "hidden=" + ccmd.hidden + " text=" + JSON.stringify(ccmd.textContent));
+    // 再点收起：task-command 与输出区同关
+    crow._listeners["click"][0]();
+    chk("bash collapse hides command line again",
+        ccmd.hidden === true && crow.querySelector(".task-output").hidden === true,
+        "cmd.hidden=" + ccmd.hidden + " out.hidden=" + crow.querySelector(".task-output").hidden);
+    // <>& 特殊字符经 textContent 安全渲染（不解析为 HTML）
+    const xssCmd = 'printf "<b>&amp;</b>" && echo "a" > "b"';
+    renderTaskList([{ session_id: "s1", id: 96, kind: "bash", label: "特殊字符命令",
+      full_command: xssCmd, output: "", role: null }], elsById["composerTasks"]);
+    const xrow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    const xcmd = xrow.querySelector(".task-command");
+    xrow._listeners["click"][0]();
+    chk("bash command line renders <>& as plain text",
+        xcmd !== null && xcmd.textContent === "命令: " + xssCmd,
+        "text=" + (xcmd ? JSON.stringify(xcmd.textContent) : "null"));
+    // (d) full_command 缺失 → 无 .task-command 元素（点击展开不报错）
+    renderTaskList([{ session_id: "s1", id: 97, kind: "bash", label: "ls",
+      full_command: null, output: "ok", role: null }], elsById["composerTasks"]);
+    const nrow2 = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    chk("bash without full_command omits command line",
+        nrow2.querySelector(".task-command") === null,
+        "cmd=" + String(nrow2.querySelector(".task-command")));
+    nrow2._listeners["click"][0]();
+    chk("bash without full_command expands output only",
+        nrow2.querySelector(".task-output").hidden === false
+        && nrow2.querySelector(".task-command") === null,
+        "hidden=" + nrow2.querySelector(".task-output").hidden);
+    // delegate 行不受影响：无 .task-command（走 .task-stream 分支）
+    renderTaskList([{ session_id: "s1", id: 98, kind: "delegate", label: "子任务W",
+      full_command: null, output: null, role: null }], elsById["composerTasks"]);
+    chk("delegate row has no command line",
+        elsById["composerTasks"].querySelectorAll(".task-row")[0]
+          .querySelector(".task-command") === null,
+        "cmd=" + String(elsById["composerTasks"].querySelectorAll(".task-row")[0]
+          .querySelector(".task-command")));
+
     await pollSessions();   // 还原激活 workspace 缓存（后续测试基于轮询状态继续）
 
     // ---- Token 折叠：默认收起 → 点击展开 → 输入后按钮「已设置」 → 再点收起 ----

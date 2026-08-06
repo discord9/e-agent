@@ -584,12 +584,22 @@ function buildTaskRow(t, key, restoreExpanded) {
     line.appendChild(status);
     row.appendChild(line);
 
-    let pre = null, streamEl = null;
+    let pre = null, streamEl = null, cmdEl = null;
     if (isDelegate) {
       streamEl = el("pre", "task-stream", "(等待流式输出…)");
       streamEl.hidden = true;
       row.appendChild(streamEl);
     } else {
+      // 展开区顶部命令行：bash 任务有 full_command 时显示完整命令原文
+      // （不截断；el() 走 textContent，<>& 等字符安全渲染），置于
+      // .task-output 之前，与输出区同开同关。full_command 缺失/空白 →
+      // 安静省略不渲染该元素。
+      const fullCmd = t.full_command != null ? String(t.full_command) : "";
+      if (fullCmd.trim() !== "") {
+        cmdEl = el("pre", "task-command", "命令: " + fullCmd);
+        cmdEl.hidden = true;
+        row.appendChild(cmdEl);
+      }
       const out = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
       pre = el("pre", "task-output" + (out ? "" : " empty"), out || "(无输出)");
       pre.hidden = true;
@@ -616,6 +626,7 @@ function buildTaskRow(t, key, restoreExpanded) {
           state.tasks.streamText.delete(key);
         } else {
           pre.hidden = true;
+          if (cmdEl) cmdEl.hidden = true;   // 命令行与输出区同关
           stopTaskPoller(key);
           state.tasks.degraded.delete(key);   // 收起即重置：重新展开时重新尝试轮询
         }
@@ -627,6 +638,7 @@ function buildTaskRow(t, key, restoreExpanded) {
           startTaskStream(t, key, streamEl, status);
         } else {
           pre.hidden = false;
+          if (cmdEl) cmdEl.hidden = false;   // 命令行与输出区同开
           if (!state.tasks.degraded.has(key)) {   // 已降级（404）：只显示静态尾部
             startOutputPoller(key, t, pre, (phase) => { status.hidden = phase !== "start"; });
           }
@@ -666,6 +678,7 @@ function buildTaskRow(t, key, restoreExpanded) {
         startTaskStream(t, key, streamEl, status);
       } else {
         pre.hidden = false;
+        if (cmdEl) cmdEl.hidden = false;   // 重建恢复展开态：命令行同步展开
         if (!state.tasks.degraded.has(key)) {     // 降级行不重启轮询
           startOutputPoller(key, t, pre, (phase) => { status.hidden = phase !== "start"; });
         }
