@@ -1741,10 +1741,27 @@ function taskIsWaitingGreen(t, kids) {
   return !!sub && sub.busy === false;
 }
 
+/* 某 workspace 的任务数组：优先用该 ws 的 byWorkspace 缓存（pollTasks 每轮
+   写入的 per-ws 权威快照）；缺失时从聚合 list 按 _ws 过滤回退；两者都无 →
+   null（未加载 → 调用方回退 kids 计数）。解决「切换 workspace 瞬间聚合
+   list 尚未包含目标 ws 时 dot 闪烁消失」（目标 ws 有缓存应立即显示）。 */
+function tasksForWorkspace(wsId) {
+  const cached = state.tasks.byWorkspace && state.tasks.byWorkspace[wsId];
+  if (cached !== undefined) return cached;
+  if (state.tasks && Array.isArray(state.tasks.list)) {
+    const fromAgg = state.tasks.list.filter((t) => !t._ws || t._ws === wsId);
+    if (fromAgg.length > 0) return fromAgg;
+  }
+  return null;
+}
+
 /* subagent 是否还有对应的 delegate 后台任务（任务面板条目仍在：delegate
-   在等后台任务 / 会话存活时条目未清）。 */
-function hasDelegateTask(k) {
-  return (state.tasks.list || []).some((t) => t.kind === "delegate"
+   在等后台任务 / 会话存活时条目未清）。按本 workspace 数据源判定
+   （byWorkspace 缓存优先），切换 workspace 瞬间聚合 list 缺目标 ws 时
+   不误判为无任务。 */
+function hasDelegateTask(k, wsId) {
+  const list = tasksForWorkspace(wsId);
+  return !!list && list.some((t) => t.kind === "delegate"
     && resolveSubagentSessionId(t) === k.id);
 }
 
@@ -1888,16 +1905,18 @@ function buildTreeRoot(s, kids, wsId) {
   }
   // 环绕点数量 = 该父会话的全部后台任务数（/api/tasks：bash 后台任务 +
   // delegate subagent 任务，与任务面板 2s 轮询对齐）；任务面板未加载
-  // （state.tasks.list 为 undefined，侧边栏先渲染）时回退 running 子会话
-  // 计数，避免闪烁。主点只表达父会话自身状态；每个环绕点对应一个任务：
-  // bash 任务恒红（一直在跑），delegate 任务按对应 subagent 会话的 busy
-  // 判定——busy:true 红点，busy:false（Idle 在等）绿点。
-  // state.tasks.list 是多 workspace 聚合全量：按 session_id 匹配父会话即
-  // 覆盖所有 workspace（session id 全局唯一），_ws 标记再按本 workspace
-  // 精确过滤（防御跨 workspace 同 id 的极端情况）。
-  const tasksLoaded = state.tasks && Array.isArray(state.tasks.list);
-  const parentTasks = tasksLoaded
-    ? state.tasks.list.filter((t) => t.session_id === s.id && (!t._ws || t._ws === wsId))
+  // （tasksForWorkspace 返回 null：byWorkspace 无缓存且聚合 list 无该 ws
+  // 任务，侧边栏先渲染）时回退 running 子会话计数，避免闪烁。主点只表达
+  // 父会话自身状态；每个环绕点对应一个任务：bash 任务恒红（一直在跑），
+  // delegate 任务按对应 subagent 会话的 busy 判定——busy:true 红点，
+  // busy:false（Idle 在等）绿点。
+  // 数据源按本 workspace：优先 byWorkspace[wsId] 的 per-ws 权威快照
+  // （pollTasks 每轮写入；切换 workspace 瞬间聚合 list 尚未含目标 ws 时
+  // 仍有缓存 → dot 不闪），缓存缺失才从聚合 list 过滤（聚合 list 本身是
+  // 各 ws 快照的合并视图，按 _ws 标记精确过滤，防御跨 workspace 同 id）。
+  const wsTasks = tasksForWorkspace(wsId);
+  const parentTasks = wsTasks
+    ? wsTasks.filter((t) => t.session_id === s.id)
     : null;   // 未加载 → 回退 kids 计数
   const runningKidCount = parentTasks === null
     ? kids.filter(isSubagentRunning).length
@@ -2072,7 +2091,7 @@ function renderSubagentRows(container, kids, hist, wsId) {
     // 时条目仍在）→ 绿色 busy-dot-green（活着但空闲/在等）；inactive 历史
     // 行（无任务、无 live）不点亮（现状）。
     const idleAlive = !running && k.busy === false
-      && (isSessionLive(k) || hasDelegateTask(k));
+      && (isSessionLive(k) || hasDelegateTask(k, wsId));
     const dot = el("span", "busy-dot" + (running ? " busy" : idleAlive ? " busy-dot-green" : ""));
     // label 优先：subagent 的任务面板标题最友好；旧 server 无 label → 回退 title/id
     // 有 label/title：两行（label/title 行 + 完整 id 行）；无则一行完整 id。

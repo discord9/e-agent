@@ -2980,6 +2980,86 @@ async function main(){
     state.tasks.composerOpen = false;
 
     // =====================================================================
+    // 切 workspace dot 不闪：侧边栏按 workspace 优先用 byWorkspace 缓存
+    // （tasksForWorkspace）。场景 A：目标 ws 有 byWorkspace 缓存时，切换
+    // 瞬间聚合 list 尚未包含该 ws（pollTasks 未完成）→ 父会话环绕点与
+    // subagent 子行绿点都不消失（byWorkspace 兜底）。场景 B：缓存也缺失
+    // （从未轮询过）→ 回退 running 子会话计数，仍不闪。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+      { id: "a2", parent_session_id: "a1", label: "A 子任务", status: "Busy", entry_count: 2, busy: true, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Idle", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: false, active: true },
+      { id: "sub-b1", parent_session_id: "b1", label: "B 子代理", status: "Idle", entry_count: 2, busy: false, active: false },
+      { id: "sub-b2", parent_session_id: "b1", label: "B 跑着的子代理", status: "Busy", entry_count: 2, busy: true, active: true },
+    ];
+    await pollAllWorkspaces();
+    await flush();
+    tasksData = [{ session_id: "a1", id: 1, kind: "bash", label: "A 构建",
+      full_command: "cargo build", output: "", role: null }];
+    tasksDataB = [
+      { session_id: "b1", id: 1, kind: "delegate", label: "B 子代理",
+        role: "seer", subagent_session_id: "sub-b1" },
+      { session_id: "b1", id: 2, kind: "bash", label: "B 构建",
+        full_command: "make -C b", output: "", role: null },
+    ];
+    await pollTasks();            // byWorkspace 填好（A/B 各有权威快照）
+    await flush();
+    // 模拟「切到 B 后 pollTasks 尚未完成」：聚合 list 只剩 A 的任务
+    // （byWorkspace 的 B 快照仍在）；走真实 switchWorkspace 切换
+    // （lastList ← B 的 workspaceLists 缓存），不等其内启动的 pollTasks。
+    state.tasks.list = state.tasks.list.filter((t) => t._ws === "wsA");
+    switchWorkspace("wsB");
+    await flush();
+    state.tasks.list = state.tasks.list.filter((t) => t._ws === "wsA");   // 防切换内嵌 pollTasks 已补回
+    renderSidebarTree(true);
+    wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const bRootRowW = wsSections[1].querySelectorAll(".tree-row")[0];
+    const bWrapW = bRootRowW.querySelector(".busy-dot-wrap");
+    chk("ws switch: byWorkspace fallback keeps B parent orbit dots",
+        bWrapW.querySelectorAll(".orbit-dot").length === 2,
+        "dots=" + bWrapW.querySelectorAll(".orbit-dot").length);
+    // 展开 B 父会话渲染子行：sub-b1 有对应 delegate 任务（byWorkspace
+    // 兜底判定）→ busy:false 活着在等 → 绿点不消失
+    bRootRowW.querySelector(".tree-toggle")._listeners["click"][0]({ stopPropagation() {} });
+    const bSubRowW = [...wsSections[1].querySelectorAll(".tree-row-child")]
+      .find((r) => r.textContent.includes("sub-b1"));
+    chk("ws switch: byWorkspace fallback keeps sub row green dot",
+        !!bSubRowW && bSubRowW.querySelector(".busy-dot.busy-dot-green") !== null,
+        "green=" + String(!!bSubRowW
+          && bSubRowW.querySelector(".busy-dot.busy-dot-green") !== null));
+    // 场景 B：byWorkspace 缓存也缺失（从未轮询过 B）→ 回退 running 子
+    // 会话计数（sub-b2 busy:true ×1）→ 父会话仍有 1 个环绕点，不闪
+    delete state.tasks.byWorkspace["wsB"];
+    renderSidebarTree(true);
+    wsSections = elsById["sidebarTree"].querySelectorAll(".tree-ws-section");
+    const bWrapNoCache = wsSections[1].querySelectorAll(".tree-row")[0]
+      .querySelector(".busy-dot-wrap");
+    chk("ws switch: no cache falls back to running kids count",
+        bWrapNoCache.querySelectorAll(".orbit-dot").length === 1,
+        "dots=" + bWrapNoCache.querySelectorAll(".orbit-dot").length);
+    // 还原：清任务 + 刷新快照 + 切回 A（恢复后续测试段会话布局）
+    tasksData = [];
+    tasksDataB = [];
+    await pollTasks();
+    await flush();
+    sessionsData = [
+      { id: "a1", status: "Idle", model: "kimi", title: "A 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 8, busy: false, active: true },
+      { id: "a2", parent_session_id: "a1", label: "A 子任务", status: "Idle", entry_count: 2, active: true },
+      { id: "a-orphan", parent_session_id: "missing-a", status: "Idle", entry_count: 1, active: true },
+    ];
+    sessionsDataB = [
+      { id: "b1", status: "Busy", model: "deepseek", title: "B 主会话", created_at: "2024-02-02T00:00:00Z", entry_count: 5, busy: true, active: true },
+      { id: "b-orphan", parent_session_id: "missing-b", status: "Idle", entry_count: 1, active: true },
+    ];
+    await pollAllWorkspaces();
+    await flush();
+    switchWorkspace("wsA");
+    await flush();
+
+    // =====================================================================
     // 7) 跨服务器 resume 竞态：B 的 resume POST 挂起期间用户切回 A →
     //    过期 resume 不得打开任何会话（不得在错误服务器上自动 openSession）
     // =====================================================================
