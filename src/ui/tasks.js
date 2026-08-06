@@ -524,10 +524,29 @@ function buildTaskRow(t, key, restoreExpanded) {
       for (const tag of tags) tagBox.appendChild(tag);
       line.appendChild(tagBox);
     }
-    // 会话 id 完整显示：delegate 任务显示 subagent 自己的会话（点击跳转的目标），
-    // 其余任务显示父会话。不截断——省略的 id 无法区分会话。
+    // 会话标识：delegate 任务显示 subagent 自己的会话（点击跳转的目标），
+    // 其余任务显示父会话。bash 任务优先显示父会话的 title（从会话列表缓存
+    // 查，hover 放完整 id + title），无 title / 查不到才回退「会话 <id>」；
+    // delegate 任务无 title 概念（显示 subagent session id，点击跳转）。
     const sidShown = isDelegate ? (t.subagent_session_id || t.session_id) : t.session_id;
-    if (sidShown) line.appendChild(el("span", "task-meta tsid", "会话 " + sidShown));
+    if (sidShown) {
+      let sidLabel = "会话 " + sidShown;
+      let sidTitle = "";
+      if (!isDelegate) {
+        const wsId = state.workspace ? state.workspace.id : null;
+        const plist = (wsId && state.workspaceLists[wsId] !== undefined)
+          ? state.workspaceLists[wsId] : state.lastList;
+        const parent = (plist || []).find((s) => s && s.id === t.session_id) || null;
+        const parentTitle = parent && parent.title != null ? String(parent.title) : "";
+        if (parentTitle.trim() !== "") {
+          sidLabel = truncate(parentTitle, 40);
+          sidTitle = t.session_id + ": " + parentTitle;   // 悬停完整 id + title
+        }
+      }
+      const tag = el("span", "task-meta tsid", sidLabel);
+      if (sidTitle) tag.title = sidTitle;
+      line.appendChild(tag);
+    }
     // 父会话标签：delegate 任务显示其父会话 = t.session_id（发起它的会话）。
     // 先查激活 workspace 的 session 列表（state.workspaceLists，回退
     // state.lastList）拿父会话 title：有 title 显示「父: <title>」（截断到
