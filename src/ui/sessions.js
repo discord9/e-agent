@@ -487,6 +487,28 @@ async function loadOlder() {
    触发一次）。
    wsId/epoch：打开时捕获的发起上下文——响应回来时任何一项不匹配
    （新的打开/切换 workspace）→ 丢弃过期回调，不起 SSE。 */
+/* 打开会话时拉一次持久化累计用量（usage_entries 表：重启不清零，含子会话
+   合计），填进 state.sessionUsage 供 applyUsage 与 live Usage 事件合并。
+   火忘 + 完整守卫：任何失败/竞态（切会话/切 workspace）都静默——用量行
+   回退 live 进程计数（applyUsage 的 null 分支），绝不因该请求失败影响打开。 */
+function fetchSessionUsage(id, wsId, epoch) {
+  const ws = state.workspaces.find((w) => w.id === wsId) || state.workspace;
+  apiFor(ws, "/api/sessions/" + encodeURIComponent(id) + "/usage")
+    .then((res) => (res.ok ? res.json() : null))
+    .then((data) => {
+      if (epoch !== sessionOpenEpoch) return;      // 更新的打开/切换已发生：丢弃过期响应
+      if (state.workspace.id !== wsId) return;
+      if (state.sessionId !== id) return;
+      if (!data || typeof data !== "object") return;
+      state.sessionUsage = {
+        input_tokens: data.input_tokens || 0,
+        output_tokens: data.output_tokens || 0,
+      };
+      refreshUsageLine();
+    })
+    .catch(() => {});   // 静默：旧后端无此端点 / 网络失败 → 回退 live 显示
+}
+
 function openWith(id, withHistory, onReady, wsId, epoch, timeoutMs) {
   // 排队条是会话级 UI：任何打开/重连路径（openSession 两分支、
   // restartTransport、scheduleReconnect）都经 openWith，一律从空队列开始，
@@ -510,6 +532,7 @@ function openWith(id, withHistory, onReady, wsId, epoch, timeoutMs) {
     if (epoch !== sessionOpenEpoch) return;       // 更新的打开/切换 workspace 已发生
     if (state.workspace.id !== wsId) return;      // 已被切到其它服务器
     if (state.sessionId !== id) return;           // 已切换会话：丢弃过期回调
+    fetchSessionUsage(id, wsId, epoch);           // 拉持久化累计用量（重启后仍有数）
     if (r === "auth" || r === "gone") {
       // 深链 attempt 终止（无流可恢复）：清标记，防止残留标记污染后续
       // 非深链会话的 SSE 404 分类（标记与 epoch 绑定，此处显式清更稳）
@@ -619,6 +642,8 @@ function openSession(id, onReady, epoch, timeoutMs) {
   state.renameActive = false;  // 切换会话会销毁编辑框：清标志，恢复轮询重绘
   stopSSE();
   state.sessionId = id;
+  state.sessionUsage = null;   // 旧会话的累计用量不串到新会话（openWith 会重拉）
+  state.lastUsage = null;      // 旧会话的 live Usage 同样不串（防旧 context 配新累计）
   // 侧边栏是唯一导航，轮询常驻以保持会话树/busy 状态新鲜。
   // 任何手动打开都会取代/完成 URL 深链，避免后续导航再次触发
   state.deepLink.handled = true;
@@ -1875,6 +1900,8 @@ function clearCurrentSession() {
   closeForkMenu();
   stopSSE();
   state.sessionId = null;
+  state.sessionUsage = null;   // 关闭会话：清累计用量，防下次打开前残留
+  state.lastUsage = null;      // 同步清 live Usage 缓存
   state.acc = null;
   state.nextBeforeSeq = null;
   state.loadingOlder = false;

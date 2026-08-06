@@ -1809,6 +1809,73 @@ async fn usage_entries_are_scoped_by_workspace() {
 }
 
 #[tokio::test]
+async fn usage_for_sessions_filters_and_aggregates() {
+    let (_dir, session, sid) = fresh_session().await;
+    let wid = workspace_id();
+    let child = format!("sub-{sid}");
+    let other = format!("test-sql-other-{}", crate::session::new_id());
+
+    // 空 id 列表：短路为空（不发查询）。
+    assert!(session.usage_for_sessions(&[]).await.unwrap().is_empty());
+
+    // 本会话两行（同 model/kind 聚合）+ 子会话一行 + 无关会话一行。
+    session
+        .append_usage(&wid, &sid, "m", "regular", 100, 50)
+        .await
+        .unwrap();
+    session
+        .append_usage(&wid, &sid, "m", "regular", 20, 5)
+        .await
+        .unwrap();
+    session
+        .append_usage(&wid, &child, "m", "regular", 7, 3)
+        .await
+        .unwrap();
+    session
+        .append_usage(&wid, &other, "m", "regular", 999, 999)
+        .await
+        .unwrap();
+
+    // 只查本会话：聚合本行，排除子会话与无关会话。
+    let rows = session
+        .usage_for_sessions(std::slice::from_ref(&sid))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id, sid);
+    assert_eq!(rows[0].input_tokens, 120);
+    assert_eq!(rows[0].output_tokens, 55);
+
+    // 本会话 + 子会话：两行都在（服务端再把它们合计进 usage 响应）。
+    let rows = session
+        .usage_for_sessions(&[sid.clone(), child.clone()])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+    let output: u64 = rows.iter().map(|r| r.output_tokens).sum();
+    assert_eq!(input, 127);
+    assert_eq!(output, 58);
+
+    // 无关会话 id 过滤生效；未知会话 → 空。
+    assert!(
+        session
+            .usage_for_sessions(&[other])
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.session_id != sid)
+    );
+    assert!(
+        session
+            .usage_for_sessions(&["no-such-session".to_owned()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn usage_entries_persist_across_reconnect() {
     let (_dir, path) = temp_db();
     let wid = workspace_id();
