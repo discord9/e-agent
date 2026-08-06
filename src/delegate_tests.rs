@@ -1320,6 +1320,12 @@ async fn read_only_role_subagent_gets_no_write_tools_and_a_read_only_system_note
         ),
         "{request}"
     );
+    // The system prompt also carries the background-task no-poll guidance.
+    assert!(
+        request.contains("`[background task N completed]` 消息注入，无需轮询")
+            && request.contains("不要反复调用 get_background_tasks"),
+        "{request}"
+    );
 
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
 }
@@ -2246,6 +2252,121 @@ async fn background_delegate_with_detached_daemon_finalizes_and_keeps_daemon() {
     // Explicit cancel so the sleep process does not leak past the test.
     background.cancel(running[0].id);
     assert!(background.running().is_empty());
+}
+
+#[tokio::test]
+async fn subagent_background_bash_recorded_under_its_own_session() {
+    // 连带修复验证：start_runner 里 subagent 的 Agent 用**自己的 session id**
+    // 接 record_background_tasks_in 后，after_tool_entry 会把 subagent 的
+    // 后台 bash 任务记到 subagent 名下（此前 background_record 为 None，
+    // 任务既不进 running_tasks 重启后丢失）。断言两层：
+    // 1. live registry：bash 任务 owner_session = subagent 自己的会话 id
+    //    （面板显示真正的发起者）；
+    // 2. 持久化：<sub-id>.background.jsonl 存在（记录归属 subagent 会话），
+    //    任务完成后被 ack 清除。
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    // 第三条回复：bash 完成（被取消）后 completion 注入成新 turn，模型再答
+    // 一次才停——FinishWhenIdle 等阻塞任务完成才 finalize。
+    let base_url = scripted_chat(vec![
+        (
+            bash_tool_call_delta(r#"{"command": "sleep 300", "background": true}"#),
+            "tool_calls",
+        ),
+        (json!({"content": "waiting"}), "stop"),
+        (json!({"content": "got it"}), "stop"),
+    ])
+    .await;
+    let mut tool = delegate_with_url(temp.path(), base_url)
+        // 与生产一致：persist root = workspace root（session_factory 的
+        // persist_sessions(self.root)），subagent 的记录落 workspace 名下。
+        .persist_sessions(root.clone())
+        .record_background_tasks_in(root.clone(), "parent", SessionStore::Jsonl);
+    let background = tool.background.clone();
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+
+    let answer = tool
+        .execute(json!({
+            "task": "start a background bash and wait",
+            "workspace": temp.path().to_str().unwrap()
+        }))
+        .await
+        .unwrap();
+    let session_id = answer
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix("subagent session: "))
+        .expect("immediate result must carry the subagent session id");
+
+    // Live registry：subagent 的 bash 任务 owner 是 subagent 自己，不是父会话。
+    // runner 异步，轮询等待任务注册（脚本第一轮才发起 bash）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let bash_task = loop {
+        if let Some(task) = background
+            .running()
+            .into_iter()
+            .find(|task| task.kind == "bash")
+        {
+            break task;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "subagent bash task never appeared in the registry"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        bash_task.owner_session.as_deref(),
+        Some(session_id),
+        "subagent bash task must carry the subagent's own session id"
+    );
+
+    // 持久化：记录落在 subagent 自己的 background record 文件里（after_tool_entry
+    // 用 subagent 的 store + session id 登记；runner 异步，轮询等待落盘）。
+    let subagent_record = root
+        .join(".e-agent/sessions")
+        .join(format!("{session_id}.background.jsonl"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !subagent_record.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        subagent_record.exists(),
+        "subagent bash task must be recorded under its own session id"
+    );
+
+    // 取消阻塞的 bash → completion 注入 subagent → FinishWhenIdle finalize →
+    // wrapper 完成并发送一次 BackgroundCompleted。
+    background.cancel(bash_task.id);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(10), completions.recv())
+        .await
+        .expect("timed out waiting for the background completion")
+        .unwrap();
+    assert!(matches!(
+        event,
+        AgentEvent::BackgroundCompleted { output, .. }
+            if output == format!("subagent session: {session_id}\ngot it")
+    ));
+    assert!(
+        completions.try_recv().is_err(),
+        "exactly one completion is sent"
+    );
+
+    // 两条记录都被消费/清除：subagent 自己的 bash 行（ack）与父会话的
+    // delegate 行（DelegateCleanup）。
+    assert!(
+        crate::session::Session::take_unfinished_background(&root, session_id).is_empty(),
+        "subagent's own bash record is cleared on completion"
+    );
+    assert!(
+        crate::session::Session::take_unfinished_background(&root, "parent").is_empty(),
+        "delegate record is cleared on completion"
+    );
+    assert!(
+        background.running().is_empty(),
+        "bash cancelled and delegate wrapper finished: registry is empty"
+    );
 }
 
 #[tokio::test]
