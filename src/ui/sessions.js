@@ -2008,7 +2008,7 @@ function buildTreeRoot(s, kids, wsId) {
       : "共 " + runningKidCount + " 个子任务处理中";
     circles += `<g class="orbit-badge" aria-hidden="true">` +
       `<circle cx="${bx.toFixed(1)}" cy="${by.toFixed(1)}" r="4"></circle>` +
-      `<text x="${bx.toFixed(1)}" y="${by.toFixed(1)}">+${extra}</text>` +
+      `<text x="${bx.toFixed(1)}" y="${by.toFixed(1)}">${extra}</text>` +
       `<title>${escapeHtml(badgeTitle)}</title></g>`;
   }
   // 主点最后画（叠在环绕点之上）：busy → 橙，idle → 绿（class 控制 fill）。

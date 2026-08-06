@@ -3916,7 +3916,7 @@ async function main(){
         + " dots=" + wrapOf15(f1Row).querySelectorAll(".orbit-dot").length);
     chk("more than six children render five dots and overflow badge",
         wrapOf15(g1Row).querySelectorAll(".orbit-dot").length === 5
-        && wrapOf15(g1Row).querySelector(".orbit-badge text").textContent === "+3",
+        && wrapOf15(g1Row).querySelector(".orbit-badge text").textContent === "3",
         "dots=" + wrapOf15(g1Row).querySelectorAll(".orbit-dot").length
         + " overflow=" + wrapOf15(g1Row).querySelector(".orbit-badge text").textContent);
     chk("busy dot wrapper aria-label combines parent and child status",
@@ -4121,7 +4121,7 @@ async function main(){
     // 10) more than six running children → six dots + overflow
     chk("m3: more than six running children render five dots and overflow badge",
         wrapM(m3Row).querySelectorAll(".orbit-dot").length === 5
-        && wrapM(m3Row).querySelector(".orbit-badge text").textContent === "+3",
+        && wrapM(m3Row).querySelector(".orbit-badge text").textContent === "3",
         "dots=" + wrapM(m3Row).querySelectorAll(".orbit-dot").length
         + " overflow=" + wrapM(m3Row).querySelector(".orbit-badge text").textContent);
     // 11) busy:false + status:"Busy" → busy:false 权威否定：无红点、
