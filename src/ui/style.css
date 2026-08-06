@@ -1728,6 +1728,12 @@
     cursor: pointer;
   }
   .task-row:hover { border-color: var(--blue); }
+  /* 当前会话发起的任务：左侧 cyan accent bar + hover 同色，扫一眼可辨 */
+  .task-row.task-row-current {
+    border-left: 3px solid var(--cyan);
+    padding-left: 7px;   /* 10px - 3px bar，文字不错位 */
+  }
+  .task-row.task-row-current:hover { border-left-color: var(--cyan); }
   .task-row .task-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .kind-badge {
     font-size: 12px;
@@ -1754,6 +1760,12 @@
   .task-meta.tparent { color: var(--base00); }
   .task-tags { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: middle; min-width: 0; flex-wrap: wrap; }
   .task-tag { font-size: 10px; padding: 0 5px; border: 1px solid var(--base1); border-radius: 8px; color: var(--base01); background: var(--base3); word-break: break-all; }
+  /* 「本会话」标签：cyan 系，与左侧 accent bar 呼应 */
+  .task-tag.task-tag-current {
+    border-color: var(--cyan);
+    color: var(--cyan);
+    background: transparent;
+  }
   .task-cancel {
     padding: 1px 10px;
     font-size: 12px;

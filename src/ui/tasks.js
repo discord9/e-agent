@@ -488,7 +488,11 @@ function updateRetainedTaskRow(row, t, key) {
    签名。restoreExpanded=true 时按展开态启动 500ms output 轮询 / delegate
    SSE 流（与旧 renderTaskList 的「重绘恢复展开态」语义一致）。 */
 function buildTaskRow(t, key, restoreExpanded) {
-  const row = el("div", "task-row");
+  // 当前会话发起的任务（bash 的 session_id / delegate 的父 session_id 等于
+  // 正在查看的会话）→ 行加 current 标记：左侧 cyan accent bar + 「本会话」
+  // 标签，任务面板里一眼可辨哪些属于当前会话。
+  const isCurrentSession = t.session_id != null && t.session_id === state.sessionId;
+  const row = el("div", "task-row" + (isCurrentSession ? " task-row-current" : ""));
   row.setAttribute("data-task", key);
   row.setAttribute("data-key-sig", taskKeySig(t));
     const isDelegate = t.kind === "delegate";
@@ -506,6 +510,11 @@ function buildTaskRow(t, key, restoreExpanded) {
     // 参数标签（与 TUI 面板一致）：background / workspace / resume。resume
     // 表示该子代理是延续会话（delegate resume: "<id>"）。仅在有标签时渲染。
     const tags = [];
+    if (isCurrentSession) {
+      const tag = el("span", "task-tag task-tag-current", "本会话");
+      tag.title = "由当前查看的会话发起";
+      tags.push(tag);
+    }
     if (t.background === true) tags.push(el("span", "task-tag", "background"));
     if (t.workspace && String(t.workspace).trim() !== "") {
       const tag = el("span", "task-tag", "workspace: " + t.workspace);
