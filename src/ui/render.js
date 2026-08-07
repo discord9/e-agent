@@ -23,30 +23,38 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
   container.textContent = "";
   container.classList.add("expandable", "expand-copy");
   const preview = el("span", "expand-preview", s.slice(0, n) + "\n… ");
+  // 展开按钮 in-flow 紧跟截断标记（preview 之后，与文件工具 diff 的
+  // .diff-more 展开按钮同形态）：正文里预览/全文互斥显示，按钮始终可见。
+  // 点击走消息容器事件委托（sse.js）：切换 .expanded、预览/全文互换、文案
+  // 展开⇄收起。
   const btn = el("button", "expand-toggle", "展开全文" + (label ? "（" + label + "）" : ""));
   btn.type = "button";
   // 记住按钮控制的正文 pre：卡片里可能有多个 .expandable（args/result），
   // 事件委托用这个引用精确定位，而不是就近找第一个
   btn._target = container;
-  // 「复制全文」按钮：与展开按钮同框并排（CSS .expandable.expand-copy 把
-  // 按钮组绝对定位到正文右上角）。_srcText 存未截断原文，事件委托直接复制；
-  // _target 与展开按钮同机制。注意不能用 _text：El/textContent 内部用它做
-  // 文本后备存储，会被原文覆盖掉按钮标签。innerHTML 快照往返后 expando
-  // （_srcText/_target）丢失，委托回退到常驻 DOM 的 .expand-full 取全文
-  // （随快照序列化）。
-  const copy = el("button", "copy-toggle", "复制全文");
+  // 「复制全文」图标按钮（.copy-toggle.icon-btn，SVG 双矩形图标）：CSS
+  // .expandable.expand-copy 把它绝对定位到正文右上角（与文件工具 diff 的
+  // .diff-copy 同形态），展开按钮不再与其并排。title/aria-label 标注用途，
+  // 复制反馈由 copyTextToClipboard 改 title/aria + class 变色（成功绿/失败红）。
+  // _srcText 存未截断原文，事件委托直接复制；_target 与展开按钮同机制。
+  // 注意不能用 _text：El/textContent 内部用它做文本后备存储，会被原文
+  // 覆盖掉按钮标签。innerHTML 快照往返后 expando（_srcText/_target）丢失，
+  // 委托回退到常驻 DOM 的 .expand-full 取全文（随快照序列化）。
+  const copy = el("button", "copy-toggle icon-btn");
+  copy.innerHTML = copySvg();
   copy.type = "button";
+  copy.title = "复制全文";
+  copy.setAttribute("aria-label", "复制全文");
   copy._target = container;
   copy._srcText = s;
   const full = el("span", "expand-full", s);
-  container.append(preview, full);
-  // 按钮在正文 pre 框内（同框，控件样式与正文区分）；footerEl 保留
-  // 为兼容参数（当前无调用传它）
+  // 顺序：预览（截断标记）→ 展开按钮（in-flow）→ 隐藏全文 → 复制按钮
+  // （绝对定位，DOM 位置不影响视觉）。footerEl 保留为兼容参数
+  // （当前无调用传它）：按钮移入 footer 框。
+  container.append(preview, btn, full, copy);
   if (footerEl) {
     footerEl.appendChild(btn);
     footerEl.appendChild(copy);
-  } else {
-    container.append(btn, copy);
   }
   return container;
 }
@@ -57,6 +65,10 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
    title/aria-label 反馈 + 加 class 变色。纯前端，不依赖后端。 */
 function copyTextToClipboard(text, btn) {
   const isIcon = btn && btn.classList && btn.classList.contains("icon-btn");
+  // 图标按钮无文字标签：记录各自默认 title/aria-label（diff 结果「复制结果」/
+  // 长文本「复制全文」），1.2s 后还原，避免硬编码单一文案
+  const origTitle = isIcon ? (btn.title || "") : "";
+  const origAria = isIcon ? (btn.getAttribute("aria-label") || "") : "";
   const restore = () => {
     try {
       setTimeout(() => {
@@ -64,8 +76,8 @@ function copyTextToClipboard(text, btn) {
         if (isIcon) {
           // 图标按钮：撤变色 class + 恢复默认提示（与 pin/archive 按钮同机制）
           btn.classList.remove("copied", "copy-err");
-          btn.title = "复制结果";
-          btn.setAttribute("aria-label", "复制结果");
+          btn.title = origTitle;
+          btn.setAttribute("aria-label", origAria);
         } else {
           btn.textContent = "复制全文";
         }

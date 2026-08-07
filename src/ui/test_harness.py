@@ -1804,6 +1804,18 @@ async function main(){
     chk("A expand button inside pre",
         resPreA._children.some((c) => c instanceof El && c._classes && c._classes.has("expand-toggle")),
         "in-pre=" + resPreA._children.filter((c) => c instanceof El).map((c) => c._className).join(","));
+    // 展开按钮 in-flow：紧跟截断标记（preview 之后、隐藏全文之前），非绝对
+    // 定位（无 position 样式）；复制按钮（.copy-toggle）仍在容器内但 DOM 顺序
+    // 靠后（CSS 绝对定位右上角）——与文件工具 diff（.diff-more 展开按钮）同形态
+    const aKids = resPreA._children.filter((c) => c instanceof El);
+    const aKidIdx = (cls) => aKids.findIndex((c) => c._classes && c._classes.has(cls));
+    chk("A expand button in-flow right after preview",
+        aKidIdx("expand-preview") !== -1 && aKidIdx("expand-toggle") !== -1
+        && aKidIdx("expand-full") !== -1 && aKidIdx("copy-toggle") !== -1
+        && aKidIdx("expand-toggle") === aKidIdx("expand-preview") + 1
+        && aKidIdx("expand-toggle") < aKidIdx("expand-full")
+        && aKidIdx("expand-full") < aKidIdx("copy-toggle"),
+        "kids=" + aKids.map((c) => c._className).join(","));
     const clicksA = (elsById["messages"]._listeners["click"] || []);
     // footer 里有两个展开按钮（args + result）：取控制 resPreA 的那个
     const btnA = cardA.querySelectorAll(".expand-toggle")
@@ -1864,10 +1876,15 @@ async function main(){
     chk("A long text has copy button with full text",
         !!copyBtnA && copyBtnA._srcText === "y".repeat(500)
         && copyBtnA._target === resPreA
-        && copyBtnA.textContent === "复制全文",
+        && copyBtnA.classList.contains("icon-btn")
+        && copyBtnA.querySelector("svg.copy-icon") !== null
+        && copyBtnA.title === "复制全文"
+        && copyBtnA.getAttribute("aria-label") === "复制全文"
+        && copyBtnA.textContent.indexOf("复制全文") === -1,
         "text-len=" + (copyBtnA && copyBtnA._srcText && copyBtnA._srcText.length)
         + " target=" + (copyBtnA && copyBtnA._target === resPreA)
-        + " label=" + (copyBtnA && JSON.stringify(copyBtnA.textContent)));
+        + " svg=" + (copyBtnA && copyBtnA.querySelector("svg.copy-icon") !== null)
+        + " title=" + (copyBtnA && JSON.stringify(copyBtnA.title)));
     chk("A expand+copy buttons coexist",
         !!resPreA.querySelector(".expand-toggle") && !!resPreA.querySelector(".copy-toggle"),
         "in-pre=" + resPreA._children.filter((c) => c instanceof El).map((c) => c._className).join(","));
@@ -1878,14 +1895,17 @@ async function main(){
         "args-short=" + (argsShortA.querySelector(".copy-toggle") !== null)
         + " res-short=" + (lastCardB.querySelector(".tool-result").querySelector(".copy-toggle") !== null));
     // 点击复制：stub navigator.clipboard.writeText，断言写入完整原文
-    // （"y".repeat(500)，非 300 字符预览截断）；按钮短暂显示「已复制」
+    // （"y".repeat(500)，非 300 字符预览截断）；图标按钮短暂显示「已复制」
+    // （title/aria 反馈 + copied class，无文字变化）
     let copiedText = null;
     navigator.clipboard = { writeText: (t) => { copiedText = t; return Promise.resolve(); } };
     for (const fn of clicksA) fn({ target: copyBtnA });
     await flush();
     chk("A copy writes full text via clipboard API",
-        copiedText === "y".repeat(500) && copyBtnA.textContent === "已复制",
-        "len=" + (copiedText == null ? "null" : copiedText.length) + " btn=" + copyBtnA.textContent);
+        copiedText === "y".repeat(500)
+        && copyBtnA.title === "已复制" && copyBtnA.classList.contains("copied"),
+        "len=" + (copiedText == null ? "null" : copiedText.length)
+        + " title=" + copyBtnA.title + " cls=" + copyBtnA.className);
     // 复制失败 fallback：clipboard 不可用 → document.execCommand("copy")
     // （临时 textarea 选中）；execCommand 成功 → 仍显示「已复制」
     delete navigator.clipboard;
@@ -1901,16 +1921,16 @@ async function main(){
     for (const fn of clicksA) fn({ target: copyBtnA });
     await flush();
     chk("A copy falls back to execCommand",
-        execCmdA === "copy" && copyBtnA.textContent === "已复制",
-        "exec=" + execCmdA + " btn=" + copyBtnA.textContent);
+        execCmdA === "copy" && copyBtnA.title === "已复制" && copyBtnA.classList.contains("copied"),
+        "exec=" + execCmdA + " title=" + copyBtnA.title);
     document.execCommand = origExecA;
     document.createElement = origCreateA;
-    // 兜底也失败（无 execCommand / textarea 不可用）→ 「复制失败」
+    // 兜底也失败（无 execCommand / textarea 不可用）→ 「复制失败」（title/aria 反馈）
     for (const fn of clicksA) fn({ target: copyBtnA });
     await flush();
     chk("A copy failure shows 复制失败",
-        copyBtnA.textContent === "复制失败",
-        "btn=" + copyBtnA.textContent);
+        copyBtnA.title === "复制失败" && copyBtnA.classList.contains("copy-err"),
+        "title=" + copyBtnA.title + " cls=" + copyBtnA.className);
     // innerHTML 快照往返后 copy-toggle 的 _srcText/_target expando 丢失 →
     // 委托回退 .expand-full（常驻 DOM 的全文）取原文，复制仍可用
     const restoredCopyA = restoredCardA[restoredCardA.length - 1].querySelector(".copy-toggle");
@@ -1919,9 +1939,10 @@ async function main(){
     for (const fn of clicksA) fn({ target: restoredCopyA });
     await flush();
     chk("A round-trip copy falls back to expand-full text",
-        copiedText2 === "z".repeat(400) && restoredCopyA.textContent === "已复制",
+        copiedText2 === "z".repeat(400)
+        && restoredCopyA.title === "已复制" && restoredCopyA.classList.contains("copied"),
         "len=" + (copiedText2 == null ? "null" : copiedText2.length)
-        + " btn=" + restoredCopyA.textContent);
+        + " title=" + restoredCopyA.title);
 
     // ---- 文件工具差异化渲染：edit_file -/+ diff / read_file 行号 / write_file 单侧 ----
     const lastCard = () => {
