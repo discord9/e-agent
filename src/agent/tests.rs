@@ -2135,6 +2135,15 @@ async fn compaction_accepts_a_normal_summary() {
         output.entry,
         SessionEntry::Compaction { summary: s, .. } if s == summary
     ));
+    // The summary prompt must carry the plain-text guard so the model does
+    // not leak DSML/tool-call markup into the persisted summary.
+    let requests = requests.lock().unwrap();
+    assert!(matches!(
+        requests[0].last().unwrap(),
+        Message::User { content, .. }
+            if content.contains("Output a plain-text summary only")
+                && content.contains("no tool calls, no XML/DSML/function-call markup, no code blocks")
+    ));
 }
 
 #[tokio::test]

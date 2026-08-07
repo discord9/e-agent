@@ -1024,7 +1024,7 @@ impl Agent {
             strip_images(&mut request);
         }
         request.push(Message::User {
-            content: "Summarize the earlier conversation. Preserve the user's goals, decisions made, files changed, and unfinished work. Be concise and use Chinese or English to match the conversation language.".into(),
+            content: "Summarize the earlier conversation. Preserve the user's goals, decisions made, files changed, and unfinished work. Be concise and use Chinese or English to match the conversation language. Output a plain-text summary only: no tool calls, no XML/DSML/function-call markup, no code blocks.".into(),
             images: vec![],
         });
         let response = {
