@@ -5525,6 +5525,150 @@ async function main(){
         "more=" + (_winMore2 && _winMore2.textContent));
     _winSessions[7].archived = true;   // 还原
     // =====================================================================
+    // 三组折叠状态跨重绘保留（未关联 / 历史子会话 / 归档）：根因是这三组
+    // 的展开状态是纯 DOM 态（children.hidden），每次签名变化（如活跃会话
+    // entry_count 轮询 +1）整树 innerHTML="" 重建后全部回到默认折叠。方案 A：
+    // 与主会话 expanded 同 Set（内存态，不落盘）——未关联组键
+    // wsId:group:orphans、归档组键 wsId:group:archive、历史子会话组键按
+    // 宿主区分 wsId:hist:parentSid（未关联组内 wsId:hist:__orphans__）。
+    // =====================================================================
+    sessionsData = [
+      { id: "gx1", status: "Idle", title: "GX 主会话", created_at: "2024-01-01T00:00:00Z", entry_count: 3, busy: false, active: true },
+      { id: "gx1-live", parent_session_id: "gx1", label: "GX 活子", status: "Idle", entry_count: 1, busy: false, active: true },
+      { id: "gx1-hist", parent_session_id: "gx1", label: "GX 旧子", status: "Idle", entry_count: 1, busy: false, active: false },
+      { id: "gx-orphan", parent_session_id: "missing-gx", status: "Idle", entry_count: 1, active: true },
+      { id: "gx-orphan-hist", parent_session_id: "missing-gx", status: "Idle", entry_count: 1, active: false },
+      { id: "gx-arch", parent_session_id: null, status: "Idle", title: "GX 归档", created_at: "2024-01-03T00:00:00Z", entry_count: 2, active: true, archived: true },
+    ];
+    sessionsDataB = [];
+    state.workspaces = [{ id: "wsA", name: "服务器A", url: "", token: "tok-a" }];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-a";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    state.sidebar.filter = "";
+    state.sidebar.showAllWs = new Set();
+    state.sidebar.expanded = new Set();
+    state.renameActive = false;
+    elsById["sidebar"].hidden = false;
+    renderWorkspaceSelect();
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    renderSidebarTree(true);
+    const gxNoopEv = { stopPropagation(){} };
+    const gxClick = (el) => { for (const fn of (el && el._listeners["click"]) || []) fn(gxNoopEv); };
+    const gxNode = (row) => row.closest(".tree-node");
+    const gxBox = (row) => gxNode(row).querySelector(".tree-children");
+    const gxToggle = (row) => gxNode(row).querySelector(".tree-toggle");
+    const gxRows = () => [...elsById["sidebarTree"].querySelectorAll(".tree-row")];
+    const gxRow = (t) => gxRows().find((r) => (r.textContent || "").includes(t));
+    const gxHistRowIn = (box) => [...box.querySelectorAll(".tree-row")]
+      .find((r) => (r.textContent || "").includes("历史子会话"));
+    // 1) 默认折叠：三组首见 hidden=true，expanded 无对应键
+    const gxOrphRow = gxRow("未关联");
+    const gxArchRow = gxRow("归档 (1)");
+    chk("gx groups: 未关联/归档组默认折叠",
+        !!gxOrphRow && !!gxArchRow && gxBox(gxOrphRow).hidden === true
+        && gxBox(gxArchRow).hidden === true
+        && !state.sidebar.expanded.has("wsA:group:orphans")
+        && !state.sidebar.expanded.has("wsA:group:archive"),
+        "orphanHidden=" + (gxOrphRow && gxBox(gxOrphRow).hidden)
+        + " archHidden=" + (gxArchRow && gxBox(gxArchRow).hidden)
+        + " keys=" + [...state.sidebar.expanded].join(","));
+    chk("gx groups: 未展开主会话时其历史组未渲染",
+        gxBox(gxRow("GX 主会话")).hidden === true, "rootHidden=" + gxBox(gxRow("GX 主会话")).hidden);
+    // 2) 点击展开未关联/归档组：hidden=false + toggle.open + 键写入
+    gxClick(gxToggle(gxOrphRow));
+    gxClick(gxToggle(gxArchRow));
+    chk("gx groups: 点击展开未关联组",
+        gxBox(gxOrphRow).hidden === false && gxToggle(gxOrphRow).classList.contains("open")
+        && state.sidebar.expanded.has("wsA:group:orphans"),
+        "hidden=" + gxBox(gxOrphRow).hidden + " open=" + gxToggle(gxOrphRow).classList.contains("open")
+        + " key=" + state.sidebar.expanded.has("wsA:group:orphans"));
+    chk("gx groups: 点击展开归档组",
+        gxBox(gxArchRow).hidden === false && gxToggle(gxArchRow).classList.contains("open")
+        && state.sidebar.expanded.has("wsA:group:archive"),
+        "hidden=" + gxBox(gxArchRow).hidden + " open=" + gxToggle(gxArchRow).classList.contains("open")
+        + " key=" + state.sidebar.expanded.has("wsA:group:archive"));
+    // 3) 未关联组内的历史组：键 wsA:hist:__orphans__，默认折叠 → 展开
+    const gxOrphHistRow = gxHistRowIn(gxBox(gxOrphRow));
+    chk("gx groups: 未关联组内历史组默认折叠且键未写入",
+        !!gxOrphHistRow && gxBox(gxOrphHistRow).hidden === true
+        && !state.sidebar.expanded.has("wsA:hist:__orphans__"),
+        "hidden=" + (gxOrphHistRow && gxBox(gxOrphHistRow).hidden));
+    gxClick(gxToggle(gxOrphHistRow));
+    chk("gx groups: 未关联组内历史组展开写入 __orphans__ 键",
+        gxBox(gxOrphHistRow).hidden === false
+        && state.sidebar.expanded.has("wsA:hist:__orphans__"),
+        "hidden=" + gxBox(gxOrphHistRow).hidden
+        + " key=" + state.sidebar.expanded.has("wsA:hist:__orphans__"));
+    // 4) 主树内历史组：展开主会话后出现，键 wsA:hist:gx1，默认折叠 → 展开
+    const gxRootRow = gxRow("GX 主会话");
+    gxClick(gxToggle(gxRootRow));
+    const gxRootBox = gxBox(gxRootRow);
+    const gxHistRow = gxHistRowIn(gxRootBox);
+    chk("gx groups: 主树内历史组默认折叠且键未写入",
+        !!gxHistRow && gxBox(gxHistRow).hidden === true
+        && !state.sidebar.expanded.has("wsA:hist:gx1"),
+        "hidden=" + (gxHistRow && gxBox(gxHistRow).hidden));
+    gxClick(gxToggle(gxHistRow));
+    chk("gx groups: 主树内历史组展开写入 parentSid 键",
+        gxBox(gxHistRow).hidden === false && gxToggle(gxHistRow).classList.contains("open")
+        && state.sidebar.expanded.has("wsA:hist:gx1"),
+        "hidden=" + gxBox(gxHistRow).hidden
+        + " key=" + state.sidebar.expanded.has("wsA:hist:gx1"));
+    chk("gx groups: 主树/未关联两组历史键并存不冲突",
+        state.sidebar.expanded.has("wsA:hist:gx1") && state.sidebar.expanded.has("wsA:hist:__orphans__"),
+        "keys=" + [...state.sidebar.expanded].join(","));
+    // 5) 核心回归：签名变化（entry_count 轮询 +1）→ 非 force 重绘整树
+    //    重建 → 四组展开状态全部保持（方案 A 前全部回到默认折叠）
+    state.workspaceLists["wsA"].find((x) => x.id === "gx1").entry_count += 1;
+    renderSidebarTree();
+    const gxOrphRow2 = gxRow("未关联");
+    const gxArchRow2 = gxRow("归档 (1)");
+    const gxRootRow2 = gxRow("GX 主会话");
+    const gxHistRow2 = gxHistRowIn(gxBox(gxRootRow2));
+    const gxOrphHistRow2 = gxHistRowIn(gxBox(gxOrphRow2));
+    chk("gx groups: 重绘后未关联组保持展开",
+        !!gxOrphRow2 && gxBox(gxOrphRow2).hidden === false
+        && gxToggle(gxOrphRow2).classList.contains("open")
+        && state.sidebar.expanded.has("wsA:group:orphans"),
+        "hidden=" + (gxOrphRow2 && gxBox(gxOrphRow2).hidden));
+    chk("gx groups: 重绘后归档组保持展开",
+        !!gxArchRow2 && gxBox(gxArchRow2).hidden === false
+        && gxToggle(gxArchRow2).classList.contains("open")
+        && state.sidebar.expanded.has("wsA:group:archive"),
+        "hidden=" + (gxArchRow2 && gxBox(gxArchRow2).hidden));
+    chk("gx groups: 重绘后主树历史组保持展开",
+        !!gxHistRow2 && gxBox(gxHistRow2).hidden === false
+        && gxToggle(gxHistRow2).classList.contains("open")
+        && state.sidebar.expanded.has("wsA:hist:gx1"),
+        "hidden=" + (gxHistRow2 && gxBox(gxHistRow2).hidden));
+    chk("gx groups: 重绘后未关联组内历史组保持展开",
+        !!gxOrphHistRow2 && gxBox(gxOrphHistRow2).hidden === false
+        && gxToggle(gxOrphHistRow2).classList.contains("open")
+        && state.sidebar.expanded.has("wsA:hist:__orphans__"),
+        "hidden=" + (gxOrphHistRow2 && gxBox(gxOrphHistRow2).hidden));
+    // 6) 收起同样持久：再点归档组收起 → 键删除；再重绘保持收起
+    gxClick(gxToggle(gxArchRow2));
+    chk("gx groups: 再次点击收起归档组并删键",
+        gxBox(gxArchRow2).hidden === true && !gxToggle(gxArchRow2).classList.contains("open")
+        && !state.sidebar.expanded.has("wsA:group:archive"),
+        "hidden=" + gxBox(gxArchRow2).hidden
+        + " key=" + state.sidebar.expanded.has("wsA:group:archive"));
+    state.workspaceLists["wsA"].find((x) => x.id === "gx1").entry_count += 1;
+    renderSidebarTree();
+    const gxArchRow3 = gxRow("归档 (1)");
+    chk("gx groups: 重绘后归档组保持收起（其余组不受影响）",
+        !!gxArchRow3 && gxBox(gxArchRow3).hidden === true
+        && gxBox(gxRow("未关联")).hidden === false
+        && gxBox(gxHistRowIn(gxBox(gxRow("GX 主会话")))).hidden === false,
+        "archHidden=" + (gxArchRow3 && gxBox(gxArchRow3).hidden)
+        + " orphHidden=" + gxBox(gxRow("未关联")).hidden);
+    // =====================================================================
     // perf 修复回归：聚合轮询整轮一次渲染 + 签名去重 + setTimeout 链防重入
     // + 聊天视图停轮询 + 侧边栏 hidden 跳过树渲染 + 任务面板签名去重
     // + 500ms output 轮询防重入

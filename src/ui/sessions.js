@@ -1931,7 +1931,7 @@ function buildTreeRoot(s, kids, wsId) {
     toggle.title = "展开 / 收起子会话";
     toggle.addEventListener("click", (ev) => {
       ev.stopPropagation();          // 点击箭头只展开/收起，不切换会话
-      toggleSidebarNode(wsId + ":" + s.id, toggle, kids, wsId);
+      toggleSidebarNode(wsId + ":" + s.id, toggle, kids, wsId, s.id);
     });
   }
   // 环绕点数量 = 该父会话的全部后台任务数（/api/tasks：bash 后台任务 +
@@ -2077,20 +2077,20 @@ function buildTreeRoot(s, kids, wsId) {
     if (showKids) {
       children.hidden = false;
       toggle.classList.add("open");
-      renderTreeChildren(children, kids, wsId);
+      renderTreeChildren(children, kids, wsId, s.id);
     }
     node.appendChild(children);
   }
   return node;
 }
 
-function toggleSidebarNode(key, toggle, kids, wsId) {
+function toggleSidebarNode(key, toggle, kids, wsId, parentSid) {
   const children = toggle.closest(".tree-node").querySelector(".tree-children");
   if (!children) return;
   if (children.hidden) {
     children.hidden = false;
     toggle.classList.add("open");
-    renderTreeChildren(children, kids, wsId);   // 展开时才渲染子节点（400+ 会话不拖慢树）
+    renderTreeChildren(children, kids, wsId, parentSid);   // 展开时才渲染子节点（400+ 会话不拖慢树）
     state.sidebar.expanded.add(key);
   } else {
     children.hidden = true;
@@ -2102,13 +2102,14 @@ function toggleSidebarNode(key, toggle, kids, wsId) {
 /* 父节点 / 「未关联」组的子节点渲染：live subagent（active !== false，
    含 Idle 存活与旧 server 无 active 字段）直显；inactive（active ===
    false）收进折叠的「历史子会话 (N)」分组（buildHistGroup，默认收起、
-   点击展开）。 */
-function renderTreeChildren(container, kids, wsId) {
+   点击展开）。parentSid = 宿主父会话 id（主树内）；未关联组内无父会话，
+   调用方传 null → 历史组键用 __orphans__。 */
+function renderTreeChildren(container, kids, wsId, parentSid) {
   container.innerHTML = "";
   const live = [], hist = [];
   for (const k of kids) (isSessionLive(k) ? live : hist).push(k);
   renderSubagentRows(container, live, false, wsId);
-  if (hist.length) container.appendChild(buildHistGroup(hist, wsId));
+  if (hist.length) container.appendChild(buildHistGroup(hist, wsId, parentSid));
 }
 
 /* 渲染 subagent 行（不做活跃/历史分组）；hist=true 时行灰显小字 */
@@ -2152,39 +2153,47 @@ function renderSubagentRows(container, kids, hist, wsId) {
 }
 
 /* 「历史子会话 (N)」折叠分组：只收 active === false 的 inactive subagent
-   （live 直显组之外），默认收起，点击展开；不持久化展开状态（每次重绘
-   默认折叠，简单）。 */
-function buildHistGroup(kids, wsId) {
+   （live 直显组之外），默认收起，点击展开；展开状态与主会话 expanded 同
+   Set 持久（内存态，不落盘）——键按宿主区分：主树内 = wsId:hist:parentSid，
+   未关联组内（parentSid 为 null）= wsId:hist:__orphans__。 */
+function buildHistGroup(kids, wsId, parentSid) {
+  const key = wsId + ":hist:" + (parentSid || "__orphans__");
   const node = el("div", "tree-node");
   const row = el("div", "tree-row tree-hist-row");
   const toggle = el("button", "tree-toggle");
   toggle.type = "button";
   toggle.title = "展开 / 收起";
-  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle));
+  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle, key));
   const idEl = el("span", "tree-id tree-group tree-hist-label", "历史子会话 (" + kids.length + ")");
   row.append(toggle, idEl);
   node.appendChild(row);
   const children = el("div", "tree-children");
-  children.hidden = true;
+  const expanded = state.sidebar.expanded.has(key);
+  children.hidden = !expanded;
+  if (expanded) toggle.classList.add("open");
   renderSubagentRows(children, kids, true, wsId);
   node.appendChild(children);
   return node;
 }
 
-/* 「未关联」分组：孤儿 subagent 的根节点，默认折叠 */
+/* 「未关联」分组：孤儿 subagent 的根节点，默认折叠；展开状态持久（键
+   wsId:group:orphans，与主会话 expanded 同 Set，内存态）。 */
 function buildTreeGroup(label, kids, wsId) {
+  const key = wsId + ":group:orphans";
   const node = el("div", "tree-node");
   const row = el("div", "tree-row");
   const toggle = el("button", "tree-toggle");
   toggle.type = "button";
   toggle.title = "展开 / 收起";
-  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle));
+  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle, key));
   const idEl = el("span", "tree-id tree-group", label);
   row.append(toggle, idEl);
   node.appendChild(row);
   const children = el("div", "tree-children");
-  children.hidden = true;   // 「未关联」分组默认折叠，点击展开（不持久化）
-  renderTreeChildren(children, kids, wsId);
+  const expanded = state.sidebar.expanded.has(key);
+  children.hidden = !expanded;   // 「未关联」分组默认折叠，点击展开
+  if (expanded) toggle.classList.add("open");
+  renderTreeChildren(children, kids, wsId, null);   // 组内历史组键 = wsId:hist:__orphans__
   node.appendChild(children);
   return node;
 }
@@ -2192,7 +2201,8 @@ function buildTreeGroup(label, kids, wsId) {
 /* 「归档 (N)」折叠分组：归档会话（主会话 + 其子会话 + 归档孤儿）默认
    收起，点击展开；分组内主会话行保留 buildTreeRoot（含 pin/归档按钮，
    可直接恢复），孤儿子会话用 renderSubagentRows 渲染。点击分组内会话
-   行可正常打开（与普通树行一致）。不持久化展开状态（每次重绘默认折叠）。 */
+   行可正常打开（与普通树行一致）。展开状态持久（键 wsId:group:archive，
+   与主会话 expanded 同 Set，内存态）。 */
 function buildArchiveGroup(archivedSessions, wsId, childrenByParent) {
   const archivedIds = new Set(archivedSessions.map((s) => s.id));
   const isMain = (s) => !s.parent_session_id && !/^(sub|btw)-/i.test(String(s.id || ""));
@@ -2205,18 +2215,21 @@ function buildArchiveGroup(archivedSessions, wsId, childrenByParent) {
   const subRows = archivedSessions.filter((s) => s.parent_session_id
     && archivedIds.has(s.parent_session_id)
     && !mainRootIds.has(s.parent_session_id));
+  const key = wsId + ":group:archive";
   const node = el("div", "tree-node");
   const row = el("div", "tree-row tree-archive-row");
   const toggle = el("button", "tree-toggle");
   toggle.type = "button";
   toggle.title = "展开 / 收起";
-  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle));
+  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle, key));
   const idEl = el("span", "tree-id tree-group tree-archive-label",
     "归档 (" + archivedSessions.length + ")");
   row.append(toggle, idEl);
   node.appendChild(row);
   const children = el("div", "tree-children");
-  children.hidden = true;
+  const expanded = state.sidebar.expanded.has(key);
+  children.hidden = !expanded;
+  if (expanded) toggle.classList.add("open");
   for (const s of roots) {
     if (!isMain(s)) { renderSubagentRows(children, [s], true, wsId); continue; }
     children.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || [], wsId));
@@ -2226,16 +2239,20 @@ function buildArchiveGroup(archivedSessions, wsId, childrenByParent) {
   return node;
 }
 
-/* 分组折叠切换（未关联 / 历史子会话）：默认收起，点击展开，不持久化 */
-function toggleTreeGroup(ev, toggle) {
+/* 分组折叠切换（未关联 / 历史子会话 / 归档）：默认收起，点击展开；展开
+   状态写入 state.sidebar.expanded（key 由各构建函数按 wsId 前缀生成，
+   与 toggleSidebarNode 同 Set，重绘后保留——内存态，不落盘）。 */
+function toggleTreeGroup(ev, toggle, key) {
   ev.stopPropagation();
   const children = toggle.closest(".tree-node").querySelector(".tree-children");
   if (children.hidden) {
     children.hidden = false;
     toggle.classList.add("open");
+    state.sidebar.expanded.add(key);
   } else {
     children.hidden = true;
     toggle.classList.remove("open");
+    state.sidebar.expanded.delete(key);
   }
 }
 /* =====================================================================
