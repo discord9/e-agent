@@ -2012,15 +2012,26 @@ async function main(){
     navigator.clipboard = { writeText: (t) => { copiedEdit = t; return Promise.resolve(); } };
     const bigCopy = bigRes.querySelector(".copy-toggle");
     chk("edit_file has copy-result button (diff-copy)",
-        bigCopy !== null && bigCopy.textContent === "复制结果"
+        bigCopy !== null && bigCopy.classList.contains("icon-btn")
         && bigRes.classList.contains("diff-copy")
         && bigRes.querySelector(".expand-full") !== null,
-        "btn=" + (bigCopy && bigCopy.textContent) + " cls=" + bigRes.className);
+        "cls=" + (bigCopy && bigCopy.className) + " resCls=" + bigRes.className);
+    // 图标按钮（非文字）：SVG 双矩形图标 + title/aria-label 标注用途
+    chk("edit_file copy button is svg icon with title",
+        bigCopy.querySelector("svg.copy-icon") !== null
+        && bigCopy.textContent.indexOf("复制结果") === -1
+        && bigCopy.title === "复制结果"
+        && bigCopy.getAttribute("aria-label") === "复制结果",
+        "svg=" + (bigCopy.querySelector("svg.copy-icon") !== null)
+        + " title=" + JSON.stringify(bigCopy.title)
+        + " aria=" + JSON.stringify(bigCopy.getAttribute("aria-label")));
     for (const fn of clicksBig) fn({ target: bigCopy });
     await flush();
     chk("edit_file copy writes old+new text",
-        copiedEdit === bigOld + "\n" + bigNew && bigCopy.textContent === "已复制",
-        "len=" + (copiedEdit == null ? "null" : copiedEdit.length) + " btn=" + bigCopy.textContent);
+        copiedEdit === bigOld + "\n" + bigNew
+        && bigCopy.title === "已复制" && bigCopy.classList.contains("copied"),
+        "len=" + (copiedEdit == null ? "null" : copiedEdit.length)
+        + " title=" + bigCopy.title + " cls=" + bigCopy.className);
     delete navigator.clipboard;
     // edit_file 出错：保持普通 err 文本，不渲染 diff
     appendToolCall("edit_file", JSON.stringify({ path: "x.txt", old: "a", new: "b" }), state.acc, null);
@@ -2095,21 +2106,26 @@ async function main(){
         !longRes.classList.contains("expanded") && readBtn.textContent === "展开全文（内容）",
         "btn=" + readBtn.textContent);
     // 【中】read_file 复制结果按钮：.diff-copy 右上角定位类 + 隐藏 .expand-full
-    // 原文 span（快照回退源）；点击复制完整结果文本
+    // 原文 span（快照回退源）；图标按钮（SVG + title/aria），点击复制完整结果文本
     const readCopy = longRes.querySelector(".copy-toggle");
     chk("read_file diff has copy-result button + diff-copy class",
-        readCopy !== null && readCopy.textContent === "复制结果"
+        readCopy !== null && readCopy.classList.contains("icon-btn")
+        && readCopy.querySelector("svg.copy-icon") !== null
+        && readCopy.title === "复制结果"
+        && readCopy.getAttribute("aria-label") === "复制结果"
         && longRes.classList.contains("diff-copy")
         && longRes.querySelector(".expand-full") !== null,
-        "btn=" + (readCopy && readCopy.textContent) + " cls=" + longRes.className);
+        "cls=" + (readCopy && readCopy.className)
+        + " title=" + (readCopy && readCopy.title) + " resCls=" + longRes.className);
     let copiedRead = null;
     navigator.clipboard = { writeText: (t) => { copiedRead = t; return Promise.resolve(); } };
     for (const fn of clicksA) fn({ target: readCopy });
     await flush();
     chk("read_file copy writes full result text",
         copiedRead === Array.from({ length: 40 }, (_, i) => "row " + i).join("\n")
-        && readCopy.textContent === "已复制",
-        "len=" + (copiedRead == null ? "null" : copiedRead.length));
+        && readCopy.title === "已复制" && readCopy.classList.contains("copied"),
+        "len=" + (copiedRead == null ? "null" : copiedRead.length)
+        + " title=" + readCopy.title);
     delete navigator.clipboard;
     // write_file：确认行 + 全新增（+ 绿）单侧 diff，行号从 1 起
     elsById["messages"].innerHTML = "";
@@ -2126,12 +2142,14 @@ async function main(){
         && diffRowsOf(wCard, "diff-add")[0].querySelector(".diff-ln").textContent === "1"
         && diffRowsOf(wCard, "diff-add")[0].querySelector(".diff-text").textContent === "hello",
         "rows=" + wCard.querySelectorAll(".diff-row").length);
-    // 短 write（≤30 行）：无展开按钮，但有复制结果按钮
+    // 短 write（≤30 行）：无展开按钮，但有复制结果图标按钮（SVG + 无文字）
     chk("write_file short content no expand, has copy",
         wCard.querySelector(".expand-toggle") === null
         && !wCard.querySelector(".tool-result").classList.contains("expandable")
         && wCard.querySelector(".copy-toggle") !== null
-        && wCard.querySelector(".copy-toggle").textContent === "复制结果",
+        && wCard.querySelector(".copy-toggle").classList.contains("icon-btn")
+        && wCard.querySelector(".copy-toggle").querySelector("svg.copy-icon") !== null
+        && wCard.querySelector(".copy-toggle").textContent.indexOf("复制结果") === -1,
         "expand=" + (wCard.querySelector(".expand-toggle") !== null)
         + " copy=" + (wCard.querySelector(".copy-toggle") !== null));
     // 【高】write_file 超 30 行：预览 + 截断 + 「展开全文（内容）」+ .diff-full 剩余行；
@@ -2171,8 +2189,10 @@ async function main(){
     for (const fn of clicksW) fn({ target: wBigCopy });
     await flush();
     chk("write_file copy writes full content",
-        wBigCopy !== null && copiedWrite === bigContent && wBigCopy.textContent === "已复制",
-        "len=" + (copiedWrite == null ? "null" : copiedWrite.length));
+        wBigCopy !== null && copiedWrite === bigContent
+        && wBigCopy.title === "已复制" && wBigCopy.classList.contains("copied"),
+        "len=" + (copiedWrite == null ? "null" : copiedWrite.length)
+        + " title=" + (wBigCopy && wBigCopy.title));
     delete navigator.clipboard;
     // 空 old/new/content：不产生空红/绿 diff 行（纯新增/纯删除/空写入）
     appendToolCall("edit_file", JSON.stringify({ path: "add.txt", old: "", new: "hello\nworld" }),

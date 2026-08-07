@@ -53,13 +53,39 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
 /* 「复制全文」剪贴板写入：navigator.clipboard.writeText（https/现代浏览器）
    优先；失败或不可用回退 document.execCommand("copy")（临时 textarea，兼容
    非 https 上下文与老浏览器）。成功按钮短暂显示「已复制」、失败显示
-   「复制失败」，1.2s 后还原为「复制全文」。纯前端，不依赖后端。 */
+   「复制失败」，1.2s 后还原。图标按钮（.icon-btn 无文字标签）改为
+   title/aria-label 反馈 + 加 class 变色。纯前端，不依赖后端。 */
 function copyTextToClipboard(text, btn) {
+  const isIcon = btn && btn.classList && btn.classList.contains("icon-btn");
   const restore = () => {
-    try { setTimeout(() => { if (btn) btn.textContent = "复制全文"; }, 1200); }
+    try {
+      setTimeout(() => {
+        if (!btn) return;
+        if (isIcon) {
+          // 图标按钮：撤变色 class + 恢复默认提示（与 pin/archive 按钮同机制）
+          btn.classList.remove("copied", "copy-err");
+          btn.title = "复制结果";
+          btn.setAttribute("aria-label", "复制结果");
+        } else {
+          btn.textContent = "复制全文";
+        }
+      }, 1200);
+    }
     catch (e) { /* 无计时器环境（harness）：不还原也不报错 */ }
   };
-  const show = (ok) => { if (btn) { btn.textContent = ok ? "已复制" : "复制失败"; restore(); } };
+  const show = (ok) => {
+    if (!btn) return;
+    if (isIcon) {
+      // 成功绿（copied）/失败红（copy-err）变色 + title/aria 读屏反馈
+      btn.classList.toggle("copied", ok);
+      btn.classList.toggle("copy-err", !ok);
+      btn.title = ok ? "已复制" : "复制失败";
+      btn.setAttribute("aria-label", btn.title);
+    } else {
+      btn.textContent = ok ? "已复制" : "复制失败";
+    }
+    restore();
+  };
   const fallback = () => show(fallbackCopyText(text));
   if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
     try {
@@ -189,16 +215,30 @@ function diffSideRows(text, sign, startLine) {
   return rows;
 }
 
+/* 复制图标 SVG：经典双矩形（后板 + 前纸），fill 继承 currentColor
+   （与 pinSvg/archiveSvg 同款 16px innerHTML 字符串，状态色经 class 切换）。 */
+function copySvg() {
+  return '<svg class="copy-icon" viewBox="0 0 24 24" width="16" height="16" ' +
+    'aria-hidden="true" focusable="false" fill="currentColor">' +
+    '<path d="M9 3a2 2 0 0 0-2 2v1H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-1h1a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-1V5a2 2 0 0 0-2-2H9Zm0 2h3v1H9V5Zm-3 3h8v11H6V8Z"/>' +
+    '</svg>';
+}
+
 /* 文件工具结果统一控件：read_file / edit_file / write_file 结果末尾追加
-   「复制结果」按钮。按钮绝对定位到结果区右上角（.diff-copy 留出 padding-top，
-   与 maybeTruncateEl 的 .expand-copy 按钮组同款控件风格），复制正文即结果
-   原始文本（content，结构化 diff 的无损原文；_srcText 在快照往返后丢失，
-   事件委托回退到 .expand-full 隐藏的原文 span 取文本）。无论结果长短都有
-   按钮：文件内容复制是常用操作，不再依赖文本长度触发。 */
+   「复制结果」图标按钮。按钮绝对定位到结果区右上角（.diff-copy 留出
+   padding-top，与 maybeTruncateEl 的 .expand-copy 按钮组同款控件风格），
+   复制正文即结果原始文本（content，结构化 diff 的无损原文；_srcText 在
+   快照往返后丢失，事件委托回退到 .expand-full 隐藏的原文 span 取文本）。
+   无论结果长短都有按钮：文件内容复制是常用操作，不再依赖文本长度触发。
+   图标按钮（无文字）：title/aria-label 标注用途；复制反馈由
+   copyTextToClipboard 改 title/aria-label + 加 class 变色（成功绿/失败红）。 */
 function attachResultCopy(resEl, content) {
   resEl.classList.add("diff-copy");
-  const copy = el("button", "copy-toggle", "复制结果");
+  const copy = el("button", "copy-toggle icon-btn");
+  copy.innerHTML = copySvg();
   copy.type = "button";
+  copy.title = "复制结果";
+  copy.setAttribute("aria-label", "复制结果");
   copy._target = resEl;
   copy._srcText = content;
   resEl.appendChild(copy);
