@@ -11,6 +11,71 @@ fn rejects_parent_absolute_and_current_directory_paths() {
 }
 
 #[test]
+fn absolute_paths_inside_workspace_are_treated_as_relative() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let file = temp.path().join("nested/file");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, "content").unwrap();
+
+    // Read via absolute path: succeeds with the correct content.
+    assert_eq!(workspace.read(file.to_str().unwrap()).unwrap(), b"content");
+    assert_eq!(
+        workspace.read_to_string(file.to_str().unwrap()).unwrap(),
+        "content"
+    );
+    assert_eq!(
+        workspace
+            .try_read_to_string(file.to_str().unwrap())
+            .unwrap(),
+        Some("content".to_owned())
+    );
+    // A missing absolute path inside the workspace maps to `None`, not an
+    // external-root error (write_file's undo snapshot relies on this).
+    assert_eq!(
+        workspace
+            .try_read_to_string(temp.path().join("missing").to_str().unwrap())
+            .unwrap(),
+        None
+    );
+
+    // Write via absolute path inside the workspace: succeeds.
+    workspace
+        .write(temp.path().join("new/file").to_str().unwrap(), "written")
+        .unwrap();
+    assert_eq!(fs::read(temp.path().join("new/file")).unwrap(), b"written");
+    // And remove_file via absolute path inside the workspace works too.
+    workspace
+        .remove_file(temp.path().join("new/file").to_str().unwrap())
+        .unwrap();
+    assert!(!temp.path().join("new/file").exists());
+}
+
+#[test]
+fn absolute_paths_escaping_or_outside_workspace_are_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_dir = temp.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).unwrap();
+    let workspace = Workspace::new(&workspace_dir).unwrap();
+
+    // `..` escaping out of the root via an absolute path is rejected
+    // (component-validation or external-root error, never a panic).
+    let escape = workspace_dir.join("sub/../../outside");
+    assert!(workspace.read(escape.to_str().unwrap()).is_err());
+    assert!(workspace.write(escape.to_str().unwrap(), "no").is_err());
+    // Lexical `..` that stays inside the root is rejected as well: the
+    // remainder must contain only normal components.
+    let inside = workspace_dir.join("sub/../file");
+    assert!(workspace.read(inside.to_str().unwrap()).is_err());
+
+    // Absolute paths outside the workspace are still rejected with the
+    // external-root error message.
+    let outside = temp.path().join("outside");
+    let error = workspace.read(outside.to_str().unwrap()).unwrap_err();
+    assert!(error.contains("authorized external root"));
+}
+
+#[test]
 fn external_directories_and_exact_files_enforce_permissions() {
     let temp = tempfile::tempdir().unwrap();
     let workspace_dir = temp.path().join("workspace");

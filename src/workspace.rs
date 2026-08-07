@@ -165,6 +165,14 @@ impl Workspace {
                 .read(self.relative(input)?)
                 .map_err(|error| format!("read failed: {error}"));
         }
+        // Absolute paths inside the workspace root are treated as
+        // workspace-relative; only the rest falls through to external roots.
+        if let Some(rest) = self.strip_workspace_root(path) {
+            return self
+                .dir
+                .read(&rest)
+                .map_err(|error| format!("read failed: {error}"));
+        }
         let (root, remainder) = self.external(path, false)?;
         match &root.capability {
             ExternalCapability::Dir(dir) => dir
@@ -200,6 +208,10 @@ impl Workspace {
             self.dir
                 .try_exists(self.relative(input)?)
                 .map_err(|error| format!("stat failed: {error}"))?
+        } else if let Some(rest) = self.strip_workspace_root(path) {
+            self.dir
+                .try_exists(&rest)
+                .map_err(|error| format!("stat failed: {error}"))?
         } else {
             let (root, remainder) = self.external(path, false)?;
             match &root.capability {
@@ -230,6 +242,12 @@ impl Workspace {
                 .remove_file(path)
                 .map_err(|error| format!("delete failed: {error}"));
         }
+        if let Some(rest) = self.strip_workspace_root(path) {
+            return self
+                .dir
+                .remove_file(&rest)
+                .map_err(|error| format!("delete failed: {error}"));
+        }
         let (root, remainder) = self.external(path, true)?;
         match &root.capability {
             ExternalCapability::Dir(dir) => dir
@@ -249,6 +267,9 @@ impl Workspace {
             return secure_dir_write(&self.dir, path, content.as_ref());
         }
         self.reject_policy_write(path)?;
+        if let Some(rest) = self.strip_workspace_root(path) {
+            return secure_dir_write(&self.dir, &rest, content.as_ref());
+        }
         let (root, remainder) = self.external(path, true)?;
         match &root.capability {
             ExternalCapability::Dir(dir) => secure_dir_write(dir, remainder, content.as_ref()),
@@ -286,6 +307,28 @@ impl Workspace {
             return Err(".e-agent/config.toml controls sandbox and file capabilities; it must be modified by the user outside the agent".into());
         }
         Ok(())
+    }
+
+    /// If `path` is an absolute path inside the workspace root, return the
+    /// remainder relative to the root — but only when it consists purely of
+    /// normal components (empty means the root itself, on which reads/writes
+    /// naturally fail). Paths with `..`/`.` or other non-normal components,
+    /// or that are not inside the root at all, return `None` and fall
+    /// through to external-root handling. The user path is verbatim-prefix
+    /// stripped the same way the stored root was in `new()`, so Windows
+    /// `\\?\`-prefixed absolute paths compare equal to ordinary ones.
+    /// Returns owned because `strip_verbatim_prefix` yields an owned path.
+    fn strip_workspace_root(&self, path: &Path) -> Option<PathBuf> {
+        let path = crate::strip_verbatim_prefix(path);
+        let remainder = path.strip_prefix(&self.root).ok()?;
+        if remainder
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+        {
+            Some(remainder.to_path_buf())
+        } else {
+            None
+        }
     }
 
     fn external<'a, 'b>(

@@ -33,9 +33,9 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         spec(
             "read_file",
-            "Read a UTF-8-ish file. Relative paths are resolved inside the workspace and NEVER escape it (a capability boundary); external read-only roots — e.g. the main repository of a linked git worktree — are reachable ONLY via their absolute path. Lines are 1-indexed; long files are paged, use `offset` to continue reading.",
+            "Read a UTF-8-ish file. Absolute paths pointing inside the workspace are accepted and treated as workspace-relative. Relative paths are resolved inside the workspace and NEVER escape it (a capability boundary); external read-only roots — e.g. the main repository of a linked git worktree — are reachable ONLY via their absolute path. Lines are 1-indexed; long files are paged, use `offset` to continue reading.",
             json!({
-                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path"},
+                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path; absolute paths inside the workspace are also accepted (treated as workspace-relative)"},
                 "offset": {"type": "integer", "description": "first line to read, 1-indexed (default 1)"},
                 "limit": {"type": "integer", "description": format!("maximum lines to read (default {DEFAULT_READ_LINES})")}
             }),
@@ -121,7 +121,7 @@ impl Tool for ReadImage {
             "read_image",
             "Read an image file (png, jpeg/jpg, webp, gif; up to 10 MiB) and attach it to the conversation so the model can see it. Relative paths use the workspace; authorized external absolute paths are accepted. The image bytes are stored once in a global content-addressed cache and sent to the provider on the next model call.",
             json!({
-                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path to an image file"}
+                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path to an image file; absolute paths inside the workspace are also accepted (treated as workspace-relative)"}
             }),
             &["path"],
         )
@@ -165,7 +165,7 @@ impl Tool for WriteFile {
             "write_file",
             "Write a workspace-relative file or an authorized writable external absolute path, creating parent directories.",
             json!({
-                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path"},
+                "path": {"type": "string", "description": "workspace-relative or authorized writable external absolute path; absolute paths inside the workspace are also accepted (treated as workspace-relative)"},
                 "content": {"type": "string", "description": "file contents"}
             }),
             &["path", "content"],
@@ -228,7 +228,7 @@ impl Tool for EditFile {
             "edit_file",
             "Replace exactly one literal occurrence in a workspace-relative file or authorized writable external absolute path.",
             json!({
-                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path"},
+                "path": {"type": "string", "description": "workspace-relative or authorized writable external absolute path; absolute paths inside the workspace are also accepted (treated as workspace-relative)"},
                 "old": {"type": "string", "description": "exact existing text"},
                 "new": {"type": "string", "description": "replacement text"}
             }),
