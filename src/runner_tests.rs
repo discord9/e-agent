@@ -502,7 +502,7 @@ async fn aborting_join_waiter_still_aborts_inner_runner() {
 #[tokio::test]
 async fn compaction_deltas_are_live_only_and_success_has_one_projection() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut agent, entered, release) = controlled(vec![Ok("summary".into())], true);
+    let (mut agent, entered, release) = controlled(vec![Ok("The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.".into())], true);
     history_for_compaction(&mut agent);
     let (runner, handle) = SessionRunner::new(
         agent,
@@ -527,14 +527,14 @@ async fn compaction_deltas_are_live_only_and_success_has_one_projection() {
 
     release.notify_one();
     assert!(
-        matches!(live.recv().await.unwrap(), AgentEvent::Notice(text) if text == "compacted: summary")
+        matches!(live.recv().await.unwrap(), AgentEvent::Notice(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
     );
     let snapshot = handle.snapshot();
     assert_eq!(
         snapshot
             .iter()
             .filter(
-                |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: summary")
+                |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
             )
             .count(),
         1
@@ -702,7 +702,7 @@ async fn finish_when_idle_drains_prompt_and_compact_queued_at_completion() {
         vec![
             Ok("first".into()),
             Ok("second".into()),
-            Ok("summary".into()),
+            Ok("The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.".into()),
         ],
         true,
     );
@@ -735,7 +735,7 @@ async fn finish_when_idle_drains_prompt_and_compact_queued_at_completion() {
         snapshot
             .iter()
             .filter(
-                |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: summary")
+                |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
             )
             .count(),
         1
@@ -1181,9 +1181,9 @@ async fn prompt_and_compact_pending_order_is_fifo() {
     for prompt_first in [true, false] {
         let temp = tempfile::tempdir().unwrap();
         let replies = if prompt_first {
-            vec![Ok("answer".into()), Ok("summary".into())]
+            vec![Ok("answer".into()), Ok("The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.".into())]
         } else {
-            vec![Ok("summary".into()), Ok("answer".into())]
+            vec![Ok("The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.".into()), Ok("answer".into())]
         };
         let (mut agent, _, _) = controlled(replies, false);
         history_for_compaction(&mut agent);
@@ -1228,7 +1228,7 @@ async fn prompt_and_compact_pending_order_is_fifo() {
         let compact = loaded
                 .entries
                 .iter()
-                .position(|entry| matches!(entry, SessionEntry::Compaction { summary, .. } if summary == "summary"))
+                .position(|entry| matches!(entry, SessionEntry::Compaction { summary, .. } if summary == "The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on."))
                 .unwrap();
         assert_eq!(prompt < compact, prompt_first);
         task.join().await.unwrap();
@@ -1238,7 +1238,7 @@ async fn prompt_and_compact_pending_order_is_fifo() {
 #[tokio::test]
 async fn consecutive_compacts_are_not_folded() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut agent, _, _) = controlled(vec![Ok("summary".into())], false);
+    let (mut agent, _, _) = controlled(vec![Ok("The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.".into())], false);
     history_for_compaction(&mut agent);
     let (runner, handle) = SessionRunner::new(
         agent,
@@ -1258,7 +1258,7 @@ async fn consecutive_compacts_are_not_folded() {
         snapshot
             .iter()
             .filter(
-                |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: summary")
+                |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
             )
             .count(),
         1
@@ -1375,7 +1375,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
                 ),
                 (
                     AssistantMessage {
-                        content: Some("summary".into()),
+                        content: Some("The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.".into()),
                         tool_calls: vec![],
                         reasoning: None,
                     },
@@ -1448,7 +1448,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
         assert!(matches!(
             &final_context[0],
             Message::User { content, .. }
-                if content == "[compacted summary of earlier conversation]\nsummary"
+                if content == "[compacted summary of earlier conversation]\nThe user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on."
         ));
         // Placeholder skipped entirely: the only Tool message is the real
         // result, paired with its tool_call.
@@ -1635,7 +1635,7 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
     let commands = Arc::new(Mutex::new(None));
     let mut agent = Agent::new(
         Box::new(CompletingWithCancelModel {
-            reply: Some("completed summary".into()),
+            reply: Some("The completed summary of the earlier conversation covers the earlier exchange between the user and the assistant; no unfinished work remains.".into()),
             commands: commands.clone(),
         }),
         // Keeps the background-completion channel open (see
@@ -1661,7 +1661,7 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
     loop {
         if matches!(
             live.recv().await.unwrap(),
-            AgentEvent::Notice(text) if text == "compacted: completed summary"
+            AgentEvent::Notice(text) if text == "compacted: The completed summary of the earlier conversation covers the earlier exchange between the user and the assistant; no unfinished work remains."
         ) {
             break;
         }
@@ -1676,7 +1676,7 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
             loaded
                 .entries
                 .iter()
-                .filter(|entry| matches!(entry, SessionEntry::Compaction { summary, .. } if summary == "completed summary"))
+                .filter(|entry| matches!(entry, SessionEntry::Compaction { summary, .. } if summary == "The completed summary of the earlier conversation covers the earlier exchange between the user and the assistant; no unfinished work remains."))
                 .count(),
             1
         );
@@ -1684,7 +1684,7 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
             handle
                 .snapshot()
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::Notice(text) if text == "compacted: completed summary"))
+                .filter(|event| matches!(event, AgentEvent::Notice(text) if text == "compacted: The completed summary of the earlier conversation covers the earlier exchange between the user and the assistant; no unfinished work remains."))
                 .count(),
             1
         );
@@ -4330,7 +4330,7 @@ async fn steer_fifo_queued_compact_prompt_cancel_runs_compact_before_prompt() {
                 reasoning: None,
             }),
             Ok(AssistantMessage {
-                content: Some("compact summary".into()),
+                content: Some("The compact summary of the earlier conversation preserves the earlier question and the assistant's earlier reply, plus the context needed to continue with the current work.".into()),
                 tool_calls: Vec::new(),
                 reasoning: None,
             }),
@@ -4431,6 +4431,6 @@ async fn steer_fifo_queued_compact_prompt_cancel_runs_compact_before_prompt() {
     );
     assert!(loaded.entries.iter().any(|entry| matches!(
         entry,
-        SessionEntry::Compaction { summary, .. } if summary == "compact summary"
+        SessionEntry::Compaction { summary, .. } if summary == "The compact summary of the earlier conversation preserves the earlier question and the assistant's earlier reply, plus the context needed to continue with the current work."
     )));
 }

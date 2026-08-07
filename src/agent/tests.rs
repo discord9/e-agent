@@ -837,7 +837,7 @@ async fn compacts_everything_before_the_current_turn() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedModel {
         replies: vec![AssistantMessage {
-            content: Some("summary text".into()),
+            content: Some("The user's original goal was to build the project; the assistant ran the make build and its tests through bash before moving on to the latest user turn.".into()),
             tool_calls: vec![],
             reasoning: None,
         }],
@@ -909,20 +909,23 @@ async fn compacts_everything_before_the_current_turn() {
     let mut agent = Agent::new(Box::new(model), vec![]);
     agent.restore_history(transcript.into_iter().map(Into::into).collect());
 
-    assert_eq!(agent.compact().await.unwrap(), "summary text");
+    assert_eq!(
+        agent.compact().await.unwrap(),
+        "The user's original goal was to build the project; the assistant ran the make build and its tests through bash before moving on to the latest user turn."
+    );
     // Full history is append-only: 10 original entries + 1 compaction.
     assert_eq!(agent.history().len(), 11);
     assert!(matches!(
         agent.history().last().unwrap(),
         SessionEntry::Compaction { summary, retained }
-            if summary == "summary text" && *retained == current_turn
+            if summary == "The user's original goal was to build the project; the assistant ran the make build and its tests through bash before moving on to the latest user turn." && *retained == current_turn
     ));
     // The derived context is the summary plus the retained current turn.
     let context = agent.context();
     assert_eq!(context.len(), current_turn.len() + 1);
     assert!(matches!(
         &context[0],
-        Message::User { content, .. } if content == "[compacted summary of earlier conversation]\nsummary text"
+        Message::User { content, .. } if content == "[compacted summary of earlier conversation]\nThe user's original goal was to build the project; the assistant ran the make build and its tests through bash before moving on to the latest user turn."
     ));
     assert_eq!(&context[1..], current_turn.as_slice());
     let requests = requests.lock().unwrap();
@@ -1837,7 +1840,7 @@ async fn non_vision_compaction_strips_request_but_keeps_retained_images() {
     let mut agent = Agent::new(
         Box::new(GateSimModel {
             replies: vec![AssistantMessage {
-                content: Some("summary".into()),
+                content: Some("The user shared an image about an older topic; the assistant responded early in the conversation, and the work now continues with a fresh image request.".into()),
                 tool_calls: vec![],
                 reasoning: None,
             }],
@@ -1870,7 +1873,10 @@ async fn non_vision_compaction_strips_request_but_keeps_retained_images() {
         }
         .into(),
     ]);
-    assert_eq!(agent.compact().await.unwrap(), "summary");
+    assert_eq!(
+        agent.compact().await.unwrap(),
+        "The user shared an image about an older topic; the assistant responded early in the conversation, and the work now continues with a fresh image request."
+    );
     // The compaction request carried no images (the gate would have failed).
     let calls = requests.lock().unwrap();
     assert!(calls[0].iter().all(|message| !matches!(
@@ -1900,7 +1906,7 @@ async fn vision_compaction_keeps_images_in_request_and_retained_tail() {
     let mut agent = Agent::new(
         Box::new(VisionScriptedModel(ScriptedModel {
             replies: vec![AssistantMessage {
-                content: Some("summary".into()),
+                content: Some("The user shared an image about an older topic; the assistant responded early in the conversation, and the work now continues with a fresh image request.".into()),
                 tool_calls: vec![],
                 reasoning: None,
             }],
@@ -1933,7 +1939,10 @@ async fn vision_compaction_keeps_images_in_request_and_retained_tail() {
         }
         .into(),
     ]);
-    assert_eq!(agent.compact().await.unwrap(), "summary");
+    assert_eq!(
+        agent.compact().await.unwrap(),
+        "The user shared an image about an older topic; the assistant responded early in the conversation, and the work now continues with a fresh image request."
+    );
     // The vision compaction request kept the image in the compacted prefix.
     let calls = requests.lock().unwrap();
     assert!(calls[0].iter().any(|message| matches!(
@@ -1955,6 +1964,225 @@ async fn vision_compaction_keeps_images_in_request_and_retained_tail() {
     )));
 }
 
+#[tokio::test]
+async fn compaction_rejects_summary_with_tool_call_markup() {
+    // Degenerate model output that echoes the DSML rendering of tool calls
+    // (with the `tool_calls` field empty, so the existing tool-calls check
+    // cannot catch it) must fail the compaction sanity gate.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some(
+                    "<invoke name=\"bash\">\n<parameter name=\"command\">make</parameter>\n</invoke>"
+                        .into(),
+                ),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "old question".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("old answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: "current question".into(),
+            images: vec![],
+        }
+        .into(),
+    ]);
+    let error = agent.compact().await.unwrap_err().to_string();
+    assert!(
+        error.contains("compaction summary rejected by sanity gate")
+            && error.contains("tool-call/DSML markup"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn compaction_rejects_summary_echoing_retained_first_message() {
+    // The model returns the retained user turn verbatim (the accident
+    // shape: repeating the most recent context instead of summarizing).
+    let echoed = "The user asked to build the feature and run the full test suite to verify everything passes before committing.";
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some(echoed.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "old question".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("old answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: echoed.into(),
+            images: vec![],
+        }
+        .into(),
+    ]);
+    let error = agent.compact().await.unwrap_err().to_string();
+    assert!(
+        error.contains("compaction summary rejected by sanity gate")
+            && error.contains("echoes the retained context"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn compaction_rejects_too_short_summary() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some("ok".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "old question".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("old answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: "current question".into(),
+            images: vec![],
+        }
+        .into(),
+    ]);
+    let error = agent.compact().await.unwrap_err().to_string();
+    assert!(
+        error.contains("compaction summary rejected by sanity gate") && error.contains("too short"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn compaction_accepts_a_normal_summary() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let summary = "The user's original goal was to build the project with make; the assistant ran the build and its tests through bash, and no unfinished work remains before the latest user turn.";
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some(summary.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "old question".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("old answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: "current question".into(),
+            images: vec![],
+        }
+        .into(),
+    ]);
+    let output = agent.prepare_compaction().await.unwrap();
+    assert_eq!(output.summary, summary);
+    assert!(matches!(
+        output.entry,
+        SessionEntry::Compaction { summary: s, .. } if s == summary
+    ));
+}
+
+#[tokio::test]
+async fn compaction_rejects_summary_echoing_request_tail_assistant() {
+    // The accident shape: the model repeats the last compacted message
+    // verbatim — here the assistant message at the end of the request
+    // window (the message right before the retained current turn). The
+    // retained-first echo check cannot catch this (the summary shares no
+    // prefix with the retained user turn), so the request-tail comparison
+    // must reject it.
+    let echoed = "The user asked for a detailed plan to refactor the legacy module, and the assistant outlined the steps and ran the initial checks before reporting back.";
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some(echoed.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "old question".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some(echoed.into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: "current question".into(),
+            images: vec![],
+        }
+        .into(),
+    ]);
+    let error = agent.compact().await.unwrap_err().to_string();
+    assert!(
+        error.contains("compaction summary rejected by sanity gate") && error.contains("echoes"),
+        "unexpected error: {error}"
+    );
+}
 #[tokio::test]
 async fn switching_back_to_vision_restores_images_in_requests() {
     // A non-vision round strips the image from the request only; history

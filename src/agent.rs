@@ -524,6 +524,120 @@ pub(crate) struct CompactionOutput {
     pub(crate) usage: Option<Usage>,
 }
 
+/// First textual content of a message, if any. Used by the compaction
+/// sanity gate to compare a summary against the retained window.
+fn message_text(message: &Message) -> Option<&str> {
+    match message {
+        Message::System { content }
+        | Message::User { content, .. }
+        | Message::Tool { content, .. } => Some(content),
+        Message::Assistant(assistant) => assistant.content.as_deref(),
+    }
+}
+
+/// Text of the last non-prompt message in the compacted request window —
+/// the message immediately before the retained turn (an assistant's content
+/// or a tool result). User/system prompts are skipped so the scan does not
+/// pick up the summary-request prompt itself, and the earlier
+/// "nothing to compact" check guarantees at least one assistant/tool
+/// message exists in the window.
+fn request_tail_text(messages: &[Message]) -> Option<&str> {
+    messages.iter().rev().find_map(|message| match message {
+        Message::Assistant(assistant) => assistant.content.as_deref(),
+        Message::Tool { content, .. } => Some(content.as_str()),
+        _ => None,
+    })
+}
+
+/// Returns the reason when `summary` echoes `candidate` — sharing a long
+/// common prefix (up to 120 chars) or containing the first 200 chars of
+/// `candidate` verbatim. `where_` names the compared message for the error
+/// text. Strong-match on purpose: a normal summary may legitimately quote a
+/// short phrase from the conversation, so only near-verbatim repetition is
+/// treated as an echo.
+fn echo_reason(summary: &str, candidate: &str, where_: &str) -> Option<String> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    let prefix_len = summary
+        .chars()
+        .count()
+        .min(candidate.chars().count())
+        .min(120);
+    if prefix_len > 0
+        && summary
+            .chars()
+            .take(prefix_len)
+            .eq(candidate.chars().take(prefix_len))
+    {
+        return Some(format!(
+            "summary echoes {where_} (its first {prefix_len} characters match)"
+        ));
+    }
+    let probe: String = candidate.chars().take(200).collect();
+    if summary.contains(&probe) {
+        return Some(format!(
+            "summary echoes {where_} (it contains the start of that message)"
+        ));
+    }
+    None
+}
+
+/// Heuristic sanity gate for compaction summaries. Returns the reason when
+/// `summary` looks like a degenerate model output — DSML/tool-call markup
+/// leaked into the content, a verbatim echo of the retained context or of
+/// the compacted request tail, or a too-short stub — rather than a genuine
+/// summary. Conservative on purpose: a false positive only fails the
+/// compaction (which is retried on the next auto/manual compact), while a
+/// false negative would persist a poisoned summary into every future
+/// request.
+fn summary_looks_bogus(
+    summary: &str,
+    retained: &[Message],
+    request_tail: Option<&str>,
+) -> Option<String> {
+    let summary = summary.trim();
+    // (a) DSML / tool-call markup must never leak into summary content.
+    const MARKERS: &[&str] = &[
+        "<invoke",
+        "invoke name=",
+        "tool_calls",
+        "<tool_calls",
+        "<｜",
+    ];
+    if let Some(marker) = MARKERS.iter().find(|marker| summary.contains(**marker)) {
+        return Some(format!("summary contains tool-call/DSML markup ({marker})"));
+    }
+    // (b) The summary must not be a verbatim echo of the first retained
+    // message (the start of the current turn)…
+    if let Some(first) = retained.first().and_then(message_text).map(str::trim)
+        && let Some(reason) = echo_reason(summary, first, "the retained context")
+    {
+        return Some(reason);
+    }
+    // (b2) …nor of the request tail: the last message that was compacted.
+    // Accident shape: the model repeated the just-completed assistant turn,
+    // which sits at the end of the compacted window — not at the start of
+    // the retained one, so (b) alone cannot catch it.
+    if let Some(tail) = request_tail
+        && let Some(reason) =
+            echo_reason(summary, tail, "the request tail (last compacted message)")
+    {
+        return Some(reason);
+    }
+    // (c) A genuine summary needs at least a few sentences; a stub like
+    // "ok" or a single echoed line is not one.
+    const MIN_SUMMARY_CHARS: usize = 80;
+    if summary.chars().count() < MIN_SUMMARY_CHARS {
+        return Some(format!(
+            "summary is too short ({} characters, minimum {MIN_SUMMARY_CHARS})",
+            summary.chars().count()
+        ));
+    }
+    None
+}
+
 pub struct Agent {
     model: Box<dyn Model>,
     tools: Vec<Box<dyn Tool>>,
@@ -935,6 +1049,13 @@ impl Agent {
             .content
             .filter(|c| !c.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("compaction produced empty summary"))?;
+        if let Some(reason) = summary_looks_bogus(
+            &summary,
+            &context[split..],
+            request_tail_text(&context[..split]),
+        ) {
+            anyhow::bail!("compaction summary rejected by sanity gate: {reason}");
+        }
         Ok(CompactionOutput {
             entry: SessionEntry::Compaction {
                 summary: summary.clone(),
