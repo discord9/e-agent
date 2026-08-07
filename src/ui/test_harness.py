@@ -1976,11 +1976,52 @@ async function main(){
     const bigCard = lastCard();
     appendToolResult(false, "file edited (line 100)", state.acc, null);
     const bigRes = bigCard.querySelector(".tool-result");
+    // 预览区 = 卡片直属 diff-row（不含 .diff-full 全文区）；每侧 30 行 + 截断标记
+    const bigPrevDel = diffRowsOf(bigCard, "diff-del").filter((r) => !r.closest(".diff-full"));
+    const bigPrevAdd = diffRowsOf(bigCard, "diff-add").filter((r) => !r.closest(".diff-full"));
     chk("edit_file truncates each side to 30",
-        diffRowsOf(bigCard, "diff-del").length === 30
-        && diffRowsOf(bigCard, "diff-add").length === 30
+        bigPrevDel.length === 30 && bigPrevAdd.length === 30
         && bigRes.querySelector(".diff-more").textContent === "−… (10 more lines)",
         "more=" + JSON.stringify(bigRes.querySelector(".diff-more") && bigRes.querySelector(".diff-more").textContent));
+    // 【高】edit_file 截断 → 展开全文：expand-toggle + .diff-full（两侧剩余行），
+    // 点击展开后 old/new 全文同时可见；容器标 expandable，含复制结果按钮
+    const bigFull = bigRes.querySelector(".diff-full");
+    const bigExpandBtn = bigRes.querySelector(".expand-toggle");
+    chk("edit_file truncated diff has expand button + full rows",
+        bigRes.classList.contains("expandable") && !bigRes.classList.contains("expanded")
+        && bigExpandBtn !== null && bigExpandBtn.textContent === "展开全文（内容）"
+        && bigFull !== null
+        && bigFull.querySelectorAll(".diff-row").filter((r) => r.classList.contains("diff-del")).length === 10
+        && bigFull.querySelectorAll(".diff-row").filter((r) => r.classList.contains("diff-add")).length === 10
+        && bigFull.textContent.includes("old line 30") && bigFull.textContent.includes("new line 39"),
+        "btn=" + (bigExpandBtn && bigExpandBtn.textContent)
+        + " full=" + (bigFull ? bigFull.querySelectorAll(".diff-row").length : "null"));
+    const clicksBig = (elsById["messages"]._listeners["click"] || []);
+    for (const fn of clicksBig) fn({ target: bigExpandBtn });
+    chk("edit_file expand shows both sides full text",
+        bigRes.classList.contains("expanded")
+        && bigExpandBtn.textContent === "收起（内容）"
+        && bigFull.textContent.includes("old line 39") && bigFull.textContent.includes("new line 39"),
+        "btn=" + bigExpandBtn.textContent);
+    for (const fn of clicksBig) fn({ target: bigExpandBtn });
+    chk("edit_file collapse returns to preview",
+        !bigRes.classList.contains("expanded") && bigExpandBtn.textContent === "展开全文（内容）",
+        "btn=" + bigExpandBtn.textContent);
+    // 【高】edit_file 复制结果按钮：复制 old+new 原文（diff 的无损源文本）
+    let copiedEdit = null;
+    navigator.clipboard = { writeText: (t) => { copiedEdit = t; return Promise.resolve(); } };
+    const bigCopy = bigRes.querySelector(".copy-toggle");
+    chk("edit_file has copy-result button (diff-copy)",
+        bigCopy !== null && bigCopy.textContent === "复制结果"
+        && bigRes.classList.contains("diff-copy")
+        && bigRes.querySelector(".expand-full") !== null,
+        "btn=" + (bigCopy && bigCopy.textContent) + " cls=" + bigRes.className);
+    for (const fn of clicksBig) fn({ target: bigCopy });
+    await flush();
+    chk("edit_file copy writes old+new text",
+        copiedEdit === bigOld + "\n" + bigNew && bigCopy.textContent === "已复制",
+        "len=" + (copiedEdit == null ? "null" : copiedEdit.length) + " btn=" + bigCopy.textContent);
+    delete navigator.clipboard;
     // edit_file 出错：保持普通 err 文本，不渲染 diff
     appendToolCall("edit_file", JSON.stringify({ path: "x.txt", old: "a", new: "b" }), state.acc, null);
     const errCard = lastCard();
@@ -2053,6 +2094,23 @@ async function main(){
     chk("read_file collapse returns to preview",
         !longRes.classList.contains("expanded") && readBtn.textContent === "展开全文（内容）",
         "btn=" + readBtn.textContent);
+    // 【中】read_file 复制结果按钮：.diff-copy 右上角定位类 + 隐藏 .expand-full
+    // 原文 span（快照回退源）；点击复制完整结果文本
+    const readCopy = longRes.querySelector(".copy-toggle");
+    chk("read_file diff has copy-result button + diff-copy class",
+        readCopy !== null && readCopy.textContent === "复制结果"
+        && longRes.classList.contains("diff-copy")
+        && longRes.querySelector(".expand-full") !== null,
+        "btn=" + (readCopy && readCopy.textContent) + " cls=" + longRes.className);
+    let copiedRead = null;
+    navigator.clipboard = { writeText: (t) => { copiedRead = t; return Promise.resolve(); } };
+    for (const fn of clicksA) fn({ target: readCopy });
+    await flush();
+    chk("read_file copy writes full result text",
+        copiedRead === Array.from({ length: 40 }, (_, i) => "row " + i).join("\n")
+        && readCopy.textContent === "已复制",
+        "len=" + (copiedRead == null ? "null" : copiedRead.length));
+    delete navigator.clipboard;
     // write_file：确认行 + 全新增（+ 绿）单侧 diff，行号从 1 起
     elsById["messages"].innerHTML = "";
     state.acc = newAccumulator();
@@ -2068,6 +2126,54 @@ async function main(){
         && diffRowsOf(wCard, "diff-add")[0].querySelector(".diff-ln").textContent === "1"
         && diffRowsOf(wCard, "diff-add")[0].querySelector(".diff-text").textContent === "hello",
         "rows=" + wCard.querySelectorAll(".diff-row").length);
+    // 短 write（≤30 行）：无展开按钮，但有复制结果按钮
+    chk("write_file short content no expand, has copy",
+        wCard.querySelector(".expand-toggle") === null
+        && !wCard.querySelector(".tool-result").classList.contains("expandable")
+        && wCard.querySelector(".copy-toggle") !== null
+        && wCard.querySelector(".copy-toggle").textContent === "复制结果",
+        "expand=" + (wCard.querySelector(".expand-toggle") !== null)
+        + " copy=" + (wCard.querySelector(".copy-toggle") !== null));
+    // 【高】write_file 超 30 行：预览 + 截断 + 「展开全文（内容）」+ .diff-full 剩余行；
+    // 点击展开后全文可见；复制结果复制完整写入内容
+    elsById["messages"].innerHTML = "";
+    state.acc = newAccumulator();
+    const bigContent = Array.from({ length: 40 }, (_, i) => "w line " + i).join("\n");
+    appendToolCall("write_file", JSON.stringify({ path: "big.txt", content: bigContent }),
+      state.acc, null);
+    const wBigCard = lastCard();
+    appendToolResult(false, "file written", state.acc, null);
+    const wBigRes = wBigCard.querySelector(".tool-result");
+    const wBigExpandBtn = wBigRes.querySelector(".expand-toggle");
+    chk("write_file truncated diff has expand + full rows",
+        wBigRes.classList.contains("expandable")
+        && diffRowsOf(wBigCard, "diff-add").filter((r) => !r.closest(".diff-full")).length === 30
+        && wBigRes.querySelector(".diff-more").textContent === "+… (10 more lines)"
+        && wBigExpandBtn !== null && wBigExpandBtn.textContent === "展开全文（内容）"
+        && wBigRes.querySelector(".diff-full").querySelectorAll(".diff-row").length === 10
+        && wBigRes.querySelector(".diff-full").textContent.includes("w line 39"),
+        "btn=" + (wBigExpandBtn && wBigExpandBtn.textContent)
+        + " full=" + wBigRes.querySelector(".diff-full").querySelectorAll(".diff-row").length);
+    const clicksW = (elsById["messages"]._listeners["click"] || []);
+    for (const fn of clicksW) fn({ target: wBigExpandBtn });
+    chk("write_file expand shows full content",
+        wBigRes.classList.contains("expanded")
+        && wBigExpandBtn.textContent === "收起（内容）"
+        && wBigRes.querySelector(".diff-full").textContent.includes("w line 39"),
+        "btn=" + wBigExpandBtn.textContent);
+    for (const fn of clicksW) fn({ target: wBigExpandBtn });
+    chk("write_file collapse returns to preview",
+        !wBigRes.classList.contains("expanded") && wBigExpandBtn.textContent === "展开全文（内容）",
+        "btn=" + wBigExpandBtn.textContent);
+    let copiedWrite = null;
+    navigator.clipboard = { writeText: (t) => { copiedWrite = t; return Promise.resolve(); } };
+    const wBigCopy = wBigRes.querySelector(".copy-toggle");
+    for (const fn of clicksW) fn({ target: wBigCopy });
+    await flush();
+    chk("write_file copy writes full content",
+        wBigCopy !== null && copiedWrite === bigContent && wBigCopy.textContent === "已复制",
+        "len=" + (copiedWrite == null ? "null" : copiedWrite.length));
+    delete navigator.clipboard;
     // 空 old/new/content：不产生空红/绿 diff 行（纯新增/纯删除/空写入）
     appendToolCall("edit_file", JSON.stringify({ path: "add.txt", old: "", new: "hello\nworld" }),
       state.acc, null);
@@ -2258,6 +2364,27 @@ async function main(){
           && resText(c).includes("答案：完成")
           && r.querySelector(".tool-markdown") !== null,
           "cls=" + r.className + " text=" + JSON.stringify(resText(c)));
+    }
+    // 【中】delegate 工具结果长答案（>200 字符）：与后台完成 notice 同一
+    // 折叠形态 details.delegate-collapse（默认折叠，summary 显示字符数）；
+    // 短答案直接显示（不折叠）。两处共用 DELEGATE_COLLAPSE_THRESHOLD。
+    const dgLongAnswer = "很长的同步答案。".repeat(30);   // 210 字符 > 200
+    for (const [path, c] of [
+      ["live", liveToolResult("delegate", JSON.stringify({ task: "t", workspace: "/w", background: false }),
+        "subagent session: sub-l2\n" + dgLongAnswer, false)],
+      ["history", histToolResult("delegate", JSON.stringify({ task: "t", workspace: "/w", background: false }),
+        "subagent session: sub-l2\n" + dgLongAnswer, false)],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      const det = r.querySelector("details.delegate-collapse");
+      chk("delegate sync long answer folded (" + path + ")",
+          det !== null && !det.hasAttribute("open")
+          && det.querySelector("summary").textContent === "查看完整答案（" + dgLongAnswer.length + " 字符）"
+          && det.querySelector(".tool-markdown") !== null
+          && det.querySelector(".tool-markdown").textContent.includes("很长的同步答案。")
+          && resText(c).includes("子代理会话 sub-l2"),
+          "det=" + (det !== null) + " open=" + (det && det.hasAttribute("open"))
+          + " sum=" + JSON.stringify(det && det.querySelector("summary") && det.querySelector("summary").textContent));
     }
     // delegate 格式不匹配 → 回退原文
     const dgBad = liveToolResult("delegate", '{"task":"t","workspace":"/w"}', "unexpected output", false);

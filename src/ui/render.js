@@ -98,6 +98,9 @@ function fallbackCopyText(text) {
  * （tui/keys.rs parse_edit_arguments / parse_edited_line；渲染镜像
  * tui/state.rs push_diff_side 的 30 行/侧截断 + "… (N more lines)"）。
  * 行号列灰底右对齐、删除红/新增绿，样式在 style.css .tool-card 区。
+ * 三路径统一交互：截断时「展开全文（内容）」按钮（attachDiffExpand，
+ * expand-toggle 委托）+ 结果末尾「复制结果」按钮（attachResultCopy，
+ * 右上角绝对定位，复制结果原文）。
  * ===================================================================*/
 const DIFF_LINE_LIMIT = 30;      // 镜像 TUI push_diff_side 的每侧截断行数
 const DELEGATE_COLLAPSE_THRESHOLD = 200;  // delegate 完成答案超过该字符数时默认折叠
@@ -148,6 +151,14 @@ function cardToolName(card) {
   return nm ? nm.textContent : "";
 }
 
+/* diff 文本 → 行数组（镜像 Rust str::lines()：结尾单个空段丢弃）。
+   diffSideRows 与各 render*Diff 共用，保证预览/全文行切分一致。 */
+function diffLines(text) {
+  const lines = String(text == null ? "" : text).split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
 /* 单行 diff 行：[符号][行号][内容]。sign 空串 → 无符号列（read_file 视图）；
    lineNo null → 无行号列（页脚行 / TUI 解析失败路径）。sign 决定行的
    diff-add / diff-del 底色类（+ 绿 / - 红） */
@@ -168,9 +179,7 @@ function diffSideRows(text, sign, startLine) {
   const rows = [];
   const s = String(text == null ? "" : text);
   if (s === "") return rows;   // 空 old/new/content：不生成空红/绿 diff 行（纯新增/纯删除）
-  const lines = s.split("\n");
-  // Rust str::lines() 丢弃结尾单个空段：文本以 \n 结尾时不产生空 diff 行
-  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  const lines = diffLines(s);
   const shown = Math.min(lines.length, DIFF_LINE_LIMIT);
   for (let i = 0; i < shown; i++) {
     rows.push(diffRow(sign, startLine != null ? startLine + i : null, lines[i]));
@@ -180,31 +189,97 @@ function diffSideRows(text, sign, startLine) {
   return rows;
 }
 
+/* 文件工具结果统一控件：read_file / edit_file / write_file 结果末尾追加
+   「复制结果」按钮。按钮绝对定位到结果区右上角（.diff-copy 留出 padding-top，
+   与 maybeTruncateEl 的 .expand-copy 按钮组同款控件风格），复制正文即结果
+   原始文本（content，结构化 diff 的无损原文；_srcText 在快照往返后丢失，
+   事件委托回退到 .expand-full 隐藏的原文 span 取文本）。无论结果长短都有
+   按钮：文件内容复制是常用操作，不再依赖文本长度触发。 */
+function attachResultCopy(resEl, content) {
+  resEl.classList.add("diff-copy");
+  const copy = el("button", "copy-toggle", "复制结果");
+  copy.type = "button";
+  copy._target = resEl;
+  copy._srcText = content;
+  resEl.appendChild(copy);
+  // 原文隐藏 span：快照往返后委托回退取全文（与 maybeTruncateEl 同机制）
+  resEl.appendChild(el("span", "expand-full", content));
+}
+
+/* diff 截断展开统一控件（read/edit/write 共用）：预览区之后追加
+   「展开全文（内容）」按钮 + .diff-full 全文区（剩余行），容器标
+   .expandable（不含 .expanded）。点击走消息容器事件委托（expand-toggle
+   class 委托，与 maybeTruncateEl 同机制）；.diff-full 常驻 DOM，innerHTML
+   快照往返后仍可展开。按钮 in-flow 紧跟截断标记（diff-more 之后），
+   与右上角「复制结果」按钮位置区分（展开是内容导航，复制是操作）。 */
+function attachDiffExpand(resEl, label, fullRows) {
+  if (!fullRows.length) return;   // 未截断：无需展开
+  resEl.classList.add("expandable");
+  const btn = el("button", "expand-toggle", "展开全文（" + label + "）");
+  btn.type = "button";
+  btn._target = resEl;            // 事件委托精确定位（与 maybeTruncateEl 同机制）
+  resEl.appendChild(btn);
+  const full = el("div", "diff-full");
+  for (const r of fullRows) full.appendChild(r);
+  resEl.appendChild(full);
+}
+
 /* edit_file 结果："file edited (line N)" → 行号 N 起，- 红 / + 绿 两段 diff
-   （旧内容在上、新内容在下，镜像 TUI push_tool_result 的顺序） */
+   （旧内容在上、新内容在下，镜像 TUI push_tool_result 的顺序）。
+   单侧超 DIFF_LINE_LIMIT 行时：两侧预览 + 截断标记 + 一个「展开全文（内容）」
+   按钮（展开后两侧全文同时显示）；末尾加「复制结果」（复制两侧原文拼接）。
+   短 diff（两侧均 ≤30 行）：无展开按钮，仅「复制结果」。 */
 function renderEditDiff(resEl, args, content) {
   const line = parseEditedLine(content);
   resEl.classList.add("tool-diff");
   resEl.appendChild(el("div", "diff-head",
     "file edited" + (line != null ? " (line " + line + ")" : "")));
+  const oldLines = diffLines(args.old), newLines = diffLines(args.new);
+  const oldTrunc = oldLines.length > DIFF_LINE_LIMIT, newTrunc = newLines.length > DIFF_LINE_LIMIT;
+  if (!oldTrunc && !newTrunc) {   // 短 diff：直接全量渲染，无展开机制
+    for (const r of diffSideRows(args.old, "−", line)) resEl.appendChild(r);
+    for (const r of diffSideRows(args.new, "+", line)) resEl.appendChild(r);
+    attachResultCopy(resEl, args.old + "\n" + args.new);   // 复制 = 旧+新原文
+    return;
+  }
+  // 截断：预览（每侧前 30 行 + 截断标记）+ 展开按钮 + 全文区（剩余行）。
+  // diffSideRows 自带截断标记行（"… (N more lines)"）；全文区只放剩余行。
   for (const r of diffSideRows(args.old, "−", line)) resEl.appendChild(r);
   for (const r of diffSideRows(args.new, "+", line)) resEl.appendChild(r);
+  const full = [];
+  for (let i = DIFF_LINE_LIMIT; i < oldLines.length; i++)
+    full.push(diffRow("−", line != null ? line + i : null, oldLines[i]));
+  for (let i = DIFF_LINE_LIMIT; i < newLines.length; i++)
+    full.push(diffRow("+", line != null ? line + i : null, newLines[i]));
+  attachDiffExpand(resEl, "内容", full);
+  attachResultCopy(resEl, args.old + "\n" + args.new);
 }
 
 /* write_file 结果："file written" 确认行 + 全新增（+ 绿）单侧 diff。
    新文件内容即全部行，行号从 1 起；覆盖写时旧内容前端不可得，纯新增
-   视图即是诚实呈现（后端旧内容 marker 属后续项，不做） */
+   视图即是诚实呈现（后端旧内容 marker 属后续项，不做）。
+   超 DIFF_LINE_LIMIT 行时预览 + 截断 + 「展开全文（内容）」+ 剩余行全文区；
+   末尾加「复制结果」（复制写入的完整内容）。 */
 function renderWriteDiff(resEl, args, content) {
   resEl.classList.add("tool-diff");
   resEl.appendChild(el("div", "diff-head", content || "file written"));
   for (const r of diffSideRows(args.content, "+", 1)) resEl.appendChild(r);
+  const lines = diffLines(args.content);
+  if (lines.length > DIFF_LINE_LIMIT) {
+    const full = [];
+    for (let i = DIFF_LINE_LIMIT; i < lines.length; i++)
+      full.push(diffRow("+", 1 + i, lines[i]));
+    attachDiffExpand(resEl, "内容", full);
+  }
+  attachResultCopy(resEl, args.content);
 }
 
 /* read_file 结果 → 行号 + 内容逐行视图：行号 = args.offset（默认 1）+ 行下标；
    页脚 "[showing lines X-Y of Z; ...]" 行原样显示但不编号；纯状态输出
    （[empty file] / [offset ... past end ...]）不做行号，走普通截断。
    超过 DIFF_LINE_LIMIT 行时预览 + "… (N more lines)" + 展开全文（复用
-   expand-toggle 事件委托；全文常驻 .diff-full，快照往返后仍可展开） */
+   expand-toggle 事件委托；全文常驻 .diff-full，快照往返后仍可展开）。
+   末尾加「复制结果」（复制完整结果文本，含页脚）。 */
 const READ_STATUS_RE = /^\[(empty file|offset \d+ is past end of file \(\d+ lines\))\]$/;
 const READ_FOOTER_RE = /^\[showing lines \d+-\d+ of \d+[^\]]*\]$/;
 function renderFileView(resEl, args, content) {
@@ -218,8 +293,7 @@ function renderFileView(resEl, args, content) {
     return;
   }
   const offset = Math.max(1, parseInt(args && args.offset, 10) || 1);
-  const lines = s.split("\n");
-  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();  // 镜像 Rust lines()
+  const lines = diffLines(s);
   const rows = [];
   for (let i = 0; i < lines.length; i++) {
     const isFooter = READ_FOOTER_RE.test(lines[i].trim());
@@ -228,19 +302,13 @@ function renderFileView(resEl, args, content) {
   resEl.classList.add("tool-diff");
   if (rows.length <= DIFF_LINE_LIMIT) {
     for (const r of rows) resEl.appendChild(r);
+    attachResultCopy(resEl, s);
     return;
   }
-  resEl.classList.add("expandable");
   for (const r of rows.slice(0, DIFF_LINE_LIMIT)) resEl.appendChild(r);
   resEl.appendChild(el("div", "diff-more", "… (" + (rows.length - DIFF_LINE_LIMIT) + " more lines)"));
-  // 展开按钮紧跟预览区（截断标记之后、全文之前）：不依赖滚动到内容底部即可发现
-  const btn = el("button", "expand-toggle", "展开全文（内容）");
-  btn.type = "button";
-  btn._target = resEl;      // 事件委托精确定位（与 maybeTruncateEl 同机制）
-  resEl.appendChild(btn);
-  const full = el("div", "diff-full");
-  for (const r of rows.slice(DIFF_LINE_LIMIT)) full.appendChild(r);
-  resEl.appendChild(full);
+  attachDiffExpand(resEl, "内容", rows.slice(DIFF_LINE_LIMIT));
+  attachResultCopy(resEl, s);
 }
 
 /* 文件工具结果渲染入口：edit_file → diff、read_file → 行号视图、write_file →
@@ -289,7 +357,11 @@ function renderSearchResult(resEl, content) {
    - 后台启动回执 "started background task N: label\nsubagent session: sub-…" →
      「后台运行 任务 #N label」+ 「子代理会话 sub-…」
    - 同步完成 "subagent session: sub-…\n<答案>" → 「子代理会话 sub-…」+ 答案 markdown
-   - 不匹配回退原文（错误正文由 isError 分支走 renderPlainResult，保持完整可复制） */
+   - 不匹配回退原文（错误正文由 isError 分支走 renderPlainResult，保持完整可复制）。
+   长答案（>DELEGATE_COLLAPSE_THRESHOLD）默认折叠进 details.delegate-collapse
+   （与 appendBackgroundCompletion 的 delegate 完成 notice 同一折叠形态）：
+   markdown 答案整体隐藏、summary 「查看完整答案（N 字符）」点击展开；
+   短答案直接显示，避免「已完成」这类短回复也要点开。 */
 function renderDelegateResult(resEl, content) {
   const s = String(content == null ? "" : content);
   const bg = /^started background task (\d+): ([^\n]*)\nsubagent session: ([^\n]+)$/.exec(s);
@@ -313,7 +385,14 @@ function renderDelegateResult(resEl, content) {
     if (done[2]) {
       const md = el("div", "tool-markdown");
       md.innerHTML = renderMarkdown(done[2]);
-      wrap.appendChild(md);
+      if (done[2].length <= DELEGATE_COLLAPSE_THRESHOLD) {
+        wrap.appendChild(md);
+      } else {
+        const det = el("details", "delegate-collapse");
+        det.open = false;                     // 默认折叠
+        det.append(el("summary", "", "查看完整答案（" + done[2].length + " 字符）"), md);
+        wrap.appendChild(det);
+      }
     }
     resEl.appendChild(wrap);
     return;
@@ -985,7 +1064,8 @@ function appendBackgroundCompletion(id, label, output) {
     md.innerHTML = renderMarkdown(m[2]);
     // delegate 答案：长答案（>200 字符）默认折叠——包进 details.delegate-collapse
     // （不 open），summary 显示字符数，点击展开；短答案直接展开显示，避免
-    // 「已完成」这类短回复也要点开
+    // 「已完成」这类短回复也要点开。与 renderDelegateResult（delegate 工具
+    // 结果）同一折叠形态（details.delegate-collapse + 相同 summary 文案）。
     if (m[2].length <= DELEGATE_COLLAPSE_THRESHOLD) {
       n.appendChild(md);
     } else {

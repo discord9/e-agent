@@ -671,6 +671,24 @@
   .tool-card .tool-result.tool-diff.expandable .diff-full { display: none; }
   .tool-card .tool-result.tool-diff.expandable.expanded .diff-full { display: block; }
   .tool-card .tool-result.tool-diff.expandable.expanded .diff-more { display: none; }
+  /* 「复制结果」按钮（attachResultCopy）：read/edit/write 三路径统一——
+     容器标 .diff-copy（position:relative + padding-top 让出按钮行），按钮
+     绝对定位到结果区右上角（与 maybeTruncateEl .expand-copy 按钮组同款
+     控件风格，仅单个按钮）。_srcText expando 存原文；快照往返后委托回退到
+     隐藏的 .expand-full span 取全文（该 span 常驻 DOM、随快照序列化）。 */
+  .tool-card .tool-result.tool-diff.diff-copy {
+    position: relative;
+    padding-top: 26px;      /* 顶部让出按钮行，避免压住首行内容 */
+  }
+  .tool-card .tool-result.tool-diff.diff-copy .copy-toggle {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    margin: 0;
+    z-index: 1;
+  }
+  /* diff 容器的隐藏原文 span（copy 回退源）：不在视图中显示 */
+  .tool-card .tool-result.tool-diff .expand-full { display: none; }
 
   /* ---------- 工具参数紧凑渲染（文件工具 / web_search / delegate / bash 等） ----------
      主行（图标+路径/命令）+ 可选 chips；全部 textContent 渲染，无注入风险 */
@@ -839,17 +857,20 @@
   }
   .notice.delegate-complete .delegate-label { color: var(--base01); }
 
-  /* delegate 长答案折叠（appendBackgroundCompletion 的 details.delegate-collapse）：
-     沿用 details.thinking/.older-collapse 的折叠风格——小字号 summary、隐藏
-     默认 marker、自定义三角箭头（展开时旋转 90°），与 notice 布局协调 */
-  .notice.delegate-complete .delegate-collapse {
+  /* delegate 长答案折叠（details.delegate-collapse）：两处共用同一形态——
+     appendBackgroundCompletion 的 delegate 完成 notice + renderDelegateResult
+     的 delegate 工具结果。沿用 details.thinking/.older-collapse 的折叠风格——
+     小字号 summary、隐藏默认 marker、自定义三角箭头（展开时旋转 90°）。
+     选择器不限定 .notice 前缀：工具结果卡里（.tool-result.delegate-result）
+     也复用同款折叠样式。 */
+  .delegate-collapse {
     flex-shrink: 0;
     margin: 2px 0 0;
     border-left: 2px solid var(--blue);
     padding-left: 8px;
     font-size: 12px;
   }
-  .notice.delegate-complete .delegate-collapse summary {
+  .delegate-collapse summary {
     display: flex;
     align-items: center;
     gap: 6px;
@@ -858,8 +879,8 @@
     color: var(--blue);
     font-size: 12px;
   }
-  .notice.delegate-complete .delegate-collapse summary::-webkit-details-marker { display: none; }
-  .notice.delegate-complete .delegate-collapse summary::before {
+  .delegate-collapse summary::-webkit-details-marker { display: none; }
+  .delegate-collapse summary::before {
     content: "";
     width: 0;
     height: 0;
@@ -869,8 +890,8 @@
     border-bottom: 5px solid transparent;
     transition: transform 0.15s;
   }
-  .notice.delegate-complete .delegate-collapse[open] summary::before { transform: rotate(90deg); }
-  .notice.delegate-complete .delegate-collapse .tool-markdown { margin-top: 4px; }
+  .delegate-collapse[open] summary::before { transform: rotate(90deg); }
+  .delegate-collapse .tool-markdown { margin-top: 4px; }
 
   .notice {
     flex-shrink: 0;
@@ -961,10 +982,11 @@
   }
 
   /* 「复制全文」按钮 + 右上角按钮组（render.js maybeTruncateEl 长文本分支）：
-     容器标 .expand-copy（diff 展开路径 renderFileView 不标，保持原布局）；
-     展开/复制按钮绝对定位到正文区域右上角，正文第一行让出顶部留白
-     （padding-top）避免被按钮压住。.expandable.expanded 展开全文时按钮组
-     仍可见（绝对定位不随预览/全文切换隐藏）。 */
+     容器标 .expand-copy；展开/复制按钮绝对定位到正文区域右上角，正文第一行
+     让出顶部留白（padding-top）避免被按钮压住。.expandable.expanded 展开全文
+     时按钮组仍可见（绝对定位不随预览/全文切换隐藏）。文件工具 diff 结果
+     （tool-diff）不走 .expand-copy，用独立的 .diff-copy（见 tool-card 区）：
+     单「复制结果」按钮右上角，展开按钮 in-flow 紧跟截断标记。 */
   .expandable.expand-copy {
     position: relative;
     padding-top: 26px;
