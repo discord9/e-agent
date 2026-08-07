@@ -23,10 +23,12 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
   container.textContent = "";
   container.classList.add("expandable", "expand-copy");
   const preview = el("span", "expand-preview", s.slice(0, n) + "\n… ");
-  // 展开按钮 in-flow 紧跟截断标记（preview 之后，与文件工具 diff 的
-  // .diff-more 展开按钮同形态）：正文里预览/全文互斥显示，按钮始终可见。
-  // 点击走消息容器事件委托（sse.js）：切换 .expanded、预览/全文互换、文案
-  // 展开⇄收起。
+  // 展开按钮 in-flow（与文件工具 diff 的 .diff-more 展开按钮同形态），DOM
+  // 顺序在隐藏全文之后：折叠态 full display:none 不占位，按钮视觉上紧跟
+  // 截断标记（preview 之后）；展开态 full 显示，按钮自然落在全文末尾
+  // （阅读流终点可收起），而不是停在全文头部压住第一行。正文里预览/全文
+  // 互斥显示，按钮始终可见。点击走消息容器事件委托（sse.js）：切换
+  // .expanded、预览/全文互换、文案展开⇄收起。
   const btn = el("button", "expand-toggle", "展开全文" + (label ? "（" + label + "）" : ""));
   btn.type = "button";
   // 记住按钮控制的正文 pre：卡片里可能有多个 .expandable（args/result），
@@ -48,10 +50,12 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
   copy._target = container;
   copy._srcText = s;
   const full = el("span", "expand-full", s);
-  // 顺序：预览（截断标记）→ 展开按钮（in-flow）→ 隐藏全文 → 复制按钮
-  // （绝对定位，DOM 位置不影响视觉）。footerEl 保留为兼容参数
+  // 顺序：预览（截断标记）→ 隐藏全文 → 展开按钮（in-flow）→ 复制按钮
+  // （绝对定位，DOM 位置不影响视觉）。按钮放在全文之后：折叠态全文
+  // display:none 不占位，按钮视觉紧跟截断标记；展开态全文显示，按钮
+  // 跟随全文末尾（不在全文头部压住第一行）。footerEl 保留为兼容参数
   // （当前无调用传它）：按钮移入 footer 框。
-  container.append(preview, btn, full, copy);
+  container.append(preview, full, btn, copy);
   if (footerEl) {
     footerEl.appendChild(btn);
     footerEl.appendChild(copy);

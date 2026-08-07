@@ -1804,17 +1804,19 @@ async function main(){
     chk("A expand button inside pre",
         resPreA._children.some((c) => c instanceof El && c._classes && c._classes.has("expand-toggle")),
         "in-pre=" + resPreA._children.filter((c) => c instanceof El).map((c) => c._className).join(","));
-    // 展开按钮 in-flow：紧跟截断标记（preview 之后、隐藏全文之前），非绝对
-    // 定位（无 position 样式）；复制按钮（.copy-toggle）仍在容器内但 DOM 顺序
-    // 靠后（CSS 绝对定位右上角）——与文件工具 diff（.diff-more 展开按钮）同形态
+    // 展开按钮 in-flow：DOM 顺序在隐藏全文之后（preview → full → btn →
+    // copy），非绝对定位（无 position 样式）——折叠态全文 display:none 不
+    // 占位，按钮视觉紧跟截断标记；展开态全文显示，按钮落在全文末尾（不在
+    // 全文头部）。复制按钮（.copy-toggle）仍在容器内但 DOM 顺序靠后（CSS
+    // 绝对定位右上角）——与文件工具 diff（.diff-more 展开按钮）同形态
     const aKids = resPreA._children.filter((c) => c instanceof El);
     const aKidIdx = (cls) => aKids.findIndex((c) => c._classes && c._classes.has(cls));
-    chk("A expand button in-flow right after preview",
+    chk("A expand button in-flow after full text",
         aKidIdx("expand-preview") !== -1 && aKidIdx("expand-toggle") !== -1
         && aKidIdx("expand-full") !== -1 && aKidIdx("copy-toggle") !== -1
-        && aKidIdx("expand-toggle") === aKidIdx("expand-preview") + 1
-        && aKidIdx("expand-toggle") < aKidIdx("expand-full")
-        && aKidIdx("expand-full") < aKidIdx("copy-toggle"),
+        && aKidIdx("expand-preview") < aKidIdx("expand-full")
+        && aKidIdx("expand-toggle") === aKidIdx("expand-full") + 1
+        && aKidIdx("expand-toggle") < aKidIdx("copy-toggle"),
         "kids=" + aKids.map((c) => c._className).join(","));
     const clicksA = (elsById["messages"]._listeners["click"] || []);
     // footer 里有两个展开按钮（args + result）：取控制 resPreA 的那个

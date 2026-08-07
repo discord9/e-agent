@@ -983,10 +983,12 @@
 
   /* 「复制全文」图标按钮（render.js maybeTruncateEl 长文本分支）：容器标
      .expand-copy；复制按钮（图标）绝对定位到正文区域右上角，正文第一行
-     让出顶部留白（padding-top）避免被按钮压住。展开按钮 in-flow 紧跟截断
-     标记（预览 .expand-preview 之后，与文件工具 diff 的 .diff-more 展开
-     按钮同形态），不再绝对定位。.expandable.expanded 展开全文时复制按钮仍
-     可见（绝对定位不随预览/全文切换隐藏），展开按钮 in-flow 跟随正文。
+     让出顶部留白（padding-top）避免被按钮压住。展开按钮 in-flow，DOM 顺序
+     在隐藏全文（.expand-full）之后：折叠态全文不占位、按钮视觉紧跟截断标记
+     （预览 .expand-preview 之后，与文件工具 diff 的 .diff-more 展开按钮同
+     形态）；展开态全文显示、按钮跟随全文末尾（阅读流终点可收起），不压住
+     全文第一行。.expandable.expanded 展开全文时复制按钮仍可见（绝对定位
+     不随预览/全文切换隐藏）。
      文件工具 diff 结果（tool-diff）不走 .expand-copy，用独立的 .diff-copy
      （见 tool-card 区）：单「复制结果」按钮右上角。 */
   .expandable.expand-copy {
