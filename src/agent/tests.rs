@@ -2192,6 +2192,236 @@ async fn compaction_rejects_summary_echoing_request_tail_assistant() {
         "unexpected error: {error}"
     );
 }
+
+/// Assert every Assistant tool_call in `messages` has a matching Tool result
+/// and every Tool result has its Assistant tool_call inside the window.
+fn assert_complete_tool_pairs(messages: &[Message]) {
+    let mut outstanding: Vec<String> = Vec::new();
+    for message in messages {
+        match message {
+            Message::Assistant(assistant) => {
+                outstanding.extend(assistant.tool_calls.iter().map(|call| call.id.clone()));
+            }
+            Message::Tool { call_id, .. } => {
+                let position = outstanding
+                    .iter()
+                    .position(|id| id == call_id)
+                    .unwrap_or_else(|| panic!("tool result {call_id} without a pending call"));
+                outstanding.remove(position);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        outstanding.is_empty(),
+        "unanswered tool calls in retained tail: {outstanding:?}"
+    );
+}
+
+#[tokio::test]
+async fn single_user_session_compacts_tool_history() {
+    // Subagent sessions carry exactly one User message (the initial task);
+    // everything after it is a tool loop. Compaction must compact the whole
+    // tool history and retain a tail of recent tool pairs (starting on an
+    // Assistant) instead of bailing with "nothing to compact".
+    let summary = "The initial task was to implement the subagent compaction fix and verify it with the four required commands. The session then executed many tool calls through bash, building the project, running the linter and the test suite, and iterating on failures until the final checks passed.";
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some(summary.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    let mut history = vec![
+        Message::User {
+            content: "initial subagent task".into(),
+            images: vec![],
+        }
+        .into(),
+    ];
+    for i in 0..30 {
+        history.push(
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![call(&format!("call-{i}"), "bash", r#"{"cmd":"x"}"#)],
+                reasoning: None,
+            })
+            .into(),
+        );
+        history.push(
+            Message::Tool {
+                call_id: format!("call-{i}"),
+                name: "bash".into(),
+                content: format!("result {i}"),
+                is_error: false,
+                synthetic: false,
+            }
+            .into(),
+        );
+    }
+    agent.restore_history(history);
+    let output = agent.prepare_compaction().await.unwrap();
+    assert_eq!(output.summary, summary);
+    let SessionEntry::Compaction {
+        summary: s,
+        retained,
+    } = output.entry
+    else {
+        panic!("expected compaction entry");
+    };
+    assert_eq!(s, summary);
+    // The retained tail starts on an Assistant and holds complete tool pairs.
+    assert!(
+        matches!(retained.first(), Some(Message::Assistant(_))),
+        "retained tail must start on an Assistant, got {:?}",
+        retained.first()
+    );
+    assert!(retained.len() <= RETAIN_TAIL);
+    assert_complete_tool_pairs(&retained);
+    // The compaction request covered the whole tool history: it opens with
+    // the initial task and ends with the summary prompt.
+    let calls = requests.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(matches!(
+        calls[0].first(),
+        Some(Message::User { content, .. }) if content == "initial subagent task"
+    ));
+    assert!(matches!(
+        calls[0].last().unwrap(),
+        Message::User { content, .. } if content.contains("Summarize the earlier conversation")
+    ));
+}
+
+#[tokio::test]
+async fn single_user_retained_tail_adjusts_onto_an_assistant_boundary() {
+    // When the RETAIN_TAIL cut lands on a Tool result, the retained tail
+    // must still start on the next Assistant so tool pairs stay complete
+    // and the compacted window ends on a finished tool pair.
+    let summary = "The initial task asked for the compaction change; the assistant ran the full verification loop through bash, building and testing repeatedly, and the final assistant turn reported the results without further tool calls.";
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some(summary.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    let mut history = vec![
+        Message::User {
+            content: "task".into(),
+            images: vec![],
+        }
+        .into(),
+    ];
+    for i in 0..21 {
+        history.push(
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![call(&format!("call-{i}"), "bash", r#"{}"#)],
+                reasoning: None,
+            })
+            .into(),
+        );
+        history.push(
+            Message::Tool {
+                call_id: format!("call-{i}"),
+                name: "bash".into(),
+                content: format!("result {i}"),
+                is_error: false,
+                synthetic: false,
+            }
+            .into(),
+        );
+    }
+    history.push(
+        Message::Assistant(AssistantMessage {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    );
+    agent.restore_history(history);
+    let output = agent.prepare_compaction().await.unwrap();
+    let SessionEntry::Compaction { retained, .. } = output.entry else {
+        panic!("expected compaction entry");
+    };
+    assert!(
+        matches!(retained.first(), Some(Message::Assistant(_))),
+        "retained tail must start on an Assistant, got {:?}",
+        retained.first()
+    );
+    // The cut landed on call-11's Tool result; the retained tail starts at
+    // the following Assistant (call-12).
+    assert!(matches!(
+        retained.first(),
+        Some(Message::Assistant(assistant))
+            if assistant.tool_calls == vec![call("call-12", "bash", r#"{}"#)]
+    ));
+    assert_complete_tool_pairs(&retained);
+}
+
+#[tokio::test]
+async fn single_user_session_too_short_still_refuses() {
+    // A short single-task history (fewer messages than the retained tail)
+    // still bails: nothing would be left to compact.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests,
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    let mut history = vec![
+        Message::User {
+            content: "short task".into(),
+            images: vec![],
+        }
+        .into(),
+    ];
+    for i in 0..3 {
+        history.push(
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![call(&format!("call-{i}"), "bash", r#"{}"#)],
+                reasoning: None,
+            })
+            .into(),
+        );
+        history.push(
+            Message::Tool {
+                call_id: format!("call-{i}"),
+                name: "bash".into(),
+                content: format!("result {i}"),
+                is_error: false,
+                synthetic: false,
+            }
+            .into(),
+        );
+    }
+    agent.restore_history(history);
+    assert!(
+        agent
+            .compact()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("nothing to compact")
+    );
+}
 #[tokio::test]
 async fn switching_back_to_vision_restores_images_in_requests() {
     // A non-vision round strips the image from the request only; history

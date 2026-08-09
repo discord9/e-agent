@@ -11,6 +11,13 @@ use tokio::sync::mpsc;
 /// (commit 92159c7) recognized these placeholders by this literal text.
 const INTERRUPTED: &str = "[turn interrupted before a tool result was produced]";
 
+/// Number of most-recent messages kept verbatim when compacting a
+/// single-task (subagent) session whose only User message is the initial
+/// prompt. Such sessions have no "conversation before the current turn", so
+/// the compaction window becomes everything except this recent tail of tool
+/// activity, which keeps the agent working after the compaction.
+const RETAIN_TAIL: usize = 20;
+
 /// Insert a synthetic error result for every tool call left unanswered by an
 /// interrupted turn (cancel, provider error, crash), so the derived context
 /// always satisfies the provider's tool_call/tool-result pairing rule.
@@ -536,9 +543,9 @@ fn message_text(message: &Message) -> Option<&str> {
 }
 
 /// Text of the last non-prompt message in the compacted request window —
-/// the message immediately before the retained turn (an assistant's content
-/// or a tool result). User/system prompts are skipped so the scan does not
-/// pick up the summary-request prompt itself, and the earlier
+/// the message immediately before the retained window (an assistant's
+/// content or a tool result). User/system prompts are skipped so the scan
+/// does not pick up the summary-request prompt itself, and the earlier
 /// "nothing to compact" check guarantees at least one assistant/tool
 /// message exists in the window.
 fn request_tail_text(messages: &[Message]) -> Option<&str> {
@@ -995,18 +1002,54 @@ impl Agent {
 
     pub(crate) async fn prepare_compaction(&mut self) -> anyhow::Result<CompactionOutput> {
         let context = self.context();
-        let Some(split) = context
+        let Some(last_user) = context
             .iter()
             .rposition(|message| matches!(message, Message::User { .. }))
         else {
             anyhow::bail!("nothing to compact");
         };
-        if split == 0 {
-            anyhow::bail!("nothing to compact");
-        }
+        // `split` is the retained-tail start: everything before it is
+        // compacted, everything from it on stays verbatim in the context.
+        let split = if last_user > 0 {
+            // Main-agent sessions: the current turn starts at the last user
+            // message; compact everything before it and keep that turn
+            // verbatim.
+            last_user
+        } else {
+            // Subagent sessions are single-task: the only User message is
+            // the initial prompt (index 0) and the rest of the history is a
+            // tool-call loop, so there is no "conversation before the
+            // current turn" to compact. Compact everything except a
+            // retained tail of the most recent tool activity.
+            let start = context.len().saturating_sub(RETAIN_TAIL);
+            if start == 0 {
+                // The whole context fits in the retained tail — nothing
+                // left to compact.
+                anyhow::bail!("nothing to compact");
+            }
+            // The retained tail must start on an Assistant message so every
+            // retained Tool result has a matching tool_call in the window
+            // (and the compacted window ends on a completed tool pair).
+            // Scan forward from the cut for the first Assistant; if the tail
+            // window contains none (degenerate all-Tool tail), extend the
+            // search backward to the nearest Assistant.
+            match context[start..]
+                .iter()
+                .position(|message| matches!(message, Message::Assistant(_)))
+            {
+                Some(offset) => start + offset,
+                None => match context[..start]
+                    .iter()
+                    .rposition(|message| matches!(message, Message::Assistant(_)))
+                {
+                    Some(index) => index,
+                    None => anyhow::bail!("nothing to compact"),
+                },
+            }
+        };
         // Skip the context prefix (System messages) — only compact if
         // there is actual conversation history (at least one assistant or
-        // tool message) before the retained user turn.
+        // tool message) before the retained window.
         if !context[..split]
             .iter()
             .any(|msg| matches!(msg, Message::Assistant(_) | Message::Tool { .. }))
@@ -1152,10 +1195,10 @@ impl Agent {
         // Non-vision models cannot consume image parts. Strip them from the
         // *request* only, so the wire gate never rejects the whole history
         // and the session is not locked (this is the fallback that lets
-        // sessions with legacy image-bearing history — e.g. split==0 where
-        // compaction cannot run — keep working). The persisted history is
-        // untouched: switching back to a vision model restores the images
-        // on the next request.
+        // sessions with legacy image-bearing history — e.g. short
+        // single-task histories where compaction cannot run — keep
+        // working). The persisted history is untouched: switching back to a
+        // vision model restores the images on the next request.
         if !self.model.supports_vision() {
             strip_images(&mut context);
         }
