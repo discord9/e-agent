@@ -417,6 +417,22 @@ struct Thinking {
     r#type: &'static str,
 }
 
+/// A persisted assistant message with neither content nor tool calls is a
+/// half-finished stream artifact (the provider silently dropped the
+/// connection after reasoning-only deltas). Sending it makes the provider
+/// reject the whole request with a permanent 400, so strip it on the wire to
+/// rescue already-poisoned sessions. Safe: such a message necessarily has no
+/// tool calls, so no later `tool` message depends on it (tool messages pair
+/// by call_id), and reasoning is never replayed to the provider anyway
+/// (AGENTS.md), so filtering loses no information.
+fn is_poisoned_assistant(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Assistant(assistant)
+            if assistant.content.is_none() && assistant.tool_calls.is_empty()
+    )
+}
+
 impl<'a> ChatRequest<'a> {
     fn from_internal(
         model: &str,
@@ -436,6 +452,7 @@ impl<'a> ChatRequest<'a> {
                 .map(|_| Thinking { r#type: "enabled" }),
             messages: messages
                 .iter()
+                .filter(|message| !is_poisoned_assistant(message))
                 .map(|message| WireMessage::from_internal(message, image_store))
                 .collect(),
             tools: tools
@@ -622,6 +639,14 @@ fn build_assistant(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // A stream that ended with neither content nor tool calls is a
+    // half-finished turn (e.g. the provider silently dropped the connection
+    // after reasoning-only deltas). Building an assistant message anyway
+    // would persist a message the provider later rejects with a permanent
+    // 400, so bail and let the caller's retry/error path handle it instead.
+    if content.is_empty() && tool_calls.is_empty() {
+        anyhow::bail!("provider stream ended without content or tool calls (incomplete turn)");
+    }
     Ok((
         AssistantMessage {
             content: (!content.is_empty()).then_some(content),

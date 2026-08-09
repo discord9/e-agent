@@ -262,6 +262,122 @@ fn wire_messages_never_echo_reasoning() {
     assert!(message.get("reasoning_content").is_none());
 }
 
+#[test]
+fn build_assistant_rejects_reasoning_only_half_messages() {
+    let error = build_assistant("".into(), "truncated thinking".into(), vec![], None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("without content or tool calls"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn build_assistant_accepts_content_or_tool_calls() {
+    let (with_content, _) =
+        build_assistant("hello".into(), "thinking".into(), vec![], None).unwrap();
+    assert_eq!(with_content.content.as_deref(), Some("hello"));
+    assert_eq!(with_content.reasoning.as_deref(), Some("thinking"));
+    assert!(with_content.tool_calls.is_empty());
+
+    let (with_tool_call, _) = build_assistant(
+        "".into(),
+        "thinking".into(),
+        vec![AccumulatedToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"pwd"}"#.into(),
+        }],
+        None,
+    )
+    .unwrap();
+    assert!(with_tool_call.content.is_none());
+    assert_eq!(with_tool_call.tool_calls.len(), 1);
+    assert_eq!(with_tool_call.tool_calls[0].name, "bash");
+}
+
+#[test]
+fn build_assistant_still_rejects_incomplete_tool_calls() {
+    let error = build_assistant(
+        "".into(),
+        "".into(),
+        vec![AccumulatedToolCall {
+            id: "call-1".into(),
+            name: "".into(),
+            arguments: "{}".into(),
+        }],
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("incomplete tool call"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn is_poisoned_assistant_detects_only_empty_content_and_tool_calls() {
+    assert!(is_poisoned_assistant(&Message::Assistant(
+        AssistantMessage {
+            content: None,
+            tool_calls: vec![],
+            reasoning: Some("truncated".into()),
+        }
+    )));
+    assert!(!is_poisoned_assistant(&Message::Assistant(
+        AssistantMessage {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        }
+    )));
+    assert!(!is_poisoned_assistant(&Message::Assistant(
+        AssistantMessage {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning: None,
+        }
+    )));
+    assert!(!is_poisoned_assistant(&Message::User {
+        content: "hello".into(),
+        images: vec![],
+    }));
+}
+
+#[test]
+fn from_internal_filters_poisoned_assistant_messages() {
+    let request = ChatRequest::from_internal(
+        "test-model",
+        None,
+        false,
+        &[
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![],
+                reasoning: Some("truncated".into()),
+            }),
+            Message::Assistant(AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        ],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let messages = value["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["content"], "done");
+    assert!(messages[0].get("tool_calls").is_none());
+}
+
 #[tokio::test]
 async fn request_times_out_when_server_stalls() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
