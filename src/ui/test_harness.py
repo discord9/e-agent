@@ -2010,6 +2010,16 @@ async function main(){
     // 点击展开后 old/new 全文同时可见；容器标 expandable，含复制结果按钮
     const bigFull = bigRes.querySelector(".diff-full");
     const bigExpandBtn = bigRes.querySelector(".expand-toggle");
+    // 【新增】统一模板后 DOM 顺序：preview/diff-more → diff-full → expand-toggle → copy
+    const bigKids = bigRes._children.filter((c) => c instanceof El);
+    const bigKidIdx = (cls) => bigKids.findIndex((c) => c._classes && c._classes.has(cls));
+    chk("edit_file expand button after diff-full, before copy",
+        bigKidIdx("diff-full") !== -1 && bigKidIdx("expand-toggle") !== -1
+        && bigKidIdx("copy-toggle") !== -1
+        && bigKidIdx("diff-full") < bigKidIdx("expand-toggle")
+        && bigKidIdx("expand-toggle") < bigKidIdx("copy-toggle"),
+        "full=" + bigKidIdx("diff-full") + " btn=" + bigKidIdx("expand-toggle")
+        + " copy=" + bigKidIdx("copy-toggle"));
     chk("edit_file truncated diff has expand button + full rows",
         bigRes.classList.contains("expandable") && !bigRes.classList.contains("expanded")
         && bigExpandBtn !== null && bigExpandBtn.textContent === "展开全文（内容）"
@@ -2110,13 +2120,17 @@ async function main(){
         && longRes.querySelector(".diff-full").querySelectorAll(".diff-row").length === 10
         && longRes.querySelector(".diff-more").textContent === "… (10 more lines)",
         "total=" + longCard.querySelectorAll(".diff-row").length);
-    // 展开按钮可发现性：紧跟预览区（截断标记之后）、全文之前——不依赖滚动到底
+    // 展开按钮可发现性：统一模板后 DOM 顺序 diff-more → diff-full → expand-toggle → copy
     const _kids = longRes._children.filter((c) => c instanceof El);
     const _kidIdx = (cls) => _kids.findIndex((c) => c._classes && c._classes.has(cls));
-    chk("read_file expand button after preview, before full",
-        _kidIdx("diff-more") !== -1 && _kidIdx("expand-toggle") !== -1 && _kidIdx("diff-full") !== -1
-        && _kidIdx("diff-more") < _kidIdx("expand-toggle") && _kidIdx("expand-toggle") < _kidIdx("diff-full"),
-        "more=" + _kidIdx("diff-more") + " btn=" + _kidIdx("expand-toggle") + " full=" + _kidIdx("diff-full"));
+    chk("read_file expand button after diff-full, before copy",
+        _kidIdx("diff-more") !== -1 && _kidIdx("diff-full") !== -1
+        && _kidIdx("expand-toggle") !== -1 && _kidIdx("copy-toggle") !== -1
+        && _kidIdx("diff-more") < _kidIdx("diff-full")
+        && _kidIdx("diff-full") < _kidIdx("expand-toggle")
+        && _kidIdx("expand-toggle") < _kidIdx("copy-toggle"),
+        "more=" + _kidIdx("diff-more") + " full=" + _kidIdx("diff-full")
+        + " btn=" + _kidIdx("expand-toggle") + " copy=" + _kidIdx("copy-toggle"));
     const readBtn = longRes.querySelector(".expand-toggle");
     for (const fn of clicksA) fn({ target: readBtn });
     chk("read_file expand shows all rows",
@@ -2186,6 +2200,16 @@ async function main(){
     appendToolResult(false, "file written", state.acc, null);
     const wBigRes = wBigCard.querySelector(".tool-result");
     const wBigExpandBtn = wBigRes.querySelector(".expand-toggle");
+    // 【新增】统一模板后 DOM 顺序：preview/diff-more → diff-full → expand-toggle → copy
+    const wBigKids = wBigRes._children.filter((c) => c instanceof El);
+    const wBigKidIdx = (cls) => wBigKids.findIndex((c) => c._classes && c._classes.has(cls));
+    chk("write_file expand button after diff-full, before copy",
+        wBigKidIdx("diff-full") !== -1 && wBigKidIdx("expand-toggle") !== -1
+        && wBigKidIdx("copy-toggle") !== -1
+        && wBigKidIdx("diff-full") < wBigKidIdx("expand-toggle")
+        && wBigKidIdx("expand-toggle") < wBigKidIdx("copy-toggle"),
+        "full=" + wBigKidIdx("diff-full") + " btn=" + wBigKidIdx("expand-toggle")
+        + " copy=" + wBigKidIdx("copy-toggle"));
     chk("write_file truncated diff has expand + full rows",
         wBigRes.classList.contains("expandable")
         && diffRowsOf(wBigCard, "diff-add").filter((r) => !r.closest(".diff-full")).length === 30

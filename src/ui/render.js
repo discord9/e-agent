@@ -8,6 +8,22 @@
  * 等）；被 sessions.js/tasks.js/sse.js 调用。
  * =============================================================================*/
 
+/* 展开/收起统一模板（所有「展开全文」按钮的唯一创建入口）：
+   创建 .expand-toggle 按钮，文案「展开全文（label）」或「展开全文」，
+   设 _target=container（事件委托精确定位），追加到 container 末尾。
+   调用方须先把 full 内容（.expand-full / .diff-full）append 进 container，
+   再调用本函数——这样 DOM 顺序为 preview → full → btn：
+   - 折叠态：full display:none 不占位，按钮视觉紧跟截断标记（preview / diff-more）
+   - 展开态：full 显示，按钮自然落在全文末尾（阅读流终点可收起），不在全文头部
+   事件委托（sse.js）按 .expand-toggle class + _target 定位，DOM 顺序无关。 */
+function attachExpandToggle(container, label) {
+  const btn = el("button", "expand-toggle", "展开全文" + (label ? "（" + label + "）" : ""));
+  btn.type = "button";
+  btn._target = container;
+  container.appendChild(btn);
+  return btn;
+}
+
 /* 长内容「预览 + 展开全文」辅助（Solarized Light 一致，文本可选中复制）：
    内容 ≤ threshold 直出（不增加任何交互成本）；超过则渲染截断预览 +
    「展开全文」按钮（箭头由 CSS ::after 绘制），完整文本以隐藏 span 常驻 DOM（display:none），
@@ -23,17 +39,10 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
   container.textContent = "";
   container.classList.add("expandable", "expand-copy");
   const preview = el("span", "expand-preview", s.slice(0, n) + "\n… ");
-  // 展开按钮 in-flow（与文件工具 diff 的 .diff-more 展开按钮同形态），DOM
-  // 顺序在隐藏全文之后：折叠态 full display:none 不占位，按钮视觉上紧跟
-  // 截断标记（preview 之后）；展开态 full 显示，按钮自然落在全文末尾
-  // （阅读流终点可收起），而不是停在全文头部压住第一行。正文里预览/全文
-  // 互斥显示，按钮始终可见。点击走消息容器事件委托（sse.js）：切换
-  // .expanded、预览/全文互换、文案展开⇄收起。
-  const btn = el("button", "expand-toggle", "展开全文" + (label ? "（" + label + "）" : ""));
-  btn.type = "button";
-  // 记住按钮控制的正文 pre：卡片里可能有多个 .expandable（args/result），
-  // 事件委托用这个引用精确定位，而不是就近找第一个
-  btn._target = container;
+  const full = el("span", "expand-full", s);
+  container.append(preview, full);
+  // 展开按钮：统一模板，追加到 container 末尾（full 之后）
+  const btn = attachExpandToggle(container, label);
   // 「复制全文」图标按钮（.copy-toggle.icon-btn，SVG 双矩形图标）：CSS
   // .expandable.expand-copy 把它绝对定位到正文右上角（与文件工具 diff 的
   // .diff-copy 同形态），展开按钮不再与其并排。title/aria-label 标注用途，
@@ -49,13 +58,7 @@ function maybeTruncateEl(container, text, threshold, footerEl, label) {
   copy.setAttribute("aria-label", "复制全文");
   copy._target = container;
   copy._srcText = s;
-  const full = el("span", "expand-full", s);
-  // 顺序：预览（截断标记）→ 隐藏全文 → 展开按钮（in-flow）→ 复制按钮
-  // （绝对定位，DOM 位置不影响视觉）。按钮放在全文之后：折叠态全文
-  // display:none 不占位，按钮视觉紧跟截断标记；展开态全文显示，按钮
-  // 跟随全文末尾（不在全文头部压住第一行）。footerEl 保留为兼容参数
-  // （当前无调用传它）：按钮移入 footer 框。
-  container.append(preview, full, btn, copy);
+  container.appendChild(copy);
   if (footerEl) {
     footerEl.appendChild(btn);
     footerEl.appendChild(copy);
@@ -263,21 +266,20 @@ function attachResultCopy(resEl, content) {
 }
 
 /* diff 截断展开统一控件（read/edit/write 共用）：预览区之后追加
-   「展开全文（内容）」按钮 + .diff-full 全文区（剩余行），容器标
-   .expandable（不含 .expanded）。点击走消息容器事件委托（expand-toggle
-   class 委托，与 maybeTruncateEl 同机制）；.diff-full 常驻 DOM，innerHTML
-   快照往返后仍可展开。按钮 in-flow 紧跟截断标记（diff-more 之后），
-   与右上角「复制结果」按钮位置区分（展开是内容导航，复制是操作）。 */
+   .diff-full 全文区（剩余行），再经统一模板（attachExpandToggle）追加
+   「展开全文（label）」按钮到容器末尾。容器标 .expandable（不含 .expanded）。
+   点击走消息容器事件委托（expand-toggle class 委托，与 maybeTruncateEl 同机制）；
+   .diff-full 常驻 DOM，innerHTML 快照往返后仍可展开。
+   DOM 顺序：preview/diff-more → diff-full → expand-toggle（按钮在全文末尾，
+   折叠态因 diff-full display:none 按钮视觉紧跟截断标记）。与右上角
+   「复制结果」按钮位置区分（展开是内容导航，复制是操作）。 */
 function attachDiffExpand(resEl, label, fullRows) {
   if (!fullRows.length) return;   // 未截断：无需展开
   resEl.classList.add("expandable");
-  const btn = el("button", "expand-toggle", "展开全文（" + label + "）");
-  btn.type = "button";
-  btn._target = resEl;            // 事件委托精确定位（与 maybeTruncateEl 同机制）
-  resEl.appendChild(btn);
   const full = el("div", "diff-full");
   for (const r of fullRows) full.appendChild(r);
   resEl.appendChild(full);
+  attachExpandToggle(resEl, label);
 }
 
 /* edit_file 结果："file edited (line N)" → 行号 N 起，- 红 / + 绿 两段 diff
