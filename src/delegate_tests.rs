@@ -1246,6 +1246,104 @@ async fn role_requires_a_roles_root_and_a_known_role() {
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
 }
 
+#[tokio::test]
+// Test-only env isolation: the std Mutex guard is held across .execute()
+// awaits to serialize XDG_CONFIG_HOME mutation with roles.rs tests.
+#[allow(clippy::await_holding_lock)]
+async fn role_model_source_overrides_snapshot_at_spawn() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg-empty");
+    std::fs::create_dir_all(&xdg).unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+    let directory = temp.path().join("agents");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("fixer.md"), "You fix things.").unwrap();
+
+    let (url, captured) = capturing_model().await;
+    let snapshot_model = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(url.clone(), "test-key".into(), "old-model".into(), None)
+            .unwrap(),
+    );
+    let live_model = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(url, "test-key".into(), "new-model".into(), None).unwrap(),
+    );
+    let live = live_model.clone();
+    let mut tool = delegate_with_url(temp.path(), "http://localhost".into())
+        .with_roles_root(temp.path().to_path_buf())
+        // Construction-time snapshot says old-model…
+        .with_role_models(std::collections::HashMap::from([(
+            "fixer".to_owned(),
+            snapshot_model,
+        )]))
+        // …but the live resolver (the session factory's hot-reload source)
+        // wins at spawn.
+        .with_role_model_source(Arc::new(move |role: &str| {
+            (role == "fixer").then(|| (live.clone(), None))
+        }));
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+    tool.execute(json!({
+        "task": "fix",
+        "role": "fixer",
+        "workspace": temp.path().to_str().unwrap(),
+        "background": false
+    }))
+    .await
+    .unwrap();
+    let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(request.contains("\"model\":\"new-model\""), "{request}");
+    assert!(!request.contains("\"model\":\"old-model\""), "{request}");
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+#[tokio::test]
+// Test-only env isolation: the std Mutex guard is held across .execute()
+// awaits to serialize XDG_CONFIG_HOME mutation with roles.rs tests.
+#[allow(clippy::await_holding_lock)]
+async fn role_model_snapshot_used_without_live_source() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg-empty");
+    std::fs::create_dir_all(&xdg).unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+    let directory = temp.path().join("agents");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("fixer.md"), "You fix things.").unwrap();
+
+    let (url, captured) = capturing_model().await;
+    let snapshot_model = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(url, "test-key".into(), "snapshot-model".into(), None)
+            .unwrap(),
+    );
+    let mut tool = delegate_with_url(temp.path(), "http://localhost".into())
+        .with_roles_root(temp.path().to_path_buf())
+        .with_role_models(std::collections::HashMap::from([(
+            "fixer".to_owned(),
+            snapshot_model,
+        )]));
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+    tool.execute(json!({
+        "task": "fix",
+        "role": "fixer",
+        "workspace": temp.path().to_str().unwrap(),
+        "background": false
+    }))
+    .await
+    .unwrap();
+    let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(
+        request.contains("\"model\":\"snapshot-model\""),
+        "{request}"
+    );
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
 /// Run one subagent through a capturing mock model and return the wire
 /// request body (tools array + system prompt) plus the tool result.
 async fn run_subagent_and_capture(

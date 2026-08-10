@@ -138,6 +138,12 @@ impl Drop for DelegateCleanup {
     }
 }
 
+/// Live role-model resolver installed by the session factory: resolves a
+/// role's model from the reloadable config at spawn time (returns the model
+/// plus its context window, or `None` when the role is not routed).
+pub type RoleModelSource =
+    Arc<dyn Fn(&str) -> Option<(ConfiguredModel, Option<u64>)> + Send + Sync>;
+
 pub struct Delegate {
     /// Subagents run on the role-routed model when configured, otherwise
     /// on the main model.
@@ -162,6 +168,12 @@ pub struct Delegate {
     role_models: std::collections::HashMap<String, ConfiguredModel>,
     /// Context window per role model (from profile).
     role_context_windows: std::collections::HashMap<String, Option<u64>>,
+    /// Live role-model resolver installed by the session factory: resolves
+    /// a role's model from the reloadable config at spawn time, so `[roles]`
+    /// edits hot-reload into newly spawned subagents without a restart.
+    /// `None` (a Delegate constructed directly, e.g. in tests) falls back to
+    /// the construction-time `role_models` snapshot.
+    role_model_source: Option<RoleModelSource>,
     /// Workspace root used to read role templates (`.e-agent/agents/<role>.md`).
     roles_root: Option<std::path::PathBuf>,
     /// Optional bwrap sandbox inherited by every subagent's bash tool.
@@ -237,6 +249,7 @@ impl Delegate {
             persist_root: None,
             role_models: std::collections::HashMap::new(),
             role_context_windows: std::collections::HashMap::new(),
+            role_model_source: None,
             roles_root: None,
             sandbox: None,
             record_in: None,
@@ -274,6 +287,15 @@ impl Delegate {
         role_models: std::collections::HashMap<String, ConfiguredModel>,
     ) -> Self {
         self.role_models = role_models;
+        self
+    }
+
+    /// Resolve role models live at spawn time (from the session factory's
+    /// reloadable config) instead of the construction-time snapshot. The
+    /// source returns `(model, context window)` for a role, or `None` when
+    /// the role is not routed — the `role_models` snapshot then applies.
+    pub fn with_role_model_source(mut self, source: RoleModelSource) -> Self {
+        self.role_model_source = Some(source);
         self
     }
 
@@ -891,17 +913,27 @@ impl Tool for Delegate {
                             }
                         )
                     })?;
-                let model = self
-                    .role_models
-                    .get(role)
-                    .cloned()
-                    .unwrap_or_else(|| self.subagent_model.clone());
-                let cw = self
-                    .role_context_windows
-                    .get(role)
-                    .copied()
-                    .flatten()
-                    .or(self.subagent_context_window);
+                let (model, cw) = match &self.role_model_source {
+                    // Live source (session factory): pick up hot-reloaded
+                    // `[roles]` routing; when the role is not routed, fall
+                    // back to the default subagent model like the snapshot
+                    // path below.
+                    Some(source) => source(role).unwrap_or_else(|| {
+                        (self.subagent_model.clone(), self.subagent_context_window)
+                    }),
+                    // Construction-time snapshot (direct Delegate use/tests).
+                    None => (
+                        self.role_models
+                            .get(role)
+                            .cloned()
+                            .unwrap_or_else(|| self.subagent_model.clone()),
+                        self.role_context_windows
+                            .get(role)
+                            .copied()
+                            .flatten()
+                            .or(self.subagent_context_window),
+                    ),
+                };
                 (
                     model,
                     cw,

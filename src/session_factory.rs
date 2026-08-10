@@ -443,6 +443,37 @@ impl SessionFactory {
         self.reloadable.read().unwrap().config.clone()
     }
 
+    /// Resolve a role's model live from the reloadable state, for a Delegate
+    /// that outlives individual session builds (the resident delegate tool).
+    /// Returns `(model, context window)` for the role, or `None` when the
+    /// role is not routed — the caller then falls back to its subagent
+    /// model. `'static`: the closure owns an `Arc` clone of the reloadable
+    /// cell plus the startup snapshot, so it survives the factory and sees
+    /// config hot reloads — a `[roles]` edit is picked up by newly spawned
+    /// subagents without a restart. When there is no config at all
+    /// (`models` is `None`), the startup snapshot (this factory's
+    /// `role_models` / `role_context_windows`) is used, exactly like
+    /// [`SessionFactory::build`]'s fallback.
+    pub fn role_models_resolver(&self) -> crate::delegate::RoleModelSource {
+        let reloadable = self.reloadable.clone();
+        let snapshot_roles = self.role_models.clone();
+        let snapshot_windows = self.role_context_windows.clone();
+        Arc::new(move |role: &str| {
+            let state = reloadable.read().unwrap();
+            match &state.models {
+                Some(models) => models.roles.get(role).map(|model| {
+                    (
+                        model.clone(),
+                        models.role_context_windows.get(role).copied().flatten(),
+                    )
+                }),
+                None => snapshot_roles
+                    .get(role)
+                    .map(|model| (model.clone(), snapshot_windows.get(role).copied().flatten())),
+            }
+        })
+    }
+
     /// Re-read the config files for this workspace and, when they changed
     /// and the new config parses + resolves, atomically swap it in. Returns
     /// the outcome for logging. Never fails the process: a bad edit keeps
@@ -669,6 +700,7 @@ impl SessionFactory {
         )
         .persist_sessions(self.root.clone())
         .with_role_models(role_models.clone())
+        .with_role_model_source(self.role_models_resolver())
         .with_role_context_windows(role_context_windows.clone())
         .with_subagent_context_window(subagent_context_window)
         .with_roles_root(self.root.clone())
@@ -1430,5 +1462,78 @@ model = "m2"
         assert_eq!(factory.model_profiles(), vec!["p1/m1", "p2/m2"]);
 
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
+    fn role_models_resolver_reads_hot_reloaded_roles() {
+        let temp = tempfile::tempdir().unwrap();
+        // The test factory starts with an empty reloadable cell
+        // (models = None); apply configs through the real reload path so
+        // runtime models exist, exactly like the watcher does.
+        let factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        let with_role = |role_profile: &str| -> Config {
+            let source = format!(
+                r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+
+[models."p1/m1"]
+model = "m1"
+
+[providers.p2]
+base_url = "http://two"
+api_key_env = "PATH"
+
+[models."p2/m2"]
+model = "m2"
+
+[roles]
+fixer = "{role_profile}"
+"#
+            );
+            toml::from_str(&source).expect("test config parses")
+        };
+        {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(&mut state, Some(with_role("p1/m1")), None, &None, &None);
+        }
+        let resolver = factory.role_models_resolver();
+        // Startup config routes fixer to p1/m1 (display name "m1").
+        let (model, context_window) = resolver("fixer").expect("fixer routed");
+        assert_eq!(model.display_name(), "m1");
+        assert_eq!(context_window, None);
+
+        // Hot reload re-routes fixer to p2/m2: the SAME resolver sees it,
+        // so a resident Delegate picks the new model up at spawn.
+        {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(&mut state, Some(with_role("p2/m2")), None, &None, &None);
+        }
+        let (model, _) = resolver("fixer").expect("fixer still routed");
+        assert_eq!(model.display_name(), "m2");
+
+        // An unrouted role resolves to None; the caller falls back to its
+        // subagent model.
+        assert!(resolver("nobody").is_none());
+
+        // No config at all (models = None): the closure falls back to the
+        // startup snapshot, exactly like build() does.
+        let mut plain = SessionFactory::test_factory(temp.path().to_path_buf());
+        plain.role_models.insert(
+            "fixer".to_owned(),
+            ConfiguredModel::chat(
+                OpenAiModel::new(
+                    "http://localhost".into(),
+                    "test-key".into(),
+                    "snapshot-model".into(),
+                    None,
+                )
+                .expect("test model"),
+            ),
+        );
+        let snapshot_resolver = plain.role_models_resolver();
+        let (model, _) = snapshot_resolver("fixer").expect("snapshot fallback");
+        assert_eq!(model.display_name(), "snapshot-model");
     }
 }
