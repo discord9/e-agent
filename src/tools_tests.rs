@@ -1028,7 +1028,10 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
     #[cfg(not(windows))]
     {
         assert!(bash_desc.contains("workspace is read-only"), "{bash_desc}");
-        assert!(bash_desc.contains("network is disabled"), "{bash_desc}");
+        assert!(
+            !bash_desc.contains("network is disabled"),
+            "read-only bash follows the main network=true: {bash_desc}"
+        );
         assert!(
             bash_desc.contains("~/.rustup"),
             "readable roots survive the narrowing: {bash_desc}"
@@ -1051,7 +1054,10 @@ fn read_only_sandbox_derivation_narrows_and_keeps_readable_roots() {
     };
     let narrowed = read_only_sandbox(&sandbox);
     assert!(narrowed.enabled);
-    assert!(!narrowed.network, "network must be disabled");
+    assert!(
+        narrowed.network,
+        "network follows the main config (true here) — read-only roles keep read-only network ops"
+    );
     assert!(!narrowed.workspace_writable, "workspace must be read-only");
     assert!(
         narrowed.writable_paths.is_empty(),
@@ -1060,6 +1066,41 @@ fn read_only_sandbox_derivation_narrows_and_keeps_readable_roots() {
     assert_eq!(
         narrowed.readable_paths,
         vec!["~/.rustup".to_owned(), "~/.local".to_owned()],
+        "readable roots must be preserved"
+    );
+}
+
+#[test]
+fn read_only_sandbox_follows_main_network_config() {
+    let mut sandbox = crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        writable_paths: vec!["/mnt/big/cargo-home".into()],
+        readable_paths: vec!["~/.rustup".into()],
+    };
+    // Main config network = true → the read-only role keeps networking.
+    let narrowed = read_only_sandbox(&sandbox);
+    assert!(
+        narrowed.network,
+        "network=true in the main config must carry over to the read-only sandbox"
+    );
+    // Main config network = false → the read-only role is offline too.
+    sandbox.network = false;
+    let narrowed = read_only_sandbox(&sandbox);
+    assert!(
+        !narrowed.network,
+        "network=false in the main config must carry over to the read-only sandbox"
+    );
+    // The read-only guarantees hold either way.
+    assert!(!narrowed.workspace_writable, "workspace must be read-only");
+    assert!(
+        narrowed.writable_paths.is_empty(),
+        "extra writable roots must be dropped"
+    );
+    assert_eq!(
+        narrowed.readable_paths,
+        vec!["~/.rustup".to_owned()],
         "readable roots must be preserved"
     );
 }

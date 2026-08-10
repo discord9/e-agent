@@ -1451,9 +1451,11 @@ async fn read_only_role_subagent_keeps_bash_when_a_sandbox_is_configured() {
     assert!(!request.contains("\"write_file\""), "{request}");
     assert!(!request.contains("\"edit_file\""), "{request}");
     assert!(request.contains("\"bash\""), "{request}");
-    // The sandboxed bash description reflects the narrowed read-only policy.
+    // The sandboxed bash description reflects the narrowed read-only policy:
+    // the workspace is read-only, and the network follows the main config
+    // (network=true here), so read-only network operations stay possible.
     assert!(
-        request.contains("workspace is read-only") && request.contains("network is disabled"),
+        request.contains("workspace is read-only") && !request.contains("network is disabled"),
         "{request}"
     );
     assert!(

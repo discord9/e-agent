@@ -179,12 +179,15 @@ fn builtins_with_exa_key(
 }
 
 /// Narrow a resolved sandbox policy for read-only roles: the workspace is
-/// mounted read-only, extra writable roots are dropped, and the network is
-/// disabled. Readable roots are kept — reads stay possible.
+/// mounted read-only and extra writable roots are dropped, while the network
+/// follows the main `[sandbox]` configuration (default true) so read-only
+/// network operations (curl GET, git fetch) stay possible. Readable roots are
+/// kept — reads stay possible. To disable networking for read-only roles too,
+/// set `[sandbox] network = false`.
 pub(crate) fn read_only_sandbox(sandbox: &crate::config::Sandbox) -> crate::config::Sandbox {
     crate::config::Sandbox {
         enabled: true,
-        network: false,
+        network: sandbox.network,
         workspace_writable: false,
         writable_paths: Vec::new(),
         readable_paths: sandbox.readable_paths.clone(),
