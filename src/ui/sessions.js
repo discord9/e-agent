@@ -407,22 +407,18 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     if (state.initSource !== "snapshot") {
       if (state.initSource === "restored") {
         // 缓存的视图可能过期（切走期间会话有新消息）：用最新尾部替换，
-        // 而不是追加（追加会与缓存内容重复）。保留滚动位置（距底部偏移）
-        // 与进行中的增量块（thinking/assistant/tool 卡片，未落盘只活在
-        // 内存/SSE 增量里，history 里没有它们）。
+        // 而不是追加（追加会与缓存内容重复）。缓存里的进行中增量块
+        // （thinking/assistant/tool 卡片——未落盘只活在内存/SSE 增量里，
+        // history 里没有它们）也一律不重挂：fresh 尾部已渲染已落盘的版本，
+        // live 续写靠重新连接的 SSE。重挂只会把切走瞬间还在执行的旧卡片
+        // 无条件 append 到消息区最底部——很久以前的 bash 命令突然出现在
+        // 最新位置，甚至与尾部历史重复；且该卡永不折叠（pruneMessages
+        // 跳过 in-flight）而永久残留。保留滚动位置（距底部偏移）。
         const offset = els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight;
-        const inflight = [];
-        if (state.acc) {
-          if (state.acc.assistantEl) inflight.push(state.acc.assistantEl);
-          if (state.acc.thinkingEl) inflight.push(state.acc.thinkingEl);
-          if (state.acc.toolStack) for (const t of state.acc.toolStack) inflight.push(t.el);
-        }
         state.acc.toolStack = [];   // 防重：替换后 reattachInFlight 重新收集
         renderHistory(entries);     // 清空 + 渲染最新尾部
-        for (const el of inflight) {
-          if (el && !el.isConnected) els.messages.appendChild(el);
-        }
-        reattachInFlight(state.acc);   // 重新绑定进行中块，增量续写不中断
+        reattachInFlight(state.acc);   // 按渲染后的 DOM 现状重绑进行中块（若
+                                       // 尾部自身含未完成条目），增量续写不中断
         if (offset > 4) {
           els.messages.scrollTop = els.messages.scrollHeight - offset - els.messages.clientHeight;
           userScrolled = true;
@@ -475,10 +471,11 @@ async function loadOlder() {
   } catch (e) {
     // 静默失败，下次滚动重试
   } finally {
-    // 陈旧响应不碰 state：新会话/新加载可能已接管 loadingOlder
-    if (epoch === sessionOpenEpoch && state.workspace.id === wsId && state.sessionId === sid) {
-      state.loadingOlder = false;
-    }
+    // 无条件复位 loadingOlder：陈旧响应（epoch 不匹配，如 restartTransport
+    // 递增代次后）也必须复位，否则「加载更早历史」永久失效（loadingOlder
+    // 卡 true，后续滚动直接 return）。新会话接管时 openSession/clearCurrent
+    // Session 本就会复位，无条件复位不会影响新会话的 loadOlder。
+    state.loadingOlder = false;
   }
 }
 

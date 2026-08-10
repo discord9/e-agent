@@ -572,6 +572,7 @@ globalThis.fetch=(url,opts={})=>{
   // restored 替换回归测试用：缓存过期后切回，history 含新消息（历史数据本身不变）
   if(url.startsWith("/api/sessions/restored-test/history")) return resp(200, historyData, signal);
   if(url.startsWith("/api/sessions/restored-test2/history")) return resp(200, historyData, signal);
+  if(url.startsWith("/api/sessions/restored-test3/history")) return resp(200, historyData, signal);
   if(url==="/api/sessions/s1/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s2/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/sess-new/events") return resp(200, streamEmpty(), signal);
@@ -580,6 +581,7 @@ globalThis.fetch=(url,opts={})=>{
   // restored 回归测试：空 SSE 流（snapshot 应被 history 替换路径跳过）
   if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty(), signal);
+  if(url.startsWith("/api/sessions/restored-test3/events")) return resp(200, streamEmpty(), signal);
   // 持久化用量端点（本分支新增）：usageData 命中 → 200；置 null → 404 旧后端
   const _mUsage = /^\/api\/sessions\/([^/]+)\/usage$/.exec(url);
   if (_mUsage) {
@@ -1176,6 +1178,22 @@ async function main(){
     await flush();
     chk("no fetch when olderDone", FETCHES.length === fetchAfterDone,
         "delta="+(FETCHES.length-fetchAfterDone));
+    // ---- 回归：loadOlder 陈旧响应（epoch 变更，如 restartTransport 递增代次）也必须
+    // 复位 loadingOlder——否则「加载更早历史」永久失效（loadingOlder 卡 true） ----
+    state.nextBeforeSeq = 200;          // 恢复分页游标（paging 测试已消费到 null）
+    state.olderDone = false;
+    state.loadingOlder = false;
+    msgEl.scrollTop = 0;
+    const olderFetchBefore = FETCHES.filter((u) => u.includes("before_seq=")).length;
+    for (const fn of handlers) fn({isTrusted:true});   // 触发 loadOlder（fetch 在途）
+    chk("stale loadOlder in flight", state.loadingOlder === true
+        && FETCHES.filter((u) => u.includes("before_seq=200")).length === 1,
+        "loading=" + state.loadingOlder
+        + " n=" + FETCHES.filter((u) => u.includes("before_seq=200")).length);
+    ++sessionOpenEpoch;                 // 响应未归时代次已变（restartTransport 路径不复位 loadingOlder）
+    await flush(); await flush();       // 陈旧响应返回：finally 必须无条件复位
+    chk("stale loadOlder resets loadingOlder", state.loadingOlder === false,
+        "=" + state.loadingOlder);
     // ---- 回归：restored 分支 reattachInFlight（切回缓存会话不重复思考块） ----
     function buildInflightView(){
       const m = elsById["messages"];
@@ -1631,8 +1649,10 @@ async function main(){
         elsById["messages"].textContent.includes("完成。")
         && !elsById["messages"].textContent.includes("旧缓存消息"),
         "text=" + elsById["messages"].textContent.slice(0, 140));
-    // 进行中的增量块（未落盘、只活在缓存/SSE 里）必须保留并重新绑定：
-    // 替换后 live delta 才能继续续写，而不是丢失或重复。
+    // 进行中的增量块（未落盘、只活在缓存/SSE 里）不再重挂：切回时 fresh
+    // 尾部整体替换过期缓存，缓存里的旧进行中块不 append 回底部（否则很久
+    // 以前的卡片会出现在最新位置、与尾部历史重复、且永不折叠）。live 续写
+    // 靠重新连接的 SSE 新建块。
     state.sessionId = null;
     state.sessionStates[state.workspace.id + ":restored-test2"] = {
       html: "<div class='msg msg-assistant'><div class='msg-body'>正在流式</div></div>",
@@ -1640,11 +1660,42 @@ async function main(){
     };
     openSession("restored-test2");
     await flush(); await flush();
-    chk("restored keeps in-flight block for delta continuation",
-        !!state.acc && state.acc.assistantEl
+    chk("restored drops cached in-flight block (no re-append to bottom)",
+        !elsById["messages"].textContent.includes("正在流式")
+        && elsById["messages"].textContent.includes("完成。")
+        && !(state.acc && state.acc.assistantEl),
+        "has=" + elsById["messages"].textContent.includes("正在流式")
+        + " acc=" + !!(state.acc && state.acc.assistantEl));
+    // live 续写靠 SSE：AssistantDelta 在 fresh 尾部之后新建气泡
+    handleSSEBlock("event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"restored-test2\",\"seq\":201,\"delta\":\"续写回复\"}\n\n",
+        "restored-test2", state.workspace.id, sessionOpenEpoch);
+    chk("restored live delta creates new assistant block",
+        !!state.acc && !!state.acc.assistantEl
         && state.acc.assistantEl.isConnected
-        && elsById["messages"].textContent.includes("正在流式"),
+        && elsById["messages"].textContent.includes("续写回复"),
         "connected=" + (state.acc && state.acc.assistantEl && state.acc.assistantEl.isConnected));
+    // 主 bug 回归：缓存里的「执行中…」tool 卡片绝不重挂到底部——fresh 尾部
+    // 整体替换后，消息区最后一个子节点是尾部最新条目（forked 行），而不是
+    // 切走瞬间还在执行的旧 bash 卡片（否则它出现在最新位置、永不折叠）。
+    state.sessionId = null;
+    state.sessionStates[state.workspace.id + ":restored-test3"] = {
+      html: "<div class='msg msg-user'><span class='who'>you&gt;</span>"
+        + "<div class='msg-body'>旧消息</div></div>"
+        + "<details class='tool-card'><summary>bash</summary>"
+        + "<span class='tool-state'>执行中…</span></details>",
+      scrollTop: 0, nextBeforeSeq: 8, olderDone: false, draft: "",
+    };
+    openSession("restored-test3");
+    await flush(); await flush();
+    const msgs3 = elsById["messages"];
+    const last3 = msgs3.children[msgs3.children.length - 1];
+    chk("restored does not re-append cached in-flight tool card to bottom",
+        !msgs3.textContent.includes("执行中…")
+        && !!last3 && last3.className.includes("forked")
+        && !(state.acc && state.acc.toolStack && state.acc.toolStack.length),
+        "last=" + (last3 ? last3.className : "none")
+        + " inflight=" + msgs3.textContent.includes("执行中…")
+        + " stack=" + (state.acc && state.acc.toolStack ? state.acc.toolStack.length : "-"));
 
     // ---- A: 长内容「预览 + 展开全文」（maybeTruncateEl） ----
     // 用 MCP/未知工具名走 pretty JSON 回退路径（bash 等已改紧凑渲染）
