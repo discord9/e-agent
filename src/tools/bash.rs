@@ -685,7 +685,7 @@ pub(super) const TAIL_LIMIT: usize = 16 * 1024;
 /// 2 × `FULL_LIMIT` bytes is cheap for typical command output and avoids a
 /// spool-file round trip; a stream longer than this only gets its first
 /// `FULL_LIMIT` bytes written to the log.
-const FULL_LIMIT: usize = 16 * 1024 * 1024;
+pub(super) const FULL_LIMIT: usize = 16 * 1024 * 1024;
 
 pub(super) struct Captured {
     /// Head segment: the first `HEAD_LIMIT` bytes of the stream (the whole
@@ -802,7 +802,7 @@ fn render_stream(captured: &Captured) -> String {
 /// continuation bytes of a multibyte char split by the cut and drops the
 /// char's leading byte too when the char is incomplete. Walks at most 3
 /// bytes, so it is O(1).
-fn utf8_back_boundary(bytes: &[u8], len: usize) -> usize {
+pub(super) fn utf8_back_boundary(bytes: &[u8], len: usize) -> usize {
     let mut pos = len;
     while pos > 0 && (bytes[pos - 1] & 0xC0) == 0x80 {
         pos -= 1;
@@ -823,7 +823,7 @@ fn utf8_back_boundary(bytes: &[u8], len: usize) -> usize {
 
 /// Smallest index ≥ `offset` on a UTF-8 char boundary: skips at most 3
 /// leading continuation bytes when the tail window starts mid-character.
-fn utf8_front_boundary(bytes: &[u8], offset: usize) -> usize {
+pub(super) fn utf8_front_boundary(bytes: &[u8], offset: usize) -> usize {
     let mut pos = offset;
     let max = (offset + 3).min(bytes.len());
     while pos < max && (bytes[pos] & 0xC0) == 0x80 {
@@ -840,7 +840,7 @@ fn utf8_front_boundary(bytes: &[u8], offset: usize) -> usize {
 /// Memory trade-off: `capture` always retains up to `FULL_LIMIT` bytes per
 /// stream so the full text is available here without re-running the command;
 /// streams longer than the cap are truncated in the log with a note.
-fn persist_full_output(
+pub(super) fn persist_full_output(
     workspace_root: &std::path::Path,
     command: &str,
     stdout: &Captured,

@@ -30,7 +30,10 @@ use crate::tools::background::{OutputSlot, TaskSpool, slot_append};
 use crate::workspace::Workspace;
 
 use super::OUTPUT_LIMIT;
-use super::bash::{Captured, Shell, format_output};
+use super::bash::{
+    Captured, FULL_LIMIT, HEAD_LIMIT, Shell, TAIL_LIMIT, format_output, persist_full_output,
+    utf8_back_boundary, utf8_front_boundary,
+};
 
 struct Handle(HANDLE);
 unsafe impl Send for Handle {}
@@ -1418,9 +1421,19 @@ fn read_pipe(
     slot: Option<OutputSlot>,
     spool: Option<Arc<TaskSpool>>,
 ) -> std::io::Result<Captured> {
-    let mut bytes = Vec::new();
+    // Mirrors `bash::capture`: maintain head (first HEAD_LIMIT bytes), tail
+    // (rolling window of the last TAIL_LIMIT bytes), total, full (up to
+    // FULL_LIMIT for failure persistence) and truncated, so the shared
+    // `Captured` fields are all populated before construction — never after
+    // a move into the struct.
+    let mut captured = Captured {
+        bytes: Vec::new(),
+        tail: Vec::new(),
+        total: 0,
+        truncated: false,
+        full: Vec::new(),
+    };
     let mut buffer = [0u8; 8192];
-    let mut truncated = false;
     loop {
         let mut count = 0u32;
         if unsafe {
@@ -1435,24 +1448,12 @@ fn read_pipe(
         {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
-                return Ok(Captured {
-                    bytes,
-                    truncated,
-                    tail: Vec::new(),
-                    total: bytes.len(),
-                    full: Vec::new(),
-                });
+                break;
             }
             return Err(error);
         }
         if count == 0 {
-            return Ok(Captured {
-                bytes,
-                truncated,
-                tail: Vec::new(),
-                total: bytes.len(),
-                full: Vec::new(),
-            });
+            break;
         }
         let data = &buffer[..count as usize];
         if let Some(slot) = &slot {
@@ -1461,10 +1462,40 @@ fn read_pipe(
         if let Some(spool) = &spool {
             spool.append(data);
         }
-        let room = OUTPUT_LIMIT.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&data[..data.len().min(room)]);
-        truncated |= data.len() > room;
+        captured.total += count as usize;
+        // Full output for potential failure persistence, capped at FULL_LIMIT.
+        if captured.full.len() < FULL_LIMIT {
+            let room = FULL_LIMIT - captured.full.len();
+            captured
+                .full
+                .extend_from_slice(&data[..(count as usize).min(room)]);
+        }
+        // Head: first HEAD_LIMIT bytes.
+        if captured.bytes.len() < HEAD_LIMIT {
+            let room = HEAD_LIMIT - captured.bytes.len();
+            captured
+                .bytes
+                .extend_from_slice(&data[..(count as usize).min(room)]);
+        }
+        // Tail: rolling window of the last TAIL_LIMIT bytes.
+        captured.tail.extend_from_slice(data);
+        if captured.tail.len() > TAIL_LIMIT {
+            let excess = captured.tail.len() - TAIL_LIMIT;
+            captured.tail.drain(..excess);
+        }
+        captured.truncated |= captured.total > OUTPUT_LIMIT;
     }
+    if captured.truncated {
+        // Align both seams to UTF-8 char boundaries so the head/tail never
+        // split a multibyte character (which would render extra U+FFFD).
+        let keep = utf8_back_boundary(&captured.bytes, captured.bytes.len());
+        captured.bytes.truncate(keep);
+        let skip = utf8_front_boundary(&captured.tail, 0);
+        if skip > 0 {
+            captured.tail.drain(..skip);
+        }
+    }
+    Ok(captured)
 }
 
 fn wait_process(process: Handle) -> std::io::Result<i32> {
@@ -1549,7 +1580,22 @@ pub(super) async fn run(
         slot.store(0, Ordering::Release);
     }
     let text = format_output(Some(code), &stdout, &stderr);
-    if code == 0 { Ok(text) } else { Err(text) }
+    if code == 0 {
+        Ok(text)
+    } else {
+        let mut text = text;
+        // Same "tee on failure" as `bash::run`: a failed command whose
+        // visible output was truncated gets its full output written to a log
+        // file so the model can read_file the whole log instead of guessing
+        // from the surviving head+tail. Successful long output is not
+        // persisted.
+        if (stdout.truncated || stderr.truncated)
+            && let Some(path) = persist_full_output(workspace.root(), command, &stdout, &stderr)
+        {
+            text.push_str(&format!("\n[full output: {}]", path.display()));
+        }
+        Err(text)
+    }
 }
 
 #[cfg(test)]
