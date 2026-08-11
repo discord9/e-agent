@@ -107,40 +107,87 @@ impl CodexAuth {
         if !force && !needs_refresh(&state) {
             return Ok(());
         }
-        let refresh_token = state.tokens.refresh_token.clone();
-        let response = self
-            .client
-            .post(self.token_endpoint.as_str())
-            .json(&serde_json::json!({
-                "client_id": CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            }))
-            .send()
-            .await
-            .context("ChatGPT token refresh request failed")?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            if status == reqwest::StatusCode::UNAUTHORIZED || permanent_refresh_error(&body) {
-                bail!("ChatGPT login has expired or was revoked; run `e-agent login`");
+        // Refresh boundary: re-read the auth file before submitting a refresh
+        // token. `e-agent login` (or another e-agent process that rotated
+        // credentials) may have replaced it on disk since we loaded it, and
+        // submitting our stale refresh token would be rejected as reused.
+        // Adopt newer credentials for the same account; a different account
+        // is never adopted silently.
+        if let Some(disk) = read_auth_file(&self.path)
+            && tokens_differ(&disk.tokens, &state.tokens)
+            && same_account(&disk.tokens, &state.tokens)
+        {
+            *state = disk;
+            // Re-evaluate after adoption: the disk copy may already carry a
+            // fresh access token (e.g. a completed `e-agent login`), so no
+            // exchange is needed; a forced refresh whose rejected token no
+            // longer matches was already recovered by another process.
+            if let Some(rejected) = rejected_access_token
+                && state.tokens.access_token != rejected
+            {
+                return Ok(());
             }
-            bail!("ChatGPT token refresh failed with HTTP {status}");
+            if !force && !needs_refresh(&state) {
+                return Ok(());
+            }
         }
-        let returned: TokenResponse =
-            serde_json::from_str(&body).context("cannot decode ChatGPT token refresh response")?;
-        if let Some(value) = returned.id_token.filter(|value| !value.is_empty()) {
-            state.tokens.id_token = value;
+        // Exchange, with one guarded retry: when the provider reports the
+        // submitted refresh token as expired/reused/revoked (or a 401),
+        // another process may have rotated credentials between the reload
+        // above and this exchange. Re-read the file and adopt the disk
+        // version; only bail out when the disk carries the same token that
+        // just failed.
+        let mut retry = true;
+        loop {
+            let refresh_token = state.tokens.refresh_token.clone();
+            let response = self
+                .client
+                .post(self.token_endpoint.as_str())
+                .json(&serde_json::json!({
+                    "client_id": CLIENT_ID,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                }))
+                .send()
+                .await
+                .context("ChatGPT token refresh request failed")?;
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if !status.is_success() {
+                if status == reqwest::StatusCode::UNAUTHORIZED || permanent_refresh_error(&body) {
+                    if retry
+                        && let Some(disk) = read_auth_file(&self.path)
+                        && tokens_differ(&disk.tokens, &state.tokens)
+                        && same_account(&disk.tokens, &state.tokens)
+                    {
+                        *state = disk;
+                        if !needs_refresh(&state) {
+                            // The disk copy already carries a fresh access
+                            // token; the caller retries the request with it.
+                            return Ok(());
+                        }
+                        retry = false;
+                        continue;
+                    }
+                    return Err(login_expired_error(&body));
+                }
+                bail!("ChatGPT token refresh failed with HTTP {status}");
+            }
+            let returned: TokenResponse = serde_json::from_str(&body)
+                .context("cannot decode ChatGPT token refresh response")?;
+            if let Some(value) = returned.id_token.filter(|value| !value.is_empty()) {
+                state.tokens.id_token = value;
+            }
+            if let Some(value) = returned.access_token.filter(|value| !value.is_empty()) {
+                state.tokens.access_token = value;
+            }
+            if let Some(value) = returned.refresh_token.filter(|value| !value.is_empty()) {
+                state.tokens.refresh_token = value;
+            }
+            state.last_refresh = Utc::now();
+            save_file(&self.path, &state)?;
+            return Ok(());
         }
-        if let Some(value) = returned.access_token.filter(|value| !value.is_empty()) {
-            state.tokens.access_token = value;
-        }
-        if let Some(value) = returned.refresh_token.filter(|value| !value.is_empty()) {
-            state.tokens.refresh_token = value;
-        }
-        state.last_refresh = Utc::now();
-        save_file(&self.path, &state)?;
-        Ok(())
     }
 }
 
@@ -452,14 +499,61 @@ fn needs_refresh(data: &AuthFile) -> bool {
         .unwrap_or_else(|| data.last_refresh <= Utc::now() - UNKNOWN_EXPIRY_REFRESH)
 }
 
-fn permanent_refresh_error(body: &str) -> bool {
+/// Reads the auth file from disk; `None` when it is missing or cannot be
+/// decoded, so callers keep their in-memory snapshot and fall back to the
+/// pre-existing logic.
+fn read_auth_file(path: &Path) -> Option<AuthFile> {
+    let source = std::fs::read(path).ok()?;
+    serde_json::from_slice(&source).ok()
+}
+
+/// True when the disk copy carries different credentials than memory (either
+/// token changed), i.e. another process or a login rewrote the file.
+fn tokens_differ(disk: &Tokens, memory: &Tokens) -> bool {
+    disk.access_token != memory.access_token || disk.refresh_token != memory.refresh_token
+}
+
+/// True when both copies resolve to the same ChatGPT account (stored or
+/// JWT-derived account id). Different or undeterminable accounts are never
+/// adopted from disk, so a running process cannot silently switch accounts.
+fn same_account(disk: &Tokens, memory: &Tokens) -> bool {
+    match (usable_account(disk), usable_account(memory)) {
+        (Ok(disk_account), Ok(memory_account)) => disk_account == memory_account,
+        _ => false,
+    }
+}
+
+fn permanent_refresh_kind(body: &str) -> Option<&'static str> {
     [
         "refresh_token_expired",
         "refresh_token_reused",
         "refresh_token_invalidated",
     ]
     .iter()
-    .any(|needle| body.contains(needle))
+    .find(|needle| body.contains(**needle))
+    .copied()
+}
+
+fn permanent_refresh_error(body: &str) -> bool {
+    permanent_refresh_kind(body).is_some()
+}
+
+/// Classified, token-safe message for a permanent refresh failure. The raw
+/// provider body is never echoed (it may contain the submitted token); only
+/// the error kind is surfaced, so users can tell a true expiry or revocation
+/// from a cross-process refresh-token reuse race.
+fn login_expired_error(body: &str) -> anyhow::Error {
+    let hint = match permanent_refresh_kind(body) {
+        Some("refresh_token_expired") => "ChatGPT login has expired (refresh_token_expired)",
+        Some("refresh_token_reused") => {
+            "ChatGPT refresh token was reused by another process (refresh_token_reused)"
+        }
+        Some("refresh_token_invalidated") => {
+            "ChatGPT login was revoked (refresh_token_invalidated)"
+        }
+        _ => "ChatGPT login has expired or was revoked",
+    };
+    anyhow!("{hint}; run `e-agent login`")
 }
 
 fn save_file(path: &Path, data: &AuthFile) -> anyhow::Result<()> {
