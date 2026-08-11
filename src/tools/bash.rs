@@ -657,13 +657,52 @@ pub(super) async fn run_bash(
     if status.success() {
         Ok(text)
     } else {
+        let mut text = text;
+        // rtk-style "tee on failure": a failed command whose visible output
+        // was truncated gets its full output written to a log file so the
+        // model can read_file the whole log instead of guessing from the
+        // surviving head+tail. Successful long output is not persisted.
+        if (stdout.truncated || stderr.truncated)
+            && let Some(path) = persist_full_output(workspace.root(), command, &stdout, &stderr)
+        {
+            text.push_str(&format!("\n[full output: {}]", path.display()));
+        }
         Err(text)
     }
 }
 
+/// Per-stream output budget shown to the model (unchanged semantics: with
+/// stdout and stderr the worst case is still ~2 × OUTPUT_LIMIT bytes).
+/// The budget is split head + tail so the *end* of a stream — where build
+/// and test errors almost always land — survives truncation.
+/// `HEAD_LIMIT` (48 KiB) keeps the beginning (command echo, early progress);
+/// `TAIL_LIMIT` (16 KiB) keeps the final lines, which are the useful ones
+/// for a failed command.
+pub(super) const HEAD_LIMIT: usize = 48 * 1024;
+pub(super) const TAIL_LIMIT: usize = 16 * 1024;
+/// Upper bound on the full output retained in memory per stream for failure
+/// persistence (see [`persist_full_output`]). Always retaining up to
+/// 2 × `FULL_LIMIT` bytes is cheap for typical command output and avoids a
+/// spool-file round trip; a stream longer than this only gets its first
+/// `FULL_LIMIT` bytes written to the log.
+const FULL_LIMIT: usize = 16 * 1024 * 1024;
+
 pub(super) struct Captured {
+    /// Head segment: the first `HEAD_LIMIT` bytes of the stream (the whole
+    /// stream when `total ≤ HEAD_LIMIT`). When `truncated`, its end is
+    /// trimmed to a UTF-8 char boundary so the seam never renders a half
+    /// character; when not truncated the bytes are kept raw so the exact
+    /// stream can be glued back together with the tail window.
     pub(super) bytes: Vec<u8>,
+    /// Tail segment: the last `TAIL_LIMIT` bytes, rendered after the
+    /// truncation marker; only meaningful when `truncated`.
+    pub(super) tail: Vec<u8>,
+    /// Total bytes read from the stream (before head/tail alignment).
+    pub(super) total: usize,
     pub(super) truncated: bool,
+    /// Complete stream up to `FULL_LIMIT` bytes, retained so a failed and
+    /// truncated command's full output can be persisted to a log file.
+    pub(super) full: Vec<u8>,
 }
 
 pub(super) async fn capture(
@@ -671,38 +710,189 @@ pub(super) async fn capture(
     slot: Option<OutputSlot>,
     spool: Option<Arc<TaskSpool>>,
 ) -> std::io::Result<Captured> {
-    let mut bytes = Vec::new();
+    let mut captured = Captured {
+        bytes: Vec::new(),
+        tail: Vec::new(),
+        total: 0,
+        truncated: false,
+        full: Vec::new(),
+    };
     let mut buffer = [0; 8192];
-    let mut truncated = false;
     loop {
         let count = reader.read(&mut buffer).await?;
         if count == 0 {
-            return Ok(Captured { bytes, truncated });
+            break;
         }
+        let data = &buffer[..count];
         if let Some(slot) = &slot {
-            slot_append(slot, &buffer[..count]);
+            slot_append(slot, data);
         }
         if let Some(spool) = &spool {
-            spool.append(&buffer[..count]);
+            spool.append(data);
         }
-        let room = OUTPUT_LIMIT.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&buffer[..count.min(room)]);
-        truncated |= count > room;
+        captured.total += count;
+        // Full output for potential failure persistence, capped at FULL_LIMIT.
+        if captured.full.len() < FULL_LIMIT {
+            let room = FULL_LIMIT - captured.full.len();
+            captured.full.extend_from_slice(&data[..count.min(room)]);
+        }
+        // Head: first HEAD_LIMIT bytes.
+        if captured.bytes.len() < HEAD_LIMIT {
+            let room = HEAD_LIMIT - captured.bytes.len();
+            captured.bytes.extend_from_slice(&data[..count.min(room)]);
+        }
+        // Tail: rolling window of the last TAIL_LIMIT bytes.
+        captured.tail.extend_from_slice(data);
+        if captured.tail.len() > TAIL_LIMIT {
+            let excess = captured.tail.len() - TAIL_LIMIT;
+            captured.tail.drain(..excess);
+        }
+        captured.truncated |= captured.total > OUTPUT_LIMIT;
     }
+    if captured.truncated {
+        // Align both seams to UTF-8 char boundaries so the head/tail never
+        // split a multibyte character (which would render extra U+FFFD).
+        let keep = utf8_back_boundary(&captured.bytes, captured.bytes.len());
+        captured.bytes.truncate(keep);
+        let skip = utf8_front_boundary(&captured.tail, 0);
+        if skip > 0 {
+            captured.tail.drain(..skip);
+        }
+    }
+    Ok(captured)
 }
 
 pub(super) fn format_output(code: Option<i32>, stdout: &Captured, stderr: &Captured) -> String {
-    let mut output = format!(
+    format!(
         "exit code: {}\nstdout:\n{}\nstderr:\n{}",
         code.map_or_else(|| "signal".into(), |code| code.to_string()),
-        String::from_utf8_lossy(&stdout.bytes),
-        String::from_utf8_lossy(&stderr.bytes)
-    );
-    if stdout.truncated {
-        output.push_str("\nstdout: [truncated]");
+        render_stream(stdout),
+        render_stream(stderr)
+    )
+}
+
+/// Render one captured stream: the full text when it fit within the budget,
+/// otherwise `head … [truncated: N bytes omitted] … tail`.
+fn render_stream(captured: &Captured) -> String {
+    if !captured.truncated {
+        // The whole stream fits: `bytes` holds the first min(total,
+        // HEAD_LIMIT) bytes and anything past HEAD_LIMIT is a suffix of the
+        // rolling tail window, so gluing them back reproduces the exact
+        // stream (no lossy conversion in between).
+        let mut out = captured.bytes.clone();
+        if captured.total > out.len() {
+            let rest = captured.total - out.len();
+            let start = captured.tail.len().saturating_sub(rest);
+            out.extend_from_slice(&captured.tail[start..]);
+        }
+        return String::from_utf8_lossy(&out).into_owned();
     }
-    if stderr.truncated {
-        output.push_str("\nstderr: [truncated]");
+    let omitted = captured
+        .total
+        .saturating_sub(captured.bytes.len() + captured.tail.len());
+    format!(
+        "{}\n[truncated: {} bytes omitted]\n{}",
+        String::from_utf8_lossy(&captured.bytes),
+        omitted,
+        String::from_utf8_lossy(&captured.tail)
+    )
+}
+
+/// Largest index ≤ `len` on a UTF-8 char boundary: walks back over the
+/// continuation bytes of a multibyte char split by the cut and drops the
+/// char's leading byte too when the char is incomplete. Walks at most 3
+/// bytes, so it is O(1).
+fn utf8_back_boundary(bytes: &[u8], len: usize) -> usize {
+    let mut pos = len;
+    while pos > 0 && (bytes[pos - 1] & 0xC0) == 0x80 {
+        pos -= 1;
     }
-    output
+    if pos == 0 {
+        return 0;
+    }
+    let lead = bytes[pos - 1];
+    let conts = len - pos;
+    let needed = match lead {
+        0xC0..=0xDF => 1,
+        0xE0..=0xEF => 2,
+        0xF0..=0xF7 => 3,
+        _ => 0,
+    };
+    if conts < needed { pos - 1 } else { len }
+}
+
+/// Smallest index ≥ `offset` on a UTF-8 char boundary: skips at most 3
+/// leading continuation bytes when the tail window starts mid-character.
+fn utf8_front_boundary(bytes: &[u8], offset: usize) -> usize {
+    let mut pos = offset;
+    let max = (offset + 3).min(bytes.len());
+    while pos < max && (bytes[pos] & 0xC0) == 0x80 {
+        pos += 1;
+    }
+    pos
+}
+
+/// Persist the full untruncated output of a failed command whose displayed
+/// text was truncated, to `<workspace>/.e-agent/logs/bash-{timestamp}-{slug}.log`,
+/// and return the path so the result can hint `[full output: …]` and the
+/// model can `read_file` the log for the whole text. Returns `None` when
+/// nothing could be written (I/O error — e.g. a read-only workspace).
+/// Memory trade-off: `capture` always retains up to `FULL_LIMIT` bytes per
+/// stream so the full text is available here without re-running the command;
+/// streams longer than the cap are truncated in the log with a note.
+fn persist_full_output(
+    workspace_root: &std::path::Path,
+    command: &str,
+    stdout: &Captured,
+    stderr: &Captured,
+) -> Option<std::path::PathBuf> {
+    let logs_dir = workspace_root.join(".e-agent").join("logs");
+    std::fs::create_dir_all(&logs_dir).ok()?;
+    let path = logs_dir.join(format!(
+        "bash-{}-{}.log",
+        chrono::Local::now().format("%Y%m%d-%H%M%S%.3f"),
+        command_slug(command)
+    ));
+    let mut content = format!("$ {command}\n--- stdout ---\n");
+    content.push_str(&String::from_utf8_lossy(&stdout.full));
+    if stdout.total > stdout.full.len() {
+        content.push_str(&format!(
+            "\n[stdout log capped at {} bytes]\n",
+            stdout.full.len()
+        ));
+    }
+    content.push_str("\n--- stderr ---\n");
+    content.push_str(&String::from_utf8_lossy(&stderr.full));
+    if stderr.total > stderr.full.len() {
+        content.push_str(&format!(
+            "\n[stderr log capped at {} bytes]\n",
+            stderr.full.len()
+        ));
+    }
+    content.push('\n');
+    std::fs::write(&path, content).ok()?;
+    Some(path)
+}
+
+/// Filesystem-safe short slug for log filenames derived from the command
+/// (e.g. `cargo test -- --nocapture` → `cargo_test_nocapture`; falls back to
+/// `bash` for commands without any alphanumerics).
+fn command_slug(command: &str) -> String {
+    let mut slug = String::new();
+    let mut prev_sep = true;
+    for c in command.chars().take(64) {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+            prev_sep = false;
+        } else if !prev_sep {
+            slug.push('_');
+            prev_sep = true;
+        }
+    }
+    let slug = slug.trim_matches('_').to_string();
+    if slug.is_empty() {
+        "bash".to_string()
+    } else {
+        slug
+    }
 }

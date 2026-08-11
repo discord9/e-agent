@@ -21,6 +21,16 @@ fn http_response(status: &str, body: impl AsRef<[u8]>) -> Vec<u8> {
     response
 }
 
+fn empty_captured() -> Captured {
+    Captured {
+        bytes: Vec::new(),
+        tail: Vec::new(),
+        total: 0,
+        truncated: false,
+        full: Vec::new(),
+    }
+}
+
 fn redirect_response(location: &str) -> Vec<u8> {
     format!(
             "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -782,19 +792,158 @@ async fn write_creates_a_new_nested_file() {
 }
 
 #[tokio::test]
-async fn capture_drains_and_marks_each_truncated_stream() {
+async fn capture_splits_truncated_streams_into_head_and_tail() {
     async fn captured(bytes: Vec<u8>) -> Captured {
         let (mut writer, reader) = tokio::io::duplex(1024);
         tokio::spawn(async move { writer.write_all(&bytes).await.unwrap() });
         capture(reader, None, None).await.unwrap()
     }
-    let stdout = captured(vec![b'o'; OUTPUT_LIMIT + 1]).await;
-    let stderr = captured(vec![b'e'; OUTPUT_LIMIT + 1]).await;
-    assert_eq!(stdout.bytes.len(), OUTPUT_LIMIT);
-    assert_eq!(stderr.bytes.len(), OUTPUT_LIMIT);
-    let output = format_output(Some(0), &stdout, &stderr);
-    assert!(output.contains("stdout: [truncated]"));
-    assert!(output.contains("stderr: [truncated]"));
+
+    // Well under the budget: full text, no truncation marker.
+    let short = captured(vec![b'a'; 1024]).await;
+    let output = format_output(Some(0), &short, &empty_captured());
+    assert!(!short.truncated);
+    assert!(output.contains("aaa"), "{output}");
+    assert!(!output.contains("[truncated"), "{output}");
+
+    // A stream straddling HEAD_LIMIT but still within the budget is
+    // reconstructed exactly (head + overlapping tail window glued back).
+    let mid = captured(vec![b'b'; HEAD_LIMIT + TAIL_LIMIT / 2]).await;
+    let output = format_output(Some(0), &mid, &empty_captured());
+    assert!(!mid.truncated);
+    assert!(!output.contains("[truncated"), "{output}");
+    assert_eq!(output.matches('b').count(), HEAD_LIMIT + TAIL_LIMIT / 2);
+
+    // Over the budget: head start survives, tail end survives, middle marked.
+    let big = captured(vec![b'o'; 100 * 1024]).await;
+    assert!(big.truncated);
+    assert_eq!(big.bytes.len(), HEAD_LIMIT);
+    assert_eq!(big.tail.len(), TAIL_LIMIT);
+    let output = format_output(Some(0), &big, &empty_captured());
+    assert!(
+        output.starts_with("exit code: 0\nstdout:\noooo"),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "[truncated: {} bytes omitted]",
+            100 * 1024 - HEAD_LIMIT - TAIL_LIMIT
+        )),
+        "{output}"
+    );
+    let stdout_section = output.split("\nstderr:\n").next().unwrap();
+    assert!(stdout_section.trim_end().ends_with('o'), "{output}");
+    assert!(output.contains("\nstderr:\n"), "{output}");
+
+    // Both streams truncated: each gets its own head + marker + tail.
+    let err = captured(vec![b'e'; 80 * 1024]).await;
+    let output = format_output(Some(1), &big, &err);
+    assert!(output.contains(&format!(
+        "[truncated: {} bytes omitted]",
+        100 * 1024 - HEAD_LIMIT - TAIL_LIMIT
+    )));
+    assert!(output.contains(&format!(
+        "[truncated: {} bytes omitted]",
+        80 * 1024 - HEAD_LIMIT - TAIL_LIMIT
+    )));
+}
+
+#[tokio::test]
+async fn capture_truncation_keeps_utf8_boundaries() {
+    async fn captured(bytes: Vec<u8>) -> Captured {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        tokio::spawn(async move { writer.write_all(&bytes).await.unwrap() });
+        capture(reader, None, None).await.unwrap()
+    }
+    // "a" + 你×21846 = 65539 bytes > OUTPUT_LIMIT: both the head cut (at
+    // 49152) and the tail window front land inside a 3-byte character.
+    let mut bytes = vec![b'a'];
+    for _ in 0..21846 {
+        bytes.extend_from_slice("你".as_bytes());
+    }
+    assert!(bytes.len() > OUTPUT_LIMIT);
+    let captured = captured(bytes).await;
+    assert!(captured.truncated);
+    let rendered = format_output(Some(1), &captured, &empty_captured());
+    // No split multibyte char: from_utf8_lossy must not emit U+FFFD.
+    assert!(!rendered.contains('\u{FFFD}'), "{rendered}");
+    assert!(rendered.contains("[truncated: "), "{rendered}");
+    let stdout_section = rendered.split("stderr:\n").next().unwrap();
+    // Head ends and tail starts on complete 你 characters (the head section
+    // carries the separator newline before the marker, so trim it).
+    let head = stdout_section.split("[truncated: ").next().unwrap();
+    assert!(head.trim_end().ends_with('你'), "{rendered}");
+    let after_marker = stdout_section.split("[truncated: ").nth(1).unwrap();
+    let tail = after_marker.split_once('\n').unwrap().1;
+    assert!(tail.starts_with('你'), "{rendered}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_truncated_bash_writes_full_output_log() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let shell = Shell::detect().unwrap();
+    let text = run_bash(
+        &shell,
+        &workspace,
+        "printf 'x%.0s' {1..100000}; exit 1",
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    // The displayed text is head + tail with a marker and a log hint.
+    assert!(text.contains("[truncated: "), "{text}");
+    let path = text
+        .split("[full output: ")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("failed+truncated output must hint the full log");
+    let expected_dir = temp
+        .path()
+        .join(".e-agent/logs/")
+        .to_string_lossy()
+        .into_owned();
+    assert!(path.starts_with(&expected_dir), "hint path {path}");
+    // The log holds the complete untruncated stdout (100000 'x') plus the
+    // command echo and stream separators.
+    let content = std::fs::read_to_string(path).unwrap();
+    assert!(content.starts_with("$ printf"), "{content}");
+    assert!(content.contains("--- stdout ---"), "{content}");
+    assert!(content.contains("--- stderr ---"), "{content}");
+    let stdout_section = content.split("--- stdout ---").nth(1).unwrap();
+    let stdout_only = stdout_section.split("--- stderr ---").next().unwrap();
+    assert_eq!(stdout_only.matches('x').count(), 100000);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn successful_long_bash_output_does_not_write_a_log() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let shell = Shell::detect().unwrap();
+    let text = run_bash(
+        &shell,
+        &workspace,
+        "printf 'y%.0s' {1..100000}",
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    // Truncated display, but success → no persistence, no hint.
+    assert!(text.contains("[truncated: "), "{text}");
+    assert!(!text.contains("[full output: "), "{text}");
+    assert!(!temp.path().join(".e-agent/logs").exists());
 }
 
 #[cfg(unix)]

@@ -1435,12 +1435,24 @@ fn read_pipe(
         {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
-                return Ok(Captured { bytes, truncated });
+                return Ok(Captured {
+                    bytes,
+                    truncated,
+                    tail: Vec::new(),
+                    total: bytes.len(),
+                    full: Vec::new(),
+                });
             }
             return Err(error);
         }
         if count == 0 {
-            return Ok(Captured { bytes, truncated });
+            return Ok(Captured {
+                bytes,
+                truncated,
+                tail: Vec::new(),
+                total: bytes.len(),
+                full: Vec::new(),
+            });
         }
         let data = &buffer[..count as usize];
         if let Some(slot) = &slot {
