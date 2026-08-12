@@ -4143,6 +4143,22 @@ model = "deepseek-chat"
         assert!(html.contains("<title>e-agent · Web UI</title>"));
         assert!(html.contains("marked.setOptions"));
         assert!(html.contains("katex.renderToString"));
+        // KaTeX fonts are inlined as base64 data: URLs (self-contained,
+        // zero external requests): every @font-face src must be a woff2
+        // data URL and no relative `fonts/` fetch may survive.
+        assert!(
+            !html.contains("url(fonts/"),
+            "relative KaTeX font URLs leaked into assembled UI"
+        );
+        assert!(
+            html.contains("data:font/woff2;base64,"),
+            "no inlined KaTeX woff2 data URL in assembled UI"
+        );
+        assert_eq!(
+            html.matches("data:font/woff2;base64,").count(),
+            20,
+            "expected exactly 20 inlined KaTeX font faces"
+        );
     }
 
     /// GET / serves the assembled UI uncached: 200, text/html, no-store,
