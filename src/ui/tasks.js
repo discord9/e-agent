@@ -185,6 +185,19 @@ function shortTaskLabel(t) {
 
 /* ---- 任务行就地流式：bash 轮询 output 端点 + delegate 内嵌 SSE ---- */
 
+/* 滚动守卫：自动贴底只在用户未主动上滚时生效（与主聊天区 userScrolled 守卫
+   同款语义，见 sse.js messages scroll 监听 / render.js scrollBottom）。
+   程序滚动（scrollTop 赋值）派生的 scroll 事件 isTrusted=false 不处理；
+   用户滚回底部（4px 容差）时复位，恢复自动跟随。状态存元素私有属性
+   _userScrolled，随元素生命周期走（行重建即重置）。 */
+function attachScrollGuard(el) {
+  el.addEventListener("scroll", (ev) => {
+    if (!ev.isTrusted) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
+    el._userScrolled = !atBottom;
+  });
+}
+
 /* bash 输出轮询（通用）：给定任务 key + 目标 pre 元素 + 状态回调，500ms
    GET /api/sessions/{sid}/tasks/{tid}/output 全量刷新输出区（textContent）。
    旧后端（端点 404）→ 静默停轮询并记为降级（重绘不再重启），保持静态尾部；
@@ -195,6 +208,7 @@ function shortTaskLabel(t) {
 function startOutputPoller(key, t, pre, onPhase) {
   stopTaskPoller(key);
   if (onPhase) onPhase("start");
+  pre._userScrolled = false;   // 新一轮轮询从底部跟随开始；用户上滚后才锁定
   let intervalId = null;
   // 只停自己的轮询：2s 重绘会先停旧轮询再启新轮询，旧 tick 的异步收尾
   // 不能误清新轮询（竞态：key 相同）。
@@ -229,8 +243,25 @@ function startOutputPoller(key, t, pre, onPhase) {
       if (!pre.isConnected) { stop(false); return; }
       const txt = String(text).trim() !== "" ? String(text) : "";
       pre.classList.toggle("empty", txt === "");
-      pre.textContent = txt || "(无输出)";
-      pre.scrollTop = pre.scrollHeight;
+      // 增量追加（保住选区）：_lastText 缓存上次已渲染的完整文本；txt 以它为
+      // 前缀 → 只 append 差值文本节点，不整段 textContent 重写（整段重写会
+      // 塌缩用户选区，无法复制）。输出被清空/重置/改写（非前缀）→ 整体替换
+      // 并复位缓存。
+      if (txt === "") {
+        if (pre._lastText !== "" || pre.textContent !== "(无输出)") {
+          pre.textContent = "(无输出)";   // 任务重置/清空：回到空占位
+        }
+        pre._lastText = "";
+      } else if (txt.startsWith(pre._lastText || "")) {
+        if (!pre._lastText && pre.textContent !== "") pre.textContent = "";   // 清掉占位/旧内容
+        const chunk = txt.slice((pre._lastText || "").length);
+        if (chunk) pre.appendChild(document.createTextNode(chunk));
+        pre._lastText = txt;
+      } else {
+        pre.textContent = txt;   // 输出被改写（非前缀）：整体替换
+        pre._lastText = txt;
+      }
+      if (!pre._userScrolled) pre.scrollTop = pre.scrollHeight;
     } catch (e) {
       stop(false);   // 网络失败：停轮询，保留已有内容
     } finally {
@@ -261,7 +292,9 @@ function startTaskStream(t, key, streamEl, status) {
   if (status) status.hidden = false;
   streamEl.classList.remove("empty");
   streamEl.textContent = state.tasks.streamText.get(key) || "(等待流式输出…)";
-  streamEl.scrollTop = streamEl.scrollHeight;
+  streamEl._lastText = state.tasks.streamText.get(key) || "";   // 增量基准：DOM 与缓存对齐
+  streamEl._userScrolled = false;   // 新流从底部跟随开始（元素新建/重建时本就无状态）
+  if (!streamEl._userScrolled) streamEl.scrollTop = streamEl.scrollHeight;
   (async () => {
     try {
       const res = await api("/api/sessions/" + encodeURIComponent(t.session_id || "") + "/events", {
@@ -357,26 +390,42 @@ function updateJumpBottomPosition() {
   else btn.style.bottom = "";   // 回默认 110px（style.css .jump-bottom）
 }
 
-/* 整体替换流式区文本（snapshot 重放 / AssistantText / 404 提示） */
+/* 整体替换流式区文本（snapshot 重放 / AssistantText / 404 提示）。
+   保留全量设置语义（初始/重置），但文本未变时跳过 DOM 写（保住选区），
+   并维护 _lastText 供 appendTaskStreamText 增量续写。 */
 function setTaskStreamText(streamEl, key, text) {
   state.tasks.streamText.set(key, text);
-  if (streamEl.isConnected) {
-    streamEl.classList.toggle("empty", String(text).trim() === "");
-    streamEl.textContent = text;
-    streamEl.scrollTop = streamEl.scrollHeight;
-  }
+  if (!streamEl.isConnected) return;
+  const s = String(text);
+  if (streamEl._lastText === s) return;   // 文本未变：跳过 DOM 写（保住选区）
+  streamEl.classList.toggle("empty", s.trim() === "");
+  streamEl.textContent = s;
+  streamEl._lastText = s;
+  if (!streamEl._userScrolled) streamEl.scrollTop = streamEl.scrollHeight;
 }
 
-/* 追加流式文本（live AssistantDelta） */
+/* 追加流式文本（live AssistantDelta）：只 append 新 delta 的文本节点，
+   不整段重写（整段重写会塌缩用户选区，无法复制）。streamText 缓存总是
+   最新完整文本；DOM 按 _lastText 增量对齐，失步（行重建/重置）时整体替换。 */
 function appendTaskStreamText(streamEl, key, text) {
   if (!text) return;
   const next = (state.tasks.streamText.get(key) || "") + text;
   state.tasks.streamText.set(key, next);
-  if (streamEl.isConnected) {
-    streamEl.classList.remove("empty");
-    streamEl.textContent = next;
-    streamEl.scrollTop = streamEl.scrollHeight;
+  if (!streamEl.isConnected) return;
+  streamEl.classList.remove("empty");
+  if (streamEl._lastText === next) return;   // 已同步
+  if (next.startsWith(streamEl._lastText || "")) {
+    if (!streamEl._lastText && streamEl.textContent !== "") {
+      streamEl.textContent = "";   // 清掉占位/旧内容，再追加首个真实 chunk
+    }
+    const chunk = next.slice((streamEl._lastText || "").length);
+    if (chunk) streamEl.appendChild(document.createTextNode(chunk));
+    streamEl._lastText = next;
+  } else {
+    streamEl.textContent = next;   // 缓存与 DOM 失步（重建/重置）：整体替换
+    streamEl._lastText = next;
   }
+  if (!streamEl._userScrolled) streamEl.scrollTop = streamEl.scrollHeight;
 }
 
 /* 解析单个 SSE 事件块（轻量：只处理 assistant 相关事件）。
@@ -513,6 +562,7 @@ function updateRetainedTaskRow(row, t, key) {
   const out = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
   pre.classList.toggle("empty", out === "");
   pre.textContent = out || "(无输出)";
+  pre._lastText = out;   // 同步增量缓存：重新展开时 tick 以此为前缀基准，避免重复追加
 }
 
 /* 单个任务卡片行（keyed 更新用）：data-task = key、data-key-sig = 元数据
@@ -643,6 +693,7 @@ function buildTaskRow(t, key, restoreExpanded) {
     if (isDelegate) {
       streamEl = el("pre", "task-stream", "(等待流式输出…)");
       streamEl.hidden = true;
+      attachScrollGuard(streamEl);
       row.appendChild(streamEl);
     } else {
       // 展开区顶部命令行：bash 任务有 full_command 时显示完整命令原文
@@ -657,7 +708,9 @@ function buildTaskRow(t, key, restoreExpanded) {
       }
       const out = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
       pre = el("pre", "task-output" + (out ? "" : " empty"), out || "(无输出)");
+      pre._lastText = out;   // 初始静态快照即增量基准（首轮 tick 以它为前缀判断）
       pre.hidden = true;
+      attachScrollGuard(pre);
       row.appendChild(pre);
     }
     // 取消入口已统一为行尾常显按钮（见上 .task-cancel-inline），原展开区
