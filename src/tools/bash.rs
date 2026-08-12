@@ -1,5 +1,6 @@
 use super::*;
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -380,6 +381,85 @@ fn which_on_path(name: &str) -> Option<String> {
     None
 }
 
+/// True when `path` (or one of its ancestors) is itself a sandbox mount
+/// root — i.e. the file is reachable at that path inside the sandbox.
+pub(super) fn path_visible_in_sandbox(path: &Path, mounts: &[PathBuf]) -> bool {
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        if mounts.iter().any(|mount| mount.as_path() == dir) {
+            return true;
+        }
+        current = dir.parent();
+    }
+    false
+}
+
+/// Mount roots visible inside the sandbox, mirroring the bind set
+/// `run_bash` builds for bwrap: system read-only binds, configured
+/// readable/writable mounts and paths, and the workspace root.
+pub(super) fn sandbox_mount_roots(
+    sandbox: &crate::config::Sandbox,
+    workspace_root: &Path,
+) -> Vec<PathBuf> {
+    let mut mounts = vec![
+        PathBuf::from("/dev"),
+        PathBuf::from("/proc"),
+        PathBuf::from("/usr"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib64"),
+        PathBuf::from("/etc"),
+    ];
+    for (source, _dest) in &sandbox.readable_mounts {
+        mounts.push(PathBuf::from(source));
+    }
+    for (source, _dest) in &sandbox.writable_mounts {
+        mounts.push(PathBuf::from(source));
+    }
+    mounts.extend(sandbox.readable_paths.iter().map(PathBuf::from));
+    mounts.extend(sandbox.writable_paths.iter().map(PathBuf::from));
+    mounts.push(workspace_root.to_path_buf());
+    mounts
+}
+
+/// The sandbox default git config is injected only when the host has a
+/// `gh` executable whose path is visible inside the sandbox. `None`
+/// (no host gh) or a path outside every mount root → `false`.
+pub(super) fn gh_visible_in_sandbox(host_gh: Option<&Path>, mounts: &[PathBuf]) -> bool {
+    host_gh.is_some_and(|gh| path_visible_in_sandbox(gh, mounts))
+}
+
+/// True when `path` is a regular file with at least one execute bit.
+#[cfg(unix)]
+pub(super) fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+/// Non-Unix fallback: `is_file` only (Windows `where`-style semantics).
+#[cfg(not(unix))]
+pub(super) fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Resolve `gh` through a PATH-style variable (`which` semantics),
+/// honoring execute bits on Unix. `path_env` is injectable for tests.
+pub(super) fn gh_in_path(path_env: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "gh.exe" } else { "gh" };
+    std::env::split_paths(path_env?)
+        .map(|dir| dir.join(exe))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// Host-side absolute path to the `gh` CLI via the process PATH.
+/// `None` when the host has no executable `gh`.
+pub(super) fn gh_host_path() -> Option<PathBuf> {
+    gh_in_path(std::env::var_os("PATH").as_deref())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_bash(
     shell: &Shell,
@@ -548,6 +628,29 @@ pub(super) async fn run_bash(
             args.extend(shell.command_args(command));
             let mut cmd = Command::new("bwrap");
             cmd.args(args);
+            // Only inject the default git config when the gh CLI is
+            // actually reachable inside the sandbox: a host-side `gh`
+            // whose executable path falls under a sandbox-mounted
+            // directory. A host without gh (or with gh outside every
+            // mount root) gets no injection at all — zero impact.
+            let gh_visible = gh_visible_in_sandbox(
+                gh_host_path().as_deref(),
+                &sandbox_mount_roots(sandbox, root),
+            );
+            if sandbox.network && gh_visible {
+                // Sandbox default git config, injected via env (equivalent
+                // to a minimal ~/.gitconfig, no file needed): let `git
+                // push` work out of the box by delegating credentials to
+                // the gh CLI (whose config dir is mounted read-only) and
+                // rewriting SSH github.com URLs to HTTPS. GIT_CONFIG_*
+                // requires git >= 2.31; older git silently ignores them,
+                // which is fine (no config is still the current behavior).
+                cmd.env("GIT_CONFIG_COUNT", "2");
+                cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
+                cmd.env("GIT_CONFIG_VALUE_0", "!gh auth git-credential");
+                cmd.env("GIT_CONFIG_KEY_1", "url.https://github.com/.insteadOf");
+                cmd.env("GIT_CONFIG_VALUE_1", "git@github.com:");
+            }
             // Strip credential env vars so they are not inherited by the
             // sandboxed command. The agent reads these from the parent
             // process env directly, not via bash, so removing them here
