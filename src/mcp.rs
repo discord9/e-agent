@@ -5,7 +5,7 @@
 //! OAuth, resources/prompts, server-initiated notifications, `listChanged`
 //! refresh, server restart on crash, concurrent initialization.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -23,6 +24,13 @@ use tokio::sync::{Mutex, oneshot};
 use crate::agent::{Tool, ToolSpec};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Total wall-clock budget for [`connect_all`]. Enabled servers are
+/// connected concurrently, so the batch waits at most this long instead of
+/// the serial sum of per-server connect times. 5s leaves fast local servers
+/// (e.g. engram) essentially unaffected while bounding slow first runs
+/// (e.g. an `npx` package download) to ~5s instead of the 30s-per-server
+/// worst case.
+const CONNECT_ALL_TIMEOUT: Duration = Duration::from_secs(5);
 const RESULT_LIMIT: usize = 64 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -260,66 +268,129 @@ impl Tool for McpTool {
 /// (tools, system-prompt instructions). Failures are logged as warnings and
 /// do not abort startup. Server definitions come from the unified TOML
 /// config (`[mcp.<name>]` sections, see config.rs).
+///
+/// Enabled servers are connected concurrently (wall time ≈ the slowest
+/// server, not the sum) and the whole batch is bounded by
+/// [`CONNECT_ALL_TIMEOUT`]: on deadline, servers that already finished keep
+/// their tools (partial success) and the rest are abandoned with a warning.
 pub async fn connect_all(
     servers: HashMap<String, McpServerConfig>,
     workspace_root: &Path,
 ) -> (Vec<Box<dyn Tool>>, Vec<String>) {
+    connect_all_with_timeout(servers, workspace_root, CONNECT_ALL_TIMEOUT).await
+}
+
+/// [`connect_all`] with an injectable deadline (tests use a short one).
+async fn connect_all_with_timeout(
+    servers: HashMap<String, McpServerConfig>,
+    workspace_root: &Path,
+    timeout: Duration,
+) -> (Vec<Box<dyn Tool>>, Vec<String>) {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     let mut instructions = Vec::new();
-    for (name, server_config) in servers {
-        if !server_config.enabled {
-            continue;
-        }
-        match McpServer::connect(&name, &server_config, workspace_root).await {
-            Ok((server, server_instructions)) => {
-                if let Some(text) = server_instructions {
-                    instructions.push(format!("## MCP server `{name}`\n\n{text}"));
-                }
-                match server.list_tools().await {
-                    Ok(list) => {
-                        let mut tool_count = 0usize;
-                        for tool in list {
-                            let remote_name = tool
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned();
-                            if remote_name.is_empty() {
-                                continue;
-                            }
-                            let description = tool
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned();
-                            let parameters = tool
-                                .get("inputSchema")
-                                .cloned()
-                                .unwrap_or_else(|| json!({"type": "object"}));
-                            let spec = ToolSpec {
-                                name: format!("{name}_{remote_name}"),
-                                description,
-                                parameters,
-                            };
-                            tools.push(Box::new(McpTool {
-                                server: server.clone(),
-                                remote_name,
-                                spec,
-                            }));
-                            tool_count += 1;
+    let enabled: Vec<(String, McpServerConfig)> = servers
+        .into_iter()
+        .filter(|(_, config)| config.enabled)
+        .collect();
+    // Track which servers are still pending so the deadline warning can name
+    // them; each future reports its own name on completion.
+    let mut pending_names: HashSet<String> = enabled.iter().map(|(name, _)| name.clone()).collect();
+    // One future per enabled server, all polled concurrently by
+    // FuturesUnordered. The per-server logic (connect -> list_tools ->
+    // collect tools/instructions + eprintln) is unchanged, just concurrent:
+    // total time is max(per-server) instead of sum(per-server).
+    let mut pending: FuturesUnordered<_> = enabled
+        .into_iter()
+        .map(|(name, config)| {
+            let workspace_root = workspace_root.to_owned();
+            async move {
+                let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+                let mut instructions = Vec::new();
+                match McpServer::connect(&name, &config, &workspace_root).await {
+                    Ok((server, server_instructions)) => {
+                        if let Some(text) = server_instructions {
+                            instructions.push(format!("## MCP server `{name}`\n\n{text}"));
                         }
-                        eprintln!("e-agent: mcp server `{name}` connected ({tool_count} tools)");
+                        match server.list_tools().await {
+                            Ok(list) => {
+                                let mut tool_count = 0usize;
+                                for tool in list {
+                                    let remote_name = tool
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned();
+                                    if remote_name.is_empty() {
+                                        continue;
+                                    }
+                                    let description = tool
+                                        .get("description")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned();
+                                    let parameters = tool
+                                        .get("inputSchema")
+                                        .cloned()
+                                        .unwrap_or_else(|| json!({"type": "object"}));
+                                    let spec = ToolSpec {
+                                        name: format!("{name}_{remote_name}"),
+                                        description,
+                                        parameters,
+                                    };
+                                    tools.push(Box::new(McpTool {
+                                        server: server.clone(),
+                                        remote_name,
+                                        spec,
+                                    }));
+                                    tool_count += 1;
+                                }
+                                eprintln!(
+                                    "e-agent: mcp server `{name}` connected ({tool_count} tools)"
+                                );
+                            }
+                            Err(error) => eprintln!(
+                                "e-agent: warning: mcp server `{name}` tools/list failed: {error:#}"
+                            ),
+                        }
                     }
-                    Err(error) => eprintln!(
-                        "e-agent: warning: mcp server `{name}` tools/list failed: {error:#}"
-                    ),
+                    Err(error) => {
+                        eprintln!(
+                            "e-agent: warning: mcp server `{name}` failed to start: {error:#}"
+                        )
+                    }
                 }
+                (name, tools, instructions)
             }
-            Err(error) => {
-                eprintln!("e-agent: warning: mcp server `{name}` failed to start: {error:#}")
+        })
+        .collect();
+
+    // Drain results until every server finished or the deadline passed.
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, pending.next()).await {
+            Ok(Some((name, server_tools, server_instructions))) => {
+                pending_names.remove(&name);
+                tools.extend(server_tools);
+                instructions.extend(server_instructions);
             }
+            Ok(None) => break,
+            Err(_) => break,
         }
     }
+    for name in pending_names {
+        eprintln!(
+            "e-agent: warning: mcp server `{name}` did not finish within {timeout:?}; skipping it"
+        );
+    }
+    // `pending` drops here, abandoning any unfinished connect futures. The
+    // child processes they spawned are NOT killed (dropping a tokio `Child`
+    // only detaches the handle), but their stdin pipe closes, so stdio-
+    // driven servers exit on their own; the stdout/stderr reader tasks
+    // spawned inside `McpServer::connect` observe EOF and terminate.
     (tools, instructions)
 }
 
