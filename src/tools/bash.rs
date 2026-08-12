@@ -467,20 +467,31 @@ pub(super) async fn run_bash(
             // Put the workspace last among equal paths so workspace_writable
             // remains authoritative for the workspace root itself.
             let mut mounts = Vec::new();
+            // Configured mounts first: (canonical source, configured dest),
+            // so a symlink alias appears inside the sandbox at the path the
+            // user configured. The canonical path self-mounts below keep
+            // manually-constructed sandboxes (and the canonical locations
+            // themselves) working exactly as before.
+            for (source, dest) in &sandbox.readable_mounts {
+                mounts.push((source.as_str(), dest.as_str(), "--ro-bind-try", false));
+            }
+            for (source, dest) in &sandbox.writable_mounts {
+                mounts.push((source.as_str(), dest.as_str(), "--bind-try", false));
+            }
             for path in &sandbox.readable_paths {
-                mounts.push((path.as_str(), "--ro-bind-try", false));
+                mounts.push((path.as_str(), path.as_str(), "--ro-bind-try", false));
             }
             for path in &sandbox.writable_paths {
-                mounts.push((path.as_str(), "--bind-try", false));
+                mounts.push((path.as_str(), path.as_str(), "--bind-try", false));
             }
-            mounts.push((root_str.as_str(), workspace_bind, true));
-            mounts.sort_by_key(|(path, _, workspace)| {
-                (std::path::Path::new(path).components().count(), *workspace)
+            mounts.push((root_str.as_str(), root_str.as_str(), workspace_bind, true));
+            mounts.sort_by_key(|(_, dest, _, workspace)| {
+                (std::path::Path::new(dest).components().count(), *workspace)
             });
-            for (path, bind, _) in mounts {
+            for (source, dest, bind, _) in mounts {
                 args.push(bind.into());
-                args.push(path.into());
-                args.push(path.into());
+                args.push(source.into());
+                args.push(dest.into());
             }
             // Protect the startup policy anchor, not a custom delegated
             // workspace's unrelated config. It must come after every bind.

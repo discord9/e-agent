@@ -728,6 +728,142 @@ fn sandbox_allows_read_only_parent_with_writable_child() {
     assert_eq!(policy.writable_paths, vec![child.to_str().unwrap()]);
 }
 
+/// A configured readable path that is a symlink must keep the canonical
+/// path in `readable_paths` (the file-tool security boundary) AND surface a
+/// (canonical source, configured dest) pair in `readable_mounts` so the
+/// configured location is visible inside the sandbox.
+#[cfg(unix)]
+#[test]
+fn sandbox_resolves_readable_symlink_into_configured_mount() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let target = temp.path().join("cargo-home");
+    let alias = temp.path().join(".cargo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    symlink(&target, &alias).unwrap();
+    let path = write_config(
+        temp.path(),
+        &format!("[sandbox]\nreadable_paths = [\"{}\"]\n", alias.display()),
+    );
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    assert_eq!(
+        sandbox.readable_paths,
+        vec![canonical.to_str().unwrap()],
+        "readable_paths stays canonical (file-tool security boundary)"
+    );
+    assert_eq!(
+        sandbox.readable_mounts,
+        vec![(
+            canonical.to_str().unwrap().to_owned(),
+            alias.to_str().unwrap().to_owned()
+        )],
+        "the configured alias is mounted at its configured location"
+    );
+    assert!(
+        sandbox.writable_mounts.is_empty(),
+        "no writable mounts configured"
+    );
+}
+
+/// The `~/.cargo` scenario: a readable symlink alias whose canonical target
+/// is also configured writable. `normalize_roots` drops the readable root
+/// from `readable_paths`, but the configured alias must survive in
+/// `readable_mounts` — that is the whole point of the mounts.
+#[cfg(unix)]
+#[test]
+fn sandbox_keeps_readable_symlink_mount_shadowed_by_writable_target() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let target = temp.path().join("cargo-home");
+    let alias = temp.path().join(".cargo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    symlink(&target, &alias).unwrap();
+    let path = write_config(
+        temp.path(),
+        &format!(
+            "[sandbox]\nreadable_paths = [\"{}\"]\nwritable_paths = [\"{}\"]\n",
+            alias.display(),
+            target.display()
+        ),
+    );
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    assert_eq!(
+        sandbox.writable_paths,
+        vec![canonical.to_str().unwrap()],
+        "writable root stays canonical"
+    );
+    assert!(
+        sandbox.readable_paths.is_empty(),
+        "readable root shadowed by the writable root is dropped from readable_paths"
+    );
+    assert_eq!(
+        sandbox.readable_mounts,
+        vec![(
+            canonical.to_str().unwrap().to_owned(),
+            alias.to_str().unwrap().to_owned()
+        )],
+        "the shadowed readable alias still mounts at its configured location"
+    );
+    assert_eq!(
+        sandbox.writable_mounts,
+        vec![(
+            canonical.to_str().unwrap().to_owned(),
+            canonical.to_str().unwrap().to_owned()
+        )],
+        "the writable canonical self-mount is recorded"
+    );
+}
+
+/// Writable symlink roots behave symmetrically: canonical in
+/// `writable_paths`, configured dest in `writable_mounts`.
+#[cfg(unix)]
+#[test]
+fn sandbox_resolves_writable_symlink_into_configured_mount() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let target = temp.path().join("cargo-home");
+    let alias = temp.path().join(".cargo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    symlink(&target, &alias).unwrap();
+    let path = write_config(
+        temp.path(),
+        &format!("[sandbox]\nwritable_paths = [\"{}\"]\n", alias.display()),
+    );
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    assert_eq!(
+        sandbox.writable_paths,
+        vec![canonical.to_str().unwrap()],
+        "writable_paths stays canonical"
+    );
+    assert_eq!(
+        sandbox.writable_mounts,
+        vec![(
+            canonical.to_str().unwrap().to_owned(),
+            alias.to_str().unwrap().to_owned()
+        )],
+        "the writable alias mounts at its configured location"
+    );
+    assert!(sandbox.readable_mounts.is_empty());
+}
+
 #[test]
 fn project_sandbox_rejects_unknown_fields() {
     let temp = tempfile::tempdir().unwrap();

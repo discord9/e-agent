@@ -190,6 +190,15 @@ pub struct Sandbox {
     /// Extra readable roots shared by bash mounts and file tools.
     #[serde(default)]
     pub readable_paths: Vec<String>,
+    /// Mount points as configured: (canonical source, configured dest).
+    /// Kept separate from `readable_paths`/`writable_paths` (which stay
+    /// canonical) so a configured path that is a symlink alias of a canonical
+    /// root still appears inside the sandbox at its configured location.
+    /// Filled by `resolve_sandbox`; never read from config.
+    #[serde(default, skip)]
+    pub readable_mounts: Vec<(String, String)>,
+    #[serde(default, skip)]
+    pub writable_mounts: Vec<(String, String)>,
 }
 
 impl Default for Sandbox {
@@ -204,6 +213,8 @@ impl Default for Sandbox {
             workspace_writable: true,
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
+            readable_mounts: Vec::new(),
+            writable_mounts: Vec::new(),
         }
     }
 }
@@ -668,11 +679,26 @@ struct ProjectSandbox {
 /// ignored for compatibility; all returned paths are canonical. The
 /// project `[sandbox]` scalars (`enabled`, `network`, `workspace_writable`)
 /// override the global keys per-key; absent project keys keep the global
-/// values.
+/// values. In addition, every configured root is surfaced as a
+/// (canonical source, configured dest) pair in `readable_mounts` /
+/// `writable_mounts` so a configured alias (e.g. a `~/.cargo` symlink onto a
+/// canonical writable root) stays visible inside the sandbox at the
+/// configured location even when the readable root itself is shadowed by a
+/// writable root during normalization.
 pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Result<Sandbox> {
     let mut result = config.and_then(|c| c.sandbox.clone()).unwrap_or_default();
+    // Collect configured (canonical source, configured dest) mount pairs
+    // from the RAW canonical_roots output, before merge/normalize narrowing.
+    // normalize_roots drops a readable root shadowed by a writable root, but
+    // the configured alias (e.g. `~/.cargo` symlinked onto a canonical
+    // writable root) must still appear inside the sandbox at its configured
+    // location — that is exactly the scenario this feature fixes.
     let global_writable = canonical_roots(&result.writable_paths, workspace, true)?;
     let global_readable = canonical_roots(&result.readable_paths, workspace, true)?;
+    let mut readable_mounts: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut writable_mounts: Vec<(PathBuf, PathBuf)> = Vec::new();
+    writable_mounts.extend(global_writable.iter().cloned());
+    readable_mounts.extend(global_readable.iter().cloned());
 
     let local = project_sandbox(workspace)?;
     if let Some(local) = &local {
@@ -701,8 +727,13 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
             workspace,
             false,
         )?;
-        for path in &local_writable {
-            if !global_writable.iter().any(|root| path.starts_with(root)) {
+        writable_mounts.extend(local_writable.iter().cloned());
+        readable_mounts.extend(local_readable.iter().cloned());
+        for (path, _) in &local_writable {
+            if !global_writable
+                .iter()
+                .any(|(root, _)| path.starts_with(root))
+            {
                 bail!(
                     "project writable path {} is not within any globally authorized writable root; \
                      add this path or an ancestor to [sandbox].writable_paths in the user-level \
@@ -711,11 +742,11 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
                 );
             }
         }
-        for path in &local_readable {
+        for (path, _) in &local_readable {
             if !global_readable
                 .iter()
                 .chain(&global_writable)
-                .any(|root| path.starts_with(root))
+                .any(|(root, _)| path.starts_with(root))
             {
                 bail!(
                     "project readable path {} is not within any globally authorized readable or \
@@ -727,11 +758,20 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
             }
         }
         (
-            merge_roots(global_writable, local_writable),
-            merge_roots(global_readable, local_readable),
+            merge_roots(
+                canonical_only(global_writable),
+                canonical_only(local_writable),
+            ),
+            merge_roots(
+                canonical_only(global_readable),
+                canonical_only(local_readable),
+            ),
         )
     } else {
-        (global_writable, global_readable)
+        (
+            canonical_only(global_writable),
+            canonical_only(global_readable),
+        )
     };
     let (writable, mut readable) = normalize_roots(writable, readable)?;
 
@@ -746,11 +786,26 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
         && !writable.iter().any(|root| root == &main_repo)
         && !readable.iter().any(|root| root == &main_repo)
     {
-        readable.push(main_repo);
+        readable.push(main_repo.clone());
+        // The main repo was never user-configured under an alias, so its
+        // mount is the canonical self-mount (source == dest == canonical).
+        readable_mounts.push((main_repo.clone(), main_repo));
     }
 
     result.writable_paths = utf8_roots(writable)?;
     result.readable_paths = utf8_roots(readable)?;
+    // Deduplicate the configured mounts: identical (source, dest) pairs
+    // collapse, and a readable dest shadowed by a writable mount at the same
+    // dest is dropped (the writable bind wins at that mount point).
+    let mut writable_mounts = utf8_mounts(writable_mounts)?;
+    writable_mounts.sort();
+    writable_mounts.dedup();
+    let mut readable_mounts = utf8_mounts(readable_mounts)?;
+    readable_mounts.sort();
+    readable_mounts.dedup();
+    readable_mounts.retain(|(_, dest)| !writable_mounts.iter().any(|(_, wdest)| wdest == dest));
+    result.writable_mounts = writable_mounts;
+    result.readable_mounts = readable_mounts;
     Ok(result)
 }
 
@@ -993,11 +1048,18 @@ fn project_sandbox(workspace: &Path) -> anyhow::Result<Option<ProjectSandbox>> {
     Ok(parsed.sandbox)
 }
 
+/// Resolve configured sandbox roots into (canonical path, configured path)
+/// pairs. The canonical path is what file tools and merge/normalize use; the
+/// configured path is the `~`-expanded, workspace-joined form the user wrote
+/// (before canonicalization), so a symlink alias still mounts inside the
+/// sandbox at the user's configured location while the security boundary
+/// stays canonical. `skip_missing` silently ignores NotFound (compatibility
+/// for global roots); everything else still fails loudly.
 fn canonical_roots(
     paths: &[String],
     workspace: &Path,
     skip_missing: bool,
-) -> anyhow::Result<Vec<PathBuf>> {
+) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
     let mut roots = Vec::new();
     for configured in paths {
         let expanded = expand_sandbox_path(configured, workspace)?;
@@ -1019,11 +1081,17 @@ fn canonical_roots(
                 path.display()
             );
         }
-        if !roots.contains(&path) {
-            roots.push(path);
+        if !roots.iter().any(|(root, _)| root == &path) {
+            roots.push((path, expanded));
         }
     }
     Ok(roots)
+}
+
+/// Strip the configured dest from canonical_roots pairs: merge/normalize
+/// operate only on the canonical roots.
+fn canonical_only(pairs: Vec<(PathBuf, PathBuf)>) -> Vec<PathBuf> {
+    pairs.into_iter().map(|(canonical, _)| canonical).collect()
 }
 
 /// Merge project-selected roots into global roots with narrowing semantics:
@@ -1100,6 +1168,27 @@ fn utf8_roots(roots: Vec<PathBuf>) -> anyhow::Result<Vec<String>> {
                     PathBuf::from(path).display()
                 )
             })
+        })
+        .collect()
+}
+
+fn utf8_mounts(mounts: Vec<(PathBuf, PathBuf)>) -> anyhow::Result<Vec<(String, String)>> {
+    mounts
+        .into_iter()
+        .map(|(source, dest)| {
+            let source = source.into_os_string().into_string().map_err(|path| {
+                anyhow!(
+                    "canonical external path {} is not valid UTF-8",
+                    PathBuf::from(path).display()
+                )
+            })?;
+            let dest = dest.into_os_string().into_string().map_err(|path| {
+                anyhow!(
+                    "configured external path {} is not valid UTF-8",
+                    PathBuf::from(path).display()
+                )
+            })?;
+            Ok((source, dest))
         })
         .collect()
 }

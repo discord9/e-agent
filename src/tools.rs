@@ -191,6 +191,8 @@ pub(crate) fn read_only_sandbox(sandbox: &crate::config::Sandbox) -> crate::conf
         workspace_writable: false,
         writable_paths: Vec::new(),
         readable_paths: sandbox.readable_paths.clone(),
+        writable_mounts: Vec::new(),
+        readable_mounts: sandbox.readable_mounts.clone(),
     }
 }
 

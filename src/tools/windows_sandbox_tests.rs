@@ -10,6 +10,8 @@ fn windows_policy(workspace_writable: bool, writable_paths: Vec<String>) -> crat
         workspace_writable,
         writable_paths,
         readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
     }
 }
 
