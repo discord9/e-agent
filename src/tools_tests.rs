@@ -1015,6 +1015,8 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             workspace_writable: true,
             writable_paths: vec!["/mnt/big/cargo-home".into()],
             readable_paths: vec!["~/.rustup".into()],
+            readable_mounts: Vec::new(),
+            writable_mounts: Vec::new(),
         }),
         protect_git: true,
         shell: Shell::detect().unwrap(),
@@ -1064,6 +1066,8 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             workspace_writable: false,
             writable_paths: vec![],
             readable_paths: vec![],
+            readable_mounts: Vec::new(),
+            writable_mounts: Vec::new(),
         }),
         protect_git: false,
         shell: Shell::detect().unwrap(),
@@ -1096,6 +1100,8 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             workspace_writable: true,
             writable_paths: vec![],
             readable_paths: vec![],
+            readable_mounts: Vec::new(),
+            writable_mounts: Vec::new(),
         }),
         protect_git: false,
         shell: Shell::detect().unwrap(),
@@ -1138,6 +1144,8 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             workspace_writable: true,
             writable_paths: vec!["/mnt/big/cargo-home".into()],
             readable_paths: vec!["~/.rustup".into()],
+            readable_mounts: Vec::new(),
+            writable_mounts: Vec::new(),
         }),
         true,
         None,
@@ -1200,6 +1208,8 @@ fn read_only_sandbox_derivation_narrows_and_keeps_readable_roots() {
         workspace_writable: true,
         writable_paths: vec!["/mnt/big/cargo-home".into()],
         readable_paths: vec!["~/.rustup".into(), "~/.local".into()],
+        writable_mounts: vec![("/mnt/big/cargo-home".into(), "/mnt/big/cargo-home".into())],
+        readable_mounts: vec![("/home/x/.rustup".into(), "/home/x/.rustup".into())],
     };
     let narrowed = read_only_sandbox(&sandbox);
     assert!(narrowed.enabled);
@@ -1217,6 +1227,15 @@ fn read_only_sandbox_derivation_narrows_and_keeps_readable_roots() {
         vec!["~/.rustup".to_owned(), "~/.local".to_owned()],
         "readable roots must be preserved"
     );
+    assert!(
+        narrowed.writable_mounts.is_empty(),
+        "writable mounts must be dropped in read-only mode"
+    );
+    assert_eq!(
+        narrowed.readable_mounts,
+        vec![("/home/x/.rustup".to_owned(), "/home/x/.rustup".to_owned())],
+        "readable mounts must be preserved"
+    );
 }
 
 #[test]
@@ -1227,6 +1246,8 @@ fn read_only_sandbox_follows_main_network_config() {
         workspace_writable: true,
         writable_paths: vec!["/mnt/big/cargo-home".into()],
         readable_paths: vec!["~/.rustup".into()],
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
     };
     // Main config network = true → the read-only role keeps networking.
     let narrowed = read_only_sandbox(&sandbox);
@@ -1337,6 +1358,8 @@ fn sandbox() -> Option<crate::config::Sandbox> {
         workspace_writable: true,
         writable_paths: Vec::new(),
         readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
     })
 }
 
@@ -1372,6 +1395,83 @@ async fn sandbox_allows_workspace_writes_but_not_outside() {
         .await;
     assert!(result.is_err(), "write to /usr should fail inside sandbox");
     assert!(!std::path::Path::new("/usr/e_agent_sandbox_escape").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_mounts_configured_dests_at_their_configured_paths() {
+    // The symlink-mount fix: a (canonical source, configured dest) pair in
+    // readable_mounts/writable_mounts must appear INSIDE the sandbox at the
+    // configured dest — even when the dest does not exist on the host and
+    // would otherwise be shadowed by a fresh tmpfs (the ~/.cargo scenario:
+    // the sandbox /home is a tmpfs, so the configured ~/.cargo mount point
+    // only exists because the mount loop binds it).
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_dir = temp.path().join("ws");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    // Host roots whose content must appear under the configured dests.
+    let readable_target = temp.path().join("cargo-home");
+    let writable_target = temp.path().join("data-home");
+    std::fs::create_dir_all(&readable_target).unwrap();
+    std::fs::create_dir_all(&writable_target).unwrap();
+    std::fs::write(readable_target.join("readable-file"), "readable-content").unwrap();
+    let readable_canonical = std::fs::canonicalize(&readable_target).unwrap();
+    let writable_canonical = std::fs::canonicalize(&writable_target).unwrap();
+    let readable_dest = temp.path().join(".cargo");
+    let writable_dest = temp.path().join(".data");
+    let sandbox = crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        writable_paths: Vec::new(),
+        readable_paths: Vec::new(),
+        readable_mounts: vec![(
+            readable_canonical.to_str().unwrap().to_owned(),
+            readable_dest.to_str().unwrap().to_owned(),
+        )],
+        writable_mounts: vec![(
+            writable_canonical.to_str().unwrap().to_owned(),
+            writable_dest.to_str().unwrap().to_owned(),
+        )],
+    };
+    let tool = Bash {
+        workspace: Workspace::new(&workspace_dir).unwrap(),
+        timeout: Some(Duration::from_secs(10)),
+        sender: None,
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
+        sandbox: Some(sandbox),
+        protect_git: false,
+        shell: Shell::detect().unwrap(),
+        owner_session: None,
+    };
+    // The configured readable dest is visible inside the sandbox with the
+    // canonical source's content, and it is read-only.
+    let result = tool
+        .execute(json!({"command": format!(
+            "cat {rd}/readable-file && ! touch {rd}/blocked 2>/dev/null && echo READONLY_OK",
+            rd = readable_dest.display()
+        )}))
+        .await
+        .unwrap();
+    assert!(result.contains("readable-content"), "{result}");
+    assert!(result.contains("READONLY_OK"), "{result}");
+    // The configured writable dest writes through to the canonical source.
+    let result = tool
+        .execute(json!({"command": format!(
+            "echo written > {wd}/file && cat {wd}/file",
+            wd = writable_dest.display()
+        )}))
+        .await
+        .unwrap();
+    assert!(result.contains("written"), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(writable_target.join("file")).unwrap(),
+        "written\n"
+    );
 }
 
 #[tokio::test]

@@ -897,6 +897,8 @@ mod windows_tests {
                 workspace_writable: true,
                 writable_paths: Vec::new(),
                 readable_paths: Vec::new(),
+                readable_mounts: Vec::new(),
+                writable_mounts: Vec::new(),
             },
             false,
         )
@@ -912,6 +914,8 @@ mod windows_tests {
                 workspace_writable: true,
                 writable_paths: Vec::new(),
                 readable_paths: Vec::new(),
+                readable_mounts: Vec::new(),
+                writable_mounts: Vec::new(),
             },
             false,
         )

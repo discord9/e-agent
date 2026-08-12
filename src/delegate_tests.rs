@@ -1364,6 +1364,8 @@ async fn run_subagent_and_capture(
             workspace_writable: true,
             writable_paths: vec!["/mnt/big/cargo-home".into()],
             readable_paths: vec!["~/.rustup".into()],
+            readable_mounts: Vec::new(),
+            writable_mounts: Vec::new(),
         }));
     }
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
