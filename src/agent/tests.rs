@@ -2252,6 +2252,211 @@ async fn compaction_rejects_summary_echoing_request_tail_assistant() {
 }
 
 #[tokio::test]
+async fn compaction_accepts_summary_quoting_retained_user_message_in_longer_summary() {
+    // The user report shape: the retained first message is a short request
+    // (39 chars, so the probe is the whole message) and a genuine long
+    // summary quotes it verbatim to keep the latest request visible for the
+    // next turn. The old contains-probe gate killed this ("contains the
+    // start of that message" regardless of summary length); the dominance
+    // condition must let it through. The quote is introduced mid-summary,
+    // not placed at position 0 — a summary that literally *starts* with the
+    // retained message is still the prefix-echo accident shape.
+    let request = "Please fix the sidebar collapse state";
+    let summary = format!(
+        "The user's current request — \"{request}\" — is the sidebar collapse bug. \
+         Root cause: the collapse handler toggles the same flag that the resize observer \
+         reads, so a programmatic collapse races the observer's re-open. Decision: split \
+         the state into `collapsed` (user intent) and `width` (observed), and gate the \
+         observer on the collapsed flag. Files touched: src/components/sidebar.rs, \
+         src/components/sidebar.css, src/state.rs, tests/sidebar_test.rs. The fix adds a \
+         guard so the observer never re-opens a user-collapsed sidebar, plus a regression \
+         test that resizes after a collapse and asserts the panel stays closed. \
+         Unfinished: run the full test suite and update the changelog before committing."
+    );
+    assert!(
+        summary.chars().count() > 400,
+        "test summary must exceed 400 chars, got {}",
+        summary.chars().count()
+    );
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some(summary.clone()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "old question".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("old answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: request.into(),
+            images: vec![],
+        }
+        .into(),
+    ]);
+    let output = agent.prepare_compaction().await.unwrap();
+    assert_eq!(output.summary, summary);
+    assert!(matches!(
+        output.entry,
+        SessionEntry::Compaction { summary: s, .. } if s == summary
+    ));
+    // Accepted on the first attempt: no retry call happened.
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn compaction_rejects_summary_that_is_mostly_echo_of_retained() {
+    // Mostly-echo shape, relaxed: the summary is dominated by a verbatim
+    // copy of the retained turn's start (probe capped at 200 chars) plus a
+    // short tail, so the total stays under 2×probe — the dominance
+    // condition must still reject it. The "Summary: " lead-in keeps the
+    // common-prefix check from firing first, so this exercises the
+    // contains-dominance branch specifically (a summary literally starting
+    // with the retained text would be caught by the prefix branch instead).
+    let retained = "The user reported that the sidebar collapses whenever the window resizes, and they want the collapse state to persist across resize events so the panel stays closed until they explicitly reopen it. The report also notes that the mobile layout never reproduces the issue, which points at the desktop resize observer as the culprit, and they asked to keep the fix minimal.";
+    assert!(
+        retained.chars().count() > 200,
+        "test retained message must exceed 200 chars, got {}",
+        retained.chars().count()
+    );
+    let probe: String = retained.chars().take(200).collect();
+    let summary = format!("Summary: {probe} Minor cleanup.");
+    assert!(
+        summary.chars().count() < probe.chars().count() * 2,
+        "test summary must stay under the 2×probe dominance bound, got {} chars vs probe {}",
+        summary.chars().count(),
+        probe.chars().count()
+    );
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![
+                AssistantMessage {
+                    content: Some(summary.clone()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some(summary.clone()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "old question".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("old answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: retained.into(),
+            images: vec![],
+        }
+        .into(),
+    ]);
+    let error = agent.compact().await.unwrap_err().to_string();
+    assert!(
+        error.contains("compaction summary rejected by sanity gate")
+            && error.contains("echoes the retained context"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn compaction_accepts_summary_quoting_request_tail_in_longer_summary() {
+    // Request-tail analogue of the retained-user accept case: a long,
+    // genuine summary quotes the start of the last compacted assistant
+    // message. The old contains-probe gate killed it; the dominance
+    // condition lets it through. The retained turn itself is not quoted.
+    let tail = "The assistant outlined a three-step plan for the legacy module refactor: first extract the shared validation into its own crate, then replace the duplicated checks in the callers, and finally run the full test suite before committing.";
+    let probe: String = tail.chars().take(200).collect();
+    assert_eq!(
+        probe.chars().count(),
+        200,
+        "test tail must exceed 200 chars, got {}",
+        tail.chars().count()
+    );
+    let summary = format!(
+        "Work so far: the legacy module refactor started with an extraction plan — \"{probe}\" \
+         — and the extraction itself landed. Decision: keep the new crate dependency-free so \
+         the CLI stays lean. Files touched: src/legacy/validation.rs, src/legacy/main.rs, \
+         Cargo.toml, tests/validation_test.rs. The duplicated checks in the callers were \
+         replaced and the new crate compiles cleanly. Unfinished: run the full test suite, \
+         update the changelog, and verify the CLI output is unchanged before committing."
+    );
+    assert!(
+        summary.chars().count() > 400,
+        "test summary must exceed 400 chars, got {}",
+        summary.chars().count()
+    );
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some(summary.clone()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "old question".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some(tail.into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: "current question".into(),
+            images: vec![],
+        }
+        .into(),
+    ]);
+    let output = agent.prepare_compaction().await.unwrap();
+    assert_eq!(output.summary, summary);
+    assert!(matches!(
+        output.entry,
+        SessionEntry::Compaction { summary: s, .. } if s == summary
+    ));
+    // Accepted on the first attempt: no retry call happened.
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn compaction_rejects_metadiscourse_stub_chinese() {
     // The real-world accident shape: 217 characters of "what I am about to
     // do" (self-referential planning prose) with zero actual summary
