@@ -565,11 +565,14 @@ fn request_tail_text(messages: &[Message]) -> Option<&str> {
 }
 
 /// Returns the reason when `summary` echoes `candidate` — sharing a long
-/// common prefix (up to 120 chars) or containing the first 200 chars of
-/// `candidate` verbatim. `where_` names the compared message for the error
-/// text. Strong-match on purpose: a normal summary may legitimately quote a
-/// short phrase from the conversation, so only near-verbatim repetition is
-/// treated as an echo.
+/// common prefix (up to 120 chars), or dominated by a verbatim copy of the
+/// first 200 chars of `candidate` (contains that probe while being shorter
+/// than twice the probe, so the copy is most of the summary). `where_`
+/// names the compared message for the error text. Strong-match on purpose:
+/// a normal summary may legitimately quote a phrase from the conversation,
+/// so only near-verbatim repetition is treated as an echo — a longer
+/// summary that quotes the start of the retained message alongside real
+/// content is not an echo.
 fn echo_reason(summary: &str, candidate: &str, where_: &str) -> Option<String> {
     let candidate = candidate.trim();
     if candidate.is_empty() {
@@ -591,7 +594,14 @@ fn echo_reason(summary: &str, candidate: &str, where_: &str) -> Option<String> {
         ));
     }
     let probe: String = candidate.chars().take(200).collect();
-    if summary.contains(&probe) {
+    // Contains-probe is only an echo when the verbatim copy dominates the
+    // summary: the summary is shorter than twice the probe, so the copy is
+    // most of it. A normal summary frequently quotes the retained first
+    // message's start verbatim (e.g. keeping the user's latest short
+    // request or the just-finished background task description for the next
+    // turn); that is legitimate as long as the summary carries real content
+    // beyond the copy.
+    if summary.contains(&probe) && summary.chars().count() < probe.chars().count() * 2 {
         return Some(format!(
             "summary echoes {where_} (it contains the start of that message)"
         ));
