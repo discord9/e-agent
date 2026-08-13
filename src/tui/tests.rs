@@ -3585,6 +3585,7 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
             content: "done".into(),
             is_error: false,
             synthetic: false,
+            images: vec![],
         },
     });
     assert_eq!(out.len(), 1);
@@ -3597,6 +3598,7 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
             content: "boom".into(),
             is_error: true,
             synthetic: false,
+            images: vec![],
         },
     });
     assert_eq!(out[0].text, "  error: boom");
@@ -4060,6 +4062,7 @@ fn fork_session_entries() -> Vec<SessionEntry> {
             content: "ok".into(),
             is_error: false,
             synthetic: false,
+            images: vec![],
         }
         .into(),
         Message::Assistant(AssistantMessage {

@@ -731,9 +731,9 @@ sessions) at `$XDG_STATE_HOME/e-agent/images/`, falling back to
 
 - **`read_image` tool** (agent entrance): the model reads an image file
   (png/jpeg/webp/gif, up to 10 MiB; capability-path policy like `read_file`).
-  The bytes are stored once under their hash; the tool result carries a
-  structured marker that the runner strips into a text summary, then attaches
-  a synthetic user message carrying the image reference. Base64 never enters
+  The bytes are stored once under their hash; the tool result is structured —
+  a text summary plus the image reference — and both ride on the canonical
+  `Tool` message (no synthetic user message is created). Base64 never enters
   the scrollback or the session file.
 - **REPL `/image <path>`** (human entrance, REPL mode only): attaches the
   image to the next prompt; the placeholder line
@@ -742,12 +742,22 @@ sessions) at `$XDG_STATE_HOME/e-agent/images/`, falling back to
 Sessions persist only `ImageRef { hash, mime }` references — never base64.
 At send time the wire re-reads the file and builds the provider format:
 `image_url` parts (an object) for OpenAI-compatible chat, `input_image` parts
-(a bare-string `image_url`) for ChatGPT Responses. A missing cache file
-degrades to a `[image missing: <hash>]` text placeholder instead of failing.
+(a bare-string `image_url`) for ChatGPT Responses. An image-bearing tool
+result is encoded natively on both wires: the chat wire emits all tool
+results as plain `role:"tool"` text and then appends at most one aggregated
+temporary user image message per consecutive tool batch (wire-only, never
+persisted), while the Responses wire emits a `function_call_output` whose
+`output` is an array of `input_text` + `input_image` parts. A missing cache
+file degrades to a `[image missing: <hash>]` text placeholder instead of
+failing.
 
 A model only receives images when its profile sets `vision = true` (see
-[Run](#run)). A user message with images on a non-vision model fails with a
-clear `model X does not support image input` error before any request is sent.
+[Run](#run)). On a non-vision model the request copy strips image parts from
+user and tool messages with a text-degradation note, while the persisted
+history keeps them — switching back to a vision model restores the images on
+the next request. An explicit `/image` prompt on a non-vision model fails
+with a clear `model X does not support image input` error before any request
+is sent.
 
 Errors print their causal chain (for example `cannot decode provider
 response: error decoding response body: ...`), and provider HTTP failures

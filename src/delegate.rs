@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::{Agent, AgentEvent, Tool, ToolSpec, preview};
+use crate::agent::{Agent, AgentEvent, Tool, ToolOutput, ToolSpec, preview};
 use crate::config::SessionBackend;
 use crate::model::ConfiguredModel;
 use crate::runner::{IdlePolicy, SessionHandle, SessionResult, SessionRunner};
@@ -518,10 +518,14 @@ fn spawn_subagent_meta_create(
     }
 }
 
-fn sync_result(session_id: &str, result: SessionResult) -> Result<String, String> {
+fn sync_result(session_id: &str, result: SessionResult) -> Result<ToolOutput, String> {
     let (completed, output) = result_output(result);
     let output = format!("subagent session: {session_id}\n{output}");
-    if completed { Ok(output) } else { Err(output) }
+    if completed {
+        Ok(ToolOutput::text(output))
+    } else {
+        Err(output)
+    }
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -853,7 +857,7 @@ impl Tool for Delegate {
         }
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         const KNOWN: &[&str] = &["task", "role", "label", "background", "resume", "workspace"];
         if let Some(args) = arguments.as_object() {
             for key in args.keys() {
@@ -1227,7 +1231,9 @@ impl Tool for Delegate {
                     }
                 },
             )?;
-            return Ok(format!("{started}\nsubagent session: {session_id}"));
+            return Ok(ToolOutput::text(format!(
+                "{started}\nsubagent session: {session_id}"
+            )));
         }
         let cleanup = DelegateCleanup::new(slot, self.sessions.clone(), None);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();

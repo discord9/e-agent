@@ -1,5 +1,7 @@
 use super::*;
-use crate::agent::{AssistantMessage, Model, ModelDeltaKind, Tool, Usage, repair_tool_pairs};
+use crate::agent::{
+    AssistantMessage, Model, ModelDeltaKind, Tool, ToolOutput, Usage, repair_tool_pairs,
+};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::{
@@ -253,8 +255,9 @@ impl Model for VisionScriptedContextCaptureModel {
     }
 }
 
-/// Emits a read_image result carrying the structured image marker; shared by
-/// the runner tests covering marker splitting and synthetic attachment.
+/// Emits a structured image-bearing tool result (content + image refs);
+/// shared by the runner tests covering canonical image-bearing Tool entries
+/// and non-vision request stripping.
 struct MarkerTool;
 
 #[async_trait]
@@ -266,8 +269,14 @@ impl Tool for MarkerTool {
             parameters: serde_json::json!({"type": "object"}),
         }
     }
-    async fn execute(&self, _: Value) -> Result<String, String> {
-        Ok("__EA_IMAGE__hash123,image/png__EA_IMAGE_END__[image read: pic.png] (hash hash123, image/png, 3 bytes)".into())
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput {
+            content: "[image read: pic.png] (hash hash123, image/png, 3 bytes)".into(),
+            images: vec![crate::agent::ImagePart {
+                hash: "hash123".into(),
+                mime: "image/png".into(),
+            }],
+        })
     }
 }
 
@@ -307,7 +316,7 @@ impl Model for GateScriptedModel {
     }
 }
 
-/// Marker-emitting read_image that blocks until released, so a test can
+/// Image-bearing read_image that blocks until released, so a test can
 /// queue a `SwitchModel` command while the tool is still executing (the
 /// command lands in `wait_for_operation`'s pending cache).
 struct BlockingMarkerTool {
@@ -324,10 +333,16 @@ impl Tool for BlockingMarkerTool {
             parameters: serde_json::json!({"type": "object"}),
         }
     }
-    async fn execute(&self, _: Value) -> Result<String, String> {
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
         self.entered.notify_one();
         self.release.notified().await;
-        Ok("__EA_IMAGE__hash123,image/png__EA_IMAGE_END__[image read: pic.png] (hash hash123, image/png, 3 bytes)".into())
+        Ok(ToolOutput {
+            content: "[image read: pic.png] (hash hash123, image/png, 3 bytes)".into(),
+            images: vec![crate::agent::ImagePart {
+                hash: "hash123".into(),
+                mime: "image/png".into(),
+            }],
+        })
     }
 }
 
@@ -344,7 +359,7 @@ impl Tool for CompletingWithCancelTool {
             parameters: serde_json::json!({"type": "object"}),
         }
     }
-    async fn execute(&self, _: Value) -> Result<String, String> {
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
         self.commands
             .lock()
             .unwrap()
@@ -352,7 +367,7 @@ impl Tool for CompletingWithCancelTool {
             .unwrap()
             .send(SessionCommand::Cancel)
             .unwrap();
-        Ok("completed tool result".into())
+        Ok(ToolOutput::text("completed tool result"))
     }
 }
 
@@ -434,8 +449,8 @@ impl Tool for KeepAliveTool {
             parameters: serde_json::json!({"type": "object"}),
         }
     }
-    async fn execute(&self, _: Value) -> Result<String, String> {
-        Ok(String::new())
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::text(String::new()))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         self.sender = Some(sender);
@@ -1793,7 +1808,7 @@ async fn natural_completion_of_finish_when_idle_still_finalizes() {
 }
 
 #[tokio::test]
-async fn runner_strips_image_marker_and_skips_attachment_without_vision() {
+async fn runner_commits_image_bearing_tool_and_strips_requests_without_vision() {
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let agent = Agent::new(
@@ -1841,9 +1856,9 @@ async fn runner_strips_image_marker_and_skips_attachment_without_vision() {
     );
     task.join().await.unwrap();
 
-    // Persisted tool entry has the summary only, annotated that the image
-    // attachment was skipped (the vision gate would otherwise lock the
-    // session); no synthetic user message carries the image.
+    // Canonical persisted Tool entry keeps the summary AND the image
+    // reference (no marker, no synthetic user message, no skip annotation
+    // in history — that only appears on the non-vision request copy).
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "marker-novision")
         .await
@@ -1853,39 +1868,56 @@ async fn runner_strips_image_marker_and_skips_attachment_without_vision() {
         .iter()
         .find_map(|entry| match entry {
             SessionEntry::Message {
-                message: Message::Tool { content, .. },
-            } => Some(content.clone()),
-            _ => None,
-        })
-        .unwrap();
-    assert!(tool.starts_with("[image read: pic.png]"));
-    assert!(tool.contains("已跳过附加"));
-    assert!(!tool.contains("__EA_IMAGE__"));
-    let synthetic = loaded
-        .entries
-        .iter()
-        .filter_map(|entry| match entry {
-            SessionEntry::Message {
-                message: Message::User { content, images },
+                message: Message::Tool {
+                    content, images, ..
+                },
             } => Some((content.clone(), images.clone())),
             _ => None,
         })
-        .find(|(content, _)| content.starts_with("[image attached:"));
-    assert!(
-        synthetic.is_none(),
-        "no synthetic image user message on a non-vision model"
+        .unwrap();
+    assert!(tool.0.starts_with("[image read: pic.png]"));
+    assert!(!tool.0.contains("已跳过附加"));
+    assert!(!tool.0.contains("__EA_IMAGE__"));
+    assert_eq!(
+        tool.1,
+        vec![crate::agent::ImagePart {
+            hash: "hash123".into(),
+            mime: "image/png".into(),
+        }]
     );
-    // The second model call saw no images.
+    // No synthetic user message ever.
+    assert!(!loaded.entries.iter().any(|entry| match entry {
+        SessionEntry::Message {
+            message: Message::User { content, .. },
+        } => content.starts_with("[image attached:"),
+        _ => false,
+    }));
+    // And no UserPrompt event projected a synthetic image user.
+    assert!(!handle.snapshot().iter().any(|event| matches!(
+        event,
+        AgentEvent::UserPrompt(prompt) if prompt.starts_with("[image attached:")
+    )));
+    // The second model call saw no images (request copy stripped), with the
+    // tool content text-degraded by the skip note.
     let calls = calls.lock().unwrap();
     assert!(
         calls[1]
             .iter()
             .all(|message| !matches!(message, Message::User { images, .. } if !images.is_empty()))
     );
+    assert!(
+        calls[1]
+            .iter()
+            .all(|message| !matches!(message, Message::Tool { images, .. } if !images.is_empty()))
+    );
+    assert!(calls[1].iter().any(|message| matches!(
+        message,
+        Message::Tool { content, .. } if content.contains("已跳过附加")
+    )));
 }
 
 #[tokio::test]
-async fn runner_attaches_image_marker_with_vision_model() {
+async fn runner_commits_image_bearing_tool_with_vision_model() {
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let agent = Agent::new(
@@ -1935,8 +1967,8 @@ async fn runner_attaches_image_marker_with_vision_model() {
     );
     task.join().await.unwrap();
 
-    // Persisted tool entry has the summary only; the synthetic user message
-    // carrying the image reference follows it.
+    // Persisted tool entry keeps the summary AND the image reference; no
+    // synthetic user message follows it.
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "marker-vision")
         .await
@@ -1946,49 +1978,45 @@ async fn runner_attaches_image_marker_with_vision_model() {
         .iter()
         .find_map(|entry| match entry {
             SessionEntry::Message {
-                message: Message::Tool { content, .. },
-            } => Some(content.clone()),
-            _ => None,
-        })
-        .unwrap();
-    assert!(tool.starts_with("[image read: pic.png]"));
-    assert!(!tool.contains("__EA_IMAGE__"));
-    assert!(!tool.contains("已跳过附加"));
-    let synthetic = loaded
-        .entries
-        .iter()
-        .filter_map(|entry| match entry {
-            SessionEntry::Message {
-                message: Message::User { content, images },
+                message: Message::Tool {
+                    content, images, ..
+                },
             } => Some((content.clone(), images.clone())),
             _ => None,
         })
-        .find(|(content, _)| content.starts_with("[image attached:"));
-    let (content, images) = synthetic.expect("synthetic image user message");
-    assert_eq!(content, "[image attached: pic.png]");
+        .unwrap();
+    assert!(tool.0.starts_with("[image read: pic.png]"));
+    assert!(!tool.0.contains("__EA_IMAGE__"));
+    assert!(!tool.0.contains("已跳过附加"));
     assert_eq!(
-        images,
+        tool.1,
         vec![crate::agent::ImagePart {
             hash: "hash123".into(),
             mime: "image/png".into(),
         }]
     );
-    // The second model call saw the image on the user message.
+    assert!(!loaded.entries.iter().any(|entry| match entry {
+        SessionEntry::Message {
+            message: Message::User { content, .. },
+        } => content.starts_with("[image attached:"),
+        _ => false,
+    }));
+    // The second model call saw the image on the Tool message.
     let calls = calls.lock().unwrap();
     assert!(calls[1].iter().any(|message| matches!(
         message,
-        Message::User { images, .. } if !images.is_empty()
+        Message::Tool { images, .. } if !images.is_empty()
     )));
 }
 
 #[tokio::test]
-async fn switch_to_non_vision_during_read_image_skips_attachment() {
+async fn switch_to_non_vision_during_read_image_strips_request() {
     // Race: the session starts on a vision model, calls read_image, and the
     // user switches to a non-vision model WHILE the tool is executing. The
-    // switch must take effect before the marker is interpreted: the image
-    // must NOT be attached, and the next (non-vision) model call — which
-    // simulates the wire vision gate by erroring on image-bearing requests
-    // — must succeed.
+    // canonical history keeps the image-bearing Tool entry either way, but
+    // the next (non-vision) model call — which simulates the wire vision
+    // gate by erroring on image-bearing requests — must see a stripped
+    // request and succeed.
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let vision = GateScriptedModel {
@@ -2054,45 +2082,54 @@ async fn switch_to_non_vision_during_read_image_skips_attachment() {
         .load(temp.path(), "switch-v2nv")
         .await
         .unwrap();
-    // No synthetic image user message was committed under the new model.
-    let synthetic = loaded.entries.iter().any(|entry| match entry {
+    // Canonical history keeps the image-bearing Tool entry — no synthetic
+    // user message, no in-history skip annotation.
+    assert!(!loaded.entries.iter().any(|entry| match entry {
         SessionEntry::Message {
-            message: Message::User { content, images },
-        } => content.starts_with("[image attached:") && !images.is_empty(),
+            message: Message::User { content, .. },
+        } => content.starts_with("[image attached:"),
         _ => false,
-    });
-    assert!(
-        !synthetic,
-        "image must not be attached after switch to non-vision"
-    );
-    // The tool summary carries the skip annotation.
+    }));
     let tool = loaded
         .entries
         .iter()
         .find_map(|entry| match entry {
             SessionEntry::Message {
-                message: Message::Tool { content, .. },
-            } => Some(content.clone()),
+                message: Message::Tool {
+                    content, images, ..
+                },
+            } => Some((content.clone(), images.clone())),
             _ => None,
         })
         .unwrap();
-    assert!(tool.contains("已跳过附加"));
-    // The non-vision model's request was clean (it would have errored on an
-    // image-bearing request — the session was not poisoned).
+    assert!(tool.0.starts_with("[image read: pic.png]"));
+    assert!(!tool.0.contains("已跳过附加"));
+    assert_eq!(tool.1.len(), 1);
+    // The non-vision model's request was stripped (it would have errored on
+    // an image-bearing request — the session was not poisoned) and the tool
+    // content was text-degraded on the request copy.
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
     assert!(calls[1].iter().all(|message| !matches!(
         message,
         Message::User { images, .. } if !images.is_empty()
     )));
+    assert!(calls[1].iter().all(|message| !matches!(
+        message,
+        Message::Tool { images, .. } if !images.is_empty()
+    )));
+    assert!(calls[1].iter().any(|message| matches!(
+        message,
+        Message::Tool { content, .. } if content.contains("已跳过附加")
+    )));
 }
 
 #[tokio::test]
-async fn switch_to_vision_during_read_image_attaches() {
+async fn switch_to_vision_during_read_image_keeps_history_image_and_serves_it() {
     // Inverse race: session starts on a non-vision model, calls read_image,
     // and the user switches to a vision model WHILE the tool is executing.
-    // The image must be attached (the guard must see the NEW model) and
-    // reach the next model call.
+    // The canonical history keeps the image-bearing Tool entry, and the new
+    // vision model's next request sees the image.
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let non_vision = GateScriptedModel {
@@ -2158,32 +2195,40 @@ async fn switch_to_vision_during_read_image_attaches() {
         .load(temp.path(), "switch-nv2v")
         .await
         .unwrap();
-    // The synthetic image user message was committed and carries the image.
-    let synthetic = loaded
+    // The canonical image-bearing Tool entry was committed and carries the
+    // image; no synthetic user message exists.
+    let tool = loaded
         .entries
         .iter()
-        .filter_map(|entry| match entry {
+        .find_map(|entry| match entry {
             SessionEntry::Message {
-                message: Message::User { content, images },
+                message: Message::Tool {
+                    content, images, ..
+                },
             } => Some((content.clone(), images.clone())),
             _ => None,
         })
-        .find(|(content, _)| content.starts_with("[image attached:"));
-    let (content, images) = synthetic.expect("synthetic image user message");
-    assert_eq!(content, "[image attached: pic.png]");
+        .unwrap();
+    assert!(tool.0.starts_with("[image read: pic.png]"));
     assert_eq!(
-        images,
+        tool.1,
         vec![crate::agent::ImagePart {
             hash: "hash123".into(),
             mime: "image/png".into(),
         }]
     );
-    // The vision model's next request saw the image.
+    assert!(!loaded.entries.iter().any(|entry| match entry {
+        SessionEntry::Message {
+            message: Message::User { content, .. },
+        } => content.starts_with("[image attached:"),
+        _ => false,
+    }));
+    // The vision model's next request saw the image on the Tool message.
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
     assert!(calls[1].iter().any(|message| matches!(
         message,
-        Message::User { images, .. } if !images.is_empty()
+        Message::Tool { images, .. } if !images.is_empty()
     )));
 }
 
@@ -2423,11 +2468,11 @@ impl Tool for MockBackgroundBash {
             parameters: serde_json::json!({"type": "object"}),
         }
     }
-    async fn execute(&self, _: Value) -> Result<String, String> {
-        Ok(format!(
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::text(format!(
             "started background task {}: {}",
             self.id, self.label
-        ))
+        )))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         *self.sender.lock().unwrap() = Some(sender);
@@ -3173,10 +3218,10 @@ impl Tool for BlockingNoopTool {
             parameters: serde_json::json!({"type": "object"}),
         }
     }
-    async fn execute(&self, _: Value) -> Result<String, String> {
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
         self.entered.notify_one();
         self.release.notified().await;
-        Ok("blocked tool result".into())
+        Ok(ToolOutput::text("blocked tool result"))
     }
 }
 

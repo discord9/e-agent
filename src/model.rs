@@ -450,11 +450,7 @@ impl<'a> ChatRequest<'a> {
             thinking: reasoning_effort
                 .filter(|_| thinking)
                 .map(|_| Thinking { r#type: "enabled" }),
-            messages: messages
-                .iter()
-                .filter(|message| !is_poisoned_assistant(message))
-                .map(|message| WireMessage::from_internal(message, image_store))
-                .collect(),
+            messages: Self::wire_messages(messages, image_store),
             tools: tools
                 .iter()
                 .map(|tool| WireTool {
@@ -468,6 +464,64 @@ impl<'a> ChatRequest<'a> {
                 .collect(),
             stream: true,
         }
+    }
+}
+
+impl<'a> ChatRequest<'a> {
+    /// Build the wire message list from the internal history. A run of
+    /// consecutive `Message::Tool`s is serialized as valid `role:"tool"`
+    /// text messages first (tool results must stay plain strings on the
+    /// chat wire — images cannot ride on the tool role), then — when any
+    /// tool in the run carried images — at most ONE aggregated temporary
+    /// `role:"user"` wire message carries the whole run's image parts.
+    /// That temporary message exists only on the wire: it never enters
+    /// history, events, the store, or compaction.
+    fn wire_messages(messages: &[Message], image_store: Option<&Path>) -> Vec<WireMessage> {
+        let mut wire = Vec::new();
+        let mut index = 0;
+        while index < messages.len() {
+            if matches!(&messages[index], Message::Tool { .. }) {
+                let run_start = index;
+                while index < messages.len() && matches!(&messages[index], Message::Tool { .. }) {
+                    index += 1;
+                }
+                let run = &messages[run_start..index];
+                // All valid role:tool text messages first.
+                wire.extend(
+                    run.iter()
+                        .map(|message| WireMessage::from_internal(message, image_store)),
+                );
+                // At most one aggregated temporary user image wire message
+                // per batch.
+                let images: Vec<ImagePart> = run
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::Tool { images, .. } if !images.is_empty() => Some(images.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                if !images.is_empty() {
+                    wire.push(WireMessage {
+                        role: "user",
+                        content: Some(WireContent::from_user(
+                            &format!("[image attached: {} image(s)]", images.len()),
+                            &images,
+                            image_store,
+                        )),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+            } else {
+                let message = &messages[index];
+                index += 1;
+                if !is_poisoned_assistant(message) {
+                    wire.push(WireMessage::from_internal(message, image_store));
+                }
+            }
+        }
+        wire
     }
 }
 

@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::*;
-use crate::agent::{Agent, Tool};
+use crate::agent::{Agent, Tool, ToolOutput};
 
 #[test]
 fn converts_internal_messages_and_function_schemas() {
@@ -40,6 +40,7 @@ fn converts_internal_messages_and_function_schemas() {
                 content: "not found".into(),
                 is_error: true,
                 synthetic: false,
+                images: vec![],
             },
         ],
         &tools,
@@ -719,7 +720,7 @@ impl Tool for FailingTool {
         }
     }
 
-    async fn execute(&self, _: serde_json::Value) -> Result<String, String> {
+    async fn execute(&self, _: serde_json::Value) -> Result<ToolOutput, String> {
         Err("intentional failure".into())
     }
 }
@@ -846,6 +847,175 @@ fn chat_wire_degrades_missing_image_file_to_text_placeholder() {
     let parts = value["messages"][0]["content"].as_array().unwrap();
     assert_eq!(parts[1]["type"], "text");
     assert_eq!(parts[1]["text"], "[image missing: deadbeef]");
+}
+
+#[test]
+fn chat_wire_tool_batch_without_images_adds_no_user_message() {
+    // A consecutive tool batch with no images stays exactly one role:tool
+    // text message per tool — no aggregated user wire message appears.
+    let request = ChatRequest::from_internal(
+        "vision-model",
+        None,
+        false,
+        &[
+            Message::Tool {
+                call_id: "c1".into(),
+                name: "bash".into(),
+                content: "ok".into(),
+                images: vec![],
+                is_error: false,
+                synthetic: false,
+            },
+            Message::Tool {
+                call_id: "c2".into(),
+                name: "bash".into(),
+                content: "boom".into(),
+                images: vec![],
+                is_error: true,
+                synthetic: false,
+            },
+        ],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let messages = value["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(messages.iter().all(|message| message["role"] == "tool"));
+}
+
+#[test]
+fn chat_wire_aggregates_one_temporary_user_image_message_per_tool_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let bytes = b"\x89PNG\r\n\x1a\nfake";
+    let hash = crate::agent::store_image_bytes(temp.path(), bytes).unwrap();
+    let image = ImagePart {
+        hash,
+        mime: "image/png".into(),
+    };
+    let request = ChatRequest::from_internal(
+        "vision-model",
+        None,
+        false,
+        &[
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "read_image".into(),
+                        arguments: r#"{"path":"a.png"}"#.into(),
+                    },
+                    ToolCall {
+                        id: "call-2".into(),
+                        name: "read_image".into(),
+                        arguments: r#"{"path":"b.png"}"#.into(),
+                    },
+                ],
+                reasoning: None,
+            }),
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "read_image".into(),
+                content: "[image read: a.png] (hash x, image/png, 4 bytes)".into(),
+                images: vec![image.clone()],
+                is_error: false,
+                synthetic: false,
+            },
+            Message::Tool {
+                call_id: "call-2".into(),
+                name: "read_image".into(),
+                content: "[image read: b.png] (hash x, image/png, 4 bytes)".into(),
+                images: vec![image.clone()],
+                is_error: false,
+                synthetic: false,
+            },
+            Message::Assistant(AssistantMessage {
+                content: Some("final".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        ],
+        &[],
+        Some(temp.path()),
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let messages = value["messages"].as_array().unwrap();
+    // assistant + 2 tool text messages + ONE aggregated user + assistant.
+    assert_eq!(messages.len(), 5);
+    // Every tool result is a valid role:tool plain-text message.
+    assert_eq!(messages[1]["role"], "tool");
+    assert_eq!(
+        messages[1]["content"],
+        "[image read: a.png] (hash x, image/png, 4 bytes)"
+    );
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(
+        messages[2]["content"],
+        "[image read: b.png] (hash x, image/png, 4 bytes)"
+    );
+    // At most one aggregated temporary user image wire message per batch.
+    assert_eq!(messages[3]["role"], "user");
+    let parts = messages[3]["content"].as_array().unwrap();
+    assert_eq!(parts[0]["type"], "text");
+    assert!(
+        parts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[image attached: 2 image(s)]")
+    );
+    assert_eq!(parts[1]["type"], "image_url");
+    assert_eq!(parts[2]["type"], "image_url");
+    assert!(
+        parts[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
+    assert_eq!(messages[4]["role"], "assistant");
+}
+
+#[test]
+fn chat_wire_tool_batch_with_single_image_aggregates_one_user_message() {
+    // A batch of one image-bearing tool: tool text + one aggregated user.
+    let request = ChatRequest::from_internal(
+        "vision-model",
+        None,
+        false,
+        &[
+            Message::Tool {
+                call_id: "c1".into(),
+                name: "read_image".into(),
+                content: "[image read: a.png]".into(),
+                images: vec![ImagePart {
+                    hash: "missing-hash".into(),
+                    mime: "image/png".into(),
+                }],
+                is_error: false,
+                synthetic: false,
+            },
+            Message::Tool {
+                call_id: "c2".into(),
+                name: "bash".into(),
+                content: "plain".into(),
+                images: vec![],
+                is_error: false,
+                synthetic: false,
+            },
+        ],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let messages = value["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "tool");
+    assert_eq!(messages[1]["role"], "tool");
+    assert_eq!(messages[2]["role"], "user");
+    // Missing store file degrades to a text placeholder part.
+    let parts = messages[2]["content"].as_array().unwrap();
+    assert_eq!(parts[1]["type"], "text");
+    assert_eq!(parts[1]["text"], "[image missing: missing-hash]");
 }
 
 #[test]

@@ -1155,7 +1155,8 @@ async fn resume_rejects_a_still_running_subagent_session() {
             "background": false
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     assert!(
         answer.contains("subagent session: sub-still-running"),
         "a finished subagent still resumes: {answer}"
@@ -1379,7 +1380,8 @@ async fn run_subagent_and_capture(
             "background": false
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
     (output, request)
 }
@@ -1633,7 +1635,8 @@ async fn sync_success_contains_session_id_and_answer() {
             "background": false
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let mut lines = output.lines();
     let session_id = lines
         .next()
@@ -1684,7 +1687,8 @@ async fn fresh_spawn_records_label_as_subagent_session_title() {
             "background": false
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let session_id = answer
         .lines()
         .next()
@@ -1721,7 +1725,8 @@ async fn fresh_spawn_without_label_records_the_fallback_title() {
             "background": false
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let session_id = answer
         .lines()
         .next()
@@ -1755,7 +1760,8 @@ async fn resume_keeps_the_original_subagent_session_title() {
             "background": false
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let session_id = answer
         .lines()
         .next()
@@ -1778,7 +1784,8 @@ async fn resume_keeps_the_original_subagent_session_title() {
             "background": false
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let resumed_id = answer
         .lines()
         .next()
@@ -1832,7 +1839,8 @@ async fn omitted_background_defaults_to_one_completion_with_session_id() {
             "workspace": temp.path().to_str().unwrap()
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let mut lines = answer.lines();
     assert_eq!(
         lines.next(),
@@ -1881,7 +1889,8 @@ async fn background_failure_completion_retains_session_id() {
             "background": true
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let immediate_session = answer
         .lines()
         .nth(1)
@@ -1936,7 +1945,8 @@ async fn resume_replays_scrollback_into_session_sink() {
             "workspace": temp.path().to_str().unwrap()
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     assert!(answer.starts_with("started background task"));
 
     let id: u64 = answer
@@ -2313,7 +2323,8 @@ async fn background_delegate_with_detached_daemon_finalizes_and_keeps_daemon() {
             "workspace": temp.path().to_str().unwrap()
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let delegate_task_id: u64 = answer
         .strip_prefix("started background task ")
         .and_then(|s| s.split(':').next())
@@ -2394,7 +2405,8 @@ async fn subagent_background_bash_recorded_under_its_own_session() {
             "workspace": temp.path().to_str().unwrap()
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let session_id = answer
         .lines()
         .nth(1)
@@ -2500,7 +2512,8 @@ async fn sync_delegate_with_detached_daemon_returns_without_waiting_for_daemon()
             "background": false
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let session_id = output
         .lines()
         .next()
@@ -2550,7 +2563,8 @@ async fn background_delegate_with_non_detached_task_waits_for_completion() {
             "workspace": temp.path().to_str().unwrap()
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     let delegate_task_id: u64 = answer
         .strip_prefix("started background task ")
         .and_then(|s| s.split(':').next())

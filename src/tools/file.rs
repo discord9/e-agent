@@ -43,7 +43,7 @@ impl Tool for ReadFile {
         )
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         let offset = optional_usize(&arguments, "offset")?.unwrap_or(1);
         if offset == 0 {
             return Err("`offset` must be >= 1".into());
@@ -84,14 +84,14 @@ impl Tool for ReadFile {
         if output.is_empty() {
             output = "[empty file]".into();
         }
-        Ok(output)
+        Ok(ToolOutput::text(output))
     }
 }
 
 /// Reads an image file (capability-path policy, same as read_file), stores
 /// its bytes in the global content-addressed image store, and returns a
-/// structured marker the runner turns into an attached image on the next
-/// user message.
+/// structured [`ToolOutput`]: the display summary as `content` plus the
+/// stored image reference in `images`.
 pub(super) struct ReadImage {
     pub(super) workspace: Workspace,
     pub(super) store: Option<PathBuf>,
@@ -127,7 +127,7 @@ impl Tool for ReadImage {
         )
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         let path = required_string(&arguments, "path")?;
         let mime = crate::agent::image_mime_from_extension(path).ok_or_else(|| {
             format!("unsupported image type for {path}: expected .png, .jpeg/.jpg, .webp, or .gif")
@@ -145,12 +145,16 @@ impl Tool for ReadImage {
             .as_deref()
             .ok_or("no image store: XDG_STATE_HOME or HOME is not set")?;
         let hash = crate::agent::store_image_bytes(store, &bytes)?;
-        Ok(format!(
-            "{}{hash},{mime}{}[image read: {path}] (hash {hash}, {mime}, {} bytes)",
-            crate::agent::IMAGE_MARKER_START,
-            crate::agent::IMAGE_MARKER_END,
-            bytes.len()
-        ))
+        Ok(ToolOutput {
+            content: format!(
+                "[image read: {path}] (hash {hash}, {mime}, {} bytes)",
+                bytes.len()
+            ),
+            images: vec![crate::agent::ImagePart {
+                hash,
+                mime: mime.into(),
+            }],
+        })
     }
 }
 
@@ -172,7 +176,7 @@ impl Tool for WriteFile {
         )
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         let content = required_string(&arguments, "content")?;
         let path = required_string(&arguments, "path")?;
         // Snapshot before writing: the old content (or `None` when the file
@@ -186,7 +190,7 @@ impl Tool for WriteFile {
             content.to_owned(),
             &self.workspace,
         );
-        Ok("file written".into())
+        Ok(ToolOutput::text("file written"))
     }
 }
 
@@ -236,7 +240,7 @@ impl Tool for EditFile {
         )
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         let path = required_string(&arguments, "path")?;
         let old = required_string(&arguments, "old")?;
         let new = required_string(&arguments, "new")?;
@@ -275,7 +279,7 @@ impl Tool for EditFile {
             new.to_owned(),
             &self.workspace,
         );
-        Ok(format!("file edited (line {line})"))
+        Ok(ToolOutput::text(format!("file edited (line {line})")))
     }
 }
 

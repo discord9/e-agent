@@ -31,10 +31,10 @@ impl Tool for GetBackgroundTasks {
         }
     }
 
-    async fn execute(&self, _arguments: Value) -> Result<String, String> {
+    async fn execute(&self, _arguments: Value) -> Result<ToolOutput, String> {
         let tasks = self.background.running();
         if tasks.is_empty() {
-            return Ok("No background tasks running.".into());
+            return Ok(ToolOutput::text("No background tasks running."));
         }
         let mut out = format!("{} background task(s) running:\n", tasks.len());
         for task in tasks.iter() {
@@ -79,7 +79,7 @@ impl Tool for GetBackgroundTasks {
             }
         }
         out.truncate(out.trim_end().len());
-        Ok(out)
+        Ok(ToolOutput::text(out))
     }
 }
 
@@ -104,7 +104,7 @@ impl Tool for CancelBackgroundTask {
         }
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         let id = arguments
             .as_object()
             .ok_or("tool arguments must be a JSON object")?
@@ -114,6 +114,6 @@ impl Tool for CancelBackgroundTask {
         self.background
             .cancel(id)
             .ok_or_else(|| format!("background task {id} is not running"))?;
-        Ok(format!("cancelled background task {id}"))
+        Ok(ToolOutput::text(format!("cancelled background task {id}")))
     }
 }

@@ -74,7 +74,7 @@ impl Tool for WebSearch {
         }
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         let query = required_string(&arguments, "query")?.trim();
         if query.is_empty() {
             return Err("`query` must not be empty".into());
@@ -134,10 +134,10 @@ impl Tool for WebSearch {
         let context: ExaContextResponse = serde_json::from_slice(&body)
             .map_err(|_| "web search returned malformed JSON or no response".to_string())?;
         let _ = context.request_id;
-        Ok(truncate_utf8(
+        Ok(ToolOutput::text(truncate_utf8(
             redact_api_key(context.response, &self.api_key),
             OUTPUT_LIMIT,
-        ))
+        )))
     }
 }
 

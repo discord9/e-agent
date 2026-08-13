@@ -5589,6 +5589,7 @@ model = "deepseek-chat"
                 content: content.to_owned(),
                 is_error: false,
                 synthetic: false,
+                images: vec![],
             },
         }
     }

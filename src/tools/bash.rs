@@ -155,7 +155,7 @@ impl Tool for Bash {
         }
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         let command = required_string(&arguments, "command")?;
         let background = optional_bool(&arguments, "background")?;
         let detached = optional_bool(&arguments, "detached")?;
@@ -173,25 +173,31 @@ impl Tool for Bash {
                 // completion and never blocks this session from finishing.
                 // Runs under THIS facade's sandbox, like any background
                 // command.
-                return self.background.start_detached(
-                    self.workspace.clone(),
-                    command.to_owned(),
-                    self.protect_git,
-                    self.sandbox.clone(),
-                    self.owner_session.clone(),
-                );
+                return self
+                    .background
+                    .start_detached(
+                        self.workspace.clone(),
+                        command.to_owned(),
+                        self.protect_git,
+                        self.sandbox.clone(),
+                        self.owner_session.clone(),
+                    )
+                    .map(ToolOutput::text);
             }
             // Background commands run under THIS facade's sandbox (possibly a
             // read-only role's narrowed policy), never the shared registry's
             // wider one.
-            return self.background.start_with_sender(
-                self.workspace.clone(),
-                command.to_owned(),
-                self.protect_git,
-                self.sender.clone(),
-                self.sandbox.clone(),
-                self.owner_session.clone(),
-            );
+            return self
+                .background
+                .start_with_sender(
+                    self.workspace.clone(),
+                    command.to_owned(),
+                    self.protect_git,
+                    self.sender.clone(),
+                    self.sandbox.clone(),
+                    self.owner_session.clone(),
+                )
+                .map(ToolOutput::text);
         }
         run_bash(
             &self.shell,
@@ -205,6 +211,7 @@ impl Tool for Bash {
             self.sandbox.as_ref(),
         )
         .await
+        .map(ToolOutput::text)
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {

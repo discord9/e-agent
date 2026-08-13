@@ -52,6 +52,7 @@ fn test_entries() -> Vec<SessionEntry> {
             content: "exit code: 0\nstdout:\nok\n".into(),
             is_error: false,
             synthetic: false,
+            images: vec![],
         }
         .into(),
         Message::Tool {
@@ -60,6 +61,7 @@ fn test_entries() -> Vec<SessionEntry> {
             content: "command not found".into(),
             is_error: true,
             synthetic: false,
+            images: vec![],
         }
         .into(),
         SessionEntry::Compaction {

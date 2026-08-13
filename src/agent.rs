@@ -36,6 +36,7 @@ pub(crate) fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
                 call_id: call.id,
                 name: call.name,
                 content: INTERRUPTED.into(),
+                images: vec![],
                 is_error: true,
                 synthetic: true,
             });
@@ -104,48 +105,46 @@ pub struct ImagePart {
 /// Single-image size cap for `read_image` and the REPL `/image` command.
 pub const IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 
-/// Structured prefix a `read_image` tool result carries so the runner can
-/// split the image reference from the display summary:
-/// `__EA_IMAGE__<hash>,<mime>__EA_IMAGE_END__<summary>`.
-pub const IMAGE_MARKER_START: &str = "__EA_IMAGE__";
-pub const IMAGE_MARKER_END: &str = "__EA_IMAGE_END__";
+/// A structured tool result: display/content text plus optional image
+/// attachments. `read_image` fills `images`; the runner persists them on the
+/// `Message::Tool` entry and each wire encodes them natively (chat: one
+/// aggregated temporary user wire message per consecutive tool batch;
+/// responses: a `function_call_output` output array). Every other tool
+/// returns text only via [`ToolOutput::text`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ToolOutput {
+    pub content: String,
+    pub images: Vec<ImagePart>,
+}
 
-/// Split a tool result that may start with an image marker into the display
-/// summary (marker stripped) and the optional [`ImagePart`]. Results without
-/// the marker pass through untouched.
-pub fn split_image_marker(result: &str) -> (String, Option<ImagePart>) {
-    if let Some(rest) = result.strip_prefix(IMAGE_MARKER_START)
-        && let Some((hash_mime, summary)) = rest.split_once(IMAGE_MARKER_END)
-        && let Some((hash, mime)) = hash_mime.split_once(',')
-        && !hash.is_empty()
-        && !mime.is_empty()
-    {
-        (
-            summary.to_owned(),
-            Some(ImagePart {
-                hash: hash.to_owned(),
-                mime: mime.to_owned(),
-            }),
-        )
-    } else {
-        (result.to_owned(), None)
+impl ToolOutput {
+    /// Plain text result with no image attachments.
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            images: Vec::new(),
+        }
     }
 }
 
-/// The `path` argument of a tool call, for synthetic image-attach messages.
-pub fn tool_path_argument(arguments: &str) -> Option<String> {
-    serde_json::from_str::<Value>(arguments)
-        .ok()
-        .and_then(|value| value.get("path").and_then(Value::as_str).map(str::to_owned))
-}
-
-/// Remove image attachments from user messages. Non-vision models cannot
-/// consume image parts, so compaction strips them before sending the
-/// request (the vision gate would otherwise reject it and lock the session).
+/// Remove image attachments from user AND tool messages, text-degrading the
+/// message (a short note is appended where images were dropped). Non-vision
+/// models cannot consume image parts, so the REQUEST COPY strips them before
+/// sending (the vision gate would otherwise reject it and lock the session).
+/// The persisted history is untouched: switching back to a vision model
+/// restores the images on the next request.
 pub fn strip_images(messages: &mut [Message]) {
     for message in messages {
-        if let Message::User { images, .. } = message {
+        let (content, images) = match message {
+            Message::User { content, images } => (content, images),
+            Message::Tool {
+                content, images, ..
+            } => (content, images),
+            _ => continue,
+        };
+        if !images.is_empty() {
             images.clear();
+            content.push_str("（当前模型不支持图片，已跳过附加）");
         }
     }
 }
@@ -240,17 +239,19 @@ pub fn attach_image_from_path(path: &str) -> Result<ImagePart, String> {
     })
 }
 
-/// Vision gate shared by both wires: user messages with images require a
-/// vision-capable model. Non-vision models get a clear error instead of a
-/// malformed or silently degraded request.
+/// Vision gate shared by both wires: messages with images (user attachments
+/// or image-bearing tool results) require a vision-capable model. Non-vision
+/// models get a clear error instead of a malformed or silently degraded
+/// request.
 pub fn ensure_vision_supported(
     model: &str,
     vision: bool,
     messages: &[Message],
 ) -> anyhow::Result<()> {
-    let has_images = messages
-        .iter()
-        .any(|message| matches!(message, Message::User { images, .. } if !images.is_empty()));
+    let has_images = messages.iter().any(|message| match message {
+        Message::User { images, .. } | Message::Tool { images, .. } => !images.is_empty(),
+        _ => false,
+    });
     if has_images && !vision {
         anyhow::bail!("model {model} does not support image input");
     }
@@ -280,6 +281,14 @@ pub enum Message {
         call_id: String,
         name: String,
         content: String,
+        /// Image attachments produced by the tool (e.g. `read_image`) as
+        /// content-hash references into the global image store (never inline
+        /// base64 in the session). Only the reference is persisted; the wire
+        /// layer re-reads the file and encodes it.
+        /// `#[serde(default)]` keeps old session files (no `images` field)
+        /// loadable.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImagePart>,
         is_error: bool,
         /// Synthetic interrupted-turn placeholder from a snapshot/compaction
         /// repair, never a real tool result. Used instead of matching the
@@ -517,7 +526,7 @@ pub trait Model: Send {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
-    async fn execute(&self, arguments: Value) -> Result<String, String>;
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String>;
     fn set_event_sender(&mut self, _sender: mpsc::UnboundedSender<AgentEvent>) {}
     /// True when the tool already delivers background completions through a
     /// channel of its own (e.g. bound to a shared registry); Agent::new
@@ -1033,10 +1042,11 @@ impl Agent {
     }
 
     /// Whether the session's current model accepts image input. Non-vision
-    /// models cannot consume `Message::User` image parts — the vision gate
+    /// models cannot consume image parts — the vision gate
     /// (`ensure_vision_supported`) would reject every later model call and
-    /// lock the session — so the runner skips read_image attachments and
-    /// rejects explicit `/image` prompts on such models.
+    /// lock the session — so the runner strips them from request copies
+    /// (history keeps them) and rejects explicit `/image` prompts on such
+    /// models.
     pub(crate) fn supports_vision(&self) -> bool {
         self.model.supports_vision()
     }
@@ -1409,7 +1419,7 @@ impl Agent {
         self.tools.iter().map(|tool| tool.spec()).collect()
     }
 
-    pub(crate) async fn execute_tool(&mut self, call: &ToolCall) -> Result<String, String> {
+    pub(crate) async fn execute_tool(&mut self, call: &ToolCall) -> Result<ToolOutput, String> {
         Self::execute_on(&self.tools, call).await
     }
 
@@ -1425,12 +1435,21 @@ impl Agent {
         self.emit(event);
     }
 
-    pub(crate) fn after_tool_entry(&mut self, call: &ToolCall, result: &Result<String, String>) {
+    pub(crate) fn after_tool_entry(
+        &mut self,
+        call: &ToolCall,
+        result: &Result<ToolOutput, String>,
+    ) {
         if result.is_ok()
             && (call.name == "bash" || call.name == "pwsh")
             && is_background_call(call)
             && !is_detached_background_call(call)
-            && let Some(id) = started_task_id(result.as_deref().unwrap_or_default())
+            && let Some(id) = started_task_id(
+                result
+                    .as_ref()
+                    .map(|output| output.content.as_str())
+                    .unwrap_or_default(),
+            )
         {
             self.running_background.insert(id);
             if let Some(record) = &self.background_record {
@@ -1576,44 +1595,29 @@ impl Agent {
                 });
                 let result = Self::execute_on(&self.tools, call).await;
                 self.after_tool_entry(call, &result);
-                // A read_image result carries a structured image marker;
-                // strip it so the Tool message/event keep only the text
-                // summary (base64 never enters the scrollback), then attach
-                // the image as a synthetic User message right after the tool
-                // result (images can only ride on user role messages).
-                // Non-vision models cannot consume image parts: keep the
-                // text summary but skip the attachment, so the session is
-                // not locked out of every later model call by the vision
-                // gate (compaction would fail the same way).
-                let (mut summary, image) = match &result {
-                    Ok(content) => split_image_marker(content),
-                    Err(error) => (error.clone(), None),
+                // One canonical image-bearing Tool entry: the text summary
+                // plus the structured image references ride on the Tool
+                // message itself (no marker parsing, no synthetic User).
+                // Non-vision models never see the images: the request copy
+                // is stripped at send time (strip_images), while history
+                // keeps them so a later vision model regains them.
+                let (content, images) = match &result {
+                    Ok(output) => (output.content.clone(), output.images.clone()),
+                    Err(error) => (error.clone(), Vec::new()),
                 };
-                let supports_vision = self.model.supports_vision();
-                let image = if image.is_some() && !supports_vision {
-                    summary.push_str("（当前模型不支持图片，已跳过附加）");
-                    None
-                } else {
-                    image
-                };
+                let is_error = result.is_err();
                 self.emit(AgentEvent::ToolResult {
-                    is_error: result.is_err(),
-                    content: summary.clone(),
+                    is_error,
+                    content: content.clone(),
                 });
                 self.push_message(Message::Tool {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
-                    content: summary,
-                    is_error: result.is_err(),
+                    content,
+                    images,
+                    is_error,
                     synthetic: false,
                 });
-                if let Some(image) = image {
-                    let path = tool_path_argument(&call.arguments).unwrap_or_default();
-                    self.push_message(Message::User {
-                        content: format!("[image attached: {path}]"),
-                        images: vec![image],
-                    });
-                }
             }
         }
     }
@@ -1621,7 +1625,7 @@ impl Agent {
     /// Execute a tool call against a tool list. Associated function (not a
     /// method) so the returned future does not borrow `&self`, keeping
     /// `Agent::run` futures `Send` for use in `tokio::spawn`.
-    async fn execute_on(tools: &[Box<dyn Tool>], call: &ToolCall) -> Result<String, String> {
+    async fn execute_on(tools: &[Box<dyn Tool>], call: &ToolCall) -> Result<ToolOutput, String> {
         let arguments = serde_json::from_str(&call.arguments)
             .map_err(|error| format!("invalid JSON arguments: {error}"))?;
         let Some(tool) = tools.iter().find(|tool| tool.spec().name == call.name) else {

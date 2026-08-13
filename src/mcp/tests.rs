@@ -87,7 +87,7 @@ async fn connect_all_exposes_prefixed_tools() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].spec().name, "fake_echo");
     let output = tools[0].execute(json!({"text": "hi"})).await.unwrap();
-    assert_eq!(output, "you said: hi");
+    assert_eq!(output.content, "you said: hi");
 }
 
 #[tokio::test]

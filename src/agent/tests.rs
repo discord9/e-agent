@@ -41,8 +41,8 @@ impl Tool for EchoTool {
         }
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
-        Ok(arguments["value"].to_string())
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::text(arguments["value"].to_string()))
     }
 }
 
@@ -58,7 +58,7 @@ impl Tool for FailingTool {
         }
     }
 
-    async fn execute(&self, _: Value) -> Result<String, String> {
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
         Err("execution failed".into())
     }
 }
@@ -77,7 +77,7 @@ impl Tool for ScriptedBackgroundTool {
         }
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         assert_eq!(arguments["background"], true);
         let sender = self.sender.clone().unwrap();
         tokio::spawn(async move {
@@ -88,7 +88,7 @@ impl Tool for ScriptedBackgroundTool {
                 label: None,
             });
         });
-        Ok("started background task 1: echo done".into())
+        Ok(ToolOutput::text("started background task 1: echo done"))
     }
 
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
@@ -108,9 +108,9 @@ impl Tool for SlowEchoTool {
         }
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        Ok(arguments["value"].to_string())
+        Ok(ToolOutput::text(arguments["value"].to_string()))
     }
 }
 
@@ -181,6 +181,7 @@ fn repair_tool_pairs_drops_orphan_results_after_a_synthetic_answer() {
             content: "[turn interrupted before a tool result was produced]".into(),
             is_error: true,
             synthetic: true,
+            images: vec![],
         },
         Message::Tool {
             call_id: "call-1".into(),
@@ -188,6 +189,7 @@ fn repair_tool_pairs_drops_orphan_results_after_a_synthetic_answer() {
             content: "real result".into(),
             is_error: false,
             synthetic: false,
+            images: vec![],
         },
     ];
     let repaired = repair_tool_pairs(messages);
@@ -260,6 +262,7 @@ fn repair_tool_pairs_keeps_real_result_matching_placeholder_text() {
             content: "[turn interrupted before a tool result was produced]".into(),
             is_error: false,
             synthetic: false,
+            images: vec![],
         },
     ];
     let repaired = repair_tool_pairs(messages);
@@ -284,6 +287,52 @@ fn repair_tool_pairs_keeps_real_result_matching_placeholder_text() {
     );
     assert!(!repaired.iter().any(|m| matches!(
         m,
+        Message::Tool {
+            synthetic: true,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn repair_tool_pairs_keeps_image_bearing_tool_results() {
+    // An image-bearing Tool result passes through repair untouched: the
+    // structured image references stay on the canonical Tool message (no
+    // synthetic User, no stripping).
+    let image = ImagePart {
+        hash: "deadbeef".into(),
+        mime: "image/png".into(),
+    };
+    let messages = vec![
+        Message::User {
+            content: "u".into(),
+            images: vec![],
+        },
+        Message::Assistant(AssistantMessage {
+            content: None,
+            tool_calls: vec![call("call-img", "read_image", r#"{"path":"a.png"}"#)],
+            reasoning: None,
+        }),
+        Message::Tool {
+            call_id: "call-img".into(),
+            name: "read_image".into(),
+            content: "[image read: a.png] (hash deadbeef, image/png, 4 bytes)".into(),
+            is_error: false,
+            synthetic: false,
+            images: vec![image.clone()],
+        },
+        Message::User {
+            content: "next".into(),
+            images: vec![],
+        },
+    ];
+    let repaired = repair_tool_pairs(messages);
+    assert!(repaired.iter().any(|message| matches!(
+        message,
+        Message::Tool { images, is_error: false, .. } if *images == vec![image.clone()]
+    )));
+    assert!(!repaired.iter().any(|message| matches!(
+        message,
         Message::Tool {
             synthetic: true,
             ..
@@ -432,6 +481,7 @@ fn restore_history_migrates_legacy_placeholders_end_to_end() {
             content: "real result".into(),
             is_error: false,
             synthetic: false,
+            images: vec![],
         }
         .into(),
     ]);
@@ -500,6 +550,7 @@ fn context_pairs_real_result_across_a_compaction_snapshot() {
                     content: INTERRUPTED.into(),
                     is_error: true,
                     synthetic: true,
+                    images: vec![],
                 },
             ],
         },
@@ -509,6 +560,7 @@ fn context_pairs_real_result_across_a_compaction_snapshot() {
             content: "real result".into(),
             is_error: false,
             synthetic: false,
+            images: vec![],
         }
         .into(),
     ]);
@@ -864,6 +916,7 @@ async fn compacts_everything_before_the_current_turn() {
             content: "building".into(),
             is_error: false,
             synthetic: false,
+            images: vec![],
         },
         Message::Tool {
             call_id: "call-3".into(),
@@ -871,6 +924,7 @@ async fn compacts_everything_before_the_current_turn() {
             content: "still building".into(),
             is_error: false,
             synthetic: false,
+            images: vec![],
         },
         Message::Assistant(AssistantMessage {
             content: Some("recent answer".into()),
@@ -894,6 +948,7 @@ async fn compacts_everything_before_the_current_turn() {
             content: "old result".into(),
             is_error: false,
             synthetic: false,
+            images: vec![],
         },
         Message::User {
             content: "follow up".into(),
@@ -957,6 +1012,7 @@ async fn context_repairs_unanswered_tool_calls_from_interrupted_turns() {
             content: "built".into(),
             is_error: false,
             synthetic: false,
+            images: vec![],
         },
     ];
     let mut agent = Agent::new(
@@ -1017,8 +1073,8 @@ async fn new_keeps_an_already_wired_event_sender() {
                 parameters: json!({"type": "object"}),
             }
         }
-        async fn execute(&self, _: Value) -> Result<String, String> {
-            Ok("ok".into())
+        async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+            Ok(ToolOutput::text("ok"))
         }
         fn set_event_sender(&mut self, _: mpsc::UnboundedSender<AgentEvent>) {
             panic!("Agent::new must not retarget a pre-wired tool");
@@ -1526,29 +1582,67 @@ fn user_images_serde_round_trips_and_old_sessions_load_without_images() {
 }
 
 #[test]
-fn split_image_marker_parses_hash_and_mime_and_strips_summary() {
-    let (summary, image) = split_image_marker(
-        "__EA_IMAGE__deadbeef,image/png__EA_IMAGE_END__[image read: a.png] (hash deadbeef, image/png, 4 bytes)",
-    );
-    assert_eq!(
-        summary,
-        "[image read: a.png] (hash deadbeef, image/png, 4 bytes)"
-    );
-    assert_eq!(
-        image,
-        Some(ImagePart {
-            hash: "deadbeef".into(),
+fn tool_images_serde_round_trips_and_old_sessions_load_without_images() {
+    // New shape: the images field round-trips on Tool messages.
+    let message = Message::Tool {
+        call_id: "call-1".into(),
+        name: "read_image".into(),
+        content: "[image read: a.png] (hash abc123, image/png, 4 bytes)".into(),
+        images: vec![ImagePart {
+            hash: "abc123".into(),
             mime: "image/png".into(),
-        })
+        }],
+        is_error: false,
+        synthetic: false,
+    };
+    let json = serde_json::to_string(&message).unwrap();
+    let back: Message = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, message);
+
+    // Old sessions (no `images` key on Tool messages) deserialize with an
+    // empty list.
+    let legacy: Message = serde_json::from_str(
+        r#"{"Tool":{"call_id":"call-1","name":"bash","content":"ok","is_error":false}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        legacy,
+        Message::Tool {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            content: "ok".into(),
+            images: vec![],
+            is_error: false,
+            synthetic: false,
+        }
     );
-    // Non-marker results pass through untouched.
-    let (summary, image) = split_image_marker("plain result");
-    assert_eq!(summary, "plain result");
-    assert!(image.is_none());
-    // Malformed markers are not mistaken for attachments.
-    let (summary, image) = split_image_marker("__EA_IMAGE__nocomma__EA_IMAGE_END__rest");
-    assert_eq!(summary, "__EA_IMAGE__nocomma__EA_IMAGE_END__rest");
-    assert!(image.is_none());
+    // And serialize back without the images key when empty.
+    let legacy_json = serde_json::to_string(&legacy).unwrap();
+    assert!(!legacy_json.contains("images"));
+}
+
+#[test]
+fn tool_marker_like_text_is_plain_content_no_parsing() {
+    // The IMAGE_MARKER machinery is deleted: a tool result that happens to
+    // contain marker-like text is ordinary content with no image parts, and
+    // round-trips through serde unchanged.
+    let message = Message::Tool {
+        call_id: "call-1".into(),
+        name: "bash".into(),
+        content: "__EA_IMAGE__deadbeef,image/png__EA_IMAGE_END__plain".into(),
+        images: vec![],
+        is_error: false,
+        synthetic: false,
+    };
+    let json = serde_json::to_string(&message).unwrap();
+    let back: Message = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, message);
+    assert!(matches!(
+        back,
+        Message::Tool { images, .. } if images.is_empty()
+    ));
+    assert!(json.contains("__EA_IMAGE__"));
+    assert!(!json.contains("\"images\""));
 }
 
 struct ImageTool {
@@ -1565,15 +1659,20 @@ impl Tool for ImageTool {
         }
     }
 
-    async fn execute(&self, _: Value) -> Result<String, String> {
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
         let store = self.workspace.path().join("store");
         let bytes = b"fake-png-bytes";
         let hash = store_image_bytes(&store, bytes).unwrap();
-        Ok(format!(
-            "{IMAGE_MARKER_START}{hash},image/png{IMAGE_MARKER_END}\
-                 [image read: pics/cat.png] (hash {hash}, image/png, {} bytes)",
-            bytes.len()
-        ))
+        Ok(ToolOutput {
+            content: format!(
+                "[image read: pics/cat.png] (hash {hash}, image/png, {} bytes)",
+                bytes.len()
+            ),
+            images: vec![ImagePart {
+                hash,
+                mime: "image/png".into(),
+            }],
+        })
     }
 }
 
@@ -1619,7 +1718,7 @@ impl Model for ImageRoundModel {
 }
 
 #[tokio::test]
-async fn run_loop_strips_marker_and_attaches_synthetic_user_with_image() {
+async fn run_loop_commits_image_bearing_tool_without_synthetic_user() {
     let temp = tempfile::tempdir().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
@@ -1633,47 +1732,46 @@ async fn run_loop_strips_marker_and_attaches_synthetic_user_with_image() {
     let answer = agent.run("describe".into()).await.unwrap();
     assert_eq!(answer, "final");
     let history = agent.history();
-    // Tool result keeps only the text summary (no marker, no base64).
+    // One canonical image-bearing Tool entry: text summary + image refs,
+    // no marker, no synthetic User message.
     let tool = history
         .iter()
         .find_map(|entry| match entry {
             SessionEntry::Message {
-                message: Message::Tool { content, .. },
-            } => Some(content.clone()),
-            _ => None,
-        })
-        .unwrap();
-    assert!(tool.starts_with("[image read: pics/cat.png]"));
-    assert!(!tool.contains("__EA_IMAGE__"));
-    assert!(!tool.contains("fake-png"));
-    // The synthetic user message follows the tool result and carries the
-    // image reference.
-    let synthetic = history
-        .iter()
-        .filter_map(|entry| match entry {
-            SessionEntry::Message {
-                message: Message::User { content, images },
+                message: Message::Tool {
+                    content, images, ..
+                },
             } => Some((content.clone(), images.clone())),
             _ => None,
         })
-        .find(|(content, _)| content.starts_with("[image attached:"));
-    let (content, images) = synthetic.unwrap();
-    assert_eq!(content, "[image attached: pics/cat.png]");
-    assert_eq!(images.len(), 1);
-    assert_eq!(images[0].mime, "image/png");
-    // And the model saw the image in the second round's context.
+        .unwrap();
+    assert!(tool.0.starts_with("[image read: pics/cat.png]"));
+    assert!(!tool.0.contains("__EA_IMAGE__"));
+    assert!(!tool.0.contains("fake-png"));
+    assert_eq!(tool.1.len(), 1);
+    assert_eq!(tool.1[0].mime, "image/png");
+    assert!(!history.iter().any(|entry| match entry {
+        SessionEntry::Message {
+            message: Message::User { content, .. },
+        } => content.starts_with("[image attached:"),
+        _ => false,
+    }));
+    // The second round's context carries the image on the Tool message.
     let calls = requests.lock().unwrap();
     assert_eq!(calls.len(), 2);
     let second = &calls[1];
     assert!(second.iter().any(|message| matches!(
         message,
-        Message::User { content, images } if content.starts_with("[image attached:")
-            && !images.is_empty()
+        Message::Tool { images, .. } if !images.is_empty()
+    )));
+    assert!(!second.iter().any(|message| matches!(
+        message,
+        Message::User { content, .. } if content.starts_with("[image attached:")
     )));
 }
 
 #[tokio::test]
-async fn run_loop_skips_image_attachment_on_non_vision_models() {
+async fn run_loop_keeps_tool_images_in_history_but_strips_requests_on_non_vision() {
     let temp = tempfile::tempdir().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
@@ -1687,29 +1785,31 @@ async fn run_loop_skips_image_attachment_on_non_vision_models() {
     let answer = agent.run("describe".into()).await.unwrap();
     assert_eq!(answer, "final");
     let history = agent.history();
-    // Tool result keeps the text summary, annotated that the attachment
-    // was skipped (the vision gate would otherwise lock the session).
+    // Canonical history keeps the image-bearing Tool entry untouched (no
+    // "已跳过附加" annotation in history — that only appears on the request
+    // copy), so switching back to a vision model restores the image.
     let tool = history
         .iter()
         .find_map(|entry| match entry {
             SessionEntry::Message {
-                message: Message::Tool { content, .. },
-            } => Some(content.clone()),
+                message: Message::Tool {
+                    content, images, ..
+                },
+            } => Some((content.clone(), images.clone())),
             _ => None,
         })
         .unwrap();
-    assert!(tool.starts_with("[image read: pics/cat.png]"));
-    assert!(tool.contains("已跳过附加"));
-    assert!(!tool.contains("__EA_IMAGE__"));
-    // No synthetic user message with an image reference.
-    let synthetic = history.iter().any(|entry| match entry {
+    assert!(tool.0.starts_with("[image read: pics/cat.png]"));
+    assert!(!tool.0.contains("已跳过附加"));
+    assert_eq!(tool.1.len(), 1);
+    assert!(!history.iter().any(|entry| matches!(
+        entry,
         SessionEntry::Message {
-            message: Message::User { content, images },
-        } => content.starts_with("[image attached:") && !images.is_empty(),
-        _ => false,
-    });
-    assert!(!synthetic);
-    // The second round's context carries no images.
+            message: Message::User { images, .. }
+        } if !images.is_empty()
+    )));
+    // The non-vision request was stripped and text-degraded (no images
+    // anywhere, and the Tool content carries the skip note on the wire).
     let calls = requests.lock().unwrap();
     assert_eq!(calls.len(), 2);
     let second = &calls[1];
@@ -1718,6 +1818,15 @@ async fn run_loop_skips_image_attachment_on_non_vision_models() {
             .iter()
             .all(|message| !matches!(message, Message::User { images, .. } if !images.is_empty()))
     );
+    assert!(
+        second
+            .iter()
+            .all(|message| !matches!(message, Message::Tool { images, .. } if !images.is_empty()))
+    );
+    assert!(second.iter().any(|message| matches!(
+        message,
+        Message::Tool { content, .. } if content.contains("已跳过附加")
+    )));
 }
 
 /// `ScriptedModel` that reports vision support (compact/round requests keep
@@ -3314,6 +3423,7 @@ async fn single_user_session_compacts_tool_history() {
                 content: format!("result {i}"),
                 is_error: false,
                 synthetic: false,
+                images: vec![],
             }
             .into(),
         );
@@ -3393,6 +3503,7 @@ async fn single_user_retained_tail_adjusts_onto_an_assistant_boundary() {
                 content: format!("result {i}"),
                 is_error: false,
                 synthetic: false,
+                images: vec![],
             }
             .into(),
         );
@@ -3461,6 +3572,7 @@ async fn single_user_session_too_short_still_refuses() {
                 content: format!("result {i}"),
                 is_error: false,
                 synthetic: false,
+                images: vec![],
             }
             .into(),
         );
@@ -3596,10 +3708,10 @@ fn image_store_dedups_by_hash_and_mime_whitelist() {
     assert_eq!(load_image_bytes(None, &first), None);
 }
 
-// ── strip_images (compaction image stripping) ────────────────────────
+// ── strip_images (request-copy image stripping) ──────────────────────
 
 #[test]
-fn strip_images_clears_user_images_keeps_content_and_role() {
+fn strip_images_clears_user_and_tool_images_with_text_degradation() {
     let mut messages = vec![
         Message::System {
             content: "sys".into(),
@@ -3622,6 +3734,10 @@ fn strip_images_clears_user_images_keeps_content_and_role() {
             content: "[image read: a.png]".into(),
             is_error: false,
             synthetic: false,
+            images: vec![ImagePart {
+                hash: "beef".into(),
+                mime: "image/png".into(),
+            }],
         },
         Message::User {
             content: "plain".into(),
@@ -3636,7 +3752,7 @@ fn strip_images_clears_user_images_keeps_content_and_role() {
                 content: "sys".into(),
             },
             Message::User {
-                content: "with image".into(),
+                content: "with image（当前模型不支持图片，已跳过附加）".into(),
                 images: vec![],
             },
             Message::Assistant(AssistantMessage {
@@ -3647,9 +3763,10 @@ fn strip_images_clears_user_images_keeps_content_and_role() {
             Message::Tool {
                 call_id: "1".into(),
                 name: "read_image".into(),
-                content: "[image read: a.png]".into(),
+                content: "[image read: a.png]（当前模型不支持图片，已跳过附加）".into(),
                 is_error: false,
                 synthetic: false,
+                images: vec![],
             },
             Message::User {
                 content: "plain".into(),

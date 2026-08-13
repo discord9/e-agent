@@ -56,7 +56,7 @@ async fn await_tool(
     agent: &mut Agent,
     call: &ToolCall,
     commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
-) -> WaitResult<Result<String, String>> {
+) -> WaitResult<Result<crate::agent::ToolOutput, String>> {
     let mut operation = Box::pin(async move { agent.execute_tool(call).await });
     wait_for_operation(&mut operation, commands).await
 }
@@ -728,12 +728,10 @@ impl SessionRunner {
     /// Apply `SwitchModel` commands cached while an operation was in flight,
     /// returning the remaining commands in their original order for the
     /// regular intake. `wait_for_operation` collects commands received
-    /// during e.g. a tool execution into `pending`; a model switch must take
-    /// effect BEFORE the tool's result is interpreted, because the vision
-    /// guard on read_image results decides with the *new* model. Otherwise a
-    /// vision→non-vision switch made mid-execution would still commit the
-    /// image (poisoning every later model call through the wire gate), and a
-    /// non-vision→vision switch would wrongly drop it.
+    /// during e.g. a tool execution into `pending`; the switch applies from
+    /// the next model call on (history keeps tool images unconditionally, so
+    /// no result interpretation depends on the model — non-vision request
+    /// copies are stripped at send time).
     fn apply_pending_model_switches(
         &mut self,
         pending: Vec<SessionCommand>,
@@ -1226,38 +1224,31 @@ impl SessionRunner {
                             return;
                         }
                     };
-                    // A model switch queued while the tool ran must apply
-                    // BEFORE the result is interpreted: the vision guard
-                    // below decides with the *new* model (see
-                    // apply_pending_model_switches). Other cached commands
-                    // keep their order and are intaken after the commit.
+                    // A model switch queued while the tool ran is applied
+                    // BEFORE the result is committed; the switch takes
+                    // effect from the next model call on (history keeps
+                    // tool images unconditionally, so the commit itself does
+                    // not depend on the model — the request copy is stripped
+                    // for non-vision models at send time).
                     let pending = self.apply_pending_model_switches(waited.pending);
-                    // A read_image result carries a structured image marker;
-                    // strip it so the committed Tool entry and the ToolResult
-                    // event keep only the text summary (base64 never reaches
-                    // the scrollback), then attach the image as a synthetic
-                    // User message right after the tool result (images ride
-                    // only on user role). Non-vision models cannot consume
-                    // image parts: keep the text summary but skip the
-                    // attachment, so the session is not locked out of every
-                    // later model call by the vision gate (compaction would
-                    // fail the same way).
-                    let (mut tool_text, image) = match &result {
-                        Ok(content) => crate::agent::split_image_marker(content),
-                        Err(error) => (error.clone(), None),
+                    // One canonical image-bearing Tool entry: the text
+                    // summary plus the structured image references ride on
+                    // the Tool message itself (no marker parsing, no
+                    // synthetic User). Non-vision models never see the
+                    // images: the request copy is stripped at send time
+                    // (strip_images), while history keeps them so a later
+                    // vision model regains them.
+                    let (tool_text, images) = match &result {
+                        Ok(output) => (output.content.clone(), output.images.clone()),
+                        Err(error) => (error.clone(), Vec::new()),
                     };
-                    let supports_vision = self.agent.supports_vision();
-                    let image = if image.is_some() && !supports_vision {
-                        tool_text.push_str("（当前模型不支持图片，已跳过附加）");
-                        None
-                    } else {
-                        image
-                    };
+                    let is_error = result.is_err();
                     let entry = Message::Tool {
                         call_id: call.id.clone(),
                         name: call.name.clone(),
                         content: tool_text.clone(),
-                        is_error: result.is_err(),
+                        images,
+                        is_error,
                         synthetic: false,
                     }
                     .into();
@@ -1268,23 +1259,9 @@ impl SessionRunner {
                     }
                     self.agent.after_tool_entry(&call, &result);
                     self.agent.emit_event(AgentEvent::ToolResult {
-                        is_error: result.is_err(),
+                        is_error,
                         content: tool_text,
                     });
-                    if let Some(image) = image {
-                        let path =
-                            crate::agent::tool_path_argument(&call.arguments).unwrap_or_default();
-                        let user_entry: SessionEntry = Message::User {
-                            content: format!("[image attached: {path}]"),
-                            images: vec![image],
-                        }
-                        .into();
-                        if let Err(error) = self.commit(user_entry).await {
-                            self.terminate(SessionResult::Failed(format!("{error:#}")), pending)
-                                .await;
-                            return;
-                        }
-                    }
                     // A release that raced the tool's own completion: the
                     // tool result was committed above (contract: completed
                     // output is never lost), but the release stops the turn

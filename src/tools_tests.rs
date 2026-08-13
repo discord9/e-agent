@@ -155,7 +155,7 @@ async fn web_search_sends_the_expected_request_and_returns_response() {
         .execute(json!({"query": "  Rust ownership docs  "}))
         .await
         .unwrap();
-    assert_eq!(result, "public [redacted] context");
+    assert_eq!(result.content, "public [redacted] context");
 
     let request = server.await.unwrap();
     let header_end = request
@@ -302,9 +302,9 @@ async fn web_search_caps_success_and_error_bodies() {
         .execute(json!({"query": "public query"}))
         .await
         .unwrap();
-    assert!(result.len() <= OUTPUT_LIMIT);
-    assert!(result.is_char_boundary(result.len()));
-    assert!(result.ends_with("\n...[truncated]"));
+    assert!(result.content.len() <= OUTPUT_LIMIT);
+    assert!(result.content.is_char_boundary(result.content.len()));
+    assert!(result.content.ends_with("\n...[truncated]"));
     server.await.unwrap();
 
     let response = json!({"response": "x".repeat(WEB_SEARCH_RESPONSE_LIMIT * 2)}).to_string();
@@ -339,7 +339,7 @@ async fn web_search_caps_success_and_error_bodies() {
     server.await.unwrap();
 }
 
-async fn edit(temp: &tempfile::TempDir, old: &str, new: &str) -> Result<String, String> {
+async fn edit(temp: &tempfile::TempDir, old: &str, new: &str) -> Result<ToolOutput, String> {
     EditFile {
         workspace: Workspace::new(temp.path()).unwrap(),
     }
@@ -366,7 +366,7 @@ async fn edit_requires_exactly_one_match() {
             .contains("found 2")
     );
     assert_eq!(
-        edit(&temp, "two", "x").await.unwrap(),
+        edit(&temp, "two", "x").await.unwrap().content,
         "file edited (line 1)"
     );
     assert_eq!(std::fs::read_to_string(path).unwrap(), "one x one");
@@ -379,7 +379,7 @@ async fn edit_preserves_crlf_line_endings() {
     let path = temp.path().join("file.txt");
     // CRLF file (Windows-style); the model's old/new use LF.
     std::fs::write(&path, "line one\r\nline two\r\nline three\r\n").unwrap();
-    let result = edit(&temp, "line two", "line TWO").await.unwrap();
+    let result = edit(&temp, "line two", "line TWO").await.unwrap().content;
     assert_eq!(result, "file edited (line 2)");
     // The whole file must still be CRLF — no fake whole-line diffs.
     let after = std::fs::read_to_string(path).unwrap();
@@ -396,7 +396,7 @@ async fn edit_matches_lf_old_against_crlf_file() {
     let path = temp.path().join("file.txt");
     // Old text passed by the model without \r must still match a CRLF file.
     std::fs::write(&path, "alpha\r\nbeta\r\n").unwrap();
-    let result = edit(&temp, "beta", "BETA").await.unwrap();
+    let result = edit(&temp, "beta", "BETA").await.unwrap().content;
     assert_eq!(result, "file edited (line 2)");
     assert_eq!(std::fs::read_to_string(path).unwrap(), "alpha\r\nBETA\r\n");
 }
@@ -533,7 +533,7 @@ async fn undo_stack_is_bounded() {
     );
 }
 
-async fn read(temp: &tempfile::TempDir, arguments: Value) -> Result<String, String> {
+async fn read(temp: &tempfile::TempDir, arguments: Value) -> Result<ToolOutput, String> {
     ReadFile {
         workspace: Workspace::new(temp.path()).unwrap(),
     }
@@ -572,6 +572,7 @@ async fn external_absolute_file_tools_enforce_policy_and_reuse_semantics() {
             .execute(json!({"path": readable.join("file"), "limit": 2}))
             .await
             .unwrap()
+            .content
             .contains("use offset 3")
     );
     let write_tool = WriteFile {
@@ -641,12 +642,14 @@ async fn policy_file_tools_allow_read_but_reject_relative_and_external_absolute_
         read.execute(json!({"path": ".e-agent/config.toml"}))
             .await
             .unwrap()
+            .content
             .contains("[sandbox]")
     );
     assert!(
         read.execute(json!({"path": policy_path}))
             .await
             .unwrap()
+            .content
             .contains("[sandbox]")
     );
     for path in [
@@ -689,6 +692,7 @@ async fn policy_file_tools_reject_workspace_symlink_alias_writes() {
         .execute(json!({"path": "policy-alias"}))
         .await
         .unwrap()
+        .content
         .contains("[sandbox]")
     );
     let error = WriteFile { workspace }
@@ -705,19 +709,22 @@ async fn read_pages_lines_with_a_continuation_hint() {
     assert_eq!(
         read(&temp, json!({"path": "file.txt", "limit": 2}))
             .await
-            .unwrap(),
+            .unwrap()
+            .content,
         "a\nb\n[showing lines 1-2 of 5; use offset 3 to continue]"
     );
     assert_eq!(
         read(&temp, json!({"path": "file.txt", "offset": 3, "limit": 2}))
             .await
-            .unwrap(),
+            .unwrap()
+            .content,
         "c\nd\n[showing lines 3-4 of 5; use offset 5 to continue]"
     );
     assert_eq!(
         read(&temp, json!({"path": "file.txt", "offset": 5}))
             .await
-            .unwrap(),
+            .unwrap()
+            .content,
         "e"
     );
 }
@@ -729,12 +736,16 @@ async fn read_reports_offset_past_end_and_empty_files() {
     assert_eq!(
         read(&temp, json!({"path": "file.txt", "offset": 9}))
             .await
-            .unwrap(),
+            .unwrap()
+            .content,
         "[offset 9 is past end of file (2 lines)]"
     );
     std::fs::write(temp.path().join("empty.txt"), "").unwrap();
     assert_eq!(
-        read(&temp, json!({"path": "empty.txt"})).await.unwrap(),
+        read(&temp, json!({"path": "empty.txt"}))
+            .await
+            .unwrap()
+            .content,
         "[empty file]"
     );
 }
@@ -743,7 +754,10 @@ async fn read_reports_offset_past_end_and_empty_files() {
 async fn read_truncates_long_lines_to_the_byte_limit() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("file.txt"), "x".repeat(READ_LIMIT + 1)).unwrap();
-    let output = read(&temp, json!({"path": "file.txt"})).await.unwrap();
+    let output = read(&temp, json!({"path": "file.txt"}))
+        .await
+        .unwrap()
+        .content;
     assert!(output.ends_with("\n...[truncated]"));
     assert_eq!(output.len(), READ_LIMIT + "\n...[truncated]".len());
 }
@@ -782,7 +796,8 @@ async fn write_creates_a_new_nested_file() {
     assert_eq!(
         tool.execute(json!({"path": "new/file.txt", "content": "hello"}))
             .await
-            .unwrap(),
+            .unwrap()
+            .content,
         "file written"
     );
     assert_eq!(
@@ -1312,7 +1327,8 @@ async fn background_bash_uses_the_facade_sandbox_not_the_registry_one() {
     let started = bash
         .execute(json!({"command": "touch escape.txt", "background": true}))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     assert!(started.starts_with("started background task"), "{started}");
 
     let event = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
@@ -1456,7 +1472,8 @@ async fn sandbox_mounts_configured_dests_at_their_configured_paths() {
             rd = readable_dest.display()
         )}))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     assert!(result.contains("readable-content"), "{result}");
     assert!(result.contains("READONLY_OK"), "{result}");
     // The configured writable dest writes through to the canonical source.
@@ -1466,7 +1483,8 @@ async fn sandbox_mounts_configured_dests_at_their_configured_paths() {
             wd = writable_dest.display()
         )}))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     assert!(result.contains("written"), "{result}");
     assert_eq!(
         std::fs::read_to_string(writable_target.join("file")).unwrap(),
@@ -1498,7 +1516,8 @@ async fn sandbox_can_disable_network() {
             json!({"command": "exec 3<>/dev/tcp/127.0.0.1/80 && echo NET_OK || echo NET_BLOCKED"}),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     assert!(result.contains("NET_BLOCKED"), "{result}");
 }
 
@@ -1759,7 +1778,8 @@ async fn sandbox_extra_writable_and_readable_paths() {
     let out = tool
         .execute(json!({"command": format!("cat '{data_path}/info.txt'")}))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     assert!(out.contains("data"), "{out}");
     let write = tool
         .execute(json!({"command": format!("touch '{data_path}/nope' 2>&1")}))
@@ -1792,7 +1812,8 @@ async fn sandbox_protects_workspace_git_directory() {
     let out = tool
         .execute(json!({"command": "cat .git/HEAD"}))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     assert!(out.contains("ref: refs/heads/main"), "{out}");
     // Writing to any file under .git must fail (read-only bind).
     let write = tool
@@ -1831,7 +1852,11 @@ async fn sandbox_protects_workspace_git_file_linked_worktree() {
         owner_session: None,
     };
     // Reading the .git pointer must succeed.
-    let out = tool.execute(json!({"command": "cat .git"})).await.unwrap();
+    let out = tool
+        .execute(json!({"command": "cat .git"}))
+        .await
+        .unwrap()
+        .content;
     assert!(out.contains(gitdir), "{out}");
     // Overwriting or deleting the .git file must fail.
     let write = tool
@@ -1875,7 +1900,8 @@ async fn sandbox_mounts_systemd_resolve_when_present() {
     let out = tool
         .execute(json!({"command": "test -d /run/systemd/resolve && echo PRESENT || echo ABSENT"}))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     if host_has_resolve {
         assert!(
             out.contains("PRESENT"),
@@ -1885,7 +1911,8 @@ async fn sandbox_mounts_systemd_resolve_when_present() {
         let contents = tool
             .execute(json!({"command": "cat /run/systemd/resolve/stub-resolv.conf 2>&1 || true"}))
             .await
-            .unwrap();
+            .unwrap()
+            .content;
         assert!(
             contents.contains("nameserver"),
             "stub-resolv.conf should contain a nameserver; output: {contents}"
@@ -1920,7 +1947,8 @@ async fn sandbox_cat_etc_resolv_conf_works() {
     let out = tool
         .execute(json!({"command": "cat /etc/resolv.conf 2>&1 || true"}))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     if std::path::Path::new("/etc/resolv.conf").exists() {
         // On hosts with systemd-resolved the symlink target may or may not
         // be reachable. We only assert the file itself is present (the
@@ -1966,9 +1994,12 @@ async fn sandbox_dns_resolution_live_smoke() {
         .execute(json!({"command": "cat /run/systemd/resolve/stub-resolv.conf 2>&1"}))
         .await;
     match stub_ok {
-        Ok(out) if out.contains("nameserver") => { /* proceed */ }
+        Ok(out) if out.content.contains("nameserver") => { /* proceed */ }
         Ok(out) => {
-            eprintln!("stub-resolv.conf reachable but no nameserver line: {out}");
+            eprintln!(
+                "stub-resolv.conf reachable but no nameserver line: {}",
+                out.content
+            );
             return;
         }
         Err(e) => {
@@ -1982,17 +2013,21 @@ async fn sandbox_dns_resolution_live_smoke() {
             .await;
     match result {
         Ok(out) => {
-            let trimmed = out.trim();
+            let trimmed = out.content.trim();
             if trimmed.is_empty()
                 || trimmed.contains("not found")
                 || trimmed.contains("NXDOMAIN")
                 || trimmed.contains("SERVFAIL")
             {
-                eprintln!("DNS resolution returned no result (external network issue): {out}");
+                eprintln!(
+                    "DNS resolution returned no result (external network issue): {}",
+                    out.content
+                );
             } else {
                 assert!(
                     trimmed.contains("github.com") || trimmed.contains('.'),
-                    "expected resolved address but got: {out}"
+                    "expected resolved address but got: {}",
+                    out.content
                 );
             }
         }
@@ -2011,6 +2046,7 @@ async fn completed_background_tasks_leave_the_running_registry() {
             bash.execute(json!({"command": "true", "background": true}))
                 .await
                 .unwrap()
+                .content
                 .starts_with(&format!("started background task {id}:"))
         );
     }
@@ -2022,6 +2058,7 @@ async fn completed_background_tasks_leave_the_running_registry() {
         bash.execute(json!({"command": "true", "background": true}))
             .await
             .unwrap()
+            .content
             .starts_with("started background task 9:")
     );
 }
@@ -2190,7 +2227,7 @@ async fn get_background_tasks_lists_running_tasks() {
 
     // No tasks running initially.
     assert_eq!(
-        tool.execute(json!({})).await.unwrap(),
+        tool.execute(json!({})).await.unwrap().content,
         "No background tasks running."
     );
 
@@ -2207,7 +2244,7 @@ async fn get_background_tasks_lists_running_tasks() {
     // plus the full command on its own continuation line (the label is the
     // same here because the command is short — see the long-command test
     // below for the truncated-label case).
-    let output = tool.execute(json!({})).await.unwrap();
+    let output = tool.execute(json!({})).await.unwrap().content;
     assert_eq!(
         output,
         "1 background task(s) running:\n#1: echo hello; sleep 30 (bash)\n    command: echo hello; sleep 30"
@@ -2221,7 +2258,7 @@ async fn get_background_tasks_lists_running_tasks() {
     assert_eq!(tasks.len(), 2);
 
     // Both tasks display with their actual ids, not list positions.
-    let output = tool.execute(json!({})).await.unwrap();
+    let output = tool.execute(json!({})).await.unwrap().content;
     assert_eq!(
         output,
         "2 background task(s) running:\n#1: echo hello; sleep 30 (bash)\n    command: echo hello; sleep 30\n#2: echo world; sleep 30 (bash)\n    command: echo world; sleep 30"
@@ -2232,7 +2269,7 @@ async fn get_background_tasks_lists_running_tasks() {
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
 
     // The remaining task (id=2) still shows as #2, NOT renumbered to #1.
-    let output = tool.execute(json!({})).await.unwrap();
+    let output = tool.execute(json!({})).await.unwrap().content;
     assert_eq!(
         output,
         "1 background task(s) running:\n#2: echo world; sleep 30 (bash)\n    command: echo world; sleep 30"
@@ -2242,7 +2279,7 @@ async fn get_background_tasks_lists_running_tasks() {
     background.cancel(2);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
     assert_eq!(
-        tool.execute(json!({})).await.unwrap(),
+        tool.execute(json!({})).await.unwrap().content,
         "No background tasks running."
     );
 }
@@ -2270,7 +2307,7 @@ async fn get_background_tasks_shows_full_command_beyond_truncated_label() {
         .await
         .unwrap();
 
-    let output = tool.execute(json!({})).await.unwrap();
+    let output = tool.execute(json!({})).await.unwrap().content;
     // First line keeps the truncated label (backward compatible), the
     // continuation line carries the full command verbatim.
     let lines: Vec<&str> = output.lines().collect();
@@ -2319,7 +2356,7 @@ async fn get_background_tasks_shows_delegate_tasks_as_delegate_not_bash() {
         )
         .unwrap();
 
-    let output = tool.execute(json!({})).await.unwrap();
+    let output = tool.execute(json!({})).await.unwrap().content;
     // Delegate tasks without a role show their kind ("delegate") instead
     // of being mislabeled as "bash".
     assert_eq!(
@@ -2354,7 +2391,7 @@ async fn get_background_tasks_shows_roled_delegate_with_role_name() {
         )
         .unwrap();
 
-    let output = tool.execute(json!({})).await.unwrap();
+    let output = tool.execute(json!({})).await.unwrap().content;
     assert_eq!(
         output,
         "1 background task(s) running:\n#1: search the logs (explorer)"
@@ -2408,7 +2445,7 @@ async fn get_background_tasks_marks_the_calling_subagent_itself() {
         )
         .unwrap();
 
-    let output = tool.execute(json!({})).await.unwrap();
+    let output = tool.execute(json!({})).await.unwrap().content;
     assert_eq!(
         output,
         "2 background task(s) running:\n\
@@ -2422,7 +2459,7 @@ async fn get_background_tasks_marks_the_calling_subagent_itself() {
         background: background.clone(),
         self_session_id: None,
     };
-    let output = main_tool.execute(json!({})).await.unwrap();
+    let output = main_tool.execute(json!({})).await.unwrap().content;
     assert!(!output.contains("[self]"));
 }
 
@@ -2654,7 +2691,8 @@ async fn sandbox_does_not_protect_git_when_protect_git_is_false() {
             json!({"command": "echo 'ref: refs/heads/feature' > .git/HEAD 2>&1; cat .git/HEAD"}),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     assert!(
         write.contains("ref: refs/heads/feature"),
         "main agent must be able to write into .git: {write}"
@@ -2695,7 +2733,8 @@ async fn sandbox_does_not_protect_git_file_when_protect_git_is_false() {
     let write = tool
         .execute(json!({"command": "echo 'gitdir: /new/path' > .git 2>&1; cat .git"}))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     assert!(
         write.contains("/new/path"),
         "main agent must be able to update .git pointer: {write}"
@@ -2737,7 +2776,8 @@ async fn background_bash_inherits_protect_git_from_parent_bash() {
     let start = bash
         .execute(json!({"command": "echo corrupted > .git/HEAD 2>&1", "background": true}))
         .await
-        .unwrap();
+        .unwrap()
+        .content;
     assert!(start.starts_with("started background task"), "{start}");
     // Give it time to run and fail.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2954,16 +2994,16 @@ fn read_image_tool(temp: &tempfile::TempDir, store: &std::path::Path) -> ReadIma
 }
 
 #[tokio::test]
-async fn read_image_stores_hashes_and_returns_structured_marker() {
+async fn read_image_stores_hashes_and_returns_structured_images() {
     let temp = tempfile::tempdir().unwrap();
     let store = temp.path().join("images");
     std::fs::write(temp.path().join("cat.png"), b"png-bytes").unwrap();
     let tool = read_image_tool(&temp, &store);
     let output = tool.execute(json!({"path": "cat.png"})).await.unwrap();
-    let (summary, image) = crate::agent::split_image_marker(&output);
-    assert!(summary.starts_with("[image read: cat.png] (hash "));
-    assert!(summary.ends_with(", image/png, 9 bytes)"));
-    let image = image.unwrap();
+    assert!(output.content.starts_with("[image read: cat.png] (hash "));
+    assert!(output.content.ends_with(", image/png, 9 bytes)"));
+    assert_eq!(output.images.len(), 1);
+    let image = &output.images[0];
     assert_eq!(image.mime, "image/png");
     // The stored file is content-addressed by hash and readable back.
     assert_eq!(
@@ -2974,9 +3014,8 @@ async fn read_image_stores_hashes_and_returns_structured_marker() {
     // Dedup: reading again (even a different path with same bytes) does not
     // add a second file, and the returned hash is identical.
     std::fs::write(temp.path().join("copy.png"), b"png-bytes").unwrap();
-    let output = tool.execute(json!({"path": "copy.png"})).await.unwrap();
-    let (_, second) = crate::agent::split_image_marker(&output);
-    assert_eq!(second.unwrap().hash, image.hash);
+    let second = tool.execute(json!({"path": "copy.png"})).await.unwrap();
+    assert_eq!(second.images[0].hash, image.hash);
     assert_eq!(std::fs::read_dir(&store).unwrap().count(), 1);
 }
 
@@ -2994,8 +3033,7 @@ async fn read_image_sniffs_mime_from_extension_whitelist() {
         std::fs::write(temp.path().join(name), b"bytes").unwrap();
         let tool = read_image_tool(&temp, &store);
         let output = tool.execute(json!({"path": name})).await.unwrap();
-        let (_, image) = crate::agent::split_image_marker(&output);
-        assert_eq!(image.unwrap().mime, mime, "for {name}");
+        assert_eq!(output.images[0].mime, mime, "for {name}");
     }
 }
 
@@ -3043,7 +3081,10 @@ async fn read_file_hints_read_image_for_image_extensions() {
     // Non-image extensions still read normally.
     std::fs::write(temp.path().join("notes.txt"), b"plain").unwrap();
     assert_eq!(
-        read(&temp, json!({"path": "notes.txt"})).await.unwrap(),
+        read(&temp, json!({"path": "notes.txt"}))
+            .await
+            .unwrap()
+            .content,
         "plain"
     );
 }

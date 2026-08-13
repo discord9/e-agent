@@ -32,6 +32,7 @@ fn responses_wire_flattens_system_tools_and_tool_results() {
                 content: "failed".into(),
                 is_error: true,
                 synthetic: false,
+                images: vec![],
             },
         ],
         &[ToolSpec {
@@ -119,6 +120,104 @@ fn responses_wire_degrades_missing_image_to_text_placeholder() {
     let parts = value["input"][0]["content"].as_array().unwrap();
     assert_eq!(parts[1]["type"], "input_text");
     assert_eq!(parts[1]["text"], "[image missing: missing-hash]");
+}
+
+#[test]
+fn responses_wire_encodes_image_bearing_tool_output_as_output_array() {
+    // An image-bearing Tool result is encoded natively: function_call_output
+    // with `output` as an ARRAY of input_text + input_image parts (scalar
+    // string for plain text results, see
+    // responses_wire_flattens_system_tools_and_tool_results).
+    let temp = tempfile::tempdir().unwrap();
+    let bytes = b"\x89PNG\r\n\x1a\nfake";
+    let hash = crate::agent::store_image_bytes(temp.path(), bytes).unwrap();
+    let request = ResponsesRequest::from_internal(
+        "codex",
+        None,
+        &[
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "read_image".into(),
+                    arguments: r#"{"path":"a.png"}"#.into(),
+                }],
+                reasoning: None,
+            }),
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "read_image".into(),
+                content: "[image read: a.png] (hash x, image/png, 4 bytes)".into(),
+                images: vec![crate::agent::ImagePart {
+                    hash,
+                    mime: "image/png".into(),
+                }],
+                is_error: false,
+                synthetic: false,
+            },
+        ],
+        &[],
+        Some(temp.path()),
+    );
+    let value = serde_json::to_value(request).unwrap();
+    // content: None => the assistant contributes only the function_call
+    // item, so the function_call_output lands at input[1].
+    let output = &value["input"][1]["output"];
+    assert!(output.is_array(), "image-bearing output must be an array");
+    assert_eq!(output[0]["type"], "input_text");
+    assert_eq!(
+        output[0]["text"],
+        "[image read: a.png] (hash x, image/png, 4 bytes)"
+    );
+    assert_eq!(output[1]["type"], "input_image");
+    // Codex wire: image_url is a BARE STRING, not an object.
+    assert_eq!(
+        output[1]["image_url"].as_str().unwrap(),
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    );
+}
+
+#[test]
+fn responses_wire_degrades_missing_tool_image_to_text_part() {
+    // A missing store file on an image-bearing tool degrades to an
+    // input_text placeholder part inside the output array.
+    let request = ResponsesRequest::from_internal(
+        "codex",
+        None,
+        &[
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "read_image".into(),
+                    arguments: r#"{"path":"a.png"}"#.into(),
+                }],
+                reasoning: None,
+            }),
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "read_image".into(),
+                content: "[image read: a.png]".into(),
+                images: vec![crate::agent::ImagePart {
+                    hash: "gone-hash".into(),
+                    mime: "image/png".into(),
+                }],
+                is_error: false,
+                synthetic: false,
+            },
+        ],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let output = &value["input"][1]["output"];
+    assert!(output.is_array());
+    assert_eq!(output[0]["type"], "input_text");
+    assert_eq!(output[1]["type"], "input_text");
+    assert_eq!(output[1]["text"], "[image missing: gone-hash]");
 }
 
 #[test]

@@ -431,7 +431,36 @@ impl<'a> ResponsesRequest<'a> {
                 items.extend(message.tool_calls.iter().map(|call| json!({"type":"function_call","name":call.name,"arguments":call.arguments,"call_id":call.id})));
                 Some(Value::Array(items))
             }
-            Message::Tool { call_id, content, is_error, .. } => Some(json!({"type":"function_call_output","call_id":call_id,"output":if *is_error { format!("ERROR: {content}") } else { content.clone() }})),
+            // A tool result with attached images is encoded natively as a
+            // `function_call_output` whose `output` is an ARRAY of
+            // `input_text` + `input_image` parts (scalar string for plain
+            // text results). A missing store file degrades to a text
+            // placeholder part.
+            Message::Tool {
+                call_id,
+                content,
+                is_error,
+                images,
+                ..
+            } => {
+                let text = if *is_error {
+                    format!("ERROR: {content}")
+                } else {
+                    content.clone()
+                };
+                if images.is_empty() {
+                    Some(json!({"type":"function_call_output","call_id":call_id,"output":text}))
+                } else {
+                    let mut parts = vec![json!({"type":"input_text","text":text})];
+                    for image in images {
+                        match crate::agent::load_image_bytes(image_store, &image.hash) {
+                            Some(bytes) => parts.push(json!({"type":"input_image","image_url":format!("data:{};base64,{}", image.mime, base64::engine::general_purpose::STANDARD.encode(bytes))})),
+                            None => parts.push(json!({"type":"input_text","text":format!("[image missing: {}]", image.hash)})),
+                        }
+                    }
+                    Some(json!({"type":"function_call_output","call_id":call_id,"output":parts}))
+                }
+            }
         }).flat_map(|value| match value { Value::Array(values) => values, value => vec![value] }).collect();
         let tools = tools.iter().map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":false})).collect();
         Self {

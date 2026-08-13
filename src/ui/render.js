@@ -494,7 +494,7 @@ function renderBackgroundTaskList(resEl, content) {
   resEl.appendChild(wrap);
 }
 
-/* read_image 结果：后端已剥离 __EA_IMAGE__ marker，这里只有文本摘要；
+/* read_image 结果：后端只发文本摘要（结构化图片引用不进入事件流），
    保持现有行为（纯文本，长摘要可展开） */
 function renderImageReceipt(resEl, content) {
   renderPlainResult(resEl, String(content == null ? "" : content), "(无输出)");

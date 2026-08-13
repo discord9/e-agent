@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::agent::{Tool, ToolSpec};
+use crate::agent::{Tool, ToolOutput, ToolSpec};
 use crate::workspace::Workspace;
 
 mod background;

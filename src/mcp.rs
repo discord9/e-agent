@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
 
-use crate::agent::{Tool, ToolSpec};
+use crate::agent::{Tool, ToolOutput, ToolSpec};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Total wall-clock budget for [`connect_all`]. Enabled servers are
@@ -259,8 +259,11 @@ impl Tool for McpTool {
         self.spec.clone()
     }
 
-    async fn execute(&self, arguments: Value) -> Result<String, String> {
-        self.server.call_tool(&self.remote_name, arguments).await
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
+        self.server
+            .call_tool(&self.remote_name, arguments)
+            .await
+            .map(ToolOutput::text)
     }
 }
 

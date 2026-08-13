@@ -2130,6 +2130,7 @@ mod tests {
                 content: "exit code: 0\nstdout:\nok\n".into(),
                 is_error: false,
                 synthetic: false,
+                images: vec![],
             }
             .into(),
             Message::Tool {
@@ -2138,6 +2139,7 @@ mod tests {
                 content: "command not found".into(),
                 is_error: true,
                 synthetic: false,
+                images: vec![],
             }
             .into(),
             SessionEntry::Compaction {

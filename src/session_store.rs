@@ -2589,6 +2589,7 @@ mod shared_helpers {
                 content: "ok".into(),
                 is_error: false,
                 synthetic: false,
+                images: vec![],
             }
             .into(),
             Message::Tool {
@@ -2597,6 +2598,7 @@ mod shared_helpers {
                 content: "boom".into(),
                 is_error: true,
                 synthetic: false,
+                images: vec![],
             }
             .into(),
             SessionEntry::Compaction {
@@ -3918,6 +3920,7 @@ mod tests {
                 content: "src\n".into(),
                 is_error: false,
                 synthetic: false,
+                images: vec![],
             }
             .into();
             let tool_error = Message::Tool {
@@ -3926,6 +3929,7 @@ mod tests {
                 content: "command not found: nope".into(),
                 is_error: true,
                 synthetic: false,
+                images: vec![],
             }
             .into();
             let entries = vec![
