@@ -1158,3 +1158,317 @@ fn resize_task_detail_keeps_page_top_line() {
     assert_eq!(detail.base_line, 100);
     assert_eq!(content_row(&term), "line 108");
 }
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Session goals: /goal parsing, GoalUpdated rendering, GoalBar state
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#[test]
+fn parse_goal_distinguishes_show_set_and_actions() {
+    assert_eq!(parse_goal("/goal"), Some(GoalCommand::Show));
+    assert_eq!(parse_goal("/goal  "), Some(GoalCommand::Show));
+    assert_eq!(
+        parse_goal("/goal set ship the goal"),
+        Some(GoalCommand::Set("ship the goal".to_owned()))
+    );
+    assert_eq!(parse_goal("/goal set   "), Some(GoalCommand::Usage));
+    assert_eq!(
+        parse_goal("/goal pause"),
+        Some(GoalCommand::Action(crate::agent::GoalAction::Pause))
+    );
+    assert_eq!(
+        parse_goal("/goal resume"),
+        Some(GoalCommand::Action(crate::agent::GoalAction::Resume))
+    );
+    assert_eq!(
+        parse_goal("/goal clear"),
+        Some(GoalCommand::Action(crate::agent::GoalAction::Clear))
+    );
+    assert_eq!(parse_goal("/goal nope"), Some(GoalCommand::Usage));
+    // Not a goal command: stays a prompt.
+    assert_eq!(parse_goal("/goalx"), None);
+    assert_eq!(parse_goal("/compact"), None);
+}
+
+#[test]
+fn goal_updated_event_pushes_a_dim_notice_line() {
+    let mut state = TuiState::default();
+    let goal = crate::agent::create_goal(None, "ship it".into(), vec![]).unwrap();
+    state.push_agent_event(AgentEvent::GoalUpdated {
+        goal: Some(goal.clone()),
+    });
+    assert_eq!(state.lines.len(), 1);
+    assert!(state.lines[0].text.contains("goal [active] ship it"));
+    assert_eq!(state.lines[0].kind, LineKind::Dim);
+    // The fixed GoalBar state mirrors the same event (not just scrollback).
+    assert_eq!(state.goal.as_ref().map(|g| g.revision), Some(goal.revision));
+    // Clear tombstone renders a "cleared" line and clears the bar state.
+    state.push_agent_event(AgentEvent::GoalUpdated { goal: None });
+    assert_eq!(state.lines.last().unwrap().text, "goal cleared");
+    assert_eq!(state.goal, None);
+}
+
+#[test]
+fn session_entry_to_lines_renders_goal_updated_snapshots() {
+    let goal = crate::agent::create_goal(None, "ship it".into(), vec![]).unwrap();
+    let mut goal2 = goal.clone();
+    goal2.status = crate::agent::GoalStatus::Completed;
+    let lines = session_entry_to_lines(&SessionEntry::GoalUpdated {
+        goal: Some(goal2.clone()),
+    });
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].text.contains("goal [completed] ship it"));
+    let cleared = session_entry_to_lines(&SessionEntry::GoalUpdated { goal: None });
+    assert_eq!(cleared[0].text, "goal cleared");
+}
+
+#[test]
+fn attached_goal_commands_use_the_attached_handle_never_prompt_history() {
+    // Attached (subagent) views reuse the MAIN `/goal` parser/handler, but
+    // the mutation is queued on the ATTACHED session's own handle — a
+    // `SessionCommand::Goal` — never a prompt into its history. Other
+    // slash commands keep their existing routing (plain prompts).
+    let (handle, _sink, mut source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    let snapshot = handle.snapshot();
+    let status = handle.status();
+    state.attach(
+        1,
+        "task".into(),
+        handle,
+        String::new(),
+        None,
+        String::new(),
+        String::new(),
+        None,
+        snapshot,
+        status,
+    );
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+
+    // /goal set <objective> -> attached handle's Goal(Create), no Prompt.
+    state
+        .attached
+        .as_mut()
+        .unwrap()
+        .input
+        .insert("/goal set ship the thing");
+    state.handle_attached_key(enter, 80);
+    match source.try_recv() {
+        Ok(crate::runner::SessionCommand::Goal(crate::runner::GoalCommand::Create {
+            objective,
+            ..
+        })) => assert_eq!(objective, "ship the thing"),
+        Ok(_) | Err(_) => panic!("expected Goal(Create) on the attached channel"),
+    }
+    assert!(
+        source.try_recv().is_err(),
+        "/goal must not also queue a prompt"
+    );
+    assert!(
+        state.attached.as_ref().unwrap().input.text.is_empty(),
+        "attached input cleared after /goal submit"
+    );
+
+    // /goal pause -> attached handle's Goal(Action(Pause)).
+    state.attached.as_mut().unwrap().input.insert("/goal pause");
+    state.handle_attached_key(enter, 80);
+    match source.try_recv() {
+        Ok(crate::runner::SessionCommand::Goal(crate::runner::GoalCommand::Action(
+            crate::agent::GoalAction::Pause,
+        ))) => {}
+        Ok(_) | Err(_) => panic!("expected Goal(Action(Pause)) on the attached channel"),
+    }
+
+    // /compact stays a plain prompt to the attached runner.
+    state.attached.as_mut().unwrap().input.insert("/compact");
+    state.handle_attached_key(enter, 80);
+    match source.try_recv() {
+        Ok(crate::runner::SessionCommand::Prompt(text)) => assert_eq!(text, "/compact"),
+        Ok(_) | Err(_) => panic!("expected Prompt(/compact) on the attached channel"),
+    }
+
+    // Bare /goal shows the attached session's goal as a Notice in the
+    // attached scrollback (no command queued).
+    state.attached.as_mut().unwrap().input.insert("/goal");
+    state.handle_attached_key(enter, 80);
+    assert!(
+        source.try_recv().is_err(),
+        "bare /goal is a read, no command queued"
+    );
+    assert!(
+        state
+            .attached
+            .as_ref()
+            .unwrap()
+            .state
+            .lines
+            .iter()
+            .any(|line| line.text.contains("no goal set")),
+        "bare /goal shows the attached session's state"
+    );
+}
+
+#[test]
+fn attached_goal_full_matrix_resume_clear_usage_closed_and_finished() {
+    // set/pause/bare 已由 attached_goal_commands_use_the_attached_handle_
+    // never_prompt_history 覆盖；这里补齐 resume/clear/usage，以及 closed
+    // 与 finished handle 的语义。所有 mutation 都必须是 SessionCommand::Goal，
+    // 绝不进 prompt history。
+    let (handle, _sink, mut source) = crate::runner::session_test_channel();
+    let mut state = TuiState::default();
+    let snapshot = handle.snapshot();
+    let status = handle.status();
+    state.attach(
+        1,
+        "task".into(),
+        handle,
+        String::new(),
+        None,
+        String::new(),
+        String::new(),
+        None,
+        snapshot,
+        status,
+    );
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+
+    // /goal resume -> Goal(Action(Resume))，无 Prompt。
+    state
+        .attached
+        .as_mut()
+        .unwrap()
+        .input
+        .insert("/goal resume");
+    state.handle_attached_key(enter, 80);
+    match source.try_recv() {
+        Ok(crate::runner::SessionCommand::Goal(crate::runner::GoalCommand::Action(
+            crate::agent::GoalAction::Resume,
+        ))) => {}
+        Ok(_) | Err(_) => panic!("expected Goal(Action(Resume)) on the attached channel"),
+    }
+
+    // /goal clear -> Goal(Action(Clear))，无 Prompt。
+    state.attached.as_mut().unwrap().input.insert("/goal clear");
+    state.handle_attached_key(enter, 80);
+    match source.try_recv() {
+        Ok(crate::runner::SessionCommand::Goal(crate::runner::GoalCommand::Action(
+            crate::agent::GoalAction::Clear,
+        ))) => {}
+        Ok(_) | Err(_) => panic!("expected Goal(Action(Clear)) on the attached channel"),
+    }
+    assert!(
+        source.try_recv().is_err(),
+        "resume/clear must not leak a stray Prompt or Goal"
+    );
+
+    // /goal nope（非法参数）-> 用法 notice，无任何命令。
+    state.attached.as_mut().unwrap().input.insert("/goal nope");
+    state.handle_attached_key(enter, 80);
+    assert!(source.try_recv().is_err(), "usage must queue nothing");
+    assert!(
+        state
+            .attached
+            .as_ref()
+            .unwrap()
+            .state
+            .lines
+            .iter()
+            .any(|line| line.text.contains("用法：/goal")),
+        "usage shows the usage notice in the attached scrollback"
+    );
+
+    // Closed channel（status 非 Finished）：not-accepted notice，无 Prompt、
+    // 无 Goal（goal_command 返回 false 的路径被触发）。
+    let (closed_handle, _closed_emitter, receiver) = crate::runner::session_test_channel();
+    drop(receiver);
+    assert_eq!(
+        &*closed_handle.status().borrow(),
+        &crate::runner::SessionStatus::Idle,
+        "precondition: closed handle is Idle, not Finished"
+    );
+    let snapshot = closed_handle.snapshot();
+    let status = closed_handle.status();
+    state.attach(
+        2,
+        "closed".into(),
+        closed_handle,
+        String::new(),
+        None,
+        String::new(),
+        String::new(),
+        None,
+        snapshot,
+        status,
+    );
+    state
+        .attached
+        .as_mut()
+        .unwrap()
+        .input
+        .insert("/goal set doomed");
+    state.handle_attached_key(enter, 80);
+    assert!(
+        source.try_recv().is_err(),
+        "closed handle: nothing may be queued on any channel"
+    );
+    assert!(
+        state
+            .attached
+            .as_ref()
+            .unwrap()
+            .state
+            .lines
+            .iter()
+            .any(|line| line.text.contains("not accepted")),
+        "closed handle shows the not-accepted notice"
+    );
+
+    // Finished handle：finished 分支保留输入、无 Prompt、无 Goal 命令。
+    let (finished_handle, finished_emitter, mut finished_source) =
+        crate::runner::session_test_channel();
+    finished_emitter.set_status(crate::runner::SessionStatus::Finished(
+        crate::runner::SessionResult::Completed(None),
+    ));
+    let snapshot = finished_handle.snapshot();
+    let status = finished_handle.status();
+    state.attach(
+        3,
+        "finished".into(),
+        finished_handle,
+        String::new(),
+        None,
+        String::new(),
+        String::new(),
+        None,
+        snapshot,
+        status,
+    );
+    state
+        .attached
+        .as_mut()
+        .unwrap()
+        .input
+        .insert("/goal set late");
+    state.handle_attached_key(enter, 80);
+    assert!(
+        finished_source.try_recv().is_err(),
+        "finished handle: no Prompt, no Goal command"
+    );
+    assert!(
+        state
+            .attached
+            .as_ref()
+            .unwrap()
+            .state
+            .lines
+            .iter()
+            .any(|line| line.text.contains("subagent finished")),
+        "finished handle shows the finished notice"
+    );
+    assert_eq!(
+        state.attached.as_ref().unwrap().input.text,
+        "/goal set late",
+        "finished handle preserves the input"
+    );
+}

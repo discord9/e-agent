@@ -152,6 +152,10 @@ pub(crate) struct TuiState {
     /// Configured context window (token count) from the model profile, used
     /// to display a usage percentage and trigger the red style at >= 80%.
     pub(crate) context_window: Option<u64>,
+    /// Latest goal snapshot of the current (or attached) session, mirrored
+    /// from GoalUpdated events and seeded at startup; drives the fixed
+    /// GoalBar row (`None` = no goal / cleared).
+    pub(crate) goal: Option<crate::agent::GoalSnapshot>,
     /// Transient projection of prompts accepted while a turn is in flight.
     /// Consumption removes one item from the front; this is never persisted.
     pub(crate) queued: std::collections::VecDeque<String>,
@@ -797,7 +801,16 @@ impl TuiState {
                     let prompt = std::mem::take(&mut attached.input.text);
                     attached.input.cursor = 0;
                     if !prompt.trim().is_empty() {
-                        attached.handle.prompt(prompt);
+                        // `/goal` commands reuse the MAIN parser/handler but
+                        // act on the ATTACHED session's own handle — they
+                        // never enter the attached prompt history. All
+                        // other slash commands keep their existing routing
+                        // (plain prompts to the attached runner).
+                        if let Some(command) = super::parse_goal(&prompt) {
+                            super::handle_goal(command, &mut attached.state, &attached.handle);
+                        } else {
+                            attached.handle.prompt(prompt);
+                        }
                     }
                 }
             }
@@ -1734,6 +1747,22 @@ impl TuiState {
                 self.active_lane = None;
                 self.push_background_completion(id, &output, label.as_deref());
             }
+            AgentEvent::GoalUpdated { goal } => {
+                self.active_lane = None;
+                self.goal = goal.clone();
+                match goal {
+                    Some(goal) => self.push_line(
+                        format!(
+                            "goal [{}] {} (rev {})",
+                            goal.status.label(),
+                            goal.objective,
+                            goal.revision
+                        ),
+                        LineKind::Dim,
+                    ),
+                    None => self.push_line("goal cleared".to_owned(), LineKind::Dim),
+                }
+            }
             AgentEvent::Usage { context_input, .. } => {
                 self.tokens_context = context_input;
             }
@@ -1937,6 +1966,19 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
         // line, so a resumed TUI shows the same audit trail.
         SessionEntry::Error { text } => vec![DisplayLine {
             text: format!("error: {text}"),
+            kind: LineKind::Dim,
+            collapsed_summary: None,
+        }],
+        SessionEntry::GoalUpdated { goal } => vec![DisplayLine {
+            text: match goal {
+                Some(goal) => format!(
+                    "goal [{}] {} (rev {})",
+                    goal.status.label(),
+                    goal.objective,
+                    goal.revision
+                ),
+                None => "goal cleared".to_owned(),
+            },
             kind: LineKind::Dim,
             collapsed_summary: None,
         }],

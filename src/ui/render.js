@@ -1220,6 +1220,11 @@ function renderEntry(entry, acc, pendingCards) {
       els.messages.appendChild(el("div", "forked",
         "分叉自会话 " + shortId(entry.source) + " @ 条目 #" + (entry.at ?? "?")));
       return scrollBottom(false);
+    case "goal_updated":
+      // goal 快照/墓碑：一行 notice（不当作用户消息）
+      return entry.goal
+        ? appendNotice("goal [" + entry.goal.status + "] " + (entry.goal.objective || ""))
+        : appendNotice("goal cleared");
     case "prompt_queued":
       // 历史记录里的排队提示（后端演进若引入）：显示为 notice，不落入默认分支
       return appendNotice("⏳ 提示已排队: "

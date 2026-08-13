@@ -24,6 +24,7 @@ fn test_bash(workspace: Workspace, policy: crate::config::Sandbox) -> Bash {
         sandbox: Some(policy),
         protect_git: false,
         shell: Shell::detect().unwrap(),
+        owner_session: None,
     }
 }
 

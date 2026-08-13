@@ -4875,3 +4875,781 @@ async fn steer_fifo_queued_compact_prompt_cancel_runs_compact_before_prompt() {
         SessionEntry::Compaction { summary, .. } if summary == "The compact summary of the earlier conversation preserves the earlier question and the assistant's earlier reply, plus the context needed to continue with the current work."
     )));
 }
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Session goals: commands, tool CAS, persistence, isolation
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+async fn wait_for_goal(
+    handle: &SessionHandle,
+    expected: impl Fn(Option<&crate::agent::GoalSnapshot>) -> bool,
+) {
+    for _ in 0..400 {
+        if expected(handle.goal().as_ref()) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("goal condition not met in time");
+}
+
+async fn wait_for_log_event(handle: &SessionHandle, expected: impl Fn(&AgentEvent) -> bool) {
+    for _ in 0..400 {
+        if handle.snapshot().iter().any(&expected) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("goal event not found in time");
+}
+
+#[test]
+fn goal_command_reports_closed_channel_and_live_send() {
+    // Live channel: goal_command returns true — the command was accepted
+    // for queuing (the runner applies it asynchronously).
+    let (live_handle, _emitter, _receiver) = session_test_channel();
+    assert!(live_handle.goal_command(GoalCommand::Create {
+        objective: "ship it".into(),
+        success_criteria: vec![],
+    }));
+
+    // Closed channel (receiver dropped) with status NOT Finished: must
+    // return false — the closed-channel fallback is reachable without the
+    // Finished status precheck (HTTP POST relies on this exact path for
+    // its 409 when the runner task has exited).
+    let (closed_handle, _emitter, receiver) = session_test_channel();
+    drop(receiver);
+    assert_eq!(
+        &*closed_handle.status().borrow(),
+        &SessionStatus::Idle,
+        "precondition: status must be Idle, not Finished"
+    );
+    assert!(!closed_handle.goal_command(GoalCommand::Create {
+        objective: "nope".into(),
+        success_criteria: vec![],
+    }));
+    assert!(!closed_handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Clear)));
+}
+
+#[tokio::test]
+async fn goal_commands_create_actions_and_clear_persist_and_fan_out() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::new(),
+        }),
+        // KeepAliveTool holds the background sender open so the idle
+        // WaitForInput runner does not finalize Closed between commands.
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-sess".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let _task = runner.start(None);
+    assert!(handle.goal().is_none());
+
+    // Human create: revision 1, active.
+    handle.goal_command(GoalCommand::Create {
+        objective: "ship the goal system".into(),
+        success_criteria: vec!["tests pass".into()],
+    });
+    wait_for_goal(&handle, |g| g.is_some()).await;
+    let goal = handle.goal().unwrap();
+    assert_eq!(goal.revision, 1);
+    assert_eq!(goal.status, crate::agent::GoalStatus::Active);
+
+    // Create while active is rejected: an Error event, goal unchanged, no
+    // extra persisted entry.
+    handle.goal_command(GoalCommand::Create {
+        objective: "second".into(),
+        success_criteria: vec![],
+    });
+    wait_for_log_event(&handle, |event| {
+        matches!(event, AgentEvent::Error(text) if text.contains("cannot create a new goal"))
+    })
+    .await;
+    assert_eq!(handle.goal().unwrap().revision, 1);
+
+    // pause → resume → clear, each a durable snapshot with a bumped rev.
+    handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Pause));
+    wait_for_goal(&handle, |g| {
+        g.map(|g| g.status) == Some(crate::agent::GoalStatus::Paused)
+    })
+    .await;
+    handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Resume));
+    wait_for_goal(&handle, |g| {
+        g.map(|g| g.status) == Some(crate::agent::GoalStatus::Active)
+    })
+    .await;
+    handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Clear));
+    wait_for_goal(&handle, |g| g.is_none()).await;
+
+    // Persistence: exactly create + pause + resume + clear, all complete
+    // snapshots; the fold of the persisted log is None (cleared).
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-sess")
+        .await
+        .unwrap();
+    let updates: Vec<&SessionEntry> = loaded
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, SessionEntry::GoalUpdated { .. }))
+        .collect();
+    assert_eq!(updates.len(), 4, "rejected create appends nothing");
+    assert!(matches!(
+        updates[0],
+        SessionEntry::GoalUpdated { goal: Some(_) }
+    ));
+    assert!(matches!(
+        updates[3],
+        SessionEntry::GoalUpdated { goal: None }
+    ));
+    let folded = loaded
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| matches!(entry, SessionEntry::GoalUpdated { .. }));
+    assert!(matches!(
+        folded,
+        Some(SessionEntry::GoalUpdated { goal: None })
+    ));
+    // The runner's own event log carries the GoalUpdated fanout.
+    assert!(handle.snapshot().iter().any(|event| {
+        matches!(event, AgentEvent::GoalUpdated { goal: Some(g) } if g.revision == 2)
+    }));
+}
+
+#[tokio::test]
+async fn update_goal_tool_cas_updates_and_completes_with_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let id = goal.id.clone();
+    let rev1 = goal.revision;
+    // One turn, three tool rounds: progress (rev+1), complete with
+    // evidence (rev+1), then a STALE revision call that must be rejected.
+    let model = ScriptedAssistantModel {
+        replies: VecDeque::from(vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "update_goal".into(),
+                    arguments: serde_json::json!({
+                        "id": id, "revision": rev1, "action": "progress", "progress": "core done"
+                    })
+                    .to_string(),
+                }],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c2".into(),
+                    name: "update_goal".into(),
+                    arguments: serde_json::json!({
+                        "id": id, "revision": rev1 + 1, "action": "complete",
+                        "evidence": ["unverified: analysis passed"]
+                    })
+                    .to_string(),
+                }],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c3".into(),
+                    name: "update_goal".into(),
+                    arguments: serde_json::json!({
+                        "id": id, "revision": rev1, "action": "pause"
+                    })
+                    .to_string(),
+                }],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ]),
+    };
+    let mut agent = Agent::new(
+        Box::new(model),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated {
+        goal: Some(goal.clone()),
+    }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-tool".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let _task = runner.start(Some("work on the goal".into()));
+    let mut status = handle.status();
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+
+    // Completed, evidence kept, progress kept; two CAS-successful bumps.
+    let final_goal = handle.goal().unwrap();
+    assert_eq!(final_goal.status, crate::agent::GoalStatus::Completed);
+    assert_eq!(final_goal.revision, rev1 + 2);
+    assert_eq!(final_goal.progress, "core done");
+    assert_eq!(final_goal.evidence, vec!["unverified: analysis passed"]);
+
+    // Persisted: exactly two GoalUpdated entries (the stale call appended
+    // nothing); the stale tool result is an error Tool entry.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-tool")
+        .await
+        .unwrap();
+    let updates: Vec<&SessionEntry> = loaded
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, SessionEntry::GoalUpdated { .. }))
+        .collect();
+    assert_eq!(updates.len(), 2);
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Tool { name, is_error: true, content, .. }
+        } if name == "update_goal" && content.contains("revision mismatch")
+    )));
+}
+
+#[tokio::test]
+async fn goal_tools_are_isolated_per_session_fresh_session_has_no_goal() {
+    // A subagent's runner is a separate Agent/runner pair: the default
+    // (usually no goal) state is visible to it, and the model's
+    // update_goal cannot create one — it errors instead of inventing one.
+    let temp = tempfile::tempdir().unwrap();
+    let model = ScriptedAssistantModel {
+        replies: VecDeque::from(vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "update_goal".into(),
+                    arguments: r#"{"id":"goal-x","revision":1,"action":"pause"}"#.into(),
+                }],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ]),
+    };
+    let agent = Agent::new(
+        Box::new(model),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-empty".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let _task = runner.start(Some("work".into()));
+    let mut status = handle.status();
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert!(handle.goal().is_none());
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-empty")
+        .await
+        .unwrap();
+    assert!(
+        !loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::GoalUpdated { .. })),
+        "update_goal must not create a goal"
+    );
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Tool { name, is_error: true, content, .. }
+        } if name == "update_goal" && content.contains("no goal is set")
+    )));
+}
+
+/// Model that issues `get_goal`, then reads the id AND revision from the
+/// get_goal TOOL OUTPUT in the next context and issues `update_goal` with
+/// them — the test's CAS round trip never borrows either from the fixture.
+struct GoalRoundTripModel {
+    calls: usize,
+    /// Revision parsed from the get_goal tool output (shared for asserts).
+    seen_revision: Arc<Mutex<Option<u64>>>,
+    /// Id parsed from the get_goal tool output (shared for asserts).
+    seen_id: Arc<Mutex<Option<String>>>,
+    /// Full success_criteria array observed in the get_goal output.
+    seen_criteria: Arc<Mutex<Option<Vec<String>>>>,
+}
+
+#[async_trait]
+impl Model for GoalRoundTripModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls += 1;
+        if self.calls == 1 {
+            return Ok((
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "get_goal".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                None,
+            ));
+        }
+        if self.calls == 2 {
+            // Parse the FULL snapshot out of the committed get_goal result:
+            // the id and revision used for the CAS must come from here,
+            // never from the fixture.
+            let mut snapshot: Option<serde_json::Value> = None;
+            for message in messages {
+                if let Message::Tool {
+                    name,
+                    content,
+                    is_error: false,
+                    ..
+                } = message
+                    && name == "get_goal"
+                {
+                    snapshot = serde_json::from_str(content).ok();
+                }
+            }
+            let snapshot = snapshot.expect("get_goal must return a JSON snapshot");
+            for key in [
+                "id",
+                "revision",
+                "objective",
+                "success_criteria",
+                "status",
+                "progress",
+                "evidence",
+                "blocked_reason",
+            ] {
+                assert!(
+                    snapshot.get(key).is_some(),
+                    "get_goal snapshot missing `{key}`: {snapshot}"
+                );
+            }
+            let id = snapshot["id"].as_str().expect("id must be a string");
+            let revision = snapshot["revision"]
+                .as_u64()
+                .expect("revision must be an integer");
+            let criteria = snapshot["success_criteria"]
+                .as_array()
+                .expect("success_criteria must be the full array")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            *self.seen_revision.lock().unwrap() = Some(revision);
+            *self.seen_id.lock().unwrap() = Some(id.to_owned());
+            *self.seen_criteria.lock().unwrap() = Some(criteria);
+            assert_eq!(snapshot["objective"], "build it");
+            assert_eq!(snapshot["status"], "active");
+            return Ok((
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "c2".into(),
+                        name: "update_goal".into(),
+                        arguments: serde_json::json!({
+                            "id": id, "revision": revision, "action": "progress",
+                            "progress": "round trip"
+                        })
+                        .to_string(),
+                    }],
+                    reasoning: None,
+                },
+                None,
+            ));
+        }
+        Ok((
+            AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            None,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn get_goal_returns_full_snapshot_and_update_reads_revision_from_it() {
+    // The model genuinely reads the revision from get_goal's JSON output
+    // before updating — proving the tool output is a complete, machine-
+    // usable snapshot (not the short provider projection).
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(
+        None,
+        "build it".into(),
+        vec!["tests pass".into(), "docs updated".into()],
+    )
+    .unwrap();
+    let seen_revision = Arc::new(Mutex::new(None));
+    let seen_id = Arc::new(Mutex::new(None));
+    let seen_criteria = Arc::new(Mutex::new(None));
+    let model = GoalRoundTripModel {
+        calls: 0,
+        seen_revision: seen_revision.clone(),
+        seen_id: seen_id.clone(),
+        seen_criteria: seen_criteria.clone(),
+    };
+    let mut agent = Agent::new(
+        Box::new(model),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated {
+        goal: Some(goal.clone()),
+    }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-roundtrip".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let _task = runner.start(Some("work on the goal".into()));
+    let mut status = handle.status();
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+
+    // The id AND revision the model read both came from get_goal output and
+    // matched the fixture's; the full criteria array was visible.
+    assert_eq!(
+        *seen_revision.lock().unwrap(),
+        Some(goal.revision),
+        "revision must come from get_goal output"
+    );
+    assert_eq!(
+        *seen_id.lock().unwrap(),
+        Some(goal.id.clone()),
+        "id must come from get_goal output"
+    );
+    assert_eq!(
+        *seen_criteria.lock().unwrap(),
+        Some(vec!["tests pass".to_owned(), "docs updated".to_owned()])
+    );
+    // The CAS succeeded with the snapshot-derived id+revision: progress
+    // applied, revision bumped once, the same goal id untouched.
+    let final_goal = handle.goal().unwrap();
+    assert_eq!(final_goal.revision, goal.revision + 1);
+    assert_eq!(final_goal.id, goal.id);
+    assert_eq!(final_goal.progress, "round trip");
+}
+
+#[tokio::test]
+async fn update_goal_rejects_wrong_typed_criteria_and_evidence() {
+    // `success_criteria` / `evidence` present but not a string array: a
+    // plain tool error, never a silent filter.
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let id = goal.id.clone();
+    let rev = goal.revision;
+    let model = ScriptedAssistantModel {
+        replies: VecDeque::from(vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "update_goal".into(),
+                    arguments: serde_json::json!({
+                        "id": id, "revision": rev, "action": "progress", "progress": "p",
+                        "success_criteria": ["ok", 42]
+                    })
+                    .to_string(),
+                }],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c2".into(),
+                    name: "update_goal".into(),
+                    arguments: serde_json::json!({
+                        "id": id, "revision": rev, "action": "progress", "progress": "q",
+                        "evidence": "not-an-array"
+                    })
+                    .to_string(),
+                }],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ]),
+    };
+    let mut agent = Agent::new(
+        Box::new(model),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated {
+        goal: Some(goal.clone()),
+    }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-strict".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let _task = runner.start(Some("work".into()));
+    let mut status = handle.status();
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+
+    // Both calls failed with plain errors; nothing was committed.
+    let final_goal = handle.goal().unwrap();
+    assert_eq!(final_goal.revision, rev, "no successful transition");
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-strict")
+        .await
+        .unwrap();
+    let errors: Vec<&str> = loaded
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Message {
+                message:
+                    Message::Tool {
+                        name,
+                        content,
+                        is_error: true,
+                        ..
+                    },
+            } if name == "update_goal" => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 2, "both wrong-typed calls must error");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("success_criteria") && e.contains("array"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("evidence") && e.contains("array"))
+    );
+}
+
+#[tokio::test]
+async fn update_goal_rejects_unknown_fields_without_commit() {
+    // Misspelled / arbitrary extra keys are rejected BEFORE any transition
+    // or commit: a plain model-facing tool error naming the field(s), the
+    // revision untouched, and no GoalUpdated entry appended.
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let id = goal.id.clone();
+    let rev = goal.revision;
+    let model = ScriptedAssistantModel {
+        replies: VecDeque::from(vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "update_goal".into(),
+                    arguments: serde_json::json!({
+                        "id": id, "revision": rev, "action": "progress", "progress": "p",
+                        "sucess_criteria": ["typo"]
+                    })
+                    .to_string(),
+                }],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c2".into(),
+                    name: "update_goal".into(),
+                    arguments: serde_json::json!({
+                        "id": id, "revision": rev, "action": "pause",
+                        "bogus": {"nested": true}, "extra": 1
+                    })
+                    .to_string(),
+                }],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ]),
+    };
+    let mut agent = Agent::new(
+        Box::new(model),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated {
+        goal: Some(goal.clone()),
+    }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-unknown".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let _task = runner.start(Some("work".into()));
+    let mut status = handle.status();
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+
+    // No successful transition: revision untouched, status still active,
+    // no progress applied.
+    let final_goal = handle.goal().unwrap();
+    assert_eq!(
+        final_goal.revision, rev,
+        "unknown fields must never bump the revision"
+    );
+    assert_eq!(final_goal.status, crate::agent::GoalStatus::Active);
+    assert_eq!(final_goal.progress, "", "no progress applied");
+    // Persisted: no GoalUpdated entry; both calls errored naming the exact
+    // unknown field(s).
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-unknown")
+        .await
+        .unwrap();
+    let updates = loaded
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, SessionEntry::GoalUpdated { .. }))
+        .count();
+    assert_eq!(
+        updates, 0,
+        "unknown-field rejections must append no GoalUpdated"
+    );
+    let errors: Vec<&str> = loaded
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Message {
+                message:
+                    Message::Tool {
+                        name,
+                        content,
+                        is_error: true,
+                        ..
+                    },
+            } if name == "update_goal" => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 2, "both unknown-field calls must error");
+    assert!(
+        errors.iter().any(|e| e.contains("sucess_criteria")),
+        "error must name the misspelled field: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("`bogus`") && e.contains("`extra`")),
+        "error must name all extra fields: {errors:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_goal_rejects_unknown_arguments_and_non_object() {
+    // get_goal is a read: only the empty JSON object is accepted. Any
+    // extra key (or a non-object payload) is a plain tool error naming the
+    // field — never silently ignored.
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let model = ScriptedAssistantModel {
+        replies: VecDeque::from(vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "get_goal".into(),
+                    arguments: r#"{"extra": 1}"#.into(),
+                }],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c2".into(),
+                    name: "get_goal".into(),
+                    arguments: r#""not-an-object""#.into(),
+                }],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ]),
+    };
+    let mut agent = Agent::new(
+        Box::new(model),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated {
+        goal: Some(goal.clone()),
+    }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-get-strict".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let _task = runner.start(Some("work".into()));
+    let mut status = handle.status();
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-get-strict")
+        .await
+        .unwrap();
+    let errors: Vec<&str> = loaded
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Message {
+                message:
+                    Message::Tool {
+                        name,
+                        content,
+                        is_error: true,
+                        ..
+                    },
+            } if name == "get_goal" => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 2, "both get_goal calls must error");
+    assert!(
+        errors.iter().any(|e| e.contains("`extra`")),
+        "error must name the unknown get_goal field: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("must be a JSON object")),
+        "non-object get_goal arguments must error: {errors:?}"
+    );
+    // get_goal never mutates: the goal snapshot is untouched.
+    assert_eq!(handle.goal().unwrap().revision, goal.revision);
+    assert_eq!(handle.goal().unwrap().id, goal.id);
+}

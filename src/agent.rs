@@ -313,6 +313,248 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Lifecycle status of the session's current goal. Serialized as the
+/// lowercase name (`active`, `paused`, `blocked`, `completed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    Completed,
+}
+
+impl GoalStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            GoalStatus::Active => "active",
+            GoalStatus::Paused => "paused",
+            GoalStatus::Blocked => "blocked",
+            GoalStatus::Completed => "completed",
+        }
+    }
+}
+
+/// Immutable goal snapshot; every change appends a new `GoalUpdated` entry
+/// with a bumped `revision` (writers CAS on `id` + `revision`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalSnapshot {
+    pub id: String,
+    pub revision: u64,
+    pub objective: String,
+    pub success_criteria: Vec<String>,
+    pub status: GoalStatus,
+    pub progress: String,
+    /// Completion evidence, kept after completion; pure analysis may use an
+    /// explicit `unverified: <analysis>` string.
+    pub evidence: Vec<String>,
+    pub blocked_reason: Option<String>,
+}
+
+/// One goal transition (`update_goal` tool + human `/goal` commands).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalAction {
+    Progress {
+        progress: String,
+    },
+    Pause,
+    Resume,
+    Block {
+        reason: String,
+    },
+    /// Requires non-empty evidence (checked in [`transition_goal`]).
+    Complete,
+    /// Tombstone: `SessionEntry::GoalUpdated { goal: None }`.
+    Clear,
+}
+
+/// Create the first revision of a goal (human-only). Allowed only with no
+/// current goal or a completed one (cleared reads as "no goal").
+pub fn create_goal(
+    current: Option<&GoalSnapshot>,
+    objective: String,
+    success_criteria: Vec<String>,
+) -> Result<GoalSnapshot, String> {
+    if let Some(goal) = current
+        && goal.status != GoalStatus::Completed
+    {
+        return Err(format!(
+            "cannot create a new goal while `{}` is still {}: complete or clear it first",
+            goal.id,
+            goal.status.label()
+        ));
+    }
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return Err("goal objective must not be empty".into());
+    }
+    Ok(GoalSnapshot {
+        id: crate::session::new_id_prefixed("goal-"),
+        revision: 1,
+        objective: objective.to_owned(),
+        success_criteria: success_criteria
+            .into_iter()
+            .map(|criterion| criterion.trim().to_owned())
+            .filter(|criterion| !criterion.is_empty())
+            .collect(),
+        status: GoalStatus::Active,
+        progress: String::new(),
+        evidence: Vec::new(),
+        blocked_reason: None,
+    })
+}
+
+/// Apply one action under an `id` + `revision` CAS; `None` = cleared (the
+/// caller persists the tombstone). `evidence` is appended before status
+/// checks so `Complete` can carry fresh evidence. Plain-string errors.
+pub fn transition_goal(
+    current: Option<&GoalSnapshot>,
+    id: &str,
+    revision: u64,
+    action: &GoalAction,
+    success_criteria: Option<Vec<String>>,
+    evidence: Vec<String>,
+) -> Result<Option<GoalSnapshot>, String> {
+    let Some(goal) = current else {
+        return Err("no goal is set for this session".into());
+    };
+    if goal.id != id {
+        return Err(format!(
+            "goal id mismatch: current goal is `{}`, caller supplied `{id}`",
+            goal.id
+        ));
+    }
+    if goal.revision != revision {
+        return Err(format!(
+            "goal revision mismatch: current revision is {}, caller supplied {revision} \
+             (concurrent update? re-read with get_goal)",
+            goal.revision
+        ));
+    }
+    let mut next = goal.clone();
+    if let Some(criteria) = success_criteria {
+        next.success_criteria = criteria
+            .into_iter()
+            .map(|criterion| criterion.trim().to_owned())
+            .filter(|criterion| !criterion.is_empty())
+            .collect();
+    }
+    // THIS call's evidence, trimmed of blanks, kept apart so `Complete` can
+    // require fresh evidence in the same call (prior accumulated evidence
+    // never satisfies completion).
+    let fresh_evidence: Vec<String> = evidence
+        .into_iter()
+        .map(|item| item.trim().to_owned())
+        .filter(|item| !item.is_empty())
+        .collect();
+    next.evidence.extend(fresh_evidence.clone());
+    match action {
+        GoalAction::Progress { progress } => {
+            if next.status == GoalStatus::Completed {
+                return Err("cannot update progress: goal is already completed".into());
+            }
+            let progress = progress.trim();
+            if progress.is_empty() {
+                return Err("`progress` must not be empty".into());
+            }
+            next.progress = progress.to_owned();
+        }
+        GoalAction::Pause => {
+            if next.status != GoalStatus::Active {
+                return Err("cannot pause a goal that is not active".into());
+            }
+            next.status = GoalStatus::Paused;
+        }
+        GoalAction::Resume => {
+            if !matches!(next.status, GoalStatus::Paused | GoalStatus::Blocked) {
+                return Err("cannot resume a goal that is not paused or blocked".into());
+            }
+            next.status = GoalStatus::Active;
+            next.blocked_reason = None;
+        }
+        GoalAction::Block { reason } => {
+            if next.status == GoalStatus::Completed {
+                return Err("cannot block a completed goal".into());
+            }
+            let reason = reason.trim();
+            if reason.is_empty() {
+                return Err("`blocked_reason` must not be empty".into());
+            }
+            next.status = GoalStatus::Blocked;
+            next.blocked_reason = Some(reason.to_owned());
+        }
+        GoalAction::Complete => {
+            if next.status == GoalStatus::Completed {
+                return Err("goal is already completed".into());
+            }
+            if fresh_evidence.is_empty() {
+                return Err(
+                    "cannot complete a goal without evidence in this update: pass non-empty \
+                     `evidence` with the complete call (e.g. an explicit `unverified: <analysis>` \
+                     string for pure analysis)"
+                        .into(),
+                );
+            }
+            next.status = GoalStatus::Completed;
+            next.blocked_reason = None;
+        }
+        GoalAction::Clear => return Ok(None),
+    }
+    next.revision += 1;
+    Ok(Some(next))
+}
+
+/// Short provider-context projection, capped at [`LIMIT`] chars. This is
+/// what the model sees on every call; the full machine-usable snapshot is
+/// [`goal_snapshot_json`] (the `get_goal` tool), and the complete snapshot
+/// lives in history.
+pub fn goal_projection_text(goal: &GoalSnapshot) -> String {
+    const LIMIT: usize = 400;
+    let criteria = if goal.success_criteria.is_empty() {
+        "-".to_owned()
+    } else {
+        goal.success_criteria
+            .iter()
+            .take(3)
+            .map(|criterion| preview(criterion, 80))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let mut text = format!(
+        "id {} | {} | {}\ncriteria: {criteria}",
+        goal.id,
+        goal.status.label(),
+        preview(&goal.objective, 120),
+    );
+    if !goal.progress.is_empty() {
+        text.push_str(&format!("\nprogress: {}", preview(&goal.progress, 120)));
+    }
+    if let Some(reason) = &goal.blocked_reason {
+        text.push_str(&format!("\nblocked: {}", preview(reason, 120)));
+    }
+    if goal.status == GoalStatus::Completed && !goal.evidence.is_empty() {
+        text.push_str(&format!(
+            "\nevidence: {}",
+            goal.evidence
+                .iter()
+                .take(3)
+                .map(|item| preview(item, 60))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    preview(&text, LIMIT)
+}
+
+/// Full machine-usable goal snapshot as pretty JSON (`get_goal` tool). Every
+/// field the model needs for a CAS update round trip is present: id,
+/// revision, objective, the FULL success_criteria/evidence arrays, status,
+/// progress and blocked_reason. The short provider projection stays the
+/// domain of [`goal_projection_text`].
+pub fn goal_snapshot_json(goal: &GoalSnapshot) -> String {
+    serde_json::to_string_pretty(goal).unwrap_or_else(|_| goal_projection_text(goal))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolSpec {
     pub name: String,
@@ -374,6 +616,12 @@ pub enum AgentEvent {
         context_window: Option<u64>,
         /// Cumulative tokens for this process.
         session: Usage,
+    },
+    /// A goal snapshot update was durably committed (`None` = cleared).
+    /// Rendered by the TUI/web as a Notice line + GoalBar refresh; not a
+    /// user prompt.
+    GoalUpdated {
+        goal: Option<GoalSnapshot>,
     },
 }
 
@@ -438,6 +686,12 @@ pub enum SessionEntry {
     /// naturally (serde payload is additive).
     Error {
         text: String,
+    },
+    /// A goal snapshot update: the COMPLETE latest snapshot (`goal: None`
+    /// is the clear tombstone). Append-only; every update bumps
+    /// `goal.revision`, and the latest entry wins on resume/fork.
+    GoalUpdated {
+        goal: Option<GoalSnapshot>,
     },
 }
 
@@ -583,6 +837,14 @@ pub struct Agent {
     /// Workspace and server instructions prepended to every model call.
     /// Not persisted in sessions.
     context_prefix: Option<String>,
+    /// Latest goal snapshot, folded from the append-only history
+    /// (GoalUpdated entries). Projected into every provider context, so it
+    /// survives compaction and resume.
+    goal: Option<GoalSnapshot>,
+    /// Whether the NEWEST GoalUpdated entry is a clear tombstone. Distinguishes
+    /// "never set" from "cleared", so the provider context can override a
+    /// stale compaction summary that still mentions the old goal.
+    goal_cleared: bool,
 }
 
 impl Agent {
@@ -612,6 +874,8 @@ impl Agent {
             context_window: None,
             auto_compacted: false,
             context_prefix: None,
+            goal: None,
+            goal_cleared: false,
         }
     }
 
@@ -689,7 +953,39 @@ impl Agent {
     /// already-loaded history, use [`Self::push_entry`] — calling this again
     /// would wipe the restored entries.
     pub fn restore_history(&mut self, history: Vec<SessionEntry>) {
-        self.history = Self::migrate_legacy_placeholders(history);
+        let history = Self::migrate_legacy_placeholders(history);
+        let (goal, cleared) = Self::fold_goal(&history);
+        self.goal = goal;
+        self.goal_cleared = cleared;
+        self.history = history;
+    }
+
+    /// Latest goal snapshot folded from the history (`None` = none/cleared).
+    pub fn goal(&self) -> Option<GoalSnapshot> {
+        self.goal.clone()
+    }
+
+    /// Whether the newest goal update was a clear tombstone — distinct from
+    /// never having set a goal. Drives the provider-context override.
+    #[cfg(test)]
+    pub(crate) fn goal_cleared(&self) -> bool {
+        self.goal_cleared
+    }
+
+    /// Fold the NEWEST `GoalUpdated` entry out of a history slice. A clear
+    /// tombstone (`goal: None`) wins like any other update; the returned
+    /// bool is true exactly when the newest update is a tombstone (so a
+    /// "cleared" goal is distinguishable from "never set").
+    fn fold_goal(history: &[SessionEntry]) -> (Option<GoalSnapshot>, bool) {
+        match history
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry, SessionEntry::GoalUpdated { .. }))
+        {
+            Some(SessionEntry::GoalUpdated { goal: Some(goal) }) => (Some(goal.clone()), false),
+            Some(SessionEntry::GoalUpdated { goal: None }) => (None, true),
+            _ => (None, false),
+        }
     }
 
     /// Append a single entry to the history (e.g. a startup notice injected
@@ -720,7 +1016,8 @@ impl Agent {
                 SessionEntry::Notice { .. }
                 | SessionEntry::BackgroundCompletion { .. }
                 | SessionEntry::ForkedFrom { .. }
-                | SessionEntry::Error { .. } => {}
+                | SessionEntry::Error { .. }
+                | SessionEntry::GoalUpdated { .. } => {}
             }
         }
         history
@@ -751,6 +1048,20 @@ impl Agent {
         if let Some(prefix) = &self.context_prefix {
             messages.push(Message::System {
                 content: prefix.clone(),
+            });
+        }
+        // The session goal is projected into EVERY provider call (before
+        // compaction summaries, so it survives compaction and resume). It
+        // is not a user prompt and never lands in history as a message.
+        // After a clear, an explicit "none (cleared)" override is injected
+        // so a stale compaction summary can never re-introduce the old goal.
+        if let Some(goal) = &self.goal {
+            messages.push(Message::System {
+                content: format!("[session goal]\n{}", goal_projection_text(goal)),
+            });
+        } else if self.goal_cleared {
+            messages.push(Message::System {
+                content: "[session goal]\nnone (cleared)".into(),
             });
         }
         let mut start = 0;
@@ -803,6 +1114,9 @@ impl Agent {
                     // provider context (a failed call must not leak its own
                     // error text into the next call).
                     SessionEntry::Error { .. } => None,
+                    // Goal updates are projected at the front of context();
+                    // replaying them here would duplicate the projection.
+                    SessionEntry::GoalUpdated { .. } => None,
                 }),
         );
         repair_tool_pairs(messages)
@@ -1025,6 +1339,10 @@ impl Agent {
     }
 
     pub(crate) fn apply_entry(&mut self, entry: SessionEntry) {
+        if let SessionEntry::GoalUpdated { goal } = &entry {
+            self.goal = goal.clone();
+            self.goal_cleared = goal.is_none();
+        }
         self.history.push(entry);
     }
 

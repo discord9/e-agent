@@ -2758,3 +2758,680 @@ fn strip_images_clears_user_and_tool_images_with_text_degradation() {
         ]
     );
 }
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Session goals: create / CAS transitions / evidence / projection
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+fn goal_fixture() -> GoalSnapshot {
+    create_goal(
+        None,
+        "ship the goal system".into(),
+        vec!["tests pass".into(), "  ".into()],
+    )
+    .unwrap()
+}
+
+#[test]
+fn goal_create_cas_states_and_evidence_rules() {
+    // Create: revision 1, active, criteria trimmed of blanks.
+    let mut g = goal_fixture();
+    assert_eq!(g.revision, 1);
+    assert_eq!(g.status, GoalStatus::Active);
+    assert_eq!(g.success_criteria, vec!["tests pass"]);
+    assert!(create_goal(None, "   ".into(), vec![]).is_err());
+
+    // Create is rejected while a non-completed goal exists; a completed
+    // goal frees the slot (a cleared goal is "no goal").
+    assert!(create_goal(Some(&g), "second".into(), vec![]).is_err());
+    g.status = GoalStatus::Completed;
+    assert!(create_goal(Some(&g), "second".into(), vec![]).is_ok());
+
+    // CAS: wrong id and stale revision are both rejected.
+    let g = goal_fixture();
+    let err =
+        transition_goal(Some(&g), "other", 1, &GoalAction::Pause, None, Vec::new()).unwrap_err();
+    assert!(err.contains("id mismatch"), "{err}");
+    let err =
+        transition_goal(Some(&g), &g.id, 999, &GoalAction::Pause, None, Vec::new()).unwrap_err();
+    assert!(err.contains("revision mismatch"), "{err}");
+    assert!(transition_goal(None, "x", 1, &GoalAction::Pause, None, Vec::new()).is_err());
+
+    // Pause → resume → block → progress, each bumping the revision.
+    let g = goal_fixture();
+    let paused = transition_goal(
+        Some(&g),
+        &g.id,
+        g.revision,
+        &GoalAction::Pause,
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(paused.status, GoalStatus::Paused);
+    assert_eq!(paused.revision, 2);
+    assert!(
+        transition_goal(
+            Some(&paused),
+            &paused.id,
+            paused.revision,
+            &GoalAction::Pause,
+            None,
+            Vec::new()
+        )
+        .is_err(),
+        "pause requires active"
+    );
+    let resumed = transition_goal(
+        Some(&paused),
+        &paused.id,
+        paused.revision,
+        &GoalAction::Resume,
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(resumed.status, GoalStatus::Active);
+    let blocked = transition_goal(
+        Some(&resumed),
+        &resumed.id,
+        resumed.revision,
+        &GoalAction::Block {
+            reason: "waiting on upstream".into(),
+        },
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(blocked.status, GoalStatus::Blocked);
+    assert_eq!(
+        blocked.blocked_reason.as_deref(),
+        Some("waiting on upstream")
+    );
+    let progressed = transition_goal(
+        Some(&blocked),
+        &blocked.id,
+        blocked.revision,
+        &GoalAction::Progress {
+            progress: "wrote tests".into(),
+        },
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(progressed.progress, "wrote tests");
+    assert_eq!(progressed.revision, blocked.revision + 1);
+
+    // Complete requires non-empty evidence; `unverified:` strings are
+    // explicit evidence for pure analysis. A completed goal KEEPS its
+    // evidence and is terminal (no progress/pause/complete).
+    let err = transition_goal(
+        Some(&progressed),
+        &progressed.id,
+        progressed.revision,
+        &GoalAction::Complete,
+        None,
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert!(err.contains("evidence"), "{err}");
+    let completed = transition_goal(
+        Some(&progressed),
+        &progressed.id,
+        progressed.revision,
+        &GoalAction::Complete,
+        None,
+        vec!["unverified: analysis passed".into()],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(completed.status, GoalStatus::Completed);
+    assert_eq!(completed.evidence, vec!["unverified: analysis passed"]);
+    assert!(
+        transition_goal(
+            Some(&completed),
+            &completed.id,
+            completed.revision,
+            &GoalAction::Progress {
+                progress: "x".into()
+            },
+            None,
+            Vec::new(),
+        )
+        .is_err()
+    );
+
+    // Clear tombstones (None); the slot is free again.
+    assert!(
+        transition_goal(
+            Some(&completed),
+            &completed.id,
+            completed.revision,
+            &GoalAction::Clear,
+            None,
+            Vec::new()
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[test]
+fn goal_transition_patches_criteria_and_appends_evidence() {
+    let g = goal_fixture();
+    let updated = transition_goal(
+        Some(&g),
+        &g.id,
+        g.revision,
+        &GoalAction::Progress {
+            progress: "p".into(),
+        },
+        Some(vec!["a".into(), "   ".into(), "b".into()]),
+        vec![" ev1 ".into()],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(updated.success_criteria, vec!["a", "b"]);
+    assert_eq!(updated.evidence, vec!["ev1"]);
+}
+
+#[tokio::test]
+async fn goal_context_projection_survives_compaction() {
+    // The goal projection is prepended to every provider context and
+    // derived from history — compaction must never drop it.
+    let g = goal_fixture();
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some(
+                    "Earlier the session created a goal, made one decision about the approach,                      and left two unfinished files that still need tests and a final review."
+                        .into(),
+                ),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.apply_entry(SessionEntry::GoalUpdated {
+        goal: Some(g.clone()),
+    });
+    agent.push_entry(
+        Message::User {
+            content: "first".into(),
+            images: vec![],
+        }
+        .into(),
+    );
+    agent.push_entry(
+        Message::Assistant(AssistantMessage {
+            content: Some("mid".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    );
+    agent.push_entry(
+        Message::User {
+            content: "second".into(),
+            images: vec![],
+        }
+        .into(),
+    );
+    let has_goal = |messages: &[Message]| {
+        messages.iter().any(|m| {
+            matches!(m, Message::System { content } if content.contains("ship the goal system"))
+        })
+    };
+    assert!(
+        has_goal(&agent.context()),
+        "goal projected before compaction"
+    );
+    agent.compact().await.unwrap();
+    let after = agent.context();
+    assert!(
+        has_goal(&after),
+        "goal projection survives compaction: {after:?}"
+    );
+    assert!(after.iter().any(|m| {
+        matches!(m, Message::User { content, .. } if content.contains("compacted summary"))
+    }));
+}
+
+#[test]
+fn resume_folds_newest_goal_snapshot() {
+    // Resume: restore_history folds the newest GoalUpdated snapshot; the
+    // projection then follows it.
+    let g1 = goal_fixture();
+    let mut g2 = g1.clone();
+    g2.revision = 2;
+    g2.progress = "halfway".into();
+    let mut g3 = g2.clone();
+    g3.revision = 3;
+    g3.status = GoalStatus::Paused;
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        SessionEntry::GoalUpdated { goal: Some(g1) },
+        Message::User {
+            content: "x".into(),
+            images: vec![],
+        }
+        .into(),
+        SessionEntry::GoalUpdated { goal: Some(g2) },
+        SessionEntry::GoalUpdated { goal: Some(g3) },
+    ]);
+    let folded = agent.goal().unwrap();
+    assert_eq!(folded.revision, 3);
+    assert_eq!(folded.status, GoalStatus::Paused);
+    assert!(
+        agent
+            .context()
+            .iter()
+            .any(|m| { matches!(m, Message::System { content } if content.contains("paused")) })
+    );
+}
+
+#[test]
+fn fork_prefix_keeps_goal_updates_before_boundary() {
+    // Fork inheritance: the source prefix up to the turn boundary includes
+    // goal updates, so the forked session folds the newest snapshot.
+    let g = goal_fixture();
+    let history = vec![
+        Message::User {
+            content: "do it".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("ok".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        SessionEntry::GoalUpdated {
+            goal: Some(g.clone()),
+        },
+        Message::User {
+            content: "more".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ];
+    let prefix = fork_prefix(&history, None).unwrap();
+    assert!(
+        prefix.iter().any(
+            |entry| matches!(entry, SessionEntry::GoalUpdated { goal: Some(x) } if x.id == g.id)
+        ),
+        "goal update must be copied into the fork prefix"
+    );
+    assert_eq!(Agent::fold_goal(&prefix).0.unwrap().id, g.id);
+}
+
+#[test]
+fn goal_complete_requires_evidence_in_the_same_call() {
+    // Prior accumulated evidence never satisfies completion: the Complete
+    // action itself must carry trimmed non-empty evidence.
+    let g = goal_fixture();
+    let with_prior = transition_goal(
+        Some(&g),
+        &g.id,
+        g.revision,
+        &GoalAction::Progress {
+            progress: "wrote tests".into(),
+        },
+        None,
+        vec!["prior evidence".into()],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(with_prior.evidence, vec!["prior evidence"]);
+    let err = transition_goal(
+        Some(&with_prior),
+        &with_prior.id,
+        with_prior.revision,
+        &GoalAction::Complete,
+        None,
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert!(err.contains("evidence"), "{err}");
+    // Whitespace-only evidence is trimmed to empty: still rejected, and the
+    // prior evidence is preserved untouched.
+    let rejected = transition_goal(
+        Some(&with_prior),
+        &with_prior.id,
+        with_prior.revision,
+        &GoalAction::Complete,
+        None,
+        vec!["   ".into()],
+    )
+    .unwrap_err();
+    assert!(rejected.contains("evidence"), "{rejected}");
+    assert_eq!(with_prior.evidence, vec!["prior evidence"]);
+    // Fresh evidence in the complete call succeeds and is kept.
+    let completed = transition_goal(
+        Some(&with_prior),
+        &with_prior.id,
+        with_prior.revision,
+        &GoalAction::Complete,
+        None,
+        vec!["unverified: analysis passed".into()],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(completed.status, GoalStatus::Completed);
+    assert_eq!(
+        completed.evidence,
+        vec!["prior evidence", "unverified: analysis passed"]
+    );
+}
+
+#[test]
+fn goal_resume_allows_paused_and_blocked_and_clears_blocked_reason() {
+    // Resume state matrix: Paused -> Active and Blocked -> Active (clearing
+    // blocked_reason); Active/Completed stay rejected.
+    let g = goal_fixture();
+    let paused = transition_goal(
+        Some(&g),
+        &g.id,
+        g.revision,
+        &GoalAction::Pause,
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    let resumed = transition_goal(
+        Some(&paused),
+        &paused.id,
+        paused.revision,
+        &GoalAction::Resume,
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(resumed.status, GoalStatus::Active);
+
+    let blocked = transition_goal(
+        Some(&resumed),
+        &resumed.id,
+        resumed.revision,
+        &GoalAction::Block {
+            reason: "waiting on upstream".into(),
+        },
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(blocked.status, GoalStatus::Blocked);
+    let resumed = transition_goal(
+        Some(&blocked),
+        &blocked.id,
+        blocked.revision,
+        &GoalAction::Resume,
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(resumed.status, GoalStatus::Active);
+    assert_eq!(
+        resumed.blocked_reason, None,
+        "resume must clear blocked_reason"
+    );
+
+    // Active -> resume and Completed -> resume are both rejected.
+    assert!(
+        transition_goal(
+            Some(&resumed),
+            &resumed.id,
+            resumed.revision,
+            &GoalAction::Resume,
+            None,
+            Vec::new(),
+        )
+        .is_err()
+    );
+    let completed = transition_goal(
+        Some(&resumed),
+        &resumed.id,
+        resumed.revision,
+        &GoalAction::Complete,
+        None,
+        vec!["unverified: analysis passed".into()],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        transition_goal(
+            Some(&completed),
+            &completed.id,
+            completed.revision,
+            &GoalAction::Resume,
+            None,
+            Vec::new(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn clear_tombstone_beats_older_snapshots_and_never_set_is_distinct() {
+    // restore Some -> None = no current goal; the fold distinguishes
+    // "never set" from "cleared" so the context can override.
+    let g = goal_fixture();
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    // Never set: no GoalUpdated entries at all.
+    agent.restore_history(vec![
+        Message::User {
+            content: "x".into(),
+            images: vec![],
+        }
+        .into(),
+    ]);
+    assert_eq!(agent.goal(), None);
+    assert!(!agent.goal_cleared());
+    assert!(
+        !agent
+            .context()
+            .iter()
+            .any(|m| matches!(m, Message::System { content } if content.contains("session goal")))
+    );
+
+    // Set then clear: newest entry is the tombstone -> no goal, cleared.
+    agent.restore_history(vec![
+        SessionEntry::GoalUpdated {
+            goal: Some(g.clone()),
+        },
+        Message::User {
+            content: "x".into(),
+            images: vec![],
+        }
+        .into(),
+        SessionEntry::GoalUpdated { goal: None },
+    ]);
+    assert_eq!(agent.goal(), None);
+    assert!(agent.goal_cleared());
+    let contexts = agent.context();
+    assert!(contexts.iter().any(|m| {
+        matches!(m, Message::System { content } if content.contains("none (cleared)"))
+    }));
+}
+
+#[tokio::test]
+async fn clear_after_compaction_overrides_summary_in_context_after_resume() {
+    // create -> compact -> clear -> resume: the compaction summary mentions
+    // the old goal, but the provider context must carry an explicit
+    // "none (cleared)" override instead of the stale summary's goal.
+    let g = goal_fixture();
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some(
+                    "The session's goal was to ship the goal system; it was later abandoned.                      The user then asked to continue with other work."
+                        .into(),
+                ),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.apply_entry(SessionEntry::GoalUpdated {
+        goal: Some(g.clone()),
+    });
+    agent.push_entry(
+        Message::User {
+            content: "work on it".into(),
+            images: vec![],
+        }
+        .into(),
+    );
+    agent.push_entry(
+        Message::Assistant(AssistantMessage {
+            content: Some("started".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    );
+    agent.push_entry(
+        Message::User {
+            content: "continue".into(),
+            images: vec![],
+        }
+        .into(),
+    );
+    agent.compact().await.unwrap();
+    // The summary mentions the old goal (realistic stale compaction).
+    let before_clear = agent.context();
+    assert!(before_clear.iter().any(|m| {
+        matches!(m, Message::User { content, .. } if content.contains("compacted summary"))
+    }));
+    // Clear, then simulate a resume: restore_history from the full log.
+    let mut history = agent.history().to_vec();
+    history.push(SessionEntry::GoalUpdated { goal: None });
+    let mut resumed = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    resumed.restore_history(history);
+    assert_eq!(resumed.goal(), None);
+    assert!(resumed.goal_cleared());
+    let after = resumed.context();
+    // The override is a System message that appears BEFORE the compaction
+    // summary (position 0 after the context prefix), so it wins over the
+    // stale summary text.
+    assert!(after.iter().any(|m| {
+        matches!(m, Message::System { content } if content.contains("none (cleared)"))
+    }));
+    assert!(
+        after
+            .iter()
+            .position(|m| {
+                matches!(m, Message::System { content } if content.contains("none (cleared)"))
+            })
+            .map(|i| after[i + 1..].iter().any(|m| {
+                matches!(m, Message::User { content, .. } if content.contains("compacted summary"))
+            }))
+            .unwrap_or(false),
+        "the cleared override must precede the compaction summary: {after:?}"
+    );
+}
+
+#[test]
+fn fork_tombstone_inheritance_follows_boundary() {
+    // Fork inheritance of clear tombstones:
+    //  - clear BEFORE the fork boundary: the prefix keeps the tombstone, so
+    //    the forked session has NO current goal;
+    //  - clear AFTER the boundary: the prefix keeps the pre-clear snapshot,
+    //    so the forked session keeps the old goal.
+    let g = goal_fixture();
+    let history = vec![
+        Message::User {
+            content: "do it".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("ok".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        SessionEntry::GoalUpdated {
+            goal: Some(g.clone()),
+        },
+        Message::Assistant(AssistantMessage {
+            content: Some("middle".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        SessionEntry::GoalUpdated { goal: None },
+        Message::User {
+            content: "more".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ];
+    // Default fork (last boundary = the final assistant message): the clear
+    // tombstone (index 4) is inside the prefix -> no current goal.
+    let prefix = fork_prefix(&history, None).unwrap();
+    assert_eq!(
+        Agent::fold_goal(&prefix),
+        (None, true),
+        "clear before the boundary must be inherited as cleared"
+    );
+    // Fork at the "middle" boundary (1-based 4 = 0-based 3), which sits
+    // between the goal snapshot and the tombstone: the prefix keeps the
+    // goal and excludes the later clear.
+    let prefix = fork_prefix(&history, Some(4)).unwrap();
+    assert_eq!(Agent::fold_goal(&prefix).0.unwrap().id, g.id);
+    assert!(
+        prefix
+            .iter()
+            .all(|e| !matches!(e, SessionEntry::GoalUpdated { goal: None })),
+        "a clear after the boundary must not leak into the fork prefix"
+    );
+}

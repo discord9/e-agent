@@ -116,6 +116,8 @@ fn web_search_registration_requires_a_nonempty_key() {
         "get_background_tasks".to_string(),
         "cancel_background_task".to_string(),
         "bash".to_string(),
+        "get_goal".to_string(),
+        "update_goal".to_string(),
     ];
     for key in [None, Some("   ".into())] {
         let (tools, _) = builtins_with_exa_key(workspace.clone(), key, None, false, None, None);
@@ -135,7 +137,9 @@ fn web_search_registration_requires_a_nonempty_key() {
             "get_background_tasks",
             "cancel_background_task",
             "bash",
-            "web_search"
+            "web_search",
+            "get_goal",
+            "update_goal"
         ]
         .map(String::from)
     );
@@ -1140,7 +1144,9 @@ fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
         [
             "read_file",
             "get_background_tasks",
-            "cancel_background_task"
+            "cancel_background_task",
+            "get_goal",
+            "update_goal"
         ],
         "read-only without a sandbox: no write/edit and fail-closed no bash"
     );
@@ -1178,7 +1184,9 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             "get_background_tasks",
             "cancel_background_task",
             shell_name,
-            "web_search"
+            "web_search",
+            "get_goal",
+            "update_goal"
         ],
         "read-only with a sandbox keeps the shell and web_search"
     );
@@ -3383,4 +3391,65 @@ fn gh_visible_in_sandbox_respects_configured_mounts() {
     ));
     // No host gh -> not visible.
     assert!(!gh_visible_in_sandbox(None, &mounts));
+}
+
+#[test]
+fn goal_specs_are_closed_and_generic_specs_stay_open() {
+    // Review finding: the Goal tool schemas must reject unknown fields at
+    // the SCHEMA level (`additionalProperties: false`); generic tool
+    // schemas elsewhere must stay open.
+    let get = GetGoal.spec();
+    assert_eq!(get.parameters["type"], "object");
+    assert_eq!(
+        get.parameters["additionalProperties"],
+        serde_json::Value::Bool(false),
+        "get_goal schema must be closed"
+    );
+    let update = UpdateGoal.spec();
+    assert_eq!(
+        update.parameters["additionalProperties"],
+        serde_json::Value::Bool(false),
+        "update_goal schema must be closed"
+    );
+    for key in [
+        "id",
+        "revision",
+        "action",
+        "progress",
+        "blocked_reason",
+        "success_criteria",
+        "evidence",
+    ] {
+        assert!(
+            update.parameters["properties"].get(key).is_some(),
+            "update_goal schema must keep `{key}`"
+        );
+    }
+    // Guard rail: the generic `spec()` helper was NOT closed by this
+    // change — file/bash tools (built through it) stay open. `web_search`,
+    // `get_background_tasks` and `cancel_background_task` were already
+    // closed in the base commit by their own spec builders; untouched.
+    let preexisting_closed = [
+        "web_search",
+        "get_background_tasks",
+        "cancel_background_task",
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let (tools, _) = builtins_with_exa_key(workspace, None, None, false, None, None);
+    for tool in &tools {
+        let name = tool.spec().name;
+        if name == "get_goal" || name == "update_goal" {
+            continue;
+        }
+        if preexisting_closed.contains(&name.as_str()) {
+            continue;
+        }
+        let parameters = tool.spec().parameters;
+        assert_ne!(
+            parameters.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false)),
+            "generic tool `{name}` schema must stay open"
+        );
+    }
 }

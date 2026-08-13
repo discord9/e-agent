@@ -579,6 +579,15 @@ async fn consume_stderr_events(mut events: tokio::sync::broadcast::Receiver<Agen
                     }
                 }
             }
+            AgentEvent::GoalUpdated { goal } => match goal {
+                Some(goal) => eprintln!(
+                    "goal [{}] {} (rev {})",
+                    goal.status.label(),
+                    goal.objective,
+                    goal.revision
+                ),
+                None => eprintln!("goal cleared"),
+            },
             AgentEvent::Usage {
                 context_input,
                 context_window: _,
@@ -635,6 +644,44 @@ async fn repl(handle: SessionHandle, task: SessionTask) -> anyhow::Result<()> {
             "/compact" => {
                 handle.compact();
                 status.changed().await?;
+            }
+            "/goal" => match handle.goal() {
+                Some(goal) => eprintln!(
+                    "goal [{}] {} ({}, rev {})",
+                    goal.status.label(),
+                    goal.objective,
+                    goal.id,
+                    goal.revision
+                ),
+                None => eprintln!("no goal set（创建：/goal set <目标>）"),
+            },
+            command if command.starts_with("/goal ") => {
+                // Human goal mutation through the SAME SessionHandle
+                // transport as the TUI/web (no second persistence path);
+                // the runner persists the GoalUpdated entry and fans the
+                // result/error back as an event.
+                let rest = command.trim_start_matches("/goal").trim();
+                let set = rest.strip_prefix("set ").map(str::trim);
+                let action = match rest {
+                    "pause" => Some(e_agent::agent::GoalAction::Pause),
+                    "resume" => Some(e_agent::agent::GoalAction::Resume),
+                    "clear" => Some(e_agent::agent::GoalAction::Clear),
+                    _ => None,
+                };
+                match (set, action) {
+                    (Some(objective), _) if !objective.is_empty() => {
+                        handle.goal_command(e_agent::runner::GoalCommand::Create {
+                            objective: objective.to_owned(),
+                            success_criteria: Vec::new(),
+                        });
+                    }
+                    (_, Some(action)) => {
+                        handle.goal_command(e_agent::runner::GoalCommand::Action(action));
+                    }
+                    _ => eprintln!(
+                        "用法：/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal（查看）"
+                    ),
+                }
             }
             command if command.starts_with("/image ") => {
                 // Entrance A (human attaches an image): store it in the

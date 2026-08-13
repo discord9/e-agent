@@ -105,6 +105,7 @@ const els = {
   chatView: $("chatView"), chatEmpty: $("chatEmpty"),
   chatSessionId: $("chatSessionId"), chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
   messages: $("messages"), promptInput: $("promptInput"), queueBar: $("queueBar"),
+  goalBar: $("goalBar"),
   slashMenu: $("slashMenu"), forkMenu: $("forkMenu"),
   composerMeta: $("composerMeta"),
   jumpBottomBtn: $("jumpBottomBtn"),

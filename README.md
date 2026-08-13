@@ -358,6 +358,9 @@ command set through its slash-command menu):
 - `/fork [N]` — fork a new session from the last (or the N-th) completed
   turn boundary.
 - `/undo` — undo the most recent file operation (`edit_file` / `write_file`).
+- `/goal` / `/goal set <目标>` / `/goal pause|resume|clear` — view the
+  session's goal, create a new one (human-only), or pause/resume/clear the
+  current one.
 - `/help [命令]` — show the command list, or per-command usage detail
   (`/help fork`); an unknown command name prints a hint back to the list.
 - `/model <profile>` — switch the session's model at runtime (not listed by
@@ -613,6 +616,49 @@ log; earlier messages stay persisted and visible in the TUI. Subsequent model
 calls use the latest summary plus everything after it. When a configured model
 profile provides a context window, the agent also compacts automatically at
 80% usage.
+
+## Session goals
+
+Every session can carry at most one current goal — a minimal persistence
+layer (a deliberate subset of a DSH-style goal system, no scheduler/rounds/
+verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
+`status` (`active|paused|blocked|completed`), `progress`, `evidence`,
+`blocked_reason`.
+
+- **Human-only creation**: `/goal set <objective>` (TUI/REPL/web), or
+  `POST /api/sessions/{id}/goal` with `{"action":"set","objective":…}`.
+  Creation is rejected while a non-completed goal exists; a completed or
+  cleared goal frees the slot. The model never creates goals.
+- **Model updates**: the `get_goal` and `update_goal` tools read the current
+  goal and apply transitions (`progress`, `pause`, `resume`, `block`,
+  `complete`, `clear`) under an `id` + `revision` CAS; `get_goal` returns
+  the FULL machine-usable snapshot (all fields as JSON), while the provider
+  context keeps a short ≤400-char projection. `update_goal` can replace
+  `success_criteria` and append `evidence` (both must be string arrays).
+  `complete` requires non-empty `evidence` in the SAME call — pure analysis
+  may use an explicit `unverified: <analysis>` string; a completed goal
+  keeps its evidence. `resume` unblocks paused OR blocked goals (clearing
+  `blocked_reason`).
+- **Append-only persistence**: every change appends a complete snapshot as a
+  `SessionEntry::GoalUpdated` (`goal: null` is the clear tombstone). The
+  latest snapshot wins on resume (fold) and survives compaction: a short
+  projection is prepended to every provider context, so the goal is never
+  lost across compaction/resume/restart. After a clear, the context injects
+  an explicit `none (cleared)` override so a stale compaction summary can
+  never re-introduce the old goal.
+- **Forks inherit**: `--fork`/`/fork`/btw forks copy the source prefix up to
+  the fork boundary, including goal updates before it; the forked session
+  folds the newest snapshot naturally.
+- **Subagent isolation**: subagents get the goal tools but their runner
+  applies them against the subagent's own (usually empty) goal state — a
+  subagent can never take a mutable reference to its parent's goal.
+- **UI**: the TUI and web UI render goal updates as a notice line plus a
+  fixed GoalBar (`🎯 [status] objective`); the UI shows evidence/`unverified`
+  only, never a claim of independent verification.
+
+Non-goals (deliberately out of scope): todo/plan/workflow stages, auto goal
+rounds / max rounds, deadlines, reminders, goal DAGs / multiple goals per
+session, and a verifier agent.
 
 ## Web UI / headless server
 
@@ -1065,6 +1111,11 @@ loading, config toggle, or recursive skill discovery. Global skills are
 main-agent-only: subagents and btw forks neither inherit the index nor the
 read capability. The same-name override is a full replacement, not a merge
 or concatenation.
+Session goals are a single-current-goal persistence layer only: no
+todo/plan/workflow stages, no auto goal rounds / max rounds, no deadlines,
+no reminders, no goal DAGs / multiple goals per session, no goal verifier
+agent, and no scheduler/driver — the goal is a snapshot with a CAS, not a
+task runner.
 
 GreptimeDB-specific non-goals (when built with `--features greptime`):
 

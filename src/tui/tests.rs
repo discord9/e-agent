@@ -1638,6 +1638,132 @@ fn draw_paints_the_entire_terminal_with_theme_backgrounds() {
     assert_eq!(buffer[(0, 9)].bg, SOLARIZED_LIGHT.panel);
 }
 
+/// Row index of the fixed GoalBar (the first buffer row whose text starts
+/// with the 🎯 glyph), if the bar is rendered.
+fn goal_bar_row(terminal: &Terminal<ratatui::backend::TestBackend>) -> Option<u16> {
+    let buffer = terminal.backend().buffer();
+    let (w, h) = (buffer.area.width, buffer.area.height);
+    for y in 0..h {
+        for x in 0..w {
+            if buffer[(x, y)].symbol() == "🎯" {
+                return Some(y);
+            }
+        }
+    }
+    None
+}
+
+/// Narrow terminals must never panic, and the input/cursor must stay
+/// usable: the GoalBar (when present) renders on its own row ABOVE the
+/// input, the cursor lands inside the terminal, and a goal is dropped only
+/// when the input would otherwise be starved.
+#[test]
+fn narrow_layout_no_goal_and_goal_only() {
+    for (w, h) in [(20u16, 8u16), (16, 6), (12, 5)] {
+        // No goal: no GoalBar row, cursor inside the terminal.
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        state.input.insert("hello");
+        draw(&mut terminal, &mut state).unwrap();
+        assert_eq!(
+            goal_bar_row(&terminal),
+            None,
+            "no goal -> no GoalBar row at {w}x{h}"
+        );
+        let cursor = terminal.backend().cursor_position();
+        assert!(
+            cursor.y < h,
+            "cursor inside terminal at {w}x{h}: {cursor:?}"
+        );
+
+        // Goal only: exactly one GoalBar row, above the cursor/input.
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::default();
+        state.input.insert("hello");
+        let goal = crate::agent::create_goal(None, "ship it".into(), vec![]).unwrap();
+        state.push_agent_event(AgentEvent::GoalUpdated { goal: Some(goal) });
+        draw(&mut terminal, &mut state).unwrap();
+        let bar = goal_bar_row(&terminal).expect("goal -> GoalBar visible");
+        let cursor = terminal.backend().cursor_position();
+        assert!(
+            bar < cursor.y,
+            "GoalBar above cursor at {w}x{h}: bar={bar} cursor={cursor:?}"
+        );
+        assert!(
+            cursor.y < h,
+            "cursor inside terminal at {w}x{h}: {cursor:?}"
+        );
+    }
+}
+
+/// Goal + running tasks (collapsed hint and open panel) + typed multi-line
+/// input on narrow terminals: no panic, GoalBar (when kept) above the
+/// cursor, cursor inside the terminal. The tiny-terminal clamp drops the
+/// tasks bar first, then the GoalBar, so the input always keeps its rows.
+#[tokio::test]
+async fn narrow_layout_goal_with_tasks_and_typed_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, mut background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(temp.path()).unwrap(),
+        None,
+        false,
+        None,
+    );
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    background.set_event_sender(sender);
+    background
+        .spawn_with_id(
+            "long running task".into(),
+            None,
+            None,
+            None,
+            |_| {},
+            || async { std::future::pending::<String>().await },
+        )
+        .unwrap();
+    for (w, h, panel) in [
+        (20u16, 8u16, false),
+        (20, 8, true),
+        (16, 6, true),
+        (12, 5, true),
+    ] {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState {
+            background: Some(background.clone()),
+            show_tasks: panel,
+            ..Default::default()
+        };
+        // Typed input long enough to wrap at both 20 and 12 columns.
+        state
+            .input
+            .insert("a fairly long typed input line that wraps over several rows at narrow widths");
+        let goal =
+            crate::agent::create_goal(None, "ship the narrow layout".into(), vec![]).unwrap();
+        state.push_agent_event(AgentEvent::GoalUpdated { goal: Some(goal) });
+        draw(&mut terminal, &mut state).unwrap();
+        let bar = goal_bar_row(&terminal);
+        let cursor = terminal.backend().cursor_position();
+        if let Some(bar) = bar {
+            assert!(
+                bar < cursor.y,
+                "GoalBar above cursor at {w}x{h} panel={panel}: bar={bar} cursor={cursor:?}"
+            );
+        }
+        assert!(
+            cursor.y < h,
+            "cursor inside terminal at {w}x{h} panel={panel}: {cursor:?}"
+        );
+        // The cursor always sits in the bottom input block (3 rows).
+        assert!(
+            cursor.y >= h.saturating_sub(3),
+            "cursor in the input block at {w}x{h} panel={panel}: {cursor:?}"
+        );
+    }
+}
+
 #[test]
 fn scrolling_redraw_keeps_blank_scrollback_cells_on_solarized_surfaces() {
     let backend = ratatui::backend::TestBackend::new(12, 8);

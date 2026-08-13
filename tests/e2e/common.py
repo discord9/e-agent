@@ -90,9 +90,14 @@ class Case:
         self.pin_status = 200                # PUT /pin 的 mock 状态码
         self.archive_status = 200            # PUT /archive 的 mock 状态码
         self.btw_status = 201                # POST /btw 的 mock 状态码
+        self.goals = {}                      # sid -> goal 快照（None=无）；GET /goal 按会话返回
+        self.goal_delay = {}                 # sid -> (skip, 秒)：前 skip 次 GET /goal 不延迟，之后延迟（stale 测试）
+        self.goal_post_status = 202          # POST /goal 返回的状态码（409 = finished/closed mock）
+        self.goal_post_delay = None          # 秒；POST /goal 延迟响应（跨会话 stale 测试）
         self.records = {
             "prompt": [], "title": [], "pin": [], "archive": [], "btw": [],
-            "compact": [], "history": [], "create": [], "delete": [],
+            "compact": [], "history": [], "create": [], "delete": [], "goal": [],
+            "goal_get": [],
         }
         self.extra_handlers = []             # [(predicate(url, method), async handler(route,url,method))]
         # ---- 浏览器 ----
@@ -179,8 +184,17 @@ def make_intercept(c):
                                        body=json.dumps(payload))
         if method == "POST" and base.endswith("/api/sessions"):
             c.records["create"].append(route.request.post_data)
+            # 恢复历史会话（POST {id}）：按请求 id 原样返回（默认固定 sess-new
+            # 无法区分恢复的是哪个会话）。
+            sid = "sess-new"
+            try:
+                body = json.loads(route.request.post_data or "{}")
+                if body.get("id"):
+                    sid = body["id"]
+            except Exception:
+                pass
             return await route.fulfill(status=201, content_type="application/json",
-                                       body=json.dumps({"id": "sess-new", "status": "Idle"}))
+                                       body=json.dumps({"id": sid, "status": "Idle", "active": True}))
         if method == "DELETE" and "/api/sessions/" in url:
             c.records["delete"].append(url)
             return await route.fulfill(status=204, content_type="application/json", body="")
@@ -208,6 +222,47 @@ def make_intercept(c):
             c.records["btw"].append((url, route.request.post_data))
             return await route.fulfill(status=c.btw_status, content_type="application/json",
                                        body=json.dumps({"id": "sub-btw-1"}))
+        if method == "GET" and url.endswith("/goal"):
+            c.records["goal_get"].append(url)   # 记录 GET /goal（断言「无额外 GET B」）
+            sid = url.split("/api/sessions/", 1)[1].split("/goal", 1)[0]
+            spec = c.goal_delay.get(sid)
+            if spec:
+                skip, secs = spec
+                if skip > 0:
+                    c.goal_delay[sid] = (skip - 1, secs)   # 前 skip 次不延迟
+                else:
+                    await asyncio.sleep(secs)              # stale 测试：延迟响应
+            return await route.fulfill(status=200, content_type="application/json",
+                                       body=json.dumps({"goal": c.goals.get(sid)}))
+        if method == "POST" and url.endswith("/goal"):
+            # 模拟服务端 goal 状态：set/pause/resume/clear 就地更新该会话的
+            # goals[sid]，使随后的 GET /goal（GoalBar 初始化/刷新）返回最新
+            # 快照。goal_post_status != 202 时模拟 finished/closed（409，
+            # 不更新状态）；goal_post_delay 延迟响应（跨会话 stale 测试）。
+            c.records["goal"].append((url, route.request.post_data))
+            sid = url.split("/api/sessions/", 1)[1].split("/goal", 1)[0]
+            if c.goal_post_delay:
+                await asyncio.sleep(c.goal_post_delay)
+            if c.goal_post_status != 202:
+                return await route.fulfill(status=c.goal_post_status,
+                                           content_type="application/json", body="")
+            try:
+                body = json.loads(route.request.post_data or "{}")
+                action = body.get("action")
+                cur = c.goals.get(sid)
+                if action == "set" and str(body.get("objective", "")).strip():
+                    c.goals[sid] = {"id": "goal-1", "revision": 1,
+                                    "objective": str(body.get("objective", "")).strip(),
+                                    "success_criteria": [], "status": "active",
+                                    "progress": "", "evidence": [], "blocked_reason": None}
+                elif action in ("pause", "resume") and isinstance(cur, dict):
+                    c.goals[sid] = dict(cur, status="paused" if action == "pause" else "active",
+                                        revision=cur.get("revision", 1) + 1)
+                elif action == "clear":
+                    c.goals[sid] = None
+            except Exception:
+                pass
+            return await route.fulfill(status=202, content_type="application/json", body="{}")
         if url.endswith("/events"):
             return await route.fulfill(status=200,
                                        headers={"content-type": "text/event-stream"},

@@ -21,6 +21,8 @@
 //! | GET    | `/api/models`                     | switchable model profile names (web `/model` autocomplete) |
 //! | POST   | `/api/sessions/{id}/model`         | switch the session's model at runtime |
 //! | POST   | `/api/sessions/{id}/undo`         | undo the most recent file operation |
+//! | GET    | `/api/sessions/{id}/goal`         | current goal snapshot (or null)     |
+//! | POST   | `/api/sessions/{id}/goal`         | create / pause / resume / clear the goal |
 //! | PUT    | `/api/sessions/{id}/title`        | rename a session                  |
 //! | DELETE | `/api/sessions/{id}`              | cancel + remove from the registry  |
 //! | GET    | `/api/tasks`                        | running background tasks, all sessions |
@@ -41,7 +43,7 @@ use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context as AnyhowContext, anyhow};
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, State, rejection::JsonRejection};
 use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::sse::{Event, Sse};
@@ -522,6 +524,10 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/models", get(list_models))
         .route("/api/sessions/{id}/model", post(session_model))
         .route("/api/sessions/{id}/undo", post(session_undo))
+        .route(
+            "/api/sessions/{id}/goal",
+            get(session_goal_get).post(session_goal_post),
+        )
         .route("/api/sessions/{id}/title", put(session_title))
         .route("/api/sessions/{id}/pin", put(session_pin))
         .route("/api/sessions/{id}/archive", put(session_archive))
@@ -1617,6 +1623,118 @@ async fn session_undo(
     }
 }
 
+/// `GET /api/sessions/{id}/goal` — the committed goal snapshot (`null`
+/// when none is set / cleared). 200; 404 for an unknown session.
+async fn session_goal_get(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session = live(&state, &id)?;
+    Ok(Json(serde_json::json!({ "goal": session.handle().goal() })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoalBody {
+    /// "set" (create, human-only) | "pause" | "resume" | "clear".
+    action: String,
+    /// Required for `set`.
+    objective: Option<String>,
+    success_criteria: Option<Vec<String>>,
+}
+
+/// `POST /api/sessions/{id}/goal` — human goal mutation, applied by the
+/// runner (which re-validates atomically and persists a `GoalUpdated`
+/// entry; results/errors fan out over SSE). 202 Accepted (async, like
+/// prompt/compact); 400/409 for input the runner would reject, 409 when
+/// the session is finished or its command channel is closed (the mutation
+/// could never apply); 404 for an unknown session.
+async fn session_goal_post(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<GoalBody>, JsonRejection>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Strict body contract: `deny_unknown_fields` makes misspelled/extra
+    // fields a deserialization failure, mapped to a plain 400 (axum's
+    // default Json rejection would be 422). The handler never runs, so a
+    // rejected body is never queued or applied.
+    let Json(body) = body.map_err(|rejection| {
+        error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid goal body: {rejection}"),
+        )
+    })?;
+    let session = live(&state, &id)?;
+    let handle = session.handle();
+    // A finished/closed session can never apply a goal mutation: reject
+    // synchronously instead of a hollow 202 that the runner would drop.
+    if matches!(&*handle.status().borrow(), SessionStatus::Finished(_)) {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "session is finished: cannot modify its goal",
+        ));
+    }
+    let command = match body.action.as_str() {
+        "set" => {
+            let objective = body.objective.unwrap_or_default();
+            if objective.trim().is_empty() {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "goal objective must not be empty",
+                ));
+            }
+            // Pre-validate the create rule synchronously; the runner
+            // re-checks under the same rule (a race surfaces as an SSE
+            // `error` event).
+            if let Some(goal) = handle.goal()
+                && goal.status != crate::agent::GoalStatus::Completed
+            {
+                return Err(error(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "session already has a goal (`{}`, status {}): complete or clear it first",
+                        goal.id,
+                        goal.status.label()
+                    ),
+                ));
+            }
+            crate::runner::GoalCommand::Create {
+                objective,
+                success_criteria: body.success_criteria.unwrap_or_default(),
+            }
+        }
+        "pause" | "resume" | "clear" => {
+            if handle.goal().is_none() {
+                return Err(error(
+                    StatusCode::CONFLICT,
+                    "no goal is set for this session",
+                ));
+            }
+            let action = match body.action.as_str() {
+                "pause" => crate::agent::GoalAction::Pause,
+                "resume" => crate::agent::GoalAction::Resume,
+                _ => crate::agent::GoalAction::Clear,
+            };
+            crate::runner::GoalCommand::Action(action)
+        }
+        other => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown goal action `{other}` (known: set, pause, resume, clear)"),
+            ));
+        }
+    };
+    // Never a fake 202: if the command could not be queued (channel closed
+    // between the status check and the send), report the conflict.
+    if !handle.goal_command(command) {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "session is finished or its command channel is closed: goal not accepted",
+        ));
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
 /// Cap for user-assigned session titles: longer titles are truncated
 /// (chars, so multi-byte text is preserved), never rejected with 400 —
 /// the simplest contract, per the manual-naming design.
@@ -2155,6 +2273,10 @@ fn entry_preview(entry: &SessionEntry) -> String {
             message: Message::Tool { name, content, .. },
         } => format!("{name}: {content}"),
         SessionEntry::Compaction { summary, .. } => format!("📦 压缩：{summary}"),
+        SessionEntry::GoalUpdated { goal } => match goal {
+            Some(goal) => format!("🎯 [{}] {}", goal.status.label(), goal.objective),
+            None => "🎯 goal cleared".to_owned(),
+        },
         _ => "（系统条目）".to_owned(),
     };
     preview(&text, MAX)
@@ -2786,6 +2908,7 @@ fn event_name(event: &AgentEvent) -> &'static str {
         AgentEvent::Error(_) => "Error",
         AgentEvent::BackgroundCompleted { .. } => "BackgroundCompleted",
         AgentEvent::BackgroundCompletionNotice { .. } => "BackgroundCompletionNotice",
+        AgentEvent::GoalUpdated { .. } => "GoalUpdated",
         AgentEvent::Usage { .. } => "Usage",
     }
 }
@@ -2818,6 +2941,7 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
         | AgentEvent::BackgroundCompletionNotice { id, output, label } => {
             json!({ "id": id, "output": output, "label": label })
         }
+        AgentEvent::GoalUpdated { goal } => json!({ "goal": goal }),
         AgentEvent::Usage {
             context_input,
             context_window,
@@ -4111,6 +4235,511 @@ model = "deepseek-chat"
         let message = value["message"].as_str().unwrap();
         assert!(message.contains("已撤销 write_file: file.txt"), "{message}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+    }
+
+    /// Goal endpoints on a REAL runner (WaitForInput, no prompt — the
+    /// runner never calls the model): GET returns the committed snapshot,
+    /// POST set creates revision 1, a second set is pre-validated 409,
+    /// pause/resume transition the status, clear tombstones to null, and
+    /// the runner persists each change to the session store.
+    #[tokio::test]
+    async fn goal_endpoints_create_read_actions_and_clear() {
+        use async_trait::async_trait;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::agent::Agent;
+        use crate::runner::SessionRunner;
+
+        /// Holds the agent's background-completion sender open so the idle
+        /// WaitForInput runner does not finalize Closed between commands.
+        struct HoldSender(Option<tokio::sync::mpsc::UnboundedSender<crate::agent::AgentEvent>>);
+        #[async_trait]
+        impl crate::agent::Tool for HoldSender {
+            fn spec(&self) -> crate::agent::ToolSpec {
+                crate::agent::ToolSpec {
+                    name: "hold_sender".into(),
+                    description: "test".into(),
+                    parameters: serde_json::json!({}),
+                }
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+            ) -> Result<crate::agent::ToolOutput, String> {
+                Err("unused".into())
+            }
+            fn set_event_sender(
+                &mut self,
+                sender: tokio::sync::mpsc::UnboundedSender<crate::agent::AgentEvent>,
+            ) {
+                self.0 = Some(sender);
+            }
+        }
+
+        struct NeverCalledModel;
+        #[async_trait]
+        impl crate::agent::Model for NeverCalledModel {
+            async fn complete(
+                &mut self,
+                _: &[crate::agent::Message],
+                _: &[crate::agent::ToolSpec],
+                _: Option<&mut (dyn for<'a> FnMut(crate::agent::ModelDeltaKind, &'a str) + Send)>,
+            ) -> anyhow::Result<(crate::agent::AssistantMessage, Option<crate::agent::Usage>)>
+            {
+                panic!("goal endpoint test must never call the model");
+            }
+        }
+
+        let state = test_app_state("sekrit");
+        let temp = tempfile::tempdir().unwrap();
+        let (runner, handle) = SessionRunner::new(
+            Agent::new(Box::new(NeverCalledModel), vec![Box::new(HoldSender(None))]),
+            SessionStore::Jsonl,
+            temp.path().into(),
+            "web-goal".into(),
+            IdlePolicy::WaitForInput,
+        );
+        let runner_task = runner.start(None);
+        let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
+        let (_tools, background) = crate::tools::builtins(workspace, None, false, None);
+        state.registry.insert(
+            "web-goal".into(),
+            Arc::new(LiveSession {
+                handle: handle.clone(),
+                task: runner_task,
+                store: SessionStore::Jsonl,
+                background,
+                sessions: Sessions::default(),
+                model_name: Mutex::new("test-model".into()),
+                role_name: None,
+                created_at: chrono::Utc::now(),
+            }),
+        );
+        let app = router(state.clone());
+        let get_goal = |app: Router| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/sessions/web-goal/goal")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let post_goal = |app: Router, body: String| async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/sessions/web-goal/goal")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+        async fn wait_goal(
+            handle: &SessionHandle,
+            expected: impl Fn(Option<&crate::agent::GoalSnapshot>) -> bool,
+        ) {
+            for _ in 0..400 {
+                if expected(handle.goal().as_ref()) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("goal condition not met in time");
+        }
+
+        // Fresh session: GET → null.
+        assert!(get_goal(app.clone()).await["goal"].is_null());
+
+        // set → 202; the runner applies asynchronously and GET reflects it.
+        assert_eq!(
+            post_goal(
+                app.clone(),
+                r#"{"action":"set","objective":"ship it","success_criteria":["tests pass"]}"#
+                    .to_owned()
+            )
+            .await,
+            StatusCode::ACCEPTED
+        );
+        wait_goal(&handle, |g| g.is_some()).await;
+        let goal = handle.goal().unwrap();
+        assert_eq!(goal.status, crate::agent::GoalStatus::Active);
+        assert_eq!(goal.revision, 1);
+        let json = get_goal(app.clone()).await;
+        assert_eq!(json["goal"]["objective"], "ship it");
+        assert_eq!(json["goal"]["success_criteria"][0], "tests pass");
+
+        // set again while active → 409 (pre-validated synchronously).
+        assert_eq!(
+            post_goal(
+                app.clone(),
+                r#"{"action":"set","objective":"second"}"#.to_owned()
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        // pause → 202 → paused; resume → 202 → active; clear → 202 → null.
+        assert_eq!(
+            post_goal(app.clone(), r#"{"action":"pause"}"#.to_owned()).await,
+            StatusCode::ACCEPTED
+        );
+        wait_goal(&handle, |g| {
+            g.map(|g| g.status) == Some(crate::agent::GoalStatus::Paused)
+        })
+        .await;
+        assert_eq!(
+            post_goal(app.clone(), r#"{"action":"resume"}"#.to_owned()).await,
+            StatusCode::ACCEPTED
+        );
+        wait_goal(&handle, |g| {
+            g.map(|g| g.status) == Some(crate::agent::GoalStatus::Active)
+        })
+        .await;
+        // Unknown action → 400.
+        assert_eq!(
+            post_goal(app.clone(), r#"{"action":"skip"}"#.to_owned()).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_goal(app.clone(), r#"{"action":"clear"}"#.to_owned()).await,
+            StatusCode::ACCEPTED
+        );
+        wait_goal(&handle, |g| g.is_none()).await;
+        assert!(get_goal(app.clone()).await["goal"].is_null());
+
+        // Persistence: create + pause + resume + clear all appended.
+        let loaded = SessionStore::Jsonl
+            .load(temp.path(), "web-goal")
+            .await
+            .unwrap();
+        let updates = loaded
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::GoalUpdated { .. }))
+            .count();
+        assert_eq!(updates, 4);
+    }
+
+    #[tokio::test]
+    async fn goal_post_rejects_unknown_fields_with_400_and_applies_nothing() {
+        // `deny_unknown_fields` on GoalBody: a misspelled `success_criteria`
+        // or any arbitrary extra key is a synchronous 400 from the JSON
+        // extractor — the handler never runs, so nothing is queued or
+        // applied (no goal, no GoalUpdated entry).
+        use async_trait::async_trait;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::agent::Agent;
+        use crate::runner::SessionRunner;
+
+        /// Holds the agent's background-completion sender open so the idle
+        /// WaitForInput runner does not finalize Closed between commands.
+        struct HoldSender(Option<tokio::sync::mpsc::UnboundedSender<crate::agent::AgentEvent>>);
+        #[async_trait]
+        impl crate::agent::Tool for HoldSender {
+            fn spec(&self) -> crate::agent::ToolSpec {
+                crate::agent::ToolSpec {
+                    name: "hold_sender".into(),
+                    description: "test".into(),
+                    parameters: serde_json::json!({}),
+                }
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+            ) -> Result<crate::agent::ToolOutput, String> {
+                Err("unused".into())
+            }
+            fn set_event_sender(
+                &mut self,
+                sender: tokio::sync::mpsc::UnboundedSender<crate::agent::AgentEvent>,
+            ) {
+                self.0 = Some(sender);
+            }
+        }
+
+        struct NeverCalledModel;
+        #[async_trait]
+        impl crate::agent::Model for NeverCalledModel {
+            async fn complete(
+                &mut self,
+                _: &[crate::agent::Message],
+                _: &[crate::agent::ToolSpec],
+                _: Option<&mut (dyn for<'a> FnMut(crate::agent::ModelDeltaKind, &'a str) + Send)>,
+            ) -> anyhow::Result<(crate::agent::AssistantMessage, Option<crate::agent::Usage>)>
+            {
+                panic!("goal endpoint test must never call the model");
+            }
+        }
+
+        let state = test_app_state("sekrit");
+        let temp = tempfile::tempdir().unwrap();
+        let (runner, handle) = SessionRunner::new(
+            Agent::new(Box::new(NeverCalledModel), vec![Box::new(HoldSender(None))]),
+            SessionStore::Jsonl,
+            temp.path().into(),
+            "web-goal-strict".into(),
+            IdlePolicy::WaitForInput,
+        );
+        let runner_task = runner.start(None);
+        let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
+        let (_tools, background) = crate::tools::builtins(workspace, None, false, None);
+        state.registry.insert(
+            "web-goal-strict".into(),
+            Arc::new(LiveSession {
+                handle: handle.clone(),
+                task: runner_task,
+                store: SessionStore::Jsonl,
+                background,
+                sessions: Sessions::default(),
+                model_name: Mutex::new("test-model".into()),
+                role_name: None,
+                created_at: chrono::Utc::now(),
+            }),
+        );
+        let app = router(state.clone());
+        let post_goal = |app: Router, body: String| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/sessions/web-goal-strict/goal")
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        };
+        // Misspelled field and arbitrary extra keys: both 400, naming the
+        // offending field in the reject body.
+        for body in [
+            r#"{"action":"set","objective":"nope","sucess_criteria":["typo"]}"#,
+            r#"{"action":"set","objective":"nope","extra":"bogus"}"#,
+            r#"{"action":"set","objective":"nope","success_criteria":["ok"],"bogus":1}"#,
+        ] {
+            let (status, text) = post_goal(app.clone(), body.to_owned()).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "unknown POST /goal fields must 400 on {body}"
+            );
+            assert!(
+                text.contains("unknown field") || text.contains("deny_unknown_fields"),
+                "400 body should explain the unknown field: {text}"
+            );
+        }
+        // Nothing was queued or applied: no goal, GET stays null, and the
+        // persisted log has no GoalUpdated entry.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            handle.goal().is_none(),
+            "rejected body must not apply a goal"
+        );
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/web-goal-strict/goal")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(get.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["goal"].is_null());
+        let loaded = SessionStore::Jsonl
+            .load(temp.path(), "web-goal-strict")
+            .await
+            .unwrap();
+        assert!(
+            !loaded
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, SessionEntry::GoalUpdated { .. })),
+            "rejected bodies must never enqueue a GoalUpdated entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_post_rejects_finished_session_with_409() {
+        use async_trait::async_trait;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::agent::Agent;
+        use crate::runner::SessionRunner;
+
+        /// Finishes on its first call: the runner then finalizes and closes
+        /// its command channel (Finished status, commands_open=false).
+        struct FinishingModel;
+        #[async_trait]
+        impl crate::agent::Model for FinishingModel {
+            async fn complete(
+                &mut self,
+                _: &[crate::agent::Message],
+                _: &[crate::agent::ToolSpec],
+                _: Option<&mut (dyn for<'a> FnMut(crate::agent::ModelDeltaKind, &'a str) + Send)>,
+            ) -> anyhow::Result<(crate::agent::AssistantMessage, Option<crate::agent::Usage>)>
+            {
+                Ok((
+                    crate::agent::AssistantMessage {
+                        content: Some("done".into()),
+                        tool_calls: Vec::new(),
+                        reasoning: None,
+                    },
+                    None,
+                ))
+            }
+        }
+
+        let state = test_app_state("sekrit");
+        let temp = tempfile::tempdir().unwrap();
+        let (runner, handle) = SessionRunner::new(
+            Agent::new(Box::new(FinishingModel), Vec::new()),
+            SessionStore::Jsonl,
+            temp.path().into(),
+            "web-goal-finished".into(),
+            IdlePolicy::FinishWhenIdle,
+        );
+        let task = runner.start(Some("run once".into()));
+        let mut status = handle.status();
+        loop {
+            if matches!(&*status.borrow(), SessionStatus::Finished(_)) {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+        let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
+        let (_tools, background) = crate::tools::builtins(workspace, None, false, None);
+        state.registry.insert(
+            "web-goal-finished".into(),
+            Arc::new(LiveSession {
+                handle: handle.clone(),
+                task,
+                store: SessionStore::Jsonl,
+                background,
+                sessions: Sessions::default(),
+                model_name: Mutex::new("test-model".into()),
+                role_name: None,
+                created_at: chrono::Utc::now(),
+            }),
+        );
+        let app = router(state.clone());
+
+        // GET stays readable (read-only), POST is a hard 409 — never a
+        // hollow 202 that the closed runner would silently drop.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/web-goal-finished/goal")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        for body in [
+            r#"{"action":"set","objective":"nope"}"#,
+            r#"{"action":"pause"}"#,
+            r#"{"action":"clear"}"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/sessions/web-goal-finished/goal")
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "finished session must 409 on {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_post_rejects_closed_command_channel_with_409() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        // Status 非 Finished（Idle）但 command channel 已 closed（receiver
+        // 被 drop，模拟 runner 任务已退出但状态尚未刷新）：POST 必须 409 ——
+        // 走的是 goal_command 的 closed-channel 回退，不是 Finished 前置检查。
+        let state = test_app_state("sekrit");
+        let (handle, _emitter, receiver) = crate::runner::session_test_channel();
+        drop(receiver);
+        assert_eq!(
+            &*handle.status().borrow(),
+            &SessionStatus::Idle,
+            "precondition: status Idle, not Finished"
+        );
+        assert!(
+            !handle.goal_command(crate::runner::GoalCommand::Create {
+                objective: "nope".into(),
+                success_criteria: vec![],
+            }),
+            "closed channel must reject the command"
+        );
+        state
+            .registry
+            .insert("web-goal-closed".into(), live_session_with_handle(handle));
+        let app = router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/web-goal-closed/goal")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"action":"set","objective":"nope"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "closed command channel must 409, never a hollow 202"
+        );
     }
 
     #[test]
@@ -6149,6 +6778,19 @@ model = "deepseek-chat"
     #[tokio::test]
     async fn live_event_wire_frames_match_frontend_contract() {
         use serde_json::json;
+        // GoalUpdated：完整快照（set）与 null 墓碑（clear）都必须是
+        // `event: GoalUpdated` + 扁平 `{"goal": <snapshot|null>}` ——
+        // frontend 的 applyLiveEvent GoalUpdated 分支按此契约刷新 GoalBar。
+        let goal = crate::agent::GoalSnapshot {
+            id: "g1".into(),
+            revision: 2,
+            objective: "ship it".into(),
+            success_criteria: vec!["tests pass".into()],
+            status: crate::agent::GoalStatus::Paused,
+            progress: "half".into(),
+            evidence: vec![],
+            blocked_reason: Some("waiting".into()),
+        };
         let cases: &[(AgentEvent, &str, serde_json::Value)] = &[
             (
                 AgentEvent::UserPrompt("hi".into()),
@@ -6195,6 +6837,18 @@ model = "deepseek-chat"
                 },
                 "ToolResult",
                 json!({"is_error": true, "content": "no"}),
+            ),
+            (
+                AgentEvent::GoalUpdated {
+                    goal: Some(goal.clone()),
+                },
+                "GoalUpdated",
+                json!({ "goal": goal }),
+            ),
+            (
+                AgentEvent::GoalUpdated { goal: None },
+                "GoalUpdated",
+                json!({ "goal": null }),
             ),
         ];
         for (event, name, payload) in cases {

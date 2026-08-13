@@ -244,7 +244,7 @@ const elsById={};
 for(const id of ["topActions","backParentBtn","connState","banner","bannerText","bannerClose","tokenInput","tokenToggle","chatView","chatEmpty",
   "chatSessionId","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn",
-  "queueBar","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
+  "queueBar","goalBar","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
   "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks","forkMenu",
   "workspaceSelect","workspaceAddBtn","workspaceRemoveBtn","workspaceEditor",
   "wsNameInput","wsUrlInput","wsTokenInput","wsSaveBtn","wsCancelBtn"]) elsById[id]=new El(id);
@@ -813,7 +813,7 @@ async function main(){
     pin.selectionStart = pin.selectionEnd = 1;
     inp();
     chk("slash menu opens on /", slashMenu.open === true && sm.hidden === false
-        && sm.querySelectorAll(".slash-item").length === 7,
+        && sm.querySelectorAll(".slash-item").length === 8,
         "open=" + slashMenu.open + " items=" + sm.querySelectorAll(".slash-item").length);
     chk("slash first item selected", slashMenu.selected === 0
         && sm.querySelectorAll(".slash-item")[0].classList.contains("selected"));
@@ -833,7 +833,7 @@ async function main(){
     chk("slash arrow down moves selection", slashMenu.selected === 1,
         "sel=" + slashMenu.selected);
     kd("ArrowUp"); kd("ArrowUp");
-    chk("slash arrow up wraps", slashMenu.selected === 6, "sel=" + slashMenu.selected);
+    chk("slash arrow up wraps", slashMenu.selected === 7, "sel=" + slashMenu.selected);
     kd("ArrowDown");
     chk("slash arrow down wraps to 0", slashMenu.selected === 0, "sel=" + slashMenu.selected);
     // Enter 填入带参数命令：/rename <标题>，光标在参数位（占位被选中，输入即覆盖）

@@ -3,7 +3,7 @@
 use crate::{
     agent::{
         Agent, AgentEvent, CompactionOutput, ImagePart, Message, Model, RoundOutput, SessionEntry,
-        ToolCall, ToolSpec,
+        ToolCall, ToolOutput, ToolSpec,
     },
     session_store::SessionStore,
 };
@@ -112,6 +112,24 @@ pub enum SessionCommand {
     /// resolves the profile to a concrete model and hands it over; the
     /// runner only installs it on the agent.
     SwitchModel(Box<dyn Model>),
+    /// Human-issued goal mutation (`/goal` commands, web API). The model
+    /// never creates goals; its `update_goal` tool is intercepted by the
+    /// runner with the same transition rules under an id + revision CAS.
+    Goal(GoalCommand),
+}
+
+/// Human goal operations (creation is human-only; the model's
+/// `update_goal` tool covers the rest with explicit id/revision).
+#[derive(Clone, Debug)]
+pub enum GoalCommand {
+    /// Create the first revision (`/goal set …`, `POST /api/…/goal`).
+    /// Rejected by the runner while a non-completed goal exists.
+    Create {
+        objective: String,
+        success_criteria: Vec<String>,
+    },
+    /// An action against the CURRENT goal (human commands carry no id).
+    Action(crate::agent::GoalAction),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IdlePolicy {
@@ -139,6 +157,9 @@ struct Shared {
     status: watch::Sender<SessionStatus>,
     compaction_streaming: bool,
     commands_open: bool,
+    /// Latest goal snapshot, mirrored from the runner for UI reads
+    /// (REPL `/goal`, TUI GoalBar, web `GET /api/sessions/{id}/goal`).
+    goal: Option<crate::agent::GoalSnapshot>,
 }
 impl Shared {
     fn emit(&mut self, event: AgentEvent) {
@@ -248,6 +269,29 @@ impl SessionHandle {
             shared.commands_open = false;
         }
     }
+    /// Queue a human goal mutation (create / pause / resume / clear). The
+    /// runner applies it at the next safe point and persists a
+    /// `GoalUpdated` entry; failures surface as `AgentEvent::Error`.
+    /// Returns `true` when the command was accepted for queuing, `false`
+    /// when the command channel is closed (session finished or dropped) —
+    /// callers must never report a hollow success in that case.
+    pub fn goal_command(&self, command: GoalCommand) -> bool {
+        let mut shared = self.shared.lock().unwrap();
+        if shared.commands_open && !self.commands.is_closed() {
+            if self.commands.send(SessionCommand::Goal(command)).is_err() {
+                shared.commands_open = false;
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+    /// The latest committed goal snapshot (`None` = none/cleared). Pure
+    /// read for UIs; mutations go through [`Self::goal_command`] or the
+    /// model's `update_goal` tool.
+    pub fn goal(&self) -> Option<crate::agent::GoalSnapshot> {
+        self.shared.lock().unwrap().goal.clone()
+    }
     pub fn snapshot(&self) -> Vec<AgentEvent> {
         self.shared.lock().unwrap().log.clone()
     }
@@ -301,6 +345,7 @@ pub(crate) fn session_test_channel() -> (
         status,
         compaction_streaming: false,
         commands_open: true,
+        goal: None,
     }));
     let (commands, receiver) = mpsc::unbounded_channel();
     (
@@ -401,6 +446,7 @@ enum PendingCommand {
         image: Option<ImagePart>,
     },
     Compact,
+    Goal(GoalCommand),
 }
 
 pub struct SessionRunner {
@@ -439,12 +485,17 @@ impl SessionRunner {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (status, _) = watch::channel(SessionStatus::Idle);
         let replay = agent.history().iter().filter_map(entry_event).collect();
+        // Mirror the latest goal snapshot so UIs read it without touching
+        // the agent (resume fold: newest GoalUpdated wins — reuse the
+        // agent's own fold instead of a second reverse scan).
+        let goal = agent.goal();
         let shared = Arc::new(Mutex::new(Shared {
             log: replay,
             events,
             status,
             compaction_streaming: false,
             commands_open: true,
+            goal,
         }));
         let handler_shared = shared.clone();
         agent.set_event_handler(Box::new(move |event| {
@@ -509,6 +560,12 @@ impl SessionRunner {
                     output: output.clone(),
                     label: label.clone(),
                 })
+            }
+            // Goal updates fan out as one live event after durable commit
+            // (UI Notice line + GoalBar refresh), never as a user prompt.
+            SessionEntry::GoalUpdated { goal } => {
+                self.shared.lock().unwrap().goal = goal.clone();
+                Some(AgentEvent::GoalUpdated { goal: goal.clone() })
             }
             _ => None,
         };
@@ -577,6 +634,190 @@ impl SessionRunner {
         self.shared.lock().unwrap().emit(AgentEvent::Error(text));
     }
 
+    /// Apply + persist one human goal command. Errors are plain strings
+    /// (the caller emits them as `AgentEvent::Error`); the model tool path
+    /// reuses the same transition rules under an id + revision CAS.
+    async fn apply_goal_command(&mut self, command: GoalCommand) -> Result<(), String> {
+        let entry = match command {
+            GoalCommand::Create {
+                objective,
+                success_criteria,
+            } => {
+                let goal = crate::agent::create_goal(
+                    self.agent.goal().as_ref(),
+                    objective,
+                    success_criteria,
+                )?;
+                SessionEntry::GoalUpdated { goal: Some(goal) }
+            }
+            GoalCommand::Action(action) => {
+                let current = self.agent.goal();
+                let Some(goal) = &current else {
+                    return Err("no goal is set for this session".into());
+                };
+                let next = crate::agent::transition_goal(
+                    current.as_ref(),
+                    &goal.id,
+                    goal.revision,
+                    &action,
+                    None,
+                    Vec::new(),
+                )?;
+                SessionEntry::GoalUpdated { goal: next }
+            }
+        };
+        self.commit(entry).await.map_err(|e| format!("{e:#}"))
+    }
+
+    /// Intercepted `get_goal` / `update_goal` tool execution (the model
+    /// never creates goals; updates carry id + revision CAS and the new
+    /// snapshot is durably committed here). Both tools are STRICT about
+    /// unknown fields: misspelled/extra keys are rejected before any
+    /// transition or commit, as a plain model-facing tool error.
+    async fn execute_goal_tool(&mut self, call: &ToolCall) -> Result<ToolOutput, String> {
+        let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
+            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
+        // Reject any key outside the tool's allowed set BEFORE anything
+        // else: a misspelled field must surface as a plain tool error that
+        // names it, never a silent ignore or a half-applied transition.
+        fn reject_unknown_goal_fields(
+            object: &serde_json::Map<String, serde_json::Value>,
+            allowed: &[&str],
+            tool: &str,
+        ) -> Result<(), String> {
+            let unknown: Vec<&str> = object
+                .keys()
+                .filter(|key| !allowed.contains(&key.as_str()))
+                .map(String::as_str)
+                .collect();
+            if unknown.is_empty() {
+                return Ok(());
+            }
+            Err(format!(
+                "{tool} received unknown field(s): {}",
+                unknown
+                    .iter()
+                    .map(|key| format!("`{key}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+        match call.name.as_str() {
+            "get_goal" => {
+                // get_goal is a read: only the empty object is accepted.
+                let object = arguments
+                    .as_object()
+                    .ok_or("get_goal arguments must be a JSON object")?;
+                reject_unknown_goal_fields(object, &[], "get_goal")?;
+                Ok(ToolOutput::text(match self.agent.goal() {
+                    Some(goal) => crate::agent::goal_snapshot_json(&goal),
+                    None => "No goal is set for this session. Goals are created by the user \
+                             (/goal set …); you can update an existing one with update_goal."
+                        .into(),
+                }))
+            }
+            "update_goal" => {
+                let object = arguments
+                    .as_object()
+                    .ok_or("update_goal arguments must be a JSON object")?;
+                reject_unknown_goal_fields(
+                    object,
+                    &[
+                        "id",
+                        "revision",
+                        "action",
+                        "progress",
+                        "blocked_reason",
+                        "success_criteria",
+                        "evidence",
+                    ],
+                    "update_goal",
+                )?;
+                let id = object
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("update_goal requires `id` (a string)")?
+                    .to_owned();
+                let revision = object
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or("update_goal requires `revision` (an integer)")?;
+                let action = match object.get("action").and_then(serde_json::Value::as_str) {
+                    Some("progress") => crate::agent::GoalAction::Progress {
+                        progress: object
+                            .get("progress")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or("action `progress` requires `progress`")?
+                            .to_owned(),
+                    },
+                    Some("pause") => crate::agent::GoalAction::Pause,
+                    Some("resume") => crate::agent::GoalAction::Resume,
+                    Some("block") => crate::agent::GoalAction::Block {
+                        reason: object
+                            .get("blocked_reason")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or("action `block` requires `blocked_reason`")?
+                            .to_owned(),
+                    },
+                    Some("complete") => crate::agent::GoalAction::Complete,
+                    Some("clear") => crate::agent::GoalAction::Clear,
+                    other => {
+                        return Err(format!(
+                            "unknown update_goal action `{}` (known: progress, pause, resume, \
+                             block, complete, clear)",
+                            other.unwrap_or("")
+                        ));
+                    }
+                };
+                // Strict string-array validation: a present but non-array
+                // (or non-string-item) `success_criteria` / `evidence` is a
+                // plain tool error, never silently filtered.
+                fn string_array(
+                    object: &serde_json::Map<String, serde_json::Value>,
+                    key: &str,
+                ) -> Result<Option<Vec<String>>, String> {
+                    match object.get(key) {
+                        None => Ok(None),
+                        Some(serde_json::Value::Array(items)) => {
+                            let mut out = Vec::with_capacity(items.len());
+                            for item in items {
+                                match item.as_str() {
+                                    Some(text) => out.push(text.to_owned()),
+                                    None => {
+                                        return Err(format!("`{key}` must be an array of strings"));
+                                    }
+                                }
+                            }
+                            Ok(Some(out))
+                        }
+                        Some(_) => Err(format!("`{key}` must be an array of strings")),
+                    }
+                }
+                let success_criteria = string_array(object, "success_criteria")?;
+                let evidence = string_array(object, "evidence")?.unwrap_or_default();
+                let next = crate::agent::transition_goal(
+                    self.agent.goal().as_ref(),
+                    &id,
+                    revision,
+                    &action,
+                    success_criteria,
+                    evidence,
+                )?;
+                self.commit(SessionEntry::GoalUpdated { goal: next.clone() })
+                    .await
+                    .map_err(|error| format!("{error:#}"))?;
+                match next {
+                    Some(goal) => Ok(ToolOutput::text(format!(
+                        "goal updated:\n{}",
+                        crate::agent::goal_projection_text(&goal)
+                    ))),
+                    None => Ok(ToolOutput::text("goal cleared.")),
+                }
+            }
+            other => Err(format!("unknown goal tool: {other}")),
+        }
+    }
+
     fn status(&self, status: SessionStatus) {
         // Turn-boundary metadata touch (R4): the sessions audit table is
         // appended once per return to Idle — not per event (double-write
@@ -639,6 +880,11 @@ impl SessionRunner {
                     Some(PendingCommand::Compact) => {
                         self.pending.pop_front();
                     }
+                    // Goal mutations are dropped while terminating: the
+                    // session is ending, nothing will apply them.
+                    Some(PendingCommand::Goal(_)) => {
+                        self.pending.pop_front();
+                    }
                     None => unreachable!(),
                 }
             }
@@ -671,6 +917,10 @@ impl SessionRunner {
             }
             SessionCommand::Compact => {
                 self.pending.push_back(PendingCommand::Compact);
+                Steering::None
+            }
+            SessionCommand::Goal(command) => {
+                self.pending.push_back(PendingCommand::Goal(command));
                 Steering::None
             }
             SessionCommand::SwitchModel(model) => {
@@ -965,6 +1215,18 @@ impl SessionRunner {
                 }
                 continue;
             }
+            // Human goal mutation: apply + persist + fan out, then loop.
+            // Must run before take_prompt_batch (an unconsumed Goal at the
+            // front would start a turn with an empty prompt).
+            if matches!(self.pending.front(), Some(PendingCommand::Goal(_))) {
+                let Some(PendingCommand::Goal(command)) = self.pending.pop_front() else {
+                    unreachable!()
+                };
+                if let Err(text) = self.apply_goal_command(command).await {
+                    self.shared.lock().unwrap().emit(AgentEvent::Error(text));
+                }
+                continue;
+            }
             if self.pending.is_empty() {
                 // An operation may complete in the same scheduling turn as a sender
                 // queues follow-up work. Drain every command already ready before
@@ -1220,6 +1482,47 @@ impl SessionRunner {
                         name: call.name.clone(),
                         arguments: call.arguments.clone(),
                     });
+                    // Goal tools are intercepted by the runner: they need
+                    // the session's goal state + durable commit, which a
+                    // plain tool cannot reach. They never create goals.
+                    if call.name == "get_goal" || call.name == "update_goal" {
+                        let result = self.execute_goal_tool(&call).await;
+                        let (tool_text, images) = match &result {
+                            Ok(output) => (output.content.clone(), output.images.clone()),
+                            Err(error) => (error.clone(), Vec::new()),
+                        };
+                        let is_error = result.is_err();
+                        let entry = Message::Tool {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            content: tool_text.clone(),
+                            images,
+                            is_error,
+                            synthetic: false,
+                        }
+                        .into();
+                        if let Err(error) = self.commit(entry).await {
+                            self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                                .await;
+                            return;
+                        }
+                        self.agent.emit_event(AgentEvent::ToolResult {
+                            is_error,
+                            content: tool_text,
+                        });
+                        let steering = self.intake_after_operation(Vec::new());
+                        if steering != Steering::None {
+                            self.shared
+                                .lock()
+                                .unwrap()
+                                .emit(AgentEvent::Notice("turn cancelled".into()));
+                            if self.release_after_preempt(steering) {
+                                return;
+                            }
+                            break 'turn;
+                        }
+                        continue;
+                    }
                     let waited = await_tool(&mut self.agent, &call, &mut self.commands).await;
                     let result = match waited.outcome {
                         WaitOutcome::Completed(result) => result,
@@ -1356,6 +1659,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
         // Harness errors are durable and replay as Error events, so a
         // resumed or late-attached view sees the audit trail.
         SessionEntry::Error { text } => Some(AgentEvent::Error(text.clone())),
+        SessionEntry::GoalUpdated { goal } => Some(AgentEvent::GoalUpdated { goal: goal.clone() }),
     }
 }
 

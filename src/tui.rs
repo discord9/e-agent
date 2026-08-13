@@ -392,6 +392,9 @@ async fn run_inner(
     for event in snapshot {
         state.push_event(UiEvent { session: 0, event });
     }
+    // Seed the fixed GoalBar from the runner's fold (snapshot replay covers
+    // GoalUpdated events; this also covers the never-set/cleared case).
+    state.goal = handle.goal();
     state.session_id = labels.session.clone();
     state.model_name = labels.model.clone();
     state.cwd = labels.cwd.clone();
@@ -622,6 +625,8 @@ async fn handle_pressed_key(
             handle_btw(command, state).await;
         } else if let Some(command) = parse_fork(&prompt) {
             handle_fork(command, state).await;
+        } else if let Some(command) = parse_goal(&prompt) {
+            handle_goal(command, state, handle);
         } else {
             if !state.session_title_set {
                 set_terminal_title(&sanitize_title(&prompt));
@@ -640,7 +645,8 @@ const HELP_TEXT: &str = "\
 /rename <标题> - 重命名会话
 /btw <问题> - fork 旁路 subagent
 /fork - 从历史消息 fork
-/undo - 撤销文件操作";
+/undo - 撤销文件操作
+/goal - 查看/设置当前 goal（/goal set <目标>，/goal pause|resume|clear）";
 
 /// Detailed per-command help, shown by `/help <命令>` (kept in sync with
 /// the web UI's `/help <命令>` in `src/ui/sessions.js`). Each entry is
@@ -669,6 +675,10 @@ const HELP_DETAILS: &[(&str, &str)] = &[
     (
         "help",
         "/help [命令] - 显示帮助。\n用法：/help（命令列表）或 /help <命令>（如 /help fork）。",
+    ),
+    (
+        "goal",
+        "/goal - 查看/设置当前 goal。\n用法：/goal（查看）；/goal set <目标>（创建，需无当前 goal 或旧 goal 已完成）；/goal pause|resume|clear（暂停/恢复/清除）。\n注意：goal 每次变化以完整快照追加进会话历史，跨压缩/恢复/重开保留；模型可通过 get_goal/update_goal 工具读取和更新，但只有人能创建。",
     ),
 ];
 
@@ -1051,6 +1061,81 @@ async fn handle_fork(command: ForkCommand, state: &mut TuiState) {
             "已 fork 到新会话：{new_id}（保留 {prefix_len} 条历史）。新终端用 --session {new_id} 打开。"
         ))),
         Err(error) => state.push_agent_event(AgentEvent::Notice(format!("无法 fork：{error:#}"))),
+    }
+}
+
+/// A parsed `/goal` command.
+#[derive(Debug, PartialEq, Eq)]
+enum GoalCommand {
+    /// Bare `/goal` — show the current goal.
+    Show,
+    /// `/goal set <objective>` — create revision 1 (human-only).
+    Set(String),
+    /// `/goal pause|resume|clear` — act on the current goal.
+    Action(crate::agent::GoalAction),
+    /// Unrecognized argument — show usage.
+    Usage,
+}
+
+/// Parse a `/goal` command; `None` for anything else (stays a prompt).
+fn parse_goal(prompt: &str) -> Option<GoalCommand> {
+    if prompt == "/goal" {
+        return Some(GoalCommand::Show);
+    }
+    let rest = prompt.strip_prefix("/goal ")?.trim();
+    if rest.is_empty() {
+        return Some(GoalCommand::Show);
+    }
+    match rest {
+        "pause" => Some(GoalCommand::Action(crate::agent::GoalAction::Pause)),
+        "resume" => Some(GoalCommand::Action(crate::agent::GoalAction::Resume)),
+        "clear" => Some(GoalCommand::Action(crate::agent::GoalAction::Clear)),
+        _ => rest
+            .strip_prefix("set ")
+            .filter(|objective| !objective.trim().is_empty())
+            .map(|objective| GoalCommand::Set(objective.trim().to_owned()))
+            .or(Some(GoalCommand::Usage)),
+    }
+}
+
+/// Run a `/goal` command: show the snapshot as a Notice; mutations are
+/// queued through the runner, which persists the `GoalUpdated` entry and
+/// fans out the confirmation/error as events (the scrollback reflects the
+/// durable state, never a local guess). Shared by the main view and
+/// attached subagent views (the latter act on their own handle).
+fn handle_goal(command: GoalCommand, state: &mut TuiState, handle: &RunnerHandle) {
+    let mut queued = true;
+    match command {
+        GoalCommand::Show => match handle.goal() {
+            Some(goal) => state.push_agent_event(AgentEvent::Notice(format!(
+                "goal [{}] {} ({}, rev {})",
+                goal.status.label(),
+                goal.objective,
+                goal.id,
+                goal.revision
+            ))),
+            None => state.push_agent_event(AgentEvent::Notice(
+                "no goal set（创建：/goal set <目标>）".to_owned(),
+            )),
+        },
+        GoalCommand::Set(objective) => {
+            queued = handle.goal_command(crate::runner::GoalCommand::Create {
+                objective,
+                success_criteria: Vec::new(),
+            });
+        }
+        GoalCommand::Action(action) => {
+            queued = handle.goal_command(crate::runner::GoalCommand::Action(action));
+        }
+        GoalCommand::Usage => state.push_agent_event(AgentEvent::Notice(
+            "用法：/goal（查看）；/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）"
+                .to_owned(),
+        )),
+    }
+    if !queued {
+        state.push_agent_event(AgentEvent::Notice(
+            "goal command not accepted: session is finished or closed".to_owned(),
+        ));
     }
 }
 

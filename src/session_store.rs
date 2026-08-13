@@ -324,6 +324,7 @@ pub(crate) fn entry_kind(entry: &SessionEntry) -> &'static str {
         SessionEntry::BackgroundCompletion { .. } => "background_completion",
         SessionEntry::ForkedFrom { .. } => "forked_from",
         SessionEntry::Error { .. } => "error",
+        SessionEntry::GoalUpdated { .. } => "goal_updated",
     }
 }
 

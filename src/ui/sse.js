@@ -249,6 +249,17 @@ function handleSSEBlock(block, id, wsId, epoch) {
         renderHistory(entries);
         state.initSource = "snapshot";
       }
+      // GoalBar：snapshot 里最新的 goal_updated（set 或 clear 墓碑）折叠
+      // 出来刷新 GoalBar——history 失败走 snapshot 兜底时 GET /goal 可能
+      // 还没返回，这里保证 GoalBar 不依赖那次 GET；幂等，无 stale 风险
+      //（handleSSEBlock 顶部已校验三元组）。
+      let snapshotGoal = undefined;   // undefined = snapshot 无 goal_updated
+      for (const ev of entries) {
+        if (ev && ev.type === "goal_updated" && ev.data && "goal" in ev.data) {
+          snapshotGoal = ev.data.goal;   // null = cleared
+        }
+      }
+      if (snapshotGoal !== undefined) renderGoalBar(snapshotGoal);
     }
     return;
   }
@@ -279,6 +290,7 @@ function handleSSEBlock(block, id, wsId, epoch) {
       notice: "Notice", error: "Error",
       background_completed: "BackgroundCompleted",
       background_completion_notice: "BackgroundCompletionNotice",
+      goal_updated: "GoalUpdated",   // set 与 clear（goal:null）都刷新 GoalBar
       usage: "Usage",
     };
     try {
@@ -371,6 +383,17 @@ function applyLiveEvent(name, payload) {
     case "PromptConsumed":
       queuePromptConsumed();
       break;
+    case "GoalUpdated": {
+      // goal 快照/墓碑：刷新 GoalBar + 一行 notice（与历史 goal_updated
+      // 渲染一致；不当作普通用户消息）。
+      const p = (payload && typeof payload === "object") ? payload : {};
+      const goal = p.goal || null;
+      renderGoalBar(goal);
+      appendNotice(goal
+        ? "goal [" + (goal.status || "?") + "] " + (goal.objective || "")
+        : "goal cleared");
+      break;
+    }
     default:
       // 后端未知事件类型：不渲染、不崩，只留 console 警告（诊断辅助）
       console.warn("[SSE] 未知事件类型，已跳过：", name, payload);

@@ -64,6 +64,13 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
             // visible (not just the head).
             queued.len() as u16
         };
+        // Fixed GoalBar: one row above the tasks/input while a goal exists
+        // (current session's goal, or the attached subagent view's own).
+        let goal = state
+            .attached
+            .as_ref()
+            .map_or(&state.goal, |attached| &attached.state.goal);
+        let goal_height = u16::from(goal.is_some());
         let running: Vec<crate::tools::BackgroundTaskInfo> = state
             .background
             .as_ref()
@@ -95,19 +102,61 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
             String::new()
         };
         let output_line_count = selected_output.lines().count().min(OUTPUT_LINES);
-        let tasks_height = if state.show_tasks {
+        let mut tasks_height = if state.show_tasks {
             // border (2) + header (1) + one row per task + output tail
             (running.len() as u16 + 3 + output_line_count as u16).max(3)
         } else {
             u16::from(!running.is_empty())
         };
-        let [output, queue_bar, tasks_bar, input] = Layout::vertical([
+        let mut goal_height = goal_height;
+        let mut queue_height = queue_height;
+        // Tiny-terminal clamp: the input (and its cursor) keeps absolute
+        // priority. When the fixed bars would starve it, drop whole bars in
+        // reverse importance — tasks first (F2 reopens the panel), then the
+        // informational GoalBar, then the transient queue. Ratatui's solver
+        // would otherwise squeeze the LAST Length (the input) to zero on a
+        // short terminal, pushing the cursor out of bounds.
+        let mut fixed = queue_height + goal_height + tasks_height;
+        if usize::from(frame.area().height) < usize::from(input_height) + usize::from(fixed) {
+            fixed -= tasks_height;
+            tasks_height = 0;
+            if usize::from(frame.area().height) < usize::from(input_height) + usize::from(fixed) {
+                fixed -= goal_height;
+                goal_height = 0;
+                if usize::from(frame.area().height) < usize::from(input_height) + usize::from(fixed)
+                {
+                    queue_height = 0;
+                }
+            }
+        }
+        let [output, queue_bar, goal_bar, tasks_bar, input] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(queue_height),
+            Constraint::Length(goal_height),
             Constraint::Length(tasks_height),
             Constraint::Length(input_height),
         ])
         .areas(frame.area());
+        if goal_height > 0
+            && let Some(goal) = goal
+        {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    format!(
+                        "🎯 [{}] {} (rev {})",
+                        goal.status.label(),
+                        preview(&goal.objective, 60),
+                        goal.revision
+                    ),
+                    Style::default()
+                        .fg(SOLARIZED_LIGHT.muted)
+                        .bg(SOLARIZED_LIGHT.panel)
+                        .add_modifier(Modifier::DIM),
+                ))
+                .style(SOLARIZED_LIGHT.panel_style()),
+                goal_bar,
+            );
+        }
         if queue_height > 0 {
             let queued_lines: Vec<Line> = queued
                 .iter()

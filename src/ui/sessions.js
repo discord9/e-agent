@@ -639,6 +639,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
   state.renameActive = false;  // 切换会话会销毁编辑框：清标志，恢复轮询重绘
   stopSSE();
   state.sessionId = id;
+  renderGoalBar(null);       // 会话切换开始：立即清空旧会话的 GoalBar（防陈旧残留）
   state.sessionUsage = null;   // 旧会话的累计用量不串到新会话（openWith 会重拉）
   state.lastUsage = null;      // 旧会话的 live Usage 同样不串（防旧 context 配新累计）
   // 侧边栏是唯一导航，轮询常驻以保持会话树/busy 状态新鲜。
@@ -697,6 +698,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
     openWith(id, true, onReady, wsId, claimed, timeoutMs);   // onReady 在 loadHistory 渲染完成后触发
   }
   if (!els.sidebar.hidden) renderSidebarTree();   // 更新 .current 高亮（侧边栏可见时）
+  fetchGoal();   // 会话切换/恢复：从 GET /goal 初始化 GoalBar（只读；SSE 也会刷新）
 }
 
 /* 发送 / 取消 / 压缩 */
@@ -712,6 +714,7 @@ const SLASH_COMMANDS = [
   { name: "/model", desc: "切换当前会话模型", args: "<profile>" },
   { name: "/rename", desc: "重命名当前会话", args: "<标题>" },
   { name: "/btw", desc: "fork 旁路 subagent 继续探讨", args: "<问题>" },
+  { name: "/goal", desc: "查看/设置当前 goal（人类创建）", args: "[set <目标>|pause|resume|clear]" },
   { name: "/fork", desc: "从历史消息 fork 出新会话", args: "" },
   { name: "/undo", desc: "撤销最近的文件操作", args: "" },
   { name: "/help", desc: "显示所有命令及用法", args: "[命令]" },
@@ -1041,6 +1044,7 @@ async function sendPrompt() {
       compact: "/compact - 压缩上下文（触发上下文压缩），释放 token 继续长对话。\n用法：/compact（无参数）。",
       rename: "/rename <标题> - 重命名当前会话。\n用法：/rename 新标题；/rename（无参数）显示用法；/rename 后只跟空白则清除标题。",
       btw: "/btw <问题> - fork 旁路 subagent 继续探讨。\n用法：/btw 为什么……？\n注意：主会话不受影响，新 subagent 可在侧边栏切换。",
+      goal: "/goal [set <目标>|pause|resume|clear] - 查看/设置当前 goal。\n用法：/goal（查看）；/goal set <目标>（创建，需无当前 goal 或旧 goal 已完成）；/goal pause|resume|clear（状态操作）。\n注意：goal 每次变化以完整快照追加进会话历史；模型只能通过 get_goal/update_goal 更新，只有人能创建。",
       fork: "/fork [N] - 从历史消息 fork 出新会话。\n用法：/fork（默认最近完成的回合边界）或 /fork N（从最新往上第 N 个完成的回合边界）。\n注意：网页端 /fork 会弹出面板选择 fork 边界。",
       undo: "/undo - 撤销最近一次文件操作（edit_file / write_file）。\n用法：/undo（无参数）。\n注意：撤销后该操作不可重做；连续 /undo 可逐条向前撤销。",
       help: "/help [命令] - 显示帮助。\n用法：/help（命令列表）或 /help <命令>（如 /help fork）。",
@@ -1051,6 +1055,7 @@ async function sendPrompt() {
         "/compact - 压缩上下文",
         "/rename <标题> - 重命名会话",
         "/btw <问题> - fork 旁路 subagent",
+        "/goal [set <目标>|pause|resume|clear] - 当前 goal",
         "/fork - 从历史消息 fork",
         "/undo - 撤销文件操作",
       ].join("\n"));
@@ -1145,6 +1150,65 @@ async function sendPrompt() {
     }
     return;
   }
+  if (raw === "/goal") {
+    // 查看：GET 只读拉取并显示（不 POST /prompt、不本地猜状态）；带
+    // stale guard —— 期间切换会话/workspace 则丢弃结果，banner 不报旧状态
+    const sid = state.sessionId, wid = state.workspace.id, ep = sessionOpenEpoch;
+    fetchGoal(sid, wid, ep).then((rendered) => {
+      if (state.sessionId !== sid || state.workspace.id !== wid || sessionOpenEpoch !== ep) return;
+      const bar = els.goalBar;
+      if (rendered && bar && !bar.hidden) setBanner("当前 goal：" + bar.textContent);
+      else setBanner("当前无 goal（创建：/goal set <目标>）");
+    });
+    return;
+  }
+  if (raw.startsWith("/goal ")) {
+    const rest = raw.slice("/goal ".length).trim();
+    const isAction = rest === "pause" || rest === "resume" || rest === "clear";
+    if (rest === "set" || (!isAction && !rest.startsWith("set "))) {
+      setBanner("用法：/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal（查看）");
+      return;   // 保留输入框
+    }
+    const action = isAction ? rest : "set";
+    const objective = action === "set" ? rest.slice(4).trim() : "";
+    if (action === "set" && !objective) {
+      setBanner("用法：/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal（查看）");
+      return;   // 保留输入框
+    }
+    // POST 前同步捕获三元组；URL 只用捕获的 sid。迟到响应（await 后用户
+    // 已切换会话/workspace）必须对当前会话完全 no-op：不清输入、不 banner、
+    // 不刷新 GoalBar、不额外 GET 当前会话。
+    const sid = state.sessionId, wid = state.workspace.id, ep = sessionOpenEpoch;
+    const stillCurrent = () =>
+      state.sessionId === sid && state.workspace.id === wid && sessionOpenEpoch === ep;
+    try {
+      const body = action === "set" ? { action: "set", objective } : { action };
+      const res = await api("/api/sessions/" + encodeURIComponent(sid) + "/goal",
+        { method: "POST", body: JSON.stringify(body) });
+      if (res.status === 401 || res.status === 403) {
+        if (!stillCurrent()) return;   // 迟到认证错误：完全 no-op
+        setBanner("⚠ 认证失败：请检查 Token。");
+        return;
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        if (!stillCurrent()) return;   // 迟到 409：完全 no-op（保留当前会话输入/banner/bar）
+        setBanner("⚠ " + (text || ("HTTP " + res.status)), true);
+        return;   // 保留输入框
+      }
+      if (!stillCurrent()) return;     // 迟到 202：完全 no-op
+      els.promptInput.value = "";
+      autosizeInput();
+      // 202 = 已接受（异步持久化）；不宣称「已完成」，GoalBar 在 durable
+      // GoalUpdated（SSE）或随后的 GET 刷新后展示真实状态。
+      setBanner("goal 请求已接受（" + action + "）");
+      fetchGoal(sid, wid, ep);   // 捕获三元组刷新 GoalBar（内部 stale guard；绝不刷新当前会话）
+    } catch (e) {
+      if (!stillCurrent()) return;     // 迟到异常：完全 no-op
+      setBanner("⚠ goal 操作失败：" + e.message, true);
+    }
+    return;
+  }
   if (raw === "/fork") {
     openForkMenu();
     return;   // 保留输入框；面板选中成功后才清空（selectForkItem）
@@ -1189,6 +1253,56 @@ async function compactSession() {
     appendNotice("⏳ 压缩请求已提交…");
   } catch (e) {
     setBanner("⚠ 压缩失败：" + e.message);
+  }
+}
+
+/* =====================================================================
+ * GoalBar（紧凑固定一行）：当前会话 goal 的只读投影。更新来源有二，
+ * 幂等：SSE GoalUpdated live 事件（runner 持久化后的唯一扇出）与
+ * GET /api/sessions/{id}/goal（会话切换/恢复初始化、/goal 操作后刷新）。
+ * 人类变更只有一条持久化路径：/goal 命令 → POST /goal → SessionHandle
+ * 命令 → runner 持久化 → SSE；本函数从不本地臆造状态。
+ * ===================================================================*/
+function renderGoalBar(goal) {
+  const bar = els.goalBar;
+  if (!bar) return;
+  if (!goal || typeof goal !== "object") {
+    bar.hidden = true;
+    bar.textContent = "";
+    bar.title = "";
+    return;
+  }
+  const criteria = (Array.isArray(goal.success_criteria) && goal.success_criteria.length)
+    ? " · " + goal.success_criteria.slice(0, 2).join("；") : "";
+  bar.textContent = "🎯 [" + (goal.status || "?") + "] " + (goal.objective || "") + criteria
+    + " (rev " + (goal.revision == null ? "?" : goal.revision) + ")";
+  bar.title = "goal " + (goal.id || "");
+  bar.hidden = false;
+}
+
+async function fetchGoal(id, wsId, epoch) {
+  // Stale guard: capture the (session, workspace, epoch) triple and verify
+  // it AFTER every await — a delayed response from an old session must
+  // never paint over the new session's GoalBar.
+  const sid = (id !== undefined) ? id : state.sessionId;
+  if (!sid) return false;
+  const wid = (wsId !== undefined) ? wsId : state.workspace.id;
+  const ep = (epoch !== undefined) ? epoch : sessionOpenEpoch;
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(sid) + "/goal");
+    if (!res.ok) return false;
+    if (state.sessionId !== sid || state.workspace.id !== wid || ep !== sessionOpenEpoch) {
+      return false;   // 会话/workspace/代次已变：丢弃陈旧响应
+    }
+    const data = await res.json();
+    if (state.sessionId !== sid || state.workspace.id !== wid || ep !== sessionOpenEpoch) {
+      return false;
+    }
+    renderGoalBar(data && data.goal);
+    return true;
+  } catch (e) {
+    // GoalBar 非关键路径：失败静默，SSE GoalUpdated 仍会刷新
+    return false;
   }
 }
 

@@ -252,6 +252,10 @@ fn tools_with_background_and_exa_key(
     {
         tools.push(Box::new(WebSearch::new(key)));
     }
+    // Goal tools ride on every session (main + subagents): each session's
+    // runner executes them against ITS OWN goal state, so a subagent can
+    // never touch its parent's goal.
+    tools.extend(goal_tools());
     tools
 }
 
@@ -260,6 +264,23 @@ fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> 
         name: name.into(),
         description: description.into(),
         parameters: json!({"type": "object", "properties": properties, "required": required}),
+    }
+}
+
+/// Goal-only spec builder: the Goal schemas are CLOSED
+/// (`additionalProperties: false`) so misspelled/unknown fields are
+/// rejected by the provider's schema validation AND by the runner at
+/// runtime. Generic tool schemas stay open.
+fn goal_spec(name: &str, description: &str, properties: Value, required: &[&str]) -> ToolSpec {
+    ToolSpec {
+        name: name.into(),
+        description: description.into(),
+        parameters: json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false
+        }),
     }
 }
 
@@ -300,10 +321,61 @@ fn optional_bool(arguments: &Value, name: &str) -> Result<bool, String> {
         .map(|value| value.unwrap_or(false))
 }
 
+/// `get_goal` / `update_goal`: the RUNNER intercepts their execution by
+/// name (the session's goal state + durable commit live in the runner);
+/// the fallback `execute` only fires on direct `Agent::run` paths (tests).
+pub struct GetGoal;
+pub struct UpdateGoal;
+
+pub fn goal_tools() -> Vec<Box<dyn Tool>> {
+    vec![Box::new(GetGoal), Box::new(UpdateGoal)]
+}
+
+#[async_trait::async_trait]
+impl Tool for GetGoal {
+    fn spec(&self) -> ToolSpec {
+        goal_spec(
+            "get_goal",
+            "Read the session's current goal as a FULL JSON snapshot: id, revision, objective, success_criteria, status, progress, evidence, blocked_reason. Goals are created by the user (/goal set …), never by the model.",
+            json!({}),
+            &[],
+        )
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Err("get_goal is executed by the session runner".into())
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for UpdateGoal {
+    fn spec(&self) -> ToolSpec {
+        goal_spec(
+            "update_goal",
+            "Update the session's goal under an id + revision CAS (revision from get_goal). Actions: progress (set `progress`), pause, resume, block (set `blocked_reason`), complete (requires non-empty `evidence` in the SAME call; pure analysis may use an explicit `unverified: <analysis>` string), clear. `evidence` (string array) appends evidence. Never creates a goal.",
+            json!({
+                "id": {"type": "string", "description": "goal id from get_goal"},
+                "revision": {"type": "integer", "description": "current revision from get_goal (CAS)"},
+                "action": {"type": "string", "enum": ["progress", "pause", "resume", "block", "complete", "clear"]},
+                "progress": {"type": "string", "description": "required for action=progress"},
+                "blocked_reason": {"type": "string", "description": "required for action=block"},
+                "success_criteria": {"type": "array", "items": {"type": "string"}, "description": "replaces the goal's success criteria"},
+                "evidence": {"type": "array", "items": {"type": "string"}, "description": "appends evidence (required non-empty for complete)"}
+            }),
+            &["id", "revision", "action"],
+        )
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Err("update_goal is executed by the session runner".into())
+    }
+}
+
 #[cfg(test)]
 #[path = "tools_tests.rs"]
 mod tests;
 
+/// Windows restricted-token sandbox tests: `#[cfg(all(test, windows))]`
+/// (compiled only when running the test suite on Windows, where the
+/// write-restriction code paths are real).
 #[cfg(all(test, windows))]
 #[path = "tools/windows_sandbox_tests.rs"]
 mod windows_sandbox_tests;
