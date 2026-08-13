@@ -257,9 +257,17 @@ impl Tool for EditFile {
         let old_lf = normalize_lf(old).0;
         let new_lf = normalize_lf(new).0;
         let count = content_lf.match_indices(&old_lf).count();
-        if count != 1 {
+        if count == 0 {
             return Err(format!(
-                "expected `old` exactly once, found {count} occurrences"
+                "expected `old` exactly once, found 0 occurrences: `old` does not appear in {path} — \
+                 use `read_file` to re-read the file and copy the exact text verbatim (watch \
+                 whitespace, indentation and line endings)"
+            ));
+        }
+        if count > 1 {
+            return Err(format!(
+                "expected `old` exactly once, found {count} occurrences: `old` appears {count} times in \
+                 {path} — add more surrounding context to `old` until it matches exactly once"
             ));
         }
         let start = content_lf.match_indices(&old_lf).next().unwrap().0;

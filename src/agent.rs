@@ -300,8 +300,11 @@ pub enum Message {
 pub struct AssistantMessage {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
-    /// Model reasoning, persisted for display/audit only. Never sent back
-    /// to the provider (see WireMessage).
+    /// Model reasoning, persisted for display/audit only. By default never
+    /// sent back to the provider (see WireMessage); the sole exception is
+    /// the explicit DeepSeek compatibility profile (`deepseek_compat =
+    /// true`) with thinking mode on a tool-call assistant turn, where the
+    /// original `reasoning_content` must be echoed back to the API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
 }

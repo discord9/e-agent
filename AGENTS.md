@@ -41,7 +41,9 @@ without an explicit user request.
 - Single crate: `src/lib.rs` core + `src/main.rs` thin frontend.
 - Streaming `/chat/completions` and ChatGPT Codex `/responses` (SSE) with full
   transcript replay; persisted reasoning is display/audit only and is never
-  replayed to either provider wire.
+  replayed to either provider wire — the sole exception is an explicit
+  DeepSeek Chat compatibility profile (`deepseek_compat = true`), which
+  replays `reasoning_content` on thinking-mode tool-call assistant turns.
 - Tool errors return to the model as `role:"tool"` messages; they never
   crash the agent loop.
 - File tools stay cap-std capability-relative; `bash` is not sandboxed by
@@ -51,9 +53,15 @@ without an explicit user request.
   stay plain strings.
 - API key files must never be committed (they are gitignored).
 - Reasoning-model `reasoning_content` is persisted in the session for
-  display/audit only and is never echoed back to the API
-  (OpenAI/Kimi convention; Anthropic thinking blocks would be a wire-level
-  change, not an agent-level one).
+  display/audit only and is never echoed back to the API by default
+  (OpenAI/Kimi/Codex convention; Anthropic thinking blocks would be a
+  wire-level change, not an agent-level one). The ONLY exception is an
+  explicit DeepSeek Chat compatibility profile: when `deepseek_compat =
+  true`, `thinking = true` and the assistant message carries `tool_calls`,
+  the original `reasoning_content` (including an empty string) is echoed
+  back on the next request — DeepSeek's thinking-mode contract requires it.
+  This is per-profile explicit opt-in, never inferred from provider/model
+  strings.
 - Background task completions are injected at model-call boundaries within
   an active turn. When the agent is idle (TUI/REPL), a completion is
   delivered as a user message that starts a new turn.

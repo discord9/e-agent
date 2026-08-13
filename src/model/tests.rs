@@ -24,6 +24,7 @@ fn converts_internal_messages_and_function_schemas() {
         "test-model",
         None,
         false,
+        false,
         &[
             Message::Assistant(AssistantMessage {
                 content: None,
@@ -71,6 +72,7 @@ fn omits_empty_tool_calls_on_plain_assistant_messages() {
         "test-model",
         None,
         false,
+        false,
         &[Message::Assistant(AssistantMessage {
             content: Some("done".into()),
             tool_calls: vec![],
@@ -86,21 +88,23 @@ fn omits_empty_tool_calls_on_plain_assistant_messages() {
 
 #[test]
 fn serializes_reasoning_effort_at_the_top_level() {
-    let request = ChatRequest::from_internal("test-model", Some("max"), false, &[], &[], None);
+    let request =
+        ChatRequest::from_internal("test-model", Some("max"), false, false, &[], &[], None);
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["reasoning_effort"], "max");
 }
 
 #[test]
 fn omits_reasoning_effort_when_unset() {
-    let request = ChatRequest::from_internal("test-model", None, false, &[], &[], None);
+    let request = ChatRequest::from_internal("test-model", None, false, false, &[], &[], None);
     let value = serde_json::to_value(request).unwrap();
     assert!(value.get("reasoning_effort").is_none());
 }
 
 #[test]
 fn serializes_thinking_switch_when_enabled() {
-    let request = ChatRequest::from_internal("test-model", Some("max"), true, &[], &[], None);
+    let request =
+        ChatRequest::from_internal("test-model", Some("max"), true, false, &[], &[], None);
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["thinking"]["type"], "enabled");
 }
@@ -111,6 +115,7 @@ fn omits_thinking_switch_when_disabled_or_without_effort() {
     let disabled = serde_json::to_value(ChatRequest::from_internal(
         "test-model",
         Some("max"),
+        false,
         false,
         &[],
         &[],
@@ -124,6 +129,7 @@ fn omits_thinking_switch_when_disabled_or_without_effort() {
         "test-model",
         None,
         true,
+        false,
         &[],
         &[],
         None,
@@ -243,11 +249,138 @@ async fn sse_accumulates_text_and_tool_call_fragments() {
     );
 }
 
+#[tokio::test]
+async fn first_empty_reasoning_delta_creates_no_thinking_block() {
+    // DeepSeek streams an initial `reasoning_content: ""` chunk before real
+    // reasoning. The wire must drop that empty delta at the source: a UI
+    // thinking block is created per ReasoningDelta event, so an empty first
+    // delta would paint an empty thinking block. Only the non-empty deltas
+    // may reach the callback.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert_eq!(request["stream"], true);
+        reply_sse(
+            &mut stream,
+            &[
+                json!({"choices":[{"delta":{"reasoning_content":""},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"reasoning_content":"plan "},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"reasoning_content":""},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"reasoning_content":"more"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}),
+            ],
+        )
+        .await;
+    });
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "test-model".into(),
+        None,
+        false,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let mut deltas = Vec::new();
+    let (message, _) = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            Some(&mut |kind, delta| deltas.push((kind, delta.to_owned()))),
+        )
+        .await
+        .unwrap();
+    // No Reasoning delta for the empty chunks — nothing for a thinking
+    // block to be created from — and no empty block anywhere in the stream.
+    assert_eq!(
+        deltas,
+        [
+            (ModelDeltaKind::Reasoning, "plan ".into()),
+            (ModelDeltaKind::Reasoning, "more".into()),
+            (ModelDeltaKind::Content, "done".into()),
+        ]
+    );
+    assert_eq!(message.reasoning.as_deref(), Some("plan more"));
+    assert_eq!(message.content.as_deref(), Some("done"));
+}
+
+#[tokio::test]
+async fn empty_only_reasoning_delta_preserves_empty_reasoning_field() {
+    // A tool-call stream whose ONLY reasoning deltas are `reasoning_content:
+    // ""`: the empty text must never reach the UI (no Reasoning callback,
+    // so no empty thinking block), yet the canonical assistant must keep
+    // `Some("")` so the DeepSeek compat wire can echo the field on the next
+    // round.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert_eq!(request["stream"], true);
+        reply_sse(
+            &mut stream,
+            &[
+                json!({"choices":[{"delta":{"reasoning_content":""},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"reasoning_content":""},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ],
+        )
+        .await;
+    });
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "test-model".into(),
+        None,
+        false,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let mut deltas = Vec::new();
+    let (message, _) = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            Some(&mut |kind, delta| deltas.push((kind, delta.to_owned()))),
+        )
+        .await
+        .unwrap();
+    // No Reasoning callback for the empty chunks — nothing to paint.
+    assert!(deltas.is_empty(), "unexpected deltas: {deltas:?}");
+    // Field presence survives as Some("").
+    assert_eq!(message.reasoning.as_deref(), Some(""));
+    assert_eq!(message.tool_calls.len(), 1);
+    assert_eq!(message.tool_calls[0].name, "bash");
+
+    // The next-round compat wire echoes the empty field on the tool-call turn.
+    let request = ChatRequest::from_internal(
+        "deepseek-chat",
+        Some("high"),
+        true,
+        true,
+        &[Message::Assistant(message)],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    assert_eq!(value["messages"][0]["reasoning_content"], "");
+}
+
 #[test]
 fn wire_messages_never_echo_reasoning() {
     let request = ChatRequest::from_internal(
         "test-model",
         None,
+        false,
         false,
         &[Message::Assistant(AssistantMessage {
             content: Some("done".into()),
@@ -263,9 +396,213 @@ fn wire_messages_never_echo_reasoning() {
     assert!(message.get("reasoning_content").is_none());
 }
 
+fn tool_call_assistant(content: Option<&str>, reasoning: Option<&str>) -> Message {
+    Message::Assistant(AssistantMessage {
+        content: content.map(str::to_owned),
+        tool_calls: vec![ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"pwd"}"#.into(),
+        }],
+        reasoning: reasoning.map(str::to_owned),
+    })
+}
+
+#[test]
+fn deepseek_compat_replays_reasoning_on_tool_call_assistant() {
+    // Official DeepSeek thinking-mode contract (DSH §1 C2): an assistant
+    // turn that carries tool_calls must echo its original reasoning_content
+    // back to the API on the next request, or DeepSeek 400s.
+    let request = ChatRequest::from_internal(
+        "deepseek-chat",
+        Some("high"),
+        true,
+        true,
+        &[tool_call_assistant(None, Some("need pwd"))],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let message = &value["messages"][0];
+    assert_eq!(message["content"], "");
+    assert_eq!(message["reasoning_content"], "need pwd");
+    assert_eq!(message["tool_calls"][0]["id"], "call-1");
+}
+
+#[test]
+fn deepseek_compat_replays_empty_reasoning_on_tool_call_assistant() {
+    // Field presence matters, not just non-empty text: when the stream only
+    // carried `reasoning_content: ""`, the canonical assistant keeps
+    // `Some("")` and the compat wire must echo `"reasoning_content": ""`
+    // (not omit it) on the next tool-call round.
+    let request = ChatRequest::from_internal(
+        "deepseek-chat",
+        Some("high"),
+        true,
+        true,
+        &[tool_call_assistant(None, Some(""))],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let message = &value["messages"][0];
+    assert_eq!(message["content"], "");
+    assert_eq!(message["reasoning_content"], "");
+    assert_eq!(message["tool_calls"][0]["id"], "call-1");
+}
+
+#[test]
+fn deepseek_compat_without_reasoning_field_omits_reasoning_content() {
+    // An assistant tool-call turn whose reasoning is `None` (the stream
+    // never carried a reasoning_content field) sends NO reasoning_content —
+    // the echo is only of what was actually present.
+    let request = ChatRequest::from_internal(
+        "deepseek-chat",
+        Some("high"),
+        true,
+        true,
+        &[tool_call_assistant(None, None)],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let message = &value["messages"][0];
+    assert_eq!(message["content"], "");
+    assert!(message.get("reasoning_content").is_none());
+    assert_eq!(message["tool_calls"][0]["id"], "call-1");
+}
+
+#[test]
+fn deepseek_compat_plain_assistant_reasoning_is_not_replayed() {
+    // A plain assistant turn (no tool_calls) keeps its reasoning out of the
+    // wire: DeepSeek ignores it across user-turn boundaries and only
+    // requires it inside tool-call loops.
+    let request = ChatRequest::from_internal(
+        "deepseek-chat",
+        Some("high"),
+        true,
+        true,
+        &[Message::Assistant(AssistantMessage {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            reasoning: Some("plain thinking".into()),
+        })],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let message = &value["messages"][0];
+    assert_eq!(message["content"], "done");
+    assert!(message.get("reasoning_content").is_none());
+}
+
+#[test]
+fn deepseek_compat_without_thinking_does_not_replay() {
+    // The replay only fires when thinking mode is on (the 400 only exists
+    // with thinking enabled). The content:"" rule is unconditional for the
+    // compat profile.
+    let request = ChatRequest::from_internal(
+        "deepseek-chat",
+        None,
+        false,
+        true,
+        &[tool_call_assistant(None, Some("need pwd"))],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let message = &value["messages"][0];
+    assert_eq!(message["content"], "");
+    assert!(message.get("reasoning_content").is_none());
+    assert_eq!(message["tool_calls"][0]["id"], "call-1");
+}
+
+#[test]
+fn non_deepseek_chat_wire_is_unchanged() {
+    // OpenAI/Kimi/other chat providers keep the pre-existing wire: no
+    // reasoning_content, and a content-less tool-call assistant keeps its
+    // `content` key omitted (no "", no null, no reasoning echo).
+    let request = ChatRequest::from_internal(
+        "kimi-k3",
+        Some("high"),
+        true,
+        false,
+        &[tool_call_assistant(None, Some("internal reasoning"))],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let message = &value["messages"][0];
+    assert!(message.get("content").is_none());
+    assert!(message.get("reasoning_content").is_none());
+    assert_eq!(message["tool_calls"][0]["id"], "call-1");
+
+    // A plain assistant with reasoning also stays untouched.
+    let request = ChatRequest::from_internal(
+        "kimi-k3",
+        Some("high"),
+        true,
+        false,
+        &[Message::Assistant(AssistantMessage {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            reasoning: Some("internal reasoning".into()),
+        })],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    assert_eq!(value["messages"][0]["content"], "done");
+    assert!(value["messages"][0].get("reasoning_content").is_none());
+}
+
+#[test]
+fn chat_wire_empty_tool_result_stays_empty_string() {
+    // Successful empty tool output stays empty; errored empty output keeps
+    // the ordinary error prefix.
+    let request = ChatRequest::from_internal(
+        "test-model",
+        None,
+        false,
+        false,
+        &[Message::Tool {
+            call_id: "c1".into(),
+            name: "bash".into(),
+            content: String::new(),
+            images: vec![],
+            is_error: false,
+            synthetic: false,
+        }],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    assert_eq!(value["messages"][0]["content"], "");
+    assert_eq!(value["messages"][0]["tool_call_id"], "c1");
+
+    let request = ChatRequest::from_internal(
+        "test-model",
+        None,
+        false,
+        false,
+        &[Message::Tool {
+            call_id: "c2".into(),
+            name: "bash".into(),
+            content: String::new(),
+            images: vec![],
+            is_error: true,
+            synthetic: false,
+        }],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    assert_eq!(value["messages"][0]["content"], "ERROR: ");
+}
+
 #[test]
 fn build_assistant_rejects_reasoning_only_half_messages() {
-    let error = build_assistant("".into(), "truncated thinking".into(), vec![], None)
+    let error = build_assistant("".into(), "truncated thinking".into(), true, vec![], None)
         .unwrap_err()
         .to_string();
     assert!(
@@ -277,7 +614,7 @@ fn build_assistant_rejects_reasoning_only_half_messages() {
 #[test]
 fn build_assistant_accepts_content_or_tool_calls() {
     let (with_content, _) =
-        build_assistant("hello".into(), "thinking".into(), vec![], None).unwrap();
+        build_assistant("hello".into(), "thinking".into(), true, vec![], None).unwrap();
     assert_eq!(with_content.content.as_deref(), Some("hello"));
     assert_eq!(with_content.reasoning.as_deref(), Some("thinking"));
     assert!(with_content.tool_calls.is_empty());
@@ -285,6 +622,7 @@ fn build_assistant_accepts_content_or_tool_calls() {
     let (with_tool_call, _) = build_assistant(
         "".into(),
         "thinking".into(),
+        true,
         vec![AccumulatedToolCall {
             id: "call-1".into(),
             name: "bash".into(),
@@ -303,6 +641,7 @@ fn build_assistant_still_rejects_incomplete_tool_calls() {
     let error = build_assistant(
         "".into(),
         "".into(),
+        false,
         vec![AccumulatedToolCall {
             id: "call-1".into(),
             name: "".into(),
@@ -356,6 +695,7 @@ fn from_internal_filters_poisoned_assistant_messages() {
     let request = ChatRequest::from_internal(
         "test-model",
         None,
+        false,
         false,
         &[
             Message::Assistant(AssistantMessage {
@@ -786,6 +1126,7 @@ fn chat_wire_emits_image_url_object_parts_for_attached_images() {
         "vision-model",
         None,
         false,
+        false,
         &[Message::User {
             content: "what is this?".into(),
             images: vec![ImagePart {
@@ -817,6 +1158,7 @@ fn chat_wire_emits_image_url_object_parts_for_attached_images() {
         "vision-model",
         None,
         false,
+        false,
         &[Message::System {
             content: "sys".into(),
         }],
@@ -832,6 +1174,7 @@ fn chat_wire_degrades_missing_image_file_to_text_placeholder() {
     let request = ChatRequest::from_internal(
         "vision-model",
         None,
+        false,
         false,
         &[Message::User {
             content: "hi".into(),
@@ -856,6 +1199,7 @@ fn chat_wire_tool_batch_without_images_adds_no_user_message() {
     let request = ChatRequest::from_internal(
         "vision-model",
         None,
+        false,
         false,
         &[
             Message::Tool {
@@ -896,6 +1240,7 @@ fn chat_wire_aggregates_one_temporary_user_image_message_per_tool_batch() {
     let request = ChatRequest::from_internal(
         "vision-model",
         None,
+        false,
         false,
         &[
             Message::Assistant(AssistantMessage {
@@ -981,6 +1326,7 @@ fn chat_wire_tool_batch_with_single_image_aggregates_one_user_message() {
     let request = ChatRequest::from_internal(
         "vision-model",
         None,
+        false,
         false,
         &[
             Message::Tool {

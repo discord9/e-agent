@@ -103,6 +103,15 @@ pub struct OpenAiModel {
     /// reasoning effort needs the explicit switch; `high` enables thinking
     /// by default. Other OpenAI-compatible providers ignore the field.
     thinking: bool,
+    /// DeepSeek Chat wire compatibility (profile field `deepseek_compat =
+    /// true`). Gates the two DeepSeek thinking-mode contract fixes, both
+    /// verified against the official DeepSeek thinking-mode docs (and the
+    /// DSH spec): (1) an assistant turn that carries `tool_calls` must echo
+    /// its original `reasoning_content` back to the API on the next request
+    /// or DeepSeek 400s; (2) such a content-less assistant turn must carry
+    /// `content: ""` instead of an absent/null `content`. Defaults to false;
+    /// other providers are byte-identical to the non-compat wire.
+    deepseek_compat: bool,
     /// Whether the model accepts image input (chat wire builds image_url
     /// parts only for vision-capable models; see `ensure_vision_supported`).
     vision: bool,
@@ -162,6 +171,16 @@ impl OpenAiModel {
         self
     }
 
+    /// Enable DeepSeek Chat wire compatibility (profile field
+    /// `deepseek_compat = true`): replay `reasoning_content` on tool-call
+    /// assistant turns when thinking is on, and wire content-less assistant
+    /// turns as `content: ""` instead of absent/null. Solely for DeepSeek
+    /// Chat thinking-mode; other providers must keep this false.
+    pub fn with_deepseek_compat(mut self, deepseek_compat: bool) -> Self {
+        self.deepseek_compat = deepseek_compat;
+        self
+    }
+
     #[cfg(test)]
     fn with_image_store(mut self, store: PathBuf) -> Self {
         self.image_store = Some(store);
@@ -187,6 +206,7 @@ impl OpenAiModel {
             model,
             reasoning_effort,
             thinking: false,
+            deepseek_compat: false,
             vision,
             image_store: crate::agent::image_store_dir(),
         })
@@ -219,6 +239,7 @@ impl Model for OpenAiModel {
             &self.model,
             self.reasoning_effort.as_deref(),
             self.thinking,
+            self.deepseek_compat,
             messages,
             tools,
             self.image_store.as_deref(),
@@ -315,6 +336,12 @@ async fn consume_stream(
 ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
     let mut content = String::new();
     let mut reasoning = String::new();
+    // Whether the stream ever carried a `reasoning_content` field (even an
+    // empty one). DeepSeek emits `reasoning_content: ""` before the first
+    // non-empty chunk; that presence must survive into the canonical
+    // assistant (`Some("")`) so the compat wire can echo the field, while
+    // the empty text itself must never surface as visible thinking.
+    let mut saw_reasoning = false;
     let mut usage = None;
     let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
     let mut events = response.bytes_stream().eventsource();
@@ -349,14 +376,18 @@ async fn consume_stream(
                     );
                 }
             }
-            if let Some(delta) = choice
-                .delta
-                .reasoning_content
-                .filter(|delta| !delta.is_empty())
-            {
-                reasoning.push_str(&delta);
-                if let Some(callback) = on_delta {
-                    callback(ModelDeltaKind::Reasoning, &delta);
+            // Reasoning deltas: an empty `reasoning_content: ""` chunk is a
+            // real field presence (DeepSeek streams one before the first
+            // non-empty chunk) but must not create visible thinking text —
+            // no UI callback, no empty thinking block. Presence is tracked
+            // separately so the canonical assistant can keep `Some("")`.
+            if let Some(delta) = choice.delta.reasoning_content {
+                saw_reasoning = true;
+                if !delta.is_empty() {
+                    reasoning.push_str(&delta);
+                    if let Some(callback) = on_delta {
+                        callback(ModelDeltaKind::Reasoning, &delta);
+                    }
                 }
             }
             for call in choice.delta.tool_calls.unwrap_or_default() {
@@ -379,11 +410,11 @@ async fn consume_stream(
                 }
             }
             if choice.finish_reason.is_some() {
-                return build_assistant(content, reasoning, tool_calls, usage);
+                return build_assistant(content, reasoning, saw_reasoning, tool_calls, usage);
             }
         }
     }
-    build_assistant(content, reasoning, tool_calls, usage)
+    build_assistant(content, reasoning, saw_reasoning, tool_calls, usage)
 }
 
 fn request_error(error: reqwest::Error) -> anyhow::Error {
@@ -438,6 +469,7 @@ impl<'a> ChatRequest<'a> {
         model: &str,
         reasoning_effort: Option<&str>,
         thinking: bool,
+        deepseek_compat: bool,
         messages: &[Message],
         tools: &'a [ToolSpec],
         image_store: Option<&Path>,
@@ -450,7 +482,7 @@ impl<'a> ChatRequest<'a> {
             thinking: reasoning_effort
                 .filter(|_| thinking)
                 .map(|_| Thinking { r#type: "enabled" }),
-            messages: Self::wire_messages(messages, image_store),
+            messages: Self::wire_messages(messages, image_store, deepseek_compat, thinking),
             tools: tools
                 .iter()
                 .map(|tool| WireTool {
@@ -476,7 +508,12 @@ impl<'a> ChatRequest<'a> {
     /// `role:"user"` wire message carries the whole run's image parts.
     /// That temporary message exists only on the wire: it never enters
     /// history, events, the store, or compaction.
-    fn wire_messages(messages: &[Message], image_store: Option<&Path>) -> Vec<WireMessage> {
+    fn wire_messages(
+        messages: &[Message],
+        image_store: Option<&Path>,
+        deepseek_compat: bool,
+        thinking: bool,
+    ) -> Vec<WireMessage> {
         let mut wire = Vec::new();
         let mut index = 0;
         while index < messages.len() {
@@ -487,10 +524,9 @@ impl<'a> ChatRequest<'a> {
                 }
                 let run = &messages[run_start..index];
                 // All valid role:tool text messages first.
-                wire.extend(
-                    run.iter()
-                        .map(|message| WireMessage::from_internal(message, image_store)),
-                );
+                wire.extend(run.iter().map(|message| {
+                    WireMessage::from_internal(message, image_store, deepseek_compat, thinking)
+                }));
                 // At most one aggregated temporary user image wire message
                 // per batch.
                 let images: Vec<ImagePart> = run
@@ -511,13 +547,19 @@ impl<'a> ChatRequest<'a> {
                         )),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     });
                 }
             } else {
                 let message = &messages[index];
                 index += 1;
                 if !is_poisoned_assistant(message) {
-                    wire.push(WireMessage::from_internal(message, image_store));
+                    wire.push(WireMessage::from_internal(
+                        message,
+                        image_store,
+                        deepseek_compat,
+                        thinking,
+                    ));
                 }
             }
         }
@@ -546,35 +588,77 @@ struct WireMessage {
     tool_calls: Option<Vec<WireToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    /// DeepSeek Chat thinking-mode only: the assistant's original
+    /// `reasoning_content`, echoed back on a tool-call turn. Never set for
+    /// any other provider or message role (matches the official DeepSeek
+    /// thinking-mode docs: the field must participate in tool-call context
+    /// concatenation; plain assistant reasoning stays out of the wire).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 impl WireMessage {
-    fn from_internal(message: &Message, image_store: Option<&Path>) -> Self {
+    fn from_internal(
+        message: &Message,
+        image_store: Option<&Path>,
+        deepseek_compat: bool,
+        thinking: bool,
+    ) -> Self {
         match message {
             Message::System { content } => Self {
                 role: "system",
                 content: Some(WireContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message::User { content, images } => Self {
                 role: "user",
                 content: Some(WireContent::from_user(content, images, image_store)),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
-            Message::Assistant(message) => Self {
-                role: "assistant",
-                content: message.content.clone().map(WireContent::Text),
-                tool_calls: (!message.tool_calls.is_empty()).then(|| {
-                    message
-                        .tool_calls
-                        .iter()
-                        .map(WireToolCall::from_internal)
-                        .collect()
-                }),
-                tool_call_id: None,
-            },
+            Message::Assistant(message) => {
+                let mut content = message.content.clone().map(WireContent::Text);
+                let mut reasoning_content = None;
+                if deepseek_compat {
+                    // DeepSeek rejects assistant turns whose `content` is
+                    // absent (HTTP 400 "missing field 'content'") when the
+                    // message carries tool_calls; the official thinking-mode
+                    // sample wires such turns as `content: ""`, not null.
+                    if content.is_none() {
+                        content = Some(WireContent::Text(String::new()));
+                    }
+                    // Thinking-mode tool-call rounds MUST echo the
+                    // assistant's original `reasoning_content` back to the
+                    // API on the next request, or DeepSeek returns the
+                    // "reasoning_content must be passed back" 400. The
+                    // field is echoed verbatim, including an empty string
+                    // (`Some("")` is field presence, which DeepSeek also
+                    // requires to round-trip). Plain assistant reasoning
+                    // (no tool_calls) stays un-replayed.
+                    if thinking
+                        && !message.tool_calls.is_empty()
+                        && let Some(reasoning) = message.reasoning.as_deref()
+                    {
+                        reasoning_content = Some(reasoning.to_owned());
+                    }
+                }
+                Self {
+                    role: "assistant",
+                    content,
+                    tool_calls: (!message.tool_calls.is_empty()).then(|| {
+                        message
+                            .tool_calls
+                            .iter()
+                            .map(WireToolCall::from_internal)
+                            .collect()
+                    }),
+                    tool_call_id: None,
+                    reasoning_content,
+                }
+            }
             Message::Tool {
                 call_id,
                 content,
@@ -589,6 +673,7 @@ impl WireMessage {
                 })),
                 tool_calls: None,
                 tool_call_id: Some(call_id.clone()),
+                reasoning_content: None,
             },
         }
     }
@@ -677,6 +762,7 @@ struct AccumulatedToolCall {
 fn build_assistant(
     content: String,
     reasoning: String,
+    saw_reasoning: bool,
     tool_calls: Vec<AccumulatedToolCall>,
     usage: Option<StreamUsage>,
 ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
@@ -705,7 +791,12 @@ fn build_assistant(
         AssistantMessage {
             content: (!content.is_empty()).then_some(content),
             tool_calls,
-            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            // `Some("")` is meaningful field presence: DeepSeek streams
+            // empty reasoning chunks, and the compat wire must echo the
+            // field (even empty) on tool-call turns. Presence is tracked
+            // separately from the accumulated text because empty deltas
+            // never surface as visible thinking.
+            reasoning: saw_reasoning.then_some(reasoning),
         },
         usage.map(|usage| Usage {
             input_tokens: usage.prompt_tokens,

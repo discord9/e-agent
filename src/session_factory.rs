@@ -1147,7 +1147,8 @@ fn configured_model(
                     resolved.reasoning_effort,
                 )?
                 .with_vision(resolved.vision)
-                .with_thinking(resolved.thinking),
+                .with_thinking(resolved.thinking)
+                .with_deepseek_compat(resolved.deepseek_compat),
             );
             cm.display = display;
             Ok(cm)

@@ -38,6 +38,38 @@ request field with no CLI or environment override. For Kimi Coding `k3`, its
 canonical values are `low`, `high`, and `max`; omitting it uses Kimi Coding's
 `high` default. Other providers may define different values.
 
+DeepSeek Chat thinking mode has a wire contract of its own. `deepseek_compat`
+defaults to **false**, so every profile that does not set it — OpenAI, Kimi,
+any other OpenAI-compatible provider, and the Codex Responses wire — keeps
+the pre-existing standard wire unchanged: persisted reasoning is
+display/audit only and is never replayed. Setting `deepseek_compat = true`
+on a profile explicitly opts that profile into the DeepSeek Chat
+compatibility wire:
+
+- `content: ""` instead of an absent/null `content` on content-less
+  assistant turns — gated by `deepseek_compat` alone;
+- when `thinking = true` as well, assistant turns that carry `tool_calls`
+  echo their original `reasoning_content` (including an empty string) back
+  to the API on the next request — DeepSeek returns a 400 "reasoning_content
+  must be passed back" error without it. Plain assistant reasoning (no tool
+  calls) is never replayed, even with both flags set.
+
+```toml
+default = "deepseek/deepseek-chat"
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[models."deepseek/deepseek-chat"]
+model = "deepseek-chat"
+reasoning_effort = "high"
+thinking = true
+# Explicit DeepSeek Chat wire compatibility. Defaults to false; profiles
+# that leave it unset keep the standard wire unchanged.
+deepseek_compat = true
+```
+
 ChatGPT/Codex profiles use the separate Responses API and browser login; they
 do not accept an API key or base URL:
 
@@ -1093,7 +1125,8 @@ require a restart; there is no reload HTTP endpoint, no config diffing, no
 watch(1)/inotify, and no per-section partial reload (a bad edit is rejected
 wholesale and the last good config is kept).
 Reasoning-model `reasoning_content` is persisted in the session for
-display/audit; it is never sent back to the API.
+display/audit; it is never sent back to the API, except by an explicit
+`deepseek_compat = true` thinking-mode tool-call profile (see Run).
 Web search deliberately has no browser, crawler, URL fetch, citations, domain
 filters, multiple providers or provider trait, retries, cache, background
 search, or remote MCP support.

@@ -289,6 +289,15 @@ struct ModelProfile {
     /// `vision = true`; deepseek defaults to false.
     #[serde(default)]
     vision: Option<bool>,
+    /// DeepSeek Chat wire compatibility (default false). Solely for
+    /// DeepSeek Chat profiles in thinking mode: when `thinking = true`,
+    /// assistant turns that carry `tool_calls` echo their original
+    /// `reasoning_content` back to the API on the next request (DeepSeek
+    /// 400s without it), and content-less assistant turns wire as
+    /// `content: ""` instead of absent/null. Other providers keep the
+    /// default wire and are unaffected.
+    #[serde(default)]
+    deepseek_compat: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -300,6 +309,11 @@ pub struct ResolvedModel {
     /// Force the OpenAI-compatible `thinking` switch (`thinking:
     /// {"type": "enabled"}`) on chat requests; DeepSeek V4 `max` needs it.
     pub thinking: bool,
+    /// DeepSeek Chat wire compatibility (`deepseek_compat = true`):
+    /// thinking-mode tool-call turns replay `reasoning_content` and
+    /// content-less assistant turns wire as `content: ""`. False for every
+    /// other provider.
+    pub deepseek_compat: bool,
     pub auth: AuthMode,
     pub display: String,
     pub context_window: Option<u64>,
@@ -587,6 +601,7 @@ impl Config {
                 model,
                 reasoning_effort,
                 thinking,
+                deepseek_compat: model_profile.deepseek_compat.unwrap_or(false),
                 auth: AuthMode::ChatGpt,
                 display: profile.to_owned(),
                 context_window: model_profile.context_window,
@@ -623,6 +638,7 @@ impl Config {
             model,
             reasoning_effort,
             thinking,
+            deepseek_compat: model_profile.deepseek_compat.unwrap_or(false),
             auth: AuthMode::ApiKey,
             display: profile.to_owned(),
             context_window: model_profile.context_window,

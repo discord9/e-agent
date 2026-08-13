@@ -357,17 +357,21 @@ async fn edit_requires_exactly_one_match() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("file.txt");
     std::fs::write(&path, "one two one").unwrap();
+    // 0 matches: guide the model to re-read (via read_file) and copy the
+    // exact text verbatim.
+    let zero = edit(&temp, "missing", "x").await.unwrap_err();
+    assert!(zero.contains("found 0"), "{zero}");
+    assert!(zero.contains("use `read_file`"), "{zero}");
     assert!(
-        edit(&temp, "missing", "x")
-            .await
-            .unwrap_err()
-            .contains("found 0")
+        zero.contains("re-read the file and copy the exact text verbatim"),
+        "{zero}"
     );
+    // Multiple matches: guide the model to add context until unique.
+    let many = edit(&temp, "one", "x").await.unwrap_err();
+    assert!(many.contains("found 2"), "{many}");
     assert!(
-        edit(&temp, "one", "x")
-            .await
-            .unwrap_err()
-            .contains("found 2")
+        many.contains("add more surrounding context to `old` until it matches exactly once"),
+        "{many}"
     );
     assert_eq!(
         edit(&temp, "two", "x").await.unwrap().content,
