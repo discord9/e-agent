@@ -83,11 +83,42 @@ async def run_chat_open_sse(c):
     html = await c.ev("els.messages.innerHTML")
     c.check("SSE：AssistantText markdown 渲染", "出错了，" in t and "<strong>换个方式</strong>" in html, "")
     c.check("SSE：Notice 渲染", "系统提示行" in t, "")
-    c.check("SSE：Usage 渲染（只显示当前上下文占用，不显示累计输入/输出）",
-            "上下文 1234" in await c.ev("els.usageInfo.textContent")
-            and "输入" not in await c.ev("els.usageInfo.textContent")
-            and "输出" not in await c.ev("els.usageInfo.textContent"),
-            await c.ev("els.usageInfo.textContent"))
+    usage_text = await c.ev("els.usageInfo.textContent")
+    c.check("SSE：Usage 无 window 回退为完整上下文（不显示累计输入/输出）",
+            "上下文 1234 tok" in usage_text
+            and "输入" not in usage_text and "输出" not in usage_text
+            and await c.ev("els.usageInfo.querySelectorAll('.usage-pct').length") == 0
+            and await c.ev("els.usageInfo.querySelectorAll('.usage-detail').length") == 1,
+            usage_text)
+
+    # 有 context_window：桌面同时显示短百分比与完整详情；窄屏只隐藏详情，
+    # 不通过整串 ellipsis 冒险丢掉末尾百分比。
+    await c.ev("applyUsage({context_input:132865, context_window:512000, session:{input_tokens:999, output_tokens:888}})")
+    usage_text = await c.ev("els.usageInfo.textContent")
+    c.check("Usage 桌面：百分比短标签 DOM 存在",
+            await c.ev("els.usageInfo.querySelector('.usage-pct').textContent") == "26%", usage_text)
+    c.check("Usage 桌面：完整详情可见且不含累计输入/输出",
+            await c.ev("els.usageInfo.querySelector('.usage-detail').textContent.includes('上下文 132865/512000 tok')")
+            and await c.ev("getComputedStyle(els.usageInfo.querySelector('.usage-detail')).display !== 'none'")
+            and "输入" not in usage_text and "输出" not in usage_text, usage_text)
+    c.check("Usage DOM 阅读顺序：百分比优先、详情随后",
+            await c.ev("els.usageInfo.children[0].classList.contains('usage-pct')")
+            and await c.ev("els.usageInfo.children[1].classList.contains('usage-detail')"), "")
+
+    await c.page.set_viewport_size({"width": 390, "height": 844})
+    c.check("Usage 手机：保留百分比并隐藏详情",
+            await c.ev("getComputedStyle(els.usageInfo.querySelector('.usage-pct')).display !== 'none'")
+            and await c.ev("getComputedStyle(els.usageInfo.querySelector('.usage-detail')).display === 'none'")
+            and await c.ev("els.usageInfo.querySelector('.usage-pct').textContent") == "26%", "")
+    await c.ev("applyUsage({context_input:410000, context_window:512000})")
+    c.check("Usage >=80%：整体高用量红色语义保持",
+            await c.ev("els.usageInfo.classList.contains('usage-high')")
+            and await c.ev("els.usageInfo.querySelector('.usage-pct').textContent") == "80%", "")
+    await c.ev("applyUsage({context_input:1234})")
+    c.check("Usage 手机无 window：仍显示上下文 fallback",
+            await c.ev("els.usageInfo.querySelectorAll('.usage-pct').length") == 0
+            and await c.ev("getComputedStyle(els.usageInfo.querySelector('.usage-detail')).display !== 'none'")
+            and "上下文 1234 tok" in await c.ev("els.usageInfo.textContent"), "")
     c.check("SSE：Error 渲染", "错误: 回合失败" in t, "")
     c.check("SSE：status Busy -> 处理中 + 取消可用",
             (await c.page.locator("#chatStatus").text_content()) == "处理中"

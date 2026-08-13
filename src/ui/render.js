@@ -1462,28 +1462,32 @@ function applyStatus(status) {
 
 /* 渲染用量行：只显示当前上下文占用——最近一次正常模型请求的 Usage 事件的
    context_input / context_window（当前进程值）。不再展示全会话累计输入/输出
-   （state.sessionUsage 不参与显示）。formatUsageLine 是纯函数（测试可
-   直接断言）；applyUsage 在 SSE Usage 事件（含初始 snapshot 恢复）时调用，
-   refreshUsageLine 在 /usage 响应到达时重刷同一行。 */
+   （state.sessionUsage 不参与显示）。百分比与完整上下文分别渲染，窄屏可优先
+   保留短标签而不依赖整行省略号。formatUsageLine 是纯函数（测试可直接断言）；
+   applyUsage 在 SSE Usage 事件（含初始 snapshot 恢复）时调用，refreshUsageLine
+   在 /usage 响应到达时重刷同一行。 */
 function formatUsageLine(live) {
-  const parts = [];
-  let pct = null;
   const l = live || {};
-  // context_window 配置了才显示百分比（TUI 同语义：>=80% 标红提示接近压缩阈值）
-  if (l.context_input != null && l.context_window) {
-    pct = Math.round(l.context_input / l.context_window * 100);
-    parts.push("上下文 " + l.context_input + "/" + l.context_window + " tok (" + pct + "%)");
-  } else if (l.context_input != null) {
-    parts.push("上下文 " + l.context_input + " tok");
+  if (l.context_input == null) return { detail: "", pct: "", high: false };
+  if (l.context_window) {
+    const pct = Math.round(l.context_input / l.context_window * 100);
+    return {
+      detail: "上下文 " + l.context_input + "/" + l.context_window + " tok",
+      pct: pct + "%",
+      high: pct >= 80,
+    };
   }
-  return { text: parts.length ? "用量: " + parts.join(" · ") : "", high: pct !== null && pct >= 80 };
+  return { detail: "上下文 " + l.context_input + " tok", pct: "", high: false };
 }
 
 function renderUsageLine(live) {
   const line = formatUsageLine(live);
-  if (!line.text) return;
-  els.usageInfo.textContent = line.text;
-  // >=80% 接近自动压缩阈值：标红提醒
+  if (!line.detail) return;
+  els.usageInfo.textContent = "用量: ";
+  if (line.pct) els.usageInfo.appendChild(el("span", "usage-pct", line.pct));
+  els.usageInfo.appendChild(el("span", "usage-detail", (line.pct ? " · " : "") + line.detail));
+  els.usageInfo.classList.toggle("has-percent", !!line.pct);
+  // >=80% 接近自动压缩阈值：标红提醒（两个语义片段共同继承）。
   els.usageInfo.classList.toggle("usage-high", line.high);
 }
 

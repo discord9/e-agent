@@ -734,7 +734,9 @@ async function main(){
     // 参与显示；上下文始终来自最近一次 live Usage 事件。
     chk("usage fetch on open", FETCHES.includes("/api/sessions/s1/usage"));
     chk("usage shows context only (no cumulative in/out)",
-        elsById["usageInfo"].textContent === "用量: 上下文 1234 tok",
+        elsById["usageInfo"].textContent === "用量: 上下文 1234 tok"
+        && !elsById["usageInfo"].textContent.includes("输入")
+        && !elsById["usageInfo"].textContent.includes("输出"),
         "=" + elsById["usageInfo"].textContent);
     chk("sessionUsage state filled",
         state.sessionUsage && state.sessionUsage.input_tokens === 300
@@ -743,9 +745,18 @@ async function main(){
     // 新的 live Usage 事件：context 更新为最新值（含百分比）；输入/输出不再显示。
     applyUsage({ type: "usage", session_id: "s1", seq: 11, context_input: 2000,
                  context_window: 4000, session: { input_tokens: 130, output_tokens: 60 } });
-    chk("usage live context with pct",
-        elsById["usageInfo"].textContent === "用量: 上下文 2000/4000 tok (50%)",
+    const _usagePct = elsById["usageInfo"].querySelector(".usage-pct");
+    const _usageDetail = elsById["usageInfo"].querySelector(".usage-detail");
+    chk("usage live pct short label exists",
+        !!_usagePct && _usagePct.textContent === "50%", "=" + elsById["usageInfo"].innerHTML);
+    chk("usage live full context detail excludes cumulative in/out",
+        !!_usageDetail && _usageDetail.textContent.includes("上下文 2000/4000 tok")
+        && !elsById["usageInfo"].textContent.includes("输入")
+        && !elsById["usageInfo"].textContent.includes("输出"),
         "=" + elsById["usageInfo"].textContent);
+    chk("usage DOM reading order is pct then full detail",
+        elsById["usageInfo"].children.indexOf(_usagePct)
+        < elsById["usageInfo"].children.indexOf(_usageDetail));
     // 旧后端 /usage 404：state.sessionUsage 保持 null（不影响显示——行只依赖 context）。
     usageData["s1"] = null;
     openSession("s2");          // 切走：s1 的累计不串会话
@@ -760,8 +771,10 @@ async function main(){
     chk("sessionUsage null when /usage 404", state.sessionUsage === null);
     applyUsage({ type: "usage", session_id: "s1", seq: 12, context_input: 2100,
                  session: { input_tokens: 140, output_tokens: 70 } });
-    chk("usage context without window",
-        elsById["usageInfo"].textContent === "用量: 上下文 2100 tok",
+    chk("usage context without window fallback",
+        elsById["usageInfo"].textContent === "用量: 上下文 2100 tok"
+        && !elsById["usageInfo"].querySelector(".usage-pct")
+        && !!elsById["usageInfo"].querySelector(".usage-detail"),
         "=" + elsById["usageInfo"].textContent);
     usageData["s1"] = { input_tokens: 300, output_tokens: 150, rows: [] };   // 还原，防串后续断言
     openSession("s1");
@@ -774,7 +787,8 @@ async function main(){
     openSession("s3");
     await flush(); await flush();
     chk("snapshot usage restored on open",
-        elsById["usageInfo"].textContent === "用量: 上下文 4321/8192 tok (53%)",
+        elsById["usageInfo"].querySelector(".usage-pct").textContent === "53%"
+        && elsById["usageInfo"].querySelector(".usage-detail").textContent.includes("上下文 4321/8192 tok"),
         "=" + elsById["usageInfo"].textContent);
     chk("snapshot usage fills lastUsage",
         state.lastUsage && state.lastUsage.context_input === 4321
@@ -7093,6 +7107,15 @@ _empty_rule = re.search(
     r'#chatView\.no-session\s+\.composer\s*,[^\{]*\{([^}]*)\}', _css)
 _empty_ok = bool(_empty_rule and re.search(r'display:\s*none', _empty_rule.group(1)))
 print(("PASS" if _empty_ok else "FAIL") + " no-session hides messages and composer in style.css")
+# 手机用量：复用既有 <=480px 段，百分比常驻，只有具备百分比时隐藏完整详情；
+# 禁止退回对整个 #usageInfo 做 ellipsis（会让末尾百分比消失）。
+_mobile = re.search(r'@media\s*\(max-width:\s*480px\)\s*\{([\s\S]*?)\n\s*\}\n\s*/\* 更窄', _css)
+_mobile_css = _mobile.group(1) if _mobile else ''
+_usage_mobile_ok = bool(
+    _mobile
+    and re.search(r'#usageInfo\.has-percent\s+\.usage-detail\s*\{[^}]*display:\s*none', _mobile_css)
+    and not re.search(r'#usageInfo\s*\{[^}]*text-overflow:\s*ellipsis', _mobile_css))
+print(("PASS" if _usage_mobile_ok else "FAIL") + " mobile usage keeps pct and hides detail at <=480px")
 # LOW：ws-chip 10px 小字号前景/背景 WCAG AA 对比度 ≥ 4.5:1（深色文字配浅 tint）
 def _rel_lum(hexc):
     hexc = hexc.lstrip('#')
@@ -7172,4 +7195,4 @@ _html = open(os.path.join(HERE, 'index.html'), encoding='utf-8').read()
 _icon_m = re.search(r'<link\s+rel="icon"\s+type="image/svg\+xml"\s+href="(data:image/svg\+xml,[^"]+)"', _html)
 _icon_ok = bool(_icon_m and '%23' in _icon_m.group(1) and '#' not in _icon_m.group(1))
 print(("PASS" if _icon_ok else "FAIL") + " inline SVG favicon data URI in index.html head")
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _empty_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _icon_ok else 1)
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _empty_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _icon_ok else 1)

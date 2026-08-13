@@ -369,7 +369,9 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  #usageInfo { margin-left: auto; }
+  #usageInfo { margin-left: auto; white-space: nowrap; }
+  #usageInfo .usage-pct,
+  #usageInfo .usage-detail { white-space: nowrap; }
   #usageInfo.usage-high { color: var(--red); font-weight: bold; }
 
   /* 顶部信息栏的压缩按钮：小号低调，避免与输入区的取消/发送相邻 */
@@ -1942,13 +1944,10 @@
     .status-chip { font-size: 10px; padding: 1px 6px; }
     #usageInfo {
       font-size: 12px;
-      max-width: 30vw;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      flex-shrink: 1;
-      min-width: 0;   /* 允许 flex 收缩：长用量文本省略号截断，不撑宽/溢出 */
+      flex: 0 0 auto;
+      min-width: max-content;   /* 窄屏始终保留短百分比，不让整串省略号吞掉末尾信息 */
     }
+    #usageInfo.has-percent .usage-detail { display: none; }
     .compact-head { font-size: 10px; padding: 0 6px; }
   }
   /* 更窄的手机（≤360px，如 320px 的 iPhone SE）：再藏品牌名，保证单行不溢出 */
