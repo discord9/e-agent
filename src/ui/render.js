@@ -1460,13 +1460,12 @@ function applyStatus(status) {
   }
 }
 
-/* 合并渲染用量行：上下文用最近一次 live Usage 事件的 context_input/
-   context_window（当前进程值）；输入/输出优先用 state.sessionUsage 的
-   持久化累计（usage_entries 表，含子会话，重启不清零），未拉到（旧后端/
-   JSONL/请求失败）回退 live 的进程累计。formatUsageLine 是纯函数（测试可
-   直接断言）；applyUsage 在 SSE Usage 事件时调用，refreshUsageLine 在
-   /usage 响应到达时重刷同一行。 */
-function formatUsageLine(live, persisted) {
+/* 渲染用量行：只显示当前上下文占用——最近一次正常模型请求的 Usage 事件的
+   context_input / context_window（当前进程值）。不再展示全会话累计输入/输出
+   （state.sessionUsage 不参与显示）。formatUsageLine 是纯函数（测试可
+   直接断言）；applyUsage 在 SSE Usage 事件（含初始 snapshot 恢复）时调用，
+   refreshUsageLine 在 /usage 响应到达时重刷同一行。 */
+function formatUsageLine(live) {
   const parts = [];
   let pct = null;
   const l = live || {};
@@ -1477,16 +1476,11 @@ function formatUsageLine(live, persisted) {
   } else if (l.context_input != null) {
     parts.push("上下文 " + l.context_input + " tok");
   }
-  const s = l.session || {};
-  const inTok = persisted ? persisted.input_tokens : s.input_tokens;
-  const outTok = persisted ? persisted.output_tokens : s.output_tokens;
-  if (inTok != null) parts.push("输入 " + inTok);
-  if (outTok != null) parts.push("输出 " + outTok);
   return { text: parts.length ? "用量: " + parts.join(" · ") : "", high: pct !== null && pct >= 80 };
 }
 
 function renderUsageLine(live) {
-  const line = formatUsageLine(live, state.sessionUsage);
+  const line = formatUsageLine(live);
   if (!line.text) return;
   els.usageInfo.textContent = line.text;
   // >=80% 接近自动压缩阈值：标红提醒
@@ -1499,8 +1493,8 @@ function applyUsage(usage) {
   renderUsageLine(usage);
 }
 
-/* /usage 历史累计到达后重刷用量行（context 沿用最近 live 值，输入/输出
-   换成累计）；尚无 live Usage 事件时 context 段不显示（与旧行为一致：
+/* /usage 历史累计到达后重刷用量行（context 沿用最近 live 值——累计输入/
+   输出已不再展示）；尚无 live Usage 事件时整行不显示（与旧行为一致：
    无数据不强行渲染空行）。 */
 function refreshUsageLine() {
   renderUsageLine(state.lastUsage || null);

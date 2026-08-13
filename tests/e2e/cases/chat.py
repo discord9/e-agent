@@ -83,10 +83,10 @@ async def run_chat_open_sse(c):
     html = await c.ev("els.messages.innerHTML")
     c.check("SSE：AssistantText markdown 渲染", "出错了，" in t and "<strong>换个方式</strong>" in html, "")
     c.check("SSE：Notice 渲染", "系统提示行" in t, "")
-    c.check("SSE：Usage 渲染",
+    c.check("SSE：Usage 渲染（只显示当前上下文占用，不显示累计输入/输出）",
             "上下文 1234" in await c.ev("els.usageInfo.textContent")
-            and "输入 100" in await c.ev("els.usageInfo.textContent")
-            and "输出 50" in await c.ev("els.usageInfo.textContent"),
+            and "输入" not in await c.ev("els.usageInfo.textContent")
+            and "输出" not in await c.ev("els.usageInfo.textContent"),
             await c.ev("els.usageInfo.textContent"))
     c.check("SSE：Error 渲染", "错误: 回合失败" in t, "")
     c.check("SSE：status Busy -> 处理中 + 取消可用",

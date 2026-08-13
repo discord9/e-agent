@@ -203,6 +203,20 @@ async function readSSEStream(reader, id, wsId, epoch, ctrl) {
   }
 }
 
+/* 从初始 snapshot 事件数组恢复 current usage：取最后一个 Usage 事件（最近
+   一次正常模型请求；compaction 不刷新它）交给 applyUsage——与 live 路径共用
+   state.lastUsage + renderUsageLine，不引入第二套状态。 */
+function restoreUsageFromSnapshot(events) {
+  if (!Array.isArray(events)) return;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i];
+    if (ev && ev.type === "usage" && ev.data !== undefined) {
+      applyUsage(ev.data);
+      return;
+    }
+  }
+}
+
 /* 解析单个 SSE 事件块：任何分支（snapshot/status/resync/live）动手改 UI 前
    必须通过三重校验——陈旧流的块整块丢弃，绝不画进当前会话/workspace。 */
 function handleSSEBlock(block, id, wsId, epoch) {
@@ -218,16 +232,23 @@ function handleSSEBlock(block, id, wsId, epoch) {
   const data = dataLines.join("\n");
 
   if (eventName === "snapshot") {
-    // 已用 history 渲染过则跳过（避免重复）；恢复的会话（initSource="restored"，
-    // 视图来自缓存）也跳过——缓存内容与 snapshot 等价，重放会造成重复；
-    // history 加载失败时仍作为兜底
-    if (state.initSource !== "history" && state.initSource !== "restored") {
-      try {
-        const parsed = JSON.parse(data);
-        const entries = Array.isArray(parsed) ? parsed : (parsed.entries || []);
+    let entries = null;
+    try {
+      const parsed = JSON.parse(data);
+      entries = Array.isArray(parsed) ? parsed : (parsed.entries || []);
+    } catch (e) { /* 忽略坏数据 */ }
+    if (entries) {
+      // 初始 snapshot 含 Usage 事件时立即恢复 current usage（最近一次正常
+      // 模型请求的 context_input/context_window），不等下一次模型调用；
+      // 复用 applyUsage 路径（state.lastUsage + renderUsageLine）。
+      restoreUsageFromSnapshot(entries);
+      // 已用 history 渲染过则跳过（避免重复）；恢复的会话（initSource="restored"，
+      // 视图来自缓存）也跳过——缓存内容与 snapshot 等价，重放会造成重复；
+      // history 加载失败时仍作为兜底
+      if (state.initSource !== "history" && state.initSource !== "restored") {
         renderHistory(entries);
         state.initSource = "snapshot";
-      } catch (e) { /* 忽略坏数据 */ }
+      }
     }
     return;
   }

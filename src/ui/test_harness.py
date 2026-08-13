@@ -338,6 +338,20 @@ function stream(){
 function streamEmpty(){
   return { getReader(){ return { read: async()=>({done:true}) } } };
 }
+/* 初始 snapshot 携带 Usage 事件、无 live Usage：验证「打开即恢复 current
+   usage」（history 已渲染 → snapshot 跳过 transcript 重放，但 usage 仍要
+   从 snapshot 恢复，不等下一次模型调用）。 */
+function streamSnapshotUsage(){
+  const chunks = [
+    "event: snapshot\ndata: [{\"type\":\"usage\",\"data\":{\"context_input\":4321,\"context_window\":8192,\"session\":{\"input_tokens\":999,\"output_tokens\":888}}}]\n\n",
+    "event: status\ndata: {\"status\":\"Idle\"}\n\n",
+  ];
+  let i = 0;
+  return { getReader(){ return { read: async()=>{
+    if (i === 0) { i = 1; return {done:false, value:chunks.join("")}; }
+    return {done:true};
+  } }; } };
+}
 /* 手动控制的流：第一个 read 挂起（resolve 保存在 a1StreamReadResolve），
    之后一次性吐出 value，再结束。用于「切换后 A 的陈旧块才到达」的测试。 */
 function streamManual(){
@@ -566,6 +580,7 @@ globalThis.fetch=(url,opts={})=>{
     return resp(200, historyData);   // 含 ?limit=…（loadHistory 尾部翻页）
   }
   if(url.startsWith("/api/sessions/s2/history")) return resp(200, historyData, signal);
+  if(url.startsWith("/api/sessions/s3/history")) return resp(200, historyData, signal);
   if(url.startsWith("/api/sessions/sess-new/history")) return resp(200, {entries:[], next_before_seq:null}, signal);
   if(url.startsWith("/api/sessions/b-new/history")) return resp(200, {entries:[], next_before_seq:null}, signal);
   if(url.startsWith("/api/sessions/fork-1/history")) return resp(200, {entries:[], next_before_seq:null}, signal);
@@ -575,6 +590,7 @@ globalThis.fetch=(url,opts={})=>{
   if(url.startsWith("/api/sessions/restored-test3/history")) return resp(200, historyData, signal);
   if(url==="/api/sessions/s1/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s2/events") return resp(200, stream(), signal);
+  if(url==="/api/sessions/s3/events") return resp(200, streamSnapshotUsage(), signal);
   if(url==="/api/sessions/sess-new/events") return resp(200, streamEmpty(), signal);
   if(url==="http://b.local/api/sessions/b-new/events") return resp(200, streamEmpty(), signal);
   if(url==="/api/sessions/fork-1/events") return resp(200, stream(), signal);
@@ -712,41 +728,58 @@ async function main(){
     chk("live error", t.includes("错误: 回合失败"));
     chk("usage shown", elsById["usageInfo"].textContent.includes("1234"), "="+elsById["usageInfo"].textContent);
 
-    // ---- 持久化用量行（/api/sessions/{id}/usage + live Usage 合并） ----
-    // 打开 s1 时已拉 /usage：输入/输出显示历史累计（含子会话合计），
-    // 而不是 live 进程计数（100/50）；上下文仍用 live 值。
+    // ---- 用量行：只显示当前上下文占用（最近一次正常模型请求的 Usage
+    //      事件 context_input/context_window），不显示全会话累计输入/输出 ----
+    // /usage 仍在打开时拉取（sessions.js 既有逻辑，不动），但其累计值不再
+    // 参与显示；上下文始终来自最近一次 live Usage 事件。
     chk("usage fetch on open", FETCHES.includes("/api/sessions/s1/usage"));
-    chk("persisted usage totals shown",
-        elsById["usageInfo"].textContent === "用量: 上下文 1234 tok · 输入 300 · 输出 150",
+    chk("usage shows context only (no cumulative in/out)",
+        elsById["usageInfo"].textContent === "用量: 上下文 1234 tok",
         "=" + elsById["usageInfo"].textContent);
     chk("sessionUsage state filled",
         state.sessionUsage && state.sessionUsage.input_tokens === 300
         && state.sessionUsage.output_tokens === 150,
         "=" + JSON.stringify(state.sessionUsage));
-    // 新的 live Usage 事件：context 更新为最新值，输入/输出保持累计不回退。
+    // 新的 live Usage 事件：context 更新为最新值（含百分比）；输入/输出不再显示。
     applyUsage({ type: "usage", session_id: "s1", seq: 11, context_input: 2000,
                  context_window: 4000, session: { input_tokens: 130, output_tokens: 60 } });
-    chk("usage live+history merge",
-        elsById["usageInfo"].textContent === "用量: 上下文 2000/4000 tok (50%) · 输入 300 · 输出 150",
+    chk("usage live context with pct",
+        elsById["usageInfo"].textContent === "用量: 上下文 2000/4000 tok (50%)",
         "=" + elsById["usageInfo"].textContent);
-    // 旧后端 /usage 404：回退 live 进程计数（state.sessionUsage 保持 null）。
+    // 旧后端 /usage 404：state.sessionUsage 保持 null（不影响显示——行只依赖 context）。
     usageData["s1"] = null;
     openSession("s2");          // 切走：s1 的累计不串会话
     await flush(); await flush();
     chk("sessionUsage reset on switch", state.sessionUsage
         && state.sessionUsage.input_tokens === 21, "=" + JSON.stringify(state.sessionUsage));
-    chk("s2 persisted usage shown",
-        elsById["usageInfo"].textContent === "用量: 上下文 1234 tok · 输入 21 · 输出 7",
+    chk("s2 usage context shown",
+        elsById["usageInfo"].textContent === "用量: 上下文 1234 tok",
         "=" + elsById["usageInfo"].textContent);
     openSession("s1");
     await flush(); await flush();
     chk("sessionUsage null when /usage 404", state.sessionUsage === null);
     applyUsage({ type: "usage", session_id: "s1", seq: 12, context_input: 2100,
                  session: { input_tokens: 140, output_tokens: 70 } });
-    chk("usage falls back to live counters",
-        elsById["usageInfo"].textContent === "用量: 上下文 2100 tok · 输入 140 · 输出 70",
+    chk("usage context without window",
+        elsById["usageInfo"].textContent === "用量: 上下文 2100 tok",
         "=" + elsById["usageInfo"].textContent);
     usageData["s1"] = { input_tokens: 300, output_tokens: 150, rows: [] };   // 还原，防串后续断言
+    openSession("s1");
+    await flush(); await flush();
+
+    // ---- 初始 SSE snapshot 含 Usage 事件：打开即恢复 current usage ----
+    // s3 的流只带 snapshot Usage（无 live Usage）：history 渲染完（initSource=
+    // "history"，snapshot 跳过 transcript 重放）后，usage 仍立即从 snapshot
+    // 恢复，无需等下一次模型调用。
+    openSession("s3");
+    await flush(); await flush();
+    chk("snapshot usage restored on open",
+        elsById["usageInfo"].textContent === "用量: 上下文 4321/8192 tok (53%)",
+        "=" + elsById["usageInfo"].textContent);
+    chk("snapshot usage fills lastUsage",
+        state.lastUsage && state.lastUsage.context_input === 4321
+        && state.lastUsage.context_window === 8192,
+        "=" + JSON.stringify(state.lastUsage));
     openSession("s1");
     await flush(); await flush();
 
