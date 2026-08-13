@@ -128,7 +128,14 @@ pub struct SessionFactory {
     sandbox: Option<Sandbox>,
     read_only: bool,
     agents_instructions: Option<String>,
+    /// Startup snapshot of the skill disclosure index; never hot-reloaded.
     skills_instructions: Option<String>,
+    /// The workspace plus one extra read-only capability rooted at the
+    /// global skills directory, for the MAIN session's file tools only
+    /// (`None` when there is no usable global skills root). The plain
+    /// [`SessionFactory::workspace`] keeps no such capability, so delegated
+    /// subagents and btw forks never see global skills.
+    skills_workspace: Option<Workspace>,
     /// Print startup/session announcements to stderr (`false` for the TUI,
     /// whose alternate screen must stay clean).
     announce: bool,
@@ -217,7 +224,15 @@ impl SessionFactory {
             .context("cannot open workspace")?;
         let root = workspace.root().to_path_buf();
         let agents_instructions = read_agents(&root)?;
-        let skills_instructions = read_skills_merged(&root)?;
+        // Startup snapshot of the local skill index: global
+        // `<config_dir>/skills/*/SKILL.md` plus workspace
+        // `.e-agent/skills/*/SKILL.md` (workspace directory name fully
+        // replaces a same-name global). The global root must be a real
+        // directory, not a symlink, or global skills are skipped entirely.
+        let global_skills_dir = crate::config::config_dir()
+            .map(|dir| dir.join("skills"))
+            .filter(|dir| skills_root_is_dir(dir));
+        let skills_instructions = read_skills_index(&root, global_skills_dir.as_deref())?;
         let config = Config::load_for_workspace(&root)?;
         let backend = config
             .as_ref()
@@ -303,6 +318,22 @@ impl SessionFactory {
         workspace = workspace
             .with_external_roots(&resolved_policy)
             .map_err(anyhow::Error::msg)?;
+        // Main-session file tools only: clone the workspace with one extra
+        // read-only capability rooted at the global skills directory, so the
+        // model can `read_file` the SKILL.md paths the index advertises.
+        // The stored plain `workspace` (used by the delegate and btw forks)
+        // never gains this root, and bash keeps the original policy.
+        let skills_workspace = global_skills_dir
+            .as_ref()
+            .map(|dir| {
+                let mut with_skills = resolved_policy.clone();
+                with_skills.readable_paths.push(dir.display().to_string());
+                workspace
+                    .clone()
+                    .with_external_roots(&with_skills)
+                    .map_err(anyhow::Error::msg)
+            })
+            .transpose()?;
         let sandbox = resolved_policy.enabled.then_some(resolved_policy.clone());
         if let Some(policy) = &sandbox {
             preflight_sandbox(policy, announce)?;
@@ -329,6 +360,7 @@ impl SessionFactory {
             read_only,
             agents_instructions,
             skills_instructions,
+            skills_workspace,
             announce,
         })
     }
@@ -676,7 +708,9 @@ impl SessionFactory {
         let finalize_wait =
             crate::config::resolve_finalize_wait(config.as_ref(), &self.root).unwrap_or(None);
         let (mut tools, background) = builtins_with_bash_timeout(
-            self.workspace.clone(),
+            self.skills_workspace
+                .clone()
+                .unwrap_or_else(|| self.workspace.clone()),
             self.sandbox.clone(),
             self.read_only,
             background_timeout,
@@ -851,6 +885,7 @@ impl SessionFactory {
             read_only: false,
             agents_instructions: None,
             skills_instructions: None,
+            skills_workspace: None,
             announce: false,
         }
     }
@@ -937,98 +972,156 @@ fn read_agents(root: &Path) -> anyhow::Result<Option<String>> {
     }
 }
 
-/// Read all workspace skills from `.e-agent/skills/<name>/SKILL.md`.
-///
-/// Returns `None` (silently) when the directory is missing, empty, or contains
-/// only non-directories / missing / empty SKILL.md files. Actual I/O or UTF-8
-/// errors on a SKILL.md that should be readable are returned with a path
-/// context.
-///
-/// Skills are sorted by `<name>` (dictionary order, stable) and joined as a
-/// single block prefixed with `## Skill: <name>` per skill.
-/// Scan a single skill directory and return (name, content) pairs.
-///
-/// Missing dir, non-directory entries, missing/empty SKILL.md are silently
-/// skipped. I/O/UTF-8 errors on a readable SKILL.md bubble up with path
-/// context.
-pub fn read_skills_from(dir: &Path) -> anyhow::Result<Vec<(String, String)>> {
-    let dir_entries = match std::fs::read_dir(dir) {
-        Ok(d) => d,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).context(format!("cannot read {}", dir.display())),
-    };
+/// Fixed fallback description when a skill's frontmatter has none.
+pub const SKILL_DEFAULT_DESCRIPTION: &str = "Local e-agent skill";
 
-    let mut skills: Vec<(String, String)> = Vec::new();
+/// One skill's disclosure entry: frontmatter `name` (fallback: the skill
+/// directory's name), frontmatter `description` (fallback: the fixed short
+/// phrase), the absolute `SKILL.md` path, and the directory name used as
+/// the same-name override key.
+pub struct SkillIndexEntry {
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,
+    pub(crate) dir_name: String,
+}
 
-    for entry in dir_entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => return Err(e).context(format!("cannot read {} entry", dir.display())),
-        };
+/// The global skills root must be a real directory, never a symlink: the
+/// read-only capability handed to the main `read_file` must not reach a
+/// config sibling through a link. Missing paths count as "not a root".
+pub fn skills_root_is_dir(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+}
 
-        // Only directories are candidate skill folders
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-
-        let skill_name = match entry.file_name().into_string() {
-            Ok(name) => name,
-            Err(_) => continue,
-        };
-
-        let skill_path = entry.path().join("SKILL.md");
-
-        match std::fs::read_to_string(&skill_path) {
-            Ok(content) => {
-                if !content.trim().is_empty() {
-                    skills.push((skill_name, content));
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(e).context(format!("cannot read {}", skill_path.display()));
+/// Parse the leading `---`-fenced frontmatter for single-line `name` and
+/// `description`. Missing or unterminated frontmatter and missing/empty
+/// fields fall back: name → the skill directory's name, description → the
+/// fixed short phrase. Skills are trusted local config — no sanitizer or
+/// caps apply.
+fn skill_meta(content: &str, dir_name: &str) -> (String, String) {
+    let mut name = None;
+    let mut description = None;
+    if let Some(after_fence) = content.strip_prefix("---")
+        && let Some((frontmatter, _)) = after_fence.split_once("\n---")
+    {
+        for line in frontmatter.lines() {
+            if let Some(value) = line.strip_prefix("name:") {
+                name = Some(value.trim().to_owned());
+            } else if let Some(value) = line.strip_prefix("description:") {
+                description = Some(value.trim().to_owned());
             }
         }
     }
+    let name = name
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| dir_name.to_owned());
+    let description = description
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| SKILL_DEFAULT_DESCRIPTION.to_owned());
+    (name, description)
+}
 
+/// Scan one skills root `<dir>/<name>/SKILL.md` for disclosure entries.
+/// Missing directories are empty; non-directory or symlinked skill
+/// directories and missing or symlinked `SKILL.md` files are skipped (static
+/// boundary only — no TOCTOU/hostile-dir model). I/O errors on a `SKILL.md`
+/// that should be readable bubble up with path context.
+pub fn scan_skills_dir(dir: &Path) -> anyhow::Result<Vec<SkillIndexEntry>> {
+    let dir_entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context(format!("cannot read {}", dir.display())),
+    };
+    let mut skills = Vec::new();
+    for entry in dir_entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Err(error).context(format!("cannot read {} entry", dir.display()));
+            }
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let Ok(dir_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let skill_path = entry.path().join("SKILL.md");
+        let Ok(metadata) = std::fs::symlink_metadata(&skill_path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&skill_path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).context(format!("cannot read {}", skill_path.display()));
+            }
+        };
+        let (name, description) = skill_meta(&content, &dir_name);
+        skills.push(SkillIndexEntry {
+            name,
+            description,
+            path: skill_path,
+            dir_name,
+        });
+    }
     Ok(skills)
 }
 
-/// Merge skills from `global_dir` (e.g. `Config::config_dir()/skills/`) and
-/// `workspace_dir` (`.e-agent/skills/`).  Workspace entries override same-name
-/// globals.  Returns `None` silently when both are missing/empty.
-pub fn read_skills_merge(
-    global_dir: Option<&Path>,
-    workspace_dir: &Path,
-) -> anyhow::Result<Option<String>> {
-    let mut merged: HashMap<String, String> = HashMap::new();
-    if let Some(global) = global_dir {
-        for (name, content) in read_skills_from(global)? {
-            merged.insert(name, content);
+/// Build the startup skill index: global entries first, then workspace
+/// entries (`.e-agent/skills/`), a workspace entry with the same directory
+/// name fully replacing the global one. Sorted by display name (directory
+/// name tie-break, so a HashMap source stays deterministic) and formatted as
+/// a `name + description + absolute path` index — never the bodies.
+/// `None` when both roots are missing/empty.
+pub fn read_skills_index(root: &Path, global_dir: Option<&Path>) -> anyhow::Result<Option<String>> {
+    let mut by_dir_name: HashMap<String, SkillIndexEntry> = HashMap::new();
+    // The global root must be a real directory, not a symlink, or global
+    // skills are skipped entirely (the factory's capability decision uses
+    // the same gate).
+    if let Some(global) = global_dir.filter(|dir| skills_root_is_dir(dir)) {
+        for entry in scan_skills_dir(global)? {
+            by_dir_name.insert(entry.dir_name.clone(), entry);
         }
     }
-    for (name, content) in read_skills_from(workspace_dir)? {
-        merged.insert(name, content);
+    // The workspace root must be a real directory, not a symlink, or the
+    // whole workspace layer is skipped (same gate as the global root).
+    let workspace_skills = root.join(".e-agent").join("skills");
+    if skills_root_is_dir(&workspace_skills) {
+        for entry in scan_skills_dir(&workspace_skills)? {
+            by_dir_name.insert(entry.dir_name.clone(), entry);
+        }
     }
-    if merged.is_empty() {
+    if by_dir_name.is_empty() {
         return Ok(None);
     }
-    let mut skills: Vec<_> = merged.into_iter().collect();
-    skills.sort_by(|a, b| a.0.cmp(&b.0));
-    let combined = skills
-        .into_iter()
-        .map(|(name, content)| format!("## Skill: {name}\n\n{content}"))
+    let mut entries: Vec<SkillIndexEntry> = by_dir_name.into_values().collect();
+    entries.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.dir_name.cmp(&b.dir_name))
+    });
+    let lines = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "- **{}**: {} — {}",
+                entry.name,
+                entry.description,
+                entry.path.display()
+            )
+        })
         .collect::<Vec<_>>()
-        .join("\n\n");
-    Ok(Some(combined))
-}
-
-/// Production entry: global from `Config::config_dir()/skills/`, workspace
-/// from `<root>/.e-agent/skills/`.
-fn read_skills_merged(root: &Path) -> anyhow::Result<Option<String>> {
-    let global = crate::config::config_dir().map(|d| d.join("skills"));
-    let workspace = root.join(".e-agent").join("skills");
-    read_skills_merge(global.as_deref(), &workspace)
+        .join("\n");
+    Ok(Some(format!("## Skills\n\n{lines}")))
 }
 
 /// Turn a resolved profile into a wire model, honoring `--base-url`/`--model`

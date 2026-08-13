@@ -46,81 +46,131 @@ fn test_build_version_is_package_version() {
     assert_eq!(version_line(), expected);
 }
 
+// Progressive skill disclosure tests
+
+use e_agent::{
+    config::Sandbox,
+    session_factory::{
+        SKILL_DEFAULT_DESCRIPTION, read_skills_index, scan_skills_dir, skills_root_is_dir,
+    },
+    workspace::Workspace,
+};
+
 fn write_skill(base: &std::path::Path, name: &str, content: &str) {
     let d = base.join(name);
     fs::create_dir_all(&d).unwrap();
     fs::write(d.join("SKILL.md"), content).unwrap();
 }
 
-/// scan skip + error: missing dir, non-dir, missing/empty SKILL.md, UTF-8 error
-#[test]
-fn test_skills_scan_skip_and_error() {
-    let tmp = tempfile::tempdir().unwrap();
-    let gl = tmp.path().join("gl");
-    // missing dir → empty
-    assert!(read_skills_from(&gl).unwrap().is_empty());
-    fs::create_dir_all(&gl).unwrap();
-    // non-directory entry → skipped
-    fs::write(gl.join("not_a_dir"), "content").unwrap();
-    let d = gl.join("no-skill-md");
-    fs::create_dir_all(&d).unwrap();
-    let d2 = gl.join("empty-skill");
-    fs::create_dir_all(&d2).unwrap();
-    fs::write(d2.join("SKILL.md"), "").unwrap();
-    let d3 = gl.join("ws-only");
-    fs::create_dir_all(&d3).unwrap();
-    fs::write(d3.join("SKILL.md"), "   \n  \t  ").unwrap();
-    // only the real skill survives
-    write_skill(&gl, "real", "content");
-    let loaded = read_skills_from(&gl).unwrap();
-    assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].0, "real");
-    // UTF-8 error
-    let bad = gl.join("bad-utf8");
-    fs::create_dir_all(&bad).unwrap();
-    fs::write(bad.join("SKILL.md"), [0xff, 0xfe, 0x00]).unwrap();
-    let err = read_skills_from(&gl).unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(msg.contains("bad-utf8/SKILL.md"), "{msg}");
-    assert!(msg.contains("UTF-8"), "{msg}");
+fn fm(name: &str, description: &str) -> String {
+    format!("---\nname: {name}\ndescription: {description}\n---\n\n{name} secret body\n")
 }
 
-/// merge: sort across dirs, workspace override, content intact
 #[test]
-fn test_skills_merge_sort_override_and_content() {
+fn test_skills_index_content_override_sort() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("ws");
     let gl = tmp.path().join("gl");
-    write_skill(&gl, "z-global", "zzz");
-    write_skill(&ws, "a-ws", "aaa");
-    write_skill(&ws, "common", "ws wins");
-    write_skill(&gl, "common", "global lose");
-    write_skill(&ws, "m-ws", "line 1\nline 2\n\nline 4");
-    let result = read_skills_merge(Some(&gl), &ws).unwrap().unwrap();
-    assert_eq!(
-        result,
-        "## Skill: a-ws\n\naaa\n\n\
-         ## Skill: common\n\nws wins\n\n\
-         ## Skill: m-ws\n\nline 1\nline 2\n\nline 4\n\n\
-         ## Skill: z-global\n\nzzz"
-    );
-    assert!(!result.contains("global lose"), "override failed");
+    let ws_skills = ws.join(".e-agent/skills");
+    fs::create_dir_all(&ws_skills).unwrap();
+    write_skill(&gl, "z-global", &fm("z-global", "global z"));
+    write_skill(&gl, "common", &fm("common", "global common"));
+    write_skill(&ws_skills, "a-ws", &fm("a-ws", "ws a"));
+    write_skill(&ws_skills, "common", &fm("common", "ws wins"));
+    // Same display name from different directories: the index sorts by
+    // display name and tie-breaks deterministically on directory name.
+    write_skill(&ws_skills, "dup-aaa", &fm("same-name", "dup one"));
+    write_skill(&ws_skills, "dup-zzz", &fm("same-name", "dup two"));
+    let index = read_skills_index(&ws, Some(&gl)).unwrap().unwrap();
+    assert!(index.starts_with("## Skills\n\n- **a-ws**: ws a — "));
+    assert!(index.contains("ws wins") && !index.contains("global common"));
+    assert!(index.contains("z-global/SKILL.md") && !index.contains("secret body"));
+    let pos = |s: &str| index.find(s).unwrap();
+    assert!(pos("**a-ws**") < pos("**common**") && pos("**common**") < pos("**z-global**"));
+    assert!(pos("dup-aaa/SKILL.md") < pos("dup-zzz/SKILL.md"));
 }
 
-/// merge: global_dir=None and both dirs missing
 #[test]
-fn test_skills_merge_global_none_and_missing() {
+fn test_skills_index_frontmatter_fallbacks() {
     let tmp = tempfile::tempdir().unwrap();
-    // global=None, workspace exists
     let ws = tmp.path().join("ws");
-    write_skill(&ws, "only-ws", "content");
-    assert_eq!(
-        read_skills_merge(None, &ws).unwrap().unwrap(),
-        "## Skill: only-ws\n\ncontent"
+    let ws_skills = ws.join(".e-agent/skills");
+    fs::create_dir_all(&ws_skills).unwrap();
+    write_skill(&ws_skills, "plain", "just a body");
+    write_skill(&ws_skills, "unclosed", "---\nname: unclosed\n");
+    write_skill(
+        &ws_skills,
+        "noname",
+        "---\ndescription: only desc\n---\nbody",
     );
-    // both missing → None
-    let missing = tmp.path().join("missing");
-    assert_eq!(read_skills_merge(Some(&missing), &missing).unwrap(), None);
+    write_skill(&ws_skills, "nodesc", "---\nname: nodesc\n---\nbody");
+    let index = read_skills_index(&ws, None).unwrap().unwrap();
+    assert!(index.contains("**plain**") && index.contains("**unclosed**"));
+    assert!(index.contains("**noname**") && index.contains("only desc"));
+    assert!(index.contains("**nodesc**"));
+    assert_eq!(index.matches(SKILL_DEFAULT_DESCRIPTION).count(), 3);
+    let missing = read_skills_index(&tmp.path().join("missing"), None).unwrap();
+    assert!(missing.is_none());
+}
+
+#[test]
+fn test_skills_read_capability_scoped_to_skills_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_root = tmp.path().join("ws");
+    let skills = tmp.path().join("config/e-agent/skills");
+    fs::create_dir_all(&ws_root).unwrap();
+    write_skill(&skills, "alpha", &fm("alpha", "d"));
+    let sibling = tmp.path().join("config/e-agent/config.toml");
+    fs::write(&sibling, "sibling secret").unwrap();
+    let policy = Sandbox {
+        readable_paths: vec![skills.to_string_lossy().into_owned()],
+        ..Sandbox::default()
+    };
+    let ws = Workspace::new(&ws_root).unwrap();
+    let main_ws = ws.with_external_roots(&policy).unwrap();
+    let skill_path = skills.join("alpha/SKILL.md").to_string_lossy().into_owned();
+    let content = main_ws.read_to_string(&skill_path).unwrap();
+    assert!(content.contains("secret body"));
+    let err = main_ws
+        .read_to_string(&sibling.to_string_lossy())
+        .unwrap_err();
+    assert!(err.contains("authorized external root"));
+    let plain_ws = Workspace::new(&ws_root).unwrap();
+    assert!(plain_ws.read_to_string(&skill_path).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_skills_symlink_boundaries() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let ws_skills = ws.join(".e-agent/skills");
+    // A workspace `.e-agent/skills` root that is itself a symlink skips
+    // the whole workspace layer, exactly like a symlinked global root.
+    let sym_ws = tmp.path().join("ws-sym");
+    let real_ws_root = tmp.path().join("real-ws-skills");
+    write_skill(&real_ws_root, "ws-skill", &fm("ws-skill", "d"));
+    fs::create_dir_all(sym_ws.join(".e-agent")).unwrap();
+    symlink(&real_ws_root, sym_ws.join(".e-agent/skills")).unwrap();
+    let ws_index = read_skills_index(&sym_ws, None).unwrap();
+    assert!(ws_index.is_none());
+    fs::create_dir_all(&ws_skills).unwrap();
+    let real_root = tmp.path().join("real-root");
+    write_skill(&real_root, "global-skill", &fm("global-skill", "d"));
+    let sym_root = tmp.path().join("sym-root");
+    symlink(&real_root, &sym_root).unwrap();
+    assert!(!skills_root_is_dir(&sym_root));
+    let global = read_skills_index(&ws, Some(&sym_root)).unwrap();
+    assert!(global.is_none());
+    symlink(tmp.path().join("nowhere"), ws_skills.join("sym-dir")).unwrap();
+    let sym_file_dir = ws_skills.join("sym-file");
+    fs::create_dir_all(&sym_file_dir).unwrap();
+    symlink(tmp.path().join("nowhere.md"), sym_file_dir.join("SKILL.md")).unwrap();
+    write_skill(&ws_skills, "real", &fm("real", "real desc"));
+    let entries = scan_skills_dir(&ws_skills).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "real");
 }
 
 #[test]
@@ -140,10 +190,6 @@ fn test_tui_session_report_err() {
         ]
     );
 }
-
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-// Crash diagnostic tests
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 #[test]
 fn test_format_crash_report() {

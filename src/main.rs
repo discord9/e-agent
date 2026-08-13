@@ -910,11 +910,9 @@ fn notify_crash_if_exists() {
     acknowledge_crash(&dir.join("latest.log"), &dir.join("previous.log"));
 }
 
-// The skill-scanning helpers moved into session_factory.rs (the factory's
-// constructor owns workspace-content reading); re-exported here so the
-// existing main_tests.rs tests keep exercising them unchanged.
-#[cfg(test)]
-pub use e_agent::session_factory::{read_skills_from, read_skills_merge};
+// The skill scan + disclosure-index helpers live in session_factory.rs (the
+// factory's constructor owns the startup snapshot and the main-session
+// read-only skills capability); main_tests.rs imports them directly.
 
 #[cfg(test)]
 #[path = "main_tests.rs"]

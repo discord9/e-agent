@@ -371,16 +371,22 @@ main agent's context (subagents do not inherit them):
 - **Workspace skills**: `.e-agent/skills/<name>/SKILL.md` relative to the
   canonical workspace root.
 
-At startup, the main agent loads both directories. When a skill name exists in
-both, the workspace version **fully replaces** the global one (no
-concatenation). The merged set is sorted by `<name>` in dictionary order, and
-each skill is injected as a `## Skill: <name>\n\n<content>` block — all skills
-form a single context segment. The injection order is: main role template
-(`agents/main.md`) → workspace `AGENTS.md` → skills → MCP server
-instructions. Missing directories, empty directories, non-directory entries,
-subdirectories without `SKILL.md`, and empty `SKILL.md` files are silently
-skipped. Real I/O or UTF-8 errors on a `SKILL.md` that should be readable
-produce an error with path context.
+At startup, the main agent scans both directories once (a fixed snapshot, no
+hot reload) and injects a brief index — never the bodies — into its system
+context: each skill becomes one `- **name**: description — /absolute/path/SKILL.md`
+line, sorted by name. `name`/`description` come from the SKILL.md's leading
+`---` frontmatter (single-line `name:` / `description:` fields); missing,
+unterminated or field-less frontmatter falls back to the directory name / a
+fixed short phrase. When a skill's directory name exists in both, the
+workspace version **fully replaces** the global one. The model opens a skill
+with the existing `read_file` tool: workspace skills through the workspace
+capability, global skills through an extra read-only capability rooted at the
+global skills directory that only the main session's file tools carry
+(subagents and btw forks never see it). The injection order is: main role
+template (`agents/main.md`) → workspace `AGENTS.md` → skills → MCP server
+instructions. Missing directories, non-directory entries, and symlinked skill
+directories / `SKILL.md` files are silently skipped; the global skills root
+must itself be a real directory, not a symlink.
 `read_file` pages long files by 1-indexed lines (optional `offset`/`limit`,
 default 2000 lines per read, capped at 64 KiB) and prints a continuation hint
 when more lines remain.
@@ -1007,11 +1013,13 @@ hashed asset routes, no HTTP compression, no runtime asset discovery, and no
 KaTeX font packaging.
 Workspace skills are deliberately flat `<skills-dir>/<name>/SKILL.md` only
 (global skills from `Config::config_dir()/skills/`, workspace skills from
-`.e-agent/skills/`): no YAML/front matter parsing, remote installation,
-registry, dependencies, hot reload, slash commands, on-demand loading, config
-toggle, or recursive skill discovery. Skills are main-agent-only and are not
-inherited by subagents. The same-name override is a full replacement, not a
-merge or concatenation.
+`.e-agent/skills/`): frontmatter disclosure is limited to single-line
+`name`/`description` with no body injection, sanitizer, or caps; no remote
+installation, registry, dependencies, hot reload, slash commands, on-demand
+loading, config toggle, or recursive skill discovery. Global skills are
+main-agent-only: subagents and btw forks neither inherit the index nor the
+read capability. The same-name override is a full replacement, not a merge
+or concatenation.
 
 GreptimeDB-specific non-goals (when built with `--features greptime`):
 
