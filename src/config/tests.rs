@@ -826,6 +826,309 @@ fn sandbox_keeps_readable_symlink_mount_shadowed_by_writable_target() {
     );
 }
 
+/// After project narrowing, the configured mounts are filtered by the FINAL
+/// canonical roots: the narrowed-away global writable parent mount is
+/// stale and must not let bash regain the removed authority.
+#[test]
+fn sandbox_narrowing_drops_stale_global_writable_parent_mount() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let external = temp.path().join("external");
+    let child = external.join("child");
+    std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+    std::fs::create_dir_all(&child).unwrap();
+    let path = write_config(
+        temp.path(),
+        &format!("[sandbox]\nwritable_paths = [\"{}\"]\n", external.display()),
+    );
+    std::fs::write(
+        workspace.join(".e-agent/config.toml"),
+        format!("[sandbox]\nwritable_paths = [\"{}\"]\n", child.display()),
+    )
+    .unwrap();
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    assert_eq!(
+        sandbox.writable_mounts,
+        vec![(
+            child.to_str().unwrap().to_owned(),
+            child.to_str().unwrap().to_owned()
+        )],
+        "only the narrowed child mount survives"
+    );
+    assert!(
+        !sandbox
+            .writable_mounts
+            .iter()
+            .any(|(source, _)| Path::new(source) == external),
+        "the stale global writable parent must not resurface as a mount"
+    );
+}
+
+/// Unrelated global mounts keep their sources inside final roots and
+/// survive the post-narrowing filter; only the narrowed-away ancestor is
+/// dropped.
+#[test]
+fn sandbox_narrowing_keeps_unrelated_global_writable_mounts() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let keep = temp.path().join("keep");
+    let external = temp.path().join("external");
+    let child = external.join("child");
+    std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+    std::fs::create_dir_all(&keep).unwrap();
+    std::fs::create_dir_all(&child).unwrap();
+    let path = write_config(
+        temp.path(),
+        &format!(
+            "[sandbox]\nwritable_paths = [\"{}\", \"{}\"]\n",
+            keep.display(),
+            external.display()
+        ),
+    );
+    std::fs::write(
+        workspace.join(".e-agent/config.toml"),
+        format!("[sandbox]\nwritable_paths = [\"{}\"]\n", child.display()),
+    )
+    .unwrap();
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    assert_eq!(
+        sandbox.writable_mounts,
+        vec![
+            (
+                child.to_str().unwrap().to_owned(),
+                child.to_str().unwrap().to_owned()
+            ),
+            (
+                keep.to_str().unwrap().to_owned(),
+                keep.to_str().unwrap().to_owned()
+            ),
+        ],
+        "the unrelated global mount survives; the narrowed-away ancestor is gone"
+    );
+}
+
+/// An independent RO alias mount whose source lies inside a final writable
+/// root survives the post-narrowing filter (its dest differs from the
+/// writable self-mount), while the stale global writable parent mount is
+/// dropped.
+#[cfg(unix)]
+#[test]
+fn sandbox_narrowing_keeps_ro_alias_mount_inside_final_writable_root() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let external = temp.path().join("external");
+    let child = external.join("child");
+    let alias = temp.path().join("alias");
+    std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+    std::fs::create_dir_all(&child).unwrap();
+    symlink(&child, &alias).unwrap();
+    let path = write_config(
+        temp.path(),
+        &format!(
+            "[sandbox]\nwritable_paths = [\"{}\"]\nreadable_paths = [\"{}\"]\n",
+            external.display(),
+            alias.display()
+        ),
+    );
+    std::fs::write(
+        workspace.join(".e-agent/config.toml"),
+        format!("[sandbox]\nwritable_paths = [\"{}\"]\n", child.display()),
+    )
+    .unwrap();
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    let canonical_child = std::fs::canonicalize(&child).unwrap();
+    // The stale global writable parent mount is gone…
+    assert!(
+        !sandbox
+            .writable_mounts
+            .iter()
+            .any(|(source, _)| Path::new(source) == external),
+        "stale global writable parent mount must be dropped"
+    );
+    assert_eq!(
+        sandbox.writable_mounts,
+        vec![(
+            canonical_child.to_str().unwrap().to_owned(),
+            canonical_child.to_str().unwrap().to_owned()
+        )],
+        "only the narrowed writable child mount survives"
+    );
+    // …but the independent RO alias destination whose source lies inside
+    // the final writable root is preserved.
+    assert_eq!(
+        sandbox.readable_mounts,
+        vec![(
+            canonical_child.to_str().unwrap().to_owned(),
+            alias.to_str().unwrap().to_owned()
+        )],
+        "the RO alias mount inside the final writable root survives"
+    );
+}
+
+/// Two configured aliases of the same canonical source with different
+/// destinations must BOTH survive as mount entries (dedup only collapses
+/// identical source+dest pairs), while the canonical authority path vector
+/// still deduplicates by source.
+#[cfg(unix)]
+#[test]
+fn sandbox_preserves_same_source_writable_aliases_with_different_dests() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let target = temp.path().join("data-home");
+    let alias1 = temp.path().join(".data1");
+    let alias2 = temp.path().join(".data2");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    symlink(&target, &alias1).unwrap();
+    symlink(&target, &alias2).unwrap();
+    let path = write_config(
+        temp.path(),
+        &format!(
+            "[sandbox]\nwritable_paths = [\"{}\", \"{}\"]\n",
+            alias1.display(),
+            alias2.display()
+        ),
+    );
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    // Canonical authority stays deduplicated by source…
+    assert_eq!(
+        sandbox.writable_paths,
+        vec![canonical.to_str().unwrap()],
+        "canonical authority vector dedups by source"
+    );
+    // …while both configured destinations are preserved as mount entries.
+    assert_eq!(
+        sandbox.writable_mounts,
+        vec![
+            (
+                canonical.to_str().unwrap().to_owned(),
+                alias1.to_str().unwrap().to_owned()
+            ),
+            (
+                canonical.to_str().unwrap().to_owned(),
+                alias2.to_str().unwrap().to_owned()
+            ),
+        ],
+        "same-source writable aliases with different destinations both survive"
+    );
+    assert!(sandbox.readable_mounts.is_empty());
+}
+
+/// Readable same-source aliases behave symmetrically: both configured
+/// destinations survive as RO mount entries, canonical authority dedups.
+#[cfg(unix)]
+#[test]
+fn sandbox_preserves_same_source_readable_aliases_with_different_dests() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let target = temp.path().join("rustup-home");
+    let alias1 = temp.path().join(".rustup1");
+    let alias2 = temp.path().join(".rustup2");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    symlink(&target, &alias1).unwrap();
+    symlink(&target, &alias2).unwrap();
+    let path = write_config(
+        temp.path(),
+        &format!(
+            "[sandbox]\nreadable_paths = [\"{}\", \"{}\"]\n",
+            alias1.display(),
+            alias2.display()
+        ),
+    );
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    assert_eq!(
+        sandbox.readable_paths,
+        vec![canonical.to_str().unwrap()],
+        "canonical authority vector dedups by source"
+    );
+    assert_eq!(
+        sandbox.readable_mounts,
+        vec![
+            (
+                canonical.to_str().unwrap().to_owned(),
+                alias1.to_str().unwrap().to_owned()
+            ),
+            (
+                canonical.to_str().unwrap().to_owned(),
+                alias2.to_str().unwrap().to_owned()
+            ),
+        ],
+        "same-source readable aliases with different destinations both survive"
+    );
+    assert!(sandbox.writable_mounts.is_empty());
+}
+
+/// Exact-file same-source aliases are preserved the same way: both
+/// configured destinations survive, the canonical exact file dedups.
+#[cfg(unix)]
+#[test]
+fn sandbox_preserves_same_source_exact_file_aliases() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    let target = temp.path().join("exact");
+    let alias1 = temp.path().join("exact1");
+    let alias2 = temp.path().join("exact2");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(&target, "old").unwrap();
+    symlink(&target, &alias1).unwrap();
+    symlink(&target, &alias2).unwrap();
+    let path = write_config(
+        temp.path(),
+        &format!(
+            "[sandbox]\nwritable_paths = [\"{}\", \"{}\"]\n",
+            alias1.display(),
+            alias2.display()
+        ),
+    );
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    assert_eq!(
+        sandbox.writable_paths,
+        vec![canonical.to_str().unwrap()],
+        "canonical exact-file authority dedups by source"
+    );
+    assert_eq!(
+        sandbox.writable_mounts,
+        vec![
+            (
+                canonical.to_str().unwrap().to_owned(),
+                alias1.to_str().unwrap().to_owned()
+            ),
+            (
+                canonical.to_str().unwrap().to_owned(),
+                alias2.to_str().unwrap().to_owned()
+            ),
+        ],
+        "same-source exact-file aliases with different destinations both survive"
+    );
+    assert!(sandbox.readable_mounts.is_empty());
+}
+
 /// Writable symlink roots behave symmetrically: canonical in
 /// `writable_paths`, configured dest in `writable_mounts`.
 #[cfg(unix)]

@@ -312,8 +312,12 @@ impl SessionFactory {
                 (main_model, None, None, None, HashMap::new(), HashMap::new())
             }
         };
-        // Resolve one shared canonical policy. `enabled` controls only bwrap;
-        // file capabilities remain active independently.
+        // Resolve one shared canonical policy. `enabled` controls both the
+        // bwrap sandbox and the workspace's logical file-tool entry: with
+        // the sandbox enabled, `workspace_writable = false` denies
+        // file-tool writes inside the workspace too; with it disabled the
+        // file tools keep the historical always-writable workspace.
+        // External roots stay active independently either way.
         let resolved_policy = resolve_sandbox(config.as_ref(), &root)?;
         workspace = workspace
             .with_external_roots(&resolved_policy)

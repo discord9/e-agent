@@ -684,7 +684,16 @@ struct ProjectSandbox {
 /// `writable_mounts` so a configured alias (e.g. a `~/.cargo` symlink onto a
 /// canonical writable root) stays visible inside the sandbox at the
 /// configured location even when the readable root itself is shadowed by a
-/// writable root during normalization.
+/// writable root during normalization. Two configured aliases of the same
+/// canonical source with different destinations are BOTH preserved as
+/// separate mount entries (dedup only collapses identical source+dest
+/// pairs); the canonical authority path vectors still deduplicate by source,
+/// so aliases never multiply authority. After the merge/narrowing, the
+/// configured mounts are filtered by the final canonical roots: a stale
+/// mount whose source is no longer inside any final writable root (a
+/// narrowed-away global writable parent) is dropped so bash cannot regain
+/// the removed authority, while unrelated global mounts and independent RO
+/// alias mounts whose source lies inside a final writable root survive.
 pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Result<Sandbox> {
     let mut result = config.and_then(|c| c.sandbox.clone()).unwrap_or_default();
     // Collect configured (canonical source, configured dest) mount pairs
@@ -791,6 +800,30 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
         // mount is the canonical self-mount (source == dest == canonical).
         readable_mounts.push((main_repo.clone(), main_repo));
     }
+
+    // Filter the configured mounts by the FINAL canonical roots. The mounts
+    // were collected from the RAW roots before merge/narrowing, so they
+    // still carry narrowed-away global ancestors: a writable mount whose
+    // source is no longer inside any final writable root is stale (e.g. a
+    // global writable parent replaced by a project subpath) and is dropped,
+    // so bash cannot regain the narrowed-away authority through the stale
+    // bind. Unrelated global mounts keep their sources inside final roots
+    // and survive; an independent RO alias mount whose source lies inside a
+    // final writable root survives too (its dest differs from the writable
+    // self-mount, so it stays an independent mount point).
+    writable_mounts.retain(|(source, _)| {
+        writable
+            .iter()
+            .any(|root| Path::new(source).starts_with(root))
+    });
+    readable_mounts.retain(|(source, _)| {
+        readable
+            .iter()
+            .any(|root| Path::new(source).starts_with(root))
+            || writable
+                .iter()
+                .any(|root| Path::new(source).starts_with(root))
+    });
 
     result.writable_paths = utf8_roots(writable)?;
     result.readable_paths = utf8_roots(readable)?;
@@ -1054,7 +1087,14 @@ fn project_sandbox(workspace: &Path) -> anyhow::Result<Option<ProjectSandbox>> {
 /// (before canonicalization), so a symlink alias still mounts inside the
 /// sandbox at the user's configured location while the security boundary
 /// stays canonical. `skip_missing` silently ignores NotFound (compatibility
-/// for global roots); everything else still fails loudly.
+/// for global roots); everything else still fails loudly. Deduplication
+/// collapses only identical (canonical source, configured dest) pairs: two
+/// configured aliases of the same canonical source with DIFFERENT
+/// destinations are both preserved as separate mount entries (each appears
+/// inside the sandbox and is addressable by the file tools at its own
+/// configured location). The canonical authority path vectors derived from
+/// these pairs are still deduplicated by source in `normalize_roots`, so
+/// multiple aliases never multiply authority.
 fn canonical_roots(
     paths: &[String],
     workspace: &Path,
@@ -1081,7 +1121,10 @@ fn canonical_roots(
                 path.display()
             );
         }
-        if !roots.iter().any(|(root, _)| root == &path) {
+        if !roots
+            .iter()
+            .any(|(canonical, dest)| canonical == &path && dest == &expanded)
+        {
             roots.push((path, expanded));
         }
     }

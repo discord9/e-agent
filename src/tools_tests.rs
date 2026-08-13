@@ -1522,7 +1522,7 @@ async fn sandbox_can_disable_network() {
 }
 
 #[tokio::test]
-async fn sandbox_read_only_workspace_rejects_bash_but_not_file_tool_writes() {
+async fn sandbox_read_only_workspace_rejects_bash_and_file_tool_writes() {
     let Some(mut sandbox) = sandbox() else {
         eprintln!("bwrap unavailable; skipping sandbox test");
         return;
@@ -1530,13 +1530,40 @@ async fn sandbox_read_only_workspace_rejects_bash_but_not_file_tool_writes() {
     sandbox.workspace_writable = false;
     let _guard = undo_test_guard().await;
     let temp = tempfile::tempdir().unwrap();
-    let workspace = Workspace::new(temp.path()).unwrap();
-    WriteFile {
-        workspace: workspace.clone(),
-    }
-    .execute(json!({"path": "file-tool", "content": "yes"}))
-    .await
-    .unwrap();
+    std::fs::write(temp.path().join("existing"), "data").unwrap();
+    let workspace = Workspace::new(temp.path())
+        .unwrap()
+        .with_external_roots(&sandbox)
+        .unwrap();
+    // With the sandbox enabled and the workspace read-only, the file tools
+    // are denied writes too (reads stay allowed).
+    assert!(
+        WriteFile {
+            workspace: workspace.clone(),
+        }
+        .execute(json!({"path": "file-tool", "content": "yes"}))
+        .await
+        .is_err()
+    );
+    assert!(!temp.path().join("file-tool").exists());
+    assert!(
+        EditFile {
+            workspace: workspace.clone(),
+        }
+        .execute(json!({"path": "existing", "old": "data", "new": "x"}))
+        .await
+        .is_err()
+    );
+    assert!(
+        ReadFile {
+            workspace: workspace.clone(),
+        }
+        .execute(json!({"path": "existing"}))
+        .await
+        .unwrap()
+        .content
+        .contains("data")
+    );
     let tool = Bash {
         workspace,
         timeout: Some(Duration::from_secs(10)),
@@ -1553,6 +1580,123 @@ async fn sandbox_read_only_workspace_rejects_bash_but_not_file_tool_writes() {
             .is_err()
     );
     assert!(!temp.path().join("bash-file").exists());
+}
+
+#[tokio::test]
+async fn file_tools_resolve_configured_alias_destinations() {
+    let _guard = undo_test_guard().await;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_dir = temp.path().join("workspace");
+    let source = temp.path().join("source");
+    let alias = temp.path().join("alias");
+    std::fs::create_dir(&workspace_dir).unwrap();
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("file"), "one two one").unwrap();
+    let policy = crate::config::Sandbox {
+        writable_paths: vec![source.to_str().unwrap().to_owned()],
+        writable_mounts: vec![(
+            source.to_str().unwrap().to_owned(),
+            alias.to_str().unwrap().to_owned(),
+        )],
+        ..Default::default()
+    };
+    let workspace = Workspace::new(&workspace_dir)
+        .unwrap()
+        .with_external_roots(&policy)
+        .unwrap();
+    // read_file through the configured alias destination.
+    assert!(
+        ReadFile {
+            workspace: workspace.clone(),
+        }
+        .execute(json!({"path": alias.join("file")}))
+        .await
+        .unwrap()
+        .content
+        .contains("one two one")
+    );
+    // write_file through the alias writes through to the canonical source.
+    WriteFile {
+        workspace: workspace.clone(),
+    }
+    .execute(json!({"path": alias.join("new"), "content": "created"}))
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(source.join("new")).unwrap(),
+        "created"
+    );
+    // edit_file through the alias edits the canonical source.
+    EditFile {
+        workspace: workspace.clone(),
+    }
+    .execute(json!({"path": alias.join("file"), "old": "two", "new": "x"}))
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(source.join("file")).unwrap(),
+        "one x one"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_ro_exact_file_child_denies_tool_writes_but_allows_siblings() {
+    // Winner-before-mode at the tool level: with the sandbox enabled and a
+    // writable workspace, an exact RO file child denies write_file and
+    // edit_file (read_file still works), while a sibling follows the
+    // workspace's own writable policy.
+    let _guard = undo_test_guard().await;
+    let temp = tempfile::tempdir().unwrap();
+    let exact = temp.path().join("secret.txt");
+    std::fs::write(&exact, "data").unwrap();
+    let policy = crate::config::Sandbox {
+        enabled: true,
+        workspace_writable: true,
+        readable_paths: vec![exact.to_str().unwrap().to_owned()],
+        ..Default::default()
+    };
+    let workspace = Workspace::new(temp.path())
+        .unwrap()
+        .with_external_roots(&policy)
+        .unwrap();
+    // write_file and edit_file on the exact RO file are denied.
+    assert!(
+        WriteFile {
+            workspace: workspace.clone(),
+        }
+        .execute(json!({"path": "secret.txt", "content": "no"}))
+        .await
+        .is_err()
+    );
+    assert!(
+        EditFile {
+            workspace: workspace.clone(),
+        }
+        .execute(json!({"path": "secret.txt", "old": "data", "new": "x"}))
+        .await
+        .is_err()
+    );
+    assert_eq!(std::fs::read_to_string(&exact).unwrap(), "data");
+    // read_file still works through the same winner.
+    assert!(
+        ReadFile {
+            workspace: workspace.clone(),
+        }
+        .execute(json!({"path": "secret.txt"}))
+        .await
+        .unwrap()
+        .content
+        .contains("data")
+    );
+    // A sibling follows the RW workspace policy.
+    WriteFile { workspace }
+        .execute(json!({"path": "other.txt", "content": "yes"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("other.txt")).unwrap(),
+        "yes"
+    );
 }
 
 #[tokio::test]

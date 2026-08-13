@@ -208,11 +208,39 @@ enabled = true
 # readable_paths = ["~/.rustup", "~/.local"]
 ```
 
+When the sandbox is **enabled**, the workspace itself becomes a logical policy
+entry for the file tools: with `workspace_writable = false` the file tools
+deny writes/edits/removes inside the workspace (reads stay allowed), exactly
+like the read-only Bash mount, while an explicit writable child path still
+wins by the most-specific-entry rule and the workspace entry wins over an
+external ancestor or an equal external destination. When the sandbox is
+**disabled**, the workspace is not a policy entry and the file tools keep the
+historical always-writable workspace (Bash is unsandboxed); external roots
+stay active either way.
+
 `writable_paths` / `readable_paths` define one resolved policy shared by Bash
 mounts and the file tools' external capabilities. A leading `~` expands to the
 home directory; relative paths resolve against the main workspace. Existing
-file/directory roots are canonicalized (including symlink aliases) and aliases
-are deduplicated; missing global roots are skipped.
+file/directory roots are canonicalized (including symlink aliases); only
+identical (canonical source, configured destination) pairs are deduplicated,
+while two configured aliases of the same canonical source with different
+destinations are both preserved as separate mount entries (the canonical
+authority itself is never duplicated — the path vectors still deduplicate by
+source). Missing global roots are skipped. Each configured root is
+kept as a **(canonical source, configured logical destination)** pair: Bash
+mounts the canonical source at the configured destination, and the file tools
+open their capability from the canonical source but look up absolute paths by
+the configured logical destination (the path the user wrote, before
+canonicalization). Lookup is lexical — the input path is never ambiently
+canonicalized — and picks the single most-specific logical winner among all
+entries; an equal destination
+resolves to the workspace entry. The winner's mode is then enforced: a
+writable operation against a most-specific read-only winner is rejected
+outright and never falls back to a broader writable parent (reads select the
+same winner). The same canonical source can therefore exist
+independently as a canonical read-write entry and an alias read-only entry
+(e.g. a `~/.cargo` symlink onto a canonical writable root: the alias stays
+read-only while the canonical path stays writable).
 
 A project-local `<workspace>/.e-agent/config.toml` merges with these global
 roots instead of replacing them. A project path that is a strict subpath of a
@@ -241,6 +269,12 @@ on or off, or flip only the network policy, without restating the paths). A
 read-only child under a
 writable parent is rejected rather than silently restoring write authority;
 select a narrower writable root or downgrade the whole selected root instead.
+After narrowing, the configured mounts are filtered by the final canonical
+roots: a stale mount whose canonical source is no longer inside any final
+writable root (a narrowed-away global writable parent) is dropped so Bash
+cannot regain the removed authority through the stale bind, while unrelated
+global mounts and independent read-only alias mounts whose source lies inside
+a final writable root survive.
 The exact workspace-relative `.e-agent/config.toml` policy file is readable by
 file tools but write/edit protected and must be changed by the user outside the
 agent. Bash binds an existing policy over `/dev/null`; if only `.e-agent/`
@@ -397,8 +431,14 @@ ends the turn.
 
 The workspace and configured external capabilities constrain only the agent's
 file tools. Relative paths use the workspace; absolute paths require an
-authorized canonical external root. Readable roots permit reads, while
-writable roots permit read/write/edit. Exact-file roots do not grant authority
+authorized external root, matched by the configured logical destination (the
+canonical source backs the capability; the input path is never canonicalized).
+Readable roots permit reads, while
+writable roots permit read/write/edit. For a writable operation the
+most-specific logical winner decides: a read-only winner (e.g. a read-only
+child under a writable parent) rejects the operation outright rather than
+falling back to a broader writable root, and an exact read-only file denies
+only itself — its siblings follow the parent's own policy. Exact-file roots do not grant authority
 to siblings. Directory capabilities permit symlinks that remain inside their
 root and reject symlink escapes. Exact-file capabilities use a durable handle
 opened at startup: if the trusted host renames or replaces that pathname, file
@@ -406,7 +446,12 @@ tools still address the original inode, while Bash resolves and mounts the
 pathname on each invocation. The trusted host should keep configured roots
 stable for the run. Delegated custom workspaces must be canonical directories
 inside the startup workspace or an authorized writable external directory;
-read-only and exact-file capabilities cannot be rerooted. Capabilities do not
+read-only and exact-file capabilities cannot be rerooted, configured alias
+destinations never extend reroot, and when the sandbox is enabled a read-only
+workspace is not writable provenance either — reroot then derives only from
+writable canonical directory capabilities (an explicit writable canonical
+child of a read-only workspace still reroots through its external
+capability). Capabilities do not
 constrain hardlink inode origins or hardlink aliases to the protected project
 policy file, do not make read/edit sequences atomic, and are not a process
 sandbox.
