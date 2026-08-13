@@ -678,6 +678,114 @@ async fn keeps_transcript_across_runs() {
 }
 
 #[tokio::test]
+async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn() {
+    // Subagent toolset on a direct Agent::run: [poll x3, read_file] — the
+    // 3rd unchanged-snapshot poll fires the guard, but the turn ends only
+    // AFTER the full batch committed real ToolResults (no synthetic holes,
+    // no sentinel in history/UI). The next run resets the guard.
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("x.txt"), "hello").unwrap();
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    let (_main_tools, background) = crate::tools::builtins(workspace.clone(), None, false, None);
+    let tools =
+        crate::tools::builtins_with_background(workspace, background, None, false, true, None);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let model = ScriptedModel {
+        replies: vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![
+                    call("c1", "get_background_tasks", "{}"),
+                    call("c2", "get_background_tasks", "{}"),
+                    call("c3", "get_background_tasks", "{}"),
+                    call("c4", "read_file", r#"{"path":"x.txt"}"#),
+                ],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![call("c5", "get_background_tasks", "{}")],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("all done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ],
+        requests: Arc::new(Mutex::new(Vec::new())),
+        delays: Default::default(),
+    };
+    let mut agent = Agent::new(Box::new(model), tools);
+    agent.set_event_handler(Box::new(move |event| captured.lock().unwrap().push(event)));
+
+    assert_eq!(agent.run("turn one".into()).await.unwrap(), "");
+
+    let history = agent.history().to_vec();
+    let tools: Vec<&Message> = history
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Message { message } => match message {
+                Message::Tool { .. } => Some(message),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tools.len(), 4, "every sibling call has a Tool result");
+    assert!(matches!(
+        tools[0],
+        Message::Tool { call_id, content, is_error: false, synthetic: false, images, .. }
+            if call_id == "c1" && content == "No background tasks running." && images.is_empty()
+    ));
+    for (idx, id) in [(1usize, "c2"), (2, "c3")] {
+        assert!(matches!(
+            tools[idx],
+            Message::Tool { call_id, content, is_error: true, synthetic: false, images, .. }
+                if call_id == id && content == POLL_GUARD_ERROR && images.is_empty()
+        ));
+    }
+    assert!(matches!(
+        tools[3],
+        Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
+            if call_id == "c4" && content == "hello"
+    ));
+    // No sentinel in history, no synthetic holes, repair adds nothing.
+    let serialized = serde_json::to_string(&history).unwrap();
+    assert!(!serialized.contains(POLL_GUARD_SENTINEL));
+    assert!(history.iter().all(|entry| !matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Tool {
+                synthetic: true,
+                ..
+            }
+        }
+    )));
+    // The termination Notice was emitted through the event handler.
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE
+    )));
+
+    assert_eq!(agent.run("turn two".into()).await.unwrap(), "all done");
+    // The last committed Tool entry is c5's normal poll (guard reset).
+    let last_tool = agent.history().iter().rev().find_map(|entry| match entry {
+        SessionEntry::Message {
+            message: message @ Message::Tool { .. },
+        } => Some(message),
+        _ => None,
+    });
+    assert!(matches!(
+        last_tool,
+        Some(Message::Tool { call_id, content, is_error: false, .. })
+            if call_id == "c5" && content == "No background tasks running."
+    ));
+}
+
+#[tokio::test]
 async fn returns_invalid_arguments_and_execution_failures_to_the_model() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedModel {

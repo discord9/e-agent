@@ -14,6 +14,45 @@ use crate::session_store::EntryLocation;
 /// (commit 92159c7) recognized these placeholders by this literal text.
 const INTERRUPTED: &str = "[turn interrupted before a tool result was produced]";
 
+/// Model-facing content of a poll-guard error: the second consecutive
+/// `get_background_tasks` call with an unchanged running-task snapshot
+/// within one turn. Subagent-only: the main agent's builtins never
+/// escalate.
+pub(crate) const POLL_GUARD_ERROR: &str = "poll guard: get_background_tasks was already called with this exact task list this turn; end the turn and wait for the automatic [background task N completed] injection instead of polling again";
+
+/// Internal termination sentinel returned by the THIRD consecutive
+/// unchanged-snapshot `get_background_tasks` poll within one turn. Never
+/// enters history, model context, or UI: the batch loops (`Agent::run_loop`
+/// and `SessionRunner`) substitute [`POLL_GUARD_ERROR`] as the committed
+/// content and use the sentinel only to set the turn-termination latch
+/// after the full sibling batch has been durably committed.
+pub(crate) const POLL_GUARD_SENTINEL: &str = "\u{0}poll-guard-terminate";
+
+/// Termination notice emitted after the full tool batch (and, in the runner
+/// path, the `commit_backgrounds` safe point) when the poll guard fired,
+/// ending the current turn. The next turn starts with a reset guard.
+pub(crate) const POLL_GUARD_TERMINATION_NOTICE: &str =
+    "repeated get_background_tasks calls with an unchanged task list; ending this turn";
+
+/// True when a tool result is the internal poll-guard termination sentinel
+/// (third consecutive unchanged-snapshot poll within one turn). Batch loops
+/// use this to set a local latch; the sentinel itself never reaches
+/// history/UI.
+pub(crate) fn is_poll_guard_terminate(result: &Result<ToolOutput, String>) -> bool {
+    matches!(result, Err(error) if error == POLL_GUARD_SENTINEL)
+}
+
+/// Map a tool error to the content that may enter history/UI: the internal
+/// poll-guard sentinel becomes the model-facing [`POLL_GUARD_ERROR`] text;
+/// every other error passes through unchanged.
+pub(crate) fn tool_error_content(error: &str) -> &str {
+    if error == POLL_GUARD_SENTINEL {
+        POLL_GUARD_ERROR
+    } else {
+        error
+    }
+}
+
 /// Number of most-recent messages kept verbatim when compacting a
 /// single-task (subagent) session whose only User message is the initial
 /// prompt. Such sessions have no "conversation before the current turn", so
@@ -913,6 +952,11 @@ pub trait Tool: Send + Sync {
     fn has_event_sender(&self) -> bool {
         false
     }
+    /// Called once at the start of each true turn (fresh/queued user prompt,
+    /// idle background-completion follow-up, direct `Agent::run` call) so
+    /// per-turn tool state can reset. Never called mid-model-round,
+    /// mid-tool-batch, or around manual/auto compaction. Default: no-op.
+    fn on_turn_start(&mut self) {}
 }
 
 pub(crate) struct RoundOutput {
@@ -1151,6 +1195,18 @@ impl Agent {
 
     pub fn set_event_handler(&mut self, handler: Box<dyn FnMut(AgentEvent) + Send>) {
         self.event_handler = Some(handler);
+    }
+
+    /// Per-true-turn tool hook: every tool's `on_turn_start` runs once at
+    /// the start of a true turn (fresh user prompt, queued prompt, idle
+    /// background-completion follow-up, direct `Agent::run` call) so
+    /// per-turn tool state (e.g. the subagent poll guard) resets. Never
+    /// called mid-model-round, mid-tool-batch, or around manual/auto
+    /// compaction.
+    pub(crate) fn start_turn(&mut self) {
+        for tool in &mut self.tools {
+            tool.on_turn_start();
+        }
     }
 
     /// Full append-only history (what is persisted and shown in the TUI).
@@ -1641,6 +1697,11 @@ impl Agent {
     /// mid-turn were folded into the history at the turn's end without the
     /// model reacting to them yet — run() uses it to start a follow-up turn.
     async fn run_turn(&mut self, prompt: String) -> anyhow::Result<(String, bool)> {
+        // A true turn starts here: fresh/queued user prompt, idle
+        // background-completion follow-up, or a direct Agent::run call.
+        // Per-turn tool state (subagent poll guard) resets; model rounds,
+        // mid-tool-batch, and manual/auto compaction never do.
+        self.start_turn();
         self.drain_background();
         self.inject_pending_background();
         // Reset the auto-compact latch at the start of each new user turn so
@@ -2019,12 +2080,23 @@ impl Agent {
                 self.emit(AgentEvent::AssistantText(content.into()));
             }
             self.push_message(Message::Assistant(assistant.clone()));
+            // Subagent poll guard: the third unchanged-snapshot
+            // get_background_tasks poll returns an internal sentinel. The
+            // sentinel must never enter history/UI — the committed content
+            // is the model-facing POLL_ERROR — and the local latch only
+            // ends the turn AFTER the full sibling batch, so every call in
+            // this assistant batch gets a real ToolResult (no
+            // repair_tool_pairs hole).
+            let mut poll_terminate = false;
             for call in &assistant.tool_calls {
                 self.emit(AgentEvent::ToolCall {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 });
                 let result = Self::execute_on(&self.tools, call).await;
+                if is_poll_guard_terminate(&result) {
+                    poll_terminate = true;
+                }
                 self.after_tool_entry(call, &result);
                 // One canonical image-bearing Tool entry: the text summary
                 // plus the structured image references ride on the Tool
@@ -2034,7 +2106,7 @@ impl Agent {
                 // keeps them so a later vision model regains them.
                 let (content, images) = match &result {
                     Ok(output) => (output.content.clone(), output.images.clone()),
-                    Err(error) => (error.clone(), Vec::new()),
+                    Err(error) => (tool_error_content(error).to_owned(), Vec::new()),
                 };
                 let is_error = result.is_err();
                 self.emit(AgentEvent::ToolResult {
@@ -2049,6 +2121,14 @@ impl Agent {
                     is_error,
                     synthetic: false,
                 });
+            }
+            if poll_terminate {
+                // The full batch is committed; emit the termination notice
+                // and end the turn. A follow-up turn (queued prompt or a
+                // background completion folded at turn end) starts with the
+                // guard reset.
+                self.emit(AgentEvent::Notice(POLL_GUARD_TERMINATION_NOTICE.into()));
+                return Ok(String::new());
             }
         }
     }

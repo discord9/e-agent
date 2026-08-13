@@ -4,6 +4,16 @@ use async_trait::async_trait;
 
 use super::background::BackgroundTasks;
 
+/// Per-turn poll-guard state for subagent `get_background_tasks` calls.
+#[derive(Default)]
+pub(super) struct PollGuardState {
+    /// Sorted running-task ID snapshot observed by the last poll this turn;
+    /// `None` before the first poll.
+    last_snapshot: Option<Vec<u64>>,
+    /// Consecutive polls of the SAME snapshot within the current turn.
+    count: u8,
+}
+
 pub(super) struct GetBackgroundTasks {
     pub(super) background: BackgroundTasks,
     /// The calling session's own id (subagents only). A running delegate
@@ -11,6 +21,31 @@ pub(super) struct GetBackgroundTasks {
     /// subagent itself and is annotated as such in the output. The main
     /// agent (and any caller without a session id) passes `None`.
     pub(super) self_session_id: Option<String>,
+    /// Subagent-only poll guard: when enabled, the second consecutive
+    /// `get_background_tasks` call with an unchanged running-task snapshot
+    /// within one turn returns the model-facing
+    /// [`crate::agent::POLL_GUARD_ERROR`], and the third returns the
+    /// internal termination sentinel ([`crate::agent::POLL_GUARD_SENTINEL`])
+    /// that the batch loops map to POLL_ERROR content and use to end the
+    /// turn after the full sibling batch. The main agent's builtins pass
+    /// `false` and never escalate.
+    pub(super) poll_guard: bool,
+    guard: std::sync::Mutex<PollGuardState>,
+}
+
+impl GetBackgroundTasks {
+    pub(super) fn new(
+        background: BackgroundTasks,
+        self_session_id: Option<String>,
+        poll_guard: bool,
+    ) -> Self {
+        Self {
+            background,
+            self_session_id,
+            poll_guard,
+            guard: std::sync::Mutex::new(PollGuardState::default()),
+        }
+    }
 }
 
 #[async_trait]
@@ -31,8 +66,41 @@ impl Tool for GetBackgroundTasks {
         }
     }
 
+    fn on_turn_start(&mut self) {
+        // Per-true-turn reset: a fresh prompt, a queued prompt, an idle
+        // background-completion follow-up, or a direct Agent::run call
+        // starts with a clean slate. Never called mid-round, mid-batch, or
+        // around compaction, so those never reset the guard.
+        if self.poll_guard {
+            *self.guard.lock().unwrap() = PollGuardState::default();
+        }
+    }
+
     async fn execute(&self, _arguments: Value) -> Result<ToolOutput, String> {
         let tasks = self.background.running();
+        // Subagent poll guard: escalate on the SORTED running-task ID
+        // snapshot. Any ID-set change (new task, completion, cancellation)
+        // resets the count; output growth or task ordering never does. The
+        // empty snapshot escalates the same 1/2/3 way.
+        if self.poll_guard {
+            let mut ids: Vec<u64> = tasks.iter().map(|task| task.id).collect();
+            ids.sort_unstable();
+            let mut guard = self.guard.lock().unwrap();
+            if guard.last_snapshot.as_deref() != Some(ids.as_slice()) {
+                guard.last_snapshot = Some(ids);
+                guard.count = 1;
+            } else {
+                guard.count = guard.count.saturating_add(1);
+            }
+            match guard.count {
+                1 => {}
+                2 => return Err(crate::agent::POLL_GUARD_ERROR.to_owned()),
+                // Third and later: internal sentinel — the batch loops map
+                // it to POLL_GUARD_ERROR for history/UI and end the turn
+                // after the full sibling batch.
+                _ => return Err(crate::agent::POLL_GUARD_SENTINEL.to_owned()),
+            }
+        }
         if tasks.is_empty() {
             return Ok(ToolOutput::text("No background tasks running."));
         }

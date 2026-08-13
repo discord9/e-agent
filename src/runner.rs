@@ -2,8 +2,9 @@
 
 use crate::{
     agent::{
-        Agent, AgentEvent, CompactionOutput, ImagePart, Message, Model, RoundOutput, SessionEntry,
-        ToolCall, ToolOutput, ToolSpec,
+        Agent, AgentEvent, CompactionOutput, ImagePart, Message, Model,
+        POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry, ToolCall, ToolOutput, ToolSpec,
+        is_poll_guard_terminate, tool_error_content,
     },
     session_store::SessionStore,
 };
@@ -1396,6 +1397,12 @@ impl SessionRunner {
                     return;
                 }
             }
+            // True turn starts here (fresh/queued prompt, or the idle
+            // background-completion follow-up turn from an empty prompt
+            // batch): reset per-turn tool state (subagent poll guard).
+            // Model rounds, mid-tool-batch, and manual/auto compaction
+            // never reset it.
+            self.agent.start_turn();
             let specs = self.agent.tool_specs();
             'turn: loop {
                 let waited = await_round(&mut self.agent, &specs, &mut self.commands).await;
@@ -1530,6 +1537,15 @@ impl SessionRunner {
                 if calls.is_empty() {
                     break 'turn;
                 }
+                // Subagent poll guard: the third unchanged-snapshot
+                // get_background_tasks poll returns an internal sentinel.
+                // The sentinel never enters history/UI — the committed
+                // content is the model-facing POLL_ERROR — and the local
+                // latch only fires AFTER the full sibling batch (every call
+                // before and after the poll keeps a real ToolResult, so
+                // repair_tool_pairs never has to patch a hole) and the
+                // commit_backgrounds safe point.
+                let mut poll_terminate = false;
                 for call in calls {
                     self.agent.emit_event(AgentEvent::ToolCall {
                         name: call.name.clone(),
@@ -1654,16 +1670,21 @@ impl SessionRunner {
                     // not depend on the model — the request copy is stripped
                     // for non-vision models at send time).
                     let pending = self.apply_pending_model_switches(waited.pending);
+                    if is_poll_guard_terminate(&result) {
+                        poll_terminate = true;
+                    }
                     // One canonical image-bearing Tool entry: the text
                     // summary plus the structured image references ride on
                     // the Tool message itself (no marker parsing, no
                     // synthetic User). Non-vision models never see the
                     // images: the request copy is stripped at send time
                     // (strip_images), while history keeps them so a later
-                    // vision model regains them.
+                    // vision model regains them. The poll-guard sentinel is
+                    // mapped to the model-facing POLL_ERROR text here so it
+                    // never enters the durable entry or the UI.
                     let (tool_text, images) = match &result {
                         Ok(output) => (output.content.clone(), output.images.clone()),
-                        Err(error) => (error.clone(), Vec::new()),
+                        Err(error) => (tool_error_content(error).to_owned(), Vec::new()),
                     };
                     let is_error = result.is_err();
                     let entry = Message::Tool {
@@ -1715,6 +1736,19 @@ impl SessionRunner {
                     self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
                         .await;
                     return;
+                }
+                // Poll-guard termination: the full sibling batch is durably
+                // committed and the safe point ran — only now emit the
+                // termination Notice and end the current turn. The next
+                // turn (fresh/queued prompt, idle background-completion
+                // follow-up) starts with the guard reset and can continue
+                // normally.
+                if poll_terminate {
+                    self.shared
+                        .lock()
+                        .unwrap()
+                        .emit(AgentEvent::Notice(POLL_GUARD_TERMINATION_NOTICE.into()));
+                    break 'turn;
                 }
             }
         }

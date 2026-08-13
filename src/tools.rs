@@ -153,6 +153,11 @@ pub fn builtins_with_background(
         read_only,
         bash_timeout,
         self_session_id,
+        // Subagents: enable the unchanged-snapshot poll guard on
+        // get_background_tasks (each subagent instance owns its tools, so
+        // guards are independent per instance; the main agent stays
+        // unguarded via `builtins`).
+        true,
     )
 }
 
@@ -176,6 +181,9 @@ fn builtins_with_exa_key(
         bash_timeout,
         // The main agent has no own session id to annotate.
         None,
+        // Main builtins carry no poll guard: repeated get_background_tasks
+        // calls never escalate.
+        false,
     );
     (tools, background)
 }
@@ -208,6 +216,7 @@ fn tools_with_background_and_exa_key(
     read_only: bool,
     bash_timeout: Option<Duration>,
     self_session_id: Option<String>,
+    poll_guard: bool,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools = if read_only {
         // Read-only roles get no write/edit tools at all.
@@ -217,11 +226,11 @@ fn tools_with_background_and_exa_key(
     } else {
         file_tools(&workspace)
     };
-    tools.push(Box::new(GetBackgroundTasks {
-        background: background.clone(),
-        // clone：bash_tool 后面还要用 self_session_id 标注后台任务发起者。
-        self_session_id: self_session_id.clone(),
-    }));
+    tools.push(Box::new(GetBackgroundTasks::new(
+        background.clone(),
+        self_session_id.clone(),
+        poll_guard,
+    )));
     tools.push(Box::new(CancelBackgroundTask {
         background: background.clone(),
     }));

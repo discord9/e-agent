@@ -2449,10 +2449,7 @@ async fn get_background_tasks_lists_running_tasks() {
     let temp = tempfile::tempdir().unwrap();
     let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
     let background = bash.background.clone();
-    let tool = GetBackgroundTasks {
-        background: background.clone(),
-        self_session_id: None,
-    };
+    let tool = GetBackgroundTasks::new(background.clone(), None, false);
 
     // No tasks running initially.
     assert_eq!(
@@ -2518,10 +2515,7 @@ async fn get_background_tasks_shows_full_command_beyond_truncated_label() {
     let temp = tempfile::tempdir().unwrap();
     let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
     let background = bash.background.clone();
-    let tool = GetBackgroundTasks {
-        background: background.clone(),
-        self_session_id: None,
-    };
+    let tool = GetBackgroundTasks::new(background.clone(), None, false);
 
     // A command longer than the 100-char label budget: the label is
     // preview-truncated, but the tool's `command:` line must carry the
@@ -2570,10 +2564,7 @@ async fn get_background_tasks_shows_delegate_tasks_as_delegate_not_bash() {
     let (bash, _receiver) = background_bash(&temp, Duration::from_secs(10));
     let background = bash.background.clone();
 
-    let tool = GetBackgroundTasks {
-        background: background.clone(),
-        self_session_id: None,
-    };
+    let tool = GetBackgroundTasks::new(background.clone(), None, false);
 
     // Spawn a delegate-style task (no role, no output slot) via spawn().
     background
@@ -2605,10 +2596,7 @@ async fn get_background_tasks_shows_roled_delegate_with_role_name() {
     let (bash, _receiver) = background_bash(&temp, Duration::from_secs(10));
     let background = bash.background.clone();
 
-    let tool = GetBackgroundTasks {
-        background: background.clone(),
-        self_session_id: None,
-    };
+    let tool = GetBackgroundTasks::new(background.clone(), None, false);
 
     // A delegate with a known role (e.g. "explorer").
     background
@@ -2636,10 +2624,7 @@ async fn get_background_tasks_marks_the_calling_subagent_itself() {
     // The subagent's own session id: its delegate entry in the parent's
     // shared registry carries this in display_meta.subagent_session_id.
     let self_session_id = "sub-12345";
-    let tool = GetBackgroundTasks {
-        background: background.clone(),
-        self_session_id: Some(self_session_id.into()),
-    };
+    let tool = GetBackgroundTasks::new(background.clone(), Some(self_session_id.into()), false);
 
     // A delegate entry that IS the caller (matching subagent_session_id)…
     background
@@ -2684,12 +2669,180 @@ async fn get_background_tasks_marks_the_calling_subagent_itself() {
 
     // The main agent (self_session_id = None) never annotates any entry,
     // even one whose subagent_session_id would match a subagent.
-    let main_tool = GetBackgroundTasks {
-        background: background.clone(),
-        self_session_id: None,
-    };
+    let main_tool = GetBackgroundTasks::new(background.clone(), None, false);
     let output = main_tool.execute(json!({})).await.unwrap().content;
     assert!(!output.contains("[self]"));
+}
+
+#[tokio::test]
+async fn subagent_poll_guard_escalates_on_unchanged_snapshot_and_resets_on_change() {
+    // The subagent-only guard: 1st poll of a snapshot is normal, the 2nd is
+    // the model-facing POLL_ERROR, the 3rd is the internal termination
+    // sentinel. Any ID-set change (new task, cancellation, completion) and
+    // the per-turn hook reset the count; the empty snapshot escalates the
+    // same 1/2/3 way.
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+    let background = bash.background.clone();
+    let mut tool = GetBackgroundTasks::new(background.clone(), None, true);
+
+    // Empty snapshot: 1st normal, 2nd POLL_ERROR, 3rd sentinel.
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap().content,
+        "No background tasks running."
+    );
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap_err(),
+        crate::agent::POLL_GUARD_ERROR
+    );
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap_err(),
+        crate::agent::POLL_GUARD_SENTINEL
+    );
+
+    // Turn hook: a fresh true turn resets even with the same snapshot.
+    tool.on_turn_start();
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap().content,
+        "No background tasks running."
+    );
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap_err(),
+        crate::agent::POLL_GUARD_ERROR
+    );
+
+    // A new task is an ID-set change: back to a normal poll.
+    bash.execute(json!({"command": "echo hello; sleep 30", "background": true}))
+        .await
+        .unwrap();
+    assert_eq!(background.running().len(), 1);
+    let output = tool.execute(json!({})).await.unwrap().content;
+    assert!(
+        output.starts_with("1 background task(s) running:"),
+        "snapshot change must reset to a normal poll: {output}"
+    );
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap_err(),
+        crate::agent::POLL_GUARD_ERROR
+    );
+
+    // Cancelling is an ID-set change too: back to normal.
+    background.cancel(1);
+    let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap().content,
+        "No background tasks running."
+    );
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap_err(),
+        crate::agent::POLL_GUARD_ERROR
+    );
+    // Different subagent instances own their tools: independent counts.
+    let tool_a = GetBackgroundTasks::new(background.clone(), None, true);
+    let tool_b = GetBackgroundTasks::new(background.clone(), None, true);
+    assert_eq!(
+        tool_a.execute(json!({})).await.unwrap().content,
+        "No background tasks running."
+    );
+    assert_eq!(
+        tool_a.execute(json!({})).await.unwrap_err(),
+        crate::agent::POLL_GUARD_ERROR
+    );
+    assert_eq!(
+        tool_b.execute(json!({})).await.unwrap().content,
+        "No background tasks running."
+    );
+    assert_eq!(
+        tool_a.execute(json!({})).await.unwrap_err(),
+        crate::agent::POLL_GUARD_SENTINEL
+    );
+}
+#[tokio::test]
+async fn subagent_poll_guard_completion_resets_and_output_growth_does_not() {
+    // A task COMPLETING changes the ID set → reset. Output growth of the
+    // same task never resets (only the sorted ID set is compared).
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+    let background = bash.background.clone();
+    let tool = GetBackgroundTasks::new(background.clone(), None, true);
+
+    // Short task: completes on its own (~0.2s), spooling output over time.
+    bash.execute(json!({"command": "echo one; sleep 0.2; echo two; sleep 30", "background": true}))
+        .await
+        .unwrap();
+    assert_eq!(background.running().len(), 1);
+
+    // 1st poll: normal.
+    let output = tool.execute(json!({})).await.unwrap().content;
+    assert!(output.starts_with("1 background task(s) running:"));
+
+    // Let the task's spool grow (echo two lands ~0.2s after start): the ID
+    // set is unchanged, so output growth must NOT reset — the 2nd poll is
+    // still the POLL_ERROR.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        background
+            .output(1)
+            .is_some_and(|bytes| bytes.windows(3).any(|window| window == b"two")),
+        "background task output must grow for the non-reset proof"
+    );
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap_err(),
+        crate::agent::POLL_GUARD_ERROR,
+        "output growth of the same task must not reset the poll guard"
+    );
+
+    // A task COMPLETING changes the ID set → reset (normal poll again).
+    // A fresh SHORT task gives a fresh snapshot {2}; after it completes the
+    // observed set is empty — different from {2}, so the next poll resets.
+    background.cancel(1);
+    let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+    bash.execute(json!({"command": "sleep 0.1", "background": true}))
+        .await
+        .unwrap();
+    assert!(
+        tool.execute(json!({}))
+            .await
+            .unwrap()
+            .content
+            .starts_with("1 background task(s) running:")
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await;
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap().content,
+        "No background tasks running."
+    );
+}
+
+#[tokio::test]
+async fn main_get_background_tasks_never_escalates() {
+    // Main builtins construct the tool with poll_guard=false: repeated
+    // calls (even with a task running) always return the normal snapshot.
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+    let background = bash.background.clone();
+    let tool = GetBackgroundTasks::new(background.clone(), None, false);
+
+    for _ in 0..4 {
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap().content,
+            "No background tasks running."
+        );
+    }
+
+    bash.execute(json!({"command": "echo hello; sleep 30", "background": true}))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let output = tool.execute(json!({})).await.unwrap().content;
+        assert!(
+            output.starts_with("1 background task(s) running:"),
+            "main polls must never escalate: {output}"
+        );
+    }
+
+    background.cancel(1);
+    let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
 }
 
 #[tokio::test]
