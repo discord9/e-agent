@@ -1884,8 +1884,8 @@ impl Model for GateSimModel {
 }
 
 /// Scripted model that returns a scripted `Usage` per call (in lockstep
-/// with the scripted replies) so the compaction retry path's usage
-/// accumulation can be asserted.
+/// with the scripted replies) so the compaction's usage accounting can be
+/// asserted.
 struct UsageScriptedModel {
     replies: Vec<AssistantMessage>,
     usages: Vec<Usage>,
@@ -2101,31 +2101,18 @@ async fn vision_compaction_keeps_images_in_request_and_retained_tail() {
 }
 
 #[tokio::test]
-async fn compaction_rejects_summary_with_tool_call_markup() {
-    // Degenerate model output that echoes the DSML rendering of tool calls
-    // (with the `tool_calls` field empty, so the existing tool-calls check
-    // cannot catch it) must fail the compaction sanity gate.
+async fn compaction_rejects_summary_with_tool_calls() {
+    // A compaction response that carries tool calls is a hard failure (not
+    // a gate heuristic): the summary must be plain text, so the compaction
+    // bails immediately.
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
         Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(
-                        "<invoke name=\"bash\">\n<parameter name=\"command\">make</parameter>\n</invoke>"
-                            .into(),
-                    ),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(
-                        "<invoke name=\"bash\">\n<parameter name=\"command\">make</parameter>\n</invoke>"
-                            .into(),
-                    ),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
+            replies: vec![AssistantMessage {
+                content: Some("the summary".into()),
+                tool_calls: vec![call("call-1", "bash", r#"{"cmd":"x"}"#)],
+                reasoning: None,
+            }],
             requests: requests.clone(),
             delays: Default::default(),
         }),
@@ -2151,80 +2138,24 @@ async fn compaction_rejects_summary_with_tool_call_markup() {
     ]);
     let error = agent.compact().await.unwrap_err().to_string();
     assert!(
-        error.contains("compaction summary rejected by sanity gate")
-            && error.contains("tool-call/DSML markup"),
+        error.contains("compaction response contains tool calls"),
         "unexpected error: {error}"
     );
 }
 
 #[tokio::test]
-async fn compaction_rejects_summary_echoing_retained_first_message() {
-    // The model returns the retained user turn verbatim (the accident
-    // shape: repeating the most recent context instead of summarizing).
-    let echoed = "The user asked to build the feature and run the full test suite to verify everything passes before committing.";
+async fn compaction_rejects_empty_summary() {
+    // A compaction response with no content (or content that trims to
+    // empty) is a hard failure, not a gate heuristic: there is nothing to
+    // persist.
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
         Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(echoed.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(echoed.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: echoed.into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let error = agent.compact().await.unwrap_err().to_string();
-    assert!(
-        error.contains("compaction summary rejected by sanity gate")
-            && error.contains("echoes the retained context"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn compaction_rejects_too_short_summary() {
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some("ok".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some("ok".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
+            replies: vec![AssistantMessage {
+                content: None,
+                tool_calls: vec![],
+                reasoning: None,
+            }],
             requests: requests.clone(),
             delays: Default::default(),
         }),
@@ -2250,7 +2181,7 @@ async fn compaction_rejects_too_short_summary() {
     ]);
     let error = agent.compact().await.unwrap_err().to_string();
     assert!(
-        error.contains("compaction summary rejected by sanity gate") && error.contains("too short"),
+        error.contains("compaction produced empty summary"),
         "unexpected error: {error}"
     );
 }
@@ -2307,91 +2238,18 @@ async fn compaction_accepts_a_normal_summary() {
 }
 
 #[tokio::test]
-async fn compaction_rejects_summary_echoing_request_tail_assistant() {
-    // The accident shape: the model repeats the last compacted message
-    // verbatim — here the assistant message at the end of the request
-    // window (the message right before the retained current turn). The
-    // retained-first echo check cannot catch this (the summary shares no
-    // prefix with the retained user turn), so the request-tail comparison
-    // must reject it.
-    let echoed = "The user asked for a detailed plan to refactor the legacy module, and the assistant outlined the steps and ran the initial checks before reporting back.";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(echoed.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(echoed.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some(echoed.into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let error = agent.compact().await.unwrap_err().to_string();
-    assert!(
-        error.contains("compaction summary rejected by sanity gate") && error.contains("echoes"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn compaction_accepts_summary_quoting_retained_user_message_in_longer_summary() {
-    // The user report shape: the retained first message is a short request
-    // (39 chars, so the probe is the whole message) and a genuine long
-    // summary quotes it verbatim to keep the latest request visible for the
-    // next turn. The old contains-probe gate killed this ("contains the
-    // start of that message" regardless of summary length); the dominance
-    // condition must let it through. The quote is introduced mid-summary,
-    // not placed at position 0 — a summary that literally *starts* with the
-    // retained message is still the prefix-echo accident shape.
-    let request = "Please fix the sidebar collapse state";
-    let summary = format!(
-        "The user's current request — \"{request}\" — is the sidebar collapse bug. \
-         Root cause: the collapse handler toggles the same flag that the resize observer \
-         reads, so a programmatic collapse races the observer's re-open. Decision: split \
-         the state into `collapsed` (user intent) and `width` (observed), and gate the \
-         observer on the collapsed flag. Files touched: src/components/sidebar.rs, \
-         src/components/sidebar.css, src/state.rs, tests/sidebar_test.rs. The fix adds a \
-         guard so the observer never re-opens a user-collapsed sidebar, plus a regression \
-         test that resizes after a collapse and asserts the panel stays closed. \
-         Unfinished: run the full test suite and update the changelog before committing."
-    );
-    assert!(
-        summary.chars().count() > 400,
-        "test summary must exceed 400 chars, got {}",
-        summary.chars().count()
-    );
+async fn compaction_accepts_old_gate_marker_content() {
+    // Regression: the compaction sanity gate is gone. Non-empty plain
+    // content that the old gate's heuristics would have rejected — DSML
+    // markup (`<invoke`), a `tool_calls` mention, and a short
+    // metadiscourse-style stub under the old 80-char minimum — is now
+    // accepted and persisted verbatim on the first attempt.
+    let summary = "This is a compaction request. <invoke name=\"bash\">tool_calls</invoke>";
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
         Box::new(ScriptedModel {
             replies: vec![AssistantMessage {
-                content: Some(summary.clone()),
+                content: Some(summary.into()),
                 tool_calls: vec![],
                 reasoning: None,
             }],
@@ -2408,143 +2266,6 @@ async fn compaction_accepts_summary_quoting_retained_user_message_in_longer_summ
         .into(),
         Message::Assistant(AssistantMessage {
             content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: request.into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let output = agent.prepare_compaction().await.unwrap();
-    assert_eq!(output.summary, summary);
-    assert!(matches!(
-        output.entry,
-        SessionEntry::Compaction { summary: s, .. } if s == summary
-    ));
-    // Accepted on the first attempt: no retry call happened.
-    assert_eq!(requests.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn compaction_rejects_summary_that_is_mostly_echo_of_retained() {
-    // Mostly-echo shape, relaxed: the summary is dominated by a verbatim
-    // copy of the retained turn's start (probe capped at 200 chars) plus a
-    // short tail, so the total stays under 2×probe — the dominance
-    // condition must still reject it. The "Summary: " lead-in keeps the
-    // common-prefix check from firing first, so this exercises the
-    // contains-dominance branch specifically (a summary literally starting
-    // with the retained text would be caught by the prefix branch instead).
-    let retained = "The user reported that the sidebar collapses whenever the window resizes, and they want the collapse state to persist across resize events so the panel stays closed until they explicitly reopen it. The report also notes that the mobile layout never reproduces the issue, which points at the desktop resize observer as the culprit, and they asked to keep the fix minimal.";
-    assert!(
-        retained.chars().count() > 200,
-        "test retained message must exceed 200 chars, got {}",
-        retained.chars().count()
-    );
-    let probe: String = retained.chars().take(200).collect();
-    let summary = format!("Summary: {probe} Minor cleanup.");
-    assert!(
-        summary.chars().count() < probe.chars().count() * 2,
-        "test summary must stay under the 2×probe dominance bound, got {} chars vs probe {}",
-        summary.chars().count(),
-        probe.chars().count()
-    );
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(summary.clone()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(summary.clone()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: retained.into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let error = agent.compact().await.unwrap_err().to_string();
-    assert!(
-        error.contains("compaction summary rejected by sanity gate")
-            && error.contains("echoes the retained context"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn compaction_accepts_summary_quoting_request_tail_in_longer_summary() {
-    // Request-tail analogue of the retained-user accept case: a long,
-    // genuine summary quotes the start of the last compacted assistant
-    // message. The old contains-probe gate killed it; the dominance
-    // condition lets it through. The retained turn itself is not quoted.
-    let tail = "The assistant outlined a three-step plan for the legacy module refactor: first extract the shared validation into its own crate, then replace the duplicated checks in the callers, and finally run the full test suite before committing.";
-    let probe: String = tail.chars().take(200).collect();
-    assert_eq!(
-        probe.chars().count(),
-        200,
-        "test tail must exceed 200 chars, got {}",
-        tail.chars().count()
-    );
-    let summary = format!(
-        "Work so far: the legacy module refactor started with an extraction plan — \"{probe}\" \
-         — and the extraction itself landed. Decision: keep the new crate dependency-free so \
-         the CLI stays lean. Files touched: src/legacy/validation.rs, src/legacy/main.rs, \
-         Cargo.toml, tests/validation_test.rs. The duplicated checks in the callers were \
-         replaced and the new crate compiles cleanly. Unfinished: run the full test suite, \
-         update the changelog, and verify the CLI output is unchanged before committing."
-    );
-    assert!(
-        summary.chars().count() > 400,
-        "test summary must exceed 400 chars, got {}",
-        summary.chars().count()
-    );
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![AssistantMessage {
-                content: Some(summary.clone()),
-                tool_calls: vec![],
-                reasoning: None,
-            }],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some(tail.into()),
             tool_calls: vec![],
             reasoning: None,
         })
@@ -2561,766 +2282,28 @@ async fn compaction_accepts_summary_quoting_request_tail_in_longer_summary() {
         output.entry,
         SessionEntry::Compaction { summary: s, .. } if s == summary
     ));
-    // Accepted on the first attempt: no retry call happened.
+    // Accepted on the first attempt: exactly one model call, no retry.
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
-async fn compaction_rejects_metadiscourse_stub_chinese() {
-    // The real-world accident shape: 217 characters of "what I am about to
-    // do" (self-referential planning prose) with zero actual summary
-    // content. Marker-free and longer than 80 characters, so the old gate
-    // let it through; the metadiscourse check must reject it (twice: the
-    // single retry also fails, then the compaction bails).
-    let stub = "这是一个 compaction 请求(系统提示触发的摘要生成)。但注意:我是一个编排 agent,我的职责是管理这个会话的进程,不是真正去压缩。按照 e-agent 的语义,prepare_compaction 会调用我生成摘要,然后持久化为 Compaction 条目。我需要生成一份完整的会话摘要,保留用户目标、决策、文件改动、未完成工作。会话很长,覆盖了 8 月 7 日到 8 月 11 日的多轮工作。让我按时间线整理。";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let error = agent.compact().await.unwrap_err().to_string();
-    assert!(
-        error.contains("compaction summary rejected by sanity gate")
-            && error.contains("metadiscourse stub"),
-        "unexpected error: {error}"
-    );
-    // The gate was consulted twice: the plain prompt, then the retry hint.
-    assert_eq!(requests.lock().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn compaction_rejects_metadiscourse_stub_english() {
-    let stub = "This is a compaction request triggered by the system prompt. I need to generate a complete session summary. Let me organize the timeline first.";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let error = agent.compact().await.unwrap_err().to_string();
-    assert!(
-        error.contains("compaction summary rejected by sanity gate")
-            && error.contains("metadiscourse stub"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn compaction_rejects_planning_only_summary_without_content_signals() {
-    // Fallback substance check: long, marker-free planning prose that does
-    // not hit enough highly specific metadiscourse phrases (only one "let me
-    // organize") and carries no file path, no commit hash, and no content
-    // words must still be rejected.
-    let stub = "Let me organize this. I will structure a summary of the long conversation. The work covered several days of activity. I need to produce the complete summary now.";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let error = agent.compact().await.unwrap_err().to_string();
-    assert!(
-        error.contains("compaction summary rejected by sanity gate")
-            && error.contains("lacks content signals"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn compaction_accepts_summary_with_file_path_and_content_words() {
-    let summary =
-        "Fixed the compaction gate in src/agent.rs, decided to retry once, files: agent.rs";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![AssistantMessage {
-                content: Some(summary.into()),
-                tool_calls: vec![],
-                reasoning: None,
-            }],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let output = agent.prepare_compaction().await.unwrap();
-    assert_eq!(output.summary, summary);
-    // Accepted on the first attempt: no retry call happened.
-    assert_eq!(requests.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn compaction_accepts_normal_chinese_summary() {
-    let summary = "用户的目标是修复会话压缩的问题。我们做了决策:先检测元话语 stub,再检查内容信号,失败后重试一次。改动了配置和测试文件,修复了错误,验证通过,没有未完成的工作,下一步是提交。";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![AssistantMessage {
-                content: Some(summary.into()),
-                tool_calls: vec![],
-                reasoning: None,
-            }],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let output = agent.prepare_compaction().await.unwrap();
-    assert_eq!(output.summary, summary);
-    assert_eq!(requests.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn compaction_retries_once_when_gate_rejects_first_attempt() {
-    // Gate rejection on the plain prompt must not bail: the same request
-    // gets one retry with the reinforced hint appended, and a good second
-    // summary is accepted.
-    let rejected = "这是一个 compaction 请求,我需要生成一份完整的会话摘要,让我按时间线整理,系统提示触发的摘要生成。会话很长,覆盖了多轮工作,保留用户目标、决策、文件改动、未完成工作。";
-    let accepted =
-        "Fixed the compaction gate in src/agent.rs, decided to retry once, files: agent.rs";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(rejected.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(accepted.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let output = agent.prepare_compaction().await.unwrap();
-    assert_eq!(output.summary, accepted);
-    let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    // Attempt 0 kept the plain prompt; attempt 1 appended the retry hint to
-    // the same trailing user message.
-    assert!(matches!(
-        requests[0].last().unwrap(),
-        Message::User { content, .. }
-            if content.contains("Start directly with the summary content")
-                && !content.contains("Your previous attempt was rejected")
-    ));
-    assert!(matches!(
-        requests[1].last().unwrap(),
-        Message::User { content, .. } if content.contains("Your previous attempt was rejected")
-    ));
-}
-
-#[tokio::test]
-async fn compaction_accepts_conceptual_english_summary_without_artifacts() {
-    // A plain conceptual summary with no file paths, no hashes, and no
-    // content words must pass: content signals are not an independent hard
-    // condition anymore (the oracle's first finding — this shape was being
-    // wrongly killed).
-    let summary = "The user asked how Rust ownership and borrowing interact. The assistant explained moves, shared references, mutable references, and lifetime constraints with examples.";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![AssistantMessage {
-                content: Some(summary.into()),
-                tool_calls: vec![],
-                reasoning: None,
-            }],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let output = agent.prepare_compaction().await.unwrap();
-    assert_eq!(output.summary, summary);
-    assert_eq!(requests.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn compaction_accepts_conceptual_chinese_summary_without_artifacts() {
-    // Same as the English conceptual case: no artifacts, no content words,
-    // no metadiscourse phrases — a valid summary, accepted.
-    let summary = "用户询问所有权与借用的关系。助手解释了移动、共享引用、可变引用和生命周期约束,并给出了示例,讨论已经结束。这些内容涵盖了 Rust 的核心内存安全模型。整体属于概念性的知识讲解。";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![AssistantMessage {
-                content: Some(summary.into()),
-                tool_calls: vec![],
-                reasoning: None,
-            }],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let output = agent.prepare_compaction().await.unwrap();
-    assert_eq!(output.summary, summary);
-    assert_eq!(requests.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn compaction_accepts_single_metadiscourse_phrase_with_content_signals() {
-    // One metadiscourse phrase ("this is a compaction request") plus real
-    // content (a file path) is tolerated. This also pins the overlap fix:
-    // "this is a compact" is contained in "this is a compaction request",
-    // so the non-overlapping counter sees exactly 1 hit — under the old
-    // double-counting this summary would be rejected despite its content.
-    let summary = "This is a compaction request. We fixed the gate in src/agent.rs and the tests pass afterwards.";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![AssistantMessage {
-                content: Some(summary.into()),
-                tool_calls: vec![],
-                reasoning: None,
-            }],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let output = agent.prepare_compaction().await.unwrap();
-    assert_eq!(output.summary, summary);
-    assert_eq!(requests.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn compaction_rejects_single_metadiscourse_phrase_without_content_signals() {
-    // The combined condition: one self-referential phrase with no concrete
-    // content signals (no path, no hash, no content words) is still a stub.
-    let stub = "This is a compaction request. I am preparing the summary of the earlier conversation for the session record.";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let error = agent.compact().await.unwrap_err().to_string();
-    assert!(
-        error.contains("compaction summary rejected by sanity gate")
-            && error.contains("metadiscourse stub")
-            && error.contains("lacks content signals"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn compaction_accepts_chinese_overlap_phrase_with_content() {
-    // Chinese overlap fix: "生成一份完整的会话摘要" is contained in
-    // "我需要生成一份完整的会话摘要", so the non-overlapping counter sees
-    // exactly 1 hit; with a file path present the summary is accepted.
-    // Under the old double-counting it would be rejected despite content.
-    let summary = "我需要生成一份完整的会话摘要。修复了 src/agent.rs 中的压缩门禁,验证通过,测试全部成功,没有未完成的工作。改动已提交,构建通过,下一步是推送并合并到主分支。";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![AssistantMessage {
-                content: Some(summary.into()),
-                tool_calls: vec![],
-                reasoning: None,
-            }],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let output = agent.prepare_compaction().await.unwrap();
-    assert_eq!(output.summary, summary);
-    assert_eq!(requests.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn compaction_rejects_chinese_overlap_phrase_without_content() {
-    // The same single (non-overlapping) phrase with no content signals
-    // fails via the combined condition.
-    let stub = "我需要生成一份完整的会话摘要。这是为了记录之前的会话内容,方便以后回顾整个对话的经过。整个对话包含了多个主题,时间跨度比较长。需要把关键信息都保留下来。现在开始整理。";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let error = agent.compact().await.unwrap_err().to_string();
-    assert!(
-        error.contains("compaction summary rejected by sanity gate")
-            && error.contains("metadiscourse stub")
-            && error.contains("lacks content signals"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn compaction_accepts_hash_signal_summary() {
-    // "deadbeef" is a full ≥7-char hex run containing a–f with letter-free
-    // neighbors: it counts as a commit-hash content signal, so the single
-    // metadiscourse phrase is tolerated.
-    let summary = "This is a compaction request. The commit hash is deadbeef and the build passed afterwards.";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![AssistantMessage {
-                content: Some(summary.into()),
-                tool_calls: vec![],
-                reasoning: None,
-            }],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let output = agent.prepare_compaction().await.unwrap();
-    assert_eq!(output.summary, summary);
-    assert_eq!(requests.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn compaction_rejects_feedback_not_a_hash_signal() {
-    // "feedback" contains only a 6-char hex run ("feedba", then non-hex
-    // 'k'), so it must not count as a commit hash. With no other content
-    // signals the single metadiscourse phrase is rejected — if "feedback"
-    // were (wrongly) treated as a hash, this would pass.
-    let stub = "This is a compaction request. The feedback was noted and the discussion continued for a while.";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let error = agent.compact().await.unwrap_err().to_string();
-    assert!(
-        error.contains("compaction summary rejected by sanity gate")
-            && error.contains("lacks content signals"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn compaction_rejects_pure_numeric_date_not_a_hash() {
-    // "20240812" is a ≥7-char hex run but contains no a–f: it is a date,
-    // not a commit hash. With no other content signals the single
-    // metadiscourse phrase is rejected — if pure digits counted as a hash,
-    // this would pass.
-    let stub = "This is a compaction request. The date was 20240812 and the session continued for some time.";
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
-        Box::new(ScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(stub.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            requests: requests.clone(),
-            delays: Default::default(),
-        }),
-        vec![],
-    );
-    agent.restore_history(vec![
-        Message::User {
-            content: "old question".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("old answer".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "current question".into(),
-            images: vec![],
-        }
-        .into(),
-    ]);
-    let error = agent.compact().await.unwrap_err().to_string();
-    assert!(
-        error.contains("compaction summary rejected by sanity gate")
-            && error.contains("lacks content signals"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn compaction_accumulates_usage_across_the_retry() {
-    // The gate retry issues two model calls; the returned usage must be the
-    // sum of both attempts, not just the successful one.
-    let rejected = "This is a compaction request triggered by the system prompt. I need to generate a complete session summary. Let me organize the timeline first.";
-    let accepted = "The user asked to fix the compaction gate in src/agent.rs; the assistant implemented the change, ran the test suite, and verified the build passes.";
+async fn compaction_records_usage() {
+    // The single compaction call's usage is reported back for accounting
+    // (the direct-Agent path does not persist it; the runner's
+    // compact_operation owns the disk write).
+    let summary = "The user asked to fix the compaction gate in src/agent.rs; the assistant implemented the change, ran the test suite, and verified the build passes.";
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
         Box::new(UsageScriptedModel {
-            replies: vec![
-                AssistantMessage {
-                    content: Some(rejected.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some(accepted.into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ],
-            usages: vec![
-                Usage {
-                    input_tokens: 1_000,
-                    output_tokens: 200,
-                },
-                Usage {
-                    input_tokens: 500,
-                    output_tokens: 60,
-                },
-            ],
+            replies: vec![AssistantMessage {
+                content: Some(summary.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            usages: vec![Usage {
+                input_tokens: 1_000,
+                output_tokens: 200,
+            }],
             requests: requests.clone(),
         }),
         vec![],
@@ -3344,15 +2327,15 @@ async fn compaction_accumulates_usage_across_the_retry() {
         .into(),
     ]);
     let output = agent.prepare_compaction().await.unwrap();
-    assert_eq!(output.summary, accepted);
+    assert_eq!(output.summary, summary);
     assert_eq!(
         output.usage,
         Some(Usage {
-            input_tokens: 1_500,
-            output_tokens: 260,
+            input_tokens: 1_000,
+            output_tokens: 200,
         })
     );
-    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
 /// Assert every Assistant tool_call in `messages` has a matching Tool result
