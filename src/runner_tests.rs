@@ -2920,6 +2920,121 @@ async fn completion_arriving_during_last_model_round_is_committed_before_finaliz
     }
 }
 
+/// Bash tool that sends its own background completion from inside
+/// `execute`, so the completion is in the agent's channel while the tool
+/// is still running (deterministic mid-tool delivery).
+struct SelfCompletingBash {
+    id: u64,
+    sender: Arc<Mutex<Option<mpsc::UnboundedSender<AgentEvent>>>>,
+}
+
+#[async_trait]
+impl Tool for SelfCompletingBash {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "bash".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        self.sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("agent must wire the bash completion sender")
+            .send(AgentEvent::BackgroundCompleted {
+                id: self.id,
+                output: "build ok".into(),
+                label: Some("cargo build".into()),
+            })
+            .unwrap();
+        Ok(ToolOutput::text(format!(
+            "started background task {}: cargo build",
+            self.id
+        )))
+    }
+    fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
+        *self.sender.lock().unwrap() = Some(sender);
+    }
+}
+
+#[tokio::test]
+async fn completion_arriving_during_tool_batch_is_visible_to_next_provider_call_without_followup() {
+    // A completion delivered while the tool batch executes must be
+    // committed after the batch's last Tool result, before the next
+    // provider call sees it — no follow-up turn starts.
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::Jsonl;
+    let sender = Arc::new(Mutex::new(None));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![background_bash_call("cargo build", false)],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("all done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(SelfCompletingBash {
+            id: 9,
+            sender: sender.clone(),
+        })],
+    );
+    let (runner, _) = SessionRunner::new(
+        agent,
+        store.clone(),
+        temp.path().into(),
+        "mid-turn-bg".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("go".into()));
+
+    // A clean join proves exactly two model calls (a regression would panic on a third).
+    task.join().await.unwrap();
+
+    // Persisted order: Assistant(tool_calls) -> Tool -> BackgroundCompletion.
+    let loaded = store.load(temp.path(), "mid-turn-bg").await.unwrap();
+    let order: Vec<&str> = loaded
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            SessionEntry::BackgroundCompletion { .. } => "completion",
+            SessionEntry::Message { message, .. } => match message {
+                Message::Assistant(m) if !m.tool_calls.is_empty() => "assistant",
+                Message::Tool { .. } => "tool",
+                _ => "other",
+            },
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(order, ["other", "assistant", "tool", "completion", "other"]);
+
+    let calls = calls.lock().unwrap();
+    assert!(
+        calls.len() == 2
+            && calls[1].iter().any(
+                |m| matches!(m, Message::User { content, .. } if content.contains("build ok"))
+            ),
+        "no extra follow-up turn; next call must see the completion: {calls:?}"
+    );
+}
+
 #[tokio::test]
 async fn empty_content_without_tool_calls_is_a_natural_turn_end() {
     // An assistant message with empty content and no tool calls is a

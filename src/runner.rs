@@ -661,14 +661,20 @@ impl SessionRunner {
         }
     }
     async fn commit_backgrounds(&mut self) -> anyhow::Result<bool> {
-        self.agent.drain_background_ready();
         let mut any = false;
-        while let Some(entry) = self.agent.peek_background_entry() {
+        loop {
+            // Re-drain on every pass: a completion that arrives while the
+            // previous entry's store append is awaiting must not be left in
+            // the channel past this flush — it would miss this safety
+            // boundary (the next provider call would not see it).
+            self.agent.drain_background_ready();
+            let Some(entry) = self.agent.peek_background_entry() else {
+                return Ok(any);
+            };
             self.commit(entry).await?;
             self.agent.ack_background_entry();
             any = true;
         }
-        Ok(any)
     }
 
     fn has_prompt_work(&self) -> bool {
@@ -1277,6 +1283,21 @@ impl SessionRunner {
                         }
                         break 'turn;
                     }
+                }
+                // The assistant's full tool-result batch is durably
+                // committed: drain + durably commit any background
+                // completions that arrived while this batch executed (or
+                // during the provider stream that produced it), so the next
+                // provider call within this same turn sees them immediately
+                // instead of only after the turn ends. This is the safe
+                // point — never between the assistant's tool_calls and a
+                // real Tool result of the batch. Pending commands (if any)
+                // are unaffected: `commit_backgrounds` only drains the
+                // agent's background channel.
+                if let Err(error) = self.commit_backgrounds().await {
+                    self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                        .await;
+                    return;
                 }
             }
         }
