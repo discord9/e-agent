@@ -1933,6 +1933,13 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
             kind: LineKind::Dim,
             collapsed_summary: None,
         }],
+        // Harness errors replay exactly like the live `AgentEvent::Error`
+        // line, so a resumed TUI shows the same audit trail.
+        SessionEntry::Error { text } => vec![DisplayLine {
+            text: format!("error: {text}"),
+            kind: LineKind::Dim,
+            collapsed_summary: None,
+        }],
     }
 }
 

@@ -186,6 +186,54 @@ fn entry_event_projects_forked_from_as_notice() {
     );
 }
 
+#[test]
+fn error_entry_is_excluded_from_context_but_projected_to_error_event() {
+    // The dual contract: `SessionEntry::Error` stays out of the provider
+    // context (Agent::context), but replays as `AgentEvent::Error` so a
+    // resumed or late-attached view can audit it.
+    let mut agent = Agent::new(
+        Box::new(ControlledModel {
+            replies: VecDeque::new(),
+            block_first: false,
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "hello".into(),
+            images: vec![],
+        }
+        .into(),
+        SessionEntry::Error {
+            text: "provider exploded".into(),
+        },
+    ]);
+    let context = agent.context();
+    assert_eq!(context.len(), 1, "only the user message reaches context");
+    assert_eq!(
+        context[0],
+        Message::User {
+            content: "hello".into(),
+            images: vec![],
+        }
+    );
+    assert!(
+        !serde_json::to_string(&context)
+            .unwrap()
+            .contains("provider exploded"),
+        "error text must never reach the provider wire"
+    );
+    // Projection for replay/late attach.
+    assert_eq!(
+        entry_event(&SessionEntry::Error {
+            text: "provider exploded".into()
+        }),
+        Some(AgentEvent::Error("provider exploded".into()))
+    );
+}
+
 fn recovering_agent(
     replies: Vec<anyhow::Result<AssistantMessage>>,
     block_first: bool,
@@ -252,6 +300,32 @@ impl Model for VisionScriptedContextCaptureModel {
 
     fn supports_vision(&self) -> bool {
         true
+    }
+}
+
+/// Scripted model whose first call fails and later calls succeed, capturing
+/// every context for inspection — proves a durable Error entry never leaks
+/// into a later provider call.
+struct FailOnceContextCaptureModel {
+    fail_first: bool,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+    reply: AssistantMessage,
+}
+
+#[async_trait]
+impl Model for FailOnceContextCaptureModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        if self.fail_first {
+            self.fail_first = false;
+            anyhow::bail!("provider exploded");
+        }
+        Ok((self.reply.clone(), None))
     }
 }
 
@@ -575,7 +649,7 @@ async fn compaction_deltas_are_live_only_and_success_has_one_projection() {
 }
 
 #[tokio::test]
-async fn failed_compaction_has_no_projection_or_persisted_entry() {
+async fn failed_compaction_persists_error_without_compaction_entry() {
     let temp = tempfile::tempdir().unwrap();
     let (mut agent, _, _) = controlled(vec![Err(anyhow::anyhow!("provider failed"))], false);
     history_for_compaction(&mut agent);
@@ -610,6 +684,27 @@ async fn failed_compaction_has_no_projection_or_persisted_entry() {
             .iter()
             .any(|entry| matches!(entry, SessionEntry::Compaction { .. }))
     );
+    // The failure itself is durable: exactly one Error entry, and it
+    // projects back to an `AgentEvent::Error` on reload.
+    let errors: Vec<&SessionEntry> = loaded
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, SessionEntry::Error { .. }))
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "one root error, one Error entry: {loaded:?}"
+    );
+    assert!(
+        matches!(errors[0], SessionEntry::Error { text } if text.contains("compaction error") && text.contains("provider failed"))
+    );
+    assert_eq!(
+        entry_event(errors[0]),
+        Some(AgentEvent::Error(
+            "compaction error: provider failed".to_owned()
+        ))
+    );
     drop(handle);
     drop(task);
 }
@@ -637,6 +732,18 @@ async fn empty_manual_compaction_returns_idle_and_accepts_a_prompt() {
     assert!(handle.snapshot().iter().any(
         |event| matches!(event, AgentEvent::Error(text) if text.contains("nothing to compact"))
     ));
+    // The "nothing to compact" failure is a real harness error: durable.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "empty")
+        .await
+        .unwrap();
+    assert!(
+        loaded.entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Error { text } if text.contains("nothing to compact")
+        )),
+        "empty-manual-compaction error must be persisted: {loaded:?}"
+    );
     handle.prompt("still alive");
     loop {
         if matches!(live.recv().await.unwrap(), AgentEvent::AssistantDelta(text) if text == "streamed")
@@ -974,18 +1081,29 @@ async fn model_call_failure_returns_to_idle_and_recovers() {
         AgentEvent::Error(text) if text.contains("model call failed")
     )));
 
-    // The failed round committed nothing: only the initial user prompt is on disk.
+    // The failed round committed nothing but the initial user prompt plus
+    // the durable harness Error entry (the failure is audit-persisted, the
+    // failed assistant output is not).
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "recoverable-failure")
         .await
         .unwrap();
-    assert_eq!(loaded.entries.len(), 1);
+    assert_eq!(loaded.entries.len(), 2);
     assert!(matches!(
         &loaded.entries[0],
         SessionEntry::Message {
             message: Message::User { content, .. }
         } if content == "initial"
     ));
+    assert!(
+        matches!(
+            &loaded.entries[1],
+            SessionEntry::Error { text }
+                if text.contains("model call failed") && text.contains("model boom")
+        ),
+        "the failed model call must be durably recorded: {:?}",
+        loaded.entries[1]
+    );
 
     // A fresh prompt opens a new turn that succeeds.
     handle.prompt("retry prompt");
@@ -1019,6 +1137,161 @@ async fn model_call_failure_returns_to_idle_and_recovers() {
     )));
     drop(handle);
     drop(task);
+}
+
+#[tokio::test]
+async fn model_call_failure_persists_error_and_keeps_it_out_of_next_context() {
+    // Durable-audit + context-exclusion contract: the failed call's Error
+    // entry survives a reload, and the error text never appears in the
+    // next provider call's context.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<Vec<Message>>::new()));
+    let agent = Agent::new(
+        Box::new(FailOnceContextCaptureModel {
+            fail_first: true,
+            calls: calls.clone(),
+            reply: AssistantMessage {
+                content: Some("recovered".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            },
+        }),
+        // KeepAliveTool holds a background-channel sender so the
+        // WaitForInput session survives the idle select after the failure.
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "error-context".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::Error(text) if text.contains("model call failed")
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    // The durable entry exists with the root error text.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "error-context")
+        .await
+        .unwrap();
+    let errors: Vec<&SessionEntry> = loaded
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, SessionEntry::Error { .. }))
+        .collect();
+    assert_eq!(errors.len(), 1, "one root error, one entry: {loaded:?}");
+    assert!(
+        matches!(errors[0], SessionEntry::Error { text } if text.contains("provider exploded"))
+    );
+
+    // A follow-up turn succeeds; its context must not contain the error text.
+    handle.prompt("retry");
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "recovered" => break,
+            AgentEvent::Error(text) => panic!("follow-up turn failed: {text}"),
+            _ => {}
+        }
+    }
+    let contexts = calls.lock().unwrap();
+    assert_eq!(contexts.len(), 2, "failed call + follow-up call");
+    let serialized = serde_json::to_string(&contexts[1]).unwrap();
+    assert!(
+        !serialized.contains("provider exploded"),
+        "error text leaked into the next provider context: {serialized}"
+    );
+    drop(handle);
+    drop(task);
+}
+
+#[tokio::test]
+async fn finish_when_idle_failed_turn_persists_exactly_one_error() {
+    // FinishWhenIdle pins the failure through terminate(Failed): exactly
+    // one durable Error entry for the single root error — no duplicate from
+    // the WaitForInput-style inline emit, no recursion.
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, _, _) = controlled(vec![Err(anyhow::anyhow!("terminal boom"))], false);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "finish-fail".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("initial".into()));
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert!(matches!(
+        result,
+        SessionStatus::Finished(SessionResult::Failed(text)) if text.contains("terminal boom")
+    ));
+    task.join().await.unwrap();
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "finish-fail")
+        .await
+        .unwrap();
+    let errors: Vec<&SessionEntry> = loaded
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, SessionEntry::Error { .. }))
+        .collect();
+    assert_eq!(errors.len(), 1, "exactly one Error entry: {loaded:?}");
+    assert!(matches!(errors[0], SessionEntry::Error { text } if text.contains("terminal boom")));
+}
+
+#[tokio::test]
+async fn commit_error_fallback_emits_without_recursion_when_append_fails() {
+    // No injectable failing store exists in this codebase (SessionStore is
+    // a plain enum with no test seam, and the task forbids inventing one),
+    // so the fallback is exercised with a real JSONL store whose target
+    // path is a directory: every append fails, including the Error entry
+    // append. commit_error must still fan out the AgentEvent::Error, must
+    // not retry or recurse (exactly one event, task completes), and the
+    // session still finalizes as Failed.
+    let temp = tempfile::tempdir().unwrap();
+    // `session_path` resolves to `<root>/.e-agent/sessions/<name>.jsonl`;
+    // pre-create a DIRECTORY at that path so OpenOptions::append fails.
+    let sessions_dir = temp.path().join(".e-agent/sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    std::fs::create_dir_all(sessions_dir.join("fallback.jsonl")).unwrap();
+
+    let (agent, _, _) = controlled(vec![Err(anyhow::anyhow!("store broken"))], false);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "fallback".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, status) = handle.attach();
+    let task = runner.start(Some("initial".into()));
+    // The prompt append fails -> terminate(Failed) -> commit_error append
+    // also fails -> fallback emit. Exactly one Error event, then finish.
+    let mut errors = 0;
+    loop {
+        if let AgentEvent::Error(_) = live.recv().await.unwrap() {
+            errors += 1;
+        }
+        if matches!(*status.borrow(), SessionStatus::Finished(_)) {
+            break;
+        }
+    }
+    assert_eq!(errors, 1, "fallback emits the error exactly once");
+    assert!(matches!(
+        *status.borrow(),
+        SessionStatus::Finished(SessionResult::Failed(_))
+    ));
+    task.join().await.unwrap();
 }
 
 #[tokio::test]
@@ -1579,6 +1852,14 @@ async fn in_flight_compaction_cancel_has_no_entry_or_projection() {
             .entries
             .iter()
             .any(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+    );
+    // A cancel is a Notice, never an Error entry: nothing to audit-persist.
+    assert!(
+        !loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Error { .. })),
+        "cancelled compaction must not persist an Error entry: {loaded:?}"
     );
     assert!(
         !handle.snapshot().iter().any(

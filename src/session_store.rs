@@ -323,15 +323,19 @@ pub(crate) fn entry_kind(entry: &SessionEntry) -> &'static str {
         SessionEntry::Notice { .. } => "notice",
         SessionEntry::BackgroundCompletion { .. } => "background_completion",
         SessionEntry::ForkedFrom { .. } => "forked_from",
+        SessionEntry::Error { .. } => "error",
     }
 }
 
-/// Whether a message is a tool error.
+/// Whether an entry flags an error condition. Tool errors and harness
+/// errors (persisted `SessionEntry::Error`) both count; the existing
+/// Greptime/SQLite `is_error` column is reused for both.
 pub(crate) fn is_error(entry: &SessionEntry) -> bool {
     match entry {
         SessionEntry::Message {
             message: Message::Tool { is_error, .. },
         } => *is_error,
+        SessionEntry::Error { .. } => true,
         _ => false,
     }
 }
@@ -2619,6 +2623,9 @@ mod shared_helpers {
                 event_time: None,
                 seq: None,
             },
+            SessionEntry::Error {
+                text: "harness exploded".into(),
+            },
         ]
     }
 
@@ -2638,6 +2645,7 @@ mod shared_helpers {
                 "notice",
                 "background_completion",
                 "forked_from",
+                "error",
             ]
         );
     }
@@ -2648,7 +2656,9 @@ mod shared_helpers {
         let flags: Vec<bool> = entries.iter().map(is_error).collect();
         assert_eq!(
             flags,
-            vec![false, false, false, false, true, false, false, false, false]
+            vec![
+                false, false, false, false, true, false, false, false, false, true
+            ]
         );
     }
 

@@ -431,6 +431,14 @@ pub enum SessionEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seq: Option<i64>,
     },
+    /// A harness error (provider/model call failure, compaction failure,
+    /// image rejection, termination reason). Durable for resume / late
+    /// attach audit only: `Agent::context` filters this variant, so it
+    /// never reaches the provider. Old sessions without this variant load
+    /// naturally (serde payload is additive).
+    Error {
+        text: String,
+    },
 }
 
 impl From<Message> for SessionEntry {
@@ -711,7 +719,8 @@ impl Agent {
                 }
                 SessionEntry::Notice { .. }
                 | SessionEntry::BackgroundCompletion { .. }
-                | SessionEntry::ForkedFrom { .. } => {}
+                | SessionEntry::ForkedFrom { .. }
+                | SessionEntry::Error { .. } => {}
             }
         }
         history
@@ -790,6 +799,10 @@ impl Agent {
                     // Fork provenance is audit/display only; never put it on
                     // the provider wire.
                     SessionEntry::ForkedFrom { .. } => None,
+                    // Harness errors are audit-only: they never enter the
+                    // provider context (a failed call must not leak its own
+                    // error text into the next call).
+                    SessionEntry::Error { .. } => None,
                 }),
         );
         repair_tool_pairs(messages)

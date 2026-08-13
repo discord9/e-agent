@@ -521,6 +521,7 @@ impl SessionRunner {
         }
         Ok(())
     }
+
     async fn commit_user_batch(
         &mut self,
         content: String,
@@ -551,6 +552,29 @@ impl SessionRunner {
             shared.emit(AgentEvent::UserPrompt(prompt));
         }
         Ok(())
+    }
+
+    /// Best-effort durable append of a harness error (provider/model call
+    /// failure, compaction failure, image rejection, termination reason).
+    /// The entry lands in the session store so a resumed or late-attached
+    /// view can audit it, and is fanned out as an `AgentEvent::Error`
+    /// through the single shared path — it never enters provider context
+    /// (`Agent::context` filters `SessionEntry::Error`). When the append
+    /// itself fails, only an eprintln fallback is possible: emit the event
+    /// anyway and return. No retry and no recursion: the same root error
+    /// is appended at most once.
+    async fn commit_error(&mut self, text: String) {
+        let entry = SessionEntry::Error { text: text.clone() };
+        if let Err(error) = self
+            .store
+            .append(&self.root, &self.session, std::slice::from_ref(&entry))
+            .await
+        {
+            eprintln!("e-agent: cannot persist session error: {error:#}");
+        } else {
+            self.agent.apply_entry(entry);
+        }
+        self.shared.lock().unwrap().emit(AgentEvent::Error(text));
     }
 
     fn status(&self, status: SessionStatus) {
@@ -594,10 +618,7 @@ impl SessionRunner {
 
     async fn terminate(&mut self, result: SessionResult, pending: Vec<SessionCommand>) {
         if let SessionResult::Failed(text) = &result {
-            self.shared
-                .lock()
-                .unwrap()
-                .emit(AgentEvent::Error(text.clone()));
+            self.commit_error(text.clone()).await;
         }
         self.intake_after_operation(pending);
         loop {
@@ -609,9 +630,10 @@ impl SessionRunner {
                             && let Err(error) =
                                 self.commit_user_batch(prompt, image, consumed).await
                         {
-                            self.shared.lock().unwrap().emit(AgentEvent::Error(format!(
+                            self.commit_error(format!(
                                 "persisting accepted prompt while terminating: {error:#}"
-                            )));
+                            ))
+                            .await;
                         }
                     }
                     Some(PendingCommand::Compact) => {
@@ -864,11 +886,11 @@ impl SessionRunner {
             WaitOutcome::Completed(Err(error)) => {
                 self.agent.reset_auto_compact_request();
                 let text = format!("{}compaction error: {error:#}", source.prefix());
-                let event = match source {
-                    CompactionSource::Manual => AgentEvent::Error(text),
-                    CompactionSource::Auto => AgentEvent::Notice(text),
-                };
-                self.shared.lock().unwrap().emit(event);
+                // Both manual and auto compaction failures are real harness
+                // errors: persisted as an Error entry and fanned out as an
+                // `AgentEvent::Error` (audit-visible on resume/late attach).
+                // A cancel stays a Notice and never lands as an Error entry.
+                self.commit_error(text).await;
                 self.intake_after_operation(waited.pending);
                 self.status(source.resume_status());
                 OperationFlow::Done(Steering::None)
@@ -1051,10 +1073,7 @@ impl SessionRunner {
                         // can retry without the image. Nothing was committed
                         // (a poisoned User message would lock every later
                         // model call behind the vision gate).
-                        self.shared
-                            .lock()
-                            .unwrap()
-                            .emit(AgentEvent::Error(format!("{error:#}")));
+                        self.commit_error(format!("{error:#}")).await;
                         continue;
                     }
                     self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
@@ -1079,10 +1098,8 @@ impl SessionRunner {
                             return;
                         }
                         self.intake_after_operation(waited.pending); // 保留排队命令
-                        self.shared.lock().unwrap().emit(AgentEvent::Error(
-                            // 错误进 shared log + broadcast
-                            format!("model call failed: {error:#}"),
-                        ));
+                        self.commit_error(format!("model call failed: {error:#}"))
+                            .await;
                         break 'turn; // 外层循环自然回 Idle
                     }
                     WaitOutcome::Released => {
@@ -1336,6 +1353,9 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
         SessionEntry::ForkedFrom { source, at, .. } => Some(AgentEvent::Notice(format!(
             "forked from {source} at entry {at}"
         ))),
+        // Harness errors are durable and replay as Error events, so a
+        // resumed or late-attached view sees the audit trail.
+        SessionEntry::Error { text } => Some(AgentEvent::Error(text.clone())),
     }
 }
 
