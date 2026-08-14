@@ -4,7 +4,16 @@ use async_trait::async_trait;
 
 use super::background::BackgroundTasks;
 
-/// Per-turn poll-guard state for subagent `get_background_tasks` calls.
+/// Termination thresholds for the unchanged-snapshot poll guard on
+/// `get_background_tasks`: the `count >= threshold` poll returns the
+/// internal termination sentinel, and reminders fire from the
+/// `threshold - 2` poll (never before the second) through `threshold - 1`.
+/// Subagents terminate on the 3rd unchanged poll, the main agent on the
+/// 5th.
+pub(super) const SUBAGENT_POLL_GUARD_THRESHOLD: u8 = 3;
+pub(super) const MAIN_POLL_GUARD_THRESHOLD: u8 = 5;
+
+/// Per-turn poll-guard state for `get_background_tasks` calls.
 #[derive(Default)]
 pub(super) struct PollGuardState {
     /// Sorted running-task ID snapshot observed by the last poll this turn;
@@ -21,15 +30,17 @@ pub(super) struct GetBackgroundTasks {
     /// subagent itself and is annotated as such in the output. The main
     /// agent (and any caller without a session id) passes `None`.
     pub(super) self_session_id: Option<String>,
-    /// Subagent-only poll guard: when enabled, the second consecutive
-    /// `get_background_tasks` call with an unchanged running-task snapshot
-    /// within one turn returns the model-facing
-    /// [`crate::agent::POLL_GUARD_ERROR`], and the third returns the
-    /// internal termination sentinel ([`crate::agent::POLL_GUARD_SENTINEL`])
-    /// that the batch loops map to POLL_ERROR content and use to end the
-    /// turn after the full sibling batch. The main agent's builtins pass
-    /// `false` and never escalate.
-    pub(super) poll_guard: bool,
+    /// Unchanged-snapshot poll guard: `Some(threshold)` enables escalation —
+    /// consecutive `get_background_tasks` calls with an unchanged
+    /// running-task snapshot within one turn return the model-facing
+    /// [`crate::agent::POLL_GUARD_ERROR`] from the `threshold - 2` poll and
+    /// the internal termination sentinel ([`crate::agent::POLL_GUARD_SENTINEL`])
+    /// from the `threshold` poll onward; the batch loops map the sentinel to
+    /// POLL_GUARD_ERROR content and use it to end the turn after the full
+    /// sibling batch. `None` disables the guard. Subagents use threshold 3
+    /// (reminder on the 2nd poll), the main agent threshold 5 (reminder on
+    /// the 3rd and 4th).
+    pub(super) poll_guard: Option<u8>,
     guard: std::sync::Mutex<PollGuardState>,
 }
 
@@ -37,7 +48,7 @@ impl GetBackgroundTasks {
     pub(super) fn new(
         background: BackgroundTasks,
         self_session_id: Option<String>,
-        poll_guard: bool,
+        poll_guard: Option<u8>,
     ) -> Self {
         Self {
             background,
@@ -71,18 +82,21 @@ impl Tool for GetBackgroundTasks {
         // background-completion follow-up, or a direct Agent::run call
         // starts with a clean slate. Never called mid-round, mid-batch, or
         // around compaction, so those never reset the guard.
-        if self.poll_guard {
+        if self.poll_guard.is_some() {
             *self.guard.lock().unwrap() = PollGuardState::default();
         }
     }
 
     async fn execute(&self, _arguments: Value) -> Result<ToolOutput, String> {
         let tasks = self.background.running();
-        // Subagent poll guard: escalate on the SORTED running-task ID
-        // snapshot. Any ID-set change (new task, completion, cancellation)
-        // resets the count; output growth or task ordering never does. The
-        // empty snapshot escalates the same 1/2/3 way.
-        if self.poll_guard {
+        // Poll guard: escalate on the SORTED running-task ID snapshot. Any
+        // ID-set change (new task, completion, cancellation) resets the
+        // count; output growth or task ordering never does. The empty
+        // snapshot escalates the same way, starting at the configured
+        // threshold: the `threshold - 2` poll (never before the second)
+        // returns the model-facing reminder, `threshold` and beyond the
+        // internal termination sentinel.
+        if let Some(threshold) = self.poll_guard {
             let mut ids: Vec<u64> = tasks.iter().map(|task| task.id).collect();
             ids.sort_unstable();
             let mut guard = self.guard.lock().unwrap();
@@ -92,13 +106,15 @@ impl Tool for GetBackgroundTasks {
             } else {
                 guard.count = guard.count.saturating_add(1);
             }
-            match guard.count {
-                1 => {}
-                2 => return Err(crate::agent::POLL_GUARD_ERROR.to_owned()),
-                // Third and later: internal sentinel — the batch loops map
-                // it to POLL_GUARD_ERROR for history/UI and end the turn
-                // after the full sibling batch.
-                _ => return Err(crate::agent::POLL_GUARD_SENTINEL.to_owned()),
+            let reminder_start = threshold.saturating_sub(2).max(2);
+            if guard.count >= threshold {
+                // At or beyond the threshold: internal sentinel — the batch
+                // loops map it to POLL_GUARD_ERROR for history/UI and end
+                // the turn after the full sibling batch.
+                return Err(crate::agent::POLL_GUARD_SENTINEL.to_owned());
+            }
+            if guard.count >= reminder_start {
+                return Err(crate::agent::POLL_GUARD_ERROR.to_owned());
             }
         }
         if tasks.is_empty() {

@@ -14,18 +14,20 @@ use crate::session_store::EntryLocation;
 /// (commit 92159c7) recognized these placeholders by this literal text.
 const INTERRUPTED: &str = "[turn interrupted before a tool result was produced]";
 
-/// Model-facing content of a poll-guard error: the second consecutive
+/// Model-facing content of a poll-guard error: a consecutive
 /// `get_background_tasks` call with an unchanged running-task snapshot
-/// within one turn. Subagent-only: the main agent's builtins never
-/// escalate.
+/// within one turn, at or above the configured reminder threshold but below
+/// the termination threshold (the 2nd for subagents, the 3rd and 4th for
+/// the main agent).
 pub(crate) const POLL_GUARD_ERROR: &str = "poll guard: get_background_tasks was already called with this exact task list this turn; end the turn and wait for the automatic [background task N completed] injection instead of polling again";
 
-/// Internal termination sentinel returned by the THIRD consecutive
-/// unchanged-snapshot `get_background_tasks` poll within one turn. Never
-/// enters history, model context, or UI: the batch loops (`Agent::run_loop`
-/// and `SessionRunner`) substitute [`POLL_GUARD_ERROR`] as the committed
-/// content and use the sentinel only to set the turn-termination latch
-/// after the full sibling batch has been durably committed.
+/// Internal termination sentinel returned at the configured termination
+/// threshold — the THIRD consecutive unchanged-snapshot poll for subagents,
+/// the FIFTH for the main agent. Never enters history, model context, or
+/// UI: the batch loops (`Agent::run_loop` and `SessionRunner`) substitute
+/// [`POLL_GUARD_ERROR`] as the committed content and use the sentinel only
+/// to set the turn-termination latch after the full sibling batch has been
+/// durably committed.
 pub(crate) const POLL_GUARD_SENTINEL: &str = "\u{0}poll-guard-terminate";
 
 /// Termination notice emitted after the full tool batch (and, in the runner
@@ -35,9 +37,9 @@ pub(crate) const POLL_GUARD_TERMINATION_NOTICE: &str =
     "repeated get_background_tasks calls with an unchanged task list; ending this turn";
 
 /// True when a tool result is the internal poll-guard termination sentinel
-/// (third consecutive unchanged-snapshot poll within one turn). Batch loops
-/// use this to set a local latch; the sentinel itself never reaches
-/// history/UI.
+/// (an unchanged-snapshot poll at the configured termination threshold:
+/// 3rd for subagents, 5th for the main agent). Batch loops use this to set
+/// a local latch; the sentinel itself never reaches history/UI.
 pub(crate) fn is_poll_guard_terminate(result: &Result<ToolOutput, String>) -> bool {
     matches!(result, Err(error) if error == POLL_GUARD_SENTINEL)
 }
@@ -1285,7 +1287,7 @@ impl Agent {
     /// Per-true-turn tool hook: every tool's `on_turn_start` runs once at
     /// the start of a true turn (fresh user prompt, queued prompt, idle
     /// background-completion follow-up, direct `Agent::run` call) so
-    /// per-turn tool state (e.g. the subagent poll guard) resets. Never
+    /// per-turn tool state (e.g. the poll guard) resets. Never
     /// called mid-model-round, mid-tool-batch, or around manual/auto
     /// compaction.
     pub(crate) fn start_turn(&mut self) {
@@ -1810,7 +1812,7 @@ impl Agent {
     async fn run_turn(&mut self, prompt: String) -> anyhow::Result<(String, bool)> {
         // A true turn starts here: fresh/queued user prompt, idle
         // background-completion follow-up, or a direct Agent::run call.
-        // Per-turn tool state (subagent poll guard) resets; model rounds,
+        // Per-turn tool state (poll guard) resets; model rounds,
         // mid-tool-batch, and manual/auto compaction never do.
         self.start_turn();
         self.drain_background();
@@ -2192,13 +2194,14 @@ impl Agent {
                 self.emit(AgentEvent::AssistantText(content.into()));
             }
             self.push_message(Message::Assistant(assistant.clone()));
-            // Subagent poll guard: the third unchanged-snapshot
-            // get_background_tasks poll returns an internal sentinel. The
-            // sentinel must never enter history/UI — the committed content
-            // is the model-facing POLL_ERROR — and the local latch only
-            // ends the turn AFTER the full sibling batch, so every call in
-            // this assistant batch gets a real ToolResult (no
-            // repair_tool_pairs hole).
+            // Poll guard: the terminating unchanged-snapshot
+            // get_background_tasks poll (3rd for subagents, 5th for the
+            // main agent) returns an internal sentinel. The sentinel must
+            // never enter history/UI — the committed content is the
+            // model-facing POLL_ERROR — and the local latch only ends the
+            // turn AFTER the full sibling batch, so every call in this
+            // assistant batch gets a real ToolResult (no repair_tool_pairs
+            // hole).
             let mut poll_terminate = false;
             for call in &assistant.tool_calls {
                 self.emit(AgentEvent::ToolCall {

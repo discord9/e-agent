@@ -1426,7 +1426,7 @@ impl SessionRunner {
             }
             // True turn starts here (fresh/queued prompt, or the idle
             // background-completion follow-up turn from an empty prompt
-            // batch): reset per-turn tool state (subagent poll guard).
+            // batch): reset per-turn tool state (poll guard).
             // Model rounds, mid-tool-batch, and manual/auto compaction
             // never reset it.
             self.agent.start_turn();
@@ -1566,8 +1566,9 @@ impl SessionRunner {
                 if calls.is_empty() {
                     break 'turn;
                 }
-                // Subagent poll guard: the third unchanged-snapshot
-                // get_background_tasks poll returns an internal sentinel.
+                // Poll guard: the terminating unchanged-snapshot
+                // get_background_tasks poll (3rd for subagents, 5th for the
+                // main agent) returns an internal sentinel.
                 // The sentinel never enters history/UI — the committed
                 // content is the model-facing POLL_ERROR — and the local
                 // latch only fires AFTER the full sibling batch (every call
