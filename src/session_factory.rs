@@ -131,6 +131,8 @@ pub struct SessionFactory {
     /// startup: `[sandbox]` changes require a restart (workspace roots and
     /// file capabilities are wired at construction).
     sandbox: Option<Sandbox>,
+    /// User-level `[code_mode]` flag: registers the experimental run_rust tool.
+    code_mode: bool,
     read_only: bool,
     agents_instructions: Option<String>,
     /// Startup snapshot of the skill disclosure index; never hot-reloaded.
@@ -347,6 +349,12 @@ impl SessionFactory {
         if let Some(policy) = &sandbox {
             preflight_sandbox(policy, announce)?;
         }
+        // run_rust is opt-in, user-level, and preflighted fail-closed.
+        #[rustfmt::skip]
+        let code_mode = config.as_ref().map(Config::code_mode_enabled).unwrap_or(false);
+        if code_mode {
+            preflight_code_mode(announce)?;
+        }
         Ok(Self {
             workspace,
             root,
@@ -366,6 +374,7 @@ impl SessionFactory {
             base_url: base_url_override,
             model: model_override_flag,
             sandbox,
+            code_mode,
             read_only,
             agents_instructions,
             skills_instructions,
@@ -716,15 +725,19 @@ impl SessionFactory {
             crate::config::resolve_bash_timeout(config.as_ref(), &self.root).unwrap_or(None);
         let finalize_wait =
             crate::config::resolve_finalize_wait(config.as_ref(), &self.root).unwrap_or(None);
+        #[rustfmt::skip]
+        let tools_workspace = self.skills_workspace.clone().unwrap_or_else(|| self.workspace.clone());
         let (mut tools, background) = builtins_with_bash_timeout(
-            self.skills_workspace
-                .clone()
-                .unwrap_or_else(|| self.workspace.clone()),
+            tools_workspace.clone(),
             self.sandbox.clone(),
             self.read_only,
             background_timeout,
             bash_timeout,
         );
+        // run_rust is main-agent only; the read-only sandbox is narrowed like bash.
+        #[cfg(target_os = "linux")]
+        #[rustfmt::skip]
+        register_run_rust(&mut tools, &tools_workspace, self.code_mode, self.read_only, self.sandbox.clone());
         // Read-only sessions skip MCP entirely: MCP tools carry no read-only
         // marker, so exposing them would defeat the policy. Delegation stays —
         // spawning a subagent does not mutate this session's host state, and
@@ -899,6 +912,7 @@ impl SessionFactory {
             base_url: None,
             model: None,
             sandbox: None,
+            code_mode: false,
             read_only: false,
             agents_instructions: None,
             skills_instructions: None,
@@ -908,6 +922,32 @@ impl SessionFactory {
     }
 }
 
+/// Fail-closed `[code_mode]` startup check (Linux + bwrap + rustc on PATH).
+#[rustfmt::skip]
+pub(crate) fn preflight_code_mode(announce: bool) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    { preflight_code_mode_impl(crate::tools::bwrap_available, std::env::var_os("PATH").as_deref(), announce) }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = announce; Err(anyhow!("[code_mode] requires Linux with bubblewrap; run_rust unavailable")) }
+}
+#[cfg(target_os = "linux")]
+#[rustfmt::skip]
+pub(crate) fn preflight_code_mode_impl(bwrap_ok: impl Fn() -> bool, path_env: Option<&std::ffi::OsStr>, announce: bool) -> anyhow::Result<()> {
+    if !bwrap_ok() { return Err(anyhow!("[code_mode] enabled = true but bwrap is unavailable")); }
+    if crate::tools::resolve_rustc(path_env).is_none() { return Err(anyhow!("[code_mode] enabled = true but rustc is unavailable on PATH")); }
+    if announce { eprintln!("e-agent: run_rust tool enabled ([code_mode])"); }
+    Ok(())
+}
+/// Register the experimental run_rust tool (main agent only, opt-in): the
+/// read-only sandbox is narrowed exactly like bash's (no policy fails closed).
+#[cfg(target_os = "linux")]
+#[rustfmt::skip]
+pub(crate) fn register_run_rust(tools: &mut Vec<Box<dyn crate::agent::Tool>>, workspace: &Workspace, code_mode: bool, read_only: bool, sandbox: Option<Sandbox>) {
+    if code_mode && (!read_only || sandbox.is_some()) {
+        let narrowed = if read_only { sandbox.as_ref().map(crate::tools::read_only_sandbox) } else { sandbox };
+        tools.push(crate::tools::run_rust_tool(workspace, narrowed.as_ref()));
+    }
+}
 fn preflight_sandbox(policy: &Sandbox, announce: bool) -> anyhow::Result<()> {
     #[cfg(windows)]
     {

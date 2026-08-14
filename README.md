@@ -128,7 +128,8 @@ the command it configures, `<workspace>/.e-agent/config.toml` is trusted
 input — treat it like the global config: only open workspaces you trust,
 because opening a workspace runs the MCP commands that workspace's file
 declares. A global `[mcp."<name>"] enabled = false` is a kill switch that a
-project file cannot re-enable (see the MCP section).
+project file cannot re-enable (see the MCP section). `[code_mode]` is
+user-level only for the same reason (see "Code mode: `run_rust`").
 
 ### Desktop pet sprite sheet
 
@@ -604,6 +605,14 @@ leaves it writable for repository operations. Delegated subagents/fixers bind
 `<workspace>/.git` read-only over itself after writable mounts. This covers only
 the workspace `.git` entry, not external object stores or other repositories.
 Background commands inherit the parent's role.
+
+### Code mode: `run_rust` (experimental)
+
+`[code_mode] enabled = true` in the **user-level** config (a project `.e-agent/config.toml` cannot carry it) registers the experimental `run_rust` tool for the **main agent only** — subagents never inherit it; read-only main sessions get it only when a `[sandbox]` policy exists to narrow. It compiles one model-supplied Rust source (edition 2021, std only, ≤ 128 KiB) and runs it, both stages in a forced Linux bubblewrap sandbox:
+
+- Inherits the resolved `[sandbox]` policy: workspace per `workspace_writable`, configured paths/mounts keep their semantics, `.git` always read-only, network always off, minimal PATH/locale env (credentials never set). Anonymous `/tmp` writes land in a private 0700 scratch (`<tmp>/e-agent-run-rust-*`) mounted as the sandbox `/tmp`, removed only after confirmed teardown (bwrap reaped + process group gone) by descriptor-relative `O_NOFOLLOW` removal (chmod only ever targets pinned directory fds; the final unlink verifies the created inode identity); on any teardown uncertainty the scratch is retained/quarantined and reported, never force-deleted. Hostile swaps or chmod-000 trees can fail or retry cleanup but never follow or mutate anything outside it; authorized real-path writes land on the host.
+- The compile stage mounts the host rustc/rustup toolchain and runs with its PATH/RUSTUP_HOME; the run stage gets PATH `/bin:/usr/bin` and no toolchain mounts added by run_rust, so Cargo/toolchain is not supplied on the run-stage PATH/mounts (the prebuilt `/tmp/runner` and `/tmp/main` still run on system runtime libraries; no claim against a user-supplied cargo binary invoked by explicit path). No Cargo/crates, stdin, background/daemon execution, or custom env/mount/cwd/timeout; 30-second compile/run timeouts kill the group, reap, bound the drain, and confirm the group is gone before removing the scratch (uncertain teardown retains/quarantines it); output capped at 24 KiB head + 8 KiB tail. The run status is an in-sandbox wrapper over a private inherited socketpair (dumpable-off + CLOEXEC before exec, so no descendant can forge; exactly one packet then EOF, gated on outer bwrap exit 0), so an explicit `process::exit(134)` is never misreported as a signal; the result reports the source SHA-256, the stable commands, both stage statuses and captured output — the source text is not repeated.
+- Enabling `[code_mode]` fails closed at startup without Linux+bwrap+rustc; experimental, Linux-only, main-agent-only, no sandbox-escape model claimed beyond the exact bwrap policy above.
 
 Every `web_search` query is disclosed to Exa, a third party. Never include
 credentials, tokens, private repository contents, customer data, personal data,
@@ -1220,6 +1229,14 @@ ConPTY, dedicated user, protected-git shell execution, or bwrap-equivalent
 filesystem view. Everyone/logon-SID writable public locations can remain
 writable, synthetic capability ACEs persist, and cancellation currently
 terminates only the top-level process.
+`run_rust` (experimental `[code_mode]`) has no Cargo/crates, network access,
+stdin, background or daemon execution, or custom env/mount/cwd/timeout;
+Cargo/toolchain is not supplied on the run-stage PATH/mounts (compile-only
+toolchain exposure, removed after the compile stage). A failed or uncertain
+teardown retains/quarantines its scratch path rather than deleting it.
+Workspace and configured-path writes are NOT blocked by design: they fully
+inherit the resolved `[sandbox]` policy like bash. Main-agent-only, Linux-only,
+opt-in.
 It does speak MCP to local stdio servers (tools only), but it does NOT do
 remote MCP over HTTP/SSE, MCP OAuth, MCP resources/prompts, server-initiated
 notifications, `listChanged` refresh, server restart on crash, or concurrent

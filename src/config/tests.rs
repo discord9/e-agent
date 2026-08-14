@@ -1749,7 +1749,12 @@ timeout_secs = 120
     let t = resolve_bash_timeout(Some(&config), temp.path()).unwrap();
     assert_eq!(t, Some(Duration::from_secs(120)));
 }
-
+#[test]
+fn code_mode_enabled_parses_and_defaults_to_false() {
+    let on: Config = toml::from_str("[code_mode]\nenabled = true\n").unwrap();
+    let off: Config = toml::from_str("default = \"kimi/k3\"\n").unwrap();
+    assert!(!off.code_mode_enabled() && on.code_mode_enabled());
+}
 #[test]
 fn resolve_bash_timeout_workspace_override_and_zero() {
     let temp = tempfile::tempdir().unwrap();
@@ -2551,12 +2556,11 @@ model = "k3"
         "[modles]\nmain = \"kimi/k3\"\n",
         // Misspelled legal section (models).
         "[model]\n\"kimi/k3\" = { model = \"k3\" }\n",
-        // Unknown key inside a [models] profile (deny_unknown_fields on
-        // ModelProfile).
+        // Unknown key inside a [models] profile (deny_unknown_fields on ModelProfile).
         "[models.\"kimi/k3\"]\nmodel = \"k3\"\nfutur = \"max\"\n",
-        // Unknown key inside an [mcp] server (deny_unknown_fields on
-        // McpServerConfig).
+        // Unknown key inside an [mcp] server (deny_unknown_fields on McpServerConfig).
         "[mcp.engram]\ncommad = [\"/bin/engram\"]\n",
+        "[code_mode]\nenabled = true\n",
     ] {
         std::fs::write(ws.join(".e-agent/config.toml"), source).unwrap();
         let error = Config::from_path(&global)

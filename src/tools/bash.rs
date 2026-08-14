@@ -259,7 +259,7 @@ impl Drop for ProcessGroupGuard {
 /// children typically observe EOF on the shared stdout/stderr pipes, which
 /// is usually enough for interactive shells to exit.
 #[cfg(windows)]
-pub(super) struct ProcessGroupGuard {
+struct ProcessGroupGuard {
     handle: Option<windows_sys::Win32::Foundation::HANDLE>,
 }
 
@@ -272,7 +272,7 @@ unsafe impl Send for ProcessGroupGuard {}
 
 #[cfg(windows)]
 impl ProcessGroupGuard {
-    pub(super) fn armed(pid: u32) -> Self {
+    fn armed(pid: u32) -> Self {
         use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE};
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
         Self {
@@ -280,7 +280,7 @@ impl ProcessGroupGuard {
         }
     }
 
-    pub(super) fn disarm(&mut self) {
+    fn disarm(&mut self) {
         if let Some(handle) = self.handle.take() {
             unsafe {
                 windows_sys::Win32::Foundation::CloseHandle(handle);
@@ -468,6 +468,129 @@ pub(super) fn gh_host_path() -> Option<PathBuf> {
     gh_in_path(std::env::var_os("PATH").as_deref())
 }
 
+/// Build the bwrap argument vector from the resolved `[sandbox]` policy,
+/// shared by bash and the experimental `run_rust` tool. Caller appends the program.
+pub(super) fn bwrap_args(
+    workspace: &Workspace,
+    sandbox: &crate::config::Sandbox,
+    protect_git: bool,
+    network: bool,
+    chdir: &str,
+    scratch_bind: Option<&str>,
+) -> Vec<String> {
+    let root = workspace.root();
+    let workspace_bind = if sandbox.workspace_writable {
+        "--bind"
+    } else {
+        "--ro-bind"
+    };
+    let root_str = root.to_string_lossy().into_owned();
+    // Extra /home paths must be mounted AFTER the /home tmpfs.
+    let mut args: Vec<String> = vec![
+        "--dev".into(),
+        "/dev".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--ro-bind".into(),
+        "/usr".into(),
+        "/usr".into(),
+        "--ro-bind".into(),
+        "/bin".into(),
+        "/bin".into(),
+        "--ro-bind".into(),
+        "/lib".into(),
+        "/lib".into(),
+        "--ro-bind".into(),
+        "/lib64".into(),
+        "/lib64".into(),
+        "--ro-bind-try".into(),
+        "/etc".into(),
+        "/etc".into(),
+    ];
+    // systemd-resolved stub so symlinked /etc/resolv.conf works.
+    if std::path::Path::new("/run/systemd/resolve").exists() {
+        args.push("--dir".into());
+        args.push("/run/systemd".into());
+        args.push("--ro-bind".into());
+        args.push("/run/systemd/resolve".into());
+        args.push("/run/systemd/resolve".into());
+    }
+    if let Some(scratch) = scratch_bind {
+        // run_rust: the private scratch is the sandbox /tmp, deleted afterwards.
+        args.extend(["--bind".into(), scratch.into(), "/tmp".into()]);
+    } else {
+        args.extend(["--tmpfs".into(), "/tmp".into()]);
+    }
+    args.extend(["--tmpfs".into(), "/home".into()]);
+    // Ancestors before descendants (workspace last among equals stays authoritative).
+    let mut mounts = Vec::new();
+    for (source, dest) in &sandbox.readable_mounts {
+        mounts.push((source.as_str(), dest.as_str(), "--ro-bind-try", false));
+    }
+    for (source, dest) in &sandbox.writable_mounts {
+        mounts.push((source.as_str(), dest.as_str(), "--bind-try", false));
+    }
+    for path in &sandbox.readable_paths {
+        mounts.push((path.as_str(), path.as_str(), "--ro-bind-try", false));
+    }
+    for path in &sandbox.writable_paths {
+        mounts.push((path.as_str(), path.as_str(), "--bind-try", false));
+    }
+    mounts.push((root_str.as_str(), root_str.as_str(), workspace_bind, true));
+    mounts.sort_by_key(|(_, dest, _, workspace)| {
+        (std::path::Path::new(dest).components().count(), *workspace)
+    });
+    for (source, dest, bind, _) in mounts {
+        args.push(bind.into());
+        args.push(source.into());
+        args.push(dest.into());
+    }
+    // Protect the startup policy anchor (after every bind).
+    if workspace.policy_anchor_is_visible() {
+        let policy = workspace.policy_anchor().to_string_lossy().into_owned();
+        let policy_dir = workspace
+            .policy_anchor()
+            .parent()
+            .expect("policy anchor has a parent")
+            .to_string_lossy()
+            .into_owned();
+        if std::path::Path::new(&policy).exists() {
+            args.push("--ro-bind".into());
+            args.push("/dev/null".into());
+            args.push(policy);
+        } else if std::path::Path::new(&policy_dir).is_dir() {
+            // No file mountpoint exists. Freeze the existing parent
+            // so a writable child cannot create this run's policy.
+            args.push("--ro-bind".into());
+            args.push(policy_dir.clone());
+            args.push(policy_dir);
+        }
+    }
+
+    // .git read-only over itself (subagents; run_rust always). After all binds.
+    if protect_git {
+        let git_path = format!("{root_str}/.git");
+        if std::path::Path::new(&git_path).exists() {
+            args.push("--ro-bind".into());
+            args.push(git_path.clone());
+            args.push(git_path);
+        }
+    }
+    args.extend([
+        "--unshare-pid".into(),
+        "--unshare-ipc".into(),
+        "--unshare-uts".into(),
+        "--new-session".into(),
+        "--die-with-parent".into(),
+        "--chdir".into(),
+        chdir.into(),
+    ]);
+    if !network {
+        args.push("--unshare-net".into());
+    }
+    args
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_bash(
     shell: &Shell,
@@ -498,146 +621,23 @@ pub(super) async fn run_bash(
         .await;
     }
 
-    // Build the command: bare bash, or wrapped in bwrap when sandboxed.
-    // bwrap is a *construction tool*, so we spell out the policy explicitly:
-    // system dirs read-only, workspace writable (per config), /tmp scratch,
-    // no new privileges, TIOCSTI blocked, die with the parent. Network is
-    // shared by default (agents often need to fetch); config can disable it.
+    // Build the command: bare bash, or wrapped in bwrap when sandboxed (the
+    // policy lives in `bwrap_args`, shared with run_rust; network defaults on).
     let mut process = match sandbox {
         Some(sandbox) => {
             let root = workspace.root();
-            let workspace_bind = if sandbox.workspace_writable {
-                "--bind"
-            } else {
-                "--ro-bind"
-            };
             let root_str = root.to_string_lossy().into_owned();
-            // Order matters: extra paths under /home (e.g. ~/.cargo) must be
-            // mounted AFTER the /home tmpfs, or the tmpfs would shadow them.
-            let mut args: Vec<String> = vec![
-                "--dev".into(),
-                "/dev".into(),
-                "--proc".into(),
-                "/proc".into(),
-                "--ro-bind".into(),
-                "/usr".into(),
-                "/usr".into(),
-                "--ro-bind".into(),
-                "/bin".into(),
-                "/bin".into(),
-                "--ro-bind".into(),
-                "/lib".into(),
-                "/lib".into(),
-                "--ro-bind".into(),
-                "/lib64".into(),
-                "/lib64".into(),
-                "--ro-bind-try".into(),
-                "/etc".into(),
-                "/etc".into(),
-            ];
-            // If systemd-resolved is running on the host, mount its stub
-            // resolver so that symlinked /etc/resolv.conf works inside the
-            // sandbox. Only mount the resolver directory, not whole /run.
-            if std::path::Path::new("/run/systemd/resolve").exists() {
-                args.push("--dir".into());
-                args.push("/run/systemd".into());
-                args.push("--ro-bind".into());
-                args.push("/run/systemd/resolve".into());
-                args.push("/run/systemd/resolve".into());
-            }
-            args.extend([
-                "--tmpfs".into(),
-                "/tmp".into(),
-                "--tmpfs".into(),
-                "/home".into(),
-            ]);
-            // Bind ancestors before descendants so the most specific policy
-            // wins. In particular, an external ancestor cannot override the
-            // workspace mode, while an explicit external child still can.
-            // Put the workspace last among equal paths so workspace_writable
-            // remains authoritative for the workspace root itself.
-            let mut mounts = Vec::new();
-            // Configured mounts first: (canonical source, configured dest),
-            // so a symlink alias appears inside the sandbox at the path the
-            // user configured. The canonical path self-mounts below keep
-            // manually-constructed sandboxes (and the canonical locations
-            // themselves) working exactly as before.
-            for (source, dest) in &sandbox.readable_mounts {
-                mounts.push((source.as_str(), dest.as_str(), "--ro-bind-try", false));
-            }
-            for (source, dest) in &sandbox.writable_mounts {
-                mounts.push((source.as_str(), dest.as_str(), "--bind-try", false));
-            }
-            for path in &sandbox.readable_paths {
-                mounts.push((path.as_str(), path.as_str(), "--ro-bind-try", false));
-            }
-            for path in &sandbox.writable_paths {
-                mounts.push((path.as_str(), path.as_str(), "--bind-try", false));
-            }
-            mounts.push((root_str.as_str(), root_str.as_str(), workspace_bind, true));
-            mounts.sort_by_key(|(_, dest, _, workspace)| {
-                (std::path::Path::new(dest).components().count(), *workspace)
-            });
-            for (source, dest, bind, _) in mounts {
-                args.push(bind.into());
-                args.push(source.into());
-                args.push(dest.into());
-            }
-            // Protect the startup policy anchor, not a custom delegated
-            // workspace's unrelated config. It must come after every bind.
-            if workspace.policy_anchor_is_visible() {
-                let policy = workspace.policy_anchor().to_string_lossy().into_owned();
-                let policy_dir = workspace
-                    .policy_anchor()
-                    .parent()
-                    .expect("policy anchor has a parent")
-                    .to_string_lossy()
-                    .into_owned();
-                if std::path::Path::new(&policy).exists() {
-                    args.push("--ro-bind".into());
-                    args.push("/dev/null".into());
-                    args.push(policy);
-                } else if std::path::Path::new(&policy_dir).is_dir() {
-                    // No file mountpoint exists. Freeze the existing parent
-                    // so a writable child cannot create this run's policy.
-                    args.push("--ro-bind".into());
-                    args.push(policy_dir.clone());
-                    args.push(policy_dir);
-                }
-            }
-
-            // Protect the workspace .git metadata (directory or
-            // linked-worktree pointer file) by binding it read-only over
-            // itself. This prevents the fixer / subagent from deleting or
-            // corrupting the pointer, running `git init`, or writing any
-            // commit metadata. It comes after all writable binds and the
-            // .e-agent/config.toml protection so it cannot be shadowed.
-            // Only enabled for subagents (protect_git=true); the main agent
-            // needs writable .git for orchestration (git add/commit/etc).
-            if protect_git {
-                let git_path = format!("{root_str}/.git");
-                if std::path::Path::new(&git_path).exists() {
-                    args.push("--ro-bind".into());
-                    args.push(git_path.clone());
-                    args.push(git_path);
-                }
-            }
-            args.extend([
-                "--unshare-pid".into(),
-                "--unshare-ipc".into(),
-                "--unshare-uts".into(),
-                "--new-session".into(),
-                "--die-with-parent".into(),
-                "--chdir".into(),
-                root_str,
-            ]);
-            if !sandbox.network {
-                args.push("--unshare-net".into());
-            }
-            args.push(shell.executable.clone());
-            args.extend(shell.command_args(command));
             let mut cmd = Command::new("bwrap");
-            cmd.args(args);
+            cmd.args(bwrap_args(
+                workspace,
+                sandbox,
+                protect_git,
+                sandbox.network,
+                &root_str,
+                None,
+            ));
+            cmd.arg(shell.executable.clone());
+            cmd.args(shell.command_args(command));
             // Only inject the default git config when the gh CLI is
             // actually reachable inside the sandbox: a host-side `gh`
             // whose executable path falls under a sandbox-mounted
@@ -828,6 +828,14 @@ pub(super) const TAIL_LIMIT: usize = 16 * 1024;
 /// `FULL_LIMIT` bytes written to the log.
 pub(super) const FULL_LIMIT: usize = 16 * 1024 * 1024;
 
+/// Per-stream capture budget `(head, tail, output cap, full cap)`.
+pub(super) type CaptureLimits = (usize, usize, usize, usize);
+
+pub(super) const BASH_CAPTURE: CaptureLimits = (HEAD_LIMIT, TAIL_LIMIT, OUTPUT_LIMIT, FULL_LIMIT);
+
+/// run_rust per-stage capture: first 24 KiB and last 8 KiB per stream kept.
+pub(super) const RUST_CAPTURE: CaptureLimits = (24 * 1024, 8 * 1024, 32 * 1024, FULL_LIMIT);
+
 pub(super) struct Captured {
     /// Head segment: the first `HEAD_LIMIT` bytes of the stream (the whole
     /// stream when `total ≤ HEAD_LIMIT`). When `truncated`, its end is
@@ -847,10 +855,20 @@ pub(super) struct Captured {
 }
 
 pub(super) async fn capture(
-    mut reader: impl AsyncRead + Unpin,
+    reader: impl AsyncRead + Unpin,
     slot: Option<OutputSlot>,
     spool: Option<Arc<TaskSpool>>,
 ) -> std::io::Result<Captured> {
+    capture_with(reader, slot, spool, BASH_CAPTURE).await
+}
+
+pub(super) async fn capture_with(
+    mut reader: impl AsyncRead + Unpin,
+    slot: Option<OutputSlot>,
+    spool: Option<Arc<TaskSpool>>,
+    limits: CaptureLimits,
+) -> std::io::Result<Captured> {
+    let (head_limit, tail_limit, output_limit, full_limit) = limits;
     let mut captured = Captured {
         bytes: Vec::new(),
         tail: Vec::new(),
@@ -872,23 +890,22 @@ pub(super) async fn capture(
             spool.append(data);
         }
         captured.total += count;
-        // Full output for potential failure persistence, capped at FULL_LIMIT.
-        if captured.full.len() < FULL_LIMIT {
-            let room = FULL_LIMIT - captured.full.len();
+        // Full output for potential failure persistence, capped at full_limit.
+        if captured.full.len() < full_limit {
+            let room = full_limit - captured.full.len();
             captured.full.extend_from_slice(&data[..count.min(room)]);
         }
-        // Head: first HEAD_LIMIT bytes.
-        if captured.bytes.len() < HEAD_LIMIT {
-            let room = HEAD_LIMIT - captured.bytes.len();
+        if captured.bytes.len() < head_limit {
+            let room = head_limit - captured.bytes.len();
             captured.bytes.extend_from_slice(&data[..count.min(room)]);
         }
-        // Tail: rolling window of the last TAIL_LIMIT bytes.
+        // Tail: rolling window of the last tail_limit bytes.
         captured.tail.extend_from_slice(data);
-        if captured.tail.len() > TAIL_LIMIT {
-            let excess = captured.tail.len() - TAIL_LIMIT;
+        if captured.tail.len() > tail_limit {
+            let excess = captured.tail.len() - tail_limit;
             captured.tail.drain(..excess);
         }
-        captured.truncated |= captured.total > OUTPUT_LIMIT;
+        captured.truncated |= captured.total > output_limit;
     }
     if captured.truncated {
         // Align both seams to UTF-8 char boundaries so the head/tail never
@@ -980,7 +997,7 @@ fn signal_name(signal: i32) -> String {
 
 /// Render one captured stream: the full text when it fit within the budget,
 /// otherwise `head … [truncated: N bytes omitted] … tail`.
-fn render_stream(captured: &Captured) -> String {
+pub(super) fn render_stream(captured: &Captured) -> String {
     if !captured.truncated {
         // The whole stream fits: `bytes` holds the first min(total,
         // HEAD_LIMIT) bytes and anything past HEAD_LIMIT is a suffix of the

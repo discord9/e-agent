@@ -9,6 +9,8 @@ mod background;
 mod bash;
 mod file;
 pub mod output;
+#[cfg(target_os = "linux")]
+mod rust;
 mod tasks;
 mod web;
 #[cfg(windows)]
@@ -25,6 +27,10 @@ pub use background::{
 };
 pub use bash::bash_tool;
 pub use file::{file_tools, undo_file_op};
+#[cfg(target_os = "linux")]
+pub(crate) use rust::resolve_rustc;
+#[cfg(target_os = "linux")]
+pub use rust::run_rust_tool;
 
 // The `#[cfg(test)] mod tests` child re-imports these names via `use super::*`.
 #[cfg(test)]
@@ -396,6 +402,10 @@ mod tests;
 /// Windows restricted-token sandbox tests: `#[cfg(all(test, windows))]`
 /// (compiled only when running the test suite on Windows, where the
 /// write-restriction code paths are real).
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tools/rust_tests.rs"]
+mod rust_tests;
+
 #[cfg(all(test, windows))]
 #[path = "tools/windows_sandbox_tests.rs"]
 mod windows_sandbox_tests;

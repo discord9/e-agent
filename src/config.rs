@@ -40,6 +40,8 @@ pub struct Config {
     /// Optional `[delegate]` policy (FinishWhenIdle finalize wait).
     #[serde(default)]
     delegate: Option<DelegateConfig>,
+    #[serde(default)]
+    code_mode: Option<CodeModeConfig>,
     /// Optional `[tui]` submit/newline key mapping. A project-level
     /// `[tui]` section replaces this one wholesale (fields the project
     /// omits fall back to the built-in defaults, not to these values); no
@@ -111,6 +113,13 @@ pub struct BashConfig {
 
 /// Default foreground bash timeout: 30 seconds.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
+
+/// User-level `[code_mode]` enabling the experimental `run_rust` tool.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct CodeModeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
 
 /// Delegate subagent policy, from `[delegate]`.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -566,6 +575,9 @@ impl Config {
         resolve_sandbox(Some(self), workspace)
     }
 
+    pub fn code_mode_enabled(&self) -> bool {
+        self.code_mode.as_ref().is_some_and(|c| c.enabled)
+    }
     /// The session backend from `[session] backend`, defaulting to Sqlite
     /// (`<workspace>/.e-agent/sessions.db`).
     pub fn session_backend(&self) -> SessionBackend {
