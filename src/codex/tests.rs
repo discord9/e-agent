@@ -222,14 +222,41 @@ fn responses_wire_degrades_missing_tool_image_to_text_part() {
 
 #[test]
 fn usage_requires_completed_usage_fields() {
+    // The response payload carries the nested `usage` object; optional
+    // enrichment fields are parsed when present.
     assert_eq!(
-        response_usage(&json!({"input_tokens": 3, "output_tokens": 4})).unwrap(),
+        response_usage(&json!({"usage": {"input_tokens": 3, "output_tokens": 4}}))
+            .unwrap()
+            .unwrap(),
         Usage {
             input_tokens: 3,
-            output_tokens: 4
+            output_tokens: 4,
+            ..Default::default()
         }
     );
-    assert!(response_usage(&json!({"input_tokens": 3})).is_err());
+    // Incomplete usage (missing output_tokens) is an error…
+    assert!(response_usage(&json!({"usage": {"input_tokens": 3}})).is_err());
+    // …and a response with NO usage object yields Ok(None) (not an error).
+    assert_eq!(response_usage(&json!({"input_tokens": 3})).unwrap(), None);
+    // Enrichment fields are threaded through when present.
+    assert_eq!(
+        response_usage(&json!({"finish_reason": "stop", "usage": {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "input_tokens_details": {"cached_tokens": 30},
+            "output_tokens_details": {"reasoning_tokens": 20}
+        }}))
+        .unwrap()
+        .unwrap(),
+        Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_hit_tokens: Some(30),
+            cache_miss_tokens: Some(70),
+            reasoning_tokens: Some(20),
+            finish_reason: Some("stop".into()),
+        }
+    );
 }
 
 #[tokio::test]
@@ -282,7 +309,8 @@ async fn local_sse_emits_text_reasoning_function_call_and_usage() {
         usage,
         Some(Usage {
             input_tokens: 3,
-            output_tokens: 4
+            output_tokens: 4,
+            ..Default::default()
         })
     );
     assert_eq!(
@@ -410,7 +438,8 @@ async fn backend_401_refreshes_once_persists_rotation_and_retries_once() {
         usage,
         Some(Usage {
             input_tokens: 1,
-            output_tokens: 2
+            output_tokens: 2,
+            ..Default::default()
         })
     );
     assert_eq!(
@@ -541,7 +570,8 @@ async fn transient_connect_error_retries_and_recovers() {
         usage,
         Some(Usage {
             input_tokens: 1,
-            output_tokens: 2
+            output_tokens: 2,
+            ..Default::default()
         })
     );
 }
@@ -603,7 +633,8 @@ async fn http_5xx_is_retried_then_succeeds() {
         usage,
         Some(Usage {
             input_tokens: 1,
-            output_tokens: 2
+            output_tokens: 2,
+            ..Default::default()
         })
     );
 }
@@ -719,7 +750,8 @@ async fn stream_decode_error_is_retried_then_succeeds() {
         usage,
         Some(Usage {
             input_tokens: 1,
-            output_tokens: 2
+            output_tokens: 2,
+            ..Default::default()
         })
     );
 }

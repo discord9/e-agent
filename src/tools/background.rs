@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::agent::{AgentEvent, preview};
+use crate::agent::{AgentEvent, BackgroundTrace, preview};
 
 use super::bash::{Shell, run_bash};
 
@@ -27,7 +27,54 @@ struct BackgroundRegistry {
     running: std::sync::Mutex<Vec<RunningTask>>,
 }
 
-type Completion = Arc<std::sync::Mutex<Option<Box<dyn FnOnce(u64, String) + Send>>>>;
+type Completion =
+    Arc<std::sync::Mutex<Option<Box<dyn FnOnce(u64, String, BackgroundTrace) + Send>>>>;
+
+/// Structured exit metadata of a finished background task's underlying run,
+/// written by the task's own work through an out-slot (bash: `run_bash`
+/// records code/signal/status; delegate: the subagent result's success
+/// flag). `spawn_inner` merges it with the task's start/duration timing
+/// into the completion [`BackgroundTrace`] passed to the widened
+/// `on_complete` callback.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskExit {
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    /// "completed" | "failed" | "killed".
+    pub status: Option<String>,
+}
+
+/// Shared out-slot for a task's exit metadata, following the
+/// `process_group_slot` pattern: the work closure writes it, `spawn_inner`
+/// reads it at finish time.
+pub type ExitSlot = Arc<std::sync::Mutex<TaskExit>>;
+
+/// A fresh, empty exit slot for callers that record no structured exit
+/// metadata (their trace still carries start/duration/kind).
+pub fn new_exit_slot() -> ExitSlot {
+    Arc::new(std::sync::Mutex::new(TaskExit::default()))
+}
+
+impl RunningTask {
+    /// The completion trace at finish time: start/duration timing from the
+    /// registry push, exit fields from the task's own work out-slot, and
+    /// the kind derived from the shell (`None` shell = delegate).
+    fn completion_trace(&self) -> BackgroundTrace {
+        let exit = self.exit.lock().unwrap();
+        BackgroundTrace {
+            started_at_ms: self.started_at_ms,
+            duration_ms: Some(self.started_at.elapsed().as_millis() as u64),
+            exit_code: exit.exit_code,
+            signal: exit.signal.clone(),
+            status: exit.status.clone(),
+            kind: self
+                .shell_name
+                .clone()
+                .map(|name| name.to_ascii_lowercase())
+                .or_else(|| Some("delegate".to_owned())),
+        }
+    }
+}
 
 /// A live, read-only snapshot of a background task's combined stdout+stderr
 /// tail (capped at 16KB), shared between the running `bash` capture and the
@@ -297,6 +344,13 @@ struct RunningTask {
     /// sessions, so the listing session id is not the initiator.
     owner_session: Option<String>,
     completion: Completion,
+    /// When the task was pushed to the registry (wall clock, epoch ms).
+    started_at_ms: Option<u64>,
+    /// Monotonic start instant; `elapsed()` at finish yields the duration.
+    started_at: std::time::Instant,
+    /// Exit metadata out-slot written by the work closure (bash:
+    /// `run_bash`'s out-slot; delegate: the subagent result success flag).
+    exit: ExitSlot,
 }
 
 /// Structured metadata for delegate-task display in the F2 task panel.
@@ -335,6 +389,9 @@ pub struct BackgroundTaskInfo {
     /// `None` = unknown / main session). Differs from the listing
     /// `session_id` (the registry owner) when a subagent ran the command.
     pub owner_session: Option<String>,
+    /// Epoch milliseconds at task start (`None` when the clock read failed
+    /// or the row predates the field).
+    pub started_at_ms: Option<u64>,
 }
 
 impl BackgroundTasks {
@@ -388,6 +445,7 @@ impl BackgroundTasks {
                     .unwrap_or_default(),
                 display_meta: task.display_meta.clone(),
                 owner_session: task.owner_session.clone(),
+                started_at_ms: task.started_at_ms,
             })
             .collect()
     }
@@ -433,7 +491,20 @@ impl BackgroundTasks {
         };
         task.handle.abort();
         if let Some(done) = task.completion.lock().unwrap().take() {
-            done(id, "background task cancelled".into());
+            let mut exit = task.exit.lock().unwrap();
+            // The process was aborted: no exit code was observed. If the
+            // work never recorded a status (bash run still in flight), the
+            // task died by our kill, so "killed" is the truthful status.
+            if exit.status.is_none() {
+                exit.status = Some("killed".into());
+                exit.signal = Some("SIGKILL".into());
+            }
+            drop(exit);
+            done(
+                id,
+                "background task cancelled".into(),
+                task.completion_trace(),
+            );
         }
         Some(task.label)
     }
@@ -491,11 +562,17 @@ impl BackgroundTasks {
             protect_git,
             sandbox,
             owner_session,
-            move |id, output| {
+            move |id, output, trace| {
                 let _ = sender.send(AgentEvent::BackgroundCompleted {
                     id,
                     output,
                     label: Some(completion_label.clone()),
+                    started_at_ms: trace.started_at_ms,
+                    duration_ms: trace.duration_ms,
+                    exit_code: trace.exit_code,
+                    signal: trace.signal,
+                    status: trace.status,
+                    kind: trace.kind,
                 });
             },
         )
@@ -528,7 +605,9 @@ impl BackgroundTasks {
             protect_git,
             sandbox,
             owner_session,
-            |_, _| {},
+            // Detached: on_complete is a no-op, so no completion entry is
+            // ever produced for this task.
+            |_, _, _| {},
         )
     }
 
@@ -546,12 +625,13 @@ impl BackgroundTasks {
         protect_git: bool,
         sandbox: Option<crate::config::Sandbox>,
         owner_session: Option<String>,
-        on_complete: impl FnOnce(u64, String) + Send + 'static,
+        on_complete: impl FnOnce(u64, String, BackgroundTrace) + Send + 'static,
     ) -> Result<String, String> {
         let shell = Shell::detect()?;
         let process_group = Arc::new(AtomicI32::new(0));
         let output: OutputSlot = Arc::new(std::sync::Mutex::new(Vec::new()));
         let spool: Arc<TaskSpool> = Arc::new(TaskSpool::new());
+        let exit_slot = new_exit_slot();
         let pg = process_group.clone();
         let slot = output.clone();
         let full = spool.clone();
@@ -565,6 +645,7 @@ impl BackgroundTasks {
             Some(process_group),
             None, // display_meta
             owner_session,
+            exit_slot.clone(),
             move |id| {
                 let mut running = running.running.lock().unwrap();
                 if let Some(task) = running.iter_mut().find(|task| task.id == id) {
@@ -585,6 +666,7 @@ impl BackgroundTasks {
                     Some(slot),
                     Some(full),
                     sandbox.as_ref(),
+                    Some(exit_slot),
                 )
                 .await
                 {
@@ -609,18 +691,31 @@ impl BackgroundTasks {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
-        self.spawn_with_id(label, role, process_group, None, |_| {}, work)
+        self.spawn_with_id(
+            label,
+            role,
+            process_group,
+            None,
+            new_exit_slot(),
+            |_| {},
+            work,
+        )
     }
 
     /// Like [`Self::spawn`], but invokes `on_id` with the allocated task id
     /// before the work starts (so callers can register per-task state under
-    /// the same id).
+    /// the same id). `exit_slot` is the out-slot the work closure writes
+    /// its structured exit metadata into (bash: `run_bash`'s out-slot;
+    /// delegate: the subagent result's success flag); callers that produce
+    /// no trace metadata pass a default slot.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_id<F, Fut>(
         &self,
         label: String,
         role: Option<String>,
         process_group: Option<Arc<AtomicI32>>,
         display_meta: Option<TaskDisplayMeta>,
+        exit_slot: ExitSlot,
         on_id: impl FnOnce(u64),
         work: F,
     ) -> Result<String, String>
@@ -634,6 +729,7 @@ impl BackgroundTasks {
             role,
             process_group,
             display_meta,
+            exit_slot,
             on_id,
             work,
         )
@@ -647,6 +743,7 @@ impl BackgroundTasks {
         role: Option<String>,
         process_group: Option<Arc<AtomicI32>>,
         display_meta: Option<TaskDisplayMeta>,
+        exit_slot: ExitSlot,
         on_id: impl FnOnce(u64),
         work: F,
     ) -> Result<String, String>
@@ -667,13 +764,20 @@ impl BackgroundTasks {
             // (subagents never delegate); the listing session id is already
             // the initiator, so no separate owner.
             None,
+            exit_slot,
             on_id,
             work,
-            move |id, output| {
+            move |id, output, trace| {
                 let _ = sender.send(AgentEvent::BackgroundCompleted {
                     id,
                     output,
                     label: Some(completion_label.clone()),
+                    started_at_ms: trace.started_at_ms,
+                    duration_ms: trace.duration_ms,
+                    exit_code: trace.exit_code,
+                    signal: trace.signal,
+                    status: trace.status,
+                    kind: trace.kind,
                 });
             },
         )
@@ -702,9 +806,10 @@ impl BackgroundTasks {
             process_group,
             display_meta,
             None,
+            new_exit_slot(),
             on_id,
             work,
-            |_, _| {},
+            |_, _, _| {},
         )
     }
 
@@ -716,9 +821,10 @@ impl BackgroundTasks {
         process_group: Option<Arc<AtomicI32>>,
         display_meta: Option<TaskDisplayMeta>,
         owner_session: Option<String>,
+        exit_slot: ExitSlot,
         on_id: impl FnOnce(u64),
         work: F,
-        on_complete: impl FnOnce(u64, String) + Send + 'static,
+        on_complete: impl FnOnce(u64, String, BackgroundTrace) + Send + 'static,
     ) -> Result<String, String>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -726,6 +832,11 @@ impl BackgroundTasks {
     {
         let id = self.registry.next_id.fetch_add(1, Ordering::Relaxed);
         let started = format!("started background task {id}: {label}");
+        let started_at = std::time::Instant::now();
+        let started_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis() as u64);
         let (work_tx, work_rx) = tokio::sync::oneshot::channel::<F>();
         // The task holds only a weak registry reference. Therefore dropping
         // the final BackgroundTasks owner tears down the registry and kills
@@ -741,19 +852,25 @@ impl BackgroundTasks {
                 return;
             };
             let output = work().await;
-            let completed = if let Some(running) = running.upgrade() {
+            // Remove the task from the registry and read its start timing +
+            // the exit metadata its own work recorded (the out-slot shared
+            // with the caller's work closure), then deliver the completion
+            // with the merged trace. `completed` is false when the task was
+            // cancelled (removed from the registry) while the work was
+            // still in flight — the cancel path owns the completion then.
+            let trace = if let Some(running) = running.upgrade() {
                 let mut running = running.running.lock().unwrap();
                 if let Some(index) = running.iter().position(|task| task.id == id) {
-                    running.remove(index);
-                    true
+                    let task = running.remove(index);
+                    Some(task.completion_trace())
                 } else {
-                    false
+                    None
                 }
             } else {
-                false
+                None
             };
-            if completed && let Some(done) = task_completion.lock().unwrap().take() {
-                done(id, output);
+            if let (Some(trace), Some(done)) = (trace, task_completion.lock().unwrap().take()) {
+                done(id, output, trace);
             }
         });
         self.registry.running.lock().unwrap().push(RunningTask {
@@ -769,6 +886,9 @@ impl BackgroundTasks {
             display_meta,
             owner_session,
             completion,
+            started_at_ms,
+            started_at,
+            exit: exit_slot,
         });
         on_id(id);
         if let Err(work) = work_tx.send(work) {

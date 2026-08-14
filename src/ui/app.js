@@ -85,6 +85,10 @@ const state = {
                              //  侧边栏环绕点消费全量）
     byWorkspace: {},         // workspaceId -> task[]：各 workspace 独立的 /api/tasks
                              // 缓存（聚合轮询的 stale 保留 + 面板过滤数据源）
+    finished: [],            // 已完成任务（GET /api/tasks/finished，来自持久化
+                             // session_entries，newest first；每项带 _ws 标记）
+    finishedByWorkspace: {}, // workspaceId -> finished[]：已完成列表的 per-workspace
+                             // 缓存（stale 保留 + 面板过滤数据源）
     cancelling: new Set(),   // 正在取消的任务 id（防重复点击）
     composerOpen: false,     // composer 任务面板展开状态（默认收起）
     pollers: new Map(),      // 展开中 bash 行的 output 轮询句柄（key=session_id:id → interval id）

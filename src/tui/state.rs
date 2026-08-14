@@ -113,6 +113,30 @@ impl Default for CollapseThinking {
     }
 }
 
+/// One finished background task row for the F2 panel's finished section: a
+/// live projection of the durable `SessionEntry::BackgroundCompletion` —
+/// the authoritative record lives in `session_entries` (the web panel
+/// reads the same rows through `GET /api/tasks/finished`). Populated from
+/// `BackgroundCompletionNotice` events, including the historical replay on
+/// attach, so the section shows what this TUI session has seen, newest
+/// first.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FinishedTask {
+    pub(crate) id: u64,
+    pub(crate) label: Option<String>,
+    /// "bash" | "delegate"
+    pub(crate) kind: Option<String>,
+    /// "completed" | "failed" | "killed"
+    pub(crate) status: Option<String>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) signal: Option<String>,
+    pub(crate) duration_ms: Option<u64>,
+}
+
+/// Cap on the F2 finished list. A display projection, not a store: the
+/// full history is always recoverable from `session_entries`.
+const FINISHED_TASKS_CAP: usize = 100;
+
 #[derive(Default)]
 pub(crate) struct TuiState {
     /// This session's id, shown in the input border (so it can be resumed
@@ -239,6 +263,10 @@ pub(crate) struct TuiState {
     pub(crate) show_tasks: bool,
     /// Cursor (index into the running-task list) for attach selection.
     pub(crate) task_cursor: usize,
+    /// Finished background tasks seen by this session (newest first, capped
+    /// at [`FINISHED_TASKS_CAP`]); rendered as a read-only section below
+    /// the running list in the F2 panel.
+    pub(crate) finished_tasks: Vec<FinishedTask>,
     /// Attached session view; when set, draw renders this instead of the
     /// main scrollback and Esc detaches instead of cancelling the turn.
     pub(crate) attached: Option<Box<AttachedView>>,
@@ -1737,7 +1765,15 @@ impl TuiState {
             // would duplicate it.
             AgentEvent::BackgroundCompleted { .. } => {}
             AgentEvent::BackgroundCompletionNotice {
-                id, output, label, ..
+                id,
+                output,
+                label,
+                duration_ms,
+                exit_code,
+                signal,
+                status,
+                kind,
+                ..
             } => {
                 // End the streaming lane BEFORE the aside lines: a
                 // completion notice interleaving with an in-flight
@@ -1746,6 +1782,22 @@ impl TuiState {
                 // and lose its markdown rendering). Same as Notice/Error.
                 self.active_lane = None;
                 self.push_background_completion(id, &output, label.as_deref());
+                // Finished section: newest first, capped. The notice fires
+                // only after the durable entry is committed, so this is a
+                // projection of `session_entries`, not a second store.
+                self.finished_tasks.insert(
+                    0,
+                    FinishedTask {
+                        id,
+                        label: label.clone(),
+                        kind: kind.clone(),
+                        status: status.clone(),
+                        exit_code,
+                        signal: signal.clone(),
+                        duration_ms,
+                    },
+                );
+                self.finished_tasks.truncate(FINISHED_TASKS_CAP);
             }
             AgentEvent::GoalUpdated { goal } => {
                 self.active_lane = None;

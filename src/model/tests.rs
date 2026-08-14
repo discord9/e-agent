@@ -245,6 +245,123 @@ async fn sse_accumulates_text_and_tool_call_fragments() {
         Some(Usage {
             input_tokens: 174,
             output_tokens: 156,
+            finish_reason: Some("tool_calls".into()),
+            ..Default::default()
+        })
+    );
+}
+
+/// DeepSeek/OpenAI-compatible usage enrichment: `prompt_cache_hit_tokens`,
+/// `prompt_cache_miss_tokens`, the nested
+/// `completion_tokens_details.reasoning_tokens`, and the stream's
+/// `finish_reason` are parsed into the canonical [`Usage`] when the
+/// provider supplies them; providers that don't keep them `None`.
+#[tokio::test]
+async fn sse_usage_carries_cache_reasoning_and_finish_reason() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _request = read_request(&mut stream).await;
+        reply_sse(
+            &mut stream,
+            &[
+                json!({"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop","usage":{
+                    "prompt_tokens":100,
+                    "completion_tokens":50,
+                    "prompt_cache_hit_tokens":30,
+                    "prompt_cache_miss_tokens":70,
+                    "completion_tokens_details":{"reasoning_tokens":20}
+                }}]}),
+            ],
+        )
+        .await;
+    });
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "test-model".into(),
+        None,
+        false,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let (message, usage) = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(message.content.as_deref(), Some("hi"));
+    assert_eq!(
+        usage,
+        Some(Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_hit_tokens: Some(30),
+            cache_miss_tokens: Some(70),
+            reasoning_tokens: Some(20),
+            finish_reason: Some("stop".into()),
+        })
+    );
+}
+
+/// Providers without the enrichment fields keep them `None` (absent
+/// fields deserialize as `None`; nothing is forced).
+#[tokio::test]
+async fn sse_usage_without_enrichment_stays_null() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _request = read_request(&mut stream).await;
+        reply_sse(
+            &mut stream,
+            &[
+                json!({"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop","usage":{
+                    "prompt_tokens":10,
+                    "completion_tokens":5
+                }}]}),
+            ],
+        )
+        .await;
+    });
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "test-model".into(),
+        None,
+        false,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let (_, usage) = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        usage,
+        Some(Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_hit_tokens: None,
+            cache_miss_tokens: None,
+            reasoning_tokens: None,
+            finish_reason: Some("stop".into()),
         })
     );
 }
@@ -602,9 +719,16 @@ fn chat_wire_empty_tool_result_stays_empty_string() {
 
 #[test]
 fn build_assistant_rejects_reasoning_only_half_messages() {
-    let error = build_assistant("".into(), "truncated thinking".into(), true, vec![], None)
-        .unwrap_err()
-        .to_string();
+    let error = build_assistant(
+        "".into(),
+        "truncated thinking".into(),
+        true,
+        vec![],
+        None,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(
         error.contains("without content or tool calls"),
         "unexpected error: {error}"
@@ -614,7 +738,7 @@ fn build_assistant_rejects_reasoning_only_half_messages() {
 #[test]
 fn build_assistant_accepts_content_or_tool_calls() {
     let (with_content, _) =
-        build_assistant("hello".into(), "thinking".into(), true, vec![], None).unwrap();
+        build_assistant("hello".into(), "thinking".into(), true, vec![], None, None).unwrap();
     assert_eq!(with_content.content.as_deref(), Some("hello"));
     assert_eq!(with_content.reasoning.as_deref(), Some("thinking"));
     assert!(with_content.tool_calls.is_empty());
@@ -628,6 +752,7 @@ fn build_assistant_accepts_content_or_tool_calls() {
             name: "bash".into(),
             arguments: r#"{"command":"pwd"}"#.into(),
         }],
+        None,
         None,
     )
     .unwrap();
@@ -647,6 +772,7 @@ fn build_assistant_still_rejects_incomplete_tool_calls() {
             name: "".into(),
             arguments: "{}".into(),
         }],
+        None,
         None,
     )
     .unwrap_err()

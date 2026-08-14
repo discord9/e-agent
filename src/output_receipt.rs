@@ -1268,6 +1268,12 @@ mod tests {
             id: 1,
             output: "out".into(),
             label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         };
         assert_eq!(
             field_bytes(&entry, FieldId::BgOutput).unwrap(),

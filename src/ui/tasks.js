@@ -46,6 +46,23 @@ async function fetchTasks(ws) {
   }
 }
 
+/* GET /api/tasks/finished → 最近已完成任务（newest first，来自持久化的
+   session_entries，非内存环形缓冲）。JSONL workspace 无 session_entries
+   表 → 返回空数组。失败/无 token → null（保留旧缓存，与 fetchTasks 同款
+   静默降级语义）。 */
+async function fetchFinishedTasks(ws) {
+  if (!workspaceToken(ws)) return null;
+  try {
+    const res = await fetchWithTimeout(ws, "/api/tasks/finished");
+    if (res.status === 401 || res.status === 403) return null;
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const list = await res.json();
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    return null;
+  }
+}
+
 /* 统一任务轮询（防重入：seq 竞态序号只应用最新一次响应）。
    多 workspace 聚合：遍历 state.workspaces，每个 workspace 经 apiFor 各自
    拉 /api/tasks（与 pollAllWorkspaces 同款语义），合并成一份全量列表存
@@ -53,29 +70,98 @@ async function fetchTasks(ws) {
    每个任务打 _ws 标记（所属 workspace id）供面板/侧边栏按 workspace 过滤；
    单 workspace / 未配置时行为与旧版一致（只拉激活 workspace 一份）。
    某 workspace 拉取失败 → 保留其旧缓存（stale，与单服务器语义一致），
-   不参与本轮合并。 */
+   不参与本轮合并。
+   已完成列表同轮并行拉取（state.tasks.finished + finishedByWorkspace），
+   渲染在面板底部的 finished 小节。 */
 async function pollTasks() {
   const seq = ++state.tasks.seq;
   const wss = (state.workspaces || []).slice();
   if (!wss.length && state.workspace) wss.push(state.workspace);   // 兜底
-  const results = await Promise.all(wss.map(async (ws) => ({ ws, tasks: await fetchTasks(ws) })));
+  const results = await Promise.all(wss.map(async (ws) => {
+    const [tasks, finished] = await Promise.all([fetchTasks(ws), fetchFinishedTasks(ws)]);
+    return { ws, tasks, finished };
+  }));
   if (seq !== state.tasks.seq) return;   // 过期响应丢弃
   const all = [];
-  for (const { ws, tasks } of results) {
+  const allFinished = [];
+  for (const { ws, tasks, finished } of results) {
     if (tasks === null) {
       // 拉取失败：保留该 workspace 的旧缓存（stale），避免任务闪烁消失
       const old = state.tasks.byWorkspace[ws.id];
       if (old) all.push(...old);
-      continue;
+    } else {
+      const tagged = tasks.map((t) => Object.assign({}, t, { _ws: ws.id }));
+      state.tasks.byWorkspace[ws.id] = tagged;
+      all.push(...tagged);
     }
-    const tagged = tasks.map((t) => Object.assign({}, t, { _ws: ws.id }));
-    state.tasks.byWorkspace[ws.id] = tagged;
-    all.push(...tagged);
+    if (finished === null) {
+      const old = state.tasks.finishedByWorkspace[ws.id];
+      if (old) allFinished.push(...old);
+    } else {
+      const tagged = finished.map((t) => Object.assign({}, t, { _ws: ws.id }));
+      state.tasks.finishedByWorkspace[ws.id] = tagged;
+      allFinished.push(...tagged);
+    }
   }
   state.tasks.list = all;
+  state.tasks.finished = allFinished;
   renderComposerTasks();
   renderSidebarTree();   // 任务数据恢复后主动触发侧边栏重绘（dot 数据源变化，
                          // 不再依赖 sessionId 变化碰巧打破 sidebarTreeSig 去重）
+}
+
+/* 已完成任务行签名（finished 小节去重用） */
+function finishedKeySig(t) {
+  return JSON.stringify([
+    t.session_id || "", t.seq != null ? t.seq : "", t.id != null ? t.id : "",
+    t.label || "", t.kind || "", t.status || "",
+    t.exit_code != null ? t.exit_code : "", t.signal || "",
+    t.duration_ms != null ? t.duration_ms : "",
+  ]);
+}
+
+function finishedListSig(list) {
+  return JSON.stringify((list || []).map((t) => finishedKeySig(t)));
+}
+
+/* 已完成任务行：badge + 元数据（kind/status/exit/duration）+ 截断 label。
+   只读列表，无跳转/取消。 */
+function buildFinishedRow(t) {
+  const row = el("div", "task-row task-row-finished");
+  row.setAttribute("data-finished", finishedKeySig(t));
+  const line = el("div", "task-line");
+  const shellKind = t.kind || "shell";
+  const badge = el("span", "kind-badge " + (t.kind === "delegate" ? "delegate" : shellKind),
+    t.kind === "delegate" ? "delegate" : shellKind);
+  line.appendChild(badge);
+  if (t.id != null) line.appendChild(el("span", "task-meta tid", "#" + t.id));
+  const meta = [];
+  if (t.status) meta.push(t.status);
+  if (t.exit_code != null) meta.push("exit " + t.exit_code);
+  else if (t.signal) meta.push("signal");
+  if (t.duration_ms != null) meta.push(formatDurationMs(t.duration_ms));
+  if (meta.length) {
+    line.appendChild(el("span", "task-meta tfin", meta.join(" · ")));
+  }
+  const label = (t.kind === "delegate" ? (t.label || "子代理任务") : (t.label || ""));
+  if (String(label).trim() !== "") line.appendChild(el("span", "task-label", truncate(String(label), 60)));
+  if (t.session_id) {
+    const sid = el("span", "task-meta tsid", "会话 " + t.session_id);
+    sid.title = "session_id: " + t.session_id + "（seq " + (t.seq != null ? t.seq : "?") + "，用于与 session_entries 行重建回合）";
+    line.appendChild(sid);
+  }
+  row.appendChild(line);
+  return row;
+}
+
+/* 紧凑时长：123ms / 1.23s / 2m 3s / 1h 5m */
+function formatDurationMs(ms) {
+  if (ms < 1000) return ms + "ms";
+  const secs = Math.floor(ms / 1000);
+  if (secs < 60) return secs + "." + String(Math.floor((ms % 1000) / 10)).padStart(2, "0") + "s";
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return mins + "m " + (secs % 60) + "s";
+  return Math.floor(mins / 60) + "h " + (mins % 60) + "m";
 }
 
 /* 任务元数据签名（整列表/单行两级去重用）：决定任务列表/卡片是否需要重建。
@@ -138,14 +224,17 @@ function renderComposerTasks() {
   const wsId = state.workspace ? state.workspace.id : null;
   // 过滤到激活 workspace；无 _ws 的旧数据（switchWorkspace 清空等）视为当前
   const list = (state.tasks.list || []).filter((t) => !t._ws || t._ws === wsId);
+  const finished = (state.tasks.finished || []).filter((t) => !t._ws || t._ws === wsId);
   const n = list.length;
-  const sig = tasksRenderSig(list);
-  bar.hidden = n === 0;
+  const sig = tasksRenderSig(list) + "|f" + finishedListSig(finished);
+  // 有运行中任务或已完成记录时都显示折叠条（徽标只计运行中；已完成是次级
+  // 只读小节，来自持久化 session_entries，JSONL workspace 恒为空）。
+  bar.hidden = n === 0 && finished.length === 0;
   bar.classList.toggle("active", n > 0);
   // 任务清空时整个组件（折叠条+面板）完全消失：强制收起面板，避免
   // 出现「暂无运行中任务」的空态壳；同时清理所有卡片轮询/流，并清空
   // 面板内容（面板隐藏后不再走 renderTaskList 的重绘清理路径）
-  if (n === 0) {
+  if (n === 0 && finished.length === 0) {
     state.tasks.composerOpen = false;
     for (const k of [...state.tasks.pollers.keys()]) stopTaskPoller(k);
     for (const k of [...state.tasks.streams.keys()]) stopTaskStream(k);
@@ -154,7 +243,11 @@ function renderComposerTasks() {
   }
   bar.classList.toggle("open", state.tasks.composerOpen);
   const label = bar.querySelector(".tasks-toggle-label");
-  if (label) label.textContent = "运行中任务 (" + n + ")";
+  if (label) {
+    label.textContent = n > 0
+      ? "运行中任务 (" + n + ")" + (finished.length ? " · 已完成 " + finished.length : "")
+      : "已完成任务 (" + finished.length + ")";
+  }
   if (panel) {
     panel.hidden = !state.tasks.composerOpen;
     updateJumpBottomPosition();   // 面板显隐后移动「回到底部」按钮，避免盖住面板
@@ -167,11 +260,32 @@ function renderComposerTasks() {
         lastTasksSig = sig;
         lastTasksRenderedSig = sig;
         renderTaskList(list, panel);
+        renderFinishedSection(panel, finished);
       }
     } else {
       lastTasksSig = sig;   // 收起：只记录 data 签名，不更新已渲染签名
     }
   }
+}
+
+/* 已完成小节：挂在面板末尾的只读列表（.tasks-finished 容器，独立于
+   renderTaskList 的 keyed 运行中行）。重建时整体替换；空 → 移除容器。 */
+function renderFinishedSection(panel, finished) {
+  const old = panel.querySelector(".tasks-finished");
+  if (!finished.length) {
+    if (old) old.remove();
+    return;
+  }
+  const box = old || el("div", "tasks-finished");
+  box.innerHTML = "";
+  const header = el("div", "tasks-finished-header", "已完成 (" + finished.length + ")");
+  box.appendChild(header);
+  const shown = finished.slice(0, 20);   // 面板只读预览，完整列表走 session history
+  for (const t of shown) box.appendChild(buildFinishedRow(t));
+  if (finished.length > shown.length) {
+    box.appendChild(el("div", "tasks-finished-more", "… 还有 " + (finished.length - shown.length) + " 条（完整记录在会话历史 / session_entries）"));
+  }
+  if (!old) panel.appendChild(box);
 }
 
 /* delegate 行点击现在切到 subagent 会话（见 renderTaskList）；就地流式区

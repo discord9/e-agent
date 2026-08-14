@@ -174,6 +174,7 @@ async fn tasks_panel_selection_routes_bash_to_detail_and_delegate_to_attach() {
             None,
             None,
             None,
+            crate::tools::new_exit_slot(),
             |_| {},
             || async { std::future::pending::<String>().await },
         )
@@ -942,6 +943,18 @@ fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
             id: 7,
             output: "done".into(),
             label: None,
+
+            started_at_ms: None,
+
+            duration_ms: None,
+
+            exit_code: None,
+
+            signal: None,
+
+            status: None,
+
+            kind: None,
         },
     });
     assert!(state.attached.as_ref().unwrap().finished);
@@ -982,6 +995,18 @@ fn attached_view_clears_spinner_on_background_completed_from_bridge() {
             id: 7,
             output: "done".into(),
             label: None,
+
+            started_at_ms: None,
+
+            duration_ms: None,
+
+            exit_code: None,
+
+            signal: None,
+
+            status: None,
+
+            kind: None,
         },
     });
     let attached = state.attached.as_ref().unwrap();
@@ -999,6 +1024,12 @@ fn attach_after_completion_marks_finished_from_the_snapshot() {
         id: 3,
         output: "done".into(),
         label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     });
     let mut state = TuiState::default();
     attach_test(&mut state, 3, "demo task", handle);
@@ -1021,6 +1052,79 @@ fn background_completion_notice_renders_as_dim_line() {
     // A regular user prompt still renders as user input.
     state.push_agent_event(AgentEvent::UserPrompt("hello".into()));
     assert_eq!(state.lines.last().unwrap().text, "you> hello");
+}
+
+#[test]
+fn background_completion_notice_populates_finished_task_section() {
+    // The structured notice (emitted only after the durable entry is
+    // committed) is the projection source of the F2 finished section:
+    // newest first, capped, trace metadata carried through.
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::BackgroundCompletionNotice {
+        id: 1,
+        output: "exit code: 0\nstdout:\nok\n".into(),
+        label: Some("build".into()),
+        started_at_ms: Some(1_700_000_000_000),
+        duration_ms: Some(500),
+        exit_code: Some(0),
+        signal: None,
+        status: Some("completed".into()),
+        kind: Some("bash".into()),
+    });
+    assert_eq!(state.finished_tasks.len(), 1);
+    assert_eq!(state.finished_tasks[0].id, 1);
+    assert_eq!(state.finished_tasks[0].label.as_deref(), Some("build"));
+    assert_eq!(state.finished_tasks[0].kind.as_deref(), Some("bash"));
+    assert_eq!(state.finished_tasks[0].status.as_deref(), Some("completed"));
+    assert_eq!(state.finished_tasks[0].exit_code, Some(0));
+    assert_eq!(state.finished_tasks[0].duration_ms, Some(500));
+
+    // A second notice lands newest-first.
+    state.push_agent_event(AgentEvent::BackgroundCompletionNotice {
+        id: 2,
+        output: "subagent session: sub-1\nanswer".into(),
+        label: None,
+        started_at_ms: Some(1_700_000_000_100),
+        duration_ms: Some(900),
+        exit_code: None,
+        signal: None,
+        status: Some("failed".into()),
+        kind: Some("delegate".into()),
+    });
+    assert_eq!(state.finished_tasks.len(), 2);
+    assert_eq!(state.finished_tasks[0].id, 2, "newest first");
+    assert_eq!(state.finished_tasks[0].kind.as_deref(), Some("delegate"));
+    assert_eq!(state.finished_tasks[1].id, 1);
+}
+
+#[test]
+fn finished_task_row_format_renders_metadata() {
+    use crate::tui::render::format_finished_task;
+    let task = FinishedTask {
+        id: 7,
+        label: Some("build project".into()),
+        kind: Some("bash".into()),
+        status: Some("failed".into()),
+        exit_code: Some(3),
+        signal: None,
+        duration_ms: Some(1234),
+    };
+    let text = format_finished_task(&task, 60);
+    assert!(text.starts_with("#7 bash failed exit 3 1.23s"), "{text}");
+    assert!(text.ends_with("build project"), "{text}");
+
+    // Signal death: no exit code, signal marker + duration + label.
+    let killed = FinishedTask {
+        id: 8,
+        label: None,
+        kind: Some("bash".into()),
+        status: Some("killed".into()),
+        exit_code: None,
+        signal: Some("SIGTERM".into()),
+        duration_ms: Some(42),
+    };
+    let text = format_finished_task(&killed, 60);
+    assert_eq!(text, "#8 bash killed signal 42ms", "{text}");
 }
 
 #[test]
@@ -1049,6 +1153,18 @@ fn attached_enter_steers_and_ctrl_c_cancels_through_the_handle() {
             id: 7,
             output: "done".into(),
             label: None,
+
+            started_at_ms: None,
+
+            duration_ms: None,
+
+            exit_code: None,
+
+            signal: None,
+
+            status: None,
+
+            kind: None,
         },
     });
     state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
@@ -1069,6 +1185,18 @@ fn attached_enter_on_finished_keeps_input_and_sends_nothing() {
             id: 9,
             output: "done".into(),
             label: None,
+
+            started_at_ms: None,
+
+            duration_ms: None,
+
+            exit_code: None,
+
+            signal: None,
+
+            status: None,
+
+            kind: None,
         },
     });
     {
@@ -1112,6 +1240,18 @@ fn finish_with_queued_prompts_notes_them_as_unanswered() {
             id: 11,
             output: "done".into(),
             label: None,
+
+            started_at_ms: None,
+
+            duration_ms: None,
+
+            exit_code: None,
+
+            signal: None,
+
+            status: None,
+
+            kind: None,
         },
     });
     let attached = state.attached.as_ref().unwrap();
@@ -1719,6 +1859,7 @@ async fn narrow_layout_goal_with_tasks_and_typed_input() {
             None,
             None,
             None,
+            crate::tools::new_exit_slot(),
             |_| {},
             || async { std::future::pending::<String>().await },
         )
@@ -1858,6 +1999,7 @@ fn attached_view_paints_input_corners_like_the_main_view() {
         session: crate::agent::Usage {
             input_tokens: 1_500,
             output_tokens: 0,
+            ..Default::default()
         },
     });
     let mut state = TuiState::default();
@@ -1927,6 +2069,12 @@ fn attached_title_shows_finished_before_subagent_label() {
         id: 3,
         output: "done".into(),
         label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     });
     let mut state = TuiState::default();
     let snapshot = _handle.snapshot();
@@ -2079,6 +2227,7 @@ async fn tasks_panel_tags_rows_with_the_agent_role() {
             Some("explorer".into()),
             None,
             None, // display_meta
+            crate::tools::new_exit_slot(),
             |_| {},
             || async { "done".into() },
         )
@@ -2089,6 +2238,7 @@ async fn tasks_panel_tags_rows_with_the_agent_role() {
             None,
             None,
             None, // display_meta
+            crate::tools::new_exit_slot(),
             |_| {},
             || async { "done".into() },
         )
@@ -2141,6 +2291,7 @@ async fn tasks_panel_selection_highlight_shows_on_non_attachable_task() {
                 None,
                 None,
                 None,
+                crate::tools::new_exit_slot(),
                 |_| {},
                 || async { std::future::pending::<String>().await },
             )
@@ -2204,6 +2355,7 @@ async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
             None,
             None,
             None,
+            crate::tools::new_exit_slot(),
             |_| {},
             || async { std::future::pending::<String>().await },
         )
@@ -2253,6 +2405,7 @@ async fn cancel_selected_task_cancels_any_task_and_clamps_cursor() {
                 None,
                 None,
                 None,
+                crate::tools::new_exit_slot(),
                 |_| {},
                 || async { std::future::pending::<String>().await },
             )
@@ -2598,6 +2751,12 @@ fn background_completion_ends_stream_lane_so_next_delta_starts_fresh_line() {
         id: 7,
         output: "built ok".into(),
         label: Some("build".into()),
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     });
     state.push_agent_event(AgentEvent::AssistantDelta("\nlet y = 2;\n```".into()));
 
@@ -3764,6 +3923,12 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
         id: 7,
         output: "line1\nline2".into(),
         label: Some("demo".into()),
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     });
     assert_eq!(out.len(), 3);
     assert_eq!(out[0].text, "[background task 7 completed: demo]");

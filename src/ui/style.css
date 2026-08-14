@@ -1342,6 +1342,33 @@
     background: var(--base2);
   }
 
+  /* 已完成小节（只读，来自持久化 session_entries）：分隔线 + 弱化样式，
+     与运行中 .task-row 区分；行内复用 .task-line/.kind-badge/.task-meta。 */
+  #composerTasks .tasks-finished {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border-top: 1px dashed var(--base1);
+    padding-top: 8px;
+    margin-top: 4px;
+  }
+  #composerTasks .tasks-finished-header {
+    font-size: 12px;
+    font-weight: bold;
+    color: var(--base01);
+  }
+  #composerTasks .tasks-finished .task-row {
+    border-color: var(--base1);
+    opacity: 0.75;
+  }
+  #composerTasks .tasks-finished .task-row:hover { opacity: 1; }
+  #composerTasks .tasks-finished-more {
+    font-size: 12px;
+    color: var(--base01);
+    padding-left: 8px;
+  }
+  #composerTasks .task-meta.tfin { color: var(--base01); }
+
   /* ---------- 汉堡按钮 ---------- */
   #sidebarBtn {
     flex: 0 0 auto;

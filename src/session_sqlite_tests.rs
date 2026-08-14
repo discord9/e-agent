@@ -87,12 +87,24 @@ fn test_entries() -> Vec<SessionEntry> {
             id: 2,
             output: "exit code: 0\nstdout:\nbuilt successfully\nstderr:\n".into(),
             label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         },
         // Entry with a label to verify serde roundtrip with label.
         SessionEntry::BackgroundCompletion {
             id: 3,
             output: "some output".into(),
             label: Some("build project".into()),
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         },
         Message::User {
             content: "你好世界👋\n多行".into(),
@@ -2070,19 +2082,59 @@ async fn usage_entries_append_and_summarize() {
 
     // 同一 (session, model, kind) 多行聚合；不同 model/kind 维度分行。
     session
-        .append_usage(&wid, &sid, "model-a", "regular", 100, 50)
+        .append_usage(
+            &wid,
+            &sid,
+            "model-a",
+            "regular",
+            &crate::agent::Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     session
-        .append_usage(&wid, &sid, "model-a", "regular", 200, 30)
+        .append_usage(
+            &wid,
+            &sid,
+            "model-a",
+            "regular",
+            &crate::agent::Usage {
+                input_tokens: 200,
+                output_tokens: 30,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     session
-        .append_usage(&wid, &sid, "model-a", "compact", 1000, 200)
+        .append_usage(
+            &wid,
+            &sid,
+            "model-a",
+            "compact",
+            &crate::agent::Usage {
+                input_tokens: 1000,
+                output_tokens: 200,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     session
-        .append_usage(&wid, &sid, "model-b", "regular", 10, 5)
+        .append_usage(
+            &wid,
+            &sid,
+            "model-b",
+            "regular",
+            &crate::agent::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -2115,14 +2167,34 @@ async fn usage_entries_are_scoped_by_workspace() {
     let (_dir, session, sid) = fresh_session().await;
     // 写入别的 workspace_id：本 workspace 的汇总查不到。
     session
-        .append_usage("other-workspace", &sid, "m", "regular", 1, 1)
+        .append_usage(
+            "other-workspace",
+            &sid,
+            "m",
+            "regular",
+            &crate::agent::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert!(session.usage_summary().await.unwrap().is_empty());
     // 同 workspace 的其他 session：汇总可见（usage_summary 按 workspace
     // 聚合，每行携带各自的 session_id）。
     session
-        .append_usage(&workspace_id(), "other-session", "m", "regular", 2, 2)
+        .append_usage(
+            &workspace_id(),
+            "other-session",
+            "m",
+            "regular",
+            &crate::agent::Usage {
+                input_tokens: 2,
+                output_tokens: 2,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     let rows = session.usage_summary().await.unwrap();
@@ -2143,19 +2215,59 @@ async fn usage_for_sessions_filters_and_aggregates() {
 
     // 本会话两行（同 model/kind 聚合）+ 子会话一行 + 无关会话一行。
     session
-        .append_usage(&wid, &sid, "m", "regular", 100, 50)
+        .append_usage(
+            &wid,
+            &sid,
+            "m",
+            "regular",
+            &crate::agent::Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     session
-        .append_usage(&wid, &sid, "m", "regular", 20, 5)
+        .append_usage(
+            &wid,
+            &sid,
+            "m",
+            "regular",
+            &crate::agent::Usage {
+                input_tokens: 20,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     session
-        .append_usage(&wid, &child, "m", "regular", 7, 3)
+        .append_usage(
+            &wid,
+            &child,
+            "m",
+            "regular",
+            &crate::agent::Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     session
-        .append_usage(&wid, &other, "m", "regular", 999, 999)
+        .append_usage(
+            &wid,
+            &other,
+            "m",
+            "regular",
+            &crate::agent::Usage {
+                input_tokens: 999,
+                output_tokens: 999,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -2208,7 +2320,17 @@ async fn usage_entries_persist_across_reconnect() {
             .await
             .expect("connect");
         session
-            .append_usage(&wid, &sid, "m", "regular", 7, 3)
+            .append_usage(
+                &wid,
+                &sid,
+                "m",
+                "regular",
+                &crate::agent::Usage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
     }
@@ -2241,7 +2363,17 @@ async fn store_facade_usage_append_summary_and_jsonl_noop() {
     .await
     .expect("connect sqlite store");
     store
-        .append_usage(root, &sid, "m", "regular", 5, 6)
+        .append_usage(
+            root,
+            &sid,
+            "m",
+            "regular",
+            &crate::agent::Usage {
+                input_tokens: 5,
+                output_tokens: 6,
+                ..Default::default()
+            },
+        )
         .await
         .expect("append usage via facade");
     let rows = store
@@ -2256,7 +2388,17 @@ async fn store_facade_usage_append_summary_and_jsonl_noop() {
     // JSONL facade：静默跳过（不报错、无记录）。
     let jsonl = SessionStore::Jsonl;
     jsonl
-        .append_usage(root, &sid, "m", "regular", 1, 1)
+        .append_usage(
+            root,
+            &sid,
+            "m",
+            "regular",
+            &crate::agent::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        )
         .await
         .expect("jsonl append_usage is a silent no-op");
     assert!(
@@ -2266,6 +2408,218 @@ async fn store_facade_usage_append_summary_and_jsonl_noop() {
             .expect("jsonl summary")
             .is_empty()
     );
+}
+
+/// 老库迁移：一个在 cache/reasoning/finish_reason 特性之前创建的
+/// usage_entries 表（没有这四个列）在 connect 时自动 ALTER 补列；老行读回
+/// NULL，新行（带富化字段）写入正常，迁移幂等（再 connect 不重复 ALTER）。
+/// 镜像 sessions.title/pinned/archived/writer 的既有迁移测试。
+#[tokio::test]
+async fn connect_migrates_legacy_usage_entries_table_missing_enrichment_columns() {
+    let (_dir, path) = temp_db();
+    let wid = workspace_id();
+    let p = path.to_str().unwrap();
+
+    // 手工建一个「旧版」usage_entries 表：只有基础列，没有
+    // cache_hit_tokens/cache_miss_tokens/reasoning_tokens/finish_reason，
+    // 并写入一条旧行（seq/event_time_us 用微秒时间戳）。
+    let legacy_ddl = r#"
+        CREATE TABLE usage_entries (
+            workspace_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            event_time_us INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            PRIMARY KEY (workspace_id, session_id, seq)
+        )
+    "#;
+    {
+        let db = turso::Builder::new_local(p)
+            .build()
+            .await
+            .expect("open legacy db");
+        let conn = db.connect().expect("connect legacy db");
+        conn.execute(legacy_ddl, ())
+            .await
+            .expect("create legacy usage_entries table");
+        conn.execute(
+            "INSERT INTO usage_entries \
+             (workspace_id, session_id, seq, event_time_us, model, kind, input_tokens, output_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (
+                wid.as_str(),
+                "legacy-usage",
+                1_700_000_000_000_000i64,
+                1_700_000_000_000_000i64,
+                "m",
+                "regular",
+                10i64,
+                20i64,
+            ),
+        )
+        .await
+        .expect("insert legacy usage row");
+    }
+
+    // connect 应自动探测 + ALTER：老行的新列读回 NULL，写入路径落新列，
+    // 聚合读（usage_summary）不受影响。
+    let session = SqliteSession::connect(p, &wid, "legacy-usage")
+        .await
+        .expect("connect migrates the legacy table");
+    let conn = session.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT cache_hit_tokens, cache_miss_tokens, reasoning_tokens, finish_reason \
+             FROM usage_entries WHERE session_id = ?1",
+            ("legacy-usage",),
+        )
+        .await
+        .expect("query migrated usage row");
+    let row = rows.next().await.expect("legacy row").expect("row");
+    for index in 0..4 {
+        assert!(
+            row.get_value(index).unwrap().is_null(),
+            "legacy usage row column {index} must read back NULL after migration"
+        );
+    }
+    drop(conn);
+
+    // 新行带富化字段：写入并直读。
+    let enriched = crate::agent::Usage {
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_hit_tokens: Some(30),
+        cache_miss_tokens: Some(70),
+        reasoning_tokens: Some(20),
+        finish_reason: Some("stop".into()),
+    };
+    session
+        .append_usage(&wid, "legacy-usage", "m", "regular", &enriched)
+        .await
+        .expect("append enriched usage");
+    let rows = session.usage_summary().await.expect("usage summary");
+    assert_eq!(
+        rows.len(),
+        1,
+        "legacy row + enriched row share (session, model, kind) → one aggregate"
+    );
+    assert_eq!(rows[0].input_tokens, 110, "10 (legacy) + 100 (enriched)");
+    assert_eq!(rows[0].output_tokens, 70, "20 (legacy) + 50 (enriched)");
+    let conn = session.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT cache_hit_tokens, cache_miss_tokens, reasoning_tokens, finish_reason \
+             FROM usage_entries WHERE session_id = ?1 ORDER BY seq DESC",
+            ("legacy-usage",),
+        )
+        .await
+        .expect("query enriched usage row");
+    let row = rows.next().await.expect("enriched row").expect("row");
+    assert_eq!(row.get_value(0).unwrap().as_integer(), Some(&30i64));
+    assert_eq!(row.get_value(1).unwrap().as_integer(), Some(&70i64));
+    assert_eq!(row.get_value(2).unwrap().as_integer(), Some(&20i64));
+    assert_eq!(
+        row.get_value(3).unwrap().as_text().map(String::as_str),
+        Some("stop")
+    );
+    drop(conn);
+
+    // 迁移幂等：再 connect 一次，探测发现列已存在、不重复 ALTER。
+    drop(session);
+    let session2 = SqliteSession::connect(p, &wid, "legacy-usage")
+        .await
+        .expect("reconnect on migrated db");
+    let rows = session2.usage_summary().await.expect("usage summary");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].input_tokens, 110);
+}
+
+/// finished_tasks：从 session_entries 读 background_completion 行，
+/// newest-first、携带 trace 元数据与 seq（回合重建），LIMIT 生效。
+#[tokio::test]
+async fn finished_tasks_reads_background_completion_entries_newest_first() {
+    let (_dir, session, sid) = fresh_session().await;
+    use crate::agent::SessionEntry;
+
+    // 三条完成记录：id 1（无 trace，模拟旧行）、id 2（bash failed）、
+    // id 3（delegate completed）。
+    let entries = vec![
+        SessionEntry::BackgroundCompletion {
+            id: 1,
+            output: "old".into(),
+            label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
+        },
+        SessionEntry::BackgroundCompletion {
+            id: 2,
+            output: "exit code: 3\nstdout:\n\nstderr:\n".into(),
+            label: Some("build".into()),
+            started_at_ms: Some(1_700_000_000_000),
+            duration_ms: Some(500),
+            exit_code: Some(3),
+            signal: None,
+            status: Some("failed".into()),
+            kind: Some("bash".into()),
+        },
+        SessionEntry::BackgroundCompletion {
+            id: 3,
+            output: "subagent session: sub-1\nanswer".into(),
+            label: Some("fix lints".into()),
+            started_at_ms: Some(1_700_000_000_100),
+            duration_ms: Some(900),
+            exit_code: None,
+            signal: None,
+            status: Some("completed".into()),
+            kind: Some("delegate".into()),
+        },
+    ];
+    session
+        .append_located(&entries)
+        .await
+        .expect("append completion entries");
+
+    let finished = session
+        .finished_tasks(&workspace_id(), 100)
+        .await
+        .expect("finished tasks query");
+    assert_eq!(finished.len(), 3);
+    // newest-first: the append order is the event_time order, so the
+    // last-appended row (id 3) comes first.
+    assert_eq!(finished[0].id, 3, "newest first");
+    assert_eq!(finished[2].id, 1, "oldest last");
+    let task2 = &finished[1];
+    assert_eq!(task2.session_id, sid);
+    assert_eq!(task2.label.as_deref(), Some("build"));
+    assert_eq!(task2.exit_code, Some(3));
+    assert_eq!(task2.status.as_deref(), Some("failed"));
+    assert_eq!(task2.kind.as_deref(), Some("bash"));
+    assert_eq!(task2.started_at_ms, Some(1_700_000_000_000));
+    assert_eq!(task2.duration_ms, Some(500));
+    assert_eq!(task2.signal, None);
+    assert!(
+        task2.finished_at_us >= 1_700_000_000_000_000,
+        "finished_at is the row's event_time_us (µs clock), got {}",
+        task2.finished_at_us
+    );
+    // 老行：trace 字段全 None。
+    assert_eq!(finished[2].exit_code, None);
+    assert_eq!(finished[2].status, None);
+    // LIMIT 生效。
+    let limited = session
+        .finished_tasks(&workspace_id(), 2)
+        .await
+        .expect("limit query");
+    assert_eq!(limited.len(), 2);
+    assert_eq!(limited[0].id, 3);
+    assert_eq!(limited[1].id, 2);
 }
 
 // ----------------------------------------------------------------------

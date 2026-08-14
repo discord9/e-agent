@@ -59,7 +59,7 @@ use crate::agent::{AgentEvent, Message, Model, SessionEntry, preview};
 use crate::delegate::Sessions;
 use crate::runner::{IdlePolicy, SessionHandle, SessionStatus, SessionTask};
 use crate::session_factory::{SessionBuild, SessionFactory, UnfinishedPolicy};
-use crate::session_store::SessionStore;
+use crate::session_store::{FinishedTask, SessionStore};
 use crate::tools::{BackgroundTaskInfo, BackgroundTasks};
 
 /// Heartbeat interval for SSE connections (comment line `: ping`).
@@ -533,6 +533,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/archive", put(session_archive))
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/tasks", get(list_tasks))
+        .route("/api/tasks/finished", get(finished_tasks))
         .route("/api/sessions/{id}/tasks/{task_id}", delete(cancel_task))
         .route(
             "/api/sessions/{id}/tasks/{task_id}/output",
@@ -1980,6 +1981,34 @@ async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<TaskMeta>> {
     tasks.sort_by(|a, b| (&a.session_id, a.id).cmp(&(&b.session_id, b.id)));
     Json(tasks)
 }
+
+/// `GET /api/tasks/finished` — the most recent finished background tasks
+/// across all sessions, newest first, read from the durable
+/// `session_entries` rows (`entry_kind='background_completion'`) — the
+/// ONLY authoritative record, exactly like the live `/api/tasks` snapshot
+/// stays registry-backed. Each entry carries its trace metadata
+/// (label/kind/status/exit_code/signal/duration/started_at) plus its
+/// session id and seq (the seq relates it to the session's other entries
+/// for turn reconstruction; `finished_at` is the row's event_time).
+/// Sorted newest-first with a sane limit (100). JSONL workspaces return an
+/// empty list (no `session_entries` table — same limitation as
+/// `usage_summary`).
+const FINISHED_TASKS_LIMIT: usize = 100;
+
+async fn finished_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<FinishedTask>> {
+    let root = state.factory.root();
+    match state
+        .meta_store
+        .finished_tasks(root, FINISHED_TASKS_LIMIT)
+        .await
+    {
+        Ok(tasks) => Json(tasks),
+        Err(error) => {
+            eprintln!("e-agent: cannot query finished background tasks: {error:#}");
+            Json(Vec::new())
+        }
+    }
+}
 /// `DELETE /api/sessions/{id}/tasks/{task_id}` — cancel one running
 /// background task. 204 when cancelled; 404 for an unknown session or an
 /// unknown task id in that session.
@@ -2499,14 +2528,7 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
         let model_name = state.factory.summarizer_model().display_name().to_owned();
         if let Err(error) = state
             .meta_store
-            .append_usage(
-                state.factory.root(),
-                id,
-                &model_name,
-                "summarizer",
-                usage.input_tokens,
-                usage.output_tokens,
-            )
+            .append_usage(state.factory.root(), id, &model_name, "summarizer", &usage)
             .await
         {
             eprintln!("e-agent: cannot record summarizer usage: {error:#}");
@@ -2937,10 +2959,38 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
         AgentEvent::ToolResult { is_error, content } => {
             json!({ "is_error": is_error, "content": content })
         }
-        AgentEvent::BackgroundCompleted { id, output, label }
-        | AgentEvent::BackgroundCompletionNotice { id, output, label } => {
-            json!({ "id": id, "output": output, "label": label })
+        AgentEvent::BackgroundCompleted {
+            id,
+            output,
+            label,
+            started_at_ms,
+            duration_ms,
+            exit_code,
+            signal,
+            status,
+            kind,
         }
+        | AgentEvent::BackgroundCompletionNotice {
+            id,
+            output,
+            label,
+            started_at_ms,
+            duration_ms,
+            exit_code,
+            signal,
+            status,
+            kind,
+        } => json!({
+            "id": id,
+            "output": output,
+            "label": label,
+            "started_at_ms": started_at_ms,
+            "duration_ms": duration_ms,
+            "exit_code": exit_code,
+            "signal": signal,
+            "status": status,
+            "kind": kind,
+        }),
         AgentEvent::GoalUpdated { goal } => json!({ "goal": goal }),
         AgentEvent::Usage {
             context_input,
@@ -3471,7 +3521,13 @@ mod tests {
             name(&AgentEvent::BackgroundCompleted {
                 id: 1,
                 output: "o".into(),
-                label: None
+                label: None,
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
             }),
             "BackgroundCompleted"
         );
@@ -3480,6 +3536,12 @@ mod tests {
                 id: 1,
                 output: "o".into(),
                 label: None,
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
             }),
             "BackgroundCompletionNotice"
         );
@@ -3489,7 +3551,8 @@ mod tests {
                 context_window: None,
                 session: crate::agent::Usage {
                     input_tokens: 1,
-                    output_tokens: 2
+                    output_tokens: 2,
+                    ..Default::default()
                 },
             }),
             "Usage"
@@ -3546,16 +3609,32 @@ mod tests {
                 id: 7,
                 output: "ok".into(),
                 label: Some("cargo".into()),
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
             }),
-            json!({"id": 7, "output": "ok", "label": "cargo"})
+            json!({"id": 7, "output": "ok", "label": "cargo",
+                   "started_at_ms": null, "duration_ms": null, "exit_code": null,
+                   "signal": null, "status": null, "kind": null})
         );
         assert_eq!(
             event_payload(&AgentEvent::BackgroundCompletionNotice {
                 id: 7,
                 output: "ok".into(),
                 label: None,
+                started_at_ms: Some(1_700_000_000_000),
+                duration_ms: Some(42),
+                exit_code: Some(0),
+                signal: None,
+                status: Some("completed".into()),
+                kind: Some("bash".into()),
             }),
-            json!({"id": 7, "output": "ok", "label": null})
+            json!({"id": 7, "output": "ok", "label": null,
+                   "started_at_ms": 1_700_000_000_000u64, "duration_ms": 42, "exit_code": 0,
+                   "signal": null, "status": "completed", "kind": "bash"})
         );
         assert_eq!(
             event_payload(&AgentEvent::Usage {
@@ -3563,7 +3642,8 @@ mod tests {
                 context_window: Some(4096),
                 session: crate::agent::Usage {
                     input_tokens: 100,
-                    output_tokens: 50
+                    output_tokens: 50,
+                    ..Default::default()
                 },
             }),
             json!({"context_input": 1234, "context_window": 4096, "session": {"input_tokens": 100, "output_tokens": 50}})
@@ -3594,6 +3674,12 @@ mod tests {
                 id: 1,
                 output: "done".into(),
                 label: None,
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
             },
             AgentEvent::Usage {
                 context_input: 1,
@@ -3601,6 +3687,7 @@ mod tests {
                 session: crate::agent::Usage {
                     input_tokens: 1,
                     output_tokens: 0,
+                    ..Default::default()
                 },
             },
         ];
@@ -5709,6 +5796,7 @@ model = "deepseek-chat"
                 None,
                 None,
                 None,
+                crate::tools::new_exit_slot(),
                 move |id| {
                     *hook_slot.lock().unwrap() = Some(id);
                     hook_sessions.insert(id, hook_entry);
@@ -6892,6 +6980,7 @@ model = "deepseek-chat"
                 output: vec![b'a'; 5000],
                 display_meta: None,
                 owner_session: None,
+                started_at_ms: None,
             },
         );
         assert_eq!(long.session_id, "web-x");
@@ -6923,6 +7012,7 @@ model = "deepseek-chat"
                 output: vec![0xff, 0xfe],
                 display_meta: None,
                 owner_session: None,
+                started_at_ms: None,
             },
         );
         assert_eq!(lossy.output, "\u{FFFD}\u{FFFD}");
@@ -6944,6 +7034,7 @@ model = "deepseek-chat"
                     resume: Some("sub-resume-1".into()),
                 }),
                 owner_session: None,
+                started_at_ms: None,
             },
         );
         assert_eq!(delegate.kind, "delegate");
@@ -6964,6 +7055,7 @@ model = "deepseek-chat"
                 output: Vec::new(),
                 display_meta: None,
                 owner_session: Some("sub-xyz".into()),
+                started_at_ms: None,
             },
         );
         assert_eq!(
@@ -7004,6 +7096,56 @@ model = "deepseek-chat"
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
             serde_json::json!([])
         );
+    }
+
+    /// `GET /api/tasks/finished` — with the JSONL meta store (test
+    /// default) there is no `session_entries` table, so the endpoint
+    /// returns an empty list instead of erroring. On Greptime/SQLite it
+    /// reads the durable `background_completion` rows newest-first (the
+    /// store-level query is covered by
+    /// `finished_tasks_reads_background_completion_entries_newest_first`).
+    #[tokio::test]
+    async fn finished_tasks_endpoint_returns_list_with_jsonl_meta_store() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let state = test_app_state("sekrit");
+        let (id, session) = live_session("web-idle");
+        state.registry.insert(id, session);
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks/finished")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!([])
+        );
+
+        // The live /api/tasks endpoint is unchanged (still registry-backed).
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// `DELETE /api/sessions/{id}/tasks/{task_id}` returns 404 for an
@@ -7157,6 +7299,7 @@ model = "deepseek-chat"
                 None,
                 None,
                 None,
+                crate::tools::new_exit_slot(),
                 |_| {},
                 || async {
                     tokio::time::sleep(Duration::from_secs(30)).await;
@@ -7364,6 +7507,7 @@ model = "deepseek-chat"
                     subagent_session_id: None,
                     resume: None,
                 }),
+                crate::tools::new_exit_slot(),
                 |_| {},
                 || async {
                     tokio::time::sleep(Duration::from_secs(30)).await;

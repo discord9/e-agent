@@ -972,6 +972,7 @@ async fn regular_turn_persists_usage_row() {
                 Some(Usage {
                     input_tokens: 111,
                     output_tokens: 22,
+                    ..Default::default()
                 }),
             )]),
             calls: Arc::new(Mutex::new(Vec::new())),
@@ -1659,6 +1660,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
                     Some(Usage {
                         input_tokens: 800,
                         output_tokens: 10,
+                        ..Default::default()
                     }),
                 ),
                 (
@@ -1670,6 +1672,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
                     Some(Usage {
                         input_tokens: 900,
                         output_tokens: 20,
+                        ..Default::default()
                     }),
                 ),
                 (
@@ -1681,6 +1684,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
                     Some(Usage {
                         input_tokens: 100,
                         output_tokens: 5,
+                        ..Default::default()
                     }),
                 ),
             ]
@@ -3019,6 +3023,12 @@ async fn unfinished_background_bash_blocks_finish_when_idle_until_completion() {
             id: 9,
             output: "build ok".into(),
             label: Some("cargo build".into()),
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         })
         .unwrap();
     loop {
@@ -3180,6 +3190,12 @@ async fn content_and_tool_calls_in_same_round_still_block_and_complete() {
             id: 9,
             output: "build ok".into(),
             label: Some("cargo build".into()),
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         })
         .unwrap();
     loop {
@@ -3282,6 +3298,12 @@ async fn completion_arriving_during_last_model_round_is_committed_before_finaliz
             id: 9,
             output: "build ok".into(),
             label: Some("cargo build".into()),
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         })
         .unwrap();
     release.notify_one();
@@ -3358,6 +3380,12 @@ impl Tool for SelfCompletingBash {
                 id: self.id,
                 output: "build ok".into(),
                 label: Some("cargo build".into()),
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
             })
             .unwrap();
         Ok(ToolOutput::text(format!(
@@ -3648,6 +3676,12 @@ async fn finish_when_idle_without_finalize_wait_keeps_waiting() {
             id: 9,
             output: "build ok".into(),
             label: Some("cargo build".into()),
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         })
         .unwrap();
     loop {
@@ -4784,6 +4818,12 @@ async fn steer_cancel_then_prompt_at_idle_with_blocking_background_runs_queued_t
             id: 9,
             output: "build ok".into(),
             label: Some("cargo build".into()),
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         })
         .unwrap();
     loop {

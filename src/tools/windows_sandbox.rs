@@ -1520,6 +1520,7 @@ pub(super) async fn run(
     output_slot: Option<OutputSlot>,
     spool: Option<Arc<TaskSpool>>,
     policy: &Sandbox,
+    exit_slot: Option<super::background::ExitSlot>,
 ) -> Result<String, String> {
     if protect_git {
         return Err(
@@ -1566,6 +1567,13 @@ pub(super) async fn run(
                 if let Some(slot) = &process_group_slot {
                     slot.store(0, Ordering::Release);
                 }
+                if let Some(slot) = &exit_slot {
+                    *slot.lock().unwrap() = super::background::TaskExit {
+                        exit_code: None,
+                        signal: Some("SIGKILL".into()),
+                        status: Some("killed".into()),
+                    };
+                }
                 return Err(format!(
                     "exit code: signal\nstdout:\n\nstderr:\n\n[command timed out after {} seconds]",
                     duration.as_secs_f64()
@@ -1578,6 +1586,13 @@ pub(super) async fn run(
     guard.disarm();
     if let Some(slot) = &process_group_slot {
         slot.store(0, Ordering::Release);
+    }
+    if let Some(slot) = &exit_slot {
+        *slot.lock().unwrap() = super::background::TaskExit {
+            exit_code: Some(code),
+            signal: None,
+            status: Some(if code == 0 { "completed" } else { "failed" }.into()),
+        };
     }
     let text = format_output(Some(code), &stdout, &stderr);
     if code == 0 {

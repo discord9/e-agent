@@ -16,6 +16,7 @@ fn make_task(
         output: vec![],
         display_meta,
         owner_session: None,
+        started_at_ms: None,
     }
 }
 
@@ -92,6 +93,7 @@ fn task_label_bash_no_tags() {
         output: vec![],
         display_meta: None,
         owner_session: None,
+        started_at_ms: None,
     };
     assert_eq!(format_task_label(&task, "", 40), "  #10: echo hi");
 }

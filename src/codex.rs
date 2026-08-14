@@ -334,7 +334,7 @@ async fn consume_stream(
             }
             "response.completed" => {
                 let response = value.get("response").unwrap_or(&value);
-                usage = response.get("usage").map(response_usage).transpose()?;
+                usage = response_usage(response)?;
                 completed = true;
             }
             "response.failed" | "response.incomplete" | "error" | "response.error" => {
@@ -356,17 +356,44 @@ async fn consume_stream(
     ))
 }
 
-fn response_usage(value: &Value) -> anyhow::Result<Usage> {
-    Ok(Usage {
-        input_tokens: value
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("ChatGPT Responses completed without input token usage"))?,
-        output_tokens: value
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("ChatGPT Responses completed without output token usage"))?,
-    })
+/// Read the token usage of a `response.completed` payload into the
+/// canonical [`Usage`]. OpenAI-compatible optional fields are parsed
+/// best-effort: `input_tokens_details.cached_tokens` (cache hits),
+/// `output_tokens_details.reasoning_tokens` (reasoning COUNT only — never
+/// reasoning text) and the response-level `finish_reason`, if present;
+/// absent fields stay `None`.
+fn response_usage(response: &Value) -> anyhow::Result<Option<Usage>> {
+    let Some(value) = response.get("usage") else {
+        return Ok(None);
+    };
+    let input_tokens = value
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("ChatGPT Responses completed without input token usage"))?;
+    let output_tokens = value
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("ChatGPT Responses completed without output token usage"))?;
+    let cached = value
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64);
+    Ok(Some(Usage {
+        input_tokens,
+        output_tokens,
+        cache_hit_tokens: cached,
+        // Best-effort cache-miss estimate: total input minus cached tokens
+        // (only when the provider reported a cached count).
+        cache_miss_tokens: cached.map(|cached| input_tokens.saturating_sub(cached)),
+        reasoning_tokens: value
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64),
+        finish_reason: response
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }))
 }
 
 fn provider_error(value: &Value) -> String {

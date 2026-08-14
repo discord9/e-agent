@@ -988,6 +988,7 @@ async fn failed_truncated_bash_writes_full_output_log() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -1027,6 +1028,7 @@ async fn successful_long_bash_output_does_not_write_a_log() {
         "printf 'y%.0s' {1..100000}",
         None,
         false,
+        None,
         None,
         None,
         None,
@@ -2292,6 +2294,92 @@ async fn completed_background_tasks_leave_the_running_registry() {
     );
 }
 
+/// Background bash trace metadata: exit 0 / exit 3 / signal-killed record
+/// the structured exit_code/signal/status on the completion event, with a
+/// positive duration and a present started_at. The model-visible output
+/// text ("exit code: N" / "exit code: signal") is unchanged — the
+/// structured fields ride along as metadata.
+#[tokio::test]
+async fn background_bash_completion_carries_exit_trace() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(30));
+
+    // exit 0 → status "completed", exit_code 0, no signal.
+    bash.execute(json!({"command": "true", "background": true}))
+        .await
+        .unwrap();
+    match receiver.recv().await.unwrap() {
+        AgentEvent::BackgroundCompleted {
+            output,
+            exit_code,
+            signal,
+            status,
+            kind,
+            started_at_ms,
+            duration_ms,
+            ..
+        } => {
+            assert!(output.starts_with("exit code: 0\n"), "{output}");
+            assert_eq!(exit_code, Some(0));
+            assert_eq!(signal, None);
+            assert_eq!(status.as_deref(), Some("completed"));
+            assert_eq!(kind.as_deref(), Some("bash"));
+            assert!(started_at_ms.is_some(), "started_at_ms must be present");
+            assert!(
+                duration_ms.is_some_and(|ms| ms > 0),
+                "duration_ms must be positive, got {duration_ms:?}"
+            );
+        }
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+
+    // exit 3 → status "failed", exit_code 3.
+    bash.execute(json!({"command": "exit 3", "background": true}))
+        .await
+        .unwrap();
+    match receiver.recv().await.unwrap() {
+        AgentEvent::BackgroundCompleted {
+            output,
+            exit_code,
+            signal,
+            status,
+            kind,
+            duration_ms,
+            ..
+        } => {
+            assert!(output.starts_with("exit code: 3\n"), "{output}");
+            assert_eq!(exit_code, Some(3));
+            assert_eq!(signal, None);
+            assert_eq!(status.as_deref(), Some("failed"));
+            assert_eq!(kind.as_deref(), Some("bash"));
+            assert!(duration_ms.is_some_and(|ms| ms > 0));
+        }
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+
+    // SIGTERM self-kill → status "killed", no exit code, signal name.
+    bash.execute(json!({"command": "kill -TERM $$", "background": true}))
+        .await
+        .unwrap();
+    match receiver.recv().await.unwrap() {
+        AgentEvent::BackgroundCompleted {
+            output,
+            exit_code,
+            signal,
+            status,
+            kind,
+            ..
+        } => {
+            assert!(output.starts_with("exit code: signal\n"), "{output}");
+            assert_eq!(exit_code, None, "signal death has no exit code");
+            assert_eq!(signal.as_deref(), Some("SIGTERM"));
+            assert_eq!(status.as_deref(), Some("killed"));
+            assert_eq!(kind.as_deref(), Some("bash"));
+        }
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn background_timeout_is_delivered_as_completion() {
     let temp = tempfile::tempdir().unwrap();
@@ -2638,6 +2726,7 @@ async fn get_background_tasks_marks_the_calling_subagent_itself() {
                 subagent_session_id: Some(self_session_id.into()),
                 resume: None,
             }),
+            crate::tools::new_exit_slot(),
             |_| {},
             || async { "done".into() },
         )
@@ -2654,6 +2743,7 @@ async fn get_background_tasks_marks_the_calling_subagent_itself() {
                 subagent_session_id: Some("sub-other".into()),
                 resume: None,
             }),
+            crate::tools::new_exit_slot(),
             |_| {},
             || async { "done".into() },
         )
@@ -2864,6 +2954,7 @@ async fn completion_delivery_available_requires_an_open_receiver() {
             None,
             None,
             None,
+            crate::tools::new_exit_slot(),
             |_| panic!("closed delivery must not call on_id"),
             move || async move {
                 work_runs_on_failure.fetch_add(1, Ordering::Relaxed);
@@ -2883,6 +2974,7 @@ async fn completion_delivery_available_requires_an_open_receiver() {
             None,
             None,
             None,
+            crate::tools::new_exit_slot(),
             |_| {},
             || async { "done".into() },
         )
@@ -2911,12 +3003,13 @@ async fn panicking_on_id_removes_registration_without_work_or_completion() {
             None,
             None,
             None, // owner_session：测试不关心发起者
+            crate::tools::new_exit_slot(),
             |_| panic!("controlled on_id panic"),
             move || async move {
                 work_runs_in_task.fetch_add(1, Ordering::SeqCst);
                 "unexpected".into()
             },
-            move |_, _| {
+            move |_, _, _| {
                 completions_in_task.fetch_add(1, Ordering::SeqCst);
             },
         );
@@ -2957,6 +3050,7 @@ async fn cancel_during_on_id_suppresses_work_and_completion() {
             None,
             None,
             None, // owner_session：测试不关心发起者
+            crate::tools::new_exit_slot(),
             move |_| {
                 spawn_entered.wait();
                 spawn_release.wait();
@@ -2965,7 +3059,7 @@ async fn cancel_during_on_id_suppresses_work_and_completion() {
                 spawn_work_runs.fetch_add(1, Ordering::SeqCst);
                 "unexpected".into()
             },
-            move |_, _| {
+            move |_, _, _| {
                 spawn_completions.fetch_add(1, Ordering::SeqCst);
             },
         )
@@ -3000,6 +3094,7 @@ async fn spawn_with_id_delivers_label_in_background_completed() {
         None,
         None,
         None,
+        crate::tools::new_exit_slot(),
         |_id| {},
         || async { "output from task".into() },
     )
@@ -3489,6 +3584,7 @@ async fn background_event_sender_is_shared_across_clones() {
         None,
         None,
         None,
+        crate::tools::new_exit_slot(),
         |_id| {},
         || async move { String::new() },
     );

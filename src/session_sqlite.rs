@@ -144,6 +144,13 @@ CREATE TABLE IF NOT EXISTS sessions (
 ///
 /// The read path is a plain `GROUP BY session_id, model, kind` aggregate
 /// ([`Self::usage_summary`]); no per-seq dedup is needed.
+///
+/// The per-call enrichment columns (`cache_hit_tokens`/`cache_miss_tokens`/
+/// `reasoning_tokens`/`finish_reason`) are nullable and were added after
+/// the table shipped (same probe-then-ALTER migration as `sessions.title`
+/// etc.): old rows read them back as NULL, and `seq` already relates the
+/// usage row to the `session_entries` rows of the same session (turn
+/// linkage — see [`Self::append_usage`]).
 const CREATE_TABLE_USAGE: &str = r#"
 CREATE TABLE IF NOT EXISTS usage_entries (
     workspace_id TEXT NOT NULL,
@@ -154,6 +161,10 @@ CREATE TABLE IF NOT EXISTS usage_entries (
     kind TEXT NOT NULL,
     input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
+    cache_hit_tokens INTEGER NULL,
+    cache_miss_tokens INTEGER NULL,
+    reasoning_tokens INTEGER NULL,
+    finish_reason TEXT NULL,
     PRIMARY KEY (workspace_id, session_id, seq)
 )
 "#;
@@ -425,6 +436,62 @@ impl SqliteSession {
                     "e-agent: cannot add running_tasks.full_command column \
                      (background-task full-command persistence unavailable): {error}"
                 );
+            }
+        }
+
+        // Same probe-then-ALTER migration for the per-call usage
+        // enrichment columns of `usage_entries` (cache/reasoning/finish
+        // reason, added after the table shipped). Pre-existing databases
+        // need the ALTER; fresh databases already have the columns via
+        // CREATE_TABLE_USAGE above. Old rows read the columns back as NULL
+        // (the read path treats them as `Option`). A failed ALTER does NOT
+        // block the connection: the feature degrades — `append_usage`
+        // fails loudly on the missing column, transcript operations and
+        // the aggregate usage read are unaffected (same philosophy as the
+        // sessions migration above).
+        {
+            let mut rows = conn
+                .query("PRAGMA table_info(usage_entries)", ())
+                .await
+                .map_err(|e| format!("cannot inspect usage_entries table schema: {e}"))?;
+            let mut columns: Vec<String> = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| format!("cannot inspect usage_entries table schema: {e}"))?
+            {
+                // PRAGMA table_info columns: cid, name, type, notnull,
+                // dflt_value, pk — the name is index 1.
+                if let Some(name) = row
+                    .get_value(1)
+                    .map_err(|e| format!("cannot inspect usage_entries table schema: {e}"))?
+                    .as_text()
+                {
+                    columns.push(name.clone());
+                }
+            }
+            // Keep the added column types identical to
+            // CREATE_TABLE_USAGE (INTEGER for the token counts, TEXT for
+            // finish_reason). NOTE: same turso quirk as the sessions
+            // migration — omit the explicit NULL constraint; ADD COLUMN
+            // defaults to nullable anyway.
+            let migrations: [(&str, &str, &str); 4] = [
+                ("cache_hit_tokens", "INTEGER", "usage cache-hit tokens"),
+                ("cache_miss_tokens", "INTEGER", "usage cache-miss tokens"),
+                ("reasoning_tokens", "INTEGER", "usage reasoning tokens"),
+                ("finish_reason", "TEXT", "usage finish reason"),
+            ];
+            for (name, sql_type, feature) in migrations {
+                if columns.iter().any(|c| c == name) {
+                    continue; // column already present (fresh DB or migrated)
+                }
+                let sql = format!("ALTER TABLE usage_entries ADD COLUMN {name} {sql_type}");
+                if let Err(error) = conn.execute(&sql, ()).await {
+                    eprintln!(
+                        "e-agent: cannot add usage_entries.{name} column ({feature} unavailable): \
+                         {error}"
+                    );
+                }
             }
         }
 
@@ -1429,6 +1496,15 @@ impl SqliteSession {
     /// primary key `(workspace_id, session_id, seq)` stays collision-free
     /// within one process (see the `CREATE_TABLE_USAGE` comment).
     ///
+    /// Turn linkage: `seq` is the same `next_event_time_us` clock that
+    /// stamps the `session_entries` rows, so joining
+    /// `usage_entries.seq` against `session_entries.seq` of the same
+    /// session reconstructs the per-call usage next to the assistant
+    /// message of that turn (best-effort: both clocks are monotonic per
+    /// process, but ordering across the two tables is not guaranteed to be
+    /// exactly interleaved, so treat equality as a heuristic, never a
+    /// hard join).
+    ///
     /// `workspace_id`/`session_id` are explicit parameters (not the bound
     /// session's) so the workspace-scoped meta store can record usage for
     /// any session id, and the store facade passes them through.
@@ -1438,8 +1514,7 @@ impl SqliteSession {
         session_id: &str,
         model: &str,
         kind: &str,
-        input_tokens: u64,
-        output_tokens: u64,
+        usage: &crate::agent::Usage,
     ) -> Result<(), String> {
         let seq = next_event_time_us();
         self.conn
@@ -1447,8 +1522,10 @@ impl SqliteSession {
             .await
             .execute(
                 "INSERT INTO usage_entries \
-                 (workspace_id, session_id, seq, event_time_us, model, kind, input_tokens, output_tokens) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (workspace_id, session_id, seq, event_time_us, model, kind, input_tokens, \
+                  output_tokens, cache_hit_tokens, cache_miss_tokens, reasoning_tokens, \
+                  finish_reason) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 (
                     workspace_id,
                     session_id,
@@ -1456,13 +1533,98 @@ impl SqliteSession {
                     seq,
                     model,
                     kind,
-                    input_tokens as i64,
-                    output_tokens as i64,
+                    usage.input_tokens as i64,
+                    usage.output_tokens as i64,
+                    usage.cache_hit_tokens.map(|v| v as i64),
+                    usage.cache_miss_tokens.map(|v| v as i64),
+                    usage.reasoning_tokens.map(|v| v as i64),
+                    usage.finish_reason.as_deref(),
                 ),
             )
             .await
             .map_err(|e| format!("cannot insert token usage: {e}"))?;
         Ok(())
+    }
+
+    /// List the most recent finished background tasks for the workspace,
+    /// newest first, from `session_entries` rows of
+    /// `entry_kind = 'background_completion'` (the authoritative record —
+    /// no separate finished-task store). `finished_at` is the row's
+    /// `event_time_us`; `limit` caps the result (e.g. 100). The payload
+    /// JSON deserializes through the same serde shape as `load`, so legacy
+    /// rows without the trace fields read back with them `None`.
+    pub async fn finished_tasks(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::session_store::FinishedTask>, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT session_id, seq, event_time_us, payload FROM session_entries \
+                 WHERE workspace_id = ?1 AND entry_kind = 'background_completion' \
+                 ORDER BY event_time_us DESC, seq DESC \
+                 LIMIT ?2",
+                (workspace_id, limit as i64),
+            )
+            .await
+            .map_err(|e| format!("cannot query finished background tasks: {e}"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot query finished background tasks: {e}"))?
+        {
+            let text_at = |index: usize, label: &str| {
+                row.get_value(index)
+                    .map_err(|e| format!("cannot query finished background tasks: {e}"))?
+                    .as_text()
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("cannot query finished background tasks: {label} is not text")
+                    })
+            };
+            let payload = text_at(3, "payload")?;
+            let entry: crate::agent::SessionEntry = serde_json::from_str(&payload)
+                .map_err(|e| format!("cannot decode finished background task payload: {e}"))?;
+            let crate::agent::SessionEntry::BackgroundCompletion {
+                id,
+                label,
+                started_at_ms,
+                duration_ms,
+                exit_code,
+                signal,
+                status,
+                kind,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            let int_at = |index: usize, label: &str| {
+                row.get_value(index)
+                    .map_err(|e| format!("cannot query finished background tasks: {e}"))?
+                    .as_integer()
+                    .copied()
+                    .ok_or_else(|| {
+                        format!("cannot query finished background tasks: {label} is not an integer")
+                    })
+            };
+            out.push(crate::session_store::FinishedTask {
+                session_id: text_at(0, "session_id")?,
+                seq: int_at(1, "seq")?,
+                finished_at_us: int_at(2, "event_time_us")?,
+                id,
+                label,
+                started_at_ms,
+                duration_ms,
+                exit_code,
+                signal,
+                status,
+                kind,
+            });
+        }
+        Ok(out)
     }
 
     /// Aggregate token usage per (session_id, model, kind) for this

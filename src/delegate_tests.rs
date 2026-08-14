@@ -262,6 +262,7 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
             None,
             None,
             None,
+            crate::tools::new_exit_slot(),
             move |id| {
                 *hook_slot.lock().unwrap() = Some(id);
                 hook_sessions.insert(id, probe_entry(hook_handle));
@@ -333,6 +334,7 @@ async fn background_cancel_before_first_yield_cleans_everything() {
             None,
             None,
             None,
+            crate::tools::new_exit_slot(),
             move |id| {
                 *hook_slot.lock().unwrap() = Some(id);
                 hook_sessions.insert(id, probe_entry(hook_handle.clone()));
@@ -395,6 +397,7 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
             None,
             None,
             None,
+            crate::tools::new_exit_slot(),
             move |id| {
                 *slot.lock().unwrap() = Some(id);
                 hook_sessions.insert(id, probe_entry(hook_handle.clone()));
@@ -662,6 +665,7 @@ async fn panicking_inner_model_cleans_up_and_sends_one_failure_completion() {
             None,
             None,
             None,
+            crate::tools::new_exit_slot(),
             move |id| {
                 *slot.lock().unwrap() = Some(id);
                 hook_sessions.insert(id, probe_entry(hook_handle.clone()));
@@ -1910,6 +1914,90 @@ async fn background_failure_completion_retains_session_id() {
             )),
             "failed completion must retain the main-branch session format, got: {output}"
         ),
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+}
+
+/// Background delegate trace: a successful subagent records
+/// status="completed" / kind="delegate" / no exit_code, with a positive
+/// duration and a present started_at; a failed one records
+/// status="failed". The success bool of `result_output` is kept through
+/// the work closure instead of being formatted away.
+#[tokio::test]
+async fn background_delegate_completion_carries_status_and_kind() {
+    // Success path: a scripted model that answers.
+    let temp = tempfile::tempdir().unwrap();
+    let base_url = successful_model("finished answer").await;
+    let mut tool = delegate_with_url(temp.path(), base_url);
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+    tool.execute(json!({
+        "task": "hello",
+        "workspace": temp.path().to_str().unwrap(),
+        "background": true
+    }))
+    .await
+    .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(10), receiver.recv())
+        .await
+        .expect("timed out waiting for successful background delegate")
+        .unwrap();
+    match event {
+        AgentEvent::BackgroundCompleted {
+            output,
+            exit_code,
+            signal,
+            status,
+            kind,
+            started_at_ms,
+            duration_ms,
+            ..
+        } => {
+            assert!(
+                output.contains("finished answer"),
+                "successful delegate output, got: {output}"
+            );
+            assert_eq!(exit_code, None, "delegates have no process exit code");
+            assert_eq!(signal, None);
+            assert_eq!(status.as_deref(), Some("completed"));
+            assert_eq!(kind.as_deref(), Some("delegate"));
+            assert!(started_at_ms.is_some(), "started_at_ms must be present");
+            assert!(
+                duration_ms.is_some_and(|ms| ms > 0),
+                "duration_ms must be positive, got {duration_ms:?}"
+            );
+        }
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+
+    // Failure path: model unreachable (the plain `delegate` helper points
+    // at localhost:80) → status "failed".
+    let temp = tempfile::tempdir().unwrap();
+    let mut tool = delegate(temp.path());
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+    tool.execute(json!({
+        "task": "hello",
+        "workspace": temp.path().to_str().unwrap(),
+        "background": true
+    }))
+    .await
+    .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(10), receiver.recv())
+        .await
+        .expect("timed out waiting for failed background delegate")
+        .unwrap();
+    match event {
+        AgentEvent::BackgroundCompleted {
+            status,
+            kind,
+            exit_code,
+            ..
+        } => {
+            assert_eq!(status.as_deref(), Some("failed"));
+            assert_eq!(kind.as_deref(), Some("delegate"));
+            assert_eq!(exit_code, None);
+        }
         other => panic!("expected BackgroundCompleted, got {other:?}"),
     }
 }

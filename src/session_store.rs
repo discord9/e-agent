@@ -776,6 +776,31 @@ pub struct UsageRow {
     pub last_ts: i64,
 }
 
+/// One finished background task, read back from `session_entries`
+/// (`entry_kind = 'background_completion'`) for the finished-tasks
+/// listing. `finished_at_us` is the row's `event_time` (the durable commit
+/// time, µs since epoch); `seq` is the row's sequence, which relates the
+/// completion to the surrounding entries of the same session (turn
+/// reconstruction is best-effort: ordering across rows is guaranteed by
+/// `event_time`/`seq`, but exact equality with a specific assistant entry
+/// is not forced).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct FinishedTask {
+    pub session_id: String,
+    pub seq: i64,
+    pub finished_at_us: i64,
+    pub id: u64,
+    pub label: Option<String>,
+    pub started_at_ms: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    /// "completed" | "failed" | "killed"
+    pub status: Option<String>,
+    /// "bash" | "delegate"
+    pub kind: Option<String>,
+}
+
 /// Where a live agent records its in-flight background tasks: the workspace
 /// root, the session name the record belongs to, and the store that owns
 /// the record. Carried by the main agent (`agent.background_record`) and
@@ -1376,7 +1401,9 @@ impl SessionStore {
 
     /// Record one token-usage row in the `usage_entries` table. `kind` is
     /// one of "regular" (normal turn), "compact" (compaction) or
-    /// "summarizer" (desktop-pet summary model).
+    /// "summarizer" (desktop-pet summary model). The optional
+    /// cache/reasoning/finish-reason fields of `usage` are written when
+    /// the provider reported them, NULL otherwise.
     ///
     /// For `Jsonl` this is a silent no-op: the file backend has no usage
     /// table, so token statistics are only available on the Greptime/
@@ -1389,8 +1416,7 @@ impl SessionStore {
         session_id: &str,
         model: &str,
         kind: &str,
-        input_tokens: u64,
-        output_tokens: u64,
+        usage: &crate::agent::Usage,
     ) -> Result<()> {
         match self {
             SessionStore::Jsonl => Ok(()),
@@ -1400,14 +1426,7 @@ impl SessionStore {
                 session
                     .lock()
                     .await
-                    .append_usage(
-                        &workspace_id,
-                        session_id,
-                        model,
-                        kind,
-                        input_tokens,
-                        output_tokens,
-                    )
+                    .append_usage(&workspace_id, session_id, model, kind, usage)
                     .await
             }
             #[cfg(feature = "sqlite")]
@@ -1416,17 +1435,44 @@ impl SessionStore {
                 session
                     .lock()
                     .await
-                    .append_usage(
-                        &workspace_id,
-                        session_id,
-                        model,
-                        kind,
-                        input_tokens,
-                        output_tokens,
-                    )
+                    .append_usage(&workspace_id, session_id, model, kind, usage)
                     .await
                     .map_err(anyhow::Error::msg)
             }
+        }
+    }
+
+    /// List the most recent finished background tasks for the workspace,
+    /// newest first, by reading `session_entries` rows of
+    /// `entry_kind = 'background_completion'` (the ONLY authoritative
+    /// record — there is no separate finished-task store). `limit` caps
+    /// the result (a sane UI bound, e.g. 100).
+    ///
+    /// `Jsonl` returns an empty vector: the file backend has no
+    /// `session_entries` table to query (same limitation as
+    /// [`SessionStore::usage_summary`]); the live TUI/web views still show
+    /// finished tasks through the completion events, but the DB-backed
+    /// finished-tasks listing requires Greptime/SQLite.
+    #[allow(unused_variables)]
+    pub async fn finished_tasks(&self, root: &Path, limit: usize) -> Result<Vec<FinishedTask>> {
+        let workspace_id = derive_workspace_id(root);
+        match self {
+            SessionStore::Jsonl => Ok(Vec::new()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session
+                    .lock()
+                    .await
+                    .finished_tasks(&workspace_id, limit)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .finished_tasks(&workspace_id, limit)
+                .await
+                .map_err(anyhow::Error::msg),
         }
     }
 
@@ -2925,6 +2971,12 @@ mod shared_helpers {
                 id: 7,
                 output: "done".into(),
                 label: None,
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
             },
             SessionEntry::ForkedFrom {
                 source: "src".into(),

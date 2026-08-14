@@ -25,7 +25,7 @@ use crate::config::SessionBackend;
 use crate::model::ConfiguredModel;
 use crate::runner::{IdlePolicy, SessionHandle, SessionResult, SessionRunner};
 use crate::session_store::SessionStore;
-use crate::tools::BackgroundTasks;
+use crate::tools::{BackgroundTasks, TaskExit, new_exit_slot};
 use crate::workspace::Workspace;
 /// Metadata about a live subagent session, stored alongside its handle in
 /// the registry so frontends can display the model name, role, cwd, etc.
@@ -779,6 +779,9 @@ pub async fn spawn_btw_subagent(
             subagent_session_id: Some(session_id.clone()),
             resume: None,
         }),
+        // btw subagent: no structured exit metadata (its task never
+        // "completes" — it stays registered until cancelled).
+        new_exit_slot(),
         move |id| {
             match slot_in_hook.lock() {
                 Ok(mut slot) => *slot = Some(id),
@@ -1215,11 +1218,19 @@ impl Tool for Delegate {
             let record_label = label.clone();
             let record_session_id = session_id.clone();
             let output_session_id = session_id.clone();
+            // The subagent's own exit metadata out-slot: `result_output`'s
+            // success bool is kept (instead of being formatted away) and
+            // mapped to status "completed"/"failed"; no exit code (delegate
+            // tasks have no process exit status), kind = "delegate" (the
+            // registry derives it from the absent shell name).
+            let exit_slot = new_exit_slot();
+            let work_exit = exit_slot.clone();
             let started = self.background.spawn_with_id(
                 label,
                 role,
                 None,
                 Some(task_display),
+                exit_slot,
                 move |id| {
                     match slot_in_hook.lock() {
                         Ok(mut slot) => *slot = Some(id),
@@ -1250,8 +1261,13 @@ impl Tool for Delegate {
                 move || {
                     let cleanup = cleanup;
                     async move {
-                        let (_, output) =
+                        let (completed, output) =
                             result_output(Self::runner_result(&handle, runner_task).await);
+                        *work_exit.lock().unwrap() = TaskExit {
+                            exit_code: None,
+                            signal: None,
+                            status: Some(if completed { "completed" } else { "failed" }.into()),
+                        };
                         cleanup.finish();
                         format!("subagent session: {output_session_id}\n{output}")
                     }

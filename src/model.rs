@@ -343,6 +343,7 @@ async fn consume_stream(
     // the empty text itself must never surface as visible thinking.
     let mut saw_reasoning = false;
     let mut usage = None;
+    let mut finish_reason = None;
     let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
     let mut events = response.bytes_stream().eventsource();
     while let Some(event) = events.next().await {
@@ -361,6 +362,11 @@ async fn consume_stream(
         for choice in chunk.choices {
             if let Some(reported) = choice.usage {
                 usage = Some(reported);
+            }
+            // finish_reason arrives on the stream's final chunk; the LAST
+            // non-None value wins (choices are consumed in order).
+            if let Some(reason) = &choice.finish_reason {
+                finish_reason = Some(reason.clone());
             }
             // Providers (kimi k3) interleave empty `content: ""` /
             // `reasoning_content: ""` chunks into the stream. Forwarding
@@ -410,11 +416,25 @@ async fn consume_stream(
                 }
             }
             if choice.finish_reason.is_some() {
-                return build_assistant(content, reasoning, saw_reasoning, tool_calls, usage);
+                return build_assistant(
+                    content,
+                    reasoning,
+                    saw_reasoning,
+                    tool_calls,
+                    usage,
+                    finish_reason,
+                );
             }
         }
     }
-    build_assistant(content, reasoning, saw_reasoning, tool_calls, usage)
+    build_assistant(
+        content,
+        reasoning,
+        saw_reasoning,
+        tool_calls,
+        usage,
+        finish_reason,
+    )
 }
 
 fn request_error(error: reqwest::Error) -> anyhow::Error {
@@ -765,6 +785,7 @@ fn build_assistant(
     saw_reasoning: bool,
     tool_calls: Vec<AccumulatedToolCall>,
     usage: Option<StreamUsage>,
+    finish_reason: Option<String>,
 ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
     let tool_calls = tool_calls
         .into_iter()
@@ -801,6 +822,12 @@ fn build_assistant(
         usage.map(|usage| Usage {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
+            cache_hit_tokens: usage.prompt_cache_hit_tokens,
+            cache_miss_tokens: usage.prompt_cache_miss_tokens,
+            reasoning_tokens: usage
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+            finish_reason,
         }),
     ))
 }
@@ -817,6 +844,23 @@ struct StreamChunk {
 struct StreamUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// DeepSeek/OpenAI-compatible cache accounting; absent on providers
+    /// that don't report them.
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u64>,
+    /// Nested reasoning-token count (DeepSeek/OpenAI
+    /// `completion_tokens_details.reasoning_tokens`); only the COUNT is
+    /// kept, never reasoning text.
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]

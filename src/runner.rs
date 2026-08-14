@@ -572,13 +572,27 @@ impl SessionRunner {
             SessionEntry::Message {
                 message: Message::User { content, .. },
             } => Some(AgentEvent::UserPrompt(content.clone())),
-            SessionEntry::BackgroundCompletion { id, output, label } => {
-                Some(AgentEvent::BackgroundCompletionNotice {
-                    id: *id,
-                    output: output.clone(),
-                    label: label.clone(),
-                })
-            }
+            SessionEntry::BackgroundCompletion {
+                id,
+                output,
+                label,
+                started_at_ms,
+                duration_ms,
+                exit_code,
+                signal,
+                status,
+                kind,
+            } => Some(AgentEvent::BackgroundCompletionNotice {
+                id: *id,
+                output: output.clone(),
+                label: label.clone(),
+                started_at_ms: *started_at_ms,
+                duration_ms: *duration_ms,
+                exit_code: *exit_code,
+                signal: signal.clone(),
+                status: status.clone(),
+                kind: kind.clone(),
+            }),
             // Goal updates fan out as one live event after durable commit
             // (UI Notice line + GoalBar refresh), never as a user prompt.
             SessionEntry::GoalUpdated { goal } => {
@@ -1165,9 +1179,7 @@ impl SessionRunner {
                 // （直接调用路径，无 store 访问权）不是同一事件：runner 走的是
                 // `prepare_compaction`，生产环境压缩只经此处落盘，不会重复写入。
                 if let Some(usage) = usage {
-                    let input_tokens = usage.input_tokens;
-                    let output_tokens = usage.output_tokens;
-                    self.agent.apply_usage(Some(usage), false);
+                    self.agent.apply_usage(Some(usage.clone()), false);
                     if let Err(error) = self
                         .store
                         .append_usage(
@@ -1175,8 +1187,7 @@ impl SessionRunner {
                             &self.session,
                             &self.agent.model_name(),
                             "compact",
-                            input_tokens,
-                            output_tokens,
+                            &usage,
                         )
                         .await
                     {
@@ -1462,9 +1473,7 @@ impl SessionRunner {
                 }
                 // 正常轮用量落盘（kind="regular"）；持久化失败只告警，不影响会话。
                 if let Some(usage) = usage {
-                    let input_tokens = usage.input_tokens;
-                    let output_tokens = usage.output_tokens;
-                    self.agent.apply_usage(Some(usage), true);
+                    self.agent.apply_usage(Some(usage.clone()), true);
                     if let Err(error) = self
                         .store
                         .append_usage(
@@ -1472,8 +1481,7 @@ impl SessionRunner {
                             &self.session,
                             &self.agent.model_name(),
                             "regular",
-                            input_tokens,
-                            output_tokens,
+                            &usage,
                         )
                         .await
                     {
@@ -1777,13 +1785,27 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             Some(AgentEvent::Notice(format!("compacted: {summary}")))
         }
         SessionEntry::Notice { text } => Some(AgentEvent::Notice(text.clone())),
-        SessionEntry::BackgroundCompletion { id, output, label } => {
-            Some(AgentEvent::BackgroundCompletionNotice {
-                id: *id,
-                output: output.clone(),
-                label: label.clone(),
-            })
-        }
+        SessionEntry::BackgroundCompletion {
+            id,
+            output,
+            label,
+            started_at_ms,
+            duration_ms,
+            exit_code,
+            signal,
+            status,
+            kind,
+        } => Some(AgentEvent::BackgroundCompletionNotice {
+            id: *id,
+            output: output.clone(),
+            label: label.clone(),
+            started_at_ms: *started_at_ms,
+            duration_ms: *duration_ms,
+            exit_code: *exit_code,
+            signal: signal.clone(),
+            status: status.clone(),
+            kind: kind.clone(),
+        }),
         SessionEntry::ForkedFrom { source, at, .. } => Some(AgentEvent::Notice(format!(
             "forked from {source} at entry {at}"
         ))),

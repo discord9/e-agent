@@ -1214,6 +1214,12 @@ mod tests {
                 id: 1,
                 output: "big-output".into(),
                 label: None,
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
             },
         ]
     }
@@ -1403,6 +1409,12 @@ mod tests {
             id: 2,
             output: output.clone(),
             label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         };
         let more = Session::append_located(temp.path(), "loc", &[entry]).unwrap();
         let receipt = codec
@@ -1511,6 +1523,12 @@ mod tests {
             id: 1,
             output: "out".into(),
             label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         };
         let codec_dir = tempfile::tempdir().unwrap();
         let codec = ReceiptCodec::load_from_dir(codec_dir.path()).unwrap();

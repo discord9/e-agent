@@ -102,9 +102,22 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
             String::new()
         };
         let output_line_count = selected_output.lines().count().min(OUTPUT_LINES);
+        // Finished section: header + up to FINISHED_PANEL_ROWS rows + a
+        // "+N more" line when the cap truncates the display (the list
+        // itself is capped at FINISHED_TASKS_CAP in state.rs). Zero when
+        // empty, so the panel layout is unchanged for sessions without
+        // finished tasks.
+        const FINISHED_PANEL_ROWS: usize = 5;
+        let finished_row_count = if state.show_tasks && !state.finished_tasks.is_empty() {
+            let shown = state.finished_tasks.len().min(FINISHED_PANEL_ROWS);
+            1 + shown + usize::from(state.finished_tasks.len() > FINISHED_PANEL_ROWS)
+        } else {
+            0
+        };
         let mut tasks_height = if state.show_tasks {
             // border (2) + header (1) + one row per task + output tail
-            (running.len() as u16 + 3 + output_line_count as u16).max(3)
+            // + finished section (its own header + rows when non-empty)
+            (running.len() as u16 + 3 + output_line_count as u16 + finished_row_count as u16).max(3)
         } else {
             u16::from(!running.is_empty())
         };
@@ -220,6 +233,39 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
                 for line in selected_output.lines().skip(skip) {
                     lines.push(Line::styled(
                         format!("  │ {}", preview(line, 120)),
+                        Style::default()
+                            .fg(SOLARIZED_LIGHT.muted)
+                            .bg(SOLARIZED_LIGHT.panel)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
+            }
+            // Finished section: a read-only list of the tasks this session
+            // saw complete (newest first), projected from the durable
+            // `BackgroundCompletion` entries via the notice events.
+            if !state.finished_tasks.is_empty() {
+                lines.push(Line::styled(
+                    format!("── {} finished ──", state.finished_tasks.len()),
+                    Style::default()
+                        .fg(SOLARIZED_LIGHT.text)
+                        .bg(SOLARIZED_LIGHT.panel)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                for task in state.finished_tasks.iter().take(FINISHED_PANEL_ROWS) {
+                    lines.push(Line::styled(
+                        format_finished_task(task, 60),
+                        Style::default()
+                            .fg(SOLARIZED_LIGHT.muted)
+                            .bg(SOLARIZED_LIGHT.panel)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
+                if state.finished_tasks.len() > FINISHED_PANEL_ROWS {
+                    lines.push(Line::styled(
+                        format!(
+                            "  … {} more (see session history / GET /api/tasks/finished)",
+                            state.finished_tasks.len() - FINISHED_PANEL_ROWS
+                        ),
                         Style::default()
                             .fg(SOLARIZED_LIGHT.muted)
                             .bg(SOLARIZED_LIGHT.panel)
@@ -1004,6 +1050,52 @@ pub(crate) fn format_task_label(
     s
 }
 
+/// One finished-task row for the F2 panel's finished section:
+/// `#id kind status exit_code duration label`.
+pub(crate) fn format_finished_task(task: &FinishedTask, max_chars: usize) -> String {
+    let mut parts = vec![format!("#{}", task.id)];
+    if let Some(kind) = &task.kind {
+        parts.push(kind.clone());
+    }
+    if let Some(status) = &task.status {
+        parts.push(status.clone());
+    }
+    if let Some(code) = task.exit_code {
+        parts.push(format!("exit {code}"));
+    } else if task.signal.is_some() {
+        parts.push("signal".into());
+    }
+    if let Some(ms) = task.duration_ms {
+        parts.push(format_duration(ms));
+    }
+    let mut text = parts.join(" ");
+    if let Some(label) = task
+        .label
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+    {
+        text.push(' ');
+        text.push_str(label);
+    }
+    preview(&text, max_chars)
+}
+
+/// Compact wall duration: "123ms" | "1.23s" | "2m 3s" | "1h 5m".
+pub(crate) fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
+    let secs = ms / 1000;
+    if secs < 60 {
+        return format!("{}.{:02}s", secs, (ms % 1000) / 10);
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m {}s", secs % 60);
+    }
+    format!("{}h {}m", mins / 60, mins % 60)
+}
+
 #[cfg(test)]
 mod format_task_label_tests {
     use super::*;
@@ -1024,6 +1116,7 @@ mod format_task_label_tests {
             output: vec![],
             display_meta,
             owner_session: None,
+            started_at_ms: None,
         }
     }
 
@@ -1100,6 +1193,7 @@ mod format_task_label_tests {
             output: vec![],
             display_meta: None,
             owner_session: None,
+            started_at_ms: None,
         };
         assert_eq!(format_task_label(&task, "", 40), "  #10: echo hi");
     }

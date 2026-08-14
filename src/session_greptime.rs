@@ -129,6 +129,13 @@ CREATE TABLE IF NOT EXISTS sessions (
 /// [`next_event_time_us`]), and append mode keeps a same-PK retry from
 /// silently overwriting. The read path is a plain `GROUP BY session_id,
 /// model, kind` aggregate ([`Self::usage_summary`]).
+///
+/// The per-call enrichment columns (`cache_hit_tokens`/`cache_miss_tokens`/
+/// `reasoning_tokens`/`finish_reason`) are nullable and were added after
+/// the table shipped (same probe-then-ALTER migration as `sessions.title`
+/// etc.): old rows read them back as NULL, and `seq` already relates the
+/// usage row to the `session_entries` rows of the same session (turn
+/// linkage — see [`Self::append_usage`]).
 const CREATE_TABLE_USAGE: &str = r#"
 CREATE TABLE IF NOT EXISTS usage_entries (
     workspace_id STRING NOT NULL,
@@ -139,6 +146,10 @@ CREATE TABLE IF NOT EXISTS usage_entries (
     kind STRING NOT NULL,
     input_tokens BIGINT NOT NULL,
     output_tokens BIGINT NOT NULL,
+    cache_hit_tokens BIGINT NULL,
+    cache_miss_tokens BIGINT NULL,
+    reasoning_tokens BIGINT NULL,
+    finish_reason STRING NULL,
     PRIMARY KEY (workspace_id, session_id, seq)
 ) WITH (
     append_mode = 'true',
@@ -349,6 +360,68 @@ impl GreptimeSession {
                         eprintln!(
                             "e-agent: cannot add running_tasks.full_command column \
                              (background-task full-command persistence unavailable): {error:#}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Same probe-then-ALTER migration for the per-call usage
+        // enrichment columns of `usage_entries` (cache/reasoning/finish
+        // reason, added after the table shipped). Pre-existing databases
+        // need the ALTER; fresh databases already have the columns via
+        // CREATE_TABLE_USAGE above. Old rows read the columns back as NULL
+        // (the read path treats them as `Option`). A failed ALTER does NOT
+        // block the connection: the feature degrades — `append_usage`
+        // fails loudly on the missing column, transcript operations and
+        // the aggregate usage read are unaffected (same philosophy as the
+        // sessions migration above).
+        {
+            let usage_columns: Vec<String> = client
+                .query(
+                    "SELECT column_name FROM information_schema.columns \
+                     WHERE table_name = 'usage_entries'",
+                    &[],
+                )
+                .await
+                .context("cannot inspect usage_entries table schema")?
+                .iter()
+                .map(|row| row.get("column_name"))
+                .collect();
+            for (column, feature) in [
+                ("cache_hit_tokens", "usage cache-hit tokens"),
+                ("cache_miss_tokens", "usage cache-miss tokens"),
+                ("reasoning_tokens", "usage reasoning tokens"),
+            ] {
+                if usage_columns.iter().any(|c| c == column) {
+                    continue;
+                }
+                if let Err(error) = client
+                    .execute(
+                        &format!("ALTER TABLE usage_entries ADD COLUMN {column} BIGINT NULL"),
+                        &[],
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "e-agent: cannot add usage_entries.{column} column ({feature} unavailable): \
+                         {error:#}"
+                    );
+                }
+            }
+            if !usage_columns.iter().any(|c| c == "finish_reason") {
+                match client
+                    .execute(
+                        "ALTER TABLE usage_entries ADD COLUMN finish_reason STRING NULL",
+                        &[],
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "e-agent: cannot add usage_entries.finish_reason column \
+                             (usage finish reason unavailable): {error:#}"
                         );
                     }
                 }
@@ -1333,6 +1406,15 @@ impl GreptimeSession {
     /// key `(workspace_id, session_id, seq)` stays collision-free within
     /// one process (see the `CREATE_TABLE_USAGE` comment).
     ///
+    /// Turn linkage: `seq` is the same `next_event_time_us` clock that
+    /// stamps the `session_entries` rows, so joining
+    /// `usage_entries.seq` against `session_entries.seq` of the same
+    /// session reconstructs the per-call usage next to the assistant
+    /// message of that turn (best-effort: both clocks are monotonic per
+    /// process, but ordering across the two tables is not guaranteed to be
+    /// exactly interleaved, so treat equality as a heuristic, never a
+    /// hard join).
+    ///
     /// `workspace_id`/`session_id` are explicit parameters (not the bound
     /// session's) so the workspace-scoped meta store can record usage for
     /// any session id, and the store facade passes them through.
@@ -1342,16 +1424,17 @@ impl GreptimeSession {
         session_id: &str,
         model: &str,
         kind: &str,
-        input_tokens: u64,
-        output_tokens: u64,
+        usage: &crate::agent::Usage,
     ) -> Result<()> {
         let seq = next_event_time_us();
         let ts = us_to_datetime(seq);
         self.client
             .execute(
                 "INSERT INTO usage_entries \
-                 (workspace_id, session_id, seq, event_time, model, kind, input_tokens, output_tokens) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 (workspace_id, session_id, seq, event_time, model, kind, input_tokens, \
+                  output_tokens, cache_hit_tokens, cache_miss_tokens, reasoning_tokens, \
+                  finish_reason) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                 &[
                     &workspace_id,
                     &session_id,
@@ -1359,13 +1442,77 @@ impl GreptimeSession {
                     &ts,
                     &model,
                     &kind,
-                    &(input_tokens as i64),
-                    &(output_tokens as i64),
+                    &(usage.input_tokens as i64),
+                    &(usage.output_tokens as i64),
+                    &usage.cache_hit_tokens.map(|v| v as i64),
+                    &usage.cache_miss_tokens.map(|v| v as i64),
+                    &usage.reasoning_tokens.map(|v| v as i64),
+                    &usage.finish_reason.as_deref(),
                 ],
             )
             .await
             .context("cannot insert token usage")?;
         Ok(())
+    }
+
+    /// List the most recent finished background tasks for the workspace,
+    /// newest first, from `session_entries` rows of
+    /// `entry_kind = 'background_completion'` (the authoritative record —
+    /// no separate finished-task store). `finished_at` is the row's
+    /// `event_time`; `limit` caps the result (e.g. 100). The payload JSON
+    /// deserializes through the same serde shape as `load`, so legacy rows
+    /// without the trace fields read back with them `None`.
+    pub async fn finished_tasks(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::session_store::FinishedTask>> {
+        use crate::session_store::FinishedTask;
+        let rows = self
+            .client
+            .query(
+                "SELECT session_id, seq, event_time, payload FROM session_entries \
+                 WHERE workspace_id = $1 AND entry_kind = 'background_completion' \
+                 ORDER BY event_time DESC, seq DESC \
+                 LIMIT $2",
+                &[&workspace_id, &(limit as i64)],
+            )
+            .await
+            .context("cannot query finished background tasks")?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let payload: String = row.get("payload");
+            let entry: crate::agent::SessionEntry = serde_json::from_str(&payload)
+                .context("cannot decode finished background task payload")?;
+            let crate::agent::SessionEntry::BackgroundCompletion {
+                id,
+                label,
+                started_at_ms,
+                duration_ms,
+                exit_code,
+                signal,
+                status,
+                kind,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            out.push(FinishedTask {
+                session_id: row.get("session_id"),
+                seq: row.get("seq"),
+                finished_at_us: datetime_to_us(row.get::<_, chrono::NaiveDateTime>("event_time")),
+                id,
+                label,
+                started_at_ms,
+                duration_ms,
+                exit_code,
+                signal,
+                status,
+                kind,
+            });
+        }
+        Ok(out)
     }
 
     /// Aggregate token usage per (session_id, model, kind) for this
@@ -2484,12 +2631,24 @@ mod tests {
                 id: 2,
                 output: "exit code: 0\nstdout:\nbuilt successfully\nstderr:\n".into(),
                 label: None,
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
             },
             // Entry with a label to verify serde roundtrip with label.
             SessionEntry::BackgroundCompletion {
                 id: 3,
                 output: "some output".into(),
                 label: Some("build project".into()),
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
             },
             Message::User {
                 content: "你好世界👋\n多行".into(),
@@ -2525,6 +2684,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finished_tasks_reads_background_completion_entries_newest_first() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-finished-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        let entries = vec![
+            SessionEntry::BackgroundCompletion {
+                id: 1,
+                output: "old".into(),
+                label: None,
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
+            },
+            SessionEntry::BackgroundCompletion {
+                id: 2,
+                output: "exit code: 3\nstdout:\n\nstderr:\n".into(),
+                label: Some("build".into()),
+                started_at_ms: Some(1_700_000_000_000),
+                duration_ms: Some(500),
+                exit_code: Some(3),
+                signal: None,
+                status: Some("failed".into()),
+                kind: Some("bash".into()),
+            },
+        ];
+        session.append(&entries).await.unwrap();
+
+        let finished = session.finished_tasks(&wid, 100).await.unwrap();
+        assert_eq!(finished.len(), 2);
+        assert_eq!(finished[0].id, 2, "newest first");
+        assert_eq!(finished[0].exit_code, Some(3));
+        assert_eq!(finished[0].status.as_deref(), Some("failed"));
+        assert_eq!(finished[0].kind.as_deref(), Some("bash"));
+        assert_eq!(finished[0].duration_ms, Some(500));
+        assert_eq!(finished[1].exit_code, None, "legacy row reads back NULL");
+        assert_eq!(finished[1].status, None);
+        let limited = session.finished_tasks(&wid, 1).await.unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, 2);
+    }
+
+    #[tokio::test]
     async fn usage_entries_append_and_summarize() {
         let conn = conn_str();
         if conn == "skipped" {
@@ -2540,19 +2750,59 @@ mod tests {
 
         // 同一 (session, model, kind) 多行聚合；不同 model/kind 维度分行。
         session
-            .append_usage(&wid, &sid, "model-a", "regular", 100, 50)
+            .append_usage(
+                &wid,
+                &sid,
+                "model-a",
+                "regular",
+                &crate::agent::Usage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         session
-            .append_usage(&wid, &sid, "model-a", "regular", 200, 30)
+            .append_usage(
+                &wid,
+                &sid,
+                "model-a",
+                "regular",
+                &crate::agent::Usage {
+                    input_tokens: 200,
+                    output_tokens: 30,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         session
-            .append_usage(&wid, &sid, "model-a", "compact", 1000, 200)
+            .append_usage(
+                &wid,
+                &sid,
+                "model-a",
+                "compact",
+                &crate::agent::Usage {
+                    input_tokens: 1000,
+                    output_tokens: 200,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         session
-            .append_usage(&wid, &sid, "model-b", "regular", 10, 5)
+            .append_usage(
+                &wid,
+                &sid,
+                "model-b",
+                "regular",
+                &crate::agent::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 

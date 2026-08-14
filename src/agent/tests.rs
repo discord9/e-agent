@@ -87,6 +87,12 @@ impl Tool for ScriptedBackgroundTool {
                 id: 1,
                 output: "exit code: 0\nstdout:\ndone\nstderr:\n".into(),
                 label: None,
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
             });
         });
         Ok(ToolOutput::text("started background task 1: echo done"))
@@ -1355,6 +1361,12 @@ fn background_completion_entry_serde_old_and_new() {
         id: 43,
         output: "done".into(),
         label: Some("build project".into()),
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     };
     let json = serde_json::to_string(&entry).unwrap();
     assert!(
@@ -1368,6 +1380,12 @@ fn background_completion_entry_serde_old_and_new() {
         id: 44,
         output: "done".into(),
         label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     };
     let json_none = serde_json::to_string(&entry_none).unwrap();
     assert!(
@@ -1376,6 +1394,88 @@ fn background_completion_entry_serde_old_and_new() {
     );
     let deserialized_none: SessionEntry = serde_json::from_str(&json_none).unwrap();
     assert_eq!(deserialized_none, entry_none);
+}
+
+#[test]
+fn background_completion_trace_fields_serde_roundtrip() {
+    // Old JSON WITHOUT the trace fields still deserializes: every trace
+    // field is Option + serde default, so legacy rows read back None.
+    let old_json = r#"{"type":"background_completion","id":7,"output":"done","label":"build"}"#;
+    let deserialized: SessionEntry = serde_json::from_str(old_json).unwrap();
+    match deserialized {
+        SessionEntry::BackgroundCompletion {
+            id,
+            started_at_ms,
+            duration_ms,
+            exit_code,
+            signal,
+            status,
+            kind,
+            ..
+        } => {
+            assert_eq!(id, 7);
+            assert_eq!(started_at_ms, None, "legacy row: started_at_ms is None");
+            assert_eq!(duration_ms, None, "legacy row: duration_ms is None");
+            assert_eq!(exit_code, None, "legacy row: exit_code is None");
+            assert_eq!(signal, None, "legacy row: signal is None");
+            assert_eq!(status, None, "legacy row: status is None");
+            assert_eq!(kind, None, "legacy row: kind is None");
+        }
+        other => panic!("expected BackgroundCompletion, got {other:?}"),
+    }
+
+    // New fields serialize (present) and are omitted when None — the wire
+    // shape of old sessions stays byte-compatible.
+    let full = SessionEntry::BackgroundCompletion {
+        id: 9,
+        output: "out".into(),
+        label: None,
+        started_at_ms: Some(1_700_000_000_000),
+        duration_ms: Some(1234),
+        exit_code: Some(3),
+        signal: Some("SIGTERM".into()),
+        status: Some("killed".into()),
+        kind: Some("bash".into()),
+    };
+    let json = serde_json::to_value(&full).unwrap();
+    let obj = json.as_object().unwrap();
+    assert_eq!(obj["started_at_ms"], 1_700_000_000_000u64);
+    assert_eq!(obj["duration_ms"], 1234u64);
+    assert_eq!(obj["exit_code"], 3);
+    assert_eq!(obj["signal"], "SIGTERM");
+    assert_eq!(obj["status"], "killed");
+    assert_eq!(obj["kind"], "bash");
+    let back: SessionEntry = serde_json::from_value(json).unwrap();
+    assert_eq!(back, full);
+
+    // None trace fields are skipped entirely (no "duration_ms": null noise).
+    let minimal = SessionEntry::BackgroundCompletion {
+        id: 1,
+        output: "o".into(),
+        label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
+    };
+    let json_min = serde_json::to_string(&minimal).unwrap();
+    for field in [
+        "started_at_ms",
+        "duration_ms",
+        "exit_code",
+        "signal",
+        "status",
+        "kind",
+    ] {
+        assert!(
+            !json_min.contains(field),
+            "None trace field {field} must be skipped: {json_min}"
+        );
+    }
+    let back_min: SessionEntry = serde_json::from_str(&json_min).unwrap();
+    assert_eq!(back_min, minimal);
 }
 
 #[test]
@@ -1404,6 +1504,12 @@ fn context_formats_background_completion_with_label_variants() {
             id: 7,
             output: "full output text\nwith multiple\nlines".into(),
             label,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         }]);
         let msgs = agent.context();
         assert_eq!(msgs.len(), 1);
@@ -1438,6 +1544,12 @@ fn background_completion_and_notice_coexist_in_context() {
             id: 2,
             output: "new style".into(),
             label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         },
     ]);
     let msgs = agent.context();
@@ -1504,6 +1616,12 @@ fn context_is_full_and_lossless_for_background_completions() {
         id: 1,
         output: output.clone(),
         label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     }]);
     let msgs = agent.context();
     assert_eq!(msgs.len(), 1);
@@ -1570,6 +1688,12 @@ fn context_request_passes_small_outputs_through_byte_identical() {
         id: 1,
         output: output.clone(),
         label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     })
     .unwrap();
     location.entry_hash = crate::session_store::entry_payload_hash(&payload);
@@ -1578,6 +1702,12 @@ fn context_request_passes_small_outputs_through_byte_identical() {
             id: 1,
             output: output.clone(),
             label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         }],
         vec![Some(location)],
     );
@@ -1616,6 +1746,12 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
         id: 1,
         output: output.clone(),
         label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     })
     .unwrap();
     location.entry_hash = crate::session_store::entry_payload_hash(&payload);
@@ -1624,6 +1760,12 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
             id: 1,
             output: output.clone(),
             label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         }],
         vec![Some(location.clone())],
     );
@@ -1981,6 +2123,12 @@ async fn compaction_retained_stays_full_and_request_is_bounded() {
         id: 9,
         output: huge.clone(),
         label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     };
     loc.entry_hash =
         crate::session_store::entry_payload_hash(&serde_json::to_string(&completion).unwrap());
@@ -2152,6 +2300,12 @@ async fn compaction_split_uses_actual_user_not_background_completion() {
             id: 7,
             output: "bg output".into(),
             label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
         },
     ]);
 
@@ -2356,6 +2510,12 @@ async fn compaction_request_bounds_oversized_completion_before_later_user() {
         id: 9,
         output: huge,
         label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     };
     loc.entry_hash =
         crate::session_store::entry_payload_hash(&serde_json::to_string(&completion).unwrap());
@@ -2538,6 +2698,12 @@ fn fork_prefix_default_cuts_at_last_completed_turn_and_drops_tail() {
         id: 9,
         output: "output".into(),
         label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
     });
     entries.push(SessionEntry::ForkedFrom {
         source: "other".into(),
@@ -3465,6 +3631,7 @@ async fn compaction_records_usage() {
             usages: vec![Usage {
                 input_tokens: 1_000,
                 output_tokens: 200,
+                ..Default::default()
             }],
             requests: requests.clone(),
         }),
@@ -3495,6 +3662,7 @@ async fn compaction_records_usage() {
         Some(Usage {
             input_tokens: 1_000,
             output_tokens: 200,
+            ..Default::default()
         })
     );
     assert_eq!(requests.lock().unwrap().len(), 1);

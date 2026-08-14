@@ -721,6 +721,20 @@ pub enum AgentEvent {
         id: u64,
         output: String,
         label: Option<String>,
+        /// Trace metadata (start/duration/exit/status/kind); all `None` on
+        /// legacy events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     /// A structured background completion notice for TUI scrollback display.
     /// Unlike `BackgroundCompleted` (the transient arrival/drain signal),
@@ -731,6 +745,18 @@ pub enum AgentEvent {
         id: u64,
         output: String,
         label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     Usage {
         /// Input tokens of the most recent regular turn, approximating the
@@ -757,10 +783,52 @@ pub enum ModelDeltaKind {
     Reasoning,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Provider-reported cache-hit prompt tokens (DeepSeek
+    /// `prompt_cache_hit_tokens` / OpenAI `input_tokens_details.cached_tokens`);
+    /// `None` on providers that don't report them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_tokens: Option<u64>,
+    /// Provider-reported cache-miss prompt tokens (DeepSeek
+    /// `prompt_cache_miss_tokens`); `None` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_miss_tokens: Option<u64>,
+    /// Provider-reported reasoning token count (DeepSeek/OpenAI
+    /// `completion_tokens_details.reasoning_tokens`). Only the COUNT is
+    /// kept — reasoning text is never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// Provider finish reason (enum string, e.g. "stop" | "length" |
+    /// "tool_calls"); absent when the provider stream doesn't carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+/// Structured trace metadata of a finished background task, carried
+/// end-to-end from the registry completion through the transient
+/// [`AgentEvent::BackgroundCompleted`] (and the durable-commit notice
+/// [`AgentEvent::BackgroundCompletionNotice`]) to the persisted
+/// [`SessionEntry::BackgroundCompletion`]. All fields optional: legacy rows
+/// and providers that don't report a field stay `None`, and serialization
+/// omits them (serde default + skip), so old persisted JSON and the SSE
+/// wire stay valid.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTrace {
+    /// Epoch milliseconds at task start (`None` on legacy events/rows).
+    pub started_at_ms: Option<u64>,
+    /// Wall duration in milliseconds.
+    pub duration_ms: Option<u64>,
+    /// Process exit code (`None` for delegates and signal-killed tasks).
+    pub exit_code: Option<i32>,
+    /// Terminating signal (bash tasks killed by a signal, e.g. "SIGTERM").
+    pub signal: Option<String>,
+    /// "completed" | "failed" | "killed".
+    pub status: Option<String>,
+    /// "bash" | "delegate".
+    pub kind: Option<String>,
 }
 
 /// One entry in the append-only session history. The model context is
@@ -819,6 +887,23 @@ pub enum SessionEntry {
         output: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// Trace metadata (epoch-ms start, wall duration, exit code,
+        /// terminating signal, "completed"|"failed"|"killed", and
+        /// "bash"|"delegate"). All optional: legacy rows persisted before
+        /// these fields existed deserialize with them `None` (serde
+        /// default) and serialize without them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     /// A new session forked from an existing one: source session id, the
     /// 1-based entry index it was forked at, and the source's event_time +
@@ -1023,7 +1108,7 @@ pub struct Agent {
     event_handler: Option<Box<dyn FnMut(AgentEvent) + Send>>,
     max_tool_rounds: Option<usize>,
     background_receiver: mpsc::UnboundedReceiver<AgentEvent>,
-    pending_background: VecDeque<(u64, String, Option<String>)>,
+    pending_background: VecDeque<(u64, String, Option<String>, BackgroundTrace)>,
     subscriber: Option<mpsc::UnboundedSender<AgentEvent>>,
     /// Long-lived session sinks (e.g. a TUI view). Unlike
     /// `event_handler` and `subscriber` (per-turn), these survive across
@@ -1519,7 +1604,9 @@ impl Agent {
                 // Structured background completions: same surface as
                 // before, but the header (id + label) is never bounded —
                 // only the output field carries a receipt when oversized.
-                SessionEntry::BackgroundCompletion { id, output, label } => {
+                SessionEntry::BackgroundCompletion {
+                    id, output, label, ..
+                } => {
                     let header = match label.as_ref().map(|l| l.trim()).filter(|l| !l.is_empty()) {
                         Some(l) => format!("[background task {id} completed: {l}]"),
                         None => format!("[background task {id} completed]"),
@@ -1659,17 +1746,41 @@ impl Agent {
     /// Wait for the next background task completion. Used by the TUI to
     /// wake an idle agent. The event is also queued for injection into the
     /// next model call.
-    pub async fn next_background_completion(&mut self) -> Option<(u64, String, Option<String>)> {
+    pub async fn next_background_completion(
+        &mut self,
+    ) -> Option<(u64, String, Option<String>, BackgroundTrace)> {
         loop {
             match self.background_receiver.recv().await {
-                Some(AgentEvent::BackgroundCompleted { id, output, label }) => {
-                    self.pending_background
-                        .push_back((id, output.clone(), label.clone()));
+                Some(AgentEvent::BackgroundCompleted {
+                    id,
+                    output,
+                    label,
+                    started_at_ms,
+                    duration_ms,
+                    exit_code,
+                    signal,
+                    status,
+                    kind,
+                }) => {
+                    let trace = BackgroundTrace {
+                        started_at_ms,
+                        duration_ms,
+                        exit_code,
+                        signal: signal.clone(),
+                        status: status.clone(),
+                        kind: kind.clone(),
+                    };
+                    self.pending_background.push_back((
+                        id,
+                        output.clone(),
+                        label.clone(),
+                        trace.clone(),
+                    ));
                     // No fanout here either: idle and mid-turn completions
                     // both land in the session log as a user message at the
                     // next turn boundary. The TUI prints this return value
                     // itself; fanning out would duplicate the line.
-                    return Some((id, output, label));
+                    return Some((id, output, label, trace));
                 }
                 Some(_) => {}
                 None => return None,
@@ -1985,6 +2096,7 @@ impl Agent {
                 session: Usage {
                     input_tokens: self.session_input_tokens,
                     output_tokens: self.session_output_tokens,
+                    ..Usage::default()
                 },
             });
         }
@@ -2160,13 +2272,43 @@ impl Agent {
     }
 
     pub(crate) fn drain_background_ready(&mut self) {
-        while let Ok(AgentEvent::BackgroundCompleted { id, output, label }) =
-            self.background_receiver.try_recv()
+        while let Ok(AgentEvent::BackgroundCompleted {
+            id,
+            output,
+            label,
+            started_at_ms,
+            duration_ms,
+            exit_code,
+            signal,
+            status,
+            kind,
+        }) = self.background_receiver.try_recv()
         {
-            self.pending_background
-                .push_back((id, output.clone(), label.clone()));
+            self.pending_background.push_back((
+                id,
+                output.clone(),
+                label.clone(),
+                BackgroundTrace {
+                    started_at_ms,
+                    duration_ms,
+                    exit_code,
+                    signal: signal.clone(),
+                    status: status.clone(),
+                    kind: kind.clone(),
+                },
+            ));
             if let Some(subscriber) = &self.subscriber {
-                let _ = subscriber.send(AgentEvent::BackgroundCompleted { id, output, label });
+                let _ = subscriber.send(AgentEvent::BackgroundCompleted {
+                    id,
+                    output,
+                    label,
+                    started_at_ms,
+                    duration_ms,
+                    exit_code,
+                    signal,
+                    status,
+                    kind,
+                });
             }
         }
     }
@@ -2176,17 +2318,25 @@ impl Agent {
     }
 
     pub(crate) fn peek_background_entry(&self) -> Option<SessionEntry> {
-        self.pending_background.front().map(|(id, output, label)| {
-            SessionEntry::BackgroundCompletion {
-                id: *id,
-                output: output.clone(),
-                label: label.clone(),
-            }
-        })
+        self.pending_background
+            .front()
+            .map(
+                |(id, output, label, trace)| SessionEntry::BackgroundCompletion {
+                    id: *id,
+                    output: output.clone(),
+                    label: label.clone(),
+                    started_at_ms: trace.started_at_ms,
+                    duration_ms: trace.duration_ms,
+                    exit_code: trace.exit_code,
+                    signal: trace.signal.clone(),
+                    status: trace.status.clone(),
+                    kind: trace.kind.clone(),
+                },
+            )
     }
 
     pub(crate) fn ack_background_entry(&mut self) {
-        if let Some((id, _output, _label)) = self.pending_background.pop_front() {
+        if let Some((id, _output, _label, _trace)) = self.pending_background.pop_front() {
             self.running_background.remove(&id);
             if let Some(record) = &self.background_record {
                 record

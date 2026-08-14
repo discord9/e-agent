@@ -20,7 +20,8 @@ use tasks::*;
 use web::*;
 
 pub use background::{
-    BackgroundTaskInfo, BackgroundTasks, OutputSlot, SpoolWindow, TaskDisplayMeta, TaskSpool,
+    BackgroundTaskInfo, BackgroundTasks, ExitSlot, OutputSlot, SpoolWindow, TaskDisplayMeta,
+    TaskExit, TaskSpool, new_exit_slot,
 };
 pub use bash::bash_tool;
 pub use file::{file_tools, undo_file_op};

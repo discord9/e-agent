@@ -11,7 +11,7 @@ use tokio::process::Command;
 
 use crate::agent::AgentEvent;
 
-use super::background::{BackgroundTasks, OutputSlot, TaskSpool, slot_append};
+use super::background::{BackgroundTasks, ExitSlot, OutputSlot, TaskExit, TaskSpool, slot_append};
 
 /// A bash tool bound to a shared background-task registry.
 /// `protect_git`: on non-Windows, `<workspace>/.git` is bound read-only for
@@ -209,6 +209,7 @@ impl Tool for Bash {
             None,
             None,
             self.sandbox.as_ref(),
+            None,
         )
         .await
         .map(ToolOutput::text)
@@ -478,6 +479,7 @@ pub(super) async fn run_bash(
     output_slot: Option<OutputSlot>,
     spool: Option<Arc<TaskSpool>>,
     sandbox: Option<&crate::config::Sandbox>,
+    exit_slot: Option<ExitSlot>,
 ) -> Result<String, String> {
     #[cfg(windows)]
     if let Some(policy) = sandbox {
@@ -491,6 +493,7 @@ pub(super) async fn run_bash(
             output_slot,
             spool,
             policy,
+            exit_slot,
         )
         .await;
     }
@@ -756,6 +759,13 @@ pub(super) async fn run_bash(
                 if let Some(slot) = &process_group_slot {
                     slot.store(0, Ordering::Release);
                 }
+                if let Some(slot) = &exit_slot {
+                    *slot.lock().unwrap() = TaskExit {
+                        exit_code: None,
+                        signal: Some("SIGKILL".into()),
+                        status: Some("killed".into()),
+                    };
+                }
                 #[cfg(unix)]
                 if let Some(error) = kill_error {
                     return Err(format!("failed to kill bash process group: {error}"));
@@ -773,6 +783,16 @@ pub(super) async fn run_bash(
     cancel_guard.disarm();
     if let Some(slot) = &process_group_slot {
         slot.store(0, Ordering::Release);
+    }
+    // Structured exit metadata via the out-slot (background tasks only):
+    // the human-readable text below stays the model-visible wire format,
+    // and the structured fields ride along as durable trace metadata.
+    if let Some(slot) = &exit_slot {
+        *slot.lock().unwrap() = TaskExit {
+            exit_code: status.code(),
+            signal: exit_signal_name(&status),
+            status: Some(exit_status_label(&status).to_owned()),
+        };
     }
     let text = format_output(status.code(), &stdout, &stderr);
     if status.success() {
@@ -890,6 +910,72 @@ pub(super) fn format_output(code: Option<i32>, stdout: &Captured, stderr: &Captu
         render_stream(stdout),
         render_stream(stderr)
     )
+}
+
+/// Structured status label for the exit out-slot: exit 0 → "completed", a
+/// non-zero exit code → "failed", a signal death → "killed". Mirrors the
+/// "exit code: N" / "exit code: signal" text in [`format_output`] without
+/// changing that model-visible wire text.
+pub(super) fn exit_status_label(status: &std::process::ExitStatus) -> &'static str {
+    if status.success() {
+        "completed"
+    } else if status.code().is_some() {
+        "failed"
+    } else {
+        "killed"
+    }
+}
+
+/// Human-readable signal name for a signal-killed exit status; `None` for
+/// normal (exit-code) completions. Linux signal numbers (this project's
+/// primary target); unknown numbers fall back to "signal N".
+#[cfg(unix)]
+pub(super) fn exit_signal_name(status: &std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(signal_name)
+}
+
+#[cfg(not(unix))]
+pub(super) fn exit_signal_name(_status: &std::process::ExitStatus) -> Option<String> {
+    None
+}
+
+/// Map a raw signal number to its conventional name (Linux table).
+#[cfg(unix)]
+fn signal_name(signal: i32) -> String {
+    const NAMES: &[(i32, &str)] = &[
+        (1, "SIGHUP"),
+        (2, "SIGINT"),
+        (3, "SIGQUIT"),
+        (4, "SIGILL"),
+        (5, "SIGTRAP"),
+        (6, "SIGABRT"),
+        (7, "SIGBUS"),
+        (8, "SIGFPE"),
+        (9, "SIGKILL"),
+        (10, "SIGUSR1"),
+        (11, "SIGSEGV"),
+        (12, "SIGUSR2"),
+        (13, "SIGPIPE"),
+        (14, "SIGALRM"),
+        (15, "SIGTERM"),
+        (17, "SIGCHLD"),
+        (18, "SIGCONT"),
+        (19, "SIGSTOP"),
+        (20, "SIGTSTP"),
+        (23, "SIGURG"),
+        (24, "SIGXCPU"),
+        (25, "SIGXFSZ"),
+        (26, "SIGVTALRM"),
+        (27, "SIGPROF"),
+        (28, "SIGWINCH"),
+        (31, "SIGSYS"),
+    ];
+    NAMES
+        .iter()
+        .find(|(number, _)| *number == signal)
+        .map(|(_, name)| (*name).to_owned())
+        .unwrap_or_else(|| format!("signal {signal}"))
 }
 
 /// Render one captured stream: the full text when it fit within the budget,
