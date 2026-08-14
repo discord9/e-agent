@@ -792,6 +792,117 @@ async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn
 }
 
 #[tokio::test]
+async fn poll_guard_main_builtins_carry_the_guard() {
+    // Main-agent builtins now carry the unchanged-snapshot poll guard with
+    // the softer 5th-poll threshold: in a [poll x5, read_file] batch the
+    // 1st and 2nd polls are normal, the 3rd and 4th return the
+    // model-facing POLL_ERROR, and the 5th returns the sentinel — the turn
+    // ends only AFTER the full sibling batch (no synthetic holes, no
+    // sentinel in history/UI), and the next run starts with a reset guard.
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("x.txt"), "hello").unwrap();
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    let (tools, _background) = crate::tools::builtins(workspace, None, false, None);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let model = ScriptedModel {
+        replies: vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![
+                    call("c1", "get_background_tasks", "{}"),
+                    call("c2", "get_background_tasks", "{}"),
+                    call("c3", "get_background_tasks", "{}"),
+                    call("c4", "get_background_tasks", "{}"),
+                    call("c5", "get_background_tasks", "{}"),
+                    call("c6", "read_file", r#"{"path":"x.txt"}"#),
+                ],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![call("c7", "get_background_tasks", "{}")],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("all done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ],
+        requests: Arc::new(Mutex::new(Vec::new())),
+        delays: Default::default(),
+    };
+    let mut agent = Agent::new(Box::new(model), tools);
+    agent.set_event_handler(Box::new(move |event| captured.lock().unwrap().push(event)));
+
+    assert_eq!(agent.run("turn one".into()).await.unwrap(), "");
+
+    let history = agent.history().to_vec();
+    let tools: Vec<&Message> = history
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Message { message } => match message {
+                Message::Tool { .. } => Some(message),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tools.len(), 6, "every sibling call has a Tool result");
+    for (idx, id) in [(0usize, "c1"), (1, "c2")] {
+        assert!(matches!(
+            tools[idx],
+            Message::Tool { call_id, content, is_error: false, synthetic: false, images, .. }
+                if call_id == id && content == "No background tasks running." && images.is_empty()
+        ));
+    }
+    for (idx, id) in [(2usize, "c3"), (3, "c4"), (4, "c5")] {
+        assert!(matches!(
+            tools[idx],
+            Message::Tool { call_id, content, is_error: true, synthetic: false, images, .. }
+                if call_id == id && content == POLL_GUARD_ERROR && images.is_empty()
+        ));
+    }
+    assert!(matches!(
+        tools[5],
+        Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
+            if call_id == "c6" && content == "hello"
+    ));
+    // No sentinel in history, no synthetic holes; termination notice emitted.
+    let serialized = serde_json::to_string(&history).unwrap();
+    assert!(!serialized.contains(POLL_GUARD_SENTINEL));
+    assert!(history.iter().all(|entry| !matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Tool {
+                synthetic: true,
+                ..
+            }
+        }
+    )));
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE
+    )));
+
+    // Next run: guard reset — c7's first poll is normal again.
+    assert_eq!(agent.run("turn two".into()).await.unwrap(), "all done");
+    let last_tool = agent.history().iter().rev().find_map(|entry| match entry {
+        SessionEntry::Message {
+            message: message @ Message::Tool { .. },
+        } => Some(message),
+        _ => None,
+    });
+    assert!(matches!(
+        last_tool,
+        Some(Message::Tool { call_id, content, is_error: false, .. })
+            if call_id == "c7" && content == "No background tasks running."
+    ));
+}
+
+#[tokio::test]
 async fn returns_invalid_arguments_and_execution_failures_to_the_model() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedModel {

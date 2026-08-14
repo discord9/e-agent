@@ -155,10 +155,11 @@ pub fn builtins_with_background(
         bash_timeout,
         self_session_id,
         // Subagents: enable the unchanged-snapshot poll guard on
-        // get_background_tasks (each subagent instance owns its tools, so
-        // guards are independent per instance; the main agent stays
-        // unguarded via `builtins`).
-        true,
+        // get_background_tasks with a 3rd-poll termination threshold (each
+        // subagent instance owns its tools, so guards are independent per
+        // instance; the main agent gets its softer 5th-poll threshold via
+        // `builtins`).
+        Some(SUBAGENT_POLL_GUARD_THRESHOLD),
     )
 }
 
@@ -182,9 +183,12 @@ fn builtins_with_exa_key(
         bash_timeout,
         // The main agent has no own session id to annotate.
         None,
-        // Main builtins carry no poll guard: repeated get_background_tasks
-        // calls never escalate.
-        false,
+        // Main builtins carry the unchanged-snapshot poll guard with a
+        // 5th-poll termination threshold: the 3rd and 4th consecutive
+        // unchanged polls return the reminder, the 5th ends the turn
+        // (softer than the subagent 3rd-poll threshold, but repeated
+        // get_background_tasks calls never poll forever).
+        Some(MAIN_POLL_GUARD_THRESHOLD),
     );
     (tools, background)
 }
@@ -217,7 +221,7 @@ fn tools_with_background_and_exa_key(
     read_only: bool,
     bash_timeout: Option<Duration>,
     self_session_id: Option<String>,
-    poll_guard: bool,
+    poll_guard: Option<u8>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools = if read_only {
         // Read-only roles get no write/edit tools at all.
