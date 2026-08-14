@@ -125,9 +125,12 @@ CREATE TABLE IF NOT EXISTS sessions (
 /// desktop-pet summarizer), scoped to (workspace, session) like
 /// `session_entries`. `append_mode` (same as `session_entries`): the
 /// primary key `(workspace_id, session_id, seq)` never repeats in practice
-/// (`seq` is a strictly monotonic per-process microsecond timestamp, see
-/// [`next_event_time_us`]), and append mode keeps a same-PK retry from
-/// silently overwriting. The read path is a plain `GROUP BY session_id,
+/// and append mode keeps a same-PK retry from silently overwriting. For
+/// "regular"/"compact" rows `seq` is the just-committed assistant/compaction
+/// entry's actual `session_entries.seq` (threaded from the runner's commit
+/// result); "summarizer" rows have no committed entry and fall back to the
+/// strictly monotonic per-process microsecond clock ([`next_event_time_us`]).
+/// The read path is a plain `GROUP BY session_id,
 /// model, kind` aggregate ([`Self::usage_summary`]).
 ///
 /// The per-call enrichment columns (`cache_hit_tokens`/`cache_miss_tokens`/

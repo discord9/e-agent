@@ -134,13 +134,15 @@ CREATE TABLE IF NOT EXISTS sessions (
 /// call whose usage is worth accounting (regular turns, compactions, the
 /// desktop-pet summarizer), scoped to (workspace, session) like
 /// `session_entries`. The primary key carries only `(workspace_id,
-/// session_id, seq)` (no `event_time_us`): `seq` is a strictly monotonic
-/// per-process microsecond timestamp (see [`next_event_time_us`]) reused
-/// as the row sequence, so within one process no two rows of the same
-/// session can collide. Across processes sharing one database file a
-/// same-microsecond write would collide loudly (a real INSERT error) — the
-/// write is best-effort and the runner is single-writer per session, so
-/// this is acceptable, exactly like the `sessions` snapshot PK.
+/// session_id, seq)` (no `event_time_us`). For "regular"/"compact" rows `seq`
+/// is the just-committed assistant/compaction entry's actual
+/// `session_entries.seq` (threaded from the runner's commit result);
+/// "summarizer" rows have no committed entry and fall back to the strictly
+/// monotonic per-process microsecond clock ([`next_event_time_us`]), so within
+/// one process no two rows of the same session can collide. Across processes
+/// sharing one database file a same-seq write would collide loudly (a real
+/// INSERT error) — the write is best-effort and the runner is single-writer
+/// per session, so this is acceptable, exactly like the `sessions` snapshot PK.
 ///
 /// The read path is a plain `GROUP BY session_id, model, kind` aggregate
 /// ([`Self::usage_summary`]); no per-seq dedup is needed.

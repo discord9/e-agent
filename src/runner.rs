@@ -571,9 +571,8 @@ impl SessionRunner {
         // The just-committed entry's real `session_entries.seq` (the ordinal
         // the backend assigned): threaded into `append_usage` so a usage row
         // carries the ACTUAL seq of the assistant/compaction entry it
-        // corresponds to. `None` only on backends without a usable seq
-        // (JSONL has no usage table, so callers fall back to the event-time
-        // clock there).
+        // corresponds to. `None` on JSONL, which has no usage table at all —
+        // its `append_usage` is a silent no-op, so no usage row is written.
         let committed_seq = location.as_ref().and_then(|loc| match &loc.key {
             LocatedKey::Greptime { seq, .. } | LocatedKey::Sqlite { seq, .. } => Some(*seq),
             LocatedKey::Jsonl { .. } => None,
