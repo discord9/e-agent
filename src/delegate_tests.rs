@@ -1415,6 +1415,8 @@ async fn read_only_role_subagent_gets_no_write_tools_and_a_read_only_system_note
         request.contains("get_background_tasks") && request.contains("cancel_background_task"),
         "{request}"
     );
+    // The always-on read_output pager rides on read-only subagents too.
+    assert!(request.contains("\"read_output\""), "{request}");
     // The system prompt carries the read-only declaration.
     assert!(
         request.contains(

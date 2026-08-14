@@ -5,6 +5,9 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
+use crate::output_receipt::{FieldId, ReceiptCodec, bound_field};
+use crate::session_store::EntryLocation;
+
 /// Content of the synthetic error result inserted for every tool call left
 /// unanswered by an interrupted turn (cancel, provider error, crash). Also
 /// the legacy marker: sessions written before the `synthetic` flag existed
@@ -18,6 +21,26 @@ const INTERRUPTED: &str = "[turn interrupted before a tool result was produced]"
 /// activity, which keeps the agent working after the compaction.
 const RETAIN_TAIL: usize = 20;
 
+/// How a session's compaction chooses its retained tail. The mode is set
+/// explicitly by the caller — it is NEVER inferred from the history (a
+/// user-count heuristic misclassifies a main session whose FIRST turn is a
+/// long tool loop, compacting its sole prompt away).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompactionMode {
+    /// Main-agent sessions (SessionFactory/REPL/TUI/web and btw forks): the
+    /// current prompt is the LAST actual-user message, and compaction keeps
+    /// the whole current turn verbatim — even when it is the session's
+    /// first and only user turn.
+    #[default]
+    Main,
+    /// Delegated subagent sessions: a single initial prompt followed by a
+    /// tool-call loop (and, after the first compaction, no actual user in
+    /// the retained tail at all). Compaction keeps a recent tail of tool
+    /// activity instead of a user turn, and repeated compaction works
+    /// without any retained actual user.
+    SingleTask,
+}
+
 /// Compaction summary prompt. The trailing sentence is a positive
 /// constraint: output the summary body directly, never narrate the plan to
 /// summarize (the metadiscourse-stub accident shape).
@@ -26,6 +49,9 @@ const COMPACTION_SUMMARY_PROMPT: &str = "Summarize the earlier conversation. Pre
 /// Insert a synthetic error result for every tool call left unanswered by an
 /// interrupted turn (cancel, provider error, crash), so the derived context
 /// always satisfies the provider's tool_call/tool-result pairing rule.
+/// Test-facing: production projection uses the item-aware
+/// [`repair_item_pairs`] so located metadata stays aligned.
+#[cfg(test)]
 pub(crate) fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
     fn flush(pending: &mut Vec<ToolCall>, out: &mut Vec<Message>) {
         for call in pending.drain(..) {
@@ -83,6 +109,64 @@ pub(crate) fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
             Message::System { .. } | Message::User { .. } => {
                 flush(&mut pending, &mut out);
                 out.push(message);
+            }
+        }
+    }
+    flush(&mut pending, &mut out);
+    out
+}
+
+/// Item-aware tool-call pairing repair: the same rules as
+/// [`repair_tool_pairs`], applied to [`ContextItem`]s so the located
+/// metadata stays aligned with the surviving messages. Synthetic
+/// placeholders carry no located key and are never bounded.
+fn repair_item_pairs(items: Vec<ContextItem>) -> Vec<ContextItem> {
+    fn flush(pending: &mut Vec<ToolCall>, out: &mut Vec<ContextItem>) {
+        for call in pending.drain(..) {
+            out.push(ContextItem {
+                message: Message::Tool {
+                    call_id: call.id,
+                    name: call.name,
+                    content: INTERRUPTED.into(),
+                    images: vec![],
+                    is_error: true,
+                    synthetic: true,
+                },
+                prefix: String::new(),
+                location: None,
+                field: None,
+                field_total: None,
+                actual_user: false,
+                keep_full: false,
+            });
+        }
+    }
+
+    let mut out = Vec::with_capacity(items.len());
+    let mut pending: Vec<ToolCall> = Vec::new();
+    for item in items {
+        match &item.message {
+            Message::Tool {
+                call_id,
+                synthetic: true,
+                ..
+            } => {
+                let _ = call_id;
+            }
+            Message::Tool { call_id, .. } => {
+                if pending.iter().any(|call| call.id == *call_id) {
+                    pending.retain(|call| &call.id != call_id);
+                    out.push(item);
+                }
+            }
+            Message::Assistant(assistant) => {
+                flush(&mut pending, &mut out);
+                pending = assistant.tool_calls.clone();
+                out.push(item);
+            }
+            Message::System { .. } | Message::User { .. } => {
+                flush(&mut pending, &mut out);
+                out.push(item);
             }
         }
     }
@@ -654,6 +738,28 @@ pub enum SessionEntry {
         /// The turn kept verbatim for the model context; not rendered again
         /// in the TUI (it duplicates messages already before this entry).
         retained: Vec<Message>,
+        /// Provenance of the current turn inside `retained`: the index of
+        /// the actual user prompt that opens the retained tail (`Some(0)`
+        /// for main-session compactions, where the split is the last
+        /// actual-user message). `None` when the retained tail is a
+        /// subagent tool-activity window that contains no actual user, or
+        /// for compactions persisted before this field existed (the
+        /// projection then falls back to the first user-shaped retained
+        /// message). Written by `prepare_compaction` from the context
+        /// items' actual-user provenance and read back on resume, so the
+        /// retained projection never has to guess which retained message
+        /// is the current prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_prompt_at: Option<usize>,
+        /// Distinguishes "known to contain NO current prompt" from "legacy
+        /// provenance absent": a single-task retained tail (tool window
+        /// with no actual user) sets this true, so the resume projection
+        /// never falls back to the first user-shaped retained message — a
+        /// retained background completion must not be misread as the
+        /// current prompt. `false` (legacy compactions persisted before
+        /// this field existed) keeps the user-shaped fallback.
+        #[serde(default, skip_serializing_if = "is_false")]
+        no_current_prompt: bool,
     },
     /// A system-injected notice (background completion, task-kill report)
     /// rendered in the TUI as a dim line and surfaced to the model as a
@@ -663,8 +769,12 @@ pub enum SessionEntry {
     },
     /// A structured background completion entry. Persisted in the session
     /// log with the full output. The TUI renders a truncated preview; the
-    /// model context sees the full text. Backwards-compatible: old
-    /// `Notice` entries are read without guessing string prefixes.
+    /// provider REQUEST copy bounds the output (UTF-8-safe head+tail plus a
+    /// MAC-protected `read_output` receipt, see
+    /// [`crate::output_receipt`]) so an oversized completion can never
+    /// blow up the provider context — the persisted entry stays full.
+    /// Backwards-compatible: old `Notice` entries are read without guessing
+    /// string prefixes.
     BackgroundCompletion {
         id: u64,
         output: String,
@@ -702,6 +812,13 @@ impl From<Message> for SessionEntry {
     fn from(message: Message) -> Self {
         Self::Message { message }
     }
+}
+
+/// `skip_serializing_if` helper for the `no_current_prompt` marker: false
+/// (legacy) compactions keep the old wire shape (no field), so persisted
+/// sessions and the history-response JSON are unchanged.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// True for entries that end a completed turn: an assistant message with no
@@ -810,6 +927,51 @@ pub(crate) struct CompactionOutput {
     pub(crate) usage: Option<Usage>,
 }
 
+/// One provider-context message plus the metadata the bounded projection
+/// needs: the source entry's located key (when one exists), the eligible
+/// field, the never-bounded message prefix, and whether the message is an
+/// actual user message (the CURRENT one is always kept full).
+struct ContextItem {
+    message: Message,
+    /// Leading text of `message` that is never bounded (e.g. the
+    /// `[background task N completed]` header); the field starts at
+    /// `message.content[prefix.len()..]`. Empty for plain messages.
+    prefix: String,
+    /// Located key of the persisted source entry (`None` for legacy/
+    /// test in-memory entries and synthesized messages — such fields stay
+    /// full).
+    location: Option<EntryLocation>,
+    /// The field to bound; `None` derives from the message kind (user /
+    /// assistant / tool content). System messages are never bounded.
+    field: Option<FieldId>,
+    /// The FULL field byte length the receipt must bind. `None` = the
+    /// field is exactly this message's own content (`text.len()`); for a
+    /// message inside a compaction's retained tail, the receipt binds the
+    /// whole persisted `compaction_retained` array length (what
+    /// `read_output` returns).
+    field_total: Option<usize>,
+    /// True for real `Message::User` history entries (NOT background
+    /// completion / notice projections). The last actual-user item is the
+    /// current prompt and stays full.
+    actual_user: bool,
+    /// Never bound (current actual user).
+    keep_full: bool,
+}
+
+impl ContextItem {
+    fn system(message: Message) -> Self {
+        Self {
+            message,
+            prefix: String::new(),
+            location: None,
+            field: None,
+            field_total: None,
+            actual_user: false,
+            keep_full: false,
+        }
+    }
+}
+
 pub struct Agent {
     model: Box<dyn Model>,
     tools: Vec<Box<dyn Tool>>,
@@ -848,6 +1010,23 @@ pub struct Agent {
     /// "never set" from "cleared", so the provider context can override a
     /// stale compaction summary that still mentions the old goal.
     goal_cleared: bool,
+    /// Exact physical located keys of the persisted history, aligned 1:1
+    /// with `history` (`None` = the entry has no located key: legacy/test
+    /// in-memory entries, entries pushed without a location). The bounded
+    /// provider projection turns a `Some` location into a MAC-protected
+    /// `eout1` receipt; a `None` location leaves the field full.
+    entry_locations: Vec<Option<EntryLocation>>,
+    /// The `eout1` receipt codec used by [`Self::context_request`] and
+    /// `prepare_compaction`'s bounded request. `None` (tests, or when the
+    /// state-dir key is unavailable) disables bounding: oversized fields
+    /// stay full and no receipts are issued. The runner clones it for
+    /// `read_output` verification.
+    receipt_codec: Option<ReceiptCodec>,
+    /// How compaction picks its retained tail (see [`CompactionMode`]).
+    /// Set by the caller — never inferred from the history. Main by
+    /// default; delegated subagents (src/delegate.rs) opt into
+    /// `SingleTask`.
+    compaction_mode: CompactionMode,
 }
 
 impl Agent {
@@ -879,7 +1058,34 @@ impl Agent {
             context_prefix: None,
             goal: None,
             goal_cleared: false,
+            entry_locations: Vec::new(),
+            receipt_codec: None,
+            compaction_mode: CompactionMode::Main,
         }
+    }
+
+    /// Set the compaction mode explicitly (see [`CompactionMode`]). Main by
+    /// default; delegated subagents call this with `SingleTask`. The mode
+    /// must come from the caller's session kind, never from a heuristic on
+    /// the history contents.
+    pub fn with_compaction_mode(mut self, mode: CompactionMode) -> Self {
+        self.compaction_mode = mode;
+        self
+    }
+
+    /// Install the `eout1` receipt codec used for bounded provider
+    /// projections (the runner/`read_output` verifier uses the same key).
+    /// `None` disables bounding (fields stay full). Production callers pass
+    /// `ReceiptCodec::load().ok()`; tests pass a codec from a tempdir key.
+    pub fn with_receipt_codec(mut self, codec: Option<ReceiptCodec>) -> Self {
+        self.receipt_codec = codec;
+        self
+    }
+
+    /// The installed receipt codec (the runner clones it for `read_output`
+    /// verification, so the agent and its runner always share one key).
+    pub(crate) fn receipt_codec(&self) -> Option<&ReceiptCodec> {
+        self.receipt_codec.as_ref()
     }
 
     /// Extra system context prepended to every model call. Not persisted in
@@ -954,13 +1160,36 @@ impl Agent {
 
     /// Replace the whole history (session resume). To ADD one entry to an
     /// already-loaded history, use [`Self::push_entry`] — calling this again
-    /// would wipe the restored entries.
+    /// would wipe the restored entries. Resets the located metadata to
+    /// "no located keys" (call [`Self::restore_locations`] right after when
+    /// the locations are known).
     pub fn restore_history(&mut self, history: Vec<SessionEntry>) {
         let history = Self::migrate_legacy_placeholders(history);
         let (goal, cleared) = Self::fold_goal(&history);
         self.goal = goal;
         self.goal_cleared = cleared;
+        self.entry_locations = vec![None; history.len()];
         self.history = history;
+    }
+
+    /// Restore the exact physical located keys aligned with the history
+    /// restored by [`Self::restore_history`]. Must be called with a vector
+    /// of the same length; defensive truncation keeps the alignment
+    /// invariant when a caller passes a mismatched length (missing/extra
+    /// entries then read as unlocated, which only disables receipts).
+    pub fn restore_locations(&mut self, locations: Vec<Option<EntryLocation>>) {
+        self.entry_locations = locations;
+        self.entry_locations.resize(self.history.len(), None);
+    }
+
+    /// Restore history + locations in one call (the session-resume path).
+    pub fn restore_located(
+        &mut self,
+        history: Vec<SessionEntry>,
+        locations: Vec<Option<EntryLocation>>,
+    ) {
+        self.restore_history(history);
+        self.restore_locations(locations);
     }
 
     /// Latest goal snapshot folded from the history (`None` = none/cleared).
@@ -992,8 +1221,28 @@ impl Agent {
     }
 
     /// Append a single entry to the history (e.g. a startup notice injected
-    /// after resume).
+    /// after resume). The entry has no located key: its oversized fields
+    /// stay FULL in provider projections (the total-budget stage will fail
+    /// closed later). When the entry IS persisted, prefer
+    /// [`Self::apply_entry_located`] so receipts can be issued.
     pub fn push_entry(&mut self, entry: SessionEntry) {
+        self.entry_locations.push(None);
+        self.history.push(entry);
+    }
+
+    /// Apply one entry with its exact physical located key (the runner's
+    /// durable-append path: the store's `append_located` resolved before
+    /// this, so a receipt emitted later always points at a persisted row).
+    pub(crate) fn apply_entry_located(
+        &mut self,
+        entry: SessionEntry,
+        location: Option<EntryLocation>,
+    ) {
+        if let SessionEntry::GoalUpdated { goal } = &entry {
+            self.goal = goal.clone();
+            self.goal_cleared = goal.is_none();
+        }
+        self.entry_locations.push(location);
         self.history.push(entry);
     }
 
@@ -1045,13 +1294,52 @@ impl Agent {
     }
 
     /// Messages sent to the provider: the latest compaction summary plus
-    /// everything after it.
+    /// everything after it. This is the canonical, FULL/LOSSLESS projection
+    /// (the session goal is folded in first; oversized persisted fields are
+    /// NOT bounded here). Provider request copies are bounded by
+    /// [`Self::context_request`]; `prepare_compaction` keeps this full view
+    /// for its retained tail and slices the bounded copy for the request.
     pub fn context(&self) -> Vec<Message> {
-        let mut messages = Vec::new();
+        self.repaired_items()
+            .into_iter()
+            .map(|item| item.message)
+            .collect()
+    }
+
+    /// The bounded provider request copy: identical to [`Self::context`]
+    /// except that eligible oversized persisted fields (background
+    /// completion output, tool content, notice text, historical
+    /// user/assistant content, compaction summary/retained) are projected
+    /// as a UTF-8-safe head+tail plus a MAC-protected `eout1` receipt
+    /// (`read_output` ref). System messages, the session goal, the CURRENT
+    /// actual user message, tool call ids/names/arguments, reasoning, and
+    /// images are kept exact. A field is left full when no located key
+    /// exists for its entry or when the receipt codec is unavailable —
+    /// never an unusable ref.
+    pub fn context_request(&self) -> Vec<Message> {
+        self.repaired_items()
+            .into_iter()
+            .map(|item| self.project_item(&item))
+            .collect()
+    }
+
+    /// [`Self::context_items`] with tool-call pairing repaired (the same
+    /// `repair_tool_pairs` pass, item-aware so the located metadata stays
+    /// aligned with the surviving messages).
+    fn repaired_items(&self) -> Vec<ContextItem> {
+        repair_item_pairs(self.context_items())
+    }
+
+    /// One item per provider message, in context order, carrying the
+    /// located key of the source entry (when one exists), the eligible
+    /// field, the never-bounded message prefix, and the actual-user flag
+    /// that keeps the CURRENT user prompt full.
+    fn context_items(&self) -> Vec<ContextItem> {
+        let mut items = Vec::new();
         if let Some(prefix) = &self.context_prefix {
-            messages.push(Message::System {
+            items.push(ContextItem::system(Message::System {
                 content: prefix.clone(),
-            });
+            }));
         }
         // The session goal is projected into EVERY provider call (before
         // compaction summaries, so it survives compaction and resume). It
@@ -1059,13 +1347,13 @@ impl Agent {
         // After a clear, an explicit "none (cleared)" override is injected
         // so a stale compaction summary can never re-introduce the old goal.
         if let Some(goal) = &self.goal {
-            messages.push(Message::System {
+            items.push(ContextItem::system(Message::System {
                 content: format!("[session goal]\n{}", goal_projection_text(goal)),
-            });
+            }));
         } else if self.goal_cleared {
-            messages.push(Message::System {
+            items.push(ContextItem::system(Message::System {
                 content: "[session goal]\nnone (cleared)".into(),
-            });
+            }));
         }
         let mut start = 0;
         if let Some(index) = self
@@ -1073,56 +1361,223 @@ impl Agent {
             .iter()
             .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
         {
-            let SessionEntry::Compaction { summary, retained } = &self.history[index] else {
+            let SessionEntry::Compaction {
+                summary,
+                retained,
+                current_prompt_at,
+                no_current_prompt,
+            } = &self.history[index]
+            else {
                 unreachable!()
             };
-            messages.push(Message::User {
-                content: format!("[compacted summary of earlier conversation]\n{summary}"),
-                images: vec![],
+            let location = self
+                .entry_locations
+                .get(index)
+                .and_then(|location| location.clone());
+            let header = "[compacted summary of earlier conversation]\n";
+            items.push(ContextItem {
+                message: Message::User {
+                    content: format!("{header}{summary}"),
+                    images: vec![],
+                },
+                prefix: header.to_owned(),
+                location: location.clone(),
+                field: Some(FieldId::CompactionSummary),
+                field_total: None,
+                actual_user: false,
+                keep_full: false,
             });
-            messages.extend(retained.iter().cloned());
+            // The compaction's retained tail is persisted inside the
+            // compaction entry: its located key is the compaction entry's,
+            // and the paged field is the FULL retained array
+            // (`compaction_retained`). The receipt for any bounded retained
+            // message binds the whole array's byte length (what read_output
+            // returns), not the single message's content length.
+            let retained_total = serde_json::to_vec(retained)
+                .map(|bytes| bytes.len())
+                .unwrap_or(0);
+            // The actual-user provenance of the retained tail is persisted
+            // in the compaction entry (`current_prompt_at`: the index of
+            // the current prompt inside `retained`). For legacy compactions
+            // persisted before the field existed, fall back to the first
+            // user-shaped retained message (the retained tail opens with
+            // the current prompt for main sessions). A SINGLE-TASK retained
+            // tail carries no real user at all: the explicit
+            // `no_current_prompt` marker keeps the projection from falling
+            // back — a retained background completion is user-shaped but is
+            // never the current prompt.
+            let current_prompt_at = match (current_prompt_at, no_current_prompt) {
+                (Some(index), _) => Some(*index),
+                (None, true) => None,
+                (None, false) => retained
+                    .iter()
+                    .position(|message| matches!(message, Message::User { .. })),
+            };
+            for (i, message) in retained.iter().enumerate() {
+                let is_user = matches!(message, Message::User { .. });
+                items.push(ContextItem {
+                    message: message.clone(),
+                    prefix: String::new(),
+                    location: location.clone(),
+                    field: Some(FieldId::CompactionRetained),
+                    field_total: Some(retained_total),
+                    actual_user: is_user && Some(i) == current_prompt_at,
+                    keep_full: false,
+                });
+            }
             start = index + 1;
         }
-        messages.extend(
-            self.history[start..]
-                .iter()
-                .filter_map(|entry| match entry {
-                    SessionEntry::Message { message } => Some(message.clone()),
-                    SessionEntry::Compaction { .. } => None,
-                    // Notices are system-injected events; surface them to the
-                    // model as user messages so the model reacts to background
-                    // completions and task-death notices.
-                    SessionEntry::Notice { text } => Some(Message::User {
+        for (i, entry) in self.history[start..].iter().enumerate() {
+            let i = start + i;
+            let location = self
+                .entry_locations
+                .get(i)
+                .and_then(|location| location.clone());
+            match entry {
+                SessionEntry::Message { message } => items.push(ContextItem {
+                    message: message.clone(),
+                    prefix: String::new(),
+                    location,
+                    field: None,
+                    field_total: None,
+                    actual_user: matches!(message, Message::User { .. }),
+                    keep_full: false,
+                }),
+                // Notices are system-injected events; surface them to the
+                // model as user messages so the model reacts to background
+                // completions and task-death notices. Arbitrary
+                // user/session Notices pass through the same projection
+                // (field = the whole text).
+                SessionEntry::Notice { text } => items.push(ContextItem {
+                    message: Message::User {
                         content: text.clone(),
                         images: vec![],
-                    }),
-                    // Structured background completions: same surface as
-                    // before, but derived from the structured variant rather
-                    // than a string-prefixed Notice.
-                    SessionEntry::BackgroundCompletion { id, output, label } => {
-                        let header =
-                            match label.as_ref().map(|l| l.trim()).filter(|l| !l.is_empty()) {
-                                Some(l) => format!("[background task {id} completed: {l}]"),
-                                None => format!("[background task {id} completed]"),
-                            };
-                        Some(Message::User {
+                    },
+                    prefix: String::new(),
+                    location,
+                    field: Some(FieldId::NoticeText),
+                    field_total: None,
+                    actual_user: false,
+                    keep_full: false,
+                }),
+                // Structured background completions: same surface as
+                // before, but the header (id + label) is never bounded —
+                // only the output field carries a receipt when oversized.
+                SessionEntry::BackgroundCompletion { id, output, label } => {
+                    let header = match label.as_ref().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+                        Some(l) => format!("[background task {id} completed: {l}]"),
+                        None => format!("[background task {id} completed]"),
+                    };
+                    items.push(ContextItem {
+                        message: Message::User {
                             content: format!("{header}\n{output}"),
                             images: vec![],
-                        })
-                    }
-                    // Fork provenance is audit/display only; never put it on
-                    // the provider wire.
-                    SessionEntry::ForkedFrom { .. } => None,
-                    // Harness errors are audit-only: they never enter the
-                    // provider context (a failed call must not leak its own
-                    // error text into the next call).
-                    SessionEntry::Error { .. } => None,
-                    // Goal updates are projected at the front of context();
-                    // replaying them here would duplicate the projection.
-                    SessionEntry::GoalUpdated { .. } => None,
-                }),
-        );
-        repair_tool_pairs(messages)
+                        },
+                        prefix: format!("{header}\n"),
+                        location,
+                        field: Some(FieldId::BgOutput),
+                        field_total: None,
+                        actual_user: false,
+                        keep_full: false,
+                    });
+                }
+                // Fork provenance is audit/display only; never put it on
+                // the provider wire.
+                SessionEntry::ForkedFrom { .. } => {}
+                // Compactions other than the newest one cannot appear after
+                // `start` (rposition found the last); defensive no-op.
+                SessionEntry::Compaction { .. } => {}
+                // Harness errors are audit-only: they never enter the
+                // provider context (a failed call must not leak its own
+                // error text into the next call).
+                SessionEntry::Error { .. } => {}
+                // Goal updates are projected at the front of context();
+                // replaying them here would duplicate the projection.
+                SessionEntry::GoalUpdated { .. } => {}
+            }
+        }
+        // The CURRENT actual user message (the current turn's prompt) is
+        // always kept full: mark the LAST actual-user item.
+        if let Some(last) = items.iter().rposition(|item| item.actual_user) {
+            items[last].keep_full = true;
+        }
+        items
+    }
+
+    /// Project one context item to its bounded request copy (see
+    /// [`Self::context_request`] for the rules).
+    fn project_item(&self, item: &ContextItem) -> Message {
+        if item.keep_full {
+            return item.message.clone();
+        }
+        let field = match item.field {
+            Some(field) => field,
+            None => match &item.message {
+                Message::User { .. } => FieldId::UserContent,
+                Message::Assistant(_) => FieldId::AssistantContent,
+                Message::Tool { .. } => FieldId::ToolContent,
+                Message::System { .. } => return item.message.clone(),
+            },
+        };
+        // Receipt only when a located key exists; a legacy/test in-memory
+        // entry without a key stays FULL (the total-budget stage will fail
+        // closed later). Same for an unavailable receipt codec.
+        let Some(codec) = &self.receipt_codec else {
+            return item.message.clone();
+        };
+        let Some(location) = &item.location else {
+            return item.message.clone();
+        };
+        let field_total = |text_len: usize| item.field_total.unwrap_or(text_len);
+        match &item.message {
+            Message::User { content, images } => {
+                let rest = &content[item.prefix.len()..];
+                let bounded = bound_field(codec, rest, location, field, field_total(rest.len()));
+                Message::User {
+                    content: format!("{}{}", item.prefix, bounded),
+                    images: images.clone(),
+                }
+            }
+            Message::Assistant(assistant) => {
+                debug_assert!(item.prefix.is_empty());
+                let mut assistant = assistant.clone();
+                if let Some(content) = &assistant.content {
+                    assistant.content = Some(bound_field(
+                        codec,
+                        content,
+                        location,
+                        field,
+                        field_total(content.len()),
+                    ));
+                }
+                Message::Assistant(assistant)
+            }
+            Message::Tool {
+                call_id,
+                name,
+                content,
+                images,
+                is_error,
+                synthetic,
+            } => {
+                debug_assert!(item.prefix.is_empty());
+                Message::Tool {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    content: bound_field(
+                        codec,
+                        content,
+                        location,
+                        field,
+                        field_total(content.len()),
+                    ),
+                    images: images.clone(),
+                    is_error: *is_error,
+                    synthetic: *synthetic,
+                }
+            }
+            Message::System { .. } => item.message.clone(),
+        }
     }
 
     pub fn subscribe(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
@@ -1192,12 +1647,16 @@ impl Agent {
         // a failed compaction doesn't permanently prevent future attempts.
         self.auto_compacted = false;
         if !prompt.is_empty() {
-            self.history.push(
+            // Direct-Agent path (tests / Agent::run): no durable store, so
+            // no located key — the current prompt stays FULL anyway (the
+            // current actual user is never bounded).
+            self.apply_entry_located(
                 Message::User {
                     content: prompt,
                     images: vec![],
                 }
                 .into(),
+                None,
             );
         }
         let specs: Vec<_> = self.tools.iter().map(|tool| tool.spec()).collect();
@@ -1232,62 +1691,99 @@ impl Agent {
     }
 
     pub(crate) async fn prepare_compaction(&mut self) -> anyhow::Result<CompactionOutput> {
-        let context = self.context();
-        let Some(last_user) = context
-            .iter()
-            .rposition(|message| matches!(message, Message::User { .. }))
-        else {
-            anyhow::bail!("nothing to compact");
-        };
+        // The canonical FULL context (lossless; never bounded here) and its
+        // item metadata. The bounded compaction REQUEST is derived from the
+        // same items below; the retained tail stays the full message slice.
+        let items = self.repaired_items();
+        let context: Vec<Message> = items.iter().map(|item| item.message.clone()).collect();
         // `split` is the retained-tail start: everything before it is
         // compacted, everything from it on stays verbatim in the context.
-        let split = if last_user > 0 {
-            // Main-agent sessions: the current turn starts at the last user
-            // message; compact everything before it and keep that turn
-            // verbatim.
-            last_user
-        } else {
-            // Subagent sessions are single-task: the only User message is
-            // the initial prompt (index 0) and the rest of the history is a
-            // tool-call loop, so there is no "conversation before the
-            // current turn" to compact. Compact everything except a
-            // retained tail of the most recent tool activity.
-            let start = context.len().saturating_sub(RETAIN_TAIL);
-            if start == 0 {
-                // The whole context fits in the retained tail — nothing
-                // left to compact.
-                anyhow::bail!("nothing to compact");
+        // The split is driven by the session's EXPLICIT compaction mode
+        // (never by a user-count heuristic, which misclassifies a main
+        // session whose FIRST turn is a long tool loop) and, within the
+        // Main branch, by ACTUAL-USER provenance — never by message shape:
+        // background completions and notices are projected as user
+        // messages, so "last user-shaped message" would happily compact the
+        // current turn when a completion arrived after the prompt. The last
+        // actual-user item IS the current prompt.
+        let split = match self.compaction_mode {
+            CompactionMode::Main => {
+                // Main-agent sessions: the current turn starts at the last
+                // actual-user message; compact everything before it and
+                // keep that turn verbatim — even when it is the session's
+                // FIRST (and only) user turn, so a long tool loop can never
+                // compact its own prompt away.
+                let Some(last_actual_user) = items.iter().rposition(|item| item.actual_user) else {
+                    anyhow::bail!("nothing to compact");
+                };
+                last_actual_user
             }
-            // The retained tail must start on an Assistant message so every
-            // retained Tool result has a matching tool_call in the window
-            // (and the compacted window ends on a completed tool pair).
-            // Scan forward from the cut for the first Assistant; if the tail
-            // window contains none (degenerate all-Tool tail), extend the
-            // search backward to the nearest Assistant.
-            match context[start..]
-                .iter()
-                .position(|message| matches!(message, Message::Assistant(_)))
-            {
-                Some(offset) => start + offset,
-                None => match context[..start]
+            CompactionMode::SingleTask => {
+                // Single-task (subagent) sessions: the initial prompt is
+                // the only real user and the rest of the history is a
+                // tool-call loop (the System context prefix is never a
+                // user), so there is no "conversation before the current
+                // turn" to compact — and after the first compaction the
+                // retained tail contains NO actual user at all, so repeated
+                // compaction must work without one. Compact everything
+                // except a retained tail of the most recent tool activity
+                // (which contains no real user).
+                let start = context.len().saturating_sub(RETAIN_TAIL);
+                if start == 0 {
+                    // The whole context fits in the retained tail — nothing
+                    // left to compact.
+                    anyhow::bail!("nothing to compact");
+                }
+                // The retained tail must start on an Assistant message so
+                // every retained Tool result has a matching tool_call in
+                // the window (and the compacted window ends on a completed
+                // tool pair). Scan forward from the cut for the first
+                // Assistant; if the tail window contains none (degenerate
+                // all-Tool tail), extend the search backward to the nearest
+                // Assistant.
+                match context[start..]
                     .iter()
-                    .rposition(|message| matches!(message, Message::Assistant(_)))
+                    .position(|message| matches!(message, Message::Assistant(_)))
                 {
-                    Some(index) => index,
-                    None => anyhow::bail!("nothing to compact"),
-                },
+                    Some(offset) => start + offset,
+                    None => match context[..start]
+                        .iter()
+                        .rposition(|message| matches!(message, Message::Assistant(_)))
+                    {
+                        Some(index) => index,
+                        None => anyhow::bail!("nothing to compact"),
+                    },
+                }
             }
         };
         // Skip the context prefix (System messages) — only compact if
         // there is actual conversation history (at least one assistant or
-        // tool message) before the retained window.
-        if !context[..split]
-            .iter()
-            .any(|msg| matches!(msg, Message::Assistant(_) | Message::Tool { .. }))
-        {
+        // tool message). SingleTask compacts everything before the
+        // retained tool window, so the pre-window decides. Main keeps the
+        // whole current turn (from the last actual user on) verbatim, so a
+        // FIRST turn that is a long tool loop must still compact with the
+        // whole turn — prompt included — retained: the check then covers
+        // the whole context, not just the pre-window.
+        let has_conversation = |messages: &[Message]| {
+            messages
+                .iter()
+                .any(|msg| matches!(msg, Message::Assistant(_) | Message::Tool { .. }))
+        };
+        let compactable = match self.compaction_mode {
+            CompactionMode::Main => has_conversation(&context),
+            CompactionMode::SingleTask => has_conversation(&context[..split]),
+        };
+        if !compactable {
             anyhow::bail!("nothing to compact");
         }
-        let mut request = context[..split].to_vec();
+        // The compaction REQUEST is the bounded projection of everything
+        // before the retained window: oversized persisted fields are
+        // head+tail + receipt, exactly like a normal provider call. The
+        // persisted Compaction.retained below is the FULL context slice.
+        let mut request: Vec<Message> = items[..split]
+            .iter()
+            .map(|item| self.project_item(item))
+            .collect();
         // Only non-vision models need image stripping on the compaction
         // request itself (the wire gate would otherwise reject it). The
         // persisted history and the retained tail keep images untouched:
@@ -1327,6 +1823,17 @@ impl Agent {
             entry: SessionEntry::Compaction {
                 summary: summary.clone(),
                 retained: retained.to_vec(),
+                // Preserve the actual-user provenance through the
+                // persisted entry: the retained tail opens with the
+                // current prompt exactly when the split landed on an
+                // actual-user item (main sessions). Single-task
+                // tool-window tails carry no actual user → `None`, plus
+                // the explicit `no_current_prompt` marker so a resume
+                // never falls back to the first user-shaped retained
+                // message (a retained background completion must not be
+                // misread as the current prompt).
+                current_prompt_at: items[split].actual_user.then_some(0),
+                no_current_prompt: !items[split].actual_user,
             },
             summary,
             usage,
@@ -1342,11 +1849,7 @@ impl Agent {
     }
 
     pub(crate) fn apply_entry(&mut self, entry: SessionEntry) {
-        if let SessionEntry::GoalUpdated { goal } = &entry {
-            self.goal = goal.clone();
-            self.goal_cleared = goal.is_none();
-        }
-        self.history.push(entry);
+        self.apply_entry_located(entry, None);
     }
 
     pub(crate) fn apply_usage(&mut self, usage: Option<Usage>, refresh_context: bool) {
@@ -1393,7 +1896,10 @@ impl Agent {
     }
 
     fn push_message(&mut self, message: Message) {
-        self.history.push(message.into());
+        // Direct-Agent paths (tests / compact()): the entry is not tracked
+        // by a durable store here, so it has no located key — oversized
+        // fields stay FULL in projections (never an unusable receipt ref).
+        self.apply_entry_located(message.into(), None);
     }
 
     fn record_usage(&mut self, usage: Option<Usage>, refresh_context: bool) {
@@ -1428,7 +1934,10 @@ impl Agent {
         specs: &[ToolSpec],
     ) -> anyhow::Result<RoundOutput> {
         let mut produced_content_delta = false;
-        let mut context = self.context();
+        // The BOUNDED request copy: canonical `context()` stays full and
+        // lossless; oversized eligible persisted fields are projected as
+        // head+tail + a MAC-protected `read_output` receipt.
+        let mut context = self.context_request();
         // Non-vision models cannot consume image parts. Strip them from the
         // *request* only, so the wire gate never rejects the whole history
         // and the session is not locked (this is the fallback that lets

@@ -77,6 +77,8 @@ fn test_entries() -> Vec<SessionEntry> {
                     reasoning: None,
                 }),
             ],
+            current_prompt_at: None,
+            no_current_prompt: false,
         },
         SessionEntry::Notice {
             text: "[background task 1 completed]\nexit: 0".into(),
@@ -772,6 +774,309 @@ async fn append_partial_overlap_resumes_remainder() {
 }
 
 #[tokio::test]
+async fn append_full_overlap_returns_actual_committed_locations() {
+    let (_dir, path) = temp_db();
+    let wid = workspace_id();
+    let sid = format!("test-sql-fullov-{}", crate::session::new_id());
+    let p = path.to_str().unwrap();
+    let entries: Vec<SessionEntry> = vec![
+        Message::User {
+            content: "first".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::User {
+            content: "second".into(),
+            images: vec![],
+        }
+        .into(),
+    ];
+
+    // Writer A commits seqs 0..2 and keeps its exact locations.
+    let writer_a = SqliteSession::connect(p, &wid, &sid).await.unwrap();
+    let locs_a = writer_a.append_located(&entries).await.unwrap();
+    assert_eq!(locs_a.len(), 2);
+    drop(writer_a);
+
+    // Writer B connects AFTER the commit (cursor 2), then rewinds to 0 to
+    // simulate a committed-then-errored append whose retry re-uses the
+    // same seq range.
+    let writer_b = SqliteSession::connect(p, &wid, &sid).await.unwrap();
+    *writer_b.next_seq.lock().unwrap() = 0;
+    let locs_b = writer_b.append_located(&entries).await.unwrap();
+
+    // The idempotent-retry locations must be the ACTUAL committed physical
+    // rows — identical to A's (same seq, same event_time_us, same payload
+    // hash) — never freshly generated keys.
+    assert_eq!(locs_a, locs_b, "retry must return the committed rows");
+
+    // Every returned location resolves through read_field with a receipt.
+    let codec_dir = tempfile::tempdir().unwrap();
+    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(codec_dir.path()).unwrap();
+    for (i, loc) in locs_b.iter().enumerate() {
+        let content = &["first", "second"][i];
+        let receipt = codec
+            .issue(
+                loc,
+                crate::output_receipt::FieldId::UserContent,
+                content.len(),
+            )
+            .unwrap();
+        let verified = codec.verify(&receipt).unwrap();
+        let bytes = writer_b.read_field(&verified).await.unwrap();
+        assert_eq!(bytes, content.as_bytes(), "location must resolve");
+    }
+}
+
+#[tokio::test]
+async fn append_partial_overlap_returns_actual_locations() {
+    let (_dir, path) = temp_db();
+    let wid = workspace_id();
+    let sid = format!("test-sql-partov-{}", crate::session::new_id());
+    let p = path.to_str().unwrap();
+    let entries: Vec<SessionEntry> = vec![
+        Message::User {
+            content: "a".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::User {
+            content: "b".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::User {
+            content: "c".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::User {
+            content: "d".into(),
+            images: vec![],
+        }
+        .into(),
+    ];
+
+    // A commits seqs 0..2.
+    let writer_a = SqliteSession::connect(p, &wid, &sid).await.unwrap();
+    writer_a.append_located(&entries[..2]).await.unwrap();
+    drop(writer_a);
+
+    // B (cursor 2) commits seqs 2..4, then rewinds to 2 and retries the
+    // full 2..6 slice: prefix [2,4) matches, suffix [4,6) is inserted.
+    let writer_b = SqliteSession::connect(p, &wid, &sid).await.unwrap();
+    let locs_first = writer_b.append_located(&entries[2..4]).await.unwrap();
+    *writer_b.next_seq.lock().unwrap() = 2;
+    let mut more: Vec<SessionEntry> = entries[2..].to_vec();
+    more.push(
+        Message::User {
+            content: "e".into(),
+            images: vec![],
+        }
+        .into(),
+    );
+    let locs_retry = writer_b.append_located(&more).await.unwrap();
+    assert_eq!(locs_retry.len(), 3);
+
+    // Prefix (seqs 2,3): the ACTUAL committed rows — identical to B's own
+    // first commit's locations (same event_time_us and hash).
+    assert_eq!(
+        &locs_retry[..2],
+        &locs_first[..],
+        "accepted prefix must re-read the actual committed rows"
+    );
+    // Suffix (seqs 4,5): the exact inserted rows — contiguous seqs with
+    // resolvable locations.
+    for (i, loc) in locs_retry.iter().enumerate().skip(2) {
+        let crate::session_store::LocatedKey::Sqlite { seq, event_time_us } = loc.key else {
+            panic!("sqlite location");
+        };
+        assert_eq!(seq, 4 + i as i64 - 2, "suffix seqs continue from db_max+1");
+        assert!(event_time_us > 0);
+    }
+    // A's earlier rows are untouched.
+    let loaded = writer_b.load().await.unwrap();
+    assert_eq!(loaded.len(), 5);
+    // Every returned location resolves through read_field.
+    let codec_dir = tempfile::tempdir().unwrap();
+    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(codec_dir.path()).unwrap();
+    let contents = ["c", "d", "e"];
+    for (i, loc) in locs_retry.iter().enumerate() {
+        let receipt = codec
+            .issue(
+                loc,
+                crate::output_receipt::FieldId::UserContent,
+                contents[i].len(),
+            )
+            .unwrap();
+        let verified = codec.verify(&receipt).unwrap();
+        let bytes = writer_b.read_field(&verified).await.unwrap();
+        assert_eq!(bytes, contents[i].as_bytes(), "location must resolve");
+    }
+}
+
+/// The schema enforces the session-id length bound (schema maxLength), so
+/// an over-long session id cannot be persisted even if it slipped past the
+/// name validators.
+#[tokio::test]
+async fn schema_rejects_overlong_session_id() {
+    let (_dir, path) = temp_db();
+    let wid = workspace_id();
+    let too_long = "x".repeat(crate::session_store::MAX_SESSION_ID_LEN + 1);
+    let sid = format!("test-sql-{too_long}");
+    let session = SqliteSession::connect(path.to_str().unwrap(), &wid, &sid)
+        .await
+        .expect("connect (the CHECK fires on insert, not connect)");
+    let entry = Message::User {
+        content: "hi".into(),
+        images: vec![],
+    }
+    .into();
+    let err = session
+        .append(std::slice::from_ref(&entry))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("CHECK") || err.contains("constraint"),
+        "schema must reject the over-long session id: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn racing_writers_one_wins_one_conflicts() {
+    // Two stores bound to the SAME session on the SAME database file, both
+    // with cursor 0, append DIFFERENT entries concurrently. The
+    // BEGIN IMMEDIATE transaction serializes the whole
+    // max-seq-check + overlap-validation + insert window, so exactly one
+    // writer commits and the other observes the committed rows and fails
+    // with a `concurrent write conflict` — the two writes can never
+    // interleave into a mixed log.
+    let (_dir, path) = temp_db();
+    let wid = workspace_id();
+    let sid = format!("test-sql-race-{}", crate::session::new_id());
+    let p = path.to_str().unwrap();
+    let writer_a = SqliteSession::connect(p, &wid, &sid).await.unwrap();
+    let writer_b = SqliteSession::connect(p, &wid, &sid).await.unwrap();
+    let entry_a = Message::User {
+        content: "writer A".into(),
+        images: vec![],
+    }
+    .into();
+    let entry_b = Message::User {
+        content: "writer B".into(),
+        images: vec![],
+    }
+    .into();
+
+    let ra = tokio::spawn(async move {
+        writer_a
+            .append_located(std::slice::from_ref(&entry_a))
+            .await
+    });
+    let rb = tokio::spawn(async move {
+        writer_b
+            .append_located(std::slice::from_ref(&entry_b))
+            .await
+    });
+    let (ra, rb) = tokio::join!(ra, rb);
+    let (ra, rb) = (ra.expect("writer A task"), rb.expect("writer B task"));
+
+    let (winner, loser) = match (ra, rb) {
+        (Ok(_), Err(loser)) => (0, loser),
+        (Err(loser), Ok(_)) => (1, loser),
+        other => panic!("exactly one writer must win, got {other:?}"),
+    };
+    assert!(
+        loser.contains("concurrent write conflict"),
+        "the loser must fail closed with a conflict, got: {loser}"
+    );
+
+    // The final log holds exactly the winner's entry — never a mix.
+    let winner_side = if winner == 0 { "writer A" } else { "writer B" };
+    let check = SqliteSession::connect(p, &wid, &sid).await.unwrap();
+    let loaded = check.load().await.unwrap();
+    assert_eq!(loaded.len(), 1, "exactly one writer's rows");
+    assert!(
+        matches!(
+            &loaded[0],
+            SessionEntry::Message {
+                message: Message::User { content, .. }
+            } if content == winner_side
+        ),
+        "the log must hold the winner's entry, got {:?}",
+        loaded[0]
+    );
+}
+
+/// The located loader must hash the EXACT raw stored payload bytes (the
+/// same bytes `read_field` re-hashes), not a re-serialization of the
+/// deserialized entry: a whitespace/key-order variant stored in the DB
+/// must still produce a receipt that resolves.
+#[tokio::test]
+async fn load_located_hashes_exact_raw_payload_bytes() {
+    let (_dir, path) = temp_db();
+    let wid = workspace_id();
+    let sid = format!("test-sql-rawhash-{}", crate::session::new_id());
+    let p = path.to_str().unwrap();
+
+    // Create the schema first (SqliteSession::connect), then insert a row
+    // whose raw payload is a KEY-ORDER + WHITESPACE variant of the
+    // canonical serialization (serde with preserve_order emits
+    // {"content":..,"images":..}).
+    let first = SqliteSession::connect(p, &wid, &sid).await.unwrap();
+    drop(first);
+    // `Message` is an externally-tagged enum (`{"User":{...}}`, PascalCase
+    // variant names) inside an internally-tagged `SessionEntry`
+    // (`{"type":"message","message":{...}}`). This variant reorders every
+    // key and adds whitespace — same entry, different raw bytes.
+    let raw =
+        r#"{ "message": { "User": { "images": [ ], "content": "variant" } }, "type": "message" }"#;
+    let db = turso::Builder::new_local(p).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "INSERT INTO session_entries \
+         (workspace_id, session_id, seq, event_time_us, entry_kind, payload, schema_version, is_error) \
+         VALUES (?1, ?2, 0, 1700000000000000, 'message', ?3, 1, 0)",
+        (wid.as_str(), sid.as_str(), raw),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(db);
+
+    let session = SqliteSession::connect(p, &wid, &sid).await.unwrap();
+    let located = session.load_located().await.unwrap();
+    assert_eq!(located.len(), 1);
+    let (loc, entry) = &located[0];
+    assert!(matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::User { content, .. }
+        } if content == "variant"
+    ));
+    // The hash must be the hash of the RAW stored payload.
+    assert_eq!(
+        loc.entry_hash,
+        crate::session_store::entry_payload_hash(raw),
+        "loader must hash the exact raw stored payload"
+    );
+    // A receipt issued against that location resolves through read_field
+    // (under the old re-serialization hashing it would fail integrity).
+    let codec_dir = tempfile::tempdir().unwrap();
+    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(codec_dir.path()).unwrap();
+    let receipt = codec
+        .issue(
+            loc,
+            crate::output_receipt::FieldId::UserContent,
+            "variant".len(),
+        )
+        .unwrap();
+    let verified = codec.verify(&receipt).unwrap();
+    let bytes = session.read_field(&verified).await.unwrap();
+    assert_eq!(bytes, b"variant");
+}
+
+#[tokio::test]
 async fn toctou_sync_next_seq_from_load() {
     let (_dir, path) = temp_db();
     let wid = workspace_id();
@@ -839,6 +1144,8 @@ async fn load_head_and_load_older_segmented() {
             content: "retained 1".into(),
             images: vec![],
         }],
+        current_prompt_at: None,
+        no_current_prompt: false,
     };
     let middle: Vec<SessionEntry> = vec![
         Message::User {
@@ -858,6 +1165,8 @@ async fn load_head_and_load_older_segmented() {
             content: "retained 2".into(),
             images: vec![],
         }],
+        current_prompt_at: None,
+        no_current_prompt: false,
     };
     let latest: Vec<SessionEntry> = vec![
         Message::User {
@@ -939,6 +1248,8 @@ async fn load_older_head_open_sentinel_pages_without_losing_segments() {
     let comp = |summary: &str| SessionEntry::Compaction {
         summary: summary.into(),
         retained: vec![],
+        current_prompt_at: None,
+        no_current_prompt: false,
     };
 
     // ---- No compaction: the whole session is one head segment. With no
@@ -1052,6 +1363,8 @@ async fn load_older_limited_pages_dedup_before_limit() {
     let comp = |summary: &str| SessionEntry::Compaction {
         summary: summary.into(),
         retained: vec![],
+        current_prompt_at: None,
+        no_current_prompt: false,
     };
 
     // seqs: 0,1 early; 2 comp1; 3..7 latest (comp1_seq = 2).
@@ -1189,6 +1502,8 @@ async fn load_older_pages_within_segment() {
     let comp1 = SessionEntry::Compaction {
         summary: "compaction 1".into(),
         retained: vec![],
+        current_prompt_at: None,
+        no_current_prompt: false,
     };
     // 7 middle entries: enough that one segment needs several 2-entry pages.
     let middle: Vec<SessionEntry> = (0..7)
@@ -1203,6 +1518,8 @@ async fn load_older_pages_within_segment() {
     let comp2 = SessionEntry::Compaction {
         summary: "compaction 2".into(),
         retained: vec![],
+        current_prompt_at: None,
+        no_current_prompt: false,
     };
     let latest: Vec<SessionEntry> = vec![
         Message::User {
@@ -1289,6 +1606,8 @@ async fn load_oldest_and_load_newer_segmented() {
             content: "retained 1".into(),
             images: vec![],
         }],
+        current_prompt_at: None,
+        no_current_prompt: false,
     };
     let middle: Vec<SessionEntry> = vec![
         Message::User {
@@ -1308,6 +1627,8 @@ async fn load_oldest_and_load_newer_segmented() {
             content: "retained 2".into(),
             images: vec![],
         }],
+        current_prompt_at: None,
+        no_current_prompt: false,
     };
     let latest: Vec<SessionEntry> = vec![
         Message::User {

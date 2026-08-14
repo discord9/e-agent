@@ -692,6 +692,62 @@ Non-goals (deliberately out of scope): todo/plan/workflow stages, auto goal
 rounds / max rounds, deadlines, reminders, goal DAGs / multiple goals per
 session, and a verifier agent.
 
+## Session output receipts (`eout1`) and the `read_output` tool
+
+Sessions persist every entry LOSSLESSLY (full GreptimeDB / SQLite / JSONL
+transcripts; `Agent::context()` and persisted `Compaction.retained` stay
+full/byte-exact). Only the *provider request copies* are bounded: an
+eligible oversized persisted field — background-completion output,
+`Message::Tool.content` (all persisted builtin/MCP/delegate results),
+`Notice.text`, historical user/assistant content, and
+`Compaction.summary`/`retained` — is projected as a UTF-8-safe head+tail
+plus a MAC-protected receipt (`read_output` ref) instead of the full text.
+System messages, the session goal, the CURRENT actual user prompt, tool
+call ids/names/arguments, reasoning, and images are always kept exact.
+
+- **`eout1` receipt**: `eout1.<base64url JSON>` carrying the field code,
+  backend kind, workspace fingerprint (a hash — never a path), session id,
+  the exact physical key (`ordinal` on JSONL; `seq`+`event_time_us` on
+  SQLite/Greptime), the entry's payload SHA-256, the total field byte
+  length, and an HMAC-SHA256 tag over all of it. The key is a dedicated
+  32-byte secret at `$XDG_STATE_HOME/e-agent/receipt.key` (fallback
+  `~/.config/e-agent/receipt.key`), created atomically with mode 0600,
+  stable across restarts, and never the web token. Receipts contain no
+  credentials, connection strings, or paths.
+- **Exact-version reads**: located keys pin the exact physical row
+  (`seq`+`event_time`/`ordinal`) plus the payload hash — never
+  "latest wins". A same-seq later write cannot retarget an old ref, and
+  `read_output` re-checks the hash, the field, and the total size on every
+  read (stable error classes: `invalid`, `unavailable`, `integrity`,
+  `utf8-boundary`, `out-of-range`).
+- **JSONL ordinal serialization is Unix-only (best-effort on Windows)**:
+  on Unix, cross-process JSONL append ordinals — the physical key of
+  every JSONL receipt — are serialized by an exclusive advisory `flock`
+  over the whole count+append+sync+location window; Windows has no
+  `flock`, so concurrent JSONL writers are serialized only within one
+  process. Multi-process Windows deployments should use the SQLite or
+  GreptimeDB backends.
+- **`read_output`**: always-on read-only tool on main, read-only main,
+  ordinary/read-only subagents, and btw forks. Closed schema (`ref`
+  required, `offset` default 0, `limit` default 16 KiB / max 32 KiB);
+  returns a JSON page `{"offset","length","text","next_offset",
+  "total_bytes","sha256"}` with UTF-8-boundary-safe paging. No listing,
+  search, path traversal, or DB access — possession of a valid receipt is a
+  bearer capability for exactly that one field.
+- **Durable-before-ref**: receipts are only issued from located keys
+  returned by the durable append, so a ref always resolves to a persisted
+  row. In this stage an entry WITHOUT a located key (legacy/test
+  in-memory) or with an unavailable receipt key file is left FULL
+  (fail-open — the field is projected byte-exact, never an unusable ref);
+  the total-budget stage that degrades *many medium* messages (and fails
+  closed on unlocatable fields) comes later.
+
+Non-goal (this stage): the total context-window estimator that degrades
+*many medium* messages, and per-tool output-cap expansion for producers that
+already discard bytes (bash/MCP output caps stay as they are — persisted
+originals are the precondition for exact retrieval). Bounding only applies
+to fields that are certainly already persisted before replay.
+
 ## Web UI / headless server
 
 `e-agent --serve` (alias: `e-agent web`) starts a headless HTTP server that
@@ -991,6 +1047,24 @@ with the same name in different workspaces remain isolated.
   `event_time ASC`, with `seq ASC` only as a tie-breaker; seq remains identity
   and continuity metadata.
 - No transactions — atomicity is per multi-row INSERT statement
+- **Concurrent-write detection is fail-closed, point-in-time, not
+  atomic**: GreptimeDB's pg-wire has no transactions and no
+  conditional-write/lease mechanism, so the max-seq pre-check, the
+  INSERT, and the post-insert verification are separate statements, and
+  the post-insert verification is a point-in-time re-read. e-agent
+  verifies AFTER committing: every committed row in the written range is
+  re-read and must still be the physical winner for its seq (latest
+  `event_time`, identical duplicates folded); if a foreign writer
+  superseded or diverged any row at verification time, the append fails
+  with a `concurrent write conflict` error instead of silently
+  latest-winning or advertising a receipt location the logical read path
+  would not pick. Ambiguity that is visible at verification time is
+  detected and reported — never hidden. But a foreign writer can still
+  commit at the same seqs AFTER the verification query and BEFORE
+  `append_located` returns; that post-verification race is irreducible
+  without a server-side lease or conditional write (winner-at-return
+  would require one). Exact physical receipt pinning still holds for
+  every location this process verified before the race window closed.
 - Subagents each open their own database connection (bounded, fine for
   single-user agents)
 

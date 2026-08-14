@@ -5975,6 +5975,8 @@ model = "deepseek-chat"
             SessionEntry::Compaction {
                 summary: "rolled up".into(),
                 retained: vec![],
+                current_prompt_at: None,
+                no_current_prompt: false,
             },
         ];
         assert_eq!(
@@ -6261,6 +6263,8 @@ model = "deepseek-chat"
             entry_preview(&SessionEntry::Compaction {
                 summary: "前情".into(),
                 retained: vec![],
+                current_prompt_at: None,
+                no_current_prompt: false,
             }),
             "📦 压缩：前情"
         );

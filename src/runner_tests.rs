@@ -2197,6 +2197,136 @@ async fn runner_commits_image_bearing_tool_and_strips_requests_without_vision() 
     )));
 }
 
+/// A tool whose result is far larger than the projection budget — the
+/// durable-before-ref scenario for oversized persisted tool content.
+struct HugeOutputTool;
+
+#[async_trait]
+impl Tool for HugeOutputTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "huge".into(),
+            description: "returns a huge result".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::text(format!(
+            "{}{}{}",
+            "h".repeat(crate::output_receipt::PROJECTION_HEAD_BYTES),
+            "MIDDLE-SECRET",
+            "t".repeat(crate::output_receipt::PROJECTION_TAIL_BYTES)
+        )))
+    }
+}
+
+/// Durable-before-ref: a receipt only ever appears in a provider request
+/// AFTER the oversized field was durably appended — the embedded `eout1`
+/// ref must resolve against the persisted session file (never against
+/// in-memory-only state), and the persisted field stays FULL.
+#[tokio::test]
+async fn runner_durable_before_ref_for_oversized_tool_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(temp.path()).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call-huge".into(),
+                            name: "huge".into(),
+                            arguments: r#"{}"#.into(),
+                        }],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(HugeOutputTool)],
+    )
+    .with_receipt_codec(Some(codec));
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "durable-ref".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("run it".into()));
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
+    );
+    task.join().await.unwrap();
+
+    // The persisted file holds the FULL tool result (lossless).
+    let store = SessionStore::Jsonl;
+    let loaded = store.load(temp.path(), "durable-ref").await.unwrap();
+    let tool = loaded
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Message {
+                message: Message::Tool { content, .. },
+            } => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(tool.contains("MIDDLE-SECRET"), "persisted field stays full");
+
+    // The SECOND provider request carries the bounded projection with an
+    // embedded receipt (the first request preceded the tool result).
+    let bounded = {
+        let requests = calls.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let bounded = requests[1]
+            .iter()
+            .find_map(|message| match message {
+                Message::Tool { content, .. } if content.contains("ref=eout1.") => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .expect("second request must carry the bounded tool result with a receipt");
+        assert!(bounded.starts_with(&"h".repeat(crate::output_receipt::PROJECTION_HEAD_BYTES)));
+        assert!(bounded.ends_with(&"t".repeat(crate::output_receipt::PROJECTION_TAIL_BYTES)));
+        assert!(!bounded.contains("MIDDLE-SECRET"));
+        bounded
+    };
+
+    // The embedded receipt resolves against the DURABLY PERSISTED session
+    // file (durable-before-ref): read the exact full field back.
+    let ref_start = bounded.find("ref=eout1.").unwrap() + "ref=".len();
+    let ref_end = bounded[ref_start..].find(']').unwrap() + ref_start;
+    let receipt = &bounded[ref_start..ref_end];
+    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(temp.path()).unwrap();
+    let verified = codec.verify(receipt).unwrap();
+    assert_eq!(verified.location.session, "durable-ref");
+    assert_eq!(verified.field, crate::output_receipt::FieldId::ToolContent);
+    let bytes = store.read_field(temp.path(), &verified).await.unwrap();
+    assert_eq!(
+        bytes,
+        tool.as_bytes(),
+        "receipt reads the persisted full field"
+    );
+}
+
 #[tokio::test]
 async fn runner_commits_image_bearing_tool_with_vision_model() {
     let temp = tempfile::tempdir().unwrap();

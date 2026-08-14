@@ -27,6 +27,9 @@ use tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
 use crate::agent::{Message, SessionEntry};
 use std::io::{BufRead, Write};
 
@@ -249,6 +252,122 @@ pub fn derive_workspace_id(root: &Path) -> String {
     root.to_string_lossy().to_string()
 }
 
+/// Fingerprint of a workspace id for receipt output: hex SHA-256 of the id,
+/// truncated to 16 bytes (32 hex chars). The raw id is a filesystem path on
+/// JSONL/SQLite and must never appear in receipts or errors — only this
+/// one-way fingerprint does. `workspace_id` is the id as stored by the
+/// backend (see [`derive_workspace_id`]).
+pub(crate) fn workspace_id_fingerprint(workspace_id: &str) -> String {
+    crate::agent::image_sha256(workspace_id.as_bytes())[..32].to_string()
+}
+
+/// [`workspace_id_fingerprint`] for a workspace root path.
+pub(crate) fn workspace_root_fingerprint(root: &Path) -> String {
+    workspace_id_fingerprint(&derive_workspace_id(root))
+}
+
+/// Upper bound on session id length, shared by the JSONL name validator
+/// ([`crate::session::validate_session_name`]), the receipt payload
+/// validation (`src/output_receipt.rs`), and the SQLite schema CHECK
+/// constraint (`src/session_sqlite.rs`). Real ids are far shorter
+/// (`new_id()` ≈ 23 chars; `web-…` / `sub-…` prefixes add a few); the
+/// bound exists so a receipt can never carry an unbounded session string.
+pub const MAX_SESSION_ID_LEN: usize = 128;
+
+/// Fingerprint of a backend instance for receipt output: hex
+/// HMAC-SHA256 (truncated to 32 hex chars) over `backend_kind` + NUL +
+/// the normalized instance identity, keyed by the receipt secret — the
+/// resolved SQLite database path, the Greptime connection string, or the
+/// JSONL workspace root. Receipts carry only this keyed digest (the raw
+/// path / connection string never appears in a receipt or an error), and
+/// `read_field` rejects a receipt bound to a different backend instance
+/// (e.g. another database file or a different GreptimeDB) before
+/// querying.
+///
+/// Keying matters: an UNKEYED hash of a low-entropy connection string
+/// (a default SQLite path, a well-known DSN) is an offline verifier —
+/// anyone holding a receipt could confirm it came from a guessed instance
+/// by hashing the guess. With the receipt secret in the HMAC, the
+/// published digest cannot be recomputed without the key.
+pub(crate) fn backend_instance_fingerprint(backend_kind: &str, instance: &str) -> String {
+    match crate::output_receipt::ReceiptCodec::load() {
+        Ok(codec) => keyed_backend_instance_fingerprint(codec.key(), backend_kind, instance),
+        Err(_) => {
+            // Keyless environment (no state dir / key unavailable): no
+            // receipt is ever issued or verified here, so this digest is
+            // never published. Keep plain append/load paths deterministic
+            // with the historical unkeyed SHA-256.
+            let mut identity = String::with_capacity(backend_kind.len() + 1 + instance.len());
+            identity.push_str(backend_kind);
+            identity.push('\0');
+            identity.push_str(instance);
+            crate::agent::image_sha256(identity.as_bytes())[..32].to_string()
+        }
+    }
+}
+
+/// The keyed core of [`backend_instance_fingerprint`]: HMAC-SHA256 over
+/// `backend_kind` + NUL + `instance` with the receipt key, truncated to
+/// 16 bytes (32 hex chars). Exposed for tests: the same instance under
+/// two different keys must yield two different fingerprints.
+pub(crate) fn keyed_backend_instance_fingerprint(
+    key: &[u8; 32],
+    backend_kind: &str,
+    instance: &str,
+) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(backend_kind.as_bytes());
+    mac.update(&[0]);
+    mac.update(instance.as_bytes());
+    let tag = mac.finalize().into_bytes();
+    hex_encode_truncated(&tag)
+}
+
+/// Lowercase hex of the first 16 bytes (32 hex chars) — the truncation
+/// applied to every fingerprint published in a receipt.
+fn hex_encode_truncated(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(32);
+    for byte in bytes.iter().take(16) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Lexically normalize a SQLite database path for backend-instance
+/// fingerprinting: absolutize relative paths against the current directory
+/// and collapse `.`/`..` components. Never touches the filesystem, so a
+/// not-yet-created database file fingerprints identically across
+/// processes (and a configured relative path resolves the same way the
+/// process actually opens it — against its own cwd).
+pub(crate) fn normalize_db_path(path: &str) -> String {
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out.to_string_lossy().into_owned()
+}
+
+/// SHA-256 hex of the exact persisted payload bytes (the serialized
+/// `SessionEntry`), the entry-hash half of every located key.
+pub(crate) fn entry_payload_hash(payload: &str) -> String {
+    crate::agent::image_sha256(payload.as_bytes())
+}
+
 /// Resolve the SQLite database path for a session store. An explicit
 /// `[session] backend = "sqlite"` path wins; `None` (the default backend,
 /// or a config that omits `path`) resolves to `<workspace>/.e-agent/
@@ -342,25 +461,31 @@ pub(crate) fn is_error(entry: &SessionEntry) -> bool {
 }
 
 /// Group raw DB entries by seq, keeping only the row(s) with the latest
-/// `event_time` per seq.
+/// `event_time` per seq, and return each winning entry WITH its exact
+/// physical key (`seq` + winning `event_time`) AND the exact winning raw
+/// payload bytes (the persisted `payload` string, byte-for-byte — the
+/// entry-hash input of the located loaders, so the hash always matches
+/// what `read_field` re-hashes) — the input of [`SessionStore::load_located`]
+/// / the backends' `load_located`.
 ///
 /// - Older event_time rows for the same seq are silently discarded
 ///   (they are considered overwritten by the newer write).
 /// - If the latest event_time has multiple physical rows (same microsecond),
-///   their deserialised payloads are compared. All identical → folded;
-///   any divergent → `Err` with diagnostic guidance.
+///   their deserialised payloads are compared. All identical → folded
+///   (the first raw payload is the winner's bytes); any divergent → `Err`
+///   with diagnostic guidance.
 /// - Output is sorted by the winning event_time ASC, then seq ASC.
 ///
 /// `event_time_col` names the timestamp column in the inspection SQL of the
 /// divergent-duplicates guidance (`event_time` on Greptime,
 /// `event_time_us` on SQLite). Exported as `pub(crate)` for testing without
 /// a live DB connection.
-pub(crate) fn dedup_raw_entries(
+pub(crate) fn dedup_raw_located(
     raw: &[(i64, chrono::NaiveDateTime, String)],
     session_id: &str,
     workspace_id: &str,
     event_time_col: &str,
-) -> Result<Vec<(i64, SessionEntry)>, String> {
+) -> Result<Vec<(i64, chrono::NaiveDateTime, SessionEntry, String)>, String> {
     // Group by seq: keep max event_time and all payloads at that max.
     let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
         std::collections::HashMap::with_capacity(raw.len().min(64));
@@ -412,14 +537,30 @@ pub(crate) fn dedup_raw_entries(
             }
         }
 
-        entries.push((max_et, seq, first_entry));
+        entries.push((max_et, seq, first_entry, payloads[0].clone()));
     }
 
-    entries.sort_unstable_by_key(|(event_time, seq, _)| (*event_time, *seq));
+    entries.sort_unstable_by_key(|(event_time, seq, _, _)| (*event_time, *seq));
     Ok(entries
         .into_iter()
-        .map(|(_, seq, entry)| (seq, entry))
+        .map(|(event_time, seq, entry, payload)| (seq, event_time, entry, payload))
         .collect())
+}
+
+/// The seq+winning-event_time view used by the existing load paths (no
+/// physical location): dedup by seq (latest event_time wins), sorted by
+/// winning event_time ASC then seq ASC. See [`dedup_raw_located`].
+pub(crate) fn dedup_raw_entries(
+    raw: &[(i64, chrono::NaiveDateTime, String)],
+    session_id: &str,
+    workspace_id: &str,
+    event_time_col: &str,
+) -> Result<Vec<(i64, SessionEntry)>, String> {
+    dedup_raw_located(raw, session_id, workspace_id, event_time_col).map(|rows| {
+        rows.into_iter()
+            .map(|(seq, _, entry, _)| (seq, entry))
+            .collect()
+    })
 }
 
 /// Format the concurrent-write conflict error shared by the Greptime and
@@ -472,6 +613,73 @@ pub(crate) fn format_conflict_error(
 /// the Greptime and SQLite backends (JSONL has no seq-based paging).
 #[allow(dead_code)]
 const HEAD_OPEN_SENTINEL: i64 = i64::MAX;
+
+/// The exact physical key of one persisted `session_entries` row/line, as
+/// stored by the owning backend. Pinned (never "latest wins"): a receipt
+/// issued against this key reads exactly this physical version, so a
+/// same-seq later write can never retarget an old ref (the entry hash check
+/// in `read_field` additionally rejects any payload drift).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocatedKey {
+    /// JSONL: the 0-based line ordinal in the append-only `.jsonl` file.
+    Jsonl { ordinal: i64 },
+    /// SQLite: `seq` + `event_time_us` (the row-level primary key).
+    Sqlite { seq: i64, event_time_us: i64 },
+    /// GreptimeDB: `seq` + `event_time` (µs since epoch, matching the
+    /// `TIMESTAMP(9)` TIME INDEX value this process wrote).
+    Greptime { seq: i64, event_time_us: i64 },
+}
+
+impl LocatedKey {
+    pub fn backend(&self) -> &'static str {
+        match self {
+            LocatedKey::Jsonl { .. } => "jsonl",
+            LocatedKey::Sqlite { .. } => "sqlite",
+            LocatedKey::Greptime { .. } => "greptime",
+        }
+    }
+}
+
+/// The exact physical location of one persisted entry: backend kind
+/// fingerprint, backend-instance fingerprint, session id, the backend's
+/// pinned key, and the SHA-256 hex of the exact persisted payload bytes
+/// (the serialized `SessionEntry` line/row). Aligned 1:1 with the agent
+/// history by [`crate::agent::Agent::restore_locations`]; the provider
+/// projection (`src/output_receipt.rs`) turns a location into a
+/// MAC-protected `eout1` receipt, and `read_output` resolves the receipt
+/// back to this location.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryLocation {
+    /// Backend kind code: `"jsonl"` | `"sqlite"` | `"greptime"`.
+    pub backend: &'static str,
+    /// Hex SHA-256 of the workspace id (NOT the raw path — receipt output
+    /// and errors never carry the path).
+    pub fingerprint: String,
+    /// Hex SHA-256 (32 chars) of the backend-instance identity: backend
+    /// kind + normalized instance config (the SQLite database path, the
+    /// Greptime connection string, or the JSONL root). Receipts carry only
+    /// this hash — never the path/connection string — and `read_field`
+    /// rejects a receipt bound to a different instance before querying.
+    pub backend_fp: String,
+    /// Session id the entry belongs to.
+    pub session: String,
+    /// The backend's exact physical key.
+    pub key: LocatedKey,
+    /// SHA-256 hex of the exact persisted payload bytes.
+    pub entry_hash: String,
+}
+
+/// Loaded history paired with its exact physical locations. `locations[i]`
+/// is `Some` exactly when the persisted entry at that history position has
+/// a located key (all durable backends; legacy/test in-memory entries are
+/// `None` — the projection then leaves such fields full instead of emitting
+/// an unusable receipt ref).
+#[derive(Clone, Debug)]
+pub struct LoadedLocated {
+    pub entries: Vec<SessionEntry>,
+    pub locations: Vec<Option<EntryLocation>>,
+    pub legacy: bool,
+}
 
 /// One session's metadata snapshot from the `sessions` audit table
 /// (Greptime and SQLite backends only). Every row is a COMPLETE snapshot —
@@ -1063,6 +1271,104 @@ impl SessionStore {
                 .lock()
                 .await
                 .append(entries)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Append entries to the session log and return the exact physical
+    /// located key of every appended entry (durable-append → located-key
+    /// ordering: the caller must not emit a receipt ref before this
+    /// resolves). JSONL ordinals are the appended lines' 0-based positions
+    /// (the file is line-counted before appending); Greptime/SQLite return
+    /// each row's `seq` + `event_time` as pinned at INSERT time.
+    ///
+    /// For JSONL, `root` and `name` locate the file. For Greptime/SQLite,
+    /// the session is already bound so `root`/`name` are unused.
+    pub async fn append_located(
+        &self,
+        root: &Path,
+        name: &str,
+        entries: &[SessionEntry],
+    ) -> Result<Vec<EntryLocation>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self {
+            SessionStore::Jsonl => Session::append_located(root, name, entries),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session.lock().await.append_located(entries).await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .append_located(entries)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Load the full session history paired with each entry's exact
+    /// physical location (`locations[i]` is `Some` for every durable
+    /// entry; legacy whole-document JSONL sessions load with `None` — the
+    /// projection then leaves those fields full). The located metadata is
+    /// aligned 1:1 with [`LoadedLocated::entries`] so the agent can
+    /// `restore_history` + `restore_locations` together.
+    pub async fn load_located(&self, root: &Path, name: &str) -> Result<LoadedLocated> {
+        match self {
+            SessionStore::Jsonl => Session::load_located(root, name),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                let rows = session.lock().await.load_located().await?;
+                Ok(LoadedLocated {
+                    entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
+                    locations: rows.into_iter().map(|(loc, _)| Some(loc)).collect(),
+                    legacy: false,
+                })
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => {
+                let rows = session
+                    .lock()
+                    .await
+                    .load_located()
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                Ok(LoadedLocated {
+                    entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
+                    locations: rows.into_iter().map(|(loc, _)| Some(loc)).collect(),
+                    legacy: false,
+                })
+            }
+        }
+    }
+
+    /// Exact-version field read: resolve a verified `eout1` receipt to the
+    /// exact persisted bytes of the field it names. The backend pins the
+    /// location (`seq`+`event_time` / `ordinal`), re-checks the entry hash
+    /// (a same-seq later version can never retarget an old ref), verifies
+    /// the fingerprint/session binding, extracts the field, and rejects any
+    /// total-size drift with an `integrity` error. The caller (the runner's
+    /// `read_output`) additionally checks the receipt names the current
+    /// session before calling.
+    pub async fn read_field(
+        &self,
+        root: &Path,
+        verified: &crate::output_receipt::VerifiedRef,
+    ) -> Result<Vec<u8>> {
+        match self {
+            SessionStore::Jsonl => Session::read_field(root, verified),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session.lock().await.read_field(verified).await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .read_field(verified)
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -2609,6 +2915,8 @@ mod shared_helpers {
             SessionEntry::Compaction {
                 summary: "comp".into(),
                 retained: vec![],
+                current_prompt_at: None,
+                no_current_prompt: false,
             },
             SessionEntry::Notice {
                 text: "notice".into(),
@@ -3713,11 +4021,13 @@ mod tests {
                 "dead-owner rows must probe all-dead"
             );
 
-            // 注入：无 live agent（没有 Agent，只有 store）也能拿到 Notice。
-            let entry = crate::session_factory::inject_killed_notice(&store, &root, &session)
-                .await
-                .expect("inject killed notice")
-                .expect("rows must inject a notice");
+            // 注入：无 live agent（没有 Agent，只有 store）也能拿到 Notice +
+            // 其精确 located key（seq + event_time_us + payload hash）。
+            let (entry, location) =
+                crate::session_factory::inject_killed_notice(&store, &root, &session)
+                    .await
+                    .expect("inject killed notice")
+                    .expect("rows must inject a notice");
             let SessionEntry::Notice { text } = &entry else {
                 panic!("injected entry must be a Notice, got {entry:?}");
             };
@@ -3727,6 +4037,17 @@ mod tests {
             );
             assert!(text.contains("sleep 100"), "label in notice: {text}");
             assert!(text.contains("cargo build"), "label in notice: {text}");
+            // The located key is exact: backend + fingerprint + session +
+            // a sqlite seq/event_time pin and a non-empty entry hash.
+            assert_eq!(location.backend, "sqlite");
+            assert_eq!(location.session, session);
+            assert_eq!(location.fingerprint.len(), 32);
+            let crate::session_store::LocatedKey::Sqlite { seq, event_time_us } = location.key
+            else {
+                panic!("sqlite location must carry a seq+event_time_us pin");
+            };
+            assert!(seq >= 0 && event_time_us > 0);
+            assert_eq!(location.entry_hash.len(), 64);
 
             // 记录已被消费：再 take 为空、再注入为 None（幂等）。
             let labels = store
@@ -3751,6 +4072,202 @@ mod tests {
             assert_eq!(notices[0], &entry, "persisted Notice is the injected one");
         }
 
+        /// Exact-version semantics through the SQLite store: a receipt pins
+        /// (seq, event_time_us, payload hash) — a SAME-SEQ later version
+        /// (a newer event_time_us row with different payload, appended
+        /// directly) must NEVER retarget an old ref. The old receipt still
+        /// reads the old physical row; a fresh receipt reads the new one;
+        /// deleting the pinned row fails the old ref with integrity.
+        #[tokio::test]
+        async fn sqlite_same_seq_later_version_never_retargets_old_ref() {
+            use crate::agent::Message;
+            use crate::output_receipt::{FieldId, ReceiptCodec};
+
+            let (_dir, path) = temp_db();
+            let root = std::env::temp_dir();
+            let session = format!("test-store-exact-ver-{}", crate::session::new_id());
+            let store = SessionStore::connect(&backend(&path), &root, &session)
+                .await
+                .expect("connect sqlite store");
+            let codec = ReceiptCodec::load_from_dir(_dir.path()).unwrap();
+
+            // Version A at seq 0.
+            let entry_a = SessionEntry::Message {
+                message: Message::User {
+                    content: "version-A".into(),
+                    images: vec![],
+                },
+            };
+            let locations_a = store
+                .append_located(&root, &session, std::slice::from_ref(&entry_a))
+                .await
+                .expect("append A");
+            let loc_a = locations_a[0].clone();
+            let LocatedKey::Sqlite {
+                seq,
+                event_time_us: et_a,
+            } = loc_a.key
+            else {
+                panic!("sqlite location expected");
+            };
+
+            // Version B at the SAME seq with a LATER event_time_us and a
+            // DIFFERENT payload (simulated concurrent/retry write that
+            // landed a newer row for the same logical position).
+            let entry_b = SessionEntry::Message {
+                message: Message::User {
+                    content: "version-B".into(),
+                    images: vec![],
+                },
+            };
+            let payload_b = serde_json::to_string(&entry_b).unwrap();
+            let db = turso::Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .expect("open db");
+            let conn = db.connect().expect("connect raw");
+            conn.execute(
+                "INSERT INTO session_entries \
+                 (workspace_id, session_id, seq, event_time_us, entry_kind, payload, schema_version, is_error) \
+                 VALUES (?1, ?2, ?3, ?4, 'message', ?5, 1, 0)",
+                (
+                    derive_workspace_id(&root).as_str(),
+                    session.as_str(),
+                    seq,
+                    et_a + 1, // strictly later
+                    payload_b.as_str(),
+                ),
+            )
+            .await
+            .expect("insert later version B");
+            drop(conn);
+            drop(db);
+
+            // The READ path shows the newer version (latest event_time wins).
+            let loaded = store.load(&root, &session).await.expect("load");
+            assert_eq!(loaded.entries.len(), 1);
+            assert!(matches!(
+                &loaded.entries[0],
+                SessionEntry::Message { message: Message::User { content, .. } } if content == "version-B"
+            ));
+            // load_located reports the WINNING location (seq, later et).
+            let located = store
+                .load_located(&root, &session)
+                .await
+                .expect("load_located");
+            assert_eq!(located.entries.len(), 1);
+            let new_loc = located.locations[0].clone().expect("location");
+            assert!(matches!(
+                new_loc.key,
+                LocatedKey::Sqlite { seq: s, event_time_us: et } if s == seq && et == et_a + 1
+            ));
+            assert_ne!(new_loc.entry_hash, loc_a.entry_hash);
+
+            // The OLD receipt still reads the OLD physical row exactly.
+            let old_ref = codec
+                .issue(&loc_a, FieldId::UserContent, "version-A".len())
+                .unwrap();
+            let verified = codec.verify(&old_ref).unwrap();
+            let bytes = store
+                .read_field(&root, &verified)
+                .await
+                .expect("old ref must stay pinned to version A");
+            assert_eq!(bytes, b"version-A");
+
+            // A receipt issued for the NEW location reads version B.
+            let new_ref = codec
+                .issue(&new_loc, FieldId::UserContent, "version-B".len())
+                .unwrap();
+            let verified = codec.verify(&new_ref).unwrap();
+            let bytes = store
+                .read_field(&root, &verified)
+                .await
+                .expect("new ref reads version B");
+            assert_eq!(bytes, b"version-B");
+
+            // Deleting the pinned row makes the OLD ref fail with integrity
+            // (never a silently retargeted read).
+            let db = turso::Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .expect("open db");
+            let conn = db.connect().expect("connect raw");
+            conn.execute(
+                "DELETE FROM session_entries \
+                 WHERE workspace_id = ?1 AND session_id = ?2 AND seq = ?3 AND event_time_us = ?4",
+                (
+                    derive_workspace_id(&root).as_str(),
+                    session.as_str(),
+                    seq,
+                    et_a,
+                ),
+            )
+            .await
+            .expect("delete pinned row");
+            drop(conn);
+            drop(db);
+            let err = store
+                .read_field(&root, &codec.verify(&old_ref).unwrap())
+                .await
+                .expect_err("deleted pinned row must fail the old ref");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("integrity") || msg.contains("not found"),
+                "old ref must fail closed: {msg}"
+            );
+        }
+
+        /// End-to-end read_output reconstruction on the SQLite store: bound
+        /// an oversized tool result with a receipt, read the exact full
+        /// field through the facade, and page it back byte-exactly.
+        #[tokio::test]
+        async fn sqlite_receipt_page_reconstruction() {
+            use crate::agent::Message;
+            use crate::output_receipt::{FieldId, ReceiptCodec, page_field};
+
+            let (_dir, path) = temp_db();
+            let root = std::env::temp_dir();
+            let session = format!("test-store-page-{}", crate::session::new_id());
+            let store = SessionStore::connect(&backend(&path), &root, &session)
+                .await
+                .expect("connect sqlite store");
+            let codec = ReceiptCodec::load_from_dir(_dir.path()).unwrap();
+            let content = format!("{}{}{}", "x".repeat(20_000), "MIDDLE", "y".repeat(10_000));
+            let entry = SessionEntry::Message {
+                message: Message::Tool {
+                    call_id: "call_1".into(),
+                    name: "bash".into(),
+                    content: content.clone(),
+                    is_error: false,
+                    synthetic: false,
+                    images: vec![],
+                },
+            };
+            let locations = store
+                .append_located(&root, &session, std::slice::from_ref(&entry))
+                .await
+                .expect("append");
+            let receipt = codec
+                .issue(&locations[0], FieldId::ToolContent, content.len())
+                .unwrap();
+            let verified = codec.verify(&receipt).unwrap();
+            let bytes = store
+                .read_field(&root, &verified)
+                .await
+                .expect("read_field");
+            assert_eq!(bytes, content.as_bytes());
+            // Page chain (offset 0, limit 7000, next) is lossless.
+            let mut rebuilt = Vec::new();
+            let mut offset = Some(0usize);
+            while let Some(next) = offset {
+                let page = page_field(&bytes, next, 7000).unwrap();
+                assert!(std::str::from_utf8(page.text.as_bytes()).is_ok());
+                rebuilt.extend_from_slice(page.text.as_bytes());
+                offset = page.next_offset;
+            }
+            assert_eq!(rebuilt, content.as_bytes());
+        }
+
         /// `load_head_page` on the SQLite store: the bounded head page
         /// must never strand the truncated part of the head segment —
         /// the returned cursor feeds straight back into `load_older` and
@@ -3772,6 +4289,8 @@ mod tests {
             let comp = |summary: &str| SessionEntry::Compaction {
                 summary: summary.into(),
                 retained: vec![],
+                current_prompt_at: None,
+                no_current_prompt: false,
             };
 
             // ---- No compaction: the whole session is one head segment.
@@ -3964,6 +4483,8 @@ mod tests {
                 SessionEntry::Compaction {
                     summary: "compressed".into(),
                     retained: vec![],
+                    current_prompt_at: None,
+                    no_current_prompt: false,
                 },
                 Message::User {
                     content: "and now?".into(),

@@ -3742,6 +3742,8 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
     let out = lines(&SessionEntry::Compaction {
         summary: "did things".into(),
         retained: vec![],
+        current_prompt_at: None,
+        no_current_prompt: false,
     });
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].text, "compacted: did things");

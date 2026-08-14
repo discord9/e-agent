@@ -8,12 +8,14 @@ use crate::workspace::Workspace;
 mod background;
 mod bash;
 mod file;
+pub mod output;
 mod tasks;
 mod web;
 #[cfg(windows)]
 mod windows_sandbox;
 
 use file::*;
+use output::*;
 use tasks::*;
 use web::*;
 
@@ -256,6 +258,10 @@ fn tools_with_background_and_exa_key(
     // runner executes them against ITS OWN goal state, so a subagent can
     // never touch its parent's goal.
     tools.extend(goal_tools());
+    // The always-on, read-only `read_output` tool (every session: main,
+    // read-only main, ordinary/read-only subagents, btw forks). The runner
+    // intercepts it by name with the session's store + receipt codec.
+    tools.push(Box::new(ReadOutput));
     tools
 }
 

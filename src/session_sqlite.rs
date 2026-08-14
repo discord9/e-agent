@@ -19,9 +19,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::agent::SessionEntry;
+use crate::output_receipt::{
+    ReceiptError, ReceiptErrorKind, VerifiedRef, field_bytes, validate_location_for_store,
+};
 use crate::session_store::{
-    SessionMeta, UsageRow, datetime_to_us, dedup_raw_entries, entry_kind, format_conflict_error,
-    is_error, next_event_time_us, process_identity, us_to_datetime,
+    EntryLocation, LocatedKey, SessionMeta, UsageRow, datetime_to_us, dedup_raw_entries,
+    dedup_raw_located, entry_kind, entry_payload_hash, format_conflict_error, is_error,
+    next_event_time_us, process_identity, us_to_datetime, workspace_id_fingerprint,
 };
 // Public path preserved for symmetry with `session_greptime` (the function
 // was a `pub fn` defined here before the shared-helper extraction).
@@ -44,7 +48,11 @@ CREATE TABLE IF NOT EXISTS session_entries (
     payload TEXT NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1,
     is_error INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (workspace_id, session_id, seq, event_time_us)
+    PRIMARY KEY (workspace_id, session_id, seq, event_time_us),
+    -- Schema-level maxLength for session ids, mirroring
+    -- `MAX_SESSION_ID_LEN` (the receipt payload validation and the
+    -- `validate_session_name` callers enforce the same bound).
+    CHECK (length(session_id) <= 128)
 )
 "#;
 
@@ -166,6 +174,11 @@ pub struct SqliteSession {
     next_seq: std::sync::Mutex<i64>,
     workspace_id: String,
     session_id: String,
+    /// Hex SHA-256 of the backend-instance identity (backend kind +
+    /// normalized database path). Receipts carry this hash — never the
+    /// path — and `read_field` rejects a receipt bound to another database
+    /// file before querying.
+    backend_fp: String,
     /// The session's latest metadata snapshot, cached at connect time so
     /// every touch carries the immutable columns (created_at/model/role/
     /// parent/title/pinned) without re-reading them. `None` = no row yet
@@ -473,6 +486,10 @@ impl SqliteSession {
             next_seq: std::sync::Mutex::new(0),
             workspace_id: workspace_id.to_string(),
             session_id: session_id.to_string(),
+            backend_fp: crate::session_store::backend_instance_fingerprint(
+                "sqlite",
+                &crate::session_store::normalize_db_path(db_path),
+            ),
             cached_meta: std::sync::Mutex::new(cached_meta),
         };
 
@@ -580,6 +597,139 @@ impl SqliteSession {
             )
             .await?;
         dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time_us")
+    }
+
+    /// Load every entry paired with its EXACT physical located key
+    /// (`seq` + winning `event_time_us` + payload hash), deduplicated and
+    /// ordered exactly like [`Self::load_with_seq`]. The located key pins
+    /// the winning physical row: a same-seq later write (a newer
+    /// `event_time_us`) never retargets a receipt issued against the older
+    /// row — `read_field` re-checks the payload hash and the pinned
+    /// `event_time_us`.
+    pub async fn load_located(&self) -> Result<Vec<(EntryLocation, SessionEntry)>, String> {
+        let raw = self
+            .query_raw_entries(
+                "SELECT seq, event_time_us, payload FROM session_entries \
+                 WHERE workspace_id = ?1 AND session_id = ?2 \
+                 ORDER BY event_time_us ASC, seq ASC",
+            )
+            .await?;
+        let fingerprint = workspace_id_fingerprint(&self.workspace_id);
+        let located =
+            dedup_raw_located(&raw, &self.session_id, &self.workspace_id, "event_time_us")?
+                .into_iter()
+                .map(|(seq, event_time, entry, raw_payload)| {
+                    let event_time_us = datetime_to_us(event_time);
+                    let location = EntryLocation {
+                        backend: "sqlite",
+                        fingerprint: fingerprint.clone(),
+                        backend_fp: self.backend_fp.clone(),
+                        session: self.session_id.clone(),
+                        key: LocatedKey::Sqlite { seq, event_time_us },
+                        // Hash the EXACT winning raw payload bytes (the
+                        // persisted `payload` string) — the same bytes
+                        // `read_field` re-hashes, so a whitespace/key-order
+                        // variant can never desync a receipt.
+                        entry_hash: entry_payload_hash(&raw_payload),
+                    };
+                    Ok((location, entry))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+        Ok(located)
+    }
+
+    /// Exact-version field read: verify the receipt binding against this
+    /// store (backend kind, workspace fingerprint, session), SELECT the
+    /// payload pinned by `seq` + `event_time_us` (never latest-wins),
+    /// re-check the entry hash, extract the field, and reject total-size
+    /// drift. Returns the exact persisted field bytes.
+    pub async fn read_field(&self, verified: &VerifiedRef) -> Result<Vec<u8>, String> {
+        let location = &verified.location;
+        validate_location_for_store(
+            location,
+            "sqlite",
+            &self.workspace_id,
+            &self.session_id,
+            &self.backend_fp,
+        )
+        .map_err(|error| error.display())?;
+        let LocatedKey::Sqlite { seq, event_time_us } = location.key else {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                "receipt key shape does not match the sqlite backend",
+            )
+            .display());
+        };
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT payload FROM session_entries \
+                 WHERE workspace_id = ?1 AND session_id = ?2 AND seq = ?3 AND event_time_us = ?4",
+                (
+                    self.workspace_id.as_str(),
+                    self.session_id.as_str(),
+                    seq,
+                    event_time_us,
+                ),
+            )
+            .await
+            .map_err(|e| format!("cannot read pinned entry: {e}"))?;
+        let mut payload: Option<String> = None;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot read pinned entry: {e}"))?
+        {
+            let candidate = row
+                .get_value(0)
+                .map_err(|e| format!("cannot read pinned entry: {e}"))?
+                .as_text()
+                .cloned()
+                .ok_or_else(|| "cannot read pinned entry: payload is not text".to_string())?;
+            // Identical idempotent-retry rows share the hash; the pinned
+            // payload must be among them.
+            if entry_payload_hash(&candidate) == location.entry_hash {
+                payload = Some(candidate);
+                break;
+            }
+        }
+        drop(conn);
+        let Some(payload) = payload else {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                format!(
+                    "entry not found at pinned location (seq {seq}, event_time_us {event_time_us}) \
+                     or its payload changed since the receipt was issued"
+                ),
+            )
+            .display());
+        };
+        let entry: SessionEntry = serde_json::from_str(&payload).map_err(|error| {
+            ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                format!("cannot decode pinned entry: {error}"),
+            )
+            .display()
+        })?;
+        let bytes = field_bytes(&entry, verified.field).ok_or_else(|| {
+            ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                "pinned entry no longer carries the receipt's field",
+            )
+            .display()
+        })?;
+        if bytes.len() != verified.total {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                format!(
+                    "field size changed since the receipt was issued ({} != {})",
+                    bytes.len(),
+                    verified.total
+                ),
+            )
+            .display());
+        }
+        Ok(bytes)
     }
 
     /// Run an entry-payload SELECT (first three columns seq, event_time_us,
@@ -1057,33 +1207,36 @@ impl SqliteSession {
         Ok((entries, next_comp))
     }
 
-    /// Append new entries atomically per multi-row INSERT statement.
+    /// Append new entries, returning the exact physical located key of
+    /// every appended entry (`seq` + `event_time_us`, pinned at INSERT
+    /// time).
     ///
-    /// SQLite supports real transactions, but atomicity is per statement
-    /// here to mirror the Greptime contract exactly: a single multi-row
-    /// INSERT either commits all N rows or commits zero. Serialization
-    /// happens before any DB write.
+    /// Atomicity: max-seq validation, overlap validation, the INSERT, and
+    /// the in-memory `next_seq` cursor advance all run inside ONE
+    /// `BEGIN IMMEDIATE` transaction (the SQLite file lock is reserved
+    /// immediately, so a second writer on the same database file waits
+    /// out the whole window instead of interleaving between the max-seq
+    /// check and the INSERT). On any failure the transaction rolls back
+    /// and `next_seq` is unchanged, so retries of the same slice reuse the
+    /// same seq range. Identical-payload duplicates from a
+    /// fully-committed-then-retried batch are folded by the read path, and
+    /// the returned located keys stay exact on that idempotent-retry path
+    /// (they are re-read from the committed rows, never guessed).
     ///
-    /// `next_seq` is computed once before the INSERT. On failure
-    /// `next_seq` is unchanged, so retries of the same slice reuse the same
-    /// seq range. Identical-payload duplicates from a
-    /// fully-committed-then-retried batch are folded by the read path.
-    ///
-    /// **Concurrent-write detection**: before any DB write the current DB
-    /// max seq is re-read (see [`Self::db_max_seq`]) and compared against
-    /// our cursor. A second writer (TUI + Web window, two e-agent processes
-    /// sharing one database file, import_jsonl) that committed rows at or
-    /// above our `base_seq` is otherwise invisible — both writers would
-    /// resume from their own `next_seq` and silently interleave. Detection
-    /// is best-effort: it closes the pre-write window but cannot be atomic
-    /// (the check and the INSERT are separate statements), so a write
-    /// racing the check itself can still slip through. The overlap
+    /// **Concurrent-write detection**: inside the transaction the current
+    /// DB max seq is re-read (see [`Self::db_max_seq_in`]) and compared
+    /// against our cursor. A second writer that committed rows at or above
+    /// our `base_seq` is otherwise invisible — both writers would resume
+    /// from their own `next_seq` and silently interleave. The overlap
     /// comparison distinguishes "our own earlier commit" (idempotent
     /// retry: payloads identical → skip re-insertion) from "a foreign
     /// writer" (any payload mismatch → conflict error).
-    pub async fn append(&self, entries: &[SessionEntry]) -> Result<(), String> {
+    pub async fn append_located(
+        &self,
+        entries: &[SessionEntry],
+    ) -> Result<Vec<EntryLocation>, String> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let n = entries.len();
 
@@ -1100,7 +1253,12 @@ impl SqliteSession {
         })?;
 
         // Serialize all entries upfront so serialization errors happen
-        // before any database write.
+        // before any database write. The event_time pins are generated
+        // here too; they become the actual physical values of the INSERTED
+        // rows (locations are only built AFTER the commit, from the real
+        // physical rows, so a full/partial overlap can never advertise a
+        // freshly generated key that was never committed).
+        let fingerprint = workspace_id_fingerprint(&self.workspace_id);
         let mut prepped: Vec<(i64, i64, String, String, bool)> = Vec::with_capacity(n);
         for (i, entry) in entries.iter().enumerate() {
             let seq = base_seq + i as i64;
@@ -1112,72 +1270,155 @@ impl SqliteSession {
             prepped.push((seq, ts, kind, payload, err));
         }
 
-        // Concurrent-write detection: re-read the DB max seq before any
-        // write. db_max < base_seq → nothing above our cursor, normal path.
-        // db_max >= base_seq → rows already exist in [base_seq, db_max];
-        // fold the overlapping part and compare with this batch.
-        let db_max = self.db_max_seq().await?;
-        if db_max >= base_seq {
-            let overlap_hi = db_max.min(final_cursor - 1);
-            let overlap_len = (overlap_hi - base_seq + 1) as usize;
-            let conflict_seq = self
-                .overlap_conflict_seq(&prepped, base_seq, overlap_hi)
-                .await?;
-            if let Some(seq) = conflict_seq {
-                // Best-effort writer hint for the error message: read the
-                // latest metadata snapshot's writer from the sessions audit
-                // table. The hint is labeled "latest metadata writer"
-                // because snapshot timing is not guaranteed to match the
-                // conflicting append exactly — two writers could in theory
-                // touch within the same microsecond, and snapshots never
-                // overwrite (append-only). In practice, though, the latest
-                // writer is almost always the adversary: the losing writer
-                // B's touch runs after its own (conflicting) append, so B
-                // re-stamps the row with B's identity after A's last
-                // snapshot. A failed or empty lookup falls back to the
-                // plain message (the `concurrent write conflict` substring
-                // is preserved — `friendly_failure` depends on it).
-                let writer_hint = self.latest_meta_writer().await;
-                return Err(format_conflict_error(
+        let mut conn = self.conn.lock().await;
+        // BEGIN IMMEDIATE reserves the write lock up front, so a second
+        // writer on the same database file waits out the whole window
+        // instead of reading a stale snapshot mid-transaction (turso's
+        // default `transaction()` is DEFERRED — the read would establish a
+        // snapshot that a concurrent commit invalidates with
+        // "database snapshot is stale").
+        let tx = conn
+            .transaction_with_behavior(turso::transaction::TransactionBehavior::Immediate)
+            .await
+            .map_err(|e| format!("cannot begin append transaction: {e}"))?;
+
+        // The whole validation + insert window runs inside the transaction.
+        // The inner block NEVER commits or rolls back: it returns the
+        // outcome and the caller commits (success) or rolls back (any
+        // error). turso's `Transaction` drop does NOT execute ROLLBACK —
+        // it defers it to the connection's next operation, which would
+        // leave the write lock held across an error return.
+        let outcome: Result<(Vec<EntryLocation>, i64), String> = async {
+            // Concurrent-write detection INSIDE the transaction: re-read
+            // the DB max seq after the write lock is held, so no second
+            // writer can commit between this check and the INSERT.
+            let db_max = db_max_seq_in(&tx, &self.workspace_id, &self.session_id).await?;
+            if db_max >= base_seq {
+                let overlap_hi = db_max.min(final_cursor - 1);
+                let overlap_len = (overlap_hi - base_seq + 1) as usize;
+                // Fold the overlapping window to its winning rows and
+                // compare with this batch (see `overlap_conflict_seq_in`).
+                let conflict_seq = overlap_conflict_seq_in(
+                    &tx,
+                    &self.workspace_id,
                     &self.session_id,
-                    db_max,
+                    &prepped,
                     base_seq,
-                    seq,
-                    writer_hint.as_deref(),
-                ));
-            }
-            // The whole overlap matches this batch: it is our own earlier
-            // commit (committed-then-errored append whose next_seq never
-            // advanced). Treat it as already written.
-            if overlap_len == n {
-                // The DB may have advanced beyond our batch (foreign rows);
-                // resume past the true max so we never reuse foreign seqs.
-                let mut guard = self.next_seq.lock().unwrap();
-                *guard = db_max.checked_add(1).ok_or_else(|| {
-                    format!(
-                        "max_seq overflow advancing next_seq after idempotent \
-                         retry in session '{}'",
-                        self.session_id
+                    overlap_hi,
+                )
+                .await?;
+                if let Some(seq) = conflict_seq {
+                    // Best-effort writer hint for the error message: read
+                    // the latest metadata snapshot's writer from the
+                    // sessions audit table. The hint is labeled "latest
+                    // metadata writer" because snapshot timing is not
+                    // guaranteed to match the conflicting append exactly.
+                    // A failed or empty lookup falls back to the plain
+                    // message (the `concurrent write conflict` substring is
+                    // preserved — `friendly_failure` depends on it).
+                    let writer_hint =
+                        latest_meta_writer_in(&tx, &self.workspace_id, &self.session_id).await;
+                    return Err(format_conflict_error(
+                        &self.session_id,
+                        db_max,
+                        base_seq,
+                        seq,
+                        writer_hint.as_deref(),
+                    ));
+                }
+                // The whole overlap matches this batch: it is our own
+                // earlier commit (committed-then-errored append whose
+                // next_seq never advanced). Treat it as already written —
+                // the returned locations are the ACTUAL committed physical
+                // rows, re-read from the database (never freshly
+                // generated).
+                if overlap_len == n {
+                    let committed = read_winning_rows_in(
+                        &tx,
+                        &self.workspace_id,
+                        &self.session_id,
+                        &self.backend_fp,
+                        base_seq,
+                        overlap_hi,
                     )
-                })?;
-                return Ok(());
+                    .await?;
+                    // The DB may have advanced beyond our batch (foreign
+                    // rows); resume past the true max so we never reuse
+                    // foreign seqs.
+                    let next = db_max.checked_add(1).ok_or_else(|| {
+                        format!(
+                            "max_seq overflow advancing next_seq after idempotent \
+                             retry in session '{}'",
+                            self.session_id
+                        )
+                    })?;
+                    return Ok((committed, next));
+                }
+                // Partial overlap: the matching prefix stays committed;
+                // insert only the remainder. prepped seqs are base_seq+i,
+                // so prepped[overlap_len..] continues contiguously from
+                // db_max+1 and needs no re-serialization.
+                insert_prepped_in(
+                    &tx,
+                    &self.workspace_id,
+                    &self.session_id,
+                    &prepped[overlap_len..],
+                )
+                .await?;
+                // Locations: the accepted prefix comes from the ACTUAL
+                // committed rows; the inserted suffix from the exact
+                // prepped values (which are the committed physical values).
+                let mut committed = read_winning_rows_in(
+                    &tx,
+                    &self.workspace_id,
+                    &self.session_id,
+                    &self.backend_fp,
+                    base_seq,
+                    overlap_hi,
+                )
+                .await?;
+                committed.extend(prepped_locations(
+                    &prepped[overlap_len..],
+                    &fingerprint,
+                    &self.backend_fp,
+                    &self.session_id,
+                ));
+                return Ok((committed, final_cursor));
             }
-            // Partial overlap: the matching prefix stays committed; insert
-            // only the remainder. prepped seqs are base_seq+i, so
-            // prepped[overlap_len..] continues contiguously from db_max+1
-            // and needs no re-serialization.
-            self.insert_prepped(&prepped[overlap_len..]).await?;
-            *self.next_seq.lock().unwrap() = final_cursor;
-            return Ok(());
+            // No overlap: insert the whole batch. The prepped rows ARE the
+            // committed physical rows.
+            insert_prepped_in(&tx, &self.workspace_id, &self.session_id, &prepped).await?;
+            let locations =
+                prepped_locations(&prepped, &fingerprint, &self.backend_fp, &self.session_id);
+            Ok((locations, final_cursor))
         }
+        .await;
 
-        self.insert_prepped(&prepped).await?;
+        match outcome {
+            Ok((locations, next)) => {
+                tx.commit()
+                    .await
+                    .map_err(|e| format!("cannot commit append transaction: {e}"))?;
+                // Advance next_seq only after the commit succeeds, so a
+                // partial failure does not shift sequence numbers on
+                // retry.
+                *self.next_seq.lock().unwrap() = next;
+                Ok(locations)
+            }
+            Err(error) => {
+                // Explicit rollback: turso's Transaction drop defers the
+                // ROLLBACK to the connection's next operation, which would
+                // leave the write lock held across the error return.
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
+    }
 
-        // Advance next_seq only after the insert succeeds, so a partial
-        // failure does not shift sequence numbers on retry.
-        *self.next_seq.lock().unwrap() = final_cursor;
-
-        Ok(())
+    /// Append new entries, discarding the located keys (plain-append call
+    /// sites that do not issue receipts). See [`Self::append_located`].
+    pub async fn append(&self, entries: &[SessionEntry]) -> Result<(), String> {
+        self.append_located(entries).await.map(|_| ())
     }
 
     /// Insert one token-usage row into the `usage_entries` table. `kind`
@@ -1347,150 +1588,6 @@ impl SqliteSession {
             });
         }
         Ok(out)
-    }
-
-    /// Insert prepped rows in one multi-row INSERT. SQLite has no
-    /// 65535-bound-parameter limit (and real turns are far below any
-    /// variable-count limit), so — unlike the Greptime backend — a single
-    /// statement covers the whole batch and is atomic as a whole.
-    async fn insert_prepped(
-        &self,
-        prepped: &[(i64, i64, String, String, bool)],
-    ) -> Result<(), String> {
-        let sql = build_multi_row_insert(prepped.len());
-        let wid = &self.workspace_id;
-        let sid = &self.session_id;
-        let mut values: Vec<turso::Value> = Vec::with_capacity(prepped.len() * 7);
-        for (seq, ts, kind, payload, err) in prepped {
-            values.push(turso::Value::Text(wid.clone()));
-            values.push(turso::Value::Text(sid.clone()));
-            values.push(turso::Value::Integer(*seq));
-            values.push(turso::Value::Integer(*ts));
-            values.push(turso::Value::Text(kind.clone()));
-            values.push(turso::Value::Text(payload.clone()));
-            values.push(turso::Value::Integer(if *err { 1 } else { 0 }));
-        }
-        let conn = self.conn.lock().await;
-        conn.execute(&sql, turso::params_from_iter(values))
-            .await
-            .map_err(|e| format!("cannot append to session_entries: {e}"))?;
-        Ok(())
-    }
-
-    /// The `writer` of the latest metadata snapshot for the bound session
-    /// (best-effort hint for conflict errors, see [`Self::append`]).
-    async fn latest_meta_writer(&self) -> Option<String> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT writer FROM sessions \
-                 WHERE workspace_id = ?1 AND session_id = ?2 \
-                 ORDER BY last_active_at DESC LIMIT 1",
-                (self.workspace_id.as_str(), self.session_id.as_str()),
-            )
-            .await
-            .ok()?;
-        let row = rows.next().await.ok()??;
-        row.get_value(0).ok()?.as_text().cloned()
-    }
-
-    /// Compare the DB rows already present in the overlapping seq window
-    /// `[base_seq, overlap_hi]` against this batch's prepped rows for the
-    /// same seqs.
-    ///
-    /// Folds per seq to the latest `event_time` (matching the read path's
-    /// dedup semantics) and compares the winning payload against the
-    /// prepped payload:
-    ///
-    /// - All match → our own earlier commit (idempotent retry) → `Ok(None)`.
-    /// - Any payload differs → a foreign writer → `Ok(Some(seq))` with the
-    ///   first divergent seq.
-    ///
-    /// A window with missing seqs (fewer rows than the window width) is
-    /// also reported as a conflict: our own commits are contiguous
-    /// multi-row INSERTs, so a hole can only have been left by a foreign
-    /// writer that advanced seqs without writing them.
-    async fn overlap_conflict_seq(
-        &self,
-        prepped: &[(i64, i64, String, String, bool)],
-        base_seq: i64,
-        overlap_hi: i64,
-    ) -> Result<Option<i64>, String> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT seq, event_time_us, payload FROM session_entries \
-                 WHERE workspace_id = ?1 AND session_id = ?2 \
-                 AND seq >= ?3 AND seq <= ?4 \
-                 ORDER BY seq ASC, event_time_us ASC",
-                (
-                    self.workspace_id.as_str(),
-                    self.session_id.as_str(),
-                    base_seq,
-                    overlap_hi,
-                ),
-            )
-            .await
-            .map_err(|e| format!("cannot read back seq range for concurrent-write check: {e}"))?;
-
-        // Group by seq, keeping only the row(s) with the latest event_time.
-        let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
-            std::collections::HashMap::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| format!("cannot read back seq range for concurrent-write check: {e}"))?
-        {
-            let seq = row
-                .get_value(0)
-                .map_err(|e| format!("cannot read back seq range for concurrent-write check: {e}"))?
-                .as_integer()
-                .copied()
-                .ok_or_else(|| "cannot read back seq range: seq is not an integer".to_string())?;
-            let et = row
-                .get_value(1)
-                .map_err(|e| format!("cannot read back seq range for concurrent-write check: {e}"))?
-                .as_integer()
-                .copied()
-                .ok_or_else(|| {
-                    "cannot read back seq range: event_time is not an integer".to_string()
-                })?;
-            let payload = row
-                .get_value(2)
-                .map_err(|e| format!("cannot read back seq range for concurrent-write check: {e}"))?
-                .as_text()
-                .cloned()
-                .ok_or_else(|| "cannot read back seq range: payload is not text".to_string())?;
-            let et = us_to_datetime(et);
-            let entry = per_seq.entry(seq).or_insert((et, Vec::new()));
-            match et.cmp(&entry.0) {
-                std::cmp::Ordering::Greater => {
-                    entry.0 = et;
-                    entry.1 = vec![payload];
-                }
-                std::cmp::Ordering::Equal => entry.1.push(payload),
-                std::cmp::Ordering::Less => {}
-            }
-        }
-
-        // Missing seqs in the window → a foreign writer owns (parts of) it.
-        let window_len = (overlap_hi - base_seq + 1) as usize;
-        if per_seq.len() < window_len {
-            for seq in base_seq..=overlap_hi {
-                if !per_seq.contains_key(&seq) {
-                    return Ok(Some(seq));
-                }
-            }
-        }
-
-        for (seq, (_, payloads)) in per_seq {
-            let idx = (seq - base_seq) as usize;
-            let want = &prepped[idx].3;
-            if payloads.iter().any(|p| p != want) {
-                return Ok(Some(seq));
-            }
-        }
-        Ok(None)
     }
 
     // ------------------------------------------------------------------
@@ -2401,6 +2498,299 @@ impl SqliteSession {
     pub async fn rewrite(&self, _entries: &[SessionEntry]) -> Result<(), String> {
         Ok(())
     }
+}
+
+// ----------------------------------------------------------------------
+// Transaction-scoped append helpers
+// ----------------------------------------------------------------------
+//
+// Every helper below runs against a caller-provided connection (normally
+// a live `turso::Transaction` — `Transaction` derefs to `Connection`, so
+// `&tx` coerces), so `append_located` can hold max-seq validation, overlap
+// validation, insertion, and the physical-row re-reads inside ONE
+// `BEGIN IMMEDIATE` window. Nothing here takes `&self`.
+
+/// `COALESCE(MAX(seq), -1)` inside the caller's transaction/connection.
+async fn db_max_seq_in(
+    conn: &turso::Connection,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<i64, String> {
+    let mut rows = conn
+        .query(
+            "SELECT COALESCE(MAX(seq), -1) AS max_seq \
+             FROM session_entries \
+             WHERE workspace_id = ?1 AND session_id = ?2",
+            (workspace_id, session_id),
+        )
+        .await
+        .map_err(|e| format!("cannot query max seq: {e}"))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|e| format!("cannot query max seq: {e}"))?
+        .ok_or_else(|| "cannot query max seq: no row".to_string())?;
+    row.get_value(0)
+        .map_err(|e| format!("cannot query max seq: {e}"))?
+        .as_integer()
+        .copied()
+        .ok_or_else(|| "cannot query max seq: not an integer".to_string())
+}
+
+/// Insert prepped rows in one multi-row INSERT inside the caller's
+/// transaction. SQLite has no 65535-bound-parameter limit (and real turns
+/// are far below any variable-count limit), so — unlike the Greptime
+/// backend — a single statement covers the whole batch and is atomic as a
+/// whole.
+async fn insert_prepped_in(
+    conn: &turso::Connection,
+    workspace_id: &str,
+    session_id: &str,
+    prepped: &[(i64, i64, String, String, bool)],
+) -> Result<(), String> {
+    let sql = build_multi_row_insert(prepped.len());
+    let mut values: Vec<turso::Value> = Vec::with_capacity(prepped.len() * 7);
+    for (seq, ts, kind, payload, err) in prepped {
+        values.push(turso::Value::Text(workspace_id.to_owned()));
+        values.push(turso::Value::Text(session_id.to_owned()));
+        values.push(turso::Value::Integer(*seq));
+        values.push(turso::Value::Integer(*ts));
+        values.push(turso::Value::Text(kind.clone()));
+        values.push(turso::Value::Text(payload.clone()));
+        values.push(turso::Value::Integer(if *err { 1 } else { 0 }));
+    }
+    conn.execute(&sql, turso::params_from_iter(values))
+        .await
+        .map_err(|e| format!("cannot append to session_entries: {e}"))?;
+    Ok(())
+}
+
+/// The `writer` of the latest metadata snapshot for the bound session
+/// (best-effort hint for conflict errors), read through the caller's
+/// transaction/connection.
+async fn latest_meta_writer_in(
+    conn: &turso::Connection,
+    workspace_id: &str,
+    session_id: &str,
+) -> Option<String> {
+    let mut rows = conn
+        .query(
+            "SELECT writer FROM sessions \
+             WHERE workspace_id = ?1 AND session_id = ?2 \
+             ORDER BY last_active_at DESC LIMIT 1",
+            (workspace_id, session_id),
+        )
+        .await
+        .ok()?;
+    let row = rows.next().await.ok()??;
+    row.get_value(0).ok()?.as_text().cloned()
+}
+
+/// Read the WINNING physical row of every seq in `[base_seq, overlap_hi]`
+/// (latest `event_time_us` per seq, identical duplicates folded) and
+/// return its exact location (`seq`, winning `event_time_us`, hash of the
+/// winning raw payload), ordered by seq. Used by the overlap paths of
+/// [`SqliteSession::append_located`] so the returned locations are the
+/// ACTUAL committed physical rows — never freshly generated keys.
+async fn read_winning_rows_in(
+    conn: &turso::Connection,
+    workspace_id: &str,
+    session_id: &str,
+    backend_fp: &str,
+    base_seq: i64,
+    overlap_hi: i64,
+) -> Result<Vec<EntryLocation>, String> {
+    let fingerprint = workspace_id_fingerprint(workspace_id);
+    let mut rows = conn
+        .query(
+            "SELECT seq, event_time_us, payload FROM session_entries \
+             WHERE workspace_id = ?1 AND session_id = ?2 \
+             AND seq >= ?3 AND seq <= ?4 \
+             ORDER BY seq ASC, event_time_us ASC",
+            (workspace_id, session_id, base_seq, overlap_hi),
+        )
+        .await
+        .map_err(|e| format!("cannot read back committed seq range: {e}"))?;
+
+    // Group by seq, keeping only the row(s) with the latest event_time.
+    let mut per_seq: std::collections::HashMap<i64, (i64, Vec<String>)> =
+        std::collections::HashMap::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| format!("cannot read back committed seq range: {e}"))?
+    {
+        let seq = row
+            .get_value(0)
+            .map_err(|e| format!("cannot read back committed seq range: {e}"))?
+            .as_integer()
+            .copied()
+            .ok_or_else(|| {
+                "cannot read back committed seq range: seq is not an integer".to_string()
+            })?;
+        let et_us = row
+            .get_value(1)
+            .map_err(|e| format!("cannot read back committed seq range: {e}"))?
+            .as_integer()
+            .copied()
+            .ok_or_else(|| {
+                "cannot read back committed seq range: event_time is not an integer".to_string()
+            })?;
+        let payload = row
+            .get_value(2)
+            .map_err(|e| format!("cannot read back committed seq range: {e}"))?
+            .as_text()
+            .cloned()
+            .ok_or_else(|| {
+                "cannot read back committed seq range: payload is not text".to_string()
+            })?;
+        let entry = per_seq.entry(seq).or_insert((et_us, Vec::new()));
+        match et_us.cmp(&entry.0) {
+            std::cmp::Ordering::Greater => {
+                entry.0 = et_us;
+                entry.1 = vec![payload];
+            }
+            std::cmp::Ordering::Equal => entry.1.push(payload),
+            std::cmp::Ordering::Less => {}
+        }
+    }
+
+    let mut located: Vec<EntryLocation> = per_seq
+        .into_iter()
+        .map(|(seq, (event_time_us, payloads))| EntryLocation {
+            backend: "sqlite",
+            fingerprint: fingerprint.clone(),
+            backend_fp: backend_fp.to_owned(),
+            session: session_id.to_owned(),
+            key: LocatedKey::Sqlite { seq, event_time_us },
+            entry_hash: entry_payload_hash(&payloads[0]),
+        })
+        .collect();
+    located.sort_unstable_by_key(|location| match location.key {
+        LocatedKey::Sqlite { seq, .. } => seq,
+        _ => unreachable!("sqlite location"),
+    });
+    Ok(located)
+}
+
+/// Build the exact locations of prepped rows that were INSERTED with those
+/// exact values (the prepped `seq`/`event_time_us`/`payload` ARE the
+/// committed physical row values). `backend_fp` is filled in by the caller
+/// (the store's instance fingerprint, which the free helpers cannot know).
+fn prepped_locations(
+    prepped: &[(i64, i64, String, String, bool)],
+    fingerprint: &str,
+    backend_fp: &str,
+    session_id: &str,
+) -> Vec<EntryLocation> {
+    prepped
+        .iter()
+        .map(|(seq, ts, _, payload, _)| EntryLocation {
+            backend: "sqlite",
+            fingerprint: fingerprint.to_owned(),
+            backend_fp: backend_fp.to_owned(),
+            session: session_id.to_owned(),
+            key: LocatedKey::Sqlite {
+                seq: *seq,
+                event_time_us: *ts,
+            },
+            entry_hash: entry_payload_hash(payload),
+        })
+        .collect()
+}
+
+/// Compare the DB rows already present in the overlapping seq window
+/// `[base_seq, overlap_hi]` against this batch's prepped rows for the
+/// same seqs, inside the caller's transaction.
+///
+/// Folds per seq to the latest `event_time` (matching the read path's
+/// dedup semantics) and compares the winning payload against the prepped
+/// payload:
+///
+/// - All match → our own earlier commit (idempotent retry) → `Ok(None)`.
+/// - Any payload differs → a foreign writer → `Ok(Some(seq))` with the
+///   first divergent seq.
+///
+/// A window with missing seqs (fewer rows than the window width) is also
+/// reported as a conflict: our own commits are contiguous multi-row
+/// INSERTs, so a hole can only have been left by a foreign writer that
+/// advanced seqs without writing them.
+async fn overlap_conflict_seq_in(
+    conn: &turso::Connection,
+    workspace_id: &str,
+    session_id: &str,
+    prepped: &[(i64, i64, String, String, bool)],
+    base_seq: i64,
+    overlap_hi: i64,
+) -> Result<Option<i64>, String> {
+    let mut rows = conn
+        .query(
+            "SELECT seq, event_time_us, payload FROM session_entries \
+             WHERE workspace_id = ?1 AND session_id = ?2 \
+             AND seq >= ?3 AND seq <= ?4 \
+             ORDER BY seq ASC, event_time_us ASC",
+            (workspace_id, session_id, base_seq, overlap_hi),
+        )
+        .await
+        .map_err(|e| format!("cannot read back seq range for concurrent-write check: {e}"))?;
+
+    // Group by seq, keeping only the row(s) with the latest event_time.
+    let mut per_seq: std::collections::HashMap<i64, (i64, Vec<String>)> =
+        std::collections::HashMap::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| format!("cannot read back seq range for concurrent-write check: {e}"))?
+    {
+        let seq = row
+            .get_value(0)
+            .map_err(|e| format!("cannot read back seq range for concurrent-write check: {e}"))?
+            .as_integer()
+            .copied()
+            .ok_or_else(|| "cannot read back seq range: seq is not an integer".to_string())?;
+        let et_us = row
+            .get_value(1)
+            .map_err(|e| format!("cannot read back seq range for concurrent-write check: {e}"))?
+            .as_integer()
+            .copied()
+            .ok_or_else(|| {
+                "cannot read back seq range: event_time is not an integer".to_string()
+            })?;
+        let payload = row
+            .get_value(2)
+            .map_err(|e| format!("cannot read back seq range for concurrent-write check: {e}"))?
+            .as_text()
+            .cloned()
+            .ok_or_else(|| "cannot read back seq range: payload is not text".to_string())?;
+        let entry = per_seq.entry(seq).or_insert((et_us, Vec::new()));
+        match et_us.cmp(&entry.0) {
+            std::cmp::Ordering::Greater => {
+                entry.0 = et_us;
+                entry.1 = vec![payload];
+            }
+            std::cmp::Ordering::Equal => entry.1.push(payload),
+            std::cmp::Ordering::Less => {}
+        }
+    }
+
+    // Missing seqs in the window → a foreign writer owns (parts of) it.
+    let window_len = (overlap_hi - base_seq + 1) as usize;
+    if per_seq.len() < window_len {
+        for seq in base_seq..=overlap_hi {
+            if !per_seq.contains_key(&seq) {
+                return Ok(Some(seq));
+            }
+        }
+    }
+
+    for (seq, (_, payloads)) in per_seq {
+        let idx = (seq - base_seq) as usize;
+        let want = &prepped[idx].3;
+        if payloads.iter().any(|p| p != want) {
+            return Ok(Some(seq));
+        }
+    }
+    Ok(None)
 }
 
 /// Map a `sessions` table row (all columns except `session_id`, which is

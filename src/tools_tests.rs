@@ -104,6 +104,75 @@ fn web_search_spec_exposes_only_query() {
         );
 }
 
+/// The always-on `read_output` tool is registered on EVERY session: main,
+/// read-only main (with and without a sandbox), and subagent builds (the
+/// `builtins_with_background` path).
+#[test]
+fn read_output_registered_for_main_read_only_and_subagent_builds() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let names = |tools: Vec<Box<dyn Tool>>| -> Vec<String> {
+        let mut names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
+        names.sort();
+        names
+    };
+
+    // Main build (no key, no sandbox).
+    let (tools, _) = builtins_with_exa_key(workspace.clone(), None, None, false, None, None);
+    assert!(names(tools).contains(&"read_output".to_string()));
+
+    // Read-only main build without a sandbox (fail-closed bash).
+    let (tools, _) = builtins_with_exa_key(workspace.clone(), None, None, true, None, None);
+    let n = names(tools);
+    assert!(n.contains(&"read_output".to_string()), "{n:?}");
+
+    // Subagent build (shared background registry).
+    let background = BackgroundTasks::new(None, None);
+    let sub = builtins_with_background(
+        workspace.clone(),
+        background.clone(),
+        None,
+        false,
+        true,
+        Some("sub-1".into()),
+    );
+    assert!(names(sub).contains(&"read_output".to_string()));
+
+    // Read-only subagent build.
+    let sub_ro = builtins_with_background(
+        workspace,
+        background,
+        None,
+        true,
+        true,
+        Some("sub-2".into()),
+    );
+    assert!(names(sub_ro).contains(&"read_output".to_string()));
+
+    // The schema is CLOSED and the tool is read-only by construction: its
+    // spec declares exactly ref/offset/limit with additionalProperties
+    // false and a required ref.
+    let (tools, _) = builtins_with_exa_key(
+        Workspace::new(temp.path()).unwrap(),
+        None,
+        None,
+        false,
+        None,
+        None,
+    );
+    let spec = tools
+        .iter()
+        .find(|tool| tool.spec().name == "read_output")
+        .unwrap()
+        .spec();
+    assert_eq!(spec.parameters["additionalProperties"], false);
+    assert_eq!(spec.parameters["required"], json!(["ref"]));
+    let properties = spec.parameters["properties"].as_object().unwrap();
+    let mut keys: Vec<&String> = properties.keys().collect();
+    keys.sort();
+    assert_eq!(keys, vec!["limit", "offset", "ref"]);
+}
+
 #[test]
 fn web_search_registration_requires_a_nonempty_key() {
     let temp = tempfile::tempdir().unwrap();
@@ -118,6 +187,7 @@ fn web_search_registration_requires_a_nonempty_key() {
         "bash".to_string(),
         "get_goal".to_string(),
         "update_goal".to_string(),
+        "read_output".to_string(),
     ];
     for key in [None, Some("   ".into())] {
         let (tools, _) = builtins_with_exa_key(workspace.clone(), key, None, false, None, None);
@@ -139,7 +209,8 @@ fn web_search_registration_requires_a_nonempty_key() {
             "bash",
             "web_search",
             "get_goal",
-            "update_goal"
+            "update_goal",
+            "read_output"
         ]
         .map(String::from)
     );
@@ -1150,7 +1221,8 @@ fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
             "get_background_tasks",
             "cancel_background_task",
             "get_goal",
-            "update_goal"
+            "update_goal",
+            "read_output"
         ],
         "read-only without a sandbox: no write/edit and fail-closed no bash"
     );
@@ -1190,7 +1262,8 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             shell_name,
             "web_search",
             "get_goal",
-            "update_goal"
+            "update_goal",
+            "read_output"
         ],
         "read-only with a sandbox keeps the shell and web_search"
     );
@@ -3437,6 +3510,9 @@ fn goal_specs_are_closed_and_generic_specs_stay_open() {
         "web_search",
         "get_background_tasks",
         "cancel_background_task",
+        // read_output is deliberately CLOSED (see its spec): the pager
+        // accepts exactly ref/offset/limit and nothing else.
+        "read_output",
     ];
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();

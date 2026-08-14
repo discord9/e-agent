@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::{Agent, AgentEvent, Tool, ToolOutput, ToolSpec, preview};
+use crate::agent::{Agent, AgentEvent, CompactionMode, Tool, ToolOutput, ToolSpec, preview};
 use crate::config::SessionBackend;
 use crate::model::ConfiguredModel;
 use crate::runner::{IdlePolicy, SessionHandle, SessionResult, SessionRunner};
@@ -374,9 +374,13 @@ impl Delegate {
         background: BackgroundTasks,
         task: DelegatedTask,
         persist: PersistConfig,
-        resume_entries: Option<Vec<crate::agent::SessionEntry>>,
+        resume: Option<(
+            Vec<crate::agent::SessionEntry>,
+            Vec<Option<crate::session_store::EntryLocation>>,
+        )>,
         policy: IdlePolicy,
         finalize_wait: Option<std::time::Duration>,
+        compaction_mode: CompactionMode,
     ) -> Result<(SessionHandle, crate::runner::SessionTask), String> {
         let model_name = model.display_name().to_owned();
         let agents_instructions = workspace
@@ -395,9 +399,18 @@ impl Delegate {
             Some(persist.session_id.clone()),
         );
         let mut agent = Agent::new(Box::new(model), tools);
+        // Delegated one-shot subagents compact as single tasks (tool-loop
+        // tail retained, no actual user required for repeated compaction);
+        // btw forks pass Main (interactive conversation with real user
+        // turns, current turn kept verbatim).
+        agent = agent.with_compaction_mode(compaction_mode);
         if let Some(window) = context_window {
             agent.set_context_window(window);
         }
+        // The `eout1` receipt codec (bounded provider projections + the
+        // runner's read_output verification share this one key); `None` when
+        // the state-dir key is unavailable → fields stay full.
+        agent = agent.with_receipt_codec(crate::output_receipt::ReceiptCodec::load().ok());
         let mut instructions = match task.role_prompt {
             Some(template) => format!(
                 "{template}\n\nYou are running as a subagent inside the e-agent coding assistant (on the `{model_name}` model). Work autonomously on the delegated task with the file/bash tools and, when configured, public web search, then return a concise final answer."
@@ -432,8 +445,8 @@ impl Delegate {
             instructions.push_str(&content);
         }
         agent.set_context_prefix(instructions);
-        if let Some(entries) = resume_entries {
-            agent.restore_history(entries);
+        if let Some((entries, locations)) = resume {
+            agent.restore_located(entries, locations);
         }
         let store = SessionStore::connect(&persist.backend, &persist.root, &persist.session_id)
             .await
@@ -680,6 +693,13 @@ pub async fn spawn_btw_subagent(
             .await
             .map_err(|e| format!("btw fork failed: {e:#}"))?,
     }
+    // The fork entries now live durably in the fresh session: load their
+    // exact physical located keys so the subagent's provider projections
+    // can issue receipts for oversized copied fields.
+    let located = fork_store
+        .load_located(&persist.root, &session_id)
+        .await
+        .map_err(|e| format!("btw fork failed: {e:#}"))?;
     let (handle, runner_task) = Delegate::start_runner(
         model,
         context_window,
@@ -696,11 +716,14 @@ pub async fn spawn_btw_subagent(
             interactive: true,
         },
         persist,
-        Some(fork_entries),
+        Some((located.entries, located.locations)),
         IdlePolicy::WaitForInput,
         // A btw fork never finalizes on its own (WaitForInput), so the
         // finalize wait does not apply; keep the runner's default.
         None,
+        // A btw fork is an interactive main-style conversation (real user
+        // turns, current turn kept verbatim).
+        CompactionMode::Main,
     )
     .await?;
     // Sessions metadata: the subagent's row links back to the parent
@@ -1001,12 +1024,11 @@ impl Tool for Delegate {
                 let temp_store = SessionStore::connect(&self.persist_backend, &root, &id)
                     .await
                     .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
-                let mut entries = temp_store
-                    .load(&root, &id)
+                let mut located = temp_store
+                    .load_located(&root, &id)
                     .await
-                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?
-                    .entries;
-                if entries.is_empty() {
+                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
+                if located.entries.is_empty() {
                     return Err(format!("no such subagent session: `{id}`"));
                 }
                 // Consume any background-task records left by a process that
@@ -1033,18 +1055,21 @@ impl Tool for Delegate {
                     };
                     // Persist immediately (mirrors the main-agent resume
                     // path) so a crash-before-first-turn cannot inject the
-                    // same notice again on the next resume.
-                    temp_store
-                        .append(&root, &id, std::slice::from_ref(&entry))
+                    // same notice again on the next resume. The located key
+                    // rides along so the resumed subagent's projection can
+                    // issue a receipt for the notice.
+                    let notice_locations = temp_store
+                        .append_located(&root, &id, std::slice::from_ref(&entry))
                         .await
                         .map_err(|error| {
                             format!("cannot persist resume notice for session `{id}`: {error:#}")
                         })?;
                     // Append (NOT restore_history, which would wipe the
                     // resumed history).
-                    entries.push(entry);
+                    located.entries.push(entry);
+                    located.locations.push(notice_locations.into_iter().next());
                 }
-                Some((id, entries))
+                Some((id, located.entries, located.locations))
             }
             None => None,
         };
@@ -1089,8 +1114,8 @@ impl Tool for Delegate {
             .map_err(|error| format!("invalid `workspace` path `{workspace_arg}`: {error}"))?;
 
         let model_name = model.display_name().to_string();
-        let (resume_id, resume_entries) = match resume {
-            Some((id, entries)) => (Some(id), Some(entries)),
+        let (resume_id, resume) = match resume {
+            Some((id, entries, locations)) => (Some(id), Some((entries, locations))),
             None => (None, None),
         };
         // A fresh spawn records the task-panel label as the subagent
@@ -1159,9 +1184,10 @@ impl Tool for Delegate {
                 interactive: false,
             },
             persist,
-            resume_entries,
+            resume,
             IdlePolicy::FinishWhenIdle,
             self.finalize_wait,
+            CompactionMode::SingleTask,
         )
         .await?;
         let sessions = self.sessions.clone();

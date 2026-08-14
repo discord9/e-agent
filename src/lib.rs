@@ -6,6 +6,7 @@ pub mod delegate;
 pub mod markdown;
 pub mod mcp;
 pub mod model;
+pub mod output_receipt;
 pub mod roles;
 pub mod runner;
 pub mod server;

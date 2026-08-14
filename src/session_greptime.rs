@@ -10,9 +10,13 @@ use std::collections::HashMap;
 use tokio_postgres::NoTls;
 
 use crate::agent::SessionEntry;
+use crate::output_receipt::{
+    ReceiptError, ReceiptErrorKind, VerifiedRef, field_bytes, validate_location_for_store,
+};
 use crate::session_store::{
-    SessionMeta, UsageRow, datetime_to_us, dedup_raw_entries, entry_kind, format_conflict_error,
-    is_error, next_event_time_us, process_identity, us_to_datetime,
+    EntryLocation, LocatedKey, SessionMeta, UsageRow, datetime_to_us, dedup_raw_entries,
+    dedup_raw_located, entry_kind, entry_payload_hash, format_conflict_error, is_error,
+    next_event_time_us, process_identity, us_to_datetime, workspace_id_fingerprint,
 };
 // Public path preserved for `src/bin/import_jsonl.rs` (was a `pub fn`
 // defined here before the shared-helper extraction).
@@ -148,6 +152,11 @@ pub struct GreptimeSession {
     next_seq: i64,
     workspace_id: String,
     session_id: String,
+    /// Hex SHA-256 of the backend-instance identity (backend kind + the
+    /// connection string). Receipts carry this hash — never the connection
+    /// string — and `read_field` rejects a receipt bound to another
+    /// GreptimeDB instance before querying.
+    backend_fp: String,
     /// The session's latest metadata snapshot, cached at connect time so
     /// every touch carries the immutable columns (created_at/model/role/
     /// parent/title/pinned) without re-reading them. `None` = no row yet
@@ -387,6 +396,7 @@ impl GreptimeSession {
             next_seq: 0,
             workspace_id: workspace_id.to_string(),
             session_id: session_id.to_string(),
+            backend_fp: crate::session_store::backend_instance_fingerprint("greptime", conn),
             cached_meta: std::sync::Mutex::new(cached_meta),
         };
 
@@ -500,6 +510,167 @@ impl GreptimeSession {
 
         dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
             .map_err(anyhow::Error::msg)
+    }
+
+    /// Load every entry paired with its EXACT physical located key
+    /// (`seq` + winning `event_time` + payload hash), deduplicated and
+    /// ordered exactly like [`Self::load_with_seq`]. The located key pins
+    /// the winning physical row: GreptimeDB's append mode keeps older
+    /// same-seq rows, and a receipt issued against `(seq, event_time)`
+    /// reads exactly that physical version — a same-seq later write never
+    /// retargets it (`read_field` re-checks the payload hash too).
+    pub async fn load_located(&self) -> Result<Vec<(EntryLocation, SessionEntry)>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT seq, event_time, payload FROM session_entries \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 ORDER BY event_time ASC, seq ASC",
+                &[&self.workspace_id, &self.session_id],
+            )
+            .await
+            .context("cannot load session entries")?;
+
+        let raw: Vec<(i64, chrono::NaiveDateTime, String)> = rows
+            .iter()
+            .map(|r| {
+                let seq: i64 = r.get("seq");
+                let et: chrono::NaiveDateTime = r.get("event_time");
+                let p: String = r.get("payload");
+                (seq, et, p)
+            })
+            .collect();
+
+        let fingerprint = workspace_id_fingerprint(&self.workspace_id);
+        let located = dedup_raw_located(&raw, &self.session_id, &self.workspace_id, "event_time")
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .map(|(seq, event_time, entry, raw_payload)| {
+                let location = EntryLocation {
+                    backend: "greptime",
+                    fingerprint: fingerprint.clone(),
+                    backend_fp: self.backend_fp.clone(),
+                    session: self.session_id.clone(),
+                    key: LocatedKey::Greptime {
+                        seq,
+                        event_time_us: datetime_to_us(event_time),
+                    },
+                    // Hash the EXACT winning raw payload bytes (the
+                    // persisted `payload` string) — the same bytes
+                    // `read_field` re-hashes, so a whitespace/key-order
+                    // variant can never desync a receipt.
+                    entry_hash: entry_payload_hash(&raw_payload),
+                };
+                Ok((location, entry))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(located)
+    }
+
+    /// Exact-version field read: verify the receipt binding against this
+    /// store (backend kind, workspace fingerprint, backend-instance
+    /// fingerprint, session), SELECT every physical row at the pinned
+    /// `seq` + `event_time` (never latest-wins — append mode keeps every
+    /// physical row, and identical idempotent-retry duplicates may share
+    /// the exact key), select the row whose payload hash matches the
+    /// receipt's signed hash (identical duplicates fold), and reject
+    /// divergent rows / no match. Re-checks the entry hash, extracts the
+    /// field, and rejects total-size drift.
+    pub async fn read_field(&self, verified: &VerifiedRef) -> Result<Vec<u8>> {
+        let location = &verified.location;
+        validate_location_for_store(
+            location,
+            "greptime",
+            &self.workspace_id,
+            &self.session_id,
+            &self.backend_fp,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let LocatedKey::Greptime { seq, event_time_us } = location.key else {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                "receipt key shape does not match the greptime backend",
+            )
+            .into());
+        };
+        let rows = self
+            .client
+            .query(
+                "SELECT payload FROM session_entries \
+                 WHERE workspace_id = $1 AND session_id = $2 AND seq = $3 AND event_time = $4",
+                &[
+                    &self.workspace_id,
+                    &self.session_id,
+                    &seq,
+                    &us_to_datetime(event_time_us),
+                ],
+            )
+            .await
+            .context("cannot read pinned entry")?;
+        // Fold identical duplicates at the pinned key and select the row
+        // matching the receipt's signed entry hash. `query_opt` would pick
+        // an ARBITRARY row: with an identical-payload idempotent retry at
+        // the same microsecond any row is correct, but a divergent row at
+        // the same key must not be able to shadow the signed one (or be
+        // silently served).
+        let mut signed: Option<String> = None;
+        let mut saw_divergent = false;
+        for row in &rows {
+            let payload: String = row.get("payload");
+            if entry_payload_hash(&payload) == location.entry_hash {
+                signed = Some(payload);
+            } else {
+                saw_divergent = true;
+            }
+        }
+        let Some(payload) = signed else {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                format!(
+                    "entry not found at pinned location (seq {seq}, event_time_us {event_time_us}) \
+                     or its payload changed since the receipt was issued"
+                ),
+            )
+            .into());
+        };
+        if saw_divergent {
+            // The signed row exists, but so does a DIVERGENT row at the
+            // exact same key — a foreign writer collided on the same
+            // (seq, event_time). Serving the signed row would hide the
+            // ambiguity; fail closed instead.
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                format!(
+                    "pinned location (seq {seq}, event_time_us {event_time_us}) has divergent \
+                     physical duplicates; refusing to read an ambiguous entry"
+                ),
+            )
+            .into());
+        }
+        let entry: SessionEntry = serde_json::from_str(&payload).map_err(|error| {
+            ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                format!("cannot decode pinned entry: {error}"),
+            )
+        })?;
+        let bytes = field_bytes(&entry, verified.field).ok_or_else(|| {
+            ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                "pinned entry no longer carries the receipt's field",
+            )
+        })?;
+        if bytes.len() != verified.total {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                format!(
+                    "field size changed since the receipt was issued ({} != {})",
+                    bytes.len(),
+                    verified.total
+                ),
+            )
+            .into());
+        }
+        Ok(bytes)
     }
 
     /// Load only the newest compaction segment: the last `Compaction` entry
@@ -917,7 +1088,10 @@ impl GreptimeSession {
         Ok((entries, next_comp))
     }
 
-    /// Append new entries atomically per multi-row INSERT statement.
+    /// Append new entries, returning the exact physical located key of
+    /// every appended entry (`seq` + `event_time`, pinned at INSERT time;
+    /// GreptimeDB's append mode keeps every physical row, so a receipt
+    /// against the returned key always reads exactly this version).
     ///
     /// GreptimeDB's pg-wire does not support transactions, so atomicity
     /// is per statement: a single multi-row INSERT either commits all N rows
@@ -931,23 +1105,27 @@ impl GreptimeSession {
     /// `next_seq` is computed once before any chunk loop. On failure
     /// `next_seq` is unchanged, so retries of the same slice reuse the same
     /// seq range. Identical-payload duplicates from a fully-committed-then-retried
-    /// batch are folded by the read path.
+    /// batch are folded by the read path, and the returned located keys stay
+    /// exact on that idempotent-retry path (they are re-read from the
+    /// committed rows, never freshly generated).
     ///
-    /// **Concurrent-write detection**: before any DB write the current DB
-    /// max seq is re-read (see [`Self::db_max_seq`]) and compared against
-    /// our cursor. A second writer (TUI + Web window, two e-agent processes
-    /// sharing one GreptimeDB, import_jsonl) that committed rows at or above
-    /// our `base_seq` is otherwise invisible — both writers would resume
-    /// from their own `next_seq` and silently interleave. Detection is
-    /// best-effort: it closes the pre-write window but cannot be atomic
-    /// (no transactions on the pg-wire), so a write racing the check itself
-    /// can still slip through. The overlap comparison distinguishes
-    /// "our own earlier commit" (idempotent retry: payloads identical →
-    /// skip re-insertion) from "a foreign writer" (any payload mismatch →
-    /// conflict error).
-    pub async fn append(&mut self, entries: &[SessionEntry]) -> Result<()> {
+    /// **Concurrent-write detection (best-effort, fail-closed)**: before
+    /// any DB write the current DB max seq is re-read (see
+    /// [`Self::db_max_seq`]) and compared against our cursor. GreptimeDB's
+    /// pg-wire has NO transactions and NO conditional-write/lease
+    /// mechanism, so the pre-check cannot be atomic with the INSERT — a
+    /// foreign writer can still race the window. This backend therefore
+    /// VERIFIES AFTER committing: every committed row in the written range
+    /// is re-read and must still be the physical winner for its seq
+    /// (latest `event_time`, identical duplicates folded). If a foreign
+    /// writer superseded or diverged any row, the append FAILS CLOSED with
+    /// a `concurrent write conflict` error instead of silently
+    /// latest-winning or advertising a location that the logical read path
+    /// would not pick. This is the strongest guarantee this backend can
+    /// provide: the ambiguity is detected and reported, never hidden.
+    pub async fn append_located(&mut self, entries: &[SessionEntry]) -> Result<Vec<EntryLocation>> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let n = entries.len();
 
@@ -958,13 +1136,17 @@ impl GreptimeSession {
         let n_i64 = i64::try_from(n).context("append count overflowed i64")?;
         let final_cursor = base_seq.checked_add(n_i64).ok_or_else(|| {
             anyhow::anyhow!(
-                "seq range overflow: base_seq={base_seq} count={n}; \
-                 max seq would exceed i64::MAX"
+                "seq range overflow: base_seq={base_seq} count={n};                  max seq would exceed i64::MAX"
             )
         })?;
 
         // Serialize all entries upfront so serialization errors happen
-        // before any database write.
+        // before any database write. The event_time pins are generated
+        // here too; they become the actual physical values of the INSERTED
+        // rows (locations are only built AFTER the commit, from the real
+        // physical rows, so a full/partial overlap can never advertise a
+        // freshly generated key that was never committed).
+        let fingerprint = workspace_id_fingerprint(&self.workspace_id);
         let mut prepped: Vec<(i64, chrono::NaiveDateTime, String, String, bool)> =
             Vec::with_capacity(n);
         for (i, entry) in entries.iter().enumerate() {
@@ -1005,9 +1187,7 @@ impl GreptimeSession {
                 let writer_hint = self
                     .client
                     .query_opt(
-                        "SELECT writer FROM sessions \
-                         WHERE workspace_id = $1 AND session_id = $2 \
-                         ORDER BY last_active_at DESC LIMIT 1",
+                        "SELECT writer FROM sessions                          WHERE workspace_id = $1 AND session_id = $2                          ORDER BY last_active_at DESC LIMIT 1",
                         &[&self.workspace_id, &self.session_id],
                     )
                     .await
@@ -1027,33 +1207,84 @@ impl GreptimeSession {
             }
             // The whole overlap matches this batch: it is our own earlier
             // commit (committed-then-errored append whose next_seq never
-            // advanced). Treat it as already written.
+            // advanced). Treat it as already written — the returned
+            // locations are the ACTUAL committed physical rows, re-read
+            // from the database (never freshly generated).
             if overlap_len == n {
+                let committed = self.read_winning_rows(base_seq, overlap_hi).await?;
                 // The DB may have advanced beyond our batch (foreign rows);
                 // resume past the true max so we never reuse foreign seqs.
                 self.next_seq = db_max.checked_add(1).context(format!(
-                    "max_seq overflow advancing next_seq after idempotent \
-                     retry in session '{}'",
+                    "max_seq overflow advancing next_seq after idempotent                      retry in session '{}'",
                     self.session_id
                 ))?;
-                return Ok(());
+                return Ok(committed);
             }
             // Partial overlap: the matching prefix stays committed; insert
             // only the remainder. prepped seqs are base_seq+i, so
             // prepped[overlap_len..] continues contiguously from db_max+1
             // and needs no re-serialization.
             self.insert_prepped(&prepped[overlap_len..]).await?;
+            // FAIL-CLOSED post-insert verification: re-read the whole
+            // written range and confirm our rows are still the physical
+            // winners. A foreign writer that raced the pre-check and
+            // committed at our seqs would otherwise leave our advertised
+            // locations pointing at rows the logical read path never picks.
+            if let Some(seq) = self
+                .overlap_conflict_seq(&prepped, base_seq, final_cursor - 1)
+                .await?
+            {
+                anyhow::bail!(
+                    "{}",
+                    format_conflict_error(&self.session_id, db_max, base_seq, seq, None,)
+                );
+            }
+            // Locations: the accepted prefix comes from the ACTUAL
+            // committed rows; the inserted suffix from the exact prepped
+            // values (which are the committed physical values).
+            let mut committed = self.read_winning_rows(base_seq, overlap_hi).await?;
+            committed.extend(prepped_locations(
+                &prepped[overlap_len..],
+                &fingerprint,
+                &self.backend_fp,
+                &self.session_id,
+            ));
             self.next_seq = final_cursor;
-            return Ok(());
+            return Ok(committed);
         }
 
         self.insert_prepped(&prepped).await?;
+
+        // FAIL-CLOSED post-insert verification (see the partial-overlap
+        // path above): our rows must be the physical winners of the whole
+        // written range, or the append fails closed.
+        if let Some(seq) = self
+            .overlap_conflict_seq(&prepped, base_seq, final_cursor - 1)
+            .await?
+        {
+            anyhow::bail!(
+                "{}",
+                format_conflict_error(&self.session_id, db_max, base_seq, seq, None)
+            );
+        }
 
         // Advance next_seq only after all chunks succeed, so a partial
         // failure does not shift sequence numbers on retry.
         self.next_seq = final_cursor;
 
-        Ok(())
+        // The prepped rows ARE the committed physical rows (no overlap).
+        Ok(prepped_locations(
+            &prepped,
+            &fingerprint,
+            &self.backend_fp,
+            &self.session_id,
+        ))
+    }
+
+    /// Append new entries, discarding the located keys (plain-append call
+    /// sites that do not issue receipts). See [`Self::append_located`].
+    pub async fn append(&mut self, entries: &[SessionEntry]) -> Result<()> {
+        self.append_located(entries).await.map(|_| ())
     }
 
     /// Insert prepped rows in chunked multi-row INSERTs (see [`Self::append`]
@@ -1297,6 +1528,69 @@ impl GreptimeSession {
             }
         }
         Ok(None)
+    }
+
+    /// Read the WINNING physical row of every seq in `[base_seq, overlap_hi]`
+    /// (latest `event_time` per seq, identical duplicates folded) and
+    /// return its exact location (`seq`, winning `event_time`, hash of the
+    /// winning raw payload), ordered by seq. Used by the overlap paths of
+    /// [`Self::append_located`] so the returned locations are the ACTUAL
+    /// committed physical rows — never freshly generated keys.
+    async fn read_winning_rows(
+        &self,
+        base_seq: i64,
+        overlap_hi: i64,
+    ) -> Result<Vec<EntryLocation>> {
+        let fingerprint = workspace_id_fingerprint(&self.workspace_id);
+        let rows = self
+            .client
+            .query(
+                "SELECT seq, event_time, payload FROM session_entries \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 AND seq >= $3 AND seq <= $4 \
+                 ORDER BY seq ASC, event_time ASC",
+                &[&self.workspace_id, &self.session_id, &base_seq, &overlap_hi],
+            )
+            .await
+            .context("cannot read back committed seq range")?;
+
+        // Group by seq, keeping only the row(s) with the latest event_time.
+        let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
+            std::collections::HashMap::with_capacity(rows.len().min(64));
+        for row in &rows {
+            let seq: i64 = row.get("seq");
+            let et: chrono::NaiveDateTime = row.get("event_time");
+            let payload: String = row.get("payload");
+            let entry = per_seq.entry(seq).or_insert((et, Vec::new()));
+            match et.cmp(&entry.0) {
+                std::cmp::Ordering::Greater => {
+                    entry.0 = et;
+                    entry.1 = vec![payload];
+                }
+                std::cmp::Ordering::Equal => entry.1.push(payload),
+                std::cmp::Ordering::Less => {}
+            }
+        }
+
+        let mut located: Vec<EntryLocation> = per_seq
+            .into_iter()
+            .map(|(seq, (event_time, payloads))| EntryLocation {
+                backend: "greptime",
+                fingerprint: fingerprint.clone(),
+                backend_fp: self.backend_fp.clone(),
+                session: self.session_id.clone(),
+                key: LocatedKey::Greptime {
+                    seq,
+                    event_time_us: datetime_to_us(event_time),
+                },
+                entry_hash: entry_payload_hash(&payloads[0]),
+            })
+            .collect();
+        located.sort_unstable_by_key(|location| match location.key {
+            LocatedKey::Greptime { seq, .. } => seq,
+            _ => unreachable!("greptime location"),
+        });
+        Ok(located)
     }
 
     // ------------------------------------------------------------------
@@ -2089,6 +2383,31 @@ fn build_multi_row_insert(row_count: usize) -> String {
     sql
 }
 
+/// Build the exact locations of prepped rows that were INSERTED with those
+/// exact values (the prepped `seq`/`event_time`/`payload` ARE the committed
+/// physical row values). `backend_fp` is the store's instance fingerprint.
+fn prepped_locations(
+    prepped: &[(i64, chrono::NaiveDateTime, String, String, bool)],
+    fingerprint: &str,
+    backend_fp: &str,
+    session_id: &str,
+) -> Vec<EntryLocation> {
+    prepped
+        .iter()
+        .map(|(seq, ts, _, payload, _)| EntryLocation {
+            backend: "greptime",
+            fingerprint: fingerprint.to_owned(),
+            backend_fp: backend_fp.to_owned(),
+            session: session_id.to_owned(),
+            key: LocatedKey::Greptime {
+                seq: *seq,
+                event_time_us: datetime_to_us(*ts),
+            },
+            entry_hash: entry_payload_hash(payload),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2155,6 +2474,8 @@ mod tests {
                         reasoning: None,
                     }),
                 ],
+                current_prompt_at: None,
+                no_current_prompt: false,
             },
             SessionEntry::Notice {
                 text: "[background task 1 completed]\nexit: 0".into(),
@@ -2650,6 +2971,480 @@ mod tests {
         assert_eq!(loaded_a.len(), 1);
     }
 
+    /// Exact-version semantics through the Greptime backend (requires a live
+    /// DB, `GREPTIME_PG`): `append_located` pins (seq, event_time, payload
+    /// hash); a same-seq later version (a newer event_time row appended
+    /// directly — append mode keeps every physical row) never retargets an
+    /// old ref; `read_field` re-checks the pinned event_time + hash.
+    #[tokio::test]
+    async fn located_append_load_read_exact_version() {
+        use crate::output_receipt::{FieldId, ReceiptCodec};
+        use crate::session_store::LocatedKey;
+
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-located-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let codec = ReceiptCodec::load_from_dir(dir.path()).unwrap();
+
+        let entry_a = Message::User {
+            content: "version-A".into(),
+            images: vec![],
+        }
+        .into();
+        let locations = session
+            .append_located(std::slice::from_ref(&entry_a))
+            .await
+            .unwrap();
+        assert_eq!(locations.len(), 1);
+        let loc_a = locations[0].clone();
+        assert_eq!(loc_a.backend, "greptime");
+        assert_eq!(loc_a.session, sid);
+        assert_eq!(loc_a.fingerprint.len(), 32);
+        assert_eq!(loc_a.entry_hash.len(), 64);
+        let LocatedKey::Greptime { seq, event_time_us } = loc_a.key else {
+            panic!("greptime location expected");
+        };
+
+        // Same-seq later version with different payload (direct insert).
+        let entry_b: SessionEntry = Message::User {
+            content: "version-B".into(),
+            images: vec![],
+        }
+        .into();
+        let payload_b = serde_json::to_string(&entry_b).unwrap();
+        session
+            .client
+            .execute(
+                "INSERT INTO session_entries \
+                 (workspace_id, session_id, seq, event_time, entry_kind, payload, schema_version, is_error) \
+                 VALUES ($1, $2, $3, $4, 'message', $5, 1, false)",
+                &[
+                    &wid,
+                    &sid,
+                    &seq,
+                    &us_to_datetime(event_time_us + 1),
+                    &payload_b,
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Read path dedups to the newest (latest event_time wins).
+        let loaded = session.load().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(
+            &loaded[0],
+            SessionEntry::Message { message: Message::User { content, .. } } if content == "version-B"
+        ));
+        // load_located reports the winning physical location.
+        let located = session.load_located().await.unwrap();
+        assert_eq!(located.len(), 1);
+        let new_loc = located[0].0.clone();
+        assert!(matches!(
+            new_loc.key,
+            LocatedKey::Greptime { seq: s, event_time_us: et } if s == seq && et == event_time_us + 1
+        ));
+
+        // The OLD receipt still reads the OLD physical row (pinned
+        // event_time + hash), never the retargeted newer version.
+        let old_ref = codec
+            .issue(&loc_a, FieldId::UserContent, "version-A".len())
+            .unwrap();
+        let bytes = session
+            .read_field(&codec.verify(&old_ref).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"version-A");
+        // A receipt for the new location reads version B.
+        let new_ref = codec
+            .issue(&new_loc, FieldId::UserContent, "version-B".len())
+            .unwrap();
+        let bytes = session
+            .read_field(&codec.verify(&new_ref).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"version-B");
+        // Tampering the pinned hash fails with integrity.
+        let mut tampered = loc_a.clone();
+        tampered.entry_hash = "0".repeat(64);
+        let bad_ref = codec
+            .issue(&tampered, FieldId::UserContent, "version-A".len())
+            .unwrap();
+        let err = session
+            .read_field(&codec.verify(&bad_ref).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("integrity"),
+            "hash drift must be integrity: {err:#}"
+        );
+    }
+
+    /// Full-overlap idempotent retry returns the ACTUAL committed physical
+    /// rows (same seq, event_time, hash) — never freshly generated keys.
+    #[tokio::test]
+    async fn append_full_overlap_returns_actual_committed_locations() {
+        use crate::output_receipt::{FieldId, ReceiptCodec};
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-fullov-{}", crate::session::new_id());
+        let entries: Vec<SessionEntry> = vec![
+            Message::User {
+                content: "first".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::User {
+                content: "second".into(),
+                images: vec![],
+            }
+            .into(),
+        ];
+
+        let mut writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let locs_a = writer_a.append_located(&entries).await.unwrap();
+        assert_eq!(locs_a.len(), 2);
+        drop(writer_a);
+
+        let mut writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_b.next_seq = 0; // committed-then-errored retry reuses seqs
+        let locs_b = writer_b.append_located(&entries).await.unwrap();
+
+        assert_eq!(locs_a, locs_b, "retry must return the committed rows");
+
+        // Every returned location resolves through read_field.
+        let dir = tempfile::tempdir().unwrap();
+        let codec = ReceiptCodec::load_from_dir(dir.path()).unwrap();
+        for (i, loc) in locs_b.iter().enumerate() {
+            let content = &["first", "second"][i];
+            let receipt = codec
+                .issue(loc, FieldId::UserContent, content.len())
+                .unwrap();
+            let bytes = writer_b
+                .read_field(&codec.verify(&receipt).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(bytes, content.as_bytes(), "location must resolve");
+        }
+    }
+
+    /// Partial-overlap retry returns the ACTUAL committed rows for the
+    /// accepted prefix and the exact inserted rows for the suffix.
+    #[tokio::test]
+    async fn append_partial_overlap_returns_actual_locations() {
+        use crate::output_receipt::{FieldId, ReceiptCodec};
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-partov-{}", crate::session::new_id());
+        let entries: Vec<SessionEntry> = vec![
+            Message::User {
+                content: "a".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::User {
+                content: "b".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::User {
+                content: "c".into(),
+                images: vec![],
+            }
+            .into(),
+            Message::User {
+                content: "d".into(),
+                images: vec![],
+            }
+            .into(),
+        ];
+
+        let mut writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_a.append(&entries[..2]).await.unwrap();
+        drop(writer_a);
+
+        let mut writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let locs_first = writer_b.append_located(&entries[2..4]).await.unwrap();
+        writer_b.next_seq = 2; // errored retry
+        let mut more: Vec<SessionEntry> = entries[2..].to_vec();
+        more.push(
+            Message::User {
+                content: "e".into(),
+                images: vec![],
+            }
+            .into(),
+        );
+        let locs_retry = writer_b.append_located(&more).await.unwrap();
+        assert_eq!(locs_retry.len(), 3);
+        // Prefix (seqs 2,3): the ACTUAL committed rows — identical to B's
+        // own first commit's locations.
+        assert_eq!(
+            &locs_retry[..2],
+            &locs_first[..],
+            "accepted prefix must re-read the actual committed rows"
+        );
+        // Suffix (seq 4): contiguous, resolves via read_field.
+        let dir = tempfile::tempdir().unwrap();
+        let codec = ReceiptCodec::load_from_dir(dir.path()).unwrap();
+        let contents = ["c", "d", "e"];
+        for (i, loc) in locs_retry.iter().enumerate() {
+            let receipt = codec
+                .issue(loc, FieldId::UserContent, contents[i].len())
+                .unwrap();
+            let bytes = writer_b
+                .read_field(&codec.verify(&receipt).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(bytes, contents[i].as_bytes(), "location must resolve");
+        }
+    }
+
+    /// The post-insert fail-closed detection (finding: Greptime has no
+    /// transactions/leases, so after committing we re-read the written
+    /// range and require OUR rows to be the physical winners) — a foreign
+    /// row superseding ours at the same seq is detected by the exact
+    /// comparison the append runs after every insert.
+    #[tokio::test]
+    async fn post_insert_fail_closed_detects_superseded_foreign_row() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-failclosed-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        let entry: SessionEntry = Message::User {
+            content: "mine".into(),
+            images: vec![],
+        }
+        .into();
+        // Normal append: the post-insert check runs and passes.
+        let locs = session
+            .append_located(std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+        assert_eq!(locs.len(), 1);
+        let crate::session_store::LocatedKey::Greptime { seq, event_time_us } = locs[0].key else {
+            panic!("greptime location");
+        };
+
+        // A foreign writer races the window and commits a LATER row at the
+        // same seq with a DIFFERENT payload — exactly the committed
+        // ambiguity the post-insert verification must fail closed on.
+        let foreign: SessionEntry = Message::User {
+            content: "foreign".into(),
+            images: vec![],
+        }
+        .into();
+        let payload_foreign = serde_json::to_string(&foreign).unwrap();
+        session
+            .client
+            .execute(
+                "INSERT INTO session_entries \
+                 (workspace_id, session_id, seq, event_time, entry_kind, payload, schema_version, is_error) \
+                 VALUES ($1, $2, $3, $4, 'message', $5, 1, false)",
+                &[
+                    &wid,
+                    &sid,
+                    &seq,
+                    &us_to_datetime(event_time_us + 1),
+                    &payload_foreign,
+                ],
+            )
+            .await
+            .unwrap();
+
+        // The exact post-insert comparison (overlap_conflict_seq over the
+        // written range) must report the seq: our row is no longer the
+        // winner. append_located would fail closed with a conflict instead
+        // of advertising a location the read path would not pick.
+        let prepped = vec![(
+            seq,
+            us_to_datetime(event_time_us),
+            "message".to_owned(),
+            serde_json::to_string(&entry).unwrap(),
+            false,
+        )];
+        let conflict = session
+            .overlap_conflict_seq(&prepped, seq, seq)
+            .await
+            .unwrap();
+        assert_eq!(conflict, Some(seq), "superseded row must fail closed");
+        // The logical read path agrees: the foreign row wins.
+        let loaded = session.load().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(
+            &loaded[0],
+            SessionEntry::Message { message: Message::User { content, .. } } if content == "foreign"
+        ));
+    }
+
+    /// Exact-key read with multiple physical rows at the pinned key:
+    /// identical duplicates fold and resolve; a DIVERGENT duplicate fails
+    /// closed with integrity even though the signed row exists (the
+    /// arbitrary-row `query_opt` behavior would be ambiguous).
+    #[tokio::test]
+    async fn read_field_exact_key_folds_identical_and_rejects_divergent_duplicates() {
+        use crate::output_receipt::{FieldId, ReceiptCodec};
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-exactdup-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let codec = ReceiptCodec::load_from_dir(dir.path()).unwrap();
+
+        let entry: SessionEntry = Message::User {
+            content: "dup".into(),
+            images: vec![],
+        }
+        .into();
+        let locs = session
+            .append_located(std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+        let loc = locs[0].clone();
+        let crate::session_store::LocatedKey::Greptime { seq, event_time_us } = loc.key else {
+            panic!("greptime location");
+        };
+        let payload = serde_json::to_string(&entry).unwrap();
+
+        // Identical duplicate at the exact same key (idempotent retry at
+        // the same microsecond): folds, receipt resolves.
+        session
+            .client
+            .execute(
+                "INSERT INTO session_entries \
+                 (workspace_id, session_id, seq, event_time, entry_kind, payload, schema_version, is_error) \
+                 VALUES ($1, $2, $3, $4, 'message', $5, 1, false)",
+                &[&wid, &sid, &seq, &us_to_datetime(event_time_us), &payload],
+            )
+            .await
+            .unwrap();
+        let receipt = codec
+            .issue(&loc, FieldId::UserContent, "dup".len())
+            .unwrap();
+        let bytes = session
+            .read_field(&codec.verify(&receipt).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"dup");
+
+        // A DIVERGENT duplicate at the exact same key: the signed row
+        // exists, but the key is ambiguous — fail closed.
+        let foreign: SessionEntry = Message::User {
+            content: "divergent".into(),
+            images: vec![],
+        }
+        .into();
+        session
+            .client
+            .execute(
+                "INSERT INTO session_entries \
+                 (workspace_id, session_id, seq, event_time, entry_kind, payload, schema_version, is_error) \
+                 VALUES ($1, $2, $3, $4, 'message', $5, 1, false)",
+                &[
+                    &wid,
+                    &sid,
+                    &seq,
+                    &us_to_datetime(event_time_us),
+                    &serde_json::to_string(&foreign).unwrap(),
+                ],
+            )
+            .await
+            .unwrap();
+        let err = session
+            .read_field(&codec.verify(&receipt).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("divergent"),
+            "divergent duplicates must fail closed: {err:#}"
+        );
+    }
+
+    /// The located loader hashes the EXACT raw stored payload bytes (the
+    /// same bytes `read_field` re-hashes): a whitespace/key-order variant
+    /// stored in the DB must still produce a receipt that resolves.
+    #[tokio::test]
+    async fn load_located_hashes_exact_raw_payload_bytes() {
+        use crate::output_receipt::{FieldId, ReceiptCodec};
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-rawhash-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // Externally-tagged Message inside an internally-tagged entry:
+        // reordered keys + whitespace, same entry, different raw bytes.
+        let raw = r#"{ "message": { "User": { "images": [ ], "content": "variant" } }, "type": "message" }"#;
+        session
+            .client
+            .execute(
+                "INSERT INTO session_entries \
+                 (workspace_id, session_id, seq, event_time, entry_kind, payload, schema_version, is_error) \
+                 VALUES ($1, $2, 0, $3, 'message', $4, 1, false)",
+                &[
+                    &wid,
+                    &sid,
+                    &us_to_datetime(next_event_time_us()),
+                    &raw,
+                ],
+            )
+            .await
+            .unwrap();
+
+        let located = session.load_located().await.unwrap();
+        assert_eq!(located.len(), 1);
+        let (loc, entry) = &located[0];
+        assert!(
+            matches!(
+                entry,
+                SessionEntry::Message { message: Message::User { content, .. } } if content == "variant"
+            ),
+            "variant must deserialize to the same entry"
+        );
+        assert_eq!(
+            loc.entry_hash,
+            crate::session_store::entry_payload_hash(raw),
+            "loader must hash the exact raw stored payload"
+        );
+        // A receipt issued against that location resolves (under the old
+        // re-serialization hashing it would fail integrity).
+        let dir = tempfile::tempdir().unwrap();
+        let codec = ReceiptCodec::load_from_dir(dir.path()).unwrap();
+        let receipt = codec
+            .issue(loc, FieldId::UserContent, "variant".len())
+            .unwrap();
+        let bytes = session
+            .read_field(&codec.verify(&receipt).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"variant");
+    }
+
     #[tokio::test]
     async fn load_head_and_load_older_segmented() {
         let conn = conn_str();
@@ -2679,6 +3474,8 @@ mod tests {
                 content: "retained 1".into(),
                 images: vec![],
             }],
+            current_prompt_at: None,
+            no_current_prompt: false,
         };
         let middle: Vec<SessionEntry> = vec![
             Message::User {
@@ -2698,6 +3495,8 @@ mod tests {
                 content: "retained 2".into(),
                 images: vec![],
             }],
+            current_prompt_at: None,
+            no_current_prompt: false,
         };
         let latest: Vec<SessionEntry> = vec![
             Message::User {
@@ -2806,6 +3605,8 @@ mod tests {
         let comp1 = SessionEntry::Compaction {
             summary: "compaction 1".into(),
             retained: vec![],
+            current_prompt_at: None,
+            no_current_prompt: false,
         };
         // 7 middle entries: enough that one segment needs several 2-entry
         // pages.
@@ -2821,6 +3622,8 @@ mod tests {
         let comp2 = SessionEntry::Compaction {
             summary: "compaction 2".into(),
             retained: vec![],
+            current_prompt_at: None,
+            no_current_prompt: false,
         };
         let latest: Vec<SessionEntry> = vec![
             Message::User {
@@ -2940,6 +3743,8 @@ mod tests {
         let comp = |summary: &str| SessionEntry::Compaction {
             summary: summary.into(),
             retained: vec![],
+            current_prompt_at: None,
+            no_current_prompt: false,
         };
 
         // seqs: 0,1 early; 2 comp1; 3..7 latest (comp1_seq = 2).
@@ -3078,6 +3883,8 @@ mod tests {
         let comp = |summary: &str| SessionEntry::Compaction {
             summary: summary.into(),
             retained: vec![],
+            current_prompt_at: None,
+            no_current_prompt: false,
         };
 
         // seqs: 0,1 early; 2 comp1; 3..7 latest (comp1_seq = 2). 8
@@ -3179,6 +3986,8 @@ mod tests {
         let comp = |summary: &str| SessionEntry::Compaction {
             summary: summary.into(),
             retained: vec![],
+            current_prompt_at: None,
+            no_current_prompt: false,
         };
 
         // seqs: 0,1 early; 2 comp1; 3..6 middle/latest (comp1_seq = 2).
@@ -3246,6 +4055,8 @@ mod tests {
         let comp = |summary: &str| SessionEntry::Compaction {
             summary: summary.into(),
             retained: vec![],
+            current_prompt_at: None,
+            no_current_prompt: false,
         };
 
         // ---- No compaction: whole session is one head segment. No limit
@@ -3408,6 +4219,8 @@ mod tests {
                 content: "retained 1".into(),
                 images: vec![],
             }],
+            current_prompt_at: None,
+            no_current_prompt: false,
         };
         let middle: Vec<SessionEntry> = vec![
             Message::User {
@@ -3427,6 +4240,8 @@ mod tests {
                 content: "retained 2".into(),
                 images: vec![],
             }],
+            current_prompt_at: None,
+            no_current_prompt: false,
         };
         let latest: Vec<SessionEntry> = vec![
             Message::User {

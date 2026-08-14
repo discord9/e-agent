@@ -125,17 +125,22 @@ pub struct LoadedSession {
     pub legacy: bool,
 }
 
-/// Validate that a session name contains only [a-zA-Z0-9_-]. Shared by all
-/// backends — JSONL files need this for file-system safety, and Greptime
-/// sessions are persisted as JSONL background records and must therefore
-/// pass the same check.
+/// Validate that a session name contains only [a-zA-Z0-9_-] and is at
+/// most [`crate::session_store::MAX_SESSION_ID_LEN`] chars. Shared by all
+/// backends — JSONL files need this for file-system safety, Greptime
+/// sessions are persisted as JSONL background records, and receipts bind
+/// the session id (the length bound keeps receipts bounded).
 pub fn validate_session_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty()
+        || name.len() > crate::session_store::MAX_SESSION_ID_LEN
         || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
-        anyhow::bail!("session name must contain only [a-zA-Z0-9_-]");
+        anyhow::bail!(
+            "session name must be 1..={} chars of [a-zA-Z0-9_-]",
+            crate::session_store::MAX_SESSION_ID_LEN
+        );
     }
     Ok(())
 }
@@ -195,27 +200,224 @@ impl Session {
         if entries.is_empty() {
             return Ok(());
         }
-        let path = session_path(root, name, "jsonl")?;
-        #[cfg(unix)]
-        let created = !path.exists();
-        let directory = path.parent().unwrap();
-        std::fs::create_dir_all(directory)
-            .with_context(|| format!("cannot create session directory {}", directory.display()))?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("cannot append session {}", path.display()))?;
-        for entry in entries {
-            file.write_all(&serde_json::to_vec(entry)?)?;
-            file.write_all(b"\n")?;
+        append_batch_locked(root, name, entries).map(|_| ())
+    }
+
+    /// Append new entries to the JSONL log, returning the exact physical
+    /// located key of each appended line: the 0-based ordinal of the line
+    /// (the append-only file's line count before this write) plus the
+    /// SHA-256 of the exact serialized payload bytes. The whole
+    /// count+serialize+append+sync+location window runs under ONE
+    /// exclusive lock on the session file (cross-process advisory flock on
+    /// Unix), so the ordinals are the file's true physical positions even
+    /// with concurrent writers.
+    pub fn append_located(
+        root: &Path,
+        name: &str,
+        entries: &[SessionEntry],
+    ) -> anyhow::Result<Vec<crate::session_store::EntryLocation>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
         }
-        file.sync_all()?;
-        #[cfg(unix)]
-        if created {
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        let (base, payloads) = append_batch_locked(root, name, entries)?;
+        let fingerprint = crate::session_store::workspace_root_fingerprint(root);
+        let backend_fp = crate::session_store::backend_instance_fingerprint(
+            "jsonl",
+            &crate::session_store::derive_workspace_id(root),
+        );
+        Ok(payloads
+            .into_iter()
+            .enumerate()
+            .map(|(i, payload)| {
+                let payload = String::from_utf8(payload).expect("serialized JSON is valid UTF-8");
+                crate::session_store::EntryLocation {
+                    backend: "jsonl",
+                    fingerprint: fingerprint.clone(),
+                    backend_fp: backend_fp.clone(),
+                    session: name.to_owned(),
+                    key: crate::session_store::LocatedKey::Jsonl {
+                        ordinal: base as i64 + i as i64,
+                    },
+                    entry_hash: crate::session_store::entry_payload_hash(&payload),
+                }
+            })
+            .collect())
+    }
+
+    /// Load the full JSONL history paired with each line's exact physical
+    /// location (ordinal + payload hash). Legacy whole-document `.json`
+    /// sessions load with `None` locations (they are rewritten to JSONL by
+    /// the caller; until then no receipt refs are issued for them).
+    pub fn load_located(
+        root: &Path,
+        name: &str,
+    ) -> anyhow::Result<crate::session_store::LoadedLocated> {
+        let jsonl = session_path(root, name, "jsonl")?;
+        if jsonl.exists() {
+            let file = std::fs::File::open(&jsonl)
+                .with_context(|| format!("cannot open session {}", jsonl.display()))?;
+            let fingerprint = crate::session_store::workspace_root_fingerprint(root);
+            let mut entries = Vec::new();
+            let mut locations = Vec::new();
+            for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let entry = serde_json::from_str::<SessionEntry>(&line).with_context(|| {
+                    format!(
+                        "cannot decode session {} line {}",
+                        jsonl.display(),
+                        index + 1
+                    )
+                })?;
+                locations.push(Some(crate::session_store::EntryLocation {
+                    backend: "jsonl",
+                    fingerprint: fingerprint.clone(),
+                    backend_fp: crate::session_store::backend_instance_fingerprint(
+                        "jsonl",
+                        &crate::session_store::derive_workspace_id(root),
+                    ),
+                    session: name.to_owned(),
+                    key: crate::session_store::LocatedKey::Jsonl {
+                        ordinal: entries.len() as i64,
+                    },
+                    entry_hash: crate::session_store::entry_payload_hash(&line),
+                }));
+                entries.push(entry);
+            }
+            return Ok(crate::session_store::LoadedLocated {
+                entries,
+                locations,
+                legacy: false,
+            });
         }
-        Ok(())
+        let legacy = session_path(root, name, "json")?;
+        if !legacy.exists() {
+            return Ok(crate::session_store::LoadedLocated {
+                entries: Vec::new(),
+                locations: Vec::new(),
+                legacy: false,
+            });
+        }
+        let saved: LegacySession = serde_json::from_slice(
+            &std::fs::read(&legacy)
+                .with_context(|| format!("cannot read session {}", legacy.display()))?,
+        )
+        .with_context(|| format!("cannot decode session {}", legacy.display()))?;
+        if saved.version != LEGACY_VERSION {
+            anyhow::bail!("unsupported session version {}", saved.version);
+        }
+        let entries: Vec<SessionEntry> =
+            saved.messages.into_iter().map(SessionEntry::from).collect();
+        Ok(crate::session_store::LoadedLocated {
+            locations: vec![None; entries.len()],
+            entries,
+            legacy: true,
+        })
+    }
+
+    /// Exact-version field read on the JSONL backend: read the exact line
+    /// at the receipt's ordinal, verify its payload hash (a rewritten file
+    /// or a retargeted ordinal fails with `integrity`), extract the field,
+    /// and reject total-size drift.
+    pub fn read_field(
+        root: &Path,
+        verified: &crate::output_receipt::VerifiedRef,
+    ) -> anyhow::Result<Vec<u8>> {
+        use crate::output_receipt::{ReceiptError, ReceiptErrorKind};
+        let location = &verified.location;
+        if location.backend != "jsonl" {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                "receipt backend does not match this store",
+            )
+            .into());
+        }
+        if location.fingerprint != crate::session_store::workspace_root_fingerprint(root) {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                "receipt is for a different workspace",
+            )
+            .into());
+        }
+        if location.backend_fp
+            != crate::session_store::backend_instance_fingerprint(
+                "jsonl",
+                &crate::session_store::derive_workspace_id(root),
+            )
+        {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                "receipt is for a different backend instance",
+            )
+            .into());
+        }
+        let path = session_path(root, &location.session, "jsonl")?;
+        if !path.exists() {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                "session file no longer exists",
+            )
+            .into());
+        }
+        let crate::session_store::LocatedKey::Jsonl { ordinal } = location.key else {
+            unreachable!("backend checked above");
+        };
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("cannot open session {}", path.display()))?;
+        let mut found: Option<String> = None;
+        let mut line_index = 0i64;
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line_index == ordinal {
+                found = Some(line);
+                break;
+            }
+            line_index += 1;
+        }
+        let Some(line) = found else {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                format!("entry not found at pinned ordinal {ordinal}"),
+            )
+            .into());
+        };
+        if crate::session_store::entry_payload_hash(&line) != location.entry_hash {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                "entry changed since the receipt was issued",
+            )
+            .into());
+        }
+        let entry: SessionEntry = serde_json::from_str(&line).map_err(|error| {
+            ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                format!("cannot decode pinned entry: {error}"),
+            )
+        })?;
+        let bytes =
+            crate::output_receipt::field_bytes(&entry, verified.field).ok_or_else(|| {
+                ReceiptError::new(
+                    ReceiptErrorKind::Integrity,
+                    "pinned entry no longer carries the receipt's field",
+                )
+            })?;
+        if bytes.len() != verified.total {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Integrity,
+                format!(
+                    "field size changed since the receipt was issued ({} != {})",
+                    bytes.len(),
+                    verified.total
+                ),
+            )
+            .into());
+        }
+        Ok(bytes)
     }
 
     /// Rewrite the whole log (used once to migrate legacy sessions).
@@ -465,6 +667,86 @@ fn session_path(root: &Path, name: &str, extension: &str) -> anyhow::Result<std:
     Ok(root
         .join(".e-agent/sessions")
         .join(format!("{name}.{extension}")))
+}
+
+/// Take the exclusive cross-process append lock on a JSONL session file
+/// (advisory `flock` on Unix). The lock is released on drop or process
+/// death, so a crashed writer can never leave a stale lock behind. Held
+/// for the whole count+serialize+append+sync+location window so the
+/// counted ordinal base is the true physical position even with
+/// concurrent writers.
+#[cfg(unix)]
+fn lock_session_append(file: &std::fs::File, path: &Path) -> anyhow::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive)
+        .with_context(|| format!("cannot lock session file {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn lock_session_append(_file: &std::fs::File, _path: &Path) -> anyhow::Result<()> {
+    // No flock on non-Unix platforms: the count-then-append window is
+    // serialized only within this process. Cross-process JSONL appends on
+    // Windows remain best-effort (documented limitation of the legacy
+    // file backend).
+    Ok(())
+}
+
+/// Serialize + append one batch to a JSONL session file under ONE
+/// exclusive lock (see [`lock_session_append`]), returning the base
+/// ordinal (the file's line count before this batch) and the exact
+/// serialized payload bytes. Shared by [`Session::append`] and
+/// [`Session::append_located`], so every JSONL append path holds the same
+/// lock window and a concurrent `append` can never shift the ordinals
+/// another writer counts.
+fn append_batch_locked(
+    root: &Path,
+    name: &str,
+    entries: &[SessionEntry],
+) -> anyhow::Result<(usize, Vec<Vec<u8>>)> {
+    let path = session_path(root, name, "jsonl")?;
+    let directory = path.parent().unwrap();
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("cannot create session directory {}", directory.display()))?;
+    #[cfg(unix)]
+    let created = !path.exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(&path)
+        .with_context(|| format!("cannot append session {}", path.display()))?;
+    lock_session_append(&file, &path)?;
+    // Count through the locked fd: the count is the ordinal base of the
+    // lines this batch appends. After the count the fd is at EOF and
+    // writes go to the physical end (O_APPEND).
+    let base = {
+        let mut reader = std::io::BufReader::new(&file);
+        let mut count = 0usize;
+        let mut buffer = Vec::new();
+        loop {
+            buffer.clear();
+            let read = reader.read_until(b'\n', &mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            if !buffer.iter().all(u8::is_ascii_whitespace) {
+                count += 1;
+            }
+        }
+        count
+    };
+    let mut payloads = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let payload = serde_json::to_vec(entry)?;
+        file.write_all(&payload)?;
+        file.write_all(b"\n")?;
+        payloads.push(payload);
+    }
+    file.sync_all()?;
+    #[cfg(unix)]
+    if created {
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    }
+    Ok((base, payloads))
 }
 
 #[cfg(test)]
@@ -914,5 +1196,339 @@ mod tests {
         // Empty subagent session id is treated as absent (JSONL never
         // writes an empty string, but be defensive).
         assert_eq!(format_unfinished(3, "x", Some("")), "task 3: x");
+    }
+
+    // ── Located keys: append_located / load_located / read_field ──────
+
+    use crate::output_receipt::{FieldId, ReceiptCodec, VerifiedRef, page_field};
+    use crate::session_store::{LoadedLocated, LocatedKey};
+
+    fn located_entries() -> Vec<SessionEntry> {
+        vec![
+            Message::User {
+                content: "first".into(),
+                images: vec![],
+            }
+            .into(),
+            SessionEntry::BackgroundCompletion {
+                id: 1,
+                output: "big-output".into(),
+                label: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn append_located_returns_exact_ordinals_and_hashes() {
+        let temp = tempfile::tempdir().unwrap();
+        let entries = located_entries();
+        let locations = Session::append_located(temp.path(), "loc", &entries).unwrap();
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[0].backend, "jsonl");
+        assert_eq!(locations[0].session, "loc");
+        assert_eq!(locations[0].fingerprint.len(), 32);
+        assert_eq!(locations[0].entry_hash.len(), 64);
+        assert!(matches!(locations[0].key, LocatedKey::Jsonl { ordinal: 0 }));
+        assert!(matches!(locations[1].key, LocatedKey::Jsonl { ordinal: 1 }));
+        // The entry hash is the hash of the exact persisted line.
+        let raw = std::fs::read_to_string(temp.path().join(".e-agent/sessions/loc.jsonl")).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            locations[0].entry_hash,
+            crate::session_store::entry_payload_hash(lines[0])
+        );
+        // Appending more continues the ordinals (append-only file).
+        let more = Session::append_located(temp.path(), "loc", &entries[..1]).unwrap();
+        assert!(matches!(more[0].key, LocatedKey::Jsonl { ordinal: 2 }));
+    }
+
+    #[test]
+    fn load_located_roundtrips_and_aligns_with_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let entries = located_entries();
+        let locations = Session::append_located(temp.path(), "loc", &entries).unwrap();
+        let loaded: LoadedLocated = Session::load_located(temp.path(), "loc").unwrap();
+        assert!(!loaded.legacy);
+        assert_eq!(loaded.entries, entries);
+        assert_eq!(
+            loaded.locations,
+            locations.into_iter().map(Some).collect::<Vec<_>>()
+        );
+        // Unknown session → empty.
+        let empty = Session::load_located(temp.path(), "nope").unwrap();
+        assert!(empty.entries.is_empty());
+        assert!(empty.locations.is_empty());
+    }
+
+    #[test]
+    fn load_located_legacy_json_has_no_locations() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(".e-agent/sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("old.json"),
+            r#"{"version":1,"messages":[{"User":{"content":"hi"}}]}"#,
+        )
+        .unwrap();
+        let loaded = Session::load_located(temp.path(), "old").unwrap();
+        assert!(loaded.legacy);
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.locations, vec![None]);
+    }
+
+    #[test]
+    fn read_field_returns_exact_persisted_field_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let entries = located_entries();
+        let locations = Session::append_located(temp.path(), "loc", &entries).unwrap();
+
+        // User content.
+        let verified = VerifiedRef {
+            location: locations[0].clone(),
+            field: FieldId::UserContent,
+            total: "first".len(),
+        };
+        assert_eq!(
+            Session::read_field(temp.path(), &verified).unwrap(),
+            b"first"
+        );
+
+        // Background completion output.
+        let verified = VerifiedRef {
+            location: locations[1].clone(),
+            field: FieldId::BgOutput,
+            total: "big-output".len(),
+        };
+        assert_eq!(
+            Session::read_field(temp.path(), &verified).unwrap(),
+            b"big-output"
+        );
+        // Wrong field for the entry → integrity ("no longer carries").
+        let wrong = VerifiedRef {
+            location: locations[1].clone(),
+            field: FieldId::ToolContent,
+            total: 0,
+        };
+        let err = Session::read_field(temp.path(), &wrong).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("integrity"),
+            "wrong field must be an integrity error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn read_field_rejects_hash_drift_and_missing_ordinal() {
+        let temp = tempfile::tempdir().unwrap();
+        let entries = located_entries();
+        let locations = Session::append_located(temp.path(), "loc", &entries).unwrap();
+        // Tampered entry hash → integrity (a rewritten file or a retargeted
+        // ordinal can never satisfy an old ref).
+        let mut tampered = locations[0].clone();
+        tampered.entry_hash = "0".repeat(64);
+        let verified = VerifiedRef {
+            location: tampered,
+            field: FieldId::UserContent,
+            total: 5,
+        };
+        let err = Session::read_field(temp.path(), &verified).unwrap_err();
+        assert!(format!("{err:#}").contains("integrity"), "{err:#}");
+
+        // Ordinal past the end of the file → integrity.
+        let mut missing = locations[0].clone();
+        missing.key = LocatedKey::Jsonl { ordinal: 99 };
+        let verified = VerifiedRef {
+            location: missing,
+            field: FieldId::UserContent,
+            total: 5,
+        };
+        let err = Session::read_field(temp.path(), &verified).unwrap_err();
+        assert!(format!("{err:#}").contains("integrity"), "{err:#}");
+
+        // Wrong workspace fingerprint → integrity.
+        let mut foreign = locations[0].clone();
+        foreign.fingerprint = "1".repeat(32);
+        let verified = VerifiedRef {
+            location: foreign,
+            field: FieldId::UserContent,
+            total: 5,
+        };
+        let err = Session::read_field(temp.path(), &verified).unwrap_err();
+        assert!(format!("{err:#}").contains("integrity"), "{err:#}");
+    }
+
+    #[test]
+    fn read_field_total_drift_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let entries = located_entries();
+        let locations = Session::append_located(temp.path(), "loc", &entries).unwrap();
+        let verified = VerifiedRef {
+            location: locations[0].clone(),
+            field: FieldId::UserContent,
+            total: 999, // wrong total
+        };
+        let err = Session::read_field(temp.path(), &verified).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("size changed"),
+            "total drift must be an integrity error: {err:#}"
+        );
+    }
+
+    /// End-to-end page reconstruction: bound a field into a receipt,
+    /// verify, read the exact full field, and page it with UTF-8-safe
+    /// boundaries — the exact `read_output` contract.
+    #[test]
+    fn jsonl_page_reconstruction_with_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let entries = located_entries();
+        let locations = Session::append_located(temp.path(), "loc", &entries).unwrap();
+        let codec = ReceiptCodec::load_from_dir(temp.path()).unwrap();
+        // Page the persisted "big-output" field.
+        let receipt = codec
+            .issue(&locations[1], FieldId::BgOutput, "big-output".len())
+            .unwrap();
+        let verified = codec.verify(&receipt).unwrap();
+        let bytes = Session::read_field(temp.path(), &verified).unwrap();
+        assert_eq!(bytes, b"big-output");
+        let page = page_field(&bytes, 0, 2048).unwrap();
+        assert_eq!(page.total_bytes, 10);
+        assert_eq!(page.sha256.len(), 64);
+        assert_eq!(page.text, "big-output");
+        assert_eq!(page.next_offset, None);
+
+        // A larger multibyte field: append it, page it in a chain, and
+        // rebuild byte-exactly (UTF-8 seams never split chars).
+        let output = format!("{}{}{}", "α".repeat(1000), "MIDDLE", "€".repeat(500));
+        let entry = SessionEntry::BackgroundCompletion {
+            id: 2,
+            output: output.clone(),
+            label: None,
+        };
+        let more = Session::append_located(temp.path(), "loc", &[entry]).unwrap();
+        let receipt = codec
+            .issue(&more[0], FieldId::BgOutput, output.len())
+            .unwrap();
+        let verified = codec.verify(&receipt).unwrap();
+        let bytes = Session::read_field(temp.path(), &verified).unwrap();
+        assert_eq!(bytes, output.as_bytes());
+        let mut rebuilt = Vec::new();
+        let mut offset = Some(0usize);
+        while let Some(next) = offset {
+            let page = page_field(&bytes, next, 1500).unwrap();
+            rebuilt.extend_from_slice(page.text.as_bytes());
+            offset = page.next_offset;
+        }
+        assert_eq!(rebuilt, output.as_bytes(), "paging chain must be lossless");
+    }
+
+    /// Session-name validation enforces the shared length bound too.
+    #[test]
+    fn validate_session_name_enforces_length_bound() {
+        assert!(validate_session_name("ok-session_1").is_ok());
+        let long = "x".repeat(crate::session_store::MAX_SESSION_ID_LEN);
+        assert!(validate_session_name(&long).is_ok());
+        let too_long = "x".repeat(crate::session_store::MAX_SESSION_ID_LEN + 1);
+        assert!(validate_session_name(&too_long).is_err());
+    }
+
+    /// Concurrent writers (each with its own fd) must never interleave
+    /// count and append: the returned ordinals are the file's true
+    /// physical positions — contiguous, unique, and matching the loaded
+    /// lines. The exclusive flock window covers
+    /// count+serialize+append+sync+location construction.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_appends_produce_contiguous_ordinals() {
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let session = "race-jsonl";
+        let n = 8;
+        let entries: Arc<Vec<SessionEntry>> = Arc::new(
+            (0..n)
+                .map(|i| {
+                    Message::User {
+                        content: format!("writer {i}"),
+                        images: vec![],
+                    }
+                    .into()
+                })
+                .collect(),
+        );
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let root = root.path().to_path_buf();
+                let entries = entries.clone();
+                std::thread::spawn(move || {
+                    Session::append_located(&root, session, std::slice::from_ref(&entries[i]))
+                        .unwrap()
+                })
+            })
+            .collect();
+        let mut ordinals: Vec<i64> = handles
+            .into_iter()
+            .flat_map(|handle| {
+                handle
+                    .join()
+                    .unwrap()
+                    .into_iter()
+                    .map(|location| match location.key {
+                        crate::session_store::LocatedKey::Jsonl { ordinal } => ordinal,
+                        _ => panic!("jsonl location"),
+                    })
+            })
+            .collect();
+        ordinals.sort_unstable();
+        assert_eq!(
+            ordinals,
+            (0..n as i64).collect::<Vec<i64>>(),
+            "returned ordinals must be the true contiguous physical positions"
+        );
+        // The physical file agrees: n non-blank lines, aligned 1:1.
+        let loaded = Session::load_located(root.path(), session).unwrap();
+        assert_eq!(loaded.entries.len(), n);
+        for (i, location) in loaded.locations.iter().enumerate() {
+            match location {
+                Some(crate::session_store::EntryLocation {
+                    key: crate::session_store::LocatedKey::Jsonl { ordinal },
+                    ..
+                }) => assert_eq!(*ordinal, i as i64),
+                other => panic!("every line must be located, got {other:?}"),
+            }
+        }
+    }
+
+    /// A receipt issued against one workspace root is rejected by
+    /// `read_field` bound to a DIFFERENT root — the receipt's workspace
+    /// (and, for uniformity, backend-instance) binding never resolves
+    /// against another root.
+    #[test]
+    fn read_field_rejects_foreign_workspace_root() {
+        use crate::output_receipt::{FieldId, ReceiptCodec};
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let session = "sess";
+        let entry = SessionEntry::BackgroundCompletion {
+            id: 1,
+            output: "out".into(),
+            label: None,
+        };
+        let codec_dir = tempfile::tempdir().unwrap();
+        let codec = ReceiptCodec::load_from_dir(codec_dir.path()).unwrap();
+        let locations =
+            Session::append_located(dir_a.path(), session, std::slice::from_ref(&entry)).unwrap();
+        let receipt = codec.issue(&locations[0], FieldId::BgOutput, 3).unwrap();
+        let verified = codec.verify(&receipt).unwrap();
+        // The owning root resolves; a different root is rejected with an
+        // integrity binding error (different workspace / instance).
+        assert_eq!(
+            Session::read_field(dir_a.path(), &verified).unwrap(),
+            b"out".to_vec()
+        );
+        let err = Session::read_field(dir_b.path(), &verified).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("different workspace") || text.contains("backend instance"),
+            "{text}"
+        );
     }
 }

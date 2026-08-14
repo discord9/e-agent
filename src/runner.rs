@@ -464,6 +464,13 @@ pub struct SessionRunner {
     /// Resolved from `[delegate] finalize_wait_secs` by the session factory;
     /// consumed only at the FinishWhenIdle idle point.
     finalize_wait: Option<Duration>,
+    /// The session's `eout1` receipt codec, cloned from the agent at
+    /// construction (agent and runner always share one key): the bounded
+    /// projections the agent issues receipts with are verified here for
+    /// `read_output`. `None` when the agent has no codec (tests / no state
+    /// dir) — `read_output` then fails `unavailable`, and no receipts were
+    /// issued either.
+    receipt_codec: Option<crate::output_receipt::ReceiptCodec>,
     #[cfg(test)]
     before_finalize: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -506,6 +513,9 @@ impl SessionRunner {
             shared: shared.clone(),
             commands: tx,
         };
+        // The runner's receipt codec is the agent's (they must share one
+        // key: the agent issues receipts, the runner verifies them).
+        let receipt_codec = agent.receipt_codec().cloned();
         (
             Self {
                 agent,
@@ -518,6 +528,7 @@ impl SessionRunner {
                 policy,
                 last_answer: None,
                 finalize_wait: None,
+                receipt_codec,
                 #[cfg(test)]
                 before_finalize: None,
             },
@@ -547,9 +558,15 @@ impl SessionRunner {
     }
 
     async fn commit(&mut self, entry: SessionEntry) -> anyhow::Result<()> {
-        self.store
-            .append(&self.root, &self.session, std::slice::from_ref(&entry))
+        // Durable append FIRST, then the located key: a receipt emitted by a
+        // later provider projection always points at a persisted row
+        // (durable-before-ref). The location is `None` only if the backend
+        // could not produce one (never on the durable backends).
+        let locations = self
+            .store
+            .append_located(&self.root, &self.session, std::slice::from_ref(&entry))
             .await?;
+        let location = locations.into_iter().next();
         let event = match &entry {
             SessionEntry::Message {
                 message: Message::User { content, .. },
@@ -569,7 +586,7 @@ impl SessionRunner {
             }
             _ => None,
         };
-        self.agent.apply_entry(entry);
+        self.agent.apply_entry_located(entry, location);
         if let Some(event) = event {
             // Background notices become live only after their durable entry
             // exists; using Agent's normal event path prevents a second UI-only
@@ -597,10 +614,12 @@ impl SessionRunner {
             images: image.map_or_else(Vec::new, |image| vec![image]),
         }
         .into();
-        self.store
-            .append(&self.root, &self.session, std::slice::from_ref(&entry))
+        let locations = self
+            .store
+            .append_located(&self.root, &self.session, std::slice::from_ref(&entry))
             .await?;
-        self.agent.apply_entry(entry);
+        let location = locations.into_iter().next();
+        self.agent.apply_entry_located(entry, location);
         let mut shared = self.shared.lock().unwrap();
         for (queued, prompt) in consumed {
             if queued {
@@ -622,14 +641,19 @@ impl SessionRunner {
     /// is appended at most once.
     async fn commit_error(&mut self, text: String) {
         let entry = SessionEntry::Error { text: text.clone() };
-        if let Err(error) = self
+        match self
             .store
-            .append(&self.root, &self.session, std::slice::from_ref(&entry))
+            .append_located(&self.root, &self.session, std::slice::from_ref(&entry))
             .await
         {
-            eprintln!("e-agent: cannot persist session error: {error:#}");
-        } else {
-            self.agent.apply_entry(entry);
+            Ok(mut locations) => {
+                self.agent
+                    .apply_entry_located(entry, locations.drain(..).next());
+            }
+            Err(error) => {
+                eprintln!("e-agent: cannot persist session error: {error:#}");
+                self.agent.apply_entry(entry);
+            }
         }
         self.shared.lock().unwrap().emit(AgentEvent::Error(text));
     }
@@ -816,6 +840,35 @@ impl SessionRunner {
             }
             other => Err(format!("unknown goal tool: {other}")),
         }
+    }
+
+    /// Intercepted `read_output` tool execution (the always-on read-only
+    /// pager for bounded provider projections): verify the `eout1` receipt
+    /// with the session's codec (constant-time MAC), resolve the exact
+    /// persisted field through the session store, page it, and render the
+    /// closed JSON page. The receipt must name THIS session (a receipt is a
+    /// bearer capability scoped to its own session). Stable error classes:
+    /// invalid / unavailable / integrity / utf8-boundary / out-of-range.
+    async fn execute_read_output(&mut self, call: &ToolCall) -> Result<ToolOutput, String> {
+        let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
+            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
+        let (reference, offset, limit) = crate::tools::output::parse_arguments(&arguments)?;
+        let Some(codec) = &self.receipt_codec else {
+            return Err(
+                "read_output error: unavailable: no receipt codec (receipt key unavailable)".into(),
+            );
+        };
+        let text = crate::tools::output::execute(
+            &self.store,
+            &self.root,
+            &self.session,
+            codec,
+            &reference,
+            offset,
+            limit,
+        )
+        .await?;
+        Ok(ToolOutput::text(text))
     }
 
     fn status(&self, status: SessionStatus) {
@@ -1487,6 +1540,50 @@ impl SessionRunner {
                     // plain tool cannot reach. They never create goals.
                     if call.name == "get_goal" || call.name == "update_goal" {
                         let result = self.execute_goal_tool(&call).await;
+                        let (tool_text, images) = match &result {
+                            Ok(output) => (output.content.clone(), output.images.clone()),
+                            Err(error) => (error.clone(), Vec::new()),
+                        };
+                        let is_error = result.is_err();
+                        let entry = Message::Tool {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            content: tool_text.clone(),
+                            images,
+                            is_error,
+                            synthetic: false,
+                        }
+                        .into();
+                        if let Err(error) = self.commit(entry).await {
+                            self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                                .await;
+                            return;
+                        }
+                        self.agent.emit_event(AgentEvent::ToolResult {
+                            is_error,
+                            content: tool_text,
+                        });
+                        let steering = self.intake_after_operation(Vec::new());
+                        if steering != Steering::None {
+                            self.shared
+                                .lock()
+                                .unwrap()
+                                .emit(AgentEvent::Notice("turn cancelled".into()));
+                            if self.release_after_preempt(steering) {
+                                return;
+                            }
+                            break 'turn;
+                        }
+                        continue;
+                    }
+                    // read_output is intercepted by the runner: it needs the
+                    // session's store + receipt codec (a plain tool cannot
+                    // reach them). Its result is committed like any other
+                    // tool result — and is itself an eligible persisted
+                    // field (`tool_content`), so an oversized page is
+                    // bounded with its own receipt in the next request.
+                    if call.name == "read_output" {
+                        let result = self.execute_read_output(&call).await;
                         let (tool_text, images) = match &result {
                             Ok(output) => (output.content.clone(), output.images.clone()),
                             Err(error) => (error.clone(), Vec::new()),
