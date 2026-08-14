@@ -563,6 +563,89 @@ pub(crate) fn dedup_raw_entries(
     })
 }
 
+/// Fold the raw `session_entries` rows of `entry_kind = 'background_completion'`
+/// (workspace-wide, multiple sessions) into LOGICAL finished-task rows,
+/// mirroring the session load path's duplicate semantics
+/// ([`dedup_raw_entries`]) but keyed by `(session_id, seq)`:
+///
+/// 1. Among all physical rows for a given `(session_id, seq)`, only the
+///    row(s) with the **latest** `event_time` are retained; older rows are
+///    silently discarded (they are superseded).
+///
+/// 2. If the latest event_time has multiple physical rows (same session,
+///    same seq, same max event_time — an idempotent retry at the same
+///    microsecond), their payloads are deserialised and compared. If all
+///    are identical they are folded into one logical row; if ANY differ,
+///    this returns an error naming the session/seq for manual inspection
+///    (fail closed — same policy as the load path).
+///
+/// 3. Output is ordered `event_time DESC, seq DESC` (newest logical row
+///    first). Callers MUST apply the user-visible limit AFTER this fold,
+///    so a committed-then-retried completion can never consume two limit
+///    slots and a superseded row can never appear.
+pub(crate) fn dedup_finished_rows(
+    workspace_id: &str,
+    raw: &[(String, i64, chrono::NaiveDateTime, String)],
+) -> Result<Vec<(String, i64, chrono::NaiveDateTime, String)>, String> {
+    use std::cmp::Ordering;
+    // Partition by (session_id, seq): keep the max event_time and every
+    // payload at that max.
+    let mut per_key: std::collections::HashMap<
+        (String, i64),
+        (chrono::NaiveDateTime, Vec<String>),
+    > = std::collections::HashMap::with_capacity(raw.len().min(64));
+    for (session_id, seq, event_time, payload) in raw {
+        let entry = per_key
+            .entry((session_id.clone(), *seq))
+            .or_insert((*event_time, Vec::new()));
+        match (*event_time).cmp(&entry.0) {
+            Ordering::Greater => {
+                entry.0 = *event_time;
+                entry.1 = vec![payload.clone()];
+            }
+            Ordering::Equal => entry.1.push(payload.clone()),
+            Ordering::Less => {}
+        }
+    }
+
+    let mut out = Vec::with_capacity(per_key.len());
+    for ((session_id, seq), (max_et, payloads)) in per_key {
+        let first_entry: SessionEntry = serde_json::from_str(&payloads[0]).map_err(|e| {
+            format!(
+                "cannot decode finished background task of session {} (seq {} event_time {}): {e}",
+                session_id, seq, max_et
+            )
+        })?;
+        for (i, payload) in payloads.iter().enumerate().skip(1) {
+            let other: SessionEntry = serde_json::from_str(payload).map_err(|e| {
+                format!(
+                    "cannot decode finished background task of session {} seq {} max_event_time {} (dup {}): {e}",
+                    session_id, seq, max_et, i
+                )
+            })?;
+            if other != first_entry {
+                return Err(format!(
+                    "session '{}' seq {} event_time {} has divergent physical \
+                     duplicates in the finished-task listing; cannot safely load. \
+                     Stop writers, inspect with SQL:\n\
+                     SELECT * FROM session_entries \
+                     WHERE workspace_id = '{}' AND session_id = '{}' AND seq = {} \
+                     ORDER BY event_time;\n\
+                     Resolve manually (new session or repair) then re-run.",
+                    session_id, seq, max_et, workspace_id, session_id, seq,
+                ));
+            }
+        }
+        out.push((session_id, seq, max_et, payloads[0].clone()));
+    }
+
+    // Newest logical row first: winning event_time DESC, then seq DESC
+    // (matching the raw query's tie-break so equal-event_time keys keep a
+    // stable, deterministic order).
+    out.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
+    Ok(out)
+}
+
 /// Format the concurrent-write conflict error shared by the Greptime and
 /// SQLite append paths (`db_max >= base_seq` and the overlapping rows
 /// diverge from this writer's batch). The `concurrent write conflict`
@@ -1405,6 +1488,14 @@ impl SessionStore {
     /// cache/reasoning/finish-reason fields of `usage` are written when
     /// the provider reported them, NULL otherwise.
     ///
+    /// `seq` is the `session_entries.seq` of the just-committed assistant /
+    /// compaction entry this usage belongs to (threaded from the runner's
+    /// commit result), so `usage_entries.seq` EQUALS the corresponding
+    /// `session_entries.seq` — a real equality join, not a heuristic. For
+    /// calls with no committed entry ("summarizer", or a `None` fallback)
+    /// the backend substitutes its strictly monotonic event-time clock and
+    /// the row is only event-time-ordered, never seq-joinable.
+    ///
     /// For `Jsonl` this is a silent no-op: the file backend has no usage
     /// table, so token statistics are only available on the Greptime/
     /// SQLite backends (the CLI `usage` subcommand prints a hint when the
@@ -1416,6 +1507,7 @@ impl SessionStore {
         session_id: &str,
         model: &str,
         kind: &str,
+        seq: Option<i64>,
         usage: &crate::agent::Usage,
     ) -> Result<()> {
         match self {
@@ -1426,7 +1518,7 @@ impl SessionStore {
                 session
                     .lock()
                     .await
-                    .append_usage(&workspace_id, session_id, model, kind, usage)
+                    .append_usage(&workspace_id, session_id, model, kind, seq, usage)
                     .await
             }
             #[cfg(feature = "sqlite")]
@@ -1435,7 +1527,7 @@ impl SessionStore {
                 session
                     .lock()
                     .await
-                    .append_usage(&workspace_id, session_id, model, kind, usage)
+                    .append_usage(&workspace_id, session_id, model, kind, seq, usage)
                     .await
                     .map_err(anyhow::Error::msg)
             }
@@ -2787,6 +2879,101 @@ mod shared_helpers {
             datetime_to_us(us_to_datetime(-1)) < 0 && datetime_to_us(us_to_datetime(-999_999)) < 0,
             "negative sub-second inputs must stay negative through the conversion"
         );
+    }
+
+    // --- finished-task logical-row fold --------------------------------
+
+    fn bg_completion_payload(id: u64, status: &str) -> String {
+        serde_json::to_string(&SessionEntry::BackgroundCompletion {
+            id,
+            output: format!("exit code: 0\nstdout:\n{status}\nstderr:\n"),
+            label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: Some(0),
+            signal: None,
+            status: Some(status.into()),
+            kind: Some("bash".into()),
+        })
+        .unwrap()
+    }
+
+    fn finished_time(day: i64) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            + chrono::Duration::days(day)
+    }
+
+    #[test]
+    fn dedup_finished_rows_folds_retries_and_supersedes() {
+        let ws = "ws-dedup";
+        let payload_a = bg_completion_payload(1, "completed");
+        let payload_b = bg_completion_payload(2, "failed");
+        let payload_a_superseded = bg_completion_payload(1, "killed");
+
+        // A committed-then-retried completion: same (session, seq) with an
+        // identical payload at the same microsecond (idempotent retry), plus
+        // a superseded older physical row at a smaller event_time.
+        let raw = vec![
+            ("sess-a".to_string(), 5, finished_time(1), payload_a.clone()),
+            ("sess-a".to_string(), 5, finished_time(1), payload_a.clone()),
+            (
+                "sess-a".to_string(),
+                5,
+                finished_time(2),
+                payload_a_superseded.clone(),
+            ),
+            ("sess-b".to_string(), 3, finished_time(3), payload_b.clone()),
+        ];
+        let folded = dedup_finished_rows(ws, &raw).unwrap();
+        assert_eq!(folded.len(), 2, "3 physical rows of (sess-a,5) fold to 1");
+        // Newest logical row first (event_time DESC, seq DESC).
+        assert_eq!(folded[0].0, "sess-b");
+        assert_eq!(folded[1].0, "sess-a");
+        assert_eq!(folded[1].1, 5);
+        // The winning payload is the NEWEST event_time's (superseded row
+        // discarded), and identical same-time duplicates folded.
+        let winner: SessionEntry = serde_json::from_str(&folded[1].3).unwrap();
+        let SessionEntry::BackgroundCompletion { status, .. } = winner else {
+            panic!("expected BackgroundCompletion");
+        };
+        assert_eq!(
+            status.as_deref(),
+            Some("killed"),
+            "superseded row must not win"
+        );
+        assert_eq!(
+            folded[1].2,
+            finished_time(2),
+            "winning event_time is the newest"
+        );
+    }
+
+    #[test]
+    fn dedup_finished_rows_fails_closed_on_divergent_ties() {
+        let ws = "ws-divergent";
+        // Same (session, seq), same max event_time, DIFFERENT payloads →
+        // fail closed, exactly like the session load path.
+        let raw = vec![
+            (
+                "sess-a".to_string(),
+                5,
+                finished_time(1),
+                bg_completion_payload(1, "completed"),
+            ),
+            (
+                "sess-a".to_string(),
+                5,
+                finished_time(1),
+                bg_completion_payload(9, "failed"),
+            ),
+        ];
+        let error = dedup_finished_rows(ws, &raw).unwrap_err();
+        assert!(error.contains("sess-a"), "{error}");
+        assert!(error.contains("seq 5"), "{error}");
+        assert!(error.contains("divergent"), "{error}");
     }
 
     // --- next_event_time_us ---------------------------------------------

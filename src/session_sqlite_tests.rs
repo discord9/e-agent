@@ -2087,6 +2087,7 @@ async fn usage_entries_append_and_summarize() {
             &sid,
             "model-a",
             "regular",
+            None,
             &crate::agent::Usage {
                 input_tokens: 100,
                 output_tokens: 50,
@@ -2101,6 +2102,7 @@ async fn usage_entries_append_and_summarize() {
             &sid,
             "model-a",
             "regular",
+            None,
             &crate::agent::Usage {
                 input_tokens: 200,
                 output_tokens: 30,
@@ -2115,6 +2117,7 @@ async fn usage_entries_append_and_summarize() {
             &sid,
             "model-a",
             "compact",
+            None,
             &crate::agent::Usage {
                 input_tokens: 1000,
                 output_tokens: 200,
@@ -2129,6 +2132,7 @@ async fn usage_entries_append_and_summarize() {
             &sid,
             "model-b",
             "regular",
+            None,
             &crate::agent::Usage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -2163,6 +2167,96 @@ async fn usage_entries_append_and_summarize() {
 }
 
 #[tokio::test]
+async fn usage_seq_is_the_committed_session_entry_seq() {
+    let wid = workspace_id();
+    let sid = format!("test-sql-usage-seq-{}", crate::session::new_id());
+    let session = SqliteSession::connect(":memory:", &wid, &sid)
+        .await
+        .unwrap();
+
+    // Commit an assistant entry and recover its ACTUAL session_entries.seq.
+    let entry = SessionEntry::Message {
+        message: crate::agent::Message::Assistant(crate::agent::AssistantMessage {
+            content: Some("hi".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        }),
+    };
+    let locations = session.append_located(&[entry]).await.unwrap();
+    let LocatedKey::Sqlite { seq, .. } = locations[0].key else {
+        panic!("sqlite location must carry a seq");
+    };
+
+    // Threaded seq: usage_entries.seq EQUALS the assistant entry's
+    // session_entries.seq (exact join); event_time_us is an independent
+    // event-time clock.
+    session
+        .append_usage(
+            &wid,
+            &sid,
+            "model-x",
+            "regular",
+            Some(seq),
+            &crate::agent::Usage {
+                input_tokens: 5,
+                output_tokens: 6,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let conn = session.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT seq, event_time_us FROM usage_entries WHERE workspace_id = ?1 AND session_id = ?2",
+            (wid.clone(), sid.as_str()),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let usage_seq = row.get_value(0).unwrap().as_integer().copied().unwrap();
+    let event_time_us = row.get_value(1).unwrap().as_integer().copied().unwrap();
+    drop(conn);
+    assert_eq!(usage_seq, seq, "usage_entries.seq == session_entries.seq");
+    assert!(
+        event_time_us != usage_seq,
+        "event_time_us stays an independent clock"
+    );
+
+    // None fallback: seq = event-time clock (ordered, not joinable).
+    session
+        .append_usage(
+            &wid,
+            &sid,
+            "model-x",
+            "summarizer",
+            None,
+            &crate::agent::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let conn = session.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT seq FROM usage_entries WHERE workspace_id = ?1 AND session_id = ?2 AND kind = 'summarizer'",
+            (wid.clone(), sid.as_str()),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let fallback_seq = row.get_value(0).unwrap().as_integer().copied().unwrap();
+    drop(conn);
+    assert!(
+        fallback_seq >= 1_700_000_000_000_000,
+        "None fallback uses the event-time clock, got {fallback_seq}"
+    );
+}
+
+#[tokio::test]
 async fn usage_entries_are_scoped_by_workspace() {
     let (_dir, session, sid) = fresh_session().await;
     // 写入别的 workspace_id：本 workspace 的汇总查不到。
@@ -2172,6 +2266,7 @@ async fn usage_entries_are_scoped_by_workspace() {
             &sid,
             "m",
             "regular",
+            None,
             &crate::agent::Usage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -2189,6 +2284,7 @@ async fn usage_entries_are_scoped_by_workspace() {
             "other-session",
             "m",
             "regular",
+            None,
             &crate::agent::Usage {
                 input_tokens: 2,
                 output_tokens: 2,
@@ -2220,6 +2316,7 @@ async fn usage_for_sessions_filters_and_aggregates() {
             &sid,
             "m",
             "regular",
+            None,
             &crate::agent::Usage {
                 input_tokens: 100,
                 output_tokens: 50,
@@ -2234,6 +2331,7 @@ async fn usage_for_sessions_filters_and_aggregates() {
             &sid,
             "m",
             "regular",
+            None,
             &crate::agent::Usage {
                 input_tokens: 20,
                 output_tokens: 5,
@@ -2248,6 +2346,7 @@ async fn usage_for_sessions_filters_and_aggregates() {
             &child,
             "m",
             "regular",
+            None,
             &crate::agent::Usage {
                 input_tokens: 7,
                 output_tokens: 3,
@@ -2262,6 +2361,7 @@ async fn usage_for_sessions_filters_and_aggregates() {
             &other,
             "m",
             "regular",
+            None,
             &crate::agent::Usage {
                 input_tokens: 999,
                 output_tokens: 999,
@@ -2325,6 +2425,7 @@ async fn usage_entries_persist_across_reconnect() {
                 &sid,
                 "m",
                 "regular",
+                None,
                 &crate::agent::Usage {
                     input_tokens: 7,
                     output_tokens: 3,
@@ -2368,6 +2469,7 @@ async fn store_facade_usage_append_summary_and_jsonl_noop() {
             &sid,
             "m",
             "regular",
+            None,
             &crate::agent::Usage {
                 input_tokens: 5,
                 output_tokens: 6,
@@ -2393,6 +2495,7 @@ async fn store_facade_usage_append_summary_and_jsonl_noop() {
             &sid,
             "m",
             "regular",
+            None,
             &crate::agent::Usage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -2497,7 +2600,7 @@ async fn connect_migrates_legacy_usage_entries_table_missing_enrichment_columns(
         finish_reason: Some("stop".into()),
     };
     session
-        .append_usage(&wid, "legacy-usage", "m", "regular", &enriched)
+        .append_usage(&wid, "legacy-usage", "m", "regular", None, &enriched)
         .await
         .expect("append enriched usage");
     let rows = session.usage_summary().await.expect("usage summary");
@@ -2522,8 +2625,8 @@ async fn connect_migrates_legacy_usage_entries_table_missing_enrichment_columns(
     assert_eq!(row.get_value(1).unwrap().as_integer(), Some(&70i64));
     assert_eq!(row.get_value(2).unwrap().as_integer(), Some(&20i64));
     assert_eq!(
-        row.get_value(3).unwrap().as_text().map(String::as_str),
-        Some("stop")
+        row.get_value(3).unwrap().as_text().map(|t| t.as_bytes()),
+        Some(&b"stop"[..])
     );
     drop(conn);
 

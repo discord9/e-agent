@@ -14,9 +14,9 @@ use crate::output_receipt::{
     ReceiptError, ReceiptErrorKind, VerifiedRef, field_bytes, validate_location_for_store,
 };
 use crate::session_store::{
-    EntryLocation, LocatedKey, SessionMeta, UsageRow, datetime_to_us, dedup_raw_entries,
-    dedup_raw_located, entry_kind, entry_payload_hash, format_conflict_error, is_error,
-    next_event_time_us, process_identity, us_to_datetime, workspace_id_fingerprint,
+    EntryLocation, LocatedKey, SessionMeta, UsageRow, datetime_to_us, dedup_finished_rows,
+    dedup_raw_entries, dedup_raw_located, entry_kind, entry_payload_hash, format_conflict_error,
+    is_error, next_event_time_us, process_identity, us_to_datetime, workspace_id_fingerprint,
 };
 // Public path preserved for `src/bin/import_jsonl.rs` (was a `pub fn`
 // defined here before the shared-helper extraction).
@@ -133,9 +133,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 /// The per-call enrichment columns (`cache_hit_tokens`/`cache_miss_tokens`/
 /// `reasoning_tokens`/`finish_reason`) are nullable and were added after
 /// the table shipped (same probe-then-ALTER migration as `sessions.title`
-/// etc.): old rows read them back as NULL, and `seq` already relates the
-/// usage row to the `session_entries` rows of the same session (turn
-/// linkage — see [`Self::append_usage`]).
+/// etc.): old rows read them back as NULL. `seq` carries the ACTUAL
+/// `session_entries.seq` of the assistant/compaction entry the usage row
+/// corresponds to (exact equality join for "regular"/"compact" — see
+/// [`Self::append_usage`]).
 const CREATE_TABLE_USAGE: &str = r#"
 CREATE TABLE IF NOT EXISTS usage_entries (
     workspace_id STRING NOT NULL,
@@ -1399,21 +1400,23 @@ impl GreptimeSession {
     }
 
     /// Insert one token-usage row into the `usage_entries` table. `kind`
-    /// is one of "regular" | "compact" | "summarizer". `seq` reuses the
-    /// strictly monotonic per-process microsecond clock (see
-    /// [`next_event_time_us`]), which doubles as the row's `event_time` —
-    /// no separate per-session usage seq state is needed, and the primary
-    /// key `(workspace_id, session_id, seq)` stays collision-free within
-    /// one process (see the `CREATE_TABLE_USAGE` comment).
+    /// is one of "regular" | "compact" | "summarizer".
     ///
-    /// Turn linkage: `seq` is the same `next_event_time_us` clock that
-    /// stamps the `session_entries` rows, so joining
-    /// `usage_entries.seq` against `session_entries.seq` of the same
-    /// session reconstructs the per-call usage next to the assistant
-    /// message of that turn (best-effort: both clocks are monotonic per
-    /// process, but ordering across the two tables is not guaranteed to be
-    /// exactly interleaved, so treat equality as a heuristic, never a
-    /// hard join).
+    /// TRUE relationship to `session_entries`: `seq` is the `session_entries.seq`
+    /// of the just-committed assistant / compaction entry this usage belongs
+    /// to (the runner threads it from the commit result), so
+    /// `usage_entries.seq == session_entries.seq` is an exact equality join
+    /// for "regular" and "compact" rows — NOT a best-effort heuristic. The
+    /// row's `event_time` stays the strictly monotonic per-process
+    /// microsecond clock ([`next_event_time_us`]) for event-time ordering.
+    ///
+    /// When `seq` is `None` (the "summarizer" kind has no committed
+    /// session entry, and callers may defensively pass `None` on backends
+    /// without a usable seq), the event-time clock is used as the seq
+    /// instead: the row is event-time-ordered but is NOT seq-joinable to
+    /// `session_entries`. The primary key `(workspace_id, session_id, seq)`
+    /// stays collision-free within one process (see the `CREATE_TABLE_USAGE`
+    /// comment).
     ///
     /// `workspace_id`/`session_id` are explicit parameters (not the bound
     /// session's) so the workspace-scoped meta store can record usage for
@@ -1424,10 +1427,11 @@ impl GreptimeSession {
         session_id: &str,
         model: &str,
         kind: &str,
+        seq: Option<i64>,
         usage: &crate::agent::Usage,
     ) -> Result<()> {
-        let seq = next_event_time_us();
-        let ts = us_to_datetime(seq);
+        let seq = seq.unwrap_or_else(next_event_time_us);
+        let ts = us_to_datetime(next_event_time_us());
         self.client
             .execute(
                 "INSERT INTO usage_entries \
@@ -1468,20 +1472,34 @@ impl GreptimeSession {
         limit: usize,
     ) -> Result<Vec<crate::session_store::FinishedTask>> {
         use crate::session_store::FinishedTask;
+        // Fetch without a SQL LIMIT: the user-visible cap must be applied
+        // AFTER the logical-row fold (append mode keeps duplicate physical
+        // rows, and a committed-then-retried completion would otherwise
+        // consume two limit slots / expose a superseded row).
         let rows = self
             .client
             .query(
                 "SELECT session_id, seq, event_time, payload FROM session_entries \
                  WHERE workspace_id = $1 AND entry_kind = 'background_completion' \
-                 ORDER BY event_time DESC, seq DESC \
-                 LIMIT $2",
-                &[&workspace_id, &(limit as i64)],
+                 ORDER BY event_time DESC, seq DESC",
+                &[&workspace_id],
             )
             .await
             .context("cannot query finished background tasks")?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let payload: String = row.get("payload");
+        let raw: Vec<(String, i64, chrono::NaiveDateTime, String)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get("session_id"),
+                    row.get("seq"),
+                    row.get("event_time"),
+                    row.get("payload"),
+                )
+            })
+            .collect();
+        let deduped = dedup_finished_rows(workspace_id, &raw).map_err(anyhow::Error::msg)?;
+        let mut out = Vec::with_capacity(deduped.len().min(limit));
+        for (session_id, seq, event_time, payload) in deduped.into_iter().take(limit) {
             let entry: crate::agent::SessionEntry = serde_json::from_str(&payload)
                 .context("cannot decode finished background task payload")?;
             let crate::agent::SessionEntry::BackgroundCompletion {
@@ -1499,9 +1517,9 @@ impl GreptimeSession {
                 continue;
             };
             out.push(FinishedTask {
-                session_id: row.get("session_id"),
-                seq: row.get("seq"),
-                finished_at_us: datetime_to_us(row.get::<_, chrono::NaiveDateTime>("event_time")),
+                session_id,
+                seq,
+                finished_at_us: datetime_to_us(event_time),
                 id,
                 label,
                 started_at_ms,
@@ -2735,6 +2753,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finished_tasks_dedups_retried_and_superseded_rows() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-finished-dedup-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // One logical completion (id=1), then a superseded retry of the
+        // SAME seq: the retry commit writes a newer physical row for seq 0
+        // with a different payload (id=2). A second completion lands at
+        // seq 1. Physical rows for seq 0: 2 (one superseded, one winning).
+        let first = serde_json::to_string(&SessionEntry::BackgroundCompletion {
+            id: 1,
+            output: "v1".into(),
+            label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: Some("completed".into()),
+            kind: Some("bash".into()),
+        })
+        .unwrap();
+        let retried = serde_json::to_string(&SessionEntry::BackgroundCompletion {
+            id: 2,
+            output: "v2".into(),
+            label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: Some(3),
+            signal: None,
+            status: Some("failed".into()),
+            kind: Some("bash".into()),
+        })
+        .unwrap();
+        let second = serde_json::to_string(&SessionEntry::BackgroundCompletion {
+            id: 3,
+            output: "latest".into(),
+            label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: Some(0),
+            signal: None,
+            status: Some("completed".into()),
+            kind: Some("bash".into()),
+        })
+        .unwrap();
+        let _ = &first;
+        // Write rows directly so we control seqs/event_times: an older
+        // event_time for seq 0 (superseded), a NEWER event_time for seq 0
+        // (the retry that wins), and seq 1 (newest completion).
+        let sql = "INSERT INTO session_entries                    (workspace_id, session_id, seq, event_time, entry_kind, payload,                     schema_version, is_error)                    VALUES ($1, $2, $3, $4, $5, $6, 1, false)";
+        session
+            .client
+            .execute(
+                sql,
+                &[
+                    &wid,
+                    &sid,
+                    &0i64,
+                    &crate::session_store::us_to_datetime(1_700_000_000_000_000i64),
+                    &"background_completion",
+                    &first,
+                ],
+            )
+            .await
+            .unwrap();
+        session
+            .client
+            .execute(
+                sql,
+                &[
+                    &wid,
+                    &sid,
+                    &0i64,
+                    &crate::session_store::us_to_datetime(1_700_000_000_001_000i64),
+                    &"background_completion",
+                    &retried,
+                ],
+            )
+            .await
+            .unwrap();
+        session
+            .client
+            .execute(
+                sql,
+                &[
+                    &wid,
+                    &sid,
+                    &1i64,
+                    &crate::session_store::us_to_datetime(1_700_000_000_002_000i64),
+                    &"background_completion",
+                    &second,
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Dedup folds the two seq-0 physical rows into one LOGICAL row;
+        // the superseded id=1 row must never appear.
+        let finished = session.finished_tasks(&wid, 100).await.unwrap();
+        assert_eq!(finished.len(), 2, "3 physical rows -> 2 logical rows");
+        assert_eq!(finished[0].id, 3, "newest first");
+        assert_eq!(
+            finished[1].id, 2,
+            "retry winner at seq 0, NOT the superseded id=1"
+        );
+        assert_eq!(finished[1].status.as_deref(), Some("failed"));
+        assert_eq!(finished[1].exit_code, Some(3));
+
+        // The user-visible limit applies AFTER the fold: limit=1 returns
+        // only the newest LOGICAL row, never two physical versions of seq 0.
+        let limited = session.finished_tasks(&wid, 1).await.unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, 3);
+    }
+
+    #[tokio::test]
     async fn usage_entries_append_and_summarize() {
         let conn = conn_str();
         if conn == "skipped" {
@@ -2755,6 +2894,7 @@ mod tests {
                 &sid,
                 "model-a",
                 "regular",
+                None,
                 &crate::agent::Usage {
                     input_tokens: 100,
                     output_tokens: 50,
@@ -2769,6 +2909,7 @@ mod tests {
                 &sid,
                 "model-a",
                 "regular",
+                None,
                 &crate::agent::Usage {
                     input_tokens: 200,
                     output_tokens: 30,
@@ -2783,6 +2924,7 @@ mod tests {
                 &sid,
                 "model-a",
                 "compact",
+                None,
                 &crate::agent::Usage {
                     input_tokens: 1000,
                     output_tokens: 200,
@@ -2797,6 +2939,7 @@ mod tests {
                 &sid,
                 "model-b",
                 "regular",
+                None,
                 &crate::agent::Usage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -2827,6 +2970,98 @@ mod tests {
             .expect("regular/model-b group");
         assert_eq!(regular_b.input_tokens, 10);
         assert_eq!(regular_b.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn usage_seq_is_the_committed_session_entry_seq() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-usage-seq-{}", crate::session::new_id());
+        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        // Commit an assistant entry through the normal located path and
+        // recover its ACTUAL session_entries.seq.
+        let entry = SessionEntry::Message {
+            message: crate::agent::Message::Assistant(crate::agent::AssistantMessage {
+                content: Some("hi".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        };
+        let locations = session.append_located(&[entry]).await.unwrap();
+        let LocatedKey::Greptime { seq, .. } = locations[0].key else {
+            panic!("greptime location must carry a seq");
+        };
+
+        // append_usage with the threaded seq: usage_entries.seq must EQUAL
+        // the assistant entry's session_entries.seq (exact join), while
+        // event_time is an independent event-time clock value.
+        session
+            .append_usage(
+                &wid,
+                &sid,
+                "model-x",
+                "regular",
+                Some(seq),
+                &crate::agent::Usage {
+                    input_tokens: 5,
+                    output_tokens: 6,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let rows = session
+            .client
+            .query(
+                "SELECT seq, event_time FROM usage_entries WHERE workspace_id = $1 AND session_id = $2",
+                &[&wid, &sid],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let usage_seq: i64 = rows[0].get("seq");
+        assert_eq!(usage_seq, seq, "usage_entries.seq == session_entries.seq");
+        let event_time_us = datetime_to_us(rows[0].get::<_, chrono::NaiveDateTime>("event_time"));
+        assert!(
+            event_time_us != usage_seq,
+            "event_time stays an independent clock, not the session seq"
+        );
+
+        // None (summarizer / no committed entry): seq falls back to the
+        // event-time clock — ordered but NOT joinable to session_entries.
+        session
+            .append_usage(
+                &wid,
+                &sid,
+                "model-x",
+                "summarizer",
+                None,
+                &crate::agent::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let rows = session
+            .client
+            .query(
+                "SELECT seq FROM usage_entries WHERE workspace_id = $1 AND session_id = $2 AND kind = 'summarizer'",
+                &[&wid, &sid],
+            )
+            .await
+            .unwrap();
+        let fallback_seq: i64 = rows[0].get("seq");
+        assert!(
+            fallback_seq >= 1_700_000_000_000_000,
+            "None fallback uses the event-time clock, got {fallback_seq}"
+        );
     }
 
     #[tokio::test]

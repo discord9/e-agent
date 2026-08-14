@@ -55,6 +55,19 @@ pub fn new_exit_slot() -> ExitSlot {
     Arc::new(std::sync::Mutex::new(TaskExit::default()))
 }
 
+/// Fill a task's exit slot with a truthful `failed` status when it is still
+/// empty. Shell spawn/IO failures return from `run_bash` BEFORE the slot is
+/// populated, which would otherwise leave the completion trace with
+/// start/duration/kind but no status. Explicit metadata already written by
+/// the timeout/cancel paths (`killed`/SIGKILL) is preserved.
+pub(super) fn mark_failed_if_empty(exit: &mut TaskExit) {
+    if exit.status.is_none() {
+        exit.exit_code = None;
+        exit.signal = None;
+        exit.status = Some("failed".into());
+    }
+}
+
 impl RunningTask {
     /// The completion trace at finish time: start/duration timing from the
     /// registry push, exit fields from the task's own work out-slot, and
@@ -492,13 +505,15 @@ impl BackgroundTasks {
         task.handle.abort();
         if let Some(done) = task.completion.lock().unwrap().take() {
             let mut exit = task.exit.lock().unwrap();
-            // The process was aborted: no exit code was observed. If the
-            // work never recorded a status (bash run still in flight), the
-            // task died by our kill, so "killed" is the truthful status.
-            if exit.status.is_none() {
-                exit.status = Some("killed".into());
-                exit.signal = Some("SIGKILL".into());
-            }
+            // The process was aborted: no exit code was observed. The work
+            // may already have written completed/failed into the slot
+            // (run_bash records the slot, then its wrapper removes the task
+            // from the registry) — but the accepted cancel wins: once the
+            // task is removed here, the delivered trace MUST read
+            // killed/SIGKILL, never a stale completed/failed from the race.
+            exit.exit_code = None;
+            exit.signal = Some("SIGKILL".into());
+            exit.status = Some("killed".into());
             drop(exit);
             done(
                 id,
@@ -666,11 +681,21 @@ impl BackgroundTasks {
                     Some(slot),
                     Some(full),
                     sandbox.as_ref(),
-                    Some(exit_slot),
+                    Some(exit_slot.clone()),
                 )
                 .await
                 {
-                    Ok(output) | Err(output) => output,
+                    Ok(output) => output,
+                    Err(output) => {
+                        // Shell spawn/IO failures return BEFORE the exit
+                        // slot is populated, which would leave the trace
+                        // with start/duration/kind but no failed status.
+                        // Record a truthful "failed" only when the slot is
+                        // still empty — explicit killed metadata already
+                        // written by the timeout/cancel paths is preserved.
+                        mark_failed_if_empty(&mut exit_slot.lock().unwrap());
+                        output
+                    }
                 }
             },
             on_complete,

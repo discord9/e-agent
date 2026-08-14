@@ -148,9 +148,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 /// The per-call enrichment columns (`cache_hit_tokens`/`cache_miss_tokens`/
 /// `reasoning_tokens`/`finish_reason`) are nullable and were added after
 /// the table shipped (same probe-then-ALTER migration as `sessions.title`
-/// etc.): old rows read them back as NULL, and `seq` already relates the
-/// usage row to the `session_entries` rows of the same session (turn
-/// linkage — see [`Self::append_usage`]).
+/// etc.): old rows read them back as NULL. `seq` carries the ACTUAL
+/// `session_entries.seq` of the assistant/compaction entry the usage row
+/// corresponds to (exact equality join for "regular"/"compact" — see
+/// [`Self::append_usage`]).
 const CREATE_TABLE_USAGE: &str = r#"
 CREATE TABLE IF NOT EXISTS usage_entries (
     workspace_id TEXT NOT NULL,
@@ -1489,21 +1490,23 @@ impl SqliteSession {
     }
 
     /// Insert one token-usage row into the `usage_entries` table. `kind`
-    /// is one of "regular" | "compact" | "summarizer". `seq` reuses the
-    /// strictly monotonic per-process microsecond clock (see
-    /// [`next_event_time_us`]), which doubles as the row's `event_time_us`
-    /// — no separate per-session usage seq state is needed, and the
-    /// primary key `(workspace_id, session_id, seq)` stays collision-free
-    /// within one process (see the `CREATE_TABLE_USAGE` comment).
+    /// is one of "regular" | "compact" | "summarizer".
     ///
-    /// Turn linkage: `seq` is the same `next_event_time_us` clock that
-    /// stamps the `session_entries` rows, so joining
-    /// `usage_entries.seq` against `session_entries.seq` of the same
-    /// session reconstructs the per-call usage next to the assistant
-    /// message of that turn (best-effort: both clocks are monotonic per
-    /// process, but ordering across the two tables is not guaranteed to be
-    /// exactly interleaved, so treat equality as a heuristic, never a
-    /// hard join).
+    /// TRUE relationship to `session_entries`: `seq` is the `session_entries.seq`
+    /// of the just-committed assistant / compaction entry this usage belongs
+    /// to (the runner threads it from the commit result), so
+    /// `usage_entries.seq == session_entries.seq` is an exact equality join
+    /// for "regular" and "compact" rows — NOT a best-effort heuristic. The
+    /// row's `event_time_us` stays the strictly monotonic per-process
+    /// microsecond clock ([`next_event_time_us`]) for event-time ordering.
+    ///
+    /// When `seq` is `None` (the "summarizer" kind has no committed
+    /// session entry, and callers may defensively pass `None` on backends
+    /// without a usable seq), the event-time clock is used as the seq
+    /// instead: the row is event-time-ordered but is NOT seq-joinable to
+    /// `session_entries`. The primary key `(workspace_id, session_id, seq)`
+    /// stays collision-free within one process (see the `CREATE_TABLE_USAGE`
+    /// comment).
     ///
     /// `workspace_id`/`session_id` are explicit parameters (not the bound
     /// session's) so the workspace-scoped meta store can record usage for
@@ -1514,9 +1517,11 @@ impl SqliteSession {
         session_id: &str,
         model: &str,
         kind: &str,
+        seq: Option<i64>,
         usage: &crate::agent::Usage,
     ) -> Result<(), String> {
-        let seq = next_event_time_us();
+        let seq = seq.unwrap_or_else(next_event_time_us);
+        let event_time_us = next_event_time_us();
         self.conn
             .lock()
             .await
@@ -1530,7 +1535,7 @@ impl SqliteSession {
                     workspace_id,
                     session_id,
                     seq,
-                    seq,
+                    event_time_us,
                     model,
                     kind,
                     usage.input_tokens as i64,

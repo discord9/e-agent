@@ -6,7 +6,7 @@ use crate::{
         POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry, ToolCall, ToolOutput, ToolSpec,
         is_poll_guard_terminate, tool_error_content,
     },
-    session_store::SessionStore,
+    session_store::{LocatedKey, SessionStore},
 };
 use std::{
     collections::VecDeque,
@@ -558,7 +558,7 @@ impl SessionRunner {
         }
     }
 
-    async fn commit(&mut self, entry: SessionEntry) -> anyhow::Result<()> {
+    async fn commit(&mut self, entry: SessionEntry) -> anyhow::Result<Option<i64>> {
         // Durable append FIRST, then the located key: a receipt emitted by a
         // later provider projection always points at a persisted row
         // (durable-before-ref). The location is `None` only if the backend
@@ -568,6 +568,16 @@ impl SessionRunner {
             .append_located(&self.root, &self.session, std::slice::from_ref(&entry))
             .await?;
         let location = locations.into_iter().next();
+        // The just-committed entry's real `session_entries.seq` (the ordinal
+        // the backend assigned): threaded into `append_usage` so a usage row
+        // carries the ACTUAL seq of the assistant/compaction entry it
+        // corresponds to. `None` only on backends without a usable seq
+        // (JSONL has no usage table, so callers fall back to the event-time
+        // clock there).
+        let committed_seq = location.as_ref().and_then(|loc| match &loc.key {
+            LocatedKey::Greptime { seq, .. } | LocatedKey::Sqlite { seq, .. } => Some(*seq),
+            LocatedKey::Jsonl { .. } => None,
+        });
         let event = match &entry {
             SessionEntry::Message {
                 message: Message::User { content, .. },
@@ -608,7 +618,7 @@ impl SessionRunner {
             // injection and preserves session fanout semantics.
             self.agent.emit_event(event);
         }
-        Ok(())
+        Ok(committed_seq)
     }
 
     async fn commit_user_batch(
@@ -705,7 +715,8 @@ impl SessionRunner {
                 SessionEntry::GoalUpdated { goal: next }
             }
         };
-        self.commit(entry).await.map_err(|e| format!("{e:#}"))
+        self.commit(entry).await.map_err(|e| format!("{e:#}"))?;
+        Ok(())
     }
 
     /// Intercepted `get_goal` / `update_goal` tool execution (the model
@@ -844,7 +855,8 @@ impl SessionRunner {
                 )?;
                 self.commit(SessionEntry::GoalUpdated { goal: next.clone() })
                     .await
-                    .map_err(|error| format!("{error:#}"))?;
+                    .map_err(|error| format!("{error:#}"))
+                    .map(|_| ())?;
                 match next {
                     Some(goal) => Ok(ToolOutput::text(format!(
                         "goal updated:\n{}",
@@ -1167,17 +1179,21 @@ impl SessionRunner {
             WaitOutcome::Completed(Ok(out)) => {
                 let usage = out.usage;
                 let projection = entry_event(&out.entry).expect("compaction has a projection");
-                if let Err(error) = self.commit(out.entry).await {
-                    self.terminate(SessionResult::Failed(format!("{error:#}")), waited.pending)
-                        .await;
-                    return OperationFlow::Finished;
-                }
+                let committed_seq = match self.commit(out.entry).await {
+                    Ok(seq) => seq,
+                    Err(error) => {
+                        self.terminate(SessionResult::Failed(format!("{error:#}")), waited.pending)
+                            .await;
+                        return OperationFlow::Finished;
+                    }
+                };
                 // Publish the complete projection only after durable commit. Streaming
                 // deltas were sent live-only while the operation was in flight.
                 self.shared.lock().unwrap().emit(projection);
                 // 压缩用量落盘（kind="compact"）。与 agent.rs 的 `Agent::compact`
                 // （直接调用路径，无 store 访问权）不是同一事件：runner 走的是
                 // `prepare_compaction`，生产环境压缩只经此处落盘，不会重复写入。
+                // seq = the compaction entry's ACTUAL session_entries.seq.
                 if let Some(usage) = usage {
                     self.agent.apply_usage(Some(usage.clone()), false);
                     if let Err(error) = self
@@ -1187,6 +1203,7 @@ impl SessionRunner {
                             &self.session,
                             &self.agent.model_name(),
                             "compact",
+                            committed_seq,
                             &usage,
                         )
                         .await
@@ -1466,12 +1483,16 @@ impl SessionRunner {
                 if calls.is_empty() {
                     self.last_answer = content.clone();
                 }
-                if let Err(error) = self.commit(Message::Assistant(assistant).into()).await {
-                    self.terminate(SessionResult::Failed(format!("{error:#}")), waited.pending)
-                        .await;
-                    return;
-                }
+                let committed_seq = match self.commit(Message::Assistant(assistant).into()).await {
+                    Ok(seq) => seq,
+                    Err(error) => {
+                        self.terminate(SessionResult::Failed(format!("{error:#}")), waited.pending)
+                            .await;
+                        return;
+                    }
+                };
                 // 正常轮用量落盘（kind="regular"）；持久化失败只告警，不影响会话。
+                // seq = the assistant entry's ACTUAL session_entries.seq.
                 if let Some(usage) = usage {
                     self.agent.apply_usage(Some(usage.clone()), true);
                     if let Err(error) = self
@@ -1481,6 +1502,7 @@ impl SessionRunner {
                             &self.session,
                             &self.agent.model_name(),
                             "regular",
+                            committed_seq,
                             &usage,
                         )
                         .await

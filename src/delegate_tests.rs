@@ -262,7 +262,7 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
             None,
             None,
             None,
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             move |id| {
                 *hook_slot.lock().unwrap() = Some(id);
                 hook_sessions.insert(id, probe_entry(hook_handle));
@@ -334,7 +334,7 @@ async fn background_cancel_before_first_yield_cleans_everything() {
             None,
             None,
             None,
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             move |id| {
                 *hook_slot.lock().unwrap() = Some(id);
                 hook_sessions.insert(id, probe_entry(hook_handle.clone()));
@@ -397,7 +397,7 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
             None,
             None,
             None,
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             move |id| {
                 *slot.lock().unwrap() = Some(id);
                 hook_sessions.insert(id, probe_entry(hook_handle.clone()));
@@ -665,7 +665,7 @@ async fn panicking_inner_model_cleans_up_and_sends_one_failure_completion() {
             None,
             None,
             None,
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             move |id| {
                 *slot.lock().unwrap() = Some(id);
                 hook_sessions.insert(id, probe_entry(hook_handle.clone()));

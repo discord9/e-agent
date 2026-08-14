@@ -5,6 +5,7 @@ use crossterm::event::{KeyEvent, KeyModifiers};
 
 use super::*;
 use crate::config::InputKeys;
+use crate::tools::new_exit_slot;
 use ratatui::buffer::CellDiffOption;
 
 /// Test helper: attach with default metadata, mirroring the old 3-arg
@@ -174,7 +175,7 @@ async fn tasks_panel_selection_routes_bash_to_detail_and_delegate_to_attach() {
             None,
             None,
             None,
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             |_| {},
             || async { std::future::pending::<String>().await },
         )
@@ -943,17 +944,11 @@ fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
             id: 7,
             output: "done".into(),
             label: None,
-
             started_at_ms: None,
-
             duration_ms: None,
-
             exit_code: None,
-
             signal: None,
-
             status: None,
-
             kind: None,
         },
     });
@@ -995,17 +990,11 @@ fn attached_view_clears_spinner_on_background_completed_from_bridge() {
             id: 7,
             output: "done".into(),
             label: None,
-
             started_at_ms: None,
-
             duration_ms: None,
-
             exit_code: None,
-
             signal: None,
-
             status: None,
-
             kind: None,
         },
     });
@@ -1153,17 +1142,11 @@ fn attached_enter_steers_and_ctrl_c_cancels_through_the_handle() {
             id: 7,
             output: "done".into(),
             label: None,
-
             started_at_ms: None,
-
             duration_ms: None,
-
             exit_code: None,
-
             signal: None,
-
             status: None,
-
             kind: None,
         },
     });
@@ -1185,17 +1168,11 @@ fn attached_enter_on_finished_keeps_input_and_sends_nothing() {
             id: 9,
             output: "done".into(),
             label: None,
-
             started_at_ms: None,
-
             duration_ms: None,
-
             exit_code: None,
-
             signal: None,
-
             status: None,
-
             kind: None,
         },
     });
@@ -1240,17 +1217,11 @@ fn finish_with_queued_prompts_notes_them_as_unanswered() {
             id: 11,
             output: "done".into(),
             label: None,
-
             started_at_ms: None,
-
             duration_ms: None,
-
             exit_code: None,
-
             signal: None,
-
             status: None,
-
             kind: None,
         },
     });
@@ -1859,7 +1830,7 @@ async fn narrow_layout_goal_with_tasks_and_typed_input() {
             None,
             None,
             None,
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             |_| {},
             || async { std::future::pending::<String>().await },
         )
@@ -2227,7 +2198,7 @@ async fn tasks_panel_tags_rows_with_the_agent_role() {
             Some("explorer".into()),
             None,
             None, // display_meta
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             |_| {},
             || async { "done".into() },
         )
@@ -2238,7 +2209,7 @@ async fn tasks_panel_tags_rows_with_the_agent_role() {
             None,
             None,
             None, // display_meta
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             |_| {},
             || async { "done".into() },
         )
@@ -2291,7 +2262,7 @@ async fn tasks_panel_selection_highlight_shows_on_non_attachable_task() {
                 None,
                 None,
                 None,
-                crate::tools::new_exit_slot(),
+                new_exit_slot(),
                 |_| {},
                 || async { std::future::pending::<String>().await },
             )
@@ -2355,7 +2326,7 @@ async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
             None,
             None,
             None,
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             |_| {},
             || async { std::future::pending::<String>().await },
         )
@@ -2405,7 +2376,7 @@ async fn cancel_selected_task_cancels_any_task_and_clamps_cursor() {
                 None,
                 None,
                 None,
-                crate::tools::new_exit_slot(),
+                new_exit_slot(),
                 |_| {},
                 || async { std::future::pending::<String>().await },
             )

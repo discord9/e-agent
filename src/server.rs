@@ -2528,7 +2528,14 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
         let model_name = state.factory.summarizer_model().display_name().to_owned();
         if let Err(error) = state
             .meta_store
-            .append_usage(state.factory.root(), id, &model_name, "summarizer", &usage)
+            .append_usage(
+                state.factory.root(),
+                id,
+                &model_name,
+                "summarizer",
+                None,
+                &usage,
+            )
             .await
         {
             eprintln!("e-agent: cannot record summarizer usage: {error:#}");
@@ -3625,7 +3632,7 @@ mod tests {
                 id: 7,
                 output: "ok".into(),
                 label: None,
-                started_at_ms: Some(1_700_000_000_000),
+                started_at_ms: Some(1_700_000_000_000u64),
                 duration_ms: Some(42),
                 exit_code: Some(0),
                 signal: None,

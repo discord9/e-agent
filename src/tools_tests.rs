@@ -2726,7 +2726,7 @@ async fn get_background_tasks_marks_the_calling_subagent_itself() {
                 subagent_session_id: Some(self_session_id.into()),
                 resume: None,
             }),
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             |_| {},
             || async { "done".into() },
         )
@@ -2743,7 +2743,7 @@ async fn get_background_tasks_marks_the_calling_subagent_itself() {
                 subagent_session_id: Some("sub-other".into()),
                 resume: None,
             }),
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             |_| {},
             || async { "done".into() },
         )
@@ -2954,7 +2954,7 @@ async fn completion_delivery_available_requires_an_open_receiver() {
             None,
             None,
             None,
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             |_| panic!("closed delivery must not call on_id"),
             move || async move {
                 work_runs_on_failure.fetch_add(1, Ordering::Relaxed);
@@ -2974,7 +2974,7 @@ async fn completion_delivery_available_requires_an_open_receiver() {
             None,
             None,
             None,
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             |_| {},
             || async { "done".into() },
         )
@@ -3003,7 +3003,7 @@ async fn panicking_on_id_removes_registration_without_work_or_completion() {
             None,
             None,
             None, // owner_session：测试不关心发起者
-            crate::tools::new_exit_slot(),
+            new_exit_slot(),
             |_| panic!("controlled on_id panic"),
             move || async move {
                 work_runs_in_task.fetch_add(1, Ordering::SeqCst);
@@ -3584,7 +3584,7 @@ async fn background_event_sender_is_shared_across_clones() {
         None,
         None,
         None,
-        crate::tools::new_exit_slot(),
+        new_exit_slot(),
         |_id| {},
         || async move { String::new() },
     );
@@ -3781,4 +3781,126 @@ fn goal_specs_are_closed_and_generic_specs_stay_open() {
             "generic tool `{name}` schema must stay open"
         );
     }
+}
+
+#[tokio::test]
+async fn cancel_overrides_stale_completed_trace_with_killed() {
+    // Race contract (oracle finding 3): run_bash may already have written
+    // completed/failed into the exit slot before its wrapper removes the
+    // task from the registry. Once cancel() successfully removes the task,
+    // the delivered trace MUST be killed/SIGKILL, never the stale status.
+    let mut background = BackgroundTasks::new(None, None);
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    background.set_event_sender(sender.clone());
+
+    let exit_slot = new_exit_slot();
+    let slot_for_work = exit_slot.clone();
+    // The work writes a stale "completed" trace (as run_bash does on the
+    // success path), signals that it did so, then blocks so the task stays
+    // registered — exactly the race window before the wrapper removes it.
+    let (wrote_tx, wrote_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let started = background
+        .spawn_inner(
+            "race probe".into(),
+            None,
+            None,
+            None,
+            None,
+            exit_slot,
+            |_| {},
+            move || async move {
+                *slot_for_work.lock().unwrap() = TaskExit {
+                    exit_code: Some(0),
+                    signal: None,
+                    status: Some("completed".into()),
+                };
+                let _ = wrote_tx.send(());
+                let _ = release_rx.await;
+                "done".into()
+            },
+            move |id, output, trace| {
+                let _ = sender.send(AgentEvent::BackgroundCompleted {
+                    id,
+                    output,
+                    label: Some("race probe".into()),
+                    started_at_ms: trace.started_at_ms,
+                    duration_ms: trace.duration_ms,
+                    exit_code: trace.exit_code,
+                    signal: trace.signal,
+                    status: trace.status,
+                    kind: trace.kind,
+                });
+            },
+        )
+        .expect("spawn_inner succeeds");
+    let id = background.running()[0].id;
+    assert!(started.contains(&id.to_string()));
+
+    // Wait until the stale trace is in the slot, then cancel: the cancel
+    // path removes the task and must override the stale completed trace.
+    let _ = tokio::time::timeout(Duration::from_secs(5), wrote_rx)
+        .await
+        .expect("work must write the stale slot");
+    let label = background.cancel(id).expect("cancel must remove the task");
+    assert!(label.contains("race probe"));
+    let _ = release_tx.send(());
+
+    match tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("cancel must deliver a completion")
+        .unwrap()
+    {
+        AgentEvent::BackgroundCompleted {
+            exit_code,
+            signal,
+            status,
+            kind,
+            ..
+        } => {
+            assert_eq!(exit_code, None, "canceled trace has no exit code");
+            assert_eq!(signal.as_deref(), Some("SIGKILL"));
+            assert_eq!(status.as_deref(), Some("killed"));
+            assert_eq!(kind.as_deref(), Some("delegate"));
+        }
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+}
+
+#[test]
+fn mark_failed_if_empty_fills_only_empty_slots() {
+    // Oracle finding 4: run_bash spawn/IO failures return before the exit
+    // slot is populated. The fallback fills a truthful "failed" status but
+    // never clobbers explicit killed/completed metadata.
+    let mut empty = TaskExit::default();
+    mark_failed_if_empty(&mut empty);
+    assert_eq!(empty.exit_code, None);
+    assert_eq!(empty.signal, None);
+    assert_eq!(empty.status.as_deref(), Some("failed"));
+
+    let mut killed = TaskExit {
+        exit_code: None,
+        signal: Some("SIGKILL".into()),
+        status: Some("killed".into()),
+    };
+    mark_failed_if_empty(&mut killed);
+    assert_eq!(
+        killed.signal.as_deref(),
+        Some("SIGKILL"),
+        "killed preserved"
+    );
+    assert_eq!(killed.status.as_deref(), Some("killed"), "killed preserved");
+
+    let mut completed = TaskExit {
+        exit_code: Some(0),
+        signal: None,
+        status: Some("completed".into()),
+    };
+    mark_failed_if_empty(&mut completed);
+    assert_eq!(completed.exit_code, Some(0), "completed preserved");
+    assert_eq!(
+        completed.status.as_deref(),
+        Some("completed"),
+        "completed preserved"
+    );
 }

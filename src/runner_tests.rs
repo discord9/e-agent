@@ -1660,7 +1660,8 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
                     Some(Usage {
                         input_tokens: 800,
                         output_tokens: 10,
-                        ..Default::default()
+                    ..Default::default()
+
                     }),
                 ),
                 (
@@ -1672,7 +1673,8 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
                     Some(Usage {
                         input_tokens: 900,
                         output_tokens: 20,
-                        ..Default::default()
+                    ..Default::default()
+
                     }),
                 ),
                 (
@@ -1684,7 +1686,8 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
                     Some(Usage {
                         input_tokens: 100,
                         output_tokens: 5,
-                        ..Default::default()
+                    ..Default::default()
+
                     }),
                 ),
             ]
