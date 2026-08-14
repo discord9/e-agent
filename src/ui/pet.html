@@ -241,8 +241,9 @@
     const rows = Math.max(1, Number(config.rows) || 9);
     const frameWidth = Math.max(1, Number(config.frame_width) || 192);
     const frameHeight = Math.max(1, Number(config.frame_height) || 254);
-    const loopMs = Math.max(1, Number(config.loop_ms) || 8400);
-    const total = cols * rows;
+    const idleRow = Math.max(0, Math.min(rows - 1, Number(config.idle_row) || 0));
+    const idleFrames = Math.max(1, Math.min(cols, Number(config.idle_frames) || cols));
+    const loopMs = Math.max(1, Number(config.loop_ms) || 1200);
     const turn = fish.querySelector(".pet-turn");
     if (!turn) return;
     const sprite = document.createElement("div");
@@ -261,10 +262,9 @@
     let frame = 0;
     function paint() {
       const col = frame % cols;
-      const row = Math.floor(frame / cols);
       sprite.style.backgroundPosition =
         (cols === 1 ? "0%" : (col * 100 / (cols - 1)) + "%") + " " +
-        (rows === 1 ? "0%" : (row * 100 / (rows - 1)) + "%");
+        (rows === 1 ? "0%" : (idleRow * 100 / (rows - 1)) + "%");
     }
     /* CSS backgrounds do not emit an element error event. Preload before
        mounting and revealing the pet; missing/invalid sheets render nothing. */
@@ -273,8 +273,8 @@
       paint();
       turn.replaceChildren(sprite);
       fish.hidden = false;
-      if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches && total > 1) {
-        window.setInterval(() => { frame = (frame + 1) % total; paint(); }, Math.max(16, loopMs / total));
+      if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches && idleFrames > 1) {
+        window.setInterval(() => { frame = (frame + 1) % idleFrames; paint(); }, Math.max(16, loopMs / idleFrames));
       }
     };
     image.src = spriteUrl;

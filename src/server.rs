@@ -1579,6 +1579,8 @@ struct PetRuntimeConfig {
     rows: u32,
     frame_width: u32,
     frame_height: u32,
+    idle_row: u32,
+    idle_frames: u32,
     loop_ms: u64,
 }
 
@@ -1587,29 +1589,31 @@ struct PetRuntimeConfig {
 /// mode without restarting the server.
 async fn pet_config(State(state): State<Arc<AppState>>) -> Json<PetRuntimeConfig> {
     use crate::config::{
-        DEFAULT_PET_FRAME_HEIGHT, DEFAULT_PET_FRAME_WIDTH, DEFAULT_PET_LOOP_MS,
-        DEFAULT_PET_SPRITE_COLS, DEFAULT_PET_SPRITE_ROWS,
+        DEFAULT_PET_FRAME_HEIGHT, DEFAULT_PET_FRAME_WIDTH, DEFAULT_PET_IDLE_ROW,
+        DEFAULT_PET_LOOP_MS, DEFAULT_PET_SPRITE_COLS, DEFAULT_PET_SPRITE_ROWS,
     };
 
     let pet = state
         .factory
         .current_config()
         .and_then(|config| config.pet().cloned());
+    let cols = pet
+        .as_ref()
+        .and_then(|pet| pet.sprite_cols)
+        .unwrap_or(DEFAULT_PET_SPRITE_COLS)
+        .max(1);
+    let rows = pet
+        .as_ref()
+        .and_then(|pet| pet.sprite_rows)
+        .unwrap_or(DEFAULT_PET_SPRITE_ROWS)
+        .max(1);
     Json(PetRuntimeConfig {
         enabled: pet
             .as_ref()
             .and_then(|pet| pet.spritesheet.as_ref())
             .is_some(),
-        cols: pet
-            .as_ref()
-            .and_then(|pet| pet.sprite_cols)
-            .unwrap_or(DEFAULT_PET_SPRITE_COLS)
-            .max(1),
-        rows: pet
-            .as_ref()
-            .and_then(|pet| pet.sprite_rows)
-            .unwrap_or(DEFAULT_PET_SPRITE_ROWS)
-            .max(1),
+        cols,
+        rows,
         frame_width: pet
             .as_ref()
             .and_then(|pet| pet.frame_width)
@@ -1620,6 +1624,16 @@ async fn pet_config(State(state): State<Arc<AppState>>) -> Json<PetRuntimeConfig
             .and_then(|pet| pet.frame_height)
             .unwrap_or(DEFAULT_PET_FRAME_HEIGHT)
             .max(1),
+        idle_row: pet
+            .as_ref()
+            .and_then(|pet| pet.idle_row)
+            .unwrap_or(DEFAULT_PET_IDLE_ROW)
+            .min(rows - 1),
+        idle_frames: pet
+            .as_ref()
+            .and_then(|pet| pet.idle_frames)
+            .unwrap_or(cols)
+            .clamp(1, cols),
         loop_ms: pet
             .as_ref()
             .and_then(|pet| pet.loop_ms)
@@ -7511,7 +7525,7 @@ model = "deepseek-chat"
         let sheet = temp.path().join("maid.webp");
         std::fs::write(&sheet, b"fake-webp").unwrap();
         let config: crate::config::Config = toml::from_str(&format!(
-            "[pet]\nspritesheet = {:?}\nsprite_cols = 8\nsprite_rows = 9\nframe_width = 192\nframe_height = 254\nloop_ms = 8400\n",
+            "[pet]\nspritesheet = {:?}\nsprite_cols = 8\nsprite_rows = 9\nframe_width = 192\nframe_height = 254\nidle_row = 3\nidle_frames = 5\nloop_ms = 1200\n",
             sheet
         ))
         .unwrap();
@@ -7543,7 +7557,8 @@ model = "deepseek-chat"
             value,
             serde_json::json!({
                 "enabled": true, "cols": 8, "rows": 9,
-                "frame_width": 192, "frame_height": 254, "loop_ms": 8400
+                "frame_width": 192, "frame_height": 254,
+                "idle_row": 3, "idle_frames": 5, "loop_ms": 1200
             })
         );
 
@@ -7605,6 +7620,127 @@ model = "deepseek-chat"
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn pet_endpoint_defaults_to_first_full_row_idle() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sheet = temp.path().join("maid.webp");
+        std::fs::write(&sheet, b"fake-webp").unwrap();
+        let config: crate::config::Config = toml::from_str(&format!(
+            "[pet]\nspritesheet = {:?}\nsprite_cols = 8\nsprite_rows = 9\n",
+            sheet
+        ))
+        .unwrap();
+        let mut state = test_app_state("sekrit");
+        Arc::get_mut(&mut state).unwrap().factory =
+            crate::session_factory::SessionFactory::test_factory_with_config(
+                temp.path().to_path_buf(),
+                Some(config),
+            );
+
+        let runtime = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/pet/config")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(runtime.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["idle_row"], 0);
+        assert_eq!(value["idle_frames"], 8);
+        assert_eq!(value["loop_ms"], 1200);
+    }
+
+    #[tokio::test]
+    async fn pet_endpoint_clamps_idle_values_to_sheet_grid() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        async fn get(toml_body: String) -> serde_json::Value {
+            let temp = tempfile::tempdir().unwrap();
+            let sheet = temp.path().join("maid.webp");
+            std::fs::write(&sheet, b"fake-webp").unwrap();
+            let config: crate::config::Config =
+                toml::from_str(&format!("[pet]\nspritesheet = {:?}\n{toml_body}", sheet)).unwrap();
+            let mut state = test_app_state("sekrit");
+            Arc::get_mut(&mut state).unwrap().factory =
+                crate::session_factory::SessionFactory::test_factory_with_config(
+                    temp.path().to_path_buf(),
+                    Some(config),
+                );
+            let runtime = router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/pet/config")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(runtime.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        for (toml_body, idle_row, idle_frames, cols, rows) in [
+            // idle_row beyond the grid clamps to the last row; idle_frames
+            // beyond cols clamps to cols.
+            (
+                "sprite_cols = 4\nsprite_rows = 3\nidle_row = 9\nidle_frames = 7\n",
+                2,
+                4,
+                4,
+                3,
+            ),
+            // idle_frames = 0 clamps up to 1; single-cell grid stays safe.
+            (
+                "sprite_cols = 1\nsprite_rows = 1\nidle_row = 5\nidle_frames = 0\n",
+                0,
+                1,
+                1,
+                1,
+            ),
+            // Degenerate 0x0 grid normalizes to 1x1 before any rows - 1 math.
+            (
+                "sprite_cols = 0\nsprite_rows = 0\nidle_row = 2\nidle_frames = 3\n",
+                0,
+                1,
+                1,
+                1,
+            ),
+            // In-range values pass through untouched.
+            (
+                "sprite_cols = 8\nsprite_rows = 9\nidle_row = 4\nidle_frames = 3\n",
+                4,
+                3,
+                8,
+                9,
+            ),
+        ] {
+            let value = get(toml_body.to_owned()).await;
+            assert_eq!(
+                (
+                    value["idle_row"].as_u64().unwrap(),
+                    value["idle_frames"].as_u64().unwrap(),
+                    value["cols"].as_u64().unwrap(),
+                    value["rows"].as_u64().unwrap()
+                ),
+                (idle_row, idle_frames, cols, rows),
+                "case: {toml_body}"
+            );
+        }
     }
 
     #[tokio::test]

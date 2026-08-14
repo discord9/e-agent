@@ -1524,7 +1524,9 @@ sprite_cols = 8
 sprite_rows = 9
 frame_width = 192
 frame_height = 254
-loop_ms = 8400
+idle_row = 0
+idle_frames = 8
+loop_ms = 1200
 "#,
     ))
     .unwrap();
@@ -1553,6 +1555,15 @@ fn pet_config_absent_present_and_unknown_key() {
     let absent = Config::from_path(&write_config(temp.path(), "")).unwrap();
     assert!(absent.pet().is_none());
 
+    let defaults = Config::from_path(&write_config(
+        temp.path(),
+        "[pet]\nspritesheet = \"/tmp/maid.webp\"\n",
+    ))
+    .unwrap();
+    let pet = defaults.pet().unwrap();
+    assert_eq!(pet.idle_row, None, "runtime default is row 0");
+    assert_eq!(pet.idle_frames, None, "runtime default is sprite_cols");
+
     let configured = Config::from_path(&write_config(
         temp.path(),
         r#"
@@ -1562,7 +1573,9 @@ sprite_cols = 8
 sprite_rows = 9
 frame_width = 192
 frame_height = 254
-loop_ms = 8400
+idle_row = 0
+idle_frames = 8
+loop_ms = 1200
 "#,
     ))
     .unwrap();
@@ -1575,7 +1588,9 @@ loop_ms = 8400
     assert_eq!(pet.sprite_rows, Some(9));
     assert_eq!(pet.frame_width, Some(192));
     assert_eq!(pet.frame_height, Some(254));
-    assert_eq!(pet.loop_ms, Some(8400));
+    assert_eq!(pet.idle_row, Some(0));
+    assert_eq!(pet.idle_frames, Some(8));
+    assert_eq!(pet.loop_ms, Some(1200));
 
     let error = Config::from_path(&write_config(
         temp.path(),

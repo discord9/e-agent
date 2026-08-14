@@ -71,6 +71,10 @@ pub struct PetConfig {
     #[serde(default)]
     pub frame_height: Option<u32>,
     #[serde(default)]
+    pub idle_row: Option<u32>,
+    #[serde(default)]
+    pub idle_frames: Option<u32>,
+    #[serde(default)]
     pub loop_ms: Option<u64>,
 }
 
@@ -78,7 +82,8 @@ pub const DEFAULT_PET_SPRITE_COLS: u32 = 8;
 pub const DEFAULT_PET_SPRITE_ROWS: u32 = 9;
 pub const DEFAULT_PET_FRAME_WIDTH: u32 = 192;
 pub const DEFAULT_PET_FRAME_HEIGHT: u32 = 254;
-pub const DEFAULT_PET_LOOP_MS: u64 = 8_400;
+pub const DEFAULT_PET_IDLE_ROW: u32 = 0;
+pub const DEFAULT_PET_LOOP_MS: u64 = 1_200;
 
 /// Background-task policy, from `[background]`.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]

@@ -144,11 +144,17 @@ sprite_cols = 8       # default 8
 sprite_rows = 9       # default 9
 frame_width = 192     # default 192
 frame_height = 254    # default 254
-loop_ms = 8400        # default 8400
+idle_row = 0          # default 0; one row is one animation state
+idle_frames = 8       # default sprite_cols; use the chosen row's real frame count
+loop_ms = 1200        # default 1200; duration of one idle-row cycle
+                      # (the UI honors at least ~16 ms per frame, so
+                      # effective cycles never go below 16 * idle_frames)
 ```
 
-Only PNG, JPEG, WebP, and GIF files up to 10 MiB are served. Remove the
-`[pet]` section (or its `spritesheet` key) to hide the pet entirely. The pet
+Only PNG, JPEG, WebP, and GIF files up to 10 MiB are served. Each sprite-sheet
+row is treated as a separate animation state: `idle_row` stays fixed while
+`idle_frames` controls how many cells in that row play. Remove the `[pet]`
+section (or its `spritesheet` key) to hide the pet entirely. The pet
 remains hidden if config or sprite loading fails, and it is available on narrow
 mobile screens when configured. The config is read live, so saving it and
 reloading the page does not require a server restart. A project `[pet]` section replaces the global section
