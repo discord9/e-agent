@@ -238,11 +238,11 @@
   function activateSprite(config) {
     if (!config || !config.enabled || petDismissed) return;
     const cols = Math.max(1, Number(config.cols) || 8);
-    const rows = Math.max(1, Number(config.rows) || 9);
+    const rows = Math.max(1, Number(config.rows) || 11);
     const frameWidth = Math.max(1, Number(config.frame_width) || 192);
-    const frameHeight = Math.max(1, Number(config.frame_height) || 254);
+    const frameHeight = Math.max(1, Number(config.frame_height) || 208);
     const idleRow = Math.max(0, Math.min(rows - 1, Number(config.idle_row) || 0));
-    const idleFrames = Math.max(1, Math.min(cols, Number(config.idle_frames) || cols));
+    const idleFrames = Math.max(1, Math.min(cols, Number(config.idle_frames) || 6));
     const loopMs = Math.max(1, Number(config.loop_ms) || 1200);
     const turn = fish.querySelector(".pet-turn");
     if (!turn) return;

@@ -1521,9 +1521,9 @@ newline = "alt+enter"
 [pet]
 spritesheet = "/tmp/pet.webp"
 sprite_cols = 8
-sprite_rows = 9
+sprite_rows = 11
 frame_width = 192
-frame_height = 254
+frame_height = 208
 idle_row = 0
 idle_frames = 8
 loop_ms = 1200
@@ -1562,7 +1562,10 @@ fn pet_config_absent_present_and_unknown_key() {
     .unwrap();
     let pet = defaults.pet().unwrap();
     assert_eq!(pet.idle_row, None, "runtime default is row 0");
-    assert_eq!(pet.idle_frames, None, "runtime default is sprite_cols");
+    assert_eq!(
+        pet.idle_frames, None,
+        "runtime default is 6 (row 0 has 6 real frames)"
+    );
 
     let configured = Config::from_path(&write_config(
         temp.path(),
@@ -1570,9 +1573,9 @@ fn pet_config_absent_present_and_unknown_key() {
 [pet]
 spritesheet = "/tmp/maid.webp"
 sprite_cols = 8
-sprite_rows = 9
+sprite_rows = 11
 frame_width = 192
-frame_height = 254
+frame_height = 208
 idle_row = 0
 idle_frames = 8
 loop_ms = 1200
@@ -1585,9 +1588,9 @@ loop_ms = 1200
         Some(Path::new("/tmp/maid.webp"))
     );
     assert_eq!(pet.sprite_cols, Some(8));
-    assert_eq!(pet.sprite_rows, Some(9));
+    assert_eq!(pet.sprite_rows, Some(11));
     assert_eq!(pet.frame_width, Some(192));
-    assert_eq!(pet.frame_height, Some(254));
+    assert_eq!(pet.frame_height, Some(208));
     assert_eq!(pet.idle_row, Some(0));
     assert_eq!(pet.idle_frames, Some(8));
     assert_eq!(pet.loop_ms, Some(1200));

@@ -2,21 +2,20 @@
 
 No external sprite is copied into the repository. This checks the same
 single-row CSS background-position math used by pet.html for the documented
-1536x2288, 8x9 sheet.
+1536x2288, 8x11 sheet.
 """
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PET_HTML = (ROOT / "src/ui/pet.html").read_text()
-COLS, ROWS = 8, 9
-FRAME_W, FRAME_H = 192, 254
+COLS, ROWS = 8, 11
+FRAME_W, FRAME_H = 192, 208
 SHEET_W, SHEET_H = 1536, 2288
-IDLE_ROW, IDLE_FRAMES = 0, 8
+IDLE_ROW, IDLE_FRAMES = 0, 6
 assert SHEET_W == COLS * FRAME_W
-# The supplied reference is two pixels taller than 9×254. CSS
-# `background-size: 800% 900%` intentionally fits it to the configured frame
-# grid (effective 1536×2286), exactly matching the browser implementation.
-assert SHEET_H == ROWS * FRAME_H + 2
+# The reference is exactly 11 rows of 208 px: 11 x 208 = 2288. CSS
+# `background-size: 800% 1100%` maps the frame grid onto the sheet 1:1.
+assert SHEET_H == ROWS * FRAME_H
 EFFECTIVE_W, EFFECTIVE_H = COLS * FRAME_W, ROWS * FRAME_H
 
 positions = []
@@ -31,9 +30,9 @@ for _ in range(IDLE_FRAMES + 1):
     positions.append((x_px, y_px))
     frame = (frame + 1) % IDLE_FRAMES
 
-# Row 0 advances through exactly its eight real frames, then wraps to col 0.
-assert positions[:8] == [(col * FRAME_W, 0) for col in range(8)]
-assert positions[8] == (0, 0)
+# Row 0 advances through exactly its six real frames, then wraps to col 0.
+assert positions[:6] == [(col * FRAME_W, 0) for col in range(6)]
+assert positions[6] == (0, 0)
 assert all(y == 0 for _, y in positions)
 
 # A shorter state row also loops before its padded empty cells.

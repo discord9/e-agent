@@ -79,9 +79,10 @@ pub struct PetConfig {
 }
 
 pub const DEFAULT_PET_SPRITE_COLS: u32 = 8;
-pub const DEFAULT_PET_SPRITE_ROWS: u32 = 9;
+pub const DEFAULT_PET_SPRITE_ROWS: u32 = 11;
 pub const DEFAULT_PET_FRAME_WIDTH: u32 = 192;
-pub const DEFAULT_PET_FRAME_HEIGHT: u32 = 254;
+pub const DEFAULT_PET_FRAME_HEIGHT: u32 = 208;
+pub const DEFAULT_PET_IDLE_FRAMES: u32 = 6;
 pub const DEFAULT_PET_IDLE_ROW: u32 = 0;
 pub const DEFAULT_PET_LOOP_MS: u64 = 1_200;
 

@@ -1589,8 +1589,9 @@ struct PetRuntimeConfig {
 /// mode without restarting the server.
 async fn pet_config(State(state): State<Arc<AppState>>) -> Json<PetRuntimeConfig> {
     use crate::config::{
-        DEFAULT_PET_FRAME_HEIGHT, DEFAULT_PET_FRAME_WIDTH, DEFAULT_PET_IDLE_ROW,
-        DEFAULT_PET_LOOP_MS, DEFAULT_PET_SPRITE_COLS, DEFAULT_PET_SPRITE_ROWS,
+        DEFAULT_PET_FRAME_HEIGHT, DEFAULT_PET_FRAME_WIDTH, DEFAULT_PET_IDLE_FRAMES,
+        DEFAULT_PET_IDLE_ROW, DEFAULT_PET_LOOP_MS, DEFAULT_PET_SPRITE_COLS,
+        DEFAULT_PET_SPRITE_ROWS,
     };
 
     let pet = state
@@ -1632,7 +1633,7 @@ async fn pet_config(State(state): State<Arc<AppState>>) -> Json<PetRuntimeConfig
         idle_frames: pet
             .as_ref()
             .and_then(|pet| pet.idle_frames)
-            .unwrap_or(cols)
+            .unwrap_or(DEFAULT_PET_IDLE_FRAMES)
             .clamp(1, cols),
         loop_ms: pet
             .as_ref()
@@ -7525,7 +7526,7 @@ model = "deepseek-chat"
         let sheet = temp.path().join("maid.webp");
         std::fs::write(&sheet, b"fake-webp").unwrap();
         let config: crate::config::Config = toml::from_str(&format!(
-            "[pet]\nspritesheet = {:?}\nsprite_cols = 8\nsprite_rows = 9\nframe_width = 192\nframe_height = 254\nidle_row = 3\nidle_frames = 5\nloop_ms = 1200\n",
+            "[pet]\nspritesheet = {:?}\nsprite_cols = 8\nsprite_rows = 11\nframe_width = 192\nframe_height = 208\nidle_row = 3\nidle_frames = 5\nloop_ms = 1200\n",
             sheet
         ))
         .unwrap();
@@ -7556,8 +7557,8 @@ model = "deepseek-chat"
         assert_eq!(
             value,
             serde_json::json!({
-                "enabled": true, "cols": 8, "rows": 9,
-                "frame_width": 192, "frame_height": 254,
+                "enabled": true, "cols": 8, "rows": 11,
+                "frame_width": 192, "frame_height": 208,
                 "idle_row": 3, "idle_frames": 5, "loop_ms": 1200
             })
         );
@@ -7631,7 +7632,7 @@ model = "deepseek-chat"
         let sheet = temp.path().join("maid.webp");
         std::fs::write(&sheet, b"fake-webp").unwrap();
         let config: crate::config::Config = toml::from_str(&format!(
-            "[pet]\nspritesheet = {:?}\nsprite_cols = 8\nsprite_rows = 9\n",
+            "[pet]\nspritesheet = {:?}\nsprite_cols = 8\nsprite_rows = 11\n",
             sheet
         ))
         .unwrap();
@@ -7657,7 +7658,7 @@ model = "deepseek-chat"
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["idle_row"], 0);
-        assert_eq!(value["idle_frames"], 8);
+        assert_eq!(value["idle_frames"], 6);
         assert_eq!(value["loop_ms"], 1200);
     }
 
@@ -7722,11 +7723,11 @@ model = "deepseek-chat"
             ),
             // In-range values pass through untouched.
             (
-                "sprite_cols = 8\nsprite_rows = 9\nidle_row = 4\nidle_frames = 3\n",
+                "sprite_cols = 8\nsprite_rows = 11\nidle_row = 4\nidle_frames = 3\n",
                 4,
                 3,
                 8,
-                9,
+                11,
             ),
         ] {
             let value = get(toml_body.to_owned()).await;

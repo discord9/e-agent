@@ -141,11 +141,12 @@ receives an arbitrary file path:
 [pet]
 spritesheet = "/absolute/path/to/maid.webp"
 sprite_cols = 8       # default 8
-sprite_rows = 9       # default 9
+sprite_rows = 11      # default 11
 frame_width = 192     # default 192
-frame_height = 254    # default 254
+frame_height = 208    # default 208
 idle_row = 0          # default 0; one row is one animation state
-idle_frames = 8       # default sprite_cols; use the chosen row's real frame count
+idle_frames = 6       # default 6; row 0 of the bundled sheet has 6 real frames —
+                      # set the chosen row's real frame count
 loop_ms = 1200        # default 1200; duration of one idle-row cycle
                       # (the UI honors at least ~16 ms per frame, so
                       # effective cycles never go below 16 * idle_frames)
