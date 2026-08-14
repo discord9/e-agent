@@ -1457,6 +1457,91 @@ model = "codex"
 }
 
 #[test]
+fn pet_config_absent_present_and_unknown_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let absent = Config::from_path(&write_config(temp.path(), "")).unwrap();
+    assert!(absent.pet().is_none());
+
+    let configured = Config::from_path(&write_config(
+        temp.path(),
+        r#"
+[pet]
+spritesheet = "/tmp/maid.webp"
+sprite_cols = 8
+sprite_rows = 9
+frame_width = 192
+frame_height = 254
+loop_ms = 8400
+"#,
+    ))
+    .unwrap();
+    let pet = configured.pet().unwrap();
+    assert_eq!(
+        pet.spritesheet.as_deref(),
+        Some(Path::new("/tmp/maid.webp"))
+    );
+    assert_eq!(pet.sprite_cols, Some(8));
+    assert_eq!(pet.sprite_rows, Some(9));
+    assert_eq!(pet.frame_width, Some(192));
+    assert_eq!(pet.frame_height, Some(254));
+    assert_eq!(pet.loop_ms, Some(8400));
+
+    let error = Config::from_path(&write_config(
+        temp.path(),
+        "[pet]\nspritesheet = \"/tmp/maid.webp\"\ncolumns = 8\n",
+    ))
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("unknown field `columns`"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn merged_with_project_pet_replaces_global_wholesale() {
+    let temp = tempfile::tempdir().unwrap();
+    let global = Config::from_path(&write_config(
+        temp.path(),
+        "[pet]\nspritesheet = \"/global.webp\"\nsprite_cols = 4\nloop_ms = 1000\n",
+    ))
+    .unwrap();
+    let ws = temp.path().join("ws");
+    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[pet]\nspritesheet = \"/project.png\"\nsprite_rows = 3\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[tui]\nsubmit = \"ctrl+enter\"\n",
+    )
+    .unwrap();
+    let inherited = global.merged_with_project(&ws).unwrap();
+    assert_eq!(
+        inherited.pet().and_then(|pet| pet.spritesheet.as_deref()),
+        Some(Path::new("/global.webp")),
+        "a project file without [pet] keeps the global section"
+    );
+
+    std::fs::write(
+        ws.join(".e-agent/config.toml"),
+        "[pet]\nspritesheet = \"/project.png\"\nsprite_rows = 3\n",
+    )
+    .unwrap();
+    let merged = global.merged_with_project(&ws).unwrap();
+    let pet = merged.pet().unwrap();
+    assert_eq!(pet.spritesheet.as_deref(), Some(Path::new("/project.png")));
+    assert_eq!(pet.sprite_rows, Some(3));
+    assert_eq!(pet.sprite_cols, None, "project section replaces wholesale");
+    assert_eq!(pet.loop_ms, None, "omitted values use built-in defaults");
+
+    std::fs::write(ws.join(".e-agent/config.toml"), "[pet]\nunknown = 1\n").unwrap();
+    let error = global.merged_with_project(&ws).unwrap_err();
+    assert!(format!("{error:#}").contains("unknown field"), "{error:#}");
+}
+
+#[test]
 fn resolve_background_timeout_defaults_and_global() {
     let temp = tempfile::tempdir().unwrap();
     // No config at all → default 1800s.

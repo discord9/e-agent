@@ -19,6 +19,8 @@
 //! | POST   | `/api/sessions/{id}/cancel`       | cancel the in-flight turn          |
 //! | POST   | `/api/sessions/{id}/compact`      | request compaction                 |
 //! | GET    | `/api/models`                     | switchable model profile names (web `/model` autocomplete) |
+//! | GET    | `/api/pet/config`                 | live desktop pet sprite settings |
+//! | GET    | `/api/pet/sprite`                 | configured local sprite-sheet bytes |
 //! | POST   | `/api/sessions/{id}/model`         | switch the session's model at runtime |
 //! | POST   | `/api/sessions/{id}/undo`         | undo the most recent file operation |
 //! | GET    | `/api/sessions/{id}/goal`         | current goal snapshot (or null)     |
@@ -522,6 +524,8 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/compact", post(session_compact))
         .route("/api/models", get(list_models))
+        .route("/api/pet/config", get(pet_config))
+        .route("/api/pet/sprite", get(serve_pet_sprite))
         .route("/api/sessions/{id}/model", post(session_model))
         .route("/api/sessions/{id}/undo", post(session_undo))
         .route(
@@ -1568,6 +1572,62 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     Json(state.factory.model_profiles())
 }
 
+#[derive(Debug, Serialize)]
+struct PetRuntimeConfig {
+    enabled: bool,
+    cols: u32,
+    rows: u32,
+    frame_width: u32,
+    frame_height: u32,
+    loop_ms: u64,
+}
+
+/// `GET /api/pet/config` — live desktop pet settings. This reads the
+/// reloadable config on every request, so saving the config switches sprite
+/// mode without restarting the server.
+async fn pet_config(State(state): State<Arc<AppState>>) -> Json<PetRuntimeConfig> {
+    use crate::config::{
+        DEFAULT_PET_FRAME_HEIGHT, DEFAULT_PET_FRAME_WIDTH, DEFAULT_PET_LOOP_MS,
+        DEFAULT_PET_SPRITE_COLS, DEFAULT_PET_SPRITE_ROWS,
+    };
+
+    let pet = state
+        .factory
+        .current_config()
+        .and_then(|config| config.pet().cloned());
+    Json(PetRuntimeConfig {
+        enabled: pet
+            .as_ref()
+            .and_then(|pet| pet.spritesheet.as_ref())
+            .is_some(),
+        cols: pet
+            .as_ref()
+            .and_then(|pet| pet.sprite_cols)
+            .unwrap_or(DEFAULT_PET_SPRITE_COLS)
+            .max(1),
+        rows: pet
+            .as_ref()
+            .and_then(|pet| pet.sprite_rows)
+            .unwrap_or(DEFAULT_PET_SPRITE_ROWS)
+            .max(1),
+        frame_width: pet
+            .as_ref()
+            .and_then(|pet| pet.frame_width)
+            .unwrap_or(DEFAULT_PET_FRAME_WIDTH)
+            .max(1),
+        frame_height: pet
+            .as_ref()
+            .and_then(|pet| pet.frame_height)
+            .unwrap_or(DEFAULT_PET_FRAME_HEIGHT)
+            .max(1),
+        loop_ms: pet
+            .as_ref()
+            .and_then(|pet| pet.loop_ms)
+            .unwrap_or(DEFAULT_PET_LOOP_MS)
+            .max(1),
+    })
+}
+
 /// `POST /api/sessions/{id}/model` — switch the session's model at runtime
 /// (web `/model <profile>`). Body `{"profile": "provider/model"}`; the
 /// profile is resolved against the same config the factory was built with
@@ -2076,6 +2136,71 @@ async fn task_output(
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // Images
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// Maximum bytes served from a configured pet sprite sheet. The path is
+/// trusted config (never request input), but the cap prevents accidental or
+/// maliciously replaced files from becoming unbounded responses.
+const PET_SPRITE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// `GET /api/pet/sprite` — serve only the live config's sprite-sheet path.
+/// Missing/unreadable files, disallowed extensions, and oversized files are
+/// deliberately indistinguishable as 404 so the static UI falls back to SVG.
+async fn serve_pet_sprite(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use std::io::Read;
+
+    let path = state
+        .factory
+        .current_config()
+        .and_then(|config| config.pet().and_then(|pet| pet.spritesheet.clone()))
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "pet sprite is not configured"))?;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                "pet sprite has unsupported extension",
+            )
+        })?;
+    let mime = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => {
+            return Err(error(
+                StatusCode::NOT_FOUND,
+                "pet sprite has unsupported extension",
+            ));
+        }
+    };
+    let file = std::fs::File::open(&path)
+        .map_err(|_| error(StatusCode::NOT_FOUND, "pet sprite is unavailable"))?;
+    if file
+        .metadata()
+        .map(|metadata| metadata.len() > PET_SPRITE_MAX_BYTES)
+        .unwrap_or(true)
+    {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            "pet sprite exceeds size limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(PET_SPRITE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| error(StatusCode::NOT_FOUND, "pet sprite is unreadable"))?;
+    if bytes.len() as u64 > PET_SPRITE_MAX_BYTES {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            "pet sprite exceeds size limit",
+        ));
+    }
+    Ok(([(header::CONTENT_TYPE, mime)], bytes))
+}
 
 /// `GET /api/images/{hash}` 的查询参数：可选 `mime`（前端把
 /// [`crate::agent::ImagePart`] 的 mime 带回；白名单之外一律回退
@@ -4865,6 +4990,26 @@ model = "deepseek-chat"
         }
         assert!(html.contains("<title>e-agent · Web UI</title>"));
         assert!(html.contains("marked.setOptions"));
+        let pet = read_embedded_ui("pet.html").unwrap();
+        for artwork in [
+            "<svg",
+            "maid-silhouette",
+            "maid-hair-back",
+            "maid-headpiece",
+            "maid-face",
+            "maid-uniform",
+            "maid-accents",
+            ".pet-whale-svg",
+            ".pet-body",
+        ] {
+            assert!(!pet.contains(artwork), "pet artwork leaked: {artwork}");
+        }
+        assert!(pet.contains("class=\"pet-whale\"") && pet.contains("hidden>"));
+        assert!(pet.contains("fish.hidden = false"));
+        assert!(
+            !pet.contains("max-width: 480px"),
+            "configured pet must remain visible on narrow screens"
+        );
         assert!(html.contains("katex.renderToString"));
         // KaTeX fonts are inlined as base64 data: URLs (self-contained,
         // zero external requests): every @font-face src must be a woff2
@@ -7355,6 +7500,144 @@ model = "deepseek-chat"
         // Clean up the running tasks so the test leaks no processes.
         session.background.cancel(1);
         session.background.cancel(2);
+    }
+
+    #[tokio::test]
+    async fn pet_endpoints_report_config_and_serve_only_allowed_sheet() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sheet = temp.path().join("maid.webp");
+        std::fs::write(&sheet, b"fake-webp").unwrap();
+        let config: crate::config::Config = toml::from_str(&format!(
+            "[pet]\nspritesheet = {:?}\nsprite_cols = 8\nsprite_rows = 9\nframe_width = 192\nframe_height = 254\nloop_ms = 8400\n",
+            sheet
+        ))
+        .unwrap();
+        let mut state = test_app_state("sekrit");
+        Arc::get_mut(&mut state).unwrap().factory =
+            crate::session_factory::SessionFactory::test_factory_with_config(
+                temp.path().to_path_buf(),
+                Some(config),
+            );
+        let app = router(state);
+
+        let runtime = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/pet/config")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(runtime.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "enabled": true, "cols": 8, "rows": 9,
+                "frame_width": 192, "frame_height": 254, "loop_ms": 8400
+            })
+        );
+
+        let sprite = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/pet/sprite?token=sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sprite.status(), StatusCode::OK);
+        assert_eq!(
+            sprite.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/webp"
+        );
+        assert_eq!(
+            &axum::body::to_bytes(sprite.into_body(), 1024)
+                .await
+                .unwrap()[..],
+            b"fake-webp"
+        );
+        let unauthorized = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/pet/sprite")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let unset = router(test_app_state("sekrit"));
+        let response = unset
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/pet/sprite?token=sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let runtime = unset
+            .oneshot(
+                Request::builder()
+                    .uri("/api/pet/config?token=sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(runtime.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn pet_sprite_rejects_extension_and_size_cap() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        for (name, bytes) in [
+            ("maid.svg", vec![b'x'; 10]),
+            ("maid.png", vec![b'x'; PET_SPRITE_MAX_BYTES as usize + 1]),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let sheet = temp.path().join(name);
+            std::fs::write(&sheet, bytes).unwrap();
+            let config: crate::config::Config =
+                toml::from_str(&format!("[pet]\nspritesheet = {:?}\n", sheet)).unwrap();
+            let mut state = test_app_state("sekrit");
+            Arc::get_mut(&mut state).unwrap().factory =
+                crate::session_factory::SessionFactory::test_factory_with_config(
+                    temp.path().to_path_buf(),
+                    Some(config),
+                );
+            let response = router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/pet/sprite?token=sekrit")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{name}");
+        }
     }
 
     /// `GET /api/images/{hash}`：内容寻址图片存取。测试用临时目录构造

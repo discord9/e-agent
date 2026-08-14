@@ -46,9 +46,38 @@ pub struct Config {
     /// `merged_with_project`).
     #[serde(default)]
     tui: Option<TuiConfig>,
+    /// Optional `[pet]` desktop sprite-sheet configuration. Like `[tui]`,
+    /// a project-level section replaces the global section wholesale.
+    #[serde(default)]
+    pet: Option<PetConfig>,
     #[serde(skip)]
     path: PathBuf,
 }
+
+/// Desktop pet sprite-sheet settings from `[pet]`. The section is optional:
+/// without it (or without `spritesheet`) the desktop pet is not rendered.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PetConfig {
+    #[serde(default)]
+    pub spritesheet: Option<PathBuf>,
+    #[serde(default)]
+    pub sprite_cols: Option<u32>,
+    #[serde(default)]
+    pub sprite_rows: Option<u32>,
+    #[serde(default)]
+    pub frame_width: Option<u32>,
+    #[serde(default)]
+    pub frame_height: Option<u32>,
+    #[serde(default)]
+    pub loop_ms: Option<u64>,
+}
+
+pub const DEFAULT_PET_SPRITE_COLS: u32 = 8;
+pub const DEFAULT_PET_SPRITE_ROWS: u32 = 9;
+pub const DEFAULT_PET_FRAME_WIDTH: u32 = 192;
+pub const DEFAULT_PET_FRAME_HEIGHT: u32 = 254;
+pub const DEFAULT_PET_LOOP_MS: u64 = 8_400;
 
 /// Background-task policy, from `[background]`.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -327,6 +356,11 @@ pub enum AuthMode {
 }
 
 impl Config {
+    /// Current desktop pet section. `None` means no desktop pet is rendered.
+    pub fn pet(&self) -> Option<&PetConfig> {
+        self.pet.as_ref()
+    }
+
     pub fn load() -> anyhow::Result<Option<Self>> {
         for path in config_paths() {
             if path.is_file() {
@@ -374,6 +408,9 @@ impl Config {
     ///   replaces the global section entirely; fields the project omits
     ///   fall back to the built-in defaults, not the global values. No
     ///   project `[tui]` keeps the global section.
+    /// - `[pet]`: replaced **wholesale**, matching `[tui]`; omitted fields
+    ///   use the built-in sprite defaults, while an absent project section
+    ///   keeps the global pet section.
     ///
     /// `[sandbox]`, `[background]` and `[bash]` are not merged here: they
     /// keep their workspace-aware resolvers (`resolve_sandbox`,
@@ -423,6 +460,9 @@ impl Config {
         }
         if let Some(tui) = project.tui {
             merged.tui = Some(tui);
+        }
+        if let Some(pet) = project.pet {
+            merged.pet = Some(pet);
         }
         Ok(merged)
     }
@@ -944,7 +984,7 @@ pub fn resolve_background_timeout(
 /// silent ignore — the file is an override layer, so a misspelled section
 /// would otherwise be silently dropped. Every legal section is declared
 /// below: the merged ones (`default`, `[models]`, `[mcp]`, `[roles]`,
-/// `[tui]`) are applied by `merged_with_project`; `[sandbox]`, `[bash]`,
+/// `[tui]`, `[pet]`) are applied by `merged_with_project`; `[sandbox]`, `[bash]`,
 /// `[background]` and `[delegate]` are consumed by their own
 /// workspace-aware resolvers; and `[providers]`, `[web_search]`,
 /// `[session]` are white-listed for compatibility — they parse but stay
@@ -975,6 +1015,8 @@ struct ProjectConfig {
     delegate: Option<DelegateConfig>,
     /// Whole-section `[tui]` replacement; absent keeps the global section.
     tui: Option<TuiConfig>,
+    /// Whole-section `[pet]` replacement; absent keeps the global section.
+    pet: Option<PetConfig>,
     /// Global-only sections white-listed for compatibility: parsed so the
     /// project file does not fail `deny_unknown_fields`, but never merged
     /// into the effective config (see the struct doc).

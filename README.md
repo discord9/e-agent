@@ -106,7 +106,7 @@ subagent = "kimi/k2"
 ```
 
 A project-local `<workspace>/.e-agent/config.toml` overlays `default`,
-`[models]`, `[roles]`, `[mcp]`, and `[tui]` onto this global config: models
+`[models]`, `[roles]`, `[mcp]`, `[tui]`, and `[pet]` onto this global config: models
 merge by name (a project model replaces the same-named global model; global
 models the project does not define keep their definitions; an absent or empty
 `[models]` keeps all global models), roles merge per key, and MCP servers
@@ -129,6 +129,32 @@ input — treat it like the global config: only open workspaces you trust,
 because opening a workspace runs the MCP commands that workspace's file
 declares. A global `[mcp."<name>"] enabled = false` is a kill switch that a
 project file cannot re-enable (see the MCP section).
+
+### Desktop pet sprite sheet
+
+The web UI carries no pet artwork and renders no desktop pet by default. To
+show one, add a user-supplied local sprite sheet under `[pet]` in the global or
+project config; the browser reads it through the authenticated server and never
+receives an arbitrary file path:
+
+```toml
+[pet]
+spritesheet = "/absolute/path/to/maid.webp"
+sprite_cols = 8       # default 8
+sprite_rows = 9       # default 9
+frame_width = 192     # default 192
+frame_height = 254    # default 254
+loop_ms = 8400        # default 8400
+```
+
+Only PNG, JPEG, WebP, and GIF files up to 10 MiB are served. Remove the
+`[pet]` section (or its `spritesheet` key) to hide the pet entirely. The pet
+remains hidden if config or sprite loading fails, and it is available on narrow
+mobile screens when configured. The config is read live, so saving it and
+reloading the page does not require a server restart. A project `[pet]` section replaces the global section
+wholesale, like `[tui]`; omitted fields use the built-in defaults rather than
+global field values. Sprite files are user-supplied and are never embedded in
+or distributed with e-agent.
 
 ### TUI submit/newline keys
 
@@ -785,6 +811,8 @@ The `/api` surface (JSON except for the SSE endpoint):
 | POST | `/api/sessions/{id}/cancel` | release: preempt the in-flight turn without terminating the session (with no queued messages a WaitForInput session returns to Idle and stays usable) |
 | POST | `/api/sessions/{id}/compact` | request compaction |
 | GET | `/api/models` | switchable model profile names |
+| GET | `/api/pet/config` | live desktop pet sprite settings |
+| GET | `/api/pet/sprite` | configured local sprite-sheet bytes |
 | POST | `/api/sessions/{id}/model` | switch the session's model at runtime |
 | POST | `/api/sessions/{id}/undo` | undo the most recent file operation |
 | PUT | `/api/sessions/{id}/title` | rename a session |

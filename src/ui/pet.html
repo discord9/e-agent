@@ -1,69 +1,18 @@
-<!-- ============ 原创 DeepSeek 蓝色系 Q 版女仆桌宠 ============
-     本地原创内联 SVG，不含 DeepSeek 商标或外部网络素材。
-     保留原桌宠的 90×90 拖拽、点击、气泡、总结与关闭交互。 -->
-<div id="petWhale" class="pet-whale" title="蓝色女仆桌宠 · 拖我走，点我互动！">
+<!-- Desktop pet mount: artwork is supplied only through a configured local sprite sheet. -->
+<div id="petWhale" class="pet-whale" title="桌宠 · 拖我走，点我互动！" hidden>
   <div class="pet-motion">
     <div class="pet-turn">
-      <svg viewBox="0 0 90 90" class="pet-whale-svg" aria-hidden="true">
-        <g class="pet-body">
-          <g id="maid-silhouette" fill="#162957" stroke="#102044" stroke-width="2.2" stroke-linejoin="round">
-            <path d="M25 25C13 21 7 27 10 38c2 8 9 11 16 8l5-8z"/>
-            <path d="M65 25c12-4 18 2 15 13-2 8-9 11-16 8l-5-8z"/>
-            <path d="M23 70c-4 4-6 10-6 15h56c0-5-2-11-6-15z"/>
-          </g>
 
-          <g id="maid-hair-back">
-            <path d="M19 41C19 20 29 10 45 10s26 10 26 31v22H19z" fill="#18376d" stroke="#102044" stroke-width="2.4"/>
-            <path d="M22 39c0-18 9-26 23-26s23 8 23 26v18c-6-3-10-8-11-15H33c-1 7-5 12-11 15z" fill="#244f91"/>
-            <path d="M24 31c3-12 10-17 21-17 10 0 17 5 20 16-11-6-29-6-41 1z" fill="#3c72ba" opacity=".7"/>
-          </g>
-
-          <g id="maid-headpiece" stroke="#102044" stroke-width="2" stroke-linejoin="round">
-            <path d="M26 17c2-7 7-10 12-7 2-4 5-6 7-6s5 2 7 6c5-3 10 0 12 7-11-4-27-4-38 0z" fill="#f7fbff"/>
-            <path d="M31 15c3-4 7-6 14-6s11 2 14 6" fill="none" stroke="#72b9f2"/>
-            <path d="M41 7h8v8h-8z" fill="#dff3ff"/>
-          </g>
-
-          <g id="maid-face">
-            <path d="M27 34c0-13 7-19 18-19s18 6 18 19v12c0 12-7 20-18 20s-18-8-18-20z" fill="#ffe8dd" stroke="#102044" stroke-width="2.3"/>
-            <path d="M27 36c1-14 8-21 19-21 9 0 16 5 18 16-7 1-13-2-17-7-4 6-11 10-20 12z" fill="#18376d" stroke="#102044" stroke-width="2.1" stroke-linejoin="round"/>
-            <path d="M31 29c2 1 4 2 6 1m19-3c-2 2-4 3-7 2" fill="none" stroke="#4e85cb" stroke-width="1.6" stroke-linecap="round" opacity=".85"/>
-            <g id="maid-expression" stroke="#102044" stroke-linecap="round">
-              <path d="M34 43c1-3 5-3 6 0" fill="none" stroke-width="2.3"/>
-              <path d="M50 43c1-3 5-3 6 0" fill="none" stroke-width="2.3"/>
-              <path d="M41 54c3 3 6 3 9 0" fill="none" stroke-width="2"/>
-              <circle cx="32.5" cy="50" r="2.4" fill="#f49aa6" stroke="none" opacity=".68"/>
-              <circle cx="57.5" cy="50" r="2.4" fill="#f49aa6" stroke="none" opacity=".68"/>
-            </g>
-          </g>
-
-          <g id="maid-uniform" stroke="#102044" stroke-width="2.2" stroke-linejoin="round">
-            <path d="M29 64c-7 0-11 5-11 13l8 3 4-8z" fill="#eaf7ff"/>
-            <path d="M61 64c7 0 11 5 11 13l-8 3-4-8z" fill="#eaf7ff"/>
-            <path d="M30 62h30c6 5 8 14 7 23H23c-1-9 1-18 7-23z" fill="#2f67ad"/>
-            <path d="M37 62c1 4 4 6 8 6s7-2 8-6l6 3-3 20H34l-3-20z" fill="#f7fbff"/>
-            <path d="M39 63l6 5 6-5-2-3h-8z" fill="#dff3ff"/>
-            <path d="M34 77c7 3 15 3 22 0v8H34z" fill="#dff3ff" stroke="#72b9f2" stroke-width="1.5"/>
-            <path d="M40 69h10" fill="none" stroke="#72b9f2" stroke-width="1.5" stroke-linecap="round"/>
-          </g>
-
-          <g id="maid-accents" fill="#bde8ff">
-            <circle cx="13" cy="33" r="2"/>
-            <circle cx="77" cy="32" r="2"/>
-            <path d="M13 25v5m-2.5-2.5h5M77 22v5m-2.5-2.5h5" fill="none" stroke="#bde8ff" stroke-width="1.5" stroke-linecap="round"/>
-          </g>
-        </g>
-      </svg>
     </div>
     <span class="pet-bubble b1" aria-hidden="true"></span>
     <span class="pet-bubble b2" aria-hidden="true"></span>
     <span class="pet-bubble b3" aria-hidden="true"></span>
   </div>
-  <button id="petClose" class="pet-close" title="关闭女仆桌宠" aria-label="关闭女仆桌宠">×</button>
+  <button id="petClose" class="pet-close" title="关闭桌宠" aria-label="关闭桌宠">×</button>
   <div id="petSay" class="pet-say" hidden></div>
 </div>
 <style>
-/* ============ DeepSeek 蓝色系女仆桌宠样式 ============ */
+/* ============ 可配置 spritesheet 桌宠样式 ============ */
 .pet-whale {
   position: fixed;
   right: 18px;
@@ -75,7 +24,7 @@
   user-select: none;
   touch-action: none;          /* 拖拽：禁默认触摸滚动 */
 }
-/* 把呼吸浮动与 fixed 定位分层，拖拽读取位置时不会带入动画位移。 */
+/* 把浮动与 fixed 定位分层，拖拽读取位置时不会带入动画位移。 */
 .pet-motion {
   position: relative;
   width: 100%;
@@ -92,26 +41,23 @@
   transform-style: preserve-3d;
   transition: transform 260ms ease-out;
 }
-.pet-whale-svg {
-  display: block;
-  width: 100%;
-  height: 100%;
-  overflow: visible;
-  transform-origin: center;
-  animation: pet-breathe 3.8s ease-in-out infinite;
-}
-/* 整体轻微呼吸摆动，确保 90px 下轮廓始终清晰。 */
-.pet-body {
-  transform-box: view-box;
-  transform-origin: 45px 45px;
-  animation: pet-wag 1.8s ease-in-out infinite;
+/* Runtime sprite mode: one configured frame is centered inside the same
+   90×90 interaction target. Body motion comes from the sheet; swim/held/
+   startled remain on the existing outer layers. */
+.pet-sprite {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  background-repeat: no-repeat;
+  image-rendering: auto;
+  transform: translate(-50%, -50%);
+  will-change: background-position;
 }
 /* 悬停时轻轻侧头回应用户。 */
 .pet-whale:hover:not(.dragging):not(.startled) .pet-motion { animation-duration: 3.1s; }
 .pet-whale:hover:not(.dragging) .pet-turn {
   transform: perspective(180px) rotateY(-7deg) rotateZ(-1.5deg) translateX(-1px);
 }
-.pet-whale:hover:not(.dragging) .pet-body { animation-duration: 1.05s; }
 
 /* 被抓住时短促挣动；点击后覆盖游动，做一次“吓一跳”。 */
 .pet-whale.dragging { cursor: grabbing; }
@@ -209,15 +155,6 @@
   50%      { transform: translate3d(1px, -7px, 0) rotateZ(1deg) rotateY(7deg); }
   76%      { transform: translate3d(3px, -3px, 0) rotateZ(0.2deg) rotateY(1deg); }
 }
-@keyframes pet-breathe {
-  0%, 100% { transform: scale(1); }
-  50%      { transform: scale(1.02); }
-}
-@keyframes pet-wag {
-  0%, 100% { transform: rotate(0deg); }
-  45%      { transform: rotate(-4deg); }
-  65%      { transform: rotate(-2.5deg); }
-}
 @keyframes pet-held {
   from { transform: translate3d(-1px, 0, 0) rotate(-1.1deg); }
   to   { transform: translate3d(1px, -1px, 0) rotate(1.1deg); }
@@ -237,20 +174,15 @@
 }
 /* 尊重系统“减少动态”：保留桌宠交互，但关闭位移、缩放、摆动和泡泡。 */
 @media (prefers-reduced-motion: reduce) {
-  .pet-motion,
-  .pet-whale-svg,
-  .pet-body { animation: none !important; }
+  .pet-motion { animation: none !important; }
+  .pet-sprite { will-change: auto; }
   .pet-turn { transform: none !important; transition: none; }
   .pet-bubble { display: none; }
   .pet-close { transition: none; }
 }
-/* 小屏隐藏 */
-@media (max-width: 480px) {
-  .pet-whale { display: none; }
-}
 </style>
 <script>
-/* ============ 女仆桌宠：交互 + 拖拽 ============ */
+/* ============ spritesheet 桌宠：交互 + 拖拽 ============ */
 (function () {
   const PET_KEY = "e-agent.pet.hidden";
   const PET_POS_KEY = "e-agent.pet.pos";
@@ -278,7 +210,8 @@
   ];
   const fish = document.getElementById("petWhale");
   if (!fish) return;
-  try { if (localStorage.getItem(PET_KEY) === "1") fish.hidden = true; } catch (e) {}
+  let petDismissed = false;
+  try { petDismissed = localStorage.getItem(PET_KEY) === "1"; } catch (e) {}
   // 恢复上次拖拽位置（right/bottom → left/top 转换）。最多允许 10px
   // 贴边溢出，保证 90px 的桌宠仍有大部分留在当前视口内。
   try {
@@ -300,6 +233,60 @@
   } catch (e) {}
   const closeBtn = document.getElementById("petClose");
   const say = document.getElementById("petSay");
+
+  /* --- 可选本地 spritesheet；未配置或加载失败时容器保持隐藏 --- */
+  function activateSprite(config) {
+    if (!config || !config.enabled || petDismissed) return;
+    const cols = Math.max(1, Number(config.cols) || 8);
+    const rows = Math.max(1, Number(config.rows) || 9);
+    const frameWidth = Math.max(1, Number(config.frame_width) || 192);
+    const frameHeight = Math.max(1, Number(config.frame_height) || 254);
+    const loopMs = Math.max(1, Number(config.loop_ms) || 8400);
+    const total = cols * rows;
+    const turn = fish.querySelector(".pet-turn");
+    if (!turn) return;
+    const sprite = document.createElement("div");
+    sprite.className = "pet-sprite";
+    sprite.setAttribute("role", "img");
+    sprite.setAttribute("aria-label", "桌宠动画");
+    const scale = Math.min(90 / frameWidth, 90 / frameHeight);
+    sprite.style.width = (frameWidth * scale) + "px";
+    sprite.style.height = (frameHeight * scale) + "px";
+    sprite.style.backgroundSize = (cols * 100) + "% " + (rows * 100) + "%";
+    const st = window.state;
+    const token = st && st.token;
+    const spritePath = "/api/pet/sprite" + (token ? "?token=" + encodeURIComponent(token) : "");
+    const spriteUrl = fullUrl(spritePath);
+    sprite.style.backgroundImage = "url(\"" + spriteUrl.replace(/[\"\\]/g, "\\$&") + "\")";
+    let frame = 0;
+    function paint() {
+      const col = frame % cols;
+      const row = Math.floor(frame / cols);
+      sprite.style.backgroundPosition =
+        (cols === 1 ? "0%" : (col * 100 / (cols - 1)) + "%") + " " +
+        (rows === 1 ? "0%" : (row * 100 / (rows - 1)) + "%");
+    }
+    /* CSS backgrounds do not emit an element error event. Preload before
+       mounting and revealing the pet; missing/invalid sheets render nothing. */
+    const image = new Image();
+    image.onload = () => {
+      paint();
+      turn.replaceChildren(sprite);
+      fish.hidden = false;
+      if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches && total > 1) {
+        window.setInterval(() => { frame = (frame + 1) % total; paint(); }, Math.max(16, loopMs / total));
+      }
+    };
+    image.src = spriteUrl;
+  }
+  window.addEventListener("load", () => {
+    const st = window.state;
+    const headers = st && st.token ? { "Authorization": "Bearer " + st.token } : {};
+    fetch(fullUrl("/api/pet/config"), { headers })
+      .then((res) => res.ok ? res.json() : null)
+      .then(activateSprite)
+      .catch(() => {});
+  }, { once: true });
 
   /* --- 拖拽（pointer events，支持鼠标/触摸） --- */
   let dragging = false, moved = false;
