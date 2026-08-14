@@ -2144,7 +2144,7 @@ const PET_SPRITE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 /// `GET /api/pet/sprite` — serve only the live config's sprite-sheet path.
 /// Missing/unreadable files, disallowed extensions, and oversized files are
-/// deliberately indistinguishable as 404 so the static UI falls back to SVG.
+/// deliberately indistinguishable as 404; the sprite-only UI remains hidden.
 async fn serve_pet_sprite(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {

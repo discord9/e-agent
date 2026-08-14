@@ -1457,6 +1457,97 @@ model = "codex"
 }
 
 #[test]
+fn global_config_rejects_unknown_top_level_fields_and_sections() {
+    let temp = tempfile::tempdir().unwrap();
+    for source in [
+        "unexpected = true\n",
+        "[pets]\nspritesheet = '/tmp/pet.webp'\n",
+    ] {
+        let error = Config::from_path(&write_config(temp.path(), source)).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("unknown field"), "{error}");
+    }
+}
+
+#[test]
+fn global_config_accepts_every_known_top_level_section() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = Config::from_path(&write_config(
+        temp.path(),
+        r#"
+default = "demo/main"
+
+[providers.demo]
+base_url = "https://example.test/v1"
+api_key_env = "DEMO_API_KEY"
+
+[models."demo/main"]
+model = "demo-model"
+
+[mcp.demo]
+command = ["demo-mcp"]
+enabled = false
+
+[roles]
+main = "demo/main"
+subagent = "demo/main"
+
+[web_search]
+api_key_env = "EXA_API_KEY"
+
+[sandbox]
+enabled = false
+network = true
+workspace_writable = true
+writable_paths = []
+readable_paths = []
+
+[session]
+backend = "jsonl"
+
+[background]
+timeout_secs = 1800
+
+[bash]
+timeout_secs = 30
+
+[delegate]
+finalize_wait_secs = 600
+
+[tui]
+submit = "enter"
+newline = "alt+enter"
+
+[pet]
+spritesheet = "/tmp/pet.webp"
+sprite_cols = 8
+sprite_rows = 9
+frame_width = 192
+frame_height = 254
+loop_ms = 8400
+"#,
+    ))
+    .unwrap();
+
+    assert_eq!(config.default.as_deref(), Some("demo/main"));
+    assert!(config.providers.contains_key("demo"));
+    assert!(config.models.contains_key("demo/main"));
+    assert!(config.mcp.contains_key("demo"));
+    assert_eq!(
+        config.roles.get("main").map(String::as_str),
+        Some("demo/main")
+    );
+    assert!(config.web_search.is_some());
+    assert!(config.sandbox.is_some());
+    assert!(config.session.is_some());
+    assert!(config.background.is_some());
+    assert!(config.bash.is_some());
+    assert!(config.delegate.is_some());
+    assert!(config.tui.is_some());
+    assert!(config.pet.is_some());
+}
+
+#[test]
 fn pet_config_absent_present_and_unknown_key() {
     let temp = tempfile::tempdir().unwrap();
     let absent = Config::from_path(&write_config(temp.path(), "")).unwrap();
