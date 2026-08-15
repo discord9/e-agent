@@ -5220,3 +5220,99 @@ fn fork_tombstone_inheritance_follows_boundary() {
         "a clear after the boundary must not leak into the fork prefix"
     );
 }
+
+#[test]
+fn auto_compacted_resets_after_successful_compaction_and_retriggers_on_next_big_round() {
+    // Regression for the permanent auto-compact lockout: a SUCCESSFUL
+    // compaction keeps the pre-compaction baseline (refresh_context=false),
+    // so `record_usage`'s 80% reset condition never fires while that stale
+    // baseline stays ≥80% — without `clear_auto_compacted` the latch would
+    // stay set forever and the run loop's auto-compact branch would be
+    // permanently suppressed. Mirrors the runner's `compact_operation`
+    // success path (apply_usage refresh=false + clear_auto_compacted) and
+    // the next regular round's end-of-round evaluation.
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.set_context_window(1000);
+    // Regular round at exactly 80% of the window: fires auto-compact.
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 800,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert!(agent.take_auto_compact_request());
+    // Successful compaction: usage kept with refresh_context=false (the
+    // stale baseline drives the UI "（压缩前）" annotation), then the latch
+    // is cleared by the runner.
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 800,
+            ..Default::default()
+        }),
+        false,
+    );
+    agent.clear_auto_compacted();
+    // Next regular round: still ≥80% (the current turn has not turned the
+    // page yet) — a second auto-compact must be eligible again.
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 850,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert!(
+        agent.take_auto_compact_request(),
+        "a successful compaction must not permanently suppress auto-compact"
+    );
+}
+
+#[test]
+fn auto_compacted_resets_after_successful_compaction_and_stays_silent_below_threshold() {
+    // The debounce side: after the successful-compaction reset, a next
+    // regular round whose fresh usage reflects the compacted real size
+    // (<80% of the window) must NOT trigger auto-compact.
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.set_context_window(1000);
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 800,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert!(agent.take_auto_compact_request());
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 800,
+            ..Default::default()
+        }),
+        false,
+    );
+    agent.clear_auto_compacted();
+    // The round turned the page: the fresh baseline reflects the
+    // post-compaction size.
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 100,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert!(!agent.take_auto_compact_request());
+}

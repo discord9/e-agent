@@ -1471,19 +1471,23 @@ function applyStatus(status) {
    （state.sessionUsage 不参与显示）。百分比与完整上下文分别渲染，窄屏可优先
    保留短标签而不依赖整行省略号。formatUsageLine 是纯函数（测试可直接断言）；
    applyUsage 在 SSE Usage 事件（含初始 snapshot 恢复）时调用，refreshUsageLine
-   在 /usage 响应到达时重刷同一行。 */
+   在 /usage 响应到达时重刷同一行。压缩成功后 runner 发出的 Usage 仍携带压缩前
+   基线（refresh_context=false），此时 state.usagePreCompaction 为 true →
+   追加“（压缩前）”标注，避免旧的高百分比误导；下一次普通轮的 fresh Usage
+   到达时标注被清除。 */
 function formatUsageLine(live) {
   const l = live || {};
   if (l.context_input == null) return { detail: "", pct: "", high: false };
+  const suffix = state.usagePreCompaction ? "（压缩前）" : "";
   if (l.context_window) {
     const pct = Math.round(l.context_input / l.context_window * 100);
     return {
-      detail: "上下文 " + l.context_input + "/" + l.context_window + " tok",
+      detail: "上下文 " + l.context_input + "/" + l.context_window + " tok" + suffix,
       pct: pct + "%",
       high: pct >= 80,
     };
   }
-  return { detail: "上下文 " + l.context_input + " tok", pct: "", high: false };
+  return { detail: "上下文 " + l.context_input + " tok" + suffix, pct: "", high: false };
 }
 
 function renderUsageLine(live) {

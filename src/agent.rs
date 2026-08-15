@@ -2365,6 +2365,24 @@ impl Agent {
         self.auto_compacted = false;
     }
 
+    /// Successful-compaction latch reset (runner's `compact_operation`
+    /// success path). Unlike `reset_auto_compact_request` (the failure /
+    /// cancel path, whose semantics must stay untouched), this only clears
+    /// the latch: `last_context_input` keeps its pre-compaction baseline
+    /// (refresh_context=false), so the next regular round re-evaluates it
+    /// against the window in the run loop.
+    ///
+    /// Debounce: this is safe because the run loop re-checks
+    /// `last_context_input` only at the END of a regular round. If that
+    /// round turned the page on the still-large current turn, the fresh
+    /// `last_context_input` reflects the post-compaction real size — below
+    /// 80% it stays silent. If the current turn is still huge (didn't turn
+    /// the page), the end of the NEXT round evaluates it once more — never
+    /// twice within the same round.
+    pub(crate) fn clear_auto_compacted(&mut self) {
+        self.auto_compacted = false;
+    }
+
     fn drain_background(&mut self) {
         self.drain_background_ready();
     }

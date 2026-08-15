@@ -1819,6 +1819,168 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
 }
 
 #[tokio::test]
+async fn successful_auto_compact_resets_latch_and_fires_again_on_next_big_round() {
+    // Regression for the permanent auto-compact lockout: a SUCCESSFUL
+    // compaction keeps the pre-compaction usage baseline
+    // (refresh_context=false), so `record_usage`'s 80% reset condition can
+    // never fire while the stale baseline stays ≥80%. The runner must clear
+    // the `auto_compacted` latch on success (`clear_auto_compacted`); the
+    // end of the NEXT regular round then re-evaluates the fresh baseline.
+    // Model call plan (window 1000):
+    //   [0] round 1 usage 800 (80%)          -> fires auto-compact #1
+    //   [1] compaction #1 summary usage 900  (refresh=false, baseline stays 800)
+    //   [2] round 2 usage 850 (still ≥80%)   -> must fire auto-compact #2 again
+    //   [3] compaction #2 summary usage 900
+    //   [4] round 3 usage 100 (<80%)         -> silent, final answer
+    // Without the latch reset, round 2's check is suppressed: only 4 model
+    // calls and a single compaction entry would be observed.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call-1".into(),
+                            name: "keep_alive".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 800,
+                        output_tokens: 10,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("First compaction summary: the earlier exchange is condensed into this summary.".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 900,
+                        output_tokens: 20,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call-2".into(),
+                            name: "keep_alive".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 850,
+                        output_tokens: 10,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("Second compaction summary: the current turn is still large, so the conversation is compacted once more.".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 900,
+                        output_tokens: 20,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 100,
+                        output_tokens: 5,
+                        ..Default::default()
+                    }),
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.set_context_window(1000);
+    // Prior conversation so there is something before the current turn to
+    // compact (prepare_compaction requires an assistant/tool message before
+    // the retained user turn).
+    agent.restore_history(vec![
+        Message::User {
+            content: "old question".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("old answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "auto-compact-relatch".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("current question".into()));
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
+    );
+    task.join().await.unwrap();
+
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            5,
+            "expected round, compaction, round, compaction, round: {calls:?}"
+        );
+    }
+
+    // Two persisted Compaction entries, and the FINAL round's derived
+    // context opens with the second compaction's summary — proving the
+    // second auto-compact ran on top of the first (its retained tail starts
+    // at the current prompt, so the first summary lives in the compacted
+    // earlier part, not in the second entry's retained slice).
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "auto-compact-relatch")
+        .await
+        .unwrap();
+    let compactions: Vec<&SessionEntry> = loaded
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+        .collect();
+    assert_eq!(compactions.len(), 2, "auto-compact must fire twice");
+    {
+        let calls = calls.lock().unwrap();
+        assert!(matches!(
+            &calls[4][0],
+            Message::User { content, .. }
+                if content.contains("Second compaction summary")
+        ));
+    }
+}
+
+#[tokio::test]
 async fn in_flight_compaction_cancel_has_no_entry_or_projection() {
     let temp = tempfile::tempdir().unwrap();
     let (mut agent, entered, _) = controlled(vec![Ok("unused summary".into())], true);

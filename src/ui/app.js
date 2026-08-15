@@ -56,6 +56,13 @@ const state = {
                              // 打开会话时拉 /usage 填充，切换/关闭时置 null；null → 用量行回退 live 进程计数
   lastUsage: null,           // 最近一次 live Usage 事件（applyUsage 记录）：context_input/context_window 来源；
                              // /usage 响应到达时 refreshUsageLine 按它重刷；切换/关闭会话时置 null
+  usagePreCompaction: false, // 用量行标注“（压缩前）”：压缩成功（Notice "compacted: …"）后置 true，
+                             // 下一次普通模型轮的 fresh Usage 到达时清 false。压缩自身发出的旧基线
+                             // Usage 不清除它（见 sse.js 的 compactionUsagePending 挂起逻辑）。
+  compactionUsagePending: false, // 压缩成功 Notice 之后、压缩自身旧基线 Usage 到达之前：挂起“下一次
+                             // Usage 清除标注”的动作——紧跟在 Notice 后的那条 Usage 展示的正是压缩前
+                             // 的旧值，不是普通轮的新值（runner 的 compact_operation 先 emit 投影
+                             // Notice，再 apply_usage 旧基线）。
   loadingOlder: false,       // 是否正在加载更早历史（防重入）
   olderDone: false,          // 更早历史已全部加载（next_before_seq 为 null）
   lastList: [],              // 最近一次轮询拿到的激活 workspace 会话缓存

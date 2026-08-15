@@ -1189,6 +1189,15 @@ impl SessionRunner {
                 // Publish the complete projection only after durable commit. Streaming
                 // deltas were sent live-only while the operation was in flight.
                 self.shared.lock().unwrap().emit(projection);
+                // 成功压缩后复位 auto-compact 锁存（失败/取消路径走
+                // reset_auto_compact_request，此处不动）。refresh_context=false
+                // 使 last_context_input 保持压缩前基线（UI 借此标注“压缩前”），
+                // 若不复位，下一次普通轮结束时 run loop 用旧基线 ≥80% 判断会
+                // 永久抑制自动压缩。复位是安全的防抖：run loop 只在普通轮结束
+                // 时重新检查 last_context_input —— 该轮翻篇后新基线 <80% 不再
+                // 触发；当前轮仍巨大则下一轮结束后再评估一次，同一轮内不会反复
+                // 压缩。
+                self.agent.clear_auto_compacted();
                 // 压缩用量落盘（kind="compact"）。与 agent.rs 的 `Agent::compact`
                 // （直接调用路径，无 store 访问权）不是同一事件：runner 走的是
                 // `prepare_compaction`，生产环境压缩只经此处落盘，不会重复写入。

@@ -809,6 +809,65 @@ async function main(){
         state.lastUsage && state.lastUsage.context_input === 4321
         && state.lastUsage.context_window === 8192,
         "=" + JSON.stringify(state.lastUsage));
+
+    // ---- 压缩后用量标注“（压缩前）”：压缩成功 Notice（"compacted: …"）后
+    //      runner 发出的 Usage 仍是压缩前旧基线（refresh_context=false），UI
+    //      必须标注，不能把它当普通轮的新值；下一次普通轮 fresh Usage 才清除 ----
+    state.usagePreCompaction = false;
+    state.compactionUsagePending = false;
+    applyLiveEvent("Notice", { text: "compacted: 早期内容已压缩" });
+    chk("compaction notice sets pre-compaction flag",
+        state.usagePreCompaction === true && state.compactionUsagePending === true,
+        "flag=" + state.usagePreCompaction + " pending=" + state.compactionUsagePending);
+    // 压缩自身的旧基线 Usage：消费挂起标记但保留标注（“收到任何 Usage 就清除”
+    // 会把这条旧值误当新轮，标注瞬间消失）。
+    applyLiveEvent("Usage", { type: "usage", session_id: "s1", seq: 13,
+        context_input: 2000, context_window: 4000,
+        session: { input_tokens: 1, output_tokens: 1 } });
+    chk("compaction stale usage keeps flag",
+        state.usagePreCompaction === true && state.compactionUsagePending === false,
+        "flag=" + state.usagePreCompaction + " pending=" + state.compactionUsagePending);
+    chk("usage line annotated pre-compaction",
+        elsById["usageInfo"].textContent.includes("（压缩前）"),
+        "=" + elsById["usageInfo"].textContent);
+    // 下一次普通轮的 fresh Usage：清除标注
+    applyLiveEvent("Usage", { type: "usage", session_id: "s1", seq: 14,
+        context_input: 300, context_window: 4000,
+        session: { input_tokens: 1, output_tokens: 1 } });
+    chk("regular usage clears flag", state.usagePreCompaction === false,
+        "flag=" + state.usagePreCompaction);
+    chk("usage line annotation gone",
+        !elsById["usageInfo"].textContent.includes("（压缩前）"),
+        "=" + elsById["usageInfo"].textContent);
+    // formatUsageLine 纯函数覆盖带 flag 的输出
+    state.usagePreCompaction = true;
+    chk("formatUsageLine annotates with flag",
+        formatUsageLine({ context_input: 800, context_window: 1000 }).detail.includes("（压缩前）"),
+        "=" + formatUsageLine({ context_input: 800, context_window: 1000 }).detail);
+    chk("formatUsageLine pct unaffected by flag",
+        formatUsageLine({ context_input: 800, context_window: 1000 }).pct === "80%");
+    state.usagePreCompaction = false;
+    chk("formatUsageLine clean without flag",
+        !formatUsageLine({ context_input: 800, context_window: 1000 }).detail.includes("（压缩前）"));
+    // restoreUsageFromSnapshot 按事件顺序推导标注：压缩 Notice + 旧基线 Usage
+    //（无后续普通轮）→ 恢复标注；其后有普通轮 Usage → 清除
+    restoreUsageFromSnapshot([
+      { type: "usage", data: { context_input: 5000, context_window: 8000, session: {} } },
+      { type: "notice", data: { text: "compacted: 摘要" } },
+      { type: "usage", data: { context_input: 5000, context_window: 8000, session: {} } },
+    ]);
+    chk("snapshot restore derives pre-compaction flag",
+        state.usagePreCompaction === true,
+        "flag=" + state.usagePreCompaction);
+    restoreUsageFromSnapshot([
+      { type: "usage", data: { context_input: 5000, context_window: 8000, session: {} } },
+      { type: "notice", data: { text: "compacted: 摘要" } },
+      { type: "usage", data: { context_input: 5000, context_window: 8000, session: {} } },
+      { type: "usage", data: { context_input: 1200, context_window: 8000, session: {} } },
+    ]);
+    chk("snapshot restore clears flag on later regular usage",
+        state.usagePreCompaction === false,
+        "flag=" + state.usagePreCompaction);
     openSession("s1");
     await flush(); await flush();
 

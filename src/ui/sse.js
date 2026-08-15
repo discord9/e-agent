@@ -88,6 +88,10 @@ function connectSSE(id, wsId, epoch) {
   if (!stillCurrent(id, wsId, epoch)) return;
   stopSSE();
   state.sse.stopped = false;
+  // 每次会话连接重置“（压缩前）”用量标注：标注是 per-session 状态，旧的
+  // 压缩标注绝不能串到新会话（新会话的 snapshot/live 事件会重新推导）。
+  state.usagePreCompaction = false;
+  state.compactionUsagePending = false;
   state.sse.ctrl = new AbortController();
   const ctrl = state.sse.ctrl;
 
@@ -205,15 +209,36 @@ async function readSSEStream(reader, id, wsId, epoch, ctrl) {
 
 /* 从初始 snapshot 事件数组恢复 current usage：取最后一个 Usage 事件（最近
    一次正常模型请求；compaction 不刷新它）交给 applyUsage——与 live 路径共用
-   state.lastUsage + renderUsageLine，不引入第二套状态。 */
+   state.lastUsage + renderUsageLine，不引入第二套状态。同时按事件顺序推导
+   “（压缩前）”标注：压缩成功 Notice（"compacted: …"）之后的 Usage 是压缩
+   自身发出的旧基线（runner 的 compact_operation 先 emit 投影再 apply_usage），
+   标注保留；其后的普通轮 Usage 才清除标注。 */
 function restoreUsageFromSnapshot(events) {
   if (!Array.isArray(events)) return;
-  for (let i = events.length - 1; i >= 0; i--) {
-    const ev = events[i];
-    if (ev && ev.type === "usage" && ev.data !== undefined) {
-      applyUsage(ev.data);
-      return;
+  let pending = false;        // 压缩成功 Notice 之后、压缩自身旧基线 Usage 未消费
+  let preCompaction = false;  // 最近一次 Usage 是否为压缩前基线（默认：普通轮的）
+  let lastUsage;
+  for (const ev of events) {
+    if (!ev) continue;
+    if (ev.type === "notice") {
+      const text = ev.data && (ev.data.text || ev.data.message);
+      if (typeof text === "string" && text.startsWith("compacted: ")) {
+        preCompaction = true;   // 若其后无 Usage，显示的旧值同样属于压缩前
+        pending = true;
+      }
+    } else if (ev.type === "usage" && ev.data !== undefined) {
+      if (pending) {
+        pending = false;        // 压缩自身的旧基线 Usage：标注保留
+      } else {
+        preCompaction = false;  // 普通轮 fresh Usage：清除标注
+      }
+      lastUsage = ev.data;
     }
+  }
+  if (lastUsage !== undefined) {
+    state.usagePreCompaction = preCompaction;
+    state.compactionUsagePending = false;
+    applyUsage(lastUsage);
   }
 }
 
@@ -358,9 +383,19 @@ function applyLiveEvent(name, payload) {
       appendToolResult(isErr, content, acc, p.call_id);
       break;
     }
-    case "Notice":
-      appendNotice(pickText(payload, ["text", "message"]));
+    case "Notice": {
+      const text = pickText(payload, ["text", "message"]);
+      appendNotice(text);
+      // 压缩成功投影（"compacted: …"）之后紧跟着一条携带压缩前基线的 Usage
+      // （runner 的 compact_operation 先 emit 投影 Notice，再 apply_usage 旧值）。
+      // 置“（压缩前）”标注并挂起下一次 Usage 的清除动作——那条正是压缩自己
+      // 发出的旧基线，不是普通轮的新值。
+      if (typeof text === "string" && text.startsWith("compacted: ")) {
+        state.usagePreCompaction = true;
+        state.compactionUsagePending = true;
+      }
       break;
+    }
     case "Error":
       appendError(pickText(payload, ["error", "message", "text"]));
       break;
@@ -374,6 +409,14 @@ function applyLiveEvent(name, payload) {
       break;
     }
     case "Usage":
+      if (state.compactionUsagePending) {
+        // 压缩成功路径发出的旧基线 Usage：消费挂起标记，但不清除“（压缩前）”
+        // 标注——这一条展示的正是压缩前的旧值。
+        state.compactionUsagePending = false;
+      } else {
+        // 普通模型轮的 fresh Usage：清除压缩前标注。
+        state.usagePreCompaction = false;
+      }
       applyUsage(payload);
       break;
     case "PromptQueued":
