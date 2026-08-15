@@ -64,6 +64,29 @@ fn registration_and_preflight_gate_run_rust() {
     assert!(validate_source(&"x".repeat(SOURCE_MAX_BYTES)).is_ok() && validate_source(&"x".repeat(SOURCE_MAX_BYTES + 1)).unwrap_err().contains("too large") && validate_source(&"x".repeat(SOURCE_MAX_BYTES + 1)).unwrap_err().contains(&(SOURCE_MAX_BYTES + 1).to_string()));
     if env_ok() { crate::session_factory::preflight_code_mode_impl(|| true, path.as_deref(), false).unwrap(); let spec = crate::tools::run_rust_tool(&ws, None).spec(); assert_eq!(spec.parameters["required"], json!(["source"])); assert!(spec.description.contains("bubblewrap")); }
 }
+// Regression: the run_rust spec must hand the spec() helper ONLY the
+// properties map. Previously a nested {"type","required"} object was passed
+// as `properties`, so the emitted parameters became
+// "properties": {"type": "object", "required": ["source"], "source": {...}},
+// which DeepSeek ("\"object\" is not of types \"boolean\", \"object\"") and
+// Kimi ("property schema for 'required' must be an object") reject with
+// HTTP 400.
+#[rustfmt::skip]
+#[test]
+fn run_rust_spec_parameters_are_well_formed() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(temp.path()).unwrap();
+    let parameters = crate::tools::run_rust_tool(&ws, None).spec().parameters;
+    let props = parameters["properties"].as_object().expect("properties must be an object");
+    assert_eq!(parameters["type"], json!("object"));
+    assert_eq!(parameters["required"], json!(["source"]));
+    assert_eq!(props.len(), 1, "properties must contain exactly one key, got {props:?}");
+    let keys: Vec<&String> = props.keys().collect();
+    assert_eq!(keys, vec!["source"], "only 'source' may be a property");
+    assert!(!props.contains_key("type") && !props.contains_key("required"), "spec() must wrap type/required itself, not nest them inside properties");
+    assert_eq!(props["source"], json!({"type": "string", "description": "complete Rust source code (edition 2021, std only), at most 128 KiB"}));
+    assert_eq!(parameters, json!({"type": "object", "properties": {"source": {"type": "string", "description": "complete Rust source code (edition 2021, std only), at most 128 KiB"}}, "required": ["source"]}));
+}
 #[rustfmt::skip]
 #[tokio::test]
 async fn statuses_stdin_compile_and_hash_reporting() {
