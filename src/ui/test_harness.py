@@ -302,6 +302,9 @@ const historyData={entries:[
   {type:"compaction", summary:"早期内容已压缩", retained:[]},
   {type:"notice", text:"后台任务 #1 完成"},
   {type:"background_completion", id:7, output:"build ok", label:"cargo"},
+  {type:"error", text:"历史回合失败"},
+  // forked_from 必须是最后一个条目：restored-test3 的「缓存在途 tool 卡不
+  // 重挂到底部」断言依赖尾部最新条目是 forked 行
   {type:"forked_from", source:"sess-old", at:3},
 ], next_before_seq:100};
 /* 滚动分页：更早的一页（before_seq=100 之后没有更老的段） */
@@ -695,6 +698,15 @@ async function main(){
     chk("history notice", t.includes("后台任务 #1 完成"));
     chk("history bg completion", t.includes("build ok"));
     chk("history fork", t.includes("sess-old"));
+    // history error entry：显式 case "error" 渲染为 .msg-error（红色），
+    // 不得落入 default 的「未知条目」JSON 包装
+    chk("history error text", t.includes("错误: 历史回合失败"),
+        "has=" + t.includes("错误: 历史回合失败"));
+    chk("history error rendered as msg-error",
+        elsById["messages"].querySelectorAll(".msg-error").some((e) => e.textContent.includes("历史回合失败")),
+        "errN=" + elsById["messages"].querySelectorAll(".msg-error").length);
+    chk("history error not unknown-entry wrapped", !t.includes("未知条目"),
+        "hasUnknown=" + t.includes("未知条目"));
     chk("snapshot skipped", !t.includes("SNAPSHOT-SHOULD-BE-SKIPPED"));
     chk("status Busy", elsById["chatStatus"].textContent==="处理中", "="+elsById["chatStatus"].textContent);
     chk("cancel enabled when busy", elsById["cancelBtn"].disabled===false);
@@ -7056,7 +7068,10 @@ async function main(){
     stopSSE();
 
     // =====================================================================
-    // 已完成分组：默认折叠、真 button/ARIA、点击切换、重绘/重开保持、20 条上限
+    // 已完成分组：默认折叠、真 button/ARIA、点击切换、重绘/重开保持、20 条
+    // 上限、标题不显示数量；组件只在有运行中任务时显示（running=0 → 整个
+    // 面板隐藏，无论是否有 finished 数据；finished 缓存与折叠状态保留，
+    // 新任务出现后按原状态恢复）
     // =====================================================================
     const fcSave = { ws: state.workspaces, workspace: state.workspace, token: state.token,
       list: state.tasks.list, byWs: state.tasks.byWorkspace, finished: state.tasks.finished,
@@ -7064,18 +7079,23 @@ async function main(){
     state.workspaces = [{ id: "wsA", name: "服务器A", url: "", token: "tok-a" }];
     state.workspace = state.workspaces[0]; state.token = "tok-a";
     state.tasks.byWorkspace = {}; state.tasks.list = [];
-    tasksData = []; finishedData = [{ session_id: "s1", seq: 900, id: 1, kind: "bash",
+    // 有运行中任务时组件才显示，finished 小节作为面板内的次级分组
+    tasksData = [{ session_id: "s1", id: 7, kind: "bash", label: "cargo build",
+      full_command: "cargo build", output: "building", role: null }];
+    finishedData = [{ session_id: "s1", seq: 900, id: 1, kind: "bash",
       label: "done-build", status: "Finished", exit_code: 0, duration_ms: 1234 }];
     state.tasks.composerOpen = true; state.tasks.finishedCollapsed = true; lastTasksSig = ""; lastTasksRenderedSig = "";   // 刷新后的初始值
     await pollTasks(); await flush();
     let fhdr = elsById["composerTasks"].querySelector(".tasks-finished-header");
     let fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
-    chk("finished default collapsed + real button/aria",
+    chk("finished default collapsed + real button/aria, title has no count",
         fhdr !== null && fhdr.tag === "button" && fhdr.type === "button"
         && fhdr.getAttribute("aria-expanded") === "false"
         && fhdr.getAttribute("aria-controls") === fbody.id
-        && fbody.hidden === true && state.tasks.finishedCollapsed === true,
-        "tag=" + (fhdr && fhdr.tag) + " hidden=" + (fbody && fbody.hidden));
+        && fbody.hidden === true && state.tasks.finishedCollapsed === true
+        && fhdr.textContent.trim() === "已完成",
+        "tag=" + (fhdr && fhdr.tag) + " hidden=" + (fbody && fbody.hidden)
+        + " text=" + JSON.stringify(fhdr && fhdr.textContent));
     fhdr._listeners["click"][0]();
     chk("finished click expands", fbody.hidden === false
         && fhdr.getAttribute("aria-expanded") === "true",
@@ -7092,7 +7112,7 @@ async function main(){
     fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
     chk("finished expanded survives poll repaint", fbody.hidden === false
         && fhdr.getAttribute("aria-expanded") === "true"
-        && elsById["composerTasks"].querySelectorAll(".task-row").length === 2,
+        && elsById["composerTasks"].querySelectorAll(".task-row").length === 3,
         "hidden=" + fbody.hidden + " rows=" + elsById["composerTasks"].querySelectorAll(".task-row").length);
     state.tasks.composerOpen = false;
     finishedData.push({ session_id: "s1", seq: 902, id: 3, kind: "bash", label: "done-test",
@@ -7101,7 +7121,7 @@ async function main(){
     state.tasks.composerOpen = true; renderComposerTasks(); await flush();
     fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
     chk("finished expanded survives panel close/reopen", fbody.hidden === false
-        && elsById["composerTasks"].querySelectorAll(".task-row").length === 3,
+        && elsById["composerTasks"].querySelectorAll(".task-row").length === 4,
         "rows=" + elsById["composerTasks"].querySelectorAll(".task-row").length);
     // 折叠 → 重开仍折叠；22 条 → 只渲染 20 行 + 「还有 2 条」
     elsById["composerTasks"].querySelector(".tasks-finished-header")._listeners["click"][0]();
@@ -7114,11 +7134,41 @@ async function main(){
     fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
     const moreEl = elsById["composerTasks"].querySelector(".tasks-finished-more");
     chk("finished cap at 20 rows + collapsed reopen",
-        elsById["composerTasks"].querySelectorAll(".task-row").length === 20
+        elsById["composerTasks"].querySelectorAll(".task-row").length === 21
         && moreEl !== null && moreEl.textContent.includes("还有 2 条")
         && fbody.hidden === true && state.tasks.finishedCollapsed === true,
         "rows=" + elsById["composerTasks"].querySelectorAll(".task-row").length
         + " more=" + (moreEl ? moreEl.textContent : "none"));
+    // 运行任务清零（仍有 finished 数据）→ 整个组件隐藏：不显示已完成组/
+    // header/空面板/toggle bar；finished 缓存与折叠状态保留
+    tasksData = [];
+    await pollTasks(); await flush();
+    chk("no running tasks hides whole widget even with finished",
+        elsById["tasksToggleBar"].hidden === true
+        && elsById["composerTasks"].hidden === true
+        && state.tasks.composerOpen === false
+        && elsById["composerTasks"].querySelector(".tasks-finished") === null,
+        "bar.hidden=" + elsById["tasksToggleBar"].hidden
+        + " panel.hidden=" + elsById["composerTasks"].hidden
+        + " open=" + state.tasks.composerOpen
+        + " finishedDom=" + (elsById["composerTasks"].querySelector(".tasks-finished") !== null));
+    chk("finished cache + collapse state kept while hidden",
+        state.tasks.finished.length === 22 && state.tasks.finishedCollapsed === true,
+        "finished=" + state.tasks.finished.length + " collapsed=" + state.tasks.finishedCollapsed);
+    // 新运行中任务出现 → 组件恢复，finished 小节按保留的折叠状态重建
+    tasksData = [{ session_id: "s1", id: 8, kind: "bash", label: "cargo test",
+      full_command: "cargo test", output: "running", role: null }];
+    state.tasks.composerOpen = true;
+    await pollTasks(); await flush();
+    fhdr = elsById["composerTasks"].querySelector(".tasks-finished-header");
+    fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
+    chk("finished group restored on rerun with kept collapse state",
+        fhdr !== null && fbody !== null && fbody.hidden === true
+        && fhdr.getAttribute("aria-expanded") === "false"
+        && fhdr.textContent.trim() === "已完成"
+        && elsById["composerTasks"].querySelectorAll(".task-row").length === 21,
+        "rows=" + elsById["composerTasks"].querySelectorAll(".task-row").length
+        + " collapsed=" + state.tasks.finishedCollapsed);
     tasksData = []; tasksDataB = []; finishedData = [];
     state.tasks.byWorkspace = fcSave.byWs; state.tasks.list = fcSave.list;
     state.tasks.finished = fcSave.finished; state.tasks.finishedByWorkspace = fcSave.fByWs;

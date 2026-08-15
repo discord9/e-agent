@@ -1214,6 +1214,7 @@ function renderEntry(entry, acc, pendingCards) {
     case "message": return renderMessage(entry.message, acc, pendingCards);
     case "compaction": return appendCompaction(entry.summary);
     case "notice": return appendNotice(entry.text);
+    case "error": return appendError(entry.text);
     case "background_completion":
       return appendBackgroundCompletion(entry.id ?? "?", entry.label, entry.output || "");
     case "forked_from":

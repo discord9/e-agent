@@ -210,13 +210,14 @@ function tasksRenderSig(list) {
    收起期间数据变化时，重开必须按「数据 ≠ 已渲染 DOM」重建，不能跳过）。 */
 let lastTasksRenderedSig = "";
 
-/* composer 上方折叠条 + 面板：计数即徽标；有任务时高亮，无任务整条隐藏。
-   面板只显示激活 workspace 的任务：state.tasks.list 是多 workspace 聚合的
-   全量列表（每任务带 _ws 标记），这里按 state.workspace.id 过滤——其他
-   workspace 的任务只供侧边栏环绕点消费，不混入本 workspace 的面板/徽标。
-   面板内容仅在展开时渲染（收起时只更新计数/箭头/高亮，不触碰 DOM）。
-   签名去重：数据未变且面板已渲染 → 跳过 renderTaskList，保留已展开的卡片
-   DOM 与进行中的 output 轮询/SSE 流（2s 轮询不再每轮销毁重建）。 */
+/* composer 上方折叠条 + 面板：计数即徽标；有运行中任务时高亮，无运行中
+   任务时整条隐藏（无论是否有已完成记录——已完成只作面板内次级只读小节，
+   不单独撑起组件）。面板只显示激活 workspace 的任务：state.tasks.list 是
+   多 workspace 聚合的全量列表（每任务带 _ws 标记），这里按 state.workspace.id
+   过滤——其他 workspace 的任务只供侧边栏环绕点消费，不混入本 workspace 的
+   面板/徽标。面板内容仅在展开时渲染（收起时只更新计数/箭头/高亮，不触碰
+   DOM）。签名去重：数据未变且面板已渲染 → 跳过 renderTaskList，保留已展开
+   的卡片 DOM 与进行中的 output 轮询/SSE 流（2s 轮询不再每轮销毁重建）。 */
 function renderComposerTasks() {
   const bar = els.tasksToggleBar;
   if (!bar) return;
@@ -227,14 +228,16 @@ function renderComposerTasks() {
   const finished = (state.tasks.finished || []).filter((t) => !t._ws || t._ws === wsId);
   const n = list.length;
   const sig = tasksRenderSig(list) + "|f" + finishedListSig(finished);
-  // 有运行中任务或已完成记录时都显示折叠条（徽标只计运行中；已完成是次级
-  // 只读小节，来自持久化 session_entries，JSONL workspace 恒为空）。
-  bar.hidden = n === 0 && finished.length === 0;
+  // 无运行中任务 → 整个组件（折叠条+面板）隐藏，不管有没有已完成记录：
+  // finished 缓存放 state.tasks.finished，面板隐藏不清它；等下一个运行中
+  // 任务出现时随面板一起恢复（finishedCollapsed 折叠状态同样在 state 里，
+  // 隐藏/显示不重置）。
+  bar.hidden = n === 0;
   bar.classList.toggle("active", n > 0);
-  // 任务清空时整个组件（折叠条+面板）完全消失：强制收起面板，避免
-  // 出现「暂无运行中任务」的空态壳；同时清理所有卡片轮询/流，并清空
-  // 面板内容（面板隐藏后不再走 renderTaskList 的重绘清理路径）
-  if (n === 0 && finished.length === 0) {
+  // 运行任务清零即整体隐藏：强制收起面板，避免出现「暂无运行中任务」的
+  // 空态壳或单独的已完成列表；同时清理所有卡片轮询/流，并清空面板内容
+  // （面板隐藏后不再走 renderTaskList 的重绘清理路径）。
+  if (n === 0) {
     state.tasks.composerOpen = false;
     for (const k of [...state.tasks.pollers.keys()]) stopTaskPoller(k);
     for (const k of [...state.tasks.streams.keys()]) stopTaskStream(k);
@@ -244,9 +247,11 @@ function renderComposerTasks() {
   bar.classList.toggle("open", state.tasks.composerOpen);
   const label = bar.querySelector(".tasks-toggle-label");
   if (label) {
-    label.textContent = n > 0
-      ? "运行中任务 (" + n + ")" + (finished.length ? " · 已完成 " + finished.length : "")
-      : "已完成任务 (" + finished.length + ")";
+    // 折叠条只在有运行中任务时可见（n===0 时 bar 已隐藏）：标题只计运行中
+    // 数量；已完成数量作为次级摘要附在面板内 finished 小节（其标题不显示
+    // 数量，见 renderFinishedSection）。
+    label.textContent = "运行中任务 (" + n + ")"
+      + (finished.length ? " · 已完成 " + finished.length : "");
   }
   if (panel) {
     panel.hidden = !state.tasks.composerOpen;
@@ -270,7 +275,8 @@ function renderComposerTasks() {
 
 /* 已完成小节（只读）：默认折叠，header 为真 <button>（aria-expanded/controls，
    键盘可达），点击切换 state.tasks.finishedCollapsed（页面内保持，刷新重置）；
-   行与「更多」包在 .tasks-finished-body 整体显隐，每次最多 20 条。 */
+   标题只写「已完成」，不显示精确数量（折叠/展开都保持简洁）；行与「更多」
+   包在 .tasks-finished-body 整体显隐，每次最多 20 条。 */
 function renderFinishedSection(panel, finished) {
   const old = panel.querySelector(".tasks-finished");
   if (!finished.length) {
@@ -279,7 +285,7 @@ function renderFinishedSection(panel, finished) {
   }
   const box = old || el("div", "tasks-finished");
   box.innerHTML = "";
-  const header = el("button", "tasks-finished-header", "已完成 (" + finished.length + ")");
+  const header = el("button", "tasks-finished-header", "已完成");
   header.type = "button";                    // 非表单提交
   const body = el("div", "tasks-finished-body");
   body.id = "composerTasks-finished-body";   // aria-controls 目标
