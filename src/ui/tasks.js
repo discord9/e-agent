@@ -248,10 +248,9 @@ function renderComposerTasks() {
   const label = bar.querySelector(".tasks-toggle-label");
   if (label) {
     // 折叠条只在有运行中任务时可见（n===0 时 bar 已隐藏）：标题只计运行中
-    // 数量；已完成数量作为次级摘要附在面板内 finished 小节（其标题不显示
-    // 数量，见 renderFinishedSection）。
-    label.textContent = "运行中任务 (" + n + ")"
-      + (finished.length ? " · 已完成 " + finished.length : "");
+    // 数量，不提已完成（已完成记录只在展开面板后的次级 finished 小节里，
+    // 标题也不显示数量，见 renderFinishedSection）。
+    label.textContent = "运行中任务 (" + n + ")";
   }
   if (panel) {
     panel.hidden = !state.tasks.composerOpen;
