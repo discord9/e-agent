@@ -331,3 +331,29 @@ async fn policy_surface_workspace_network_and_credentials() {
     let result = h.run(src).await.unwrap();
     assert!(result.contains("HOME:ABSENT") && !result.contains(":SET"));
 }
+// run_rust always sets protect_git=true; a rerooted worktree whose `.git`
+// lives under the policy parent must keep its .git read-only after the
+// policy projection (the projection would otherwise shadow the ro-bind).
+#[rustfmt::skip]
+#[tokio::test]
+async fn policy_surface_rerooted_worktree_git_stays_read_only() {
+    if !env_ok() { return; }
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().to_path_buf();
+    let feature = parent.join(".e-agent/worktrees/feature");
+    std::fs::create_dir_all(feature.join(".git")).unwrap();
+    std::fs::write(feature.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let mut sandbox = run_rust_policy(None);
+    sandbox.writable_paths = vec![parent.to_str().unwrap().to_owned()];
+    let workspace = Workspace::new(&parent)
+        .unwrap()
+        .with_external_roots(&sandbox)
+        .unwrap()
+        .reroot(&feature)
+        .unwrap();
+    let Some(h) = harness(&workspace, sandbox) else { return; };
+    let src = r#"fn main(){if std::fs::write(".git/evil",b"x").is_ok(){println!("GIT_WRITE_OK")}else{println!("GIT_WRITE_ERR")}}"#;
+    let result = h.run(src).await.unwrap();
+    assert!(result.contains("GIT_WRITE_ERR"), "{result}");
+    assert!(!feature.join(".git/evil").exists());
+}

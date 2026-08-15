@@ -1,7 +1,9 @@
 //! Experimental `run_rust` (main agent only, `[code_mode] enabled`): compile
 //! and run one std-only Rust source (≤ 128 KiB) in a forced Linux bubblewrap
 //! sandbox inheriting the resolved `[sandbox]` policy.
-use super::bash::{RUST_CAPTURE, bwrap_args, capture_with, render_stream};
+use super::bash::{
+    BwrapPlan, RUST_CAPTURE, build_bwrap_plan, capture_with, clear_cloexec_pre_exec, render_stream,
+};
 use super::*;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -77,14 +79,17 @@ impl RunRust {
     async fn run_stages(&self, toolchain: &RustToolchain, source: &str, hash: &str, scratch: &Scratch, latch: &Arc<AtomicBool>) -> Result<String, String> {
         std::fs::write(scratch.path.join("main.rs"), source).map_err(|e| format!("cannot stage main.rs: {e}"))?;
         std::fs::write(scratch.path.join("runner.rs"), RUNNER_SOURCE).map_err(|e| format!("cannot stage runner.rs: {e}"))?;
-        // Base args carry no toolchain mounts; only the compile stage extends them.
-        let base = bwrap_args(&self.workspace, &self.policy, true, false, "/tmp", Some(scratch.path.to_string_lossy().as_ref()));
-        let compile_bwrap = { let mut args = base.clone(); toolchain_mount_args(toolchain, &mut args); args };
+        // One descriptor-pinned plan shared by both stages: the projection
+        // fds must survive from plan construction through the compile spawn
+        // AND the run spawn, so the policy cannot drift between stages.
+        let base = build_bwrap_plan(&self.workspace, &self.policy, true, false, "/tmp", Some(scratch.path.to_string_lossy().as_ref()))?;
+        let mut compile_args = base.args.clone();
+        toolchain_mount_args(toolchain, &mut compile_args);
         let compile_program: Vec<String> = COMPILE_PROGRAM.iter().map(|s| s.to_string()).collect();
-        let compile = run_stage(&compile_bwrap, &compile_program, &StageEnv::compile(toolchain), self.compile_timeout, None, latch).await;
+        let compile = run_stage(&base, &compile_args, &compile_program, &StageEnv::compile(toolchain), self.compile_timeout, None, latch).await;
         let run = if matches!(compile.0, StageStatus::Exit(0)) {
             match status_program() {
-                Ok((pipe, program)) => Some(run_stage(&base, &program, &StageEnv::run(), self.run_timeout, Some(pipe), latch).await),
+                Ok((pipe, program)) => Some(run_stage(&base, &base.args, &program, &StageEnv::run(), self.run_timeout, Some(pipe), latch).await),
                 Err(error) => Some(Stage::failed(error)),
             }
         } else { None };
@@ -221,8 +226,8 @@ impl StageEnv {
     fn run() -> Self { Self("/bin:/usr/bin".into(), None) }
 }
 #[rustfmt::skip]
-fn toolchain_mount_args(toolchain: &RustToolchain, args: &mut Vec<String>) {
-    let mut mounts: Vec<String> = toolchain.0.iter().map(|m| m.to_string_lossy().into_owned()).collect();
+fn toolchain_mount_args(toolchain: &RustToolchain, args: &mut Vec<std::ffi::OsString>) {
+    let mut mounts: Vec<std::ffi::OsString> = toolchain.0.iter().map(|m| m.clone().into_os_string()).collect();
     mounts.sort_by_key(|mount| Path::new(mount).components().count());
     for mount in mounts { args.extend(["--ro-bind".into(), mount.clone(), mount]); }
 }
@@ -235,17 +240,22 @@ pub(super) enum StageStatus { Exit(i32), Signal(i32), TimedOut(Duration), Failed
 impl StageStatus { fn line(&self) -> String { match self { StageStatus::Exit(code) => format!("exit code {code}"), StageStatus::Signal(n) => format!("signal {n}"), StageStatus::TimedOut(after) => format!("timed out after {:.0}s", after.as_secs_f64()), StageStatus::Failed(reason) => format!("failed: {reason}") } } }
 // One checked kill → reap → bounded drain; KillGuard confirms on abort.
 #[rustfmt::skip]
-async fn run_stage(bwrap: &[String], program: &[String], env: &StageEnv, timeout: Duration, status: Option<StatusPipe>, latch: &Arc<AtomicBool>) -> Stage {
+async fn run_stage(plan: &BwrapPlan, bwrap: &[std::ffi::OsString], program: &[String], env: &StageEnv, timeout: Duration, status: Option<StatusPipe>, latch: &Arc<AtomicBool>) -> Stage {
     let mut cmd = Command::new("bwrap");
     cmd.args(bwrap).args(program);
     cmd.env_clear().env("PATH", &env.0).env("LC_ALL", "C.UTF-8").env("LANG", "C.UTF-8");
     if let Some(home) = &env.1 { cmd.env("RUSTUP_HOME", home); }
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut status_pipe = status;
+    let mut numbers = plan.numbers.clone();
     if let Some(pipe) = &status_pipe {
-        let fd = pipe.writer.as_ref().unwrap().as_raw_fd();
-        // SAFETY: in the forked child, before exec, clears CLOEXEC on the inherited writer only.
-        unsafe { cmd.pre_exec(move || { let borrowed = rustix::fd::BorrowedFd::borrow_raw(fd); rustix::io::fcntl_setfd(borrowed, rustix::io::FdFlags::empty()).map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error())) }); }
+        numbers.push(pipe.writer.as_ref().unwrap().as_raw_fd());
+    }
+    if !numbers.is_empty() {
+        // SAFETY: in the forked child, before exec, clears CLOEXEC on
+        // exactly the plan fds (and the status writer) so bwrap can bind
+        // the pinned descriptors; every other fd stays sealed.
+        unsafe { cmd.pre_exec(clear_cloexec_pre_exec(numbers)); }
     }
     let mut child = match cmd.spawn() { Ok(child) => child, Err(error) => return Stage::failed(format!("cannot start run_rust stage: {error}")) };
     // Spawned: cleanup is unsafe until confirmed reap + group absence.

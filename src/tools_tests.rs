@@ -1961,6 +1961,863 @@ async fn sandbox_missing_policy_cannot_be_created_through_writable_e_agent_child
     assert!(!policy_dir.join("config.toml").exists());
 }
 
+/// Sandboxed Bash with a temp workspace and the given policy, for the
+/// policy-anchor projection tests below.
+#[cfg(unix)]
+fn policy_bash(workspace: Workspace, sandbox: crate::config::Sandbox) -> Bash {
+    Bash {
+        workspace,
+        timeout: Some(Duration::from_secs(20)),
+        sender: None,
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
+        sandbox: Some(sandbox),
+        protect_git: false,
+        shell: Shell::detect().unwrap(),
+        owner_session: None,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_keeps_existing_worktrees_writable() {
+    // GreptimeDB reproduction: `.e-agent/` exists with `worktrees/`,
+    // `config.toml` missing, workspace writable. The old implementation
+    // froze the whole `.e-agent` dir read-only, breaking the session
+    // backend's writes; the projection must keep existing top-level
+    // ordinary entries writable per the final mount policy AND persistent
+    // on the host, while the missing config stays ENOENT.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    let worktrees = ea.join("worktrees");
+    std::fs::create_dir_all(&worktrees).unwrap();
+    std::fs::write(worktrees.join("policy-anchor-fd"), "hello\n").unwrap();
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox().unwrap());
+    // Existing top-level sibling: writable per policy and host-persistent.
+    let out = tool
+        .execute(json!({"command": "echo persisted > .e-agent/worktrees/policy-anchor-fd && cat .e-agent/worktrees/policy-anchor-fd"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(out.contains("persisted"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(worktrees.join("policy-anchor-fd")).unwrap(),
+        "persisted\n"
+    );
+    // The missing config file stays ENOENT and cannot be created.
+    let denied = tool
+        .execute(json!({"command": "touch .e-agent/config.toml 2>&1"}))
+        .await;
+    assert!(
+        denied.is_err(),
+        "config.toml must not be creatable inside the sandbox: {denied:?}"
+    );
+    assert!(!ea.join("config.toml").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_missing_config_stays_enoent_without_host_pollution() {
+    // `.e-agent/` exists (empty) but `config.toml` is missing: the
+    // projection is an empty read-only tmpfs, the config stays ENOENT and
+    // cannot be created, and the host gains nothing (no empty file, no
+    // stray entries).
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    std::fs::create_dir_all(&ea).unwrap();
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox().unwrap());
+    let out = tool
+        .execute(json!({"command": "cat .e-agent/config.toml 2>&1 || true"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(
+        out.contains("No such file"),
+        "config.toml must be ENOENT inside the sandbox: {out}"
+    );
+    let denied = tool
+        .execute(json!({"command": "touch .e-agent/config.toml 2>&1"}))
+        .await;
+    assert!(
+        denied.is_err(),
+        "config.toml must not be creatable: {denied:?}"
+    );
+    // No host pollution: the config file was never created and the existing
+    // `.e-agent` directory gained nothing.
+    assert!(!ea.join("config.toml").exists());
+    let entries: Vec<_> = std::fs::read_dir(&ea).unwrap().collect();
+    assert!(
+        entries.is_empty(),
+        "host .e-agent must stay untouched: {entries:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_absent_parent_no_host_pollution() {
+    // No `.e-agent` at all on the host, writable workspace: the projection
+    // is skipped (a tmpfs mountpoint there would be created through the
+    // writable bind — host pollution — or fail EROFS under a read-only
+    // one). The generic mount loop already excludes the subtree, so the
+    // config stays ENOENT and the host gains nothing.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("existing"), "data\n").unwrap();
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox().unwrap());
+    let out = tool
+        .execute(json!({"command": "cat .e-agent/config.toml 2>&1 || true; cat existing"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(
+        out.contains("No such file"),
+        "config.toml must be ENOENT inside the sandbox: {out}"
+    );
+    assert!(out.contains("data"), "{out}");
+    assert!(
+        !temp.path().join(".e-agent").exists(),
+        "host must not gain an empty .e-agent directory"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_missing_top_level_sibling_fails() {
+    // A missing top-level sibling of the policy file (a new `.e-agent`
+    // entry) must fail to be created inside the sandbox.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join(".e-agent/worktrees")).unwrap();
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox().unwrap());
+    let denied = tool
+        .execute(json!({"command": "touch .e-agent/sessions.db 2>&1"}))
+        .await;
+    assert!(
+        denied.is_err(),
+        "a missing top-level .e-agent entry must not be creatable: {denied:?}"
+    );
+    assert!(!temp.path().join(".e-agent/sessions.db").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_symlinks_never_exposed_or_followed() {
+    // `.e-agent/escape -> .` and a config.toml symlink pointing at a host
+    // secret must neither be exposed nor followed: the projection hides
+    // symlinks entirely (they are never projected, never resolved).
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    std::fs::create_dir_all(&ea).unwrap();
+    symlink(".", ea.join("escape")).unwrap();
+    let secret = temp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP-SECRET\n").unwrap();
+    symlink(&secret, ea.join("config.toml")).unwrap();
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox().unwrap());
+    // Neither symlink is projected as an entry.
+    let listing = tool
+        .execute(json!({"command": "ls -a .e-agent"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(
+        !listing.contains("escape") && !listing.contains("config.toml"),
+        "symlinks must be hidden by the projection: {listing}"
+    );
+    // Following the symlink must fail, not expose the secret or traverse.
+    let out = tool
+        .execute(json!({"command": "cat .e-agent/config.toml 2>&1; cat .e-agent/escape/config.toml 2>&1; true"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(
+        !out.contains("TOP-SECRET"),
+        "a symlinked config.toml must not expose its target: {out}"
+    );
+    assert!(
+        out.contains("No such file"),
+        "symlink paths must fail with ENOENT: {out}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_special_files_not_projected() {
+    // FIFO/socket top-level entries must not be projected (hidden), and the
+    // enumeration must not block on a FIFO.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    std::fs::create_dir_all(&ea).unwrap();
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        ea.join("pipe").as_path(),
+        rustix::fs::Mode::from_bits(0o600).unwrap(),
+    )
+    .unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(ea.join("sock")).unwrap();
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox().unwrap());
+    let out = tool
+        .execute(json!({"command": "ls -a .e-agent"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(
+        !out.contains("pipe") && !out.contains("sock"),
+        "special files must be hidden by the projection: {out}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_explicit_ro_and_rw_children() {
+    // Explicit descendants under `.e-agent`: an RO child stays read-only
+    // and an RW child stays writable, per the final mount policy.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    std::fs::create_dir_all(&ea).unwrap();
+    std::fs::write(ea.join("ro-child"), "locked\n").unwrap();
+    std::fs::write(ea.join("rw-child"), "initial\n").unwrap();
+    let mut sandbox = sandbox().unwrap();
+    sandbox.readable_paths = vec![ea.join("ro-child").to_str().unwrap().to_owned()];
+    sandbox.writable_paths = vec![ea.join("rw-child").to_str().unwrap().to_owned()];
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox);
+    // RO child: readable, not writable.
+    let out = tool
+        .execute(json!({"command": "cat .e-agent/ro-child"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(out.contains("locked"), "{out}");
+    let denied = tool
+        .execute(json!({"command": "echo x > .e-agent/ro-child 2>&1"}))
+        .await;
+    assert!(
+        denied.is_err(),
+        "explicit RO child must reject writes: {denied:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ea.join("ro-child")).unwrap(),
+        "locked\n"
+    );
+    // RW child: writable and host-persistent.
+    tool.execute(json!({"command": "echo yes > .e-agent/rw-child"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(ea.join("rw-child")).unwrap(),
+        "yes\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_writable_worktrees_with_read_only_workspace() {
+    // workspace_writable=false stays unchanged: the workspace is read-only,
+    // but an explicit writable child inside `.e-agent` remains writable and
+    // the config file still cannot be created.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    std::fs::create_dir_all(ea.join("worktrees")).unwrap();
+    let mut sandbox = sandbox().unwrap();
+    sandbox.workspace_writable = false;
+    sandbox.writable_paths = vec![ea.join("worktrees").to_str().unwrap().to_owned()];
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox);
+    tool.execute(json!({"command": "echo ok > .e-agent/worktrees/w"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(ea.join("worktrees/w")).unwrap(),
+        "ok\n"
+    );
+    // The workspace itself stays read-only.
+    let denied = tool
+        .execute(json!({"command": "touch top-level-file 2>&1"}))
+        .await;
+    assert!(denied.is_err(), "workspace must stay read-only: {denied:?}");
+    assert!(!temp.path().join("top-level-file").exists());
+    // The config file still cannot be created.
+    let denied = tool
+        .execute(json!({"command": "touch .e-agent/config.toml 2>&1"}))
+        .await;
+    assert!(
+        denied.is_err(),
+        "config.toml must not be creatable: {denied:?}"
+    );
+    assert!(!ea.join("config.toml").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_mount_aliases_cannot_bypass_config() {
+    // A writable mount directly onto the policy parent and a readable mount
+    // onto the policy file must not project their content over the protected
+    // entries, and the writable mount must not allow creating the config.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    std::fs::create_dir_all(ea.join("worktrees")).unwrap();
+    std::fs::write(ea.join("worktrees/w"), "real\n").unwrap();
+    let decoy = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(decoy.path().join("worktrees")).unwrap();
+    std::fs::write(decoy.path().join("config.toml"), "decoy-policy\n").unwrap();
+    std::fs::write(decoy.path().join("worktrees/w"), "decoy\n").unwrap();
+    let mut sandbox = sandbox().unwrap();
+    sandbox.writable_mounts = vec![(
+        decoy.path().to_str().unwrap().to_owned(),
+        ea.to_str().unwrap().to_owned(),
+    )];
+    sandbox.readable_mounts = vec![(
+        decoy.path().to_str().unwrap().to_owned(),
+        ea.join("config.toml").to_str().unwrap().to_owned(),
+    )];
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox);
+    // The real `.e-agent` content is restored, not the mount source's.
+    let out = tool
+        .execute(json!({"command": "cat .e-agent/worktrees/w 2>&1; ls -a .e-agent"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(out.contains("real"), "{out}");
+    assert!(
+        !out.contains("decoy"),
+        "mount aliases must not project over the policy parent: {out}"
+    );
+    // The config file stays ENOENT: the writable mount at `.e-agent` cannot
+    // create it, and the readable mount onto the config is not created.
+    let denied = tool
+        .execute(json!({"command": "touch .e-agent/config.toml 2>&1"}))
+        .await;
+    assert!(
+        denied.is_err(),
+        "a writable mount alias must not bypass the config protection: {denied:?}"
+    );
+    assert!(!ea.join("config.toml").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_toctou_pin_binds_old_inode() {
+    // Descriptor-pin the projection, THEN swap the pathnames underneath:
+    // the sandbox must bind the old inodes, never the swapped-in ones.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    use std::io::Read as _;
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    std::fs::create_dir_all(ea.join("worktrees")).unwrap();
+    std::fs::write(ea.join("worktrees/m"), "OLD\n").unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let sandbox = sandbox().unwrap();
+    let root_str = workspace.root().to_string_lossy().into_owned();
+    let plan =
+        super::bash::build_bwrap_plan(&workspace, &sandbox, false, true, &root_str, None).unwrap();
+    // Hostile swap after the pin.
+    std::fs::rename(&ea, temp.path().join(".e-agent.old")).unwrap();
+    std::fs::create_dir_all(ea.join("worktrees")).unwrap();
+    std::fs::write(ea.join("worktrees/m"), "NEW\n").unwrap();
+    let mut child = super::bash::plan_spawn(
+        &plan,
+        &[
+            std::ffi::OsString::from("/bin/cat"),
+            ea.join("worktrees/m").into_os_string(),
+        ],
+    )
+    .unwrap();
+    let mut output = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "plan spawn failed: {status:?}");
+    assert_eq!(
+        output, "OLD\n",
+        "a post-pin pathname swap must not rebind the projection"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ea.join("worktrees/m")).unwrap(),
+        "NEW\n",
+        "the swapped-in host inode must stay untouched"
+    );
+    std::fs::remove_dir_all(temp.path().join(".e-agent.old")).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_non_utf8_names_projected_byte_exact() {
+    // Non-UTF-8 names must be projected byte-exact, never lossy: the
+    // sandbox resolves the exact byte name (bash ANSI-C quoting), which
+    // only works if the projection preserved the raw name bytes.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    std::fs::create_dir_all(&ea).unwrap();
+    std::fs::write(
+        ea.join(std::ffi::OsStr::from_bytes(b"we\xffird.txt")),
+        "byte-exact\n",
+    )
+    .unwrap();
+    std::fs::create_dir(ea.join(std::ffi::OsStr::from_bytes(b"d\xfeir"))).unwrap();
+    std::fs::write(
+        ea.join(std::ffi::OsStr::from_bytes(b"d\xfeir")).join("f"),
+        "nested\n",
+    )
+    .unwrap();
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox().unwrap());
+    let out = tool
+        .execute(json!({"command": "cat .e-agent/$'we\\xffird.txt'; cat .e-agent/$'d\\xfeir'/f"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(
+        out.contains("byte-exact") && out.contains("nested"),
+        "non-UTF-8 names must be projected byte-exact: {out}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_execute_only_parent_fails_closed() {
+    // An execute-only (mode 0100) policy parent cannot be opened O_RDONLY,
+    // so the projection cannot enumerate and rebuild it — but the sandbox
+    // (same user) can still open `config.toml` by known filename through
+    // the writable workspace bind. Skipping the projection would silently
+    // drop the protection, so plan construction must fail closed instead.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    std::fs::create_dir_all(&ea).unwrap();
+    std::fs::write(ea.join("config.toml"), "[sandbox]\n").unwrap();
+    std::fs::set_permissions(&ea, std::fs::Permissions::from_mode(0o100)).unwrap();
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox().unwrap());
+    let result = tool.execute(json!({"command": "echo ran"})).await;
+    // Restore permissions so tempdir cleanup can remove the tree.
+    std::fs::set_permissions(&ea, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        result.is_err(),
+        "an unreadable policy parent must fail closed, not run unprotected: {result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ea.join("config.toml")).unwrap(),
+        "[sandbox]\n",
+        "the host config.toml must stay untouched"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_rerooted_worktree_git_stays_read_only() {
+    // A subagent rerooted into `.e-agent/worktrees/<name>` has its `.git`
+    // under the policy parent. The projection's `--tmpfs .e-agent` plus the
+    // top-level writable `worktrees` bind would shadow a `.git` ro-bind
+    // installed BEFORE the projection; protect_git must be applied AFTER it
+    // so the nested git directory stays read-only.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().to_path_buf();
+    let feature = parent.join(".e-agent/worktrees/feature");
+    std::fs::create_dir_all(feature.join(".git")).unwrap();
+    std::fs::write(feature.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let mut sandbox = sandbox().unwrap();
+    sandbox.writable_paths = vec![parent.to_str().unwrap().to_owned()];
+    let workspace = Workspace::new(&parent)
+        .unwrap()
+        .with_external_roots(&sandbox)
+        .unwrap()
+        .reroot(&feature)
+        .unwrap();
+    let tool = Bash {
+        workspace,
+        timeout: Some(Duration::from_secs(20)),
+        sender: None,
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
+        sandbox: Some(sandbox),
+        protect_git: true,
+        shell: Shell::detect().unwrap(),
+        owner_session: None,
+    };
+    // Reading git metadata works (git commands read it).
+    let out = tool
+        .execute(json!({"command": "cat .git/HEAD"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(out.contains("ref: refs/heads/main"), "{out}");
+    // Writing must fail even though the rerooted workspace is writable.
+    let write = tool
+        .execute(json!({"command": "echo corrupted > .git/HEAD 2>&1"}))
+        .await;
+    assert!(
+        write.is_err(),
+        "nested .git must stay read-only under the projection: {write:?}"
+    );
+    let rm = tool.execute(json!({"command": "rm -rf .git 2>&1"})).await;
+    assert!(rm.is_err(), "rm -rf nested .git must fail: {rm:?}");
+    // The host git directory must be untouched.
+    assert_eq!(
+        std::fs::read_to_string(feature.join(".git/HEAD")).unwrap(),
+        "ref: refs/heads/main\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_rerooted_worktree_git_pointer_stays_read_only() {
+    // Same reroot scenario with a linked-worktree `.git` pointer FILE: the
+    // pointer must stay read-only under the projection too.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().to_path_buf();
+    let feature = parent.join(".e-agent/worktrees/feature");
+    std::fs::create_dir_all(&feature).unwrap();
+    std::fs::write(
+        feature.join(".git"),
+        "gitdir: /some/external/main/.git/worktrees/feature\n",
+    )
+    .unwrap();
+    let mut sandbox = sandbox().unwrap();
+    sandbox.writable_paths = vec![parent.to_str().unwrap().to_owned()];
+    let workspace = Workspace::new(&parent)
+        .unwrap()
+        .with_external_roots(&sandbox)
+        .unwrap()
+        .reroot(&feature)
+        .unwrap();
+    let tool = Bash {
+        workspace,
+        timeout: Some(Duration::from_secs(20)),
+        sender: None,
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
+        sandbox: Some(sandbox),
+        protect_git: true,
+        shell: Shell::detect().unwrap(),
+        owner_session: None,
+    };
+    let out = tool
+        .execute(json!({"command": "cat .git"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(
+        out.contains("/some/external/main/.git/worktrees/feature"),
+        "{out}"
+    );
+    let write = tool
+        .execute(json!({"command": "echo 'gitdir: /evil' > .git 2>&1"}))
+        .await;
+    assert!(
+        write.is_err(),
+        "the nested .git pointer must stay read-only: {write:?}"
+    );
+    let rm = tool.execute(json!({"command": "rm -f .git 2>&1"})).await;
+    assert!(rm.is_err(), "rm of the .git pointer must fail: {rm:?}");
+    assert_eq!(
+        std::fs::read_to_string(feature.join(".git")).unwrap(),
+        "gitdir: /some/external/main/.git/worktrees/feature\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_rerooted_worktree_git_read_only_background_bash() {
+    // Background bash inherits protect_git=true; the rerooted worktree's
+    // nested .git must stay read-only there too (the projection shadows
+    // pre-projection ro-binds in the background task the same way).
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().to_path_buf();
+    let feature = parent.join(".e-agent/worktrees/feature");
+    std::fs::create_dir_all(feature.join(".git")).unwrap();
+    std::fs::write(feature.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let mut sandbox = sandbox().unwrap();
+    sandbox.writable_paths = vec![parent.to_str().unwrap().to_owned()];
+    let workspace = Workspace::new(&parent)
+        .unwrap()
+        .with_external_roots(&sandbox)
+        .unwrap()
+        .reroot(&feature)
+        .unwrap();
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut bash = Bash {
+        workspace,
+        timeout: Some(Duration::from_secs(20)),
+        sender: None,
+        background: BackgroundTasks::new(Some(Duration::from_secs(30 * 60)), Some(sandbox.clone())),
+        sandbox: Some(sandbox),
+        protect_git: true,
+        shell: Shell::detect().unwrap(),
+        owner_session: None,
+    };
+    bash.set_event_sender(sender);
+    let start = bash
+        .execute(json!({"command": "echo corrupted > .git/HEAD 2>&1", "background": true}))
+        .await
+        .unwrap()
+        .content;
+    assert!(start.starts_with("started background task"), "{start}");
+    // Give it time to run and fail.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        std::fs::read_to_string(feature.join(".git/HEAD")).unwrap(),
+        "ref: refs/heads/main\n",
+        "background bash must not corrupt the nested .git"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_descendants_depth_sorted_ro_parent_rw_child() {
+    // Explicit descendants must bind ancestor-first, descendant-last:
+    // `readable_paths=[.../cache/sub]` + `writable_paths=[.../cache/sub/build]`
+    // collected in that group order would bind the deeper RW child first and
+    // let the shallower RO parent stack over (shadow) it.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    std::fs::create_dir_all(ea.join("cache/sub/build")).unwrap();
+    let mut sandbox = sandbox().unwrap();
+    sandbox.readable_paths = vec![ea.join("cache/sub").to_str().unwrap().to_owned()];
+    sandbox.writable_paths = vec![ea.join("cache/sub/build").to_str().unwrap().to_owned()];
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox);
+    // The RW child under an RO parent is writable and host-persistent.
+    let out = tool
+        .execute(json!({"command": "echo yes > .e-agent/cache/sub/build/w && cat .e-agent/cache/sub/build/w"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(out.contains("yes"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(ea.join("cache/sub/build/w")).unwrap(),
+        "yes\n"
+    );
+    // The RO parent itself stays read-only.
+    let denied = tool
+        .execute(json!({"command": "touch .e-agent/cache/sub/denied 2>&1"}))
+        .await;
+    assert!(
+        denied.is_err(),
+        "the RO parent must reject writes: {denied:?}"
+    );
+    assert!(!ea.join("cache/sub/denied").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_descendants_depth_sorted_ro_parent_rw_child_mount_alias() {
+    // Path/mount alias mix: a readable MOUNT alias onto the RO parent plus a
+    // writable PATH child. Collection order (paths before mounts) alone
+    // would bind the RW child first and let the RO alias parent shadow it.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ea = temp.path().join(".e-agent");
+    // The mountpoint for the RO alias parent must already exist: bwrap
+    // cannot mkdir through the tmpfs'd `.e-agent` to create it.
+    std::fs::create_dir_all(ea.join("cache/sub/build")).unwrap();
+    let ro_src = tempfile::tempdir().unwrap();
+    std::fs::write(ro_src.path().join("locked"), "locked\n").unwrap();
+    std::fs::create_dir(ro_src.path().join("build")).unwrap();
+    let mut sandbox = sandbox().unwrap();
+    sandbox.readable_mounts = vec![(
+        ro_src.path().to_str().unwrap().to_owned(),
+        ea.join("cache/sub").to_str().unwrap().to_owned(),
+    )];
+    sandbox.writable_paths = vec![ea.join("cache/sub/build").to_str().unwrap().to_owned()];
+    let tool = policy_bash(Workspace::new(temp.path()).unwrap(), sandbox);
+    // The RO alias parent shows the alias source, read-only.
+    let out = tool
+        .execute(json!({"command": "cat .e-agent/cache/sub/locked"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(out.contains("locked"), "{out}");
+    let denied = tool
+        .execute(json!({"command": "touch .e-agent/cache/sub/denied 2>&1"}))
+        .await;
+    assert!(
+        denied.is_err(),
+        "the aliased RO parent must reject writes: {denied:?}"
+    );
+    // The RW child under the aliased RO parent stays writable: the child
+    // bind must be installed after (stack above) the RO alias parent.
+    let out = tool
+        .execute(json!({"command": "echo yes > .e-agent/cache/sub/build/w && cat .e-agent/cache/sub/build/w"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(out.contains("yes"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(ea.join("cache/sub/build/w")).unwrap(),
+        "yes\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_descendant_source_swapped_to_fifo_fails_closed() {
+    // Between config resolution and plan construction the configured
+    // descendant source is replaced by a FIFO (or socket): O_PATH still
+    // opens it, so the pinned fd must be fstat-checked — only regular
+    // files/directories may be projected; anything else fails closed.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let build = |make_special: &dyn Fn(&std::path::Path)| {
+        let temp = tempfile::tempdir().unwrap();
+        let ea = temp.path().join(".e-agent");
+        std::fs::create_dir_all(ea.join("cache")).unwrap();
+        let pinned = ea.join("cache/pinned");
+        std::fs::create_dir(&pinned).unwrap();
+        let mut sandbox = sandbox().unwrap();
+        sandbox.writable_paths = vec![pinned.to_str().unwrap().to_owned()];
+        // Config resolution: capabilities are opened from the regular dir.
+        let workspace = Workspace::new(temp.path())
+            .unwrap()
+            .with_external_roots(&sandbox)
+            .unwrap();
+        // Hostile swap BEFORE plan construction.
+        std::fs::remove_dir(&pinned).unwrap();
+        make_special(&pinned);
+        let root_str = temp.path().to_string_lossy().into_owned();
+        super::bash::build_bwrap_plan(&workspace, &sandbox, false, true, &root_str, None)
+    };
+    let fifo_err = match build(&|path| {
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Mode::from_bits(0o600).unwrap(),
+        )
+        .unwrap();
+    }) {
+        Ok(_) => panic!("a FIFO descendant source must fail closed"),
+        Err(err) => err,
+    };
+    assert!(
+        fifo_err.contains("regular file or directory"),
+        "a FIFO descendant source must fail closed: {fifo_err}"
+    );
+    let sock_err = match build(&|path| {
+        let _listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+    }) {
+        Ok(_) => panic!("a socket descendant source must fail closed"),
+        Err(err) => err,
+    };
+    assert!(
+        sock_err.contains("regular file or directory"),
+        "a socket descendant source must fail closed: {sock_err}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_policy_anchor_filtered_alias_without_projection_fails_closed() {
+    // A configured alias (canonical source != configured dest) whose dest
+    // lies under the policy parent is filtered from the generic mount loop.
+    // When the projection cannot run — the anchor is not visible from a
+    // workspace rerooted into a descendant of the alias SOURCE — the
+    // filtered destination would be silently hidden; the plan must fail
+    // closed instead.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let parent = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("sub")).unwrap();
+    std::fs::write(src.path().join("sub/data.txt"), "data\n").unwrap();
+    std::fs::create_dir_all(parent.path().join(".e-agent")).unwrap();
+    let mut sandbox = sandbox().unwrap();
+    sandbox.writable_mounts = vec![(
+        src.path().to_str().unwrap().to_owned(),
+        parent
+            .path()
+            .join(".e-agent/cache")
+            .to_str()
+            .unwrap()
+            .to_owned(),
+    )];
+    // Reroot into a descendant of the canonical SOURCE: the startup anchor
+    // (`parent/.e-agent/config.toml`) is visible from neither the new root
+    // nor any external canonical source, so the projection cannot run.
+    let workspace = Workspace::new(parent.path())
+        .unwrap()
+        .with_external_roots(&sandbox)
+        .unwrap()
+        .reroot(src.path().join("sub"))
+        .unwrap();
+    let tool = policy_bash(workspace, sandbox);
+    let result = tool.execute(json!({"command": "echo ok"})).await;
+    let err = match result {
+        Ok(_) => {
+            panic!("a filtered policy-subtree alias without a projection must fail closed");
+        }
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("fail closed") && err.contains("policy"),
+        "the refusal must explain the fail-closed policy conflict: {err}"
+    );
+}
+
 #[tokio::test]
 async fn sandbox_ro_parent_allows_rw_child_override() {
     let Some(mut sandbox) = sandbox() else {

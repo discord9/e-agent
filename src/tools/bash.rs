@@ -5,6 +5,13 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+#[cfg(unix)]
+use std::os::unix::{ffi::OsStrExt, io::AsRawFd};
+// `std::process::Command::pre_exec` (CommandExt) is only used by the
+// test-only `plan_spawn`; tokio's `Command` has an inherent `pre_exec`.
+#[cfg(all(unix, test))]
+use std::os::unix::process::CommandExt;
+
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -468,16 +475,55 @@ pub(super) fn gh_host_path() -> Option<PathBuf> {
     gh_in_path(std::env::var_os("PATH").as_deref())
 }
 
+/// A descriptor-pinned bwrap invocation plan.
+///
+/// The policy-parent protection is installed as a projection rebuilt from
+/// fds pinned with `openat2(RESOLVE_NO_SYMLINKS)` + `fstat` (regular files
+/// and directories only) at plan time. The `fds` must be held by the caller
+/// until every spawn that needs them has happened — bash foreground and
+/// background, and both run_rust stages — so the fd numbers in `args` stay
+/// valid and the pinned inodes survive pathname swaps (no TOCTOU re-bind).
+#[cfg(unix)]
+pub(super) struct BwrapPlan {
+    /// Full bwrap argument vector. `--bind-fd N dest` / `--ro-bind-fd N
+    /// dest` entries carry the actual fd numbers of `fds`.
+    pub(super) args: Vec<std::ffi::OsString>,
+    /// OwnedFds backing the `--bind-fd` numbers. Never read — holding them
+    /// is the point: they keep the fd numbers valid and the pinned inodes
+    /// alive until the last spawn.
+    #[allow(dead_code)]
+    pub(super) fds: Vec<rustix::fd::OwnedFd>,
+    /// Raw fd numbers the bwrap child must inherit. CLOEXEC is cleared on
+    /// exactly these numbers, in the forked child only, via `pre_exec`.
+    pub(super) numbers: Vec<i32>,
+}
+
 /// Build the bwrap argument vector from the resolved `[sandbox]` policy,
-/// shared by bash and the experimental `run_rust` tool. Caller appends the program.
-pub(super) fn bwrap_args(
+/// shared by bash and the experimental `run_rust` tool. Caller appends the
+/// program.
+///
+/// Security invariants:
+/// - The policy parent subtree is excluded from the generic pathname mount
+///   loop and instead rebuilt by the projection: `--tmpfs P`, restored
+///   top-level ordinary entries (regular files/dirs only, single-component
+///   names from the pinned parent fd, byte-exact even for non-UTF-8) and
+///   explicit descendants via `--bind-fd`/`--ro-bind-fd`, then
+///   `--remount-ro P`. Symlinks, FIFOs, sockets and devices are never
+///   projected. The policy file itself is always read-only; a missing one
+///   keeps its mount point absent (ENOENT) and the host gains nothing.
+/// - No pathname re-bind and no symlink fallback touch the policy parent:
+///   every bind at/under it is descriptor-pinned.
+/// - Construction failures fail closed: an Err is returned and nothing
+///   spawns.
+#[cfg(unix)]
+pub(super) fn build_bwrap_plan(
     workspace: &Workspace,
     sandbox: &crate::config::Sandbox,
     protect_git: bool,
     network: bool,
     chdir: &str,
     scratch_bind: Option<&str>,
-) -> Vec<String> {
+) -> Result<BwrapPlan, String> {
     let root = workspace.root();
     let workspace_bind = if sandbox.workspace_writable {
         "--bind"
@@ -486,7 +532,7 @@ pub(super) fn bwrap_args(
     };
     let root_str = root.to_string_lossy().into_owned();
     // Extra /home paths must be mounted AFTER the /home tmpfs.
-    let mut args: Vec<String> = vec![
+    let mut args: Vec<std::ffi::OsString> = vec![
         "--dev".into(),
         "/dev".into(),
         "--proc".into(),
@@ -522,19 +568,46 @@ pub(super) fn bwrap_args(
         args.extend(["--tmpfs".into(), "/tmp".into()]);
     }
     args.extend(["--tmpfs".into(), "/home".into()]);
-    // Ancestors before descendants (workspace last among equals stays authoritative).
+    // Ancestors before descendants (workspace last among equals stays
+    // authoritative). Any destination at or under the policy parent is
+    // excluded here: that subtree is owned by the fd-pinned projection
+    // below, so no pathname bind can project over the policy file.
+    let policy_parent = workspace.policy_anchor().parent().map(Path::to_path_buf);
     let mut mounts = Vec::new();
+    // Any configured destination at or under the policy parent is excluded
+    // from the generic pathname mount loop: that subtree is owned by the
+    // fd-pinned projection below, so no pathname bind can project over the
+    // policy file. Every filtered destination MUST be restored by the
+    // projection; if the projection cannot run, the plan fails closed
+    // instead of silently hiding the filtered destinations.
+    let mut filtered_policy_dests = false;
     for (source, dest) in &sandbox.readable_mounts {
-        mounts.push((source.as_str(), dest.as_str(), "--ro-bind-try", false));
+        if dest_is_policy_subtree(dest, policy_parent.as_deref()) {
+            filtered_policy_dests = true;
+        } else {
+            mounts.push((source.as_str(), dest.as_str(), "--ro-bind-try", false));
+        }
     }
     for (source, dest) in &sandbox.writable_mounts {
-        mounts.push((source.as_str(), dest.as_str(), "--bind-try", false));
+        if dest_is_policy_subtree(dest, policy_parent.as_deref()) {
+            filtered_policy_dests = true;
+        } else {
+            mounts.push((source.as_str(), dest.as_str(), "--bind-try", false));
+        }
     }
     for path in &sandbox.readable_paths {
-        mounts.push((path.as_str(), path.as_str(), "--ro-bind-try", false));
+        if dest_is_policy_subtree(path, policy_parent.as_deref()) {
+            filtered_policy_dests = true;
+        } else {
+            mounts.push((path.as_str(), path.as_str(), "--ro-bind-try", false));
+        }
     }
     for path in &sandbox.writable_paths {
-        mounts.push((path.as_str(), path.as_str(), "--bind-try", false));
+        if dest_is_policy_subtree(path, policy_parent.as_deref()) {
+            filtered_policy_dests = true;
+        } else {
+            mounts.push((path.as_str(), path.as_str(), "--bind-try", false));
+        }
     }
     mounts.push((root_str.as_str(), root_str.as_str(), workspace_bind, true));
     mounts.sort_by_key(|(_, dest, _, workspace)| {
@@ -545,37 +618,46 @@ pub(super) fn bwrap_args(
         args.push(source.into());
         args.push(dest.into());
     }
-    // Protect the startup policy anchor (after every bind).
+
+    // Protect the startup policy anchor: a descriptor-pinned projection
+    // applied after every other mount so no bind (workspace, alias or
+    // explicit descendant) can shadow it. Every destination filtered from
+    // the generic loop above must be restored here; a projection that
+    // cannot run fails the plan closed instead of hiding them silently.
+    let mut fds: Vec<rustix::fd::OwnedFd> = Vec::new();
     if workspace.policy_anchor_is_visible() {
-        let policy = workspace.policy_anchor().to_string_lossy().into_owned();
-        let policy_dir = workspace
-            .policy_anchor()
-            .parent()
-            .expect("policy anchor has a parent")
-            .to_string_lossy()
-            .into_owned();
-        if std::path::Path::new(&policy).exists() {
-            args.push("--ro-bind".into());
-            args.push("/dev/null".into());
-            args.push(policy);
-        } else if std::path::Path::new(&policy_dir).is_dir() {
-            // No file mountpoint exists. Freeze the existing parent
-            // so a writable child cannot create this run's policy.
-            args.push("--ro-bind".into());
-            args.push(policy_dir.clone());
-            args.push(policy_dir);
-        }
+        project_policy_parent(
+            workspace,
+            sandbox,
+            &mut args,
+            &mut fds,
+            filtered_policy_dests,
+        )?;
+    } else if filtered_policy_dests {
+        return Err(format!(
+            "fail closed: sandbox policy destinations under {} are excluded from the generic mount loop, but the policy-anchor projection cannot run from workspace {} (policy anchor {} is not visible), so those destinations would be silently hidden",
+            policy_parent
+                .as_deref()
+                .map_or_else(|| "<policy parent>".into(), |p| p.display().to_string()),
+            root_str,
+            workspace.policy_anchor().display()
+        ));
     }
 
-    // .git read-only over itself (subagents; run_rust always). After all binds.
+    // .git read-only over itself (subagents; run_rust always). Installed
+    // AFTER the policy projection: a workspace whose `.git` lives under the
+    // policy parent (e.g. rerooted into `.e-agent/worktrees/<name>`) would
+    // otherwise have its ro-bind shadowed by the projection's `--tmpfs
+    // parent` plus the top-level writable bind.
     if protect_git {
         let git_path = format!("{root_str}/.git");
         if std::path::Path::new(&git_path).exists() {
             args.push("--ro-bind".into());
-            args.push(git_path.clone());
-            args.push(git_path);
+            args.push(git_path.clone().into());
+            args.push(git_path.into());
         }
     }
+
     args.extend([
         "--unshare-pid".into(),
         "--unshare-ipc".into(),
@@ -588,7 +670,441 @@ pub(super) fn bwrap_args(
     if !network {
         args.push("--unshare-net".into());
     }
-    args
+    let numbers = fds.iter().map(|fd| fd.as_raw_fd()).collect();
+    Ok(BwrapPlan { args, fds, numbers })
+}
+
+/// True when a configured destination is the policy parent itself or lies
+/// under it (component-wise), i.e. the generic pathname mount loop must not
+/// bind it — the fd-pinned projection owns that subtree.
+#[cfg(unix)]
+fn dest_is_policy_subtree(dest: &str, policy_parent: Option<&Path>) -> bool {
+    let Some(parent) = policy_parent else {
+        return false;
+    };
+    let dest = Path::new(dest);
+    dest == parent || dest.starts_with(parent)
+}
+
+/// One resolved policy entry whose destination is the policy parent or a
+/// descendant of it: `dest` is the sandbox path, `writable` the final
+/// policy mode, `source` the real host path pinned for restoration
+/// (canonical for configured paths; the configured canonical source for
+/// mount aliases).
+#[cfg(unix)]
+struct PolicyEntry {
+    dest: PathBuf,
+    writable: bool,
+    source: PathBuf,
+}
+
+/// Configured entries (paths and mount aliases) whose destination lies at
+/// or under the policy parent.
+#[cfg(unix)]
+fn policy_entries_under(
+    sandbox: &crate::config::Sandbox,
+    policy_parent: &Path,
+) -> Vec<PolicyEntry> {
+    let mut out = Vec::new();
+    for (writable, paths) in [
+        (true, &sandbox.writable_paths),
+        (false, &sandbox.readable_paths),
+    ] {
+        for path in paths {
+            let dest = PathBuf::from(path);
+            if dest == policy_parent || dest.starts_with(policy_parent) {
+                out.push(PolicyEntry {
+                    dest: dest.clone(),
+                    writable,
+                    source: dest,
+                });
+            }
+        }
+    }
+    for (writable, mounts) in [
+        (true, &sandbox.writable_mounts),
+        (false, &sandbox.readable_mounts),
+    ] {
+        for (source, dest) in mounts {
+            let dest = PathBuf::from(dest);
+            if dest == policy_parent || dest.starts_with(policy_parent) {
+                out.push(PolicyEntry {
+                    dest,
+                    writable,
+                    source: PathBuf::from(source),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Winner-by-depth writability for a top-level child of the policy parent:
+/// the most specific policy entry covering the child decides, falling back
+/// to the workspace writability (the generic mount loop's semantics).
+#[cfg(unix)]
+fn child_writable(entries: &[PolicyEntry], dest: &Path, workspace_writable: bool) -> bool {
+    let mut best: Option<(usize, bool)> = None;
+    for entry in entries {
+        if dest.starts_with(&entry.dest) {
+            let depth = entry.dest.components().count();
+            if best.is_none_or(|(best_depth, _)| depth > best_depth) {
+                best = Some((depth, entry.writable));
+            }
+        }
+    }
+    best.map_or(workspace_writable, |(_, writable)| writable)
+}
+
+/// Append one descriptor-pinned bind (`--bind-fd`/`--ro-bind-fd`). The fd
+/// number is embedded in `args` and the OwnedFd is recorded so the number
+/// stays valid until the last spawn.
+#[cfg(unix)]
+fn push_bind(
+    args: &mut Vec<std::ffi::OsString>,
+    fds: &mut Vec<rustix::fd::OwnedFd>,
+    fd: rustix::fd::OwnedFd,
+    dest: PathBuf,
+    writable: bool,
+) {
+    args.push(
+        (if writable {
+            "--bind-fd"
+        } else {
+            "--ro-bind-fd"
+        })
+        .into(),
+    );
+    args.push(fd.as_raw_fd().to_string().into());
+    args.push(dest.into_os_string());
+    fds.push(fd);
+}
+
+/// Pin a single-component (or relative chain) path beneath a pinned parent,
+/// rejecting every symlink component via `openat2(RESOLVE_NO_SYMLINKS)`.
+#[cfg(unix)]
+fn pin_relative(
+    parent: &rustix::fd::OwnedFd,
+    relative: &Path,
+) -> rustix::io::Result<rustix::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+    let mut fd = rustix::io::dup(parent)?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(rustix::io::Errno::INVAL);
+        };
+        fd = openat2(
+            &fd,
+            name,
+            OFlags::PATH | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )?;
+    }
+    Ok(fd)
+}
+
+/// Pin the source of an explicit descendant: relative descent from the
+/// pinned policy parent when the source lies under it, else an absolute
+/// no-symlink open of the canonical source.
+#[cfg(unix)]
+fn pin_source(
+    policy_parent_fd: &rustix::fd::OwnedFd,
+    policy_parent: &Path,
+    source: &Path,
+) -> rustix::io::Result<rustix::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+    if let Ok(relative) = source.strip_prefix(policy_parent) {
+        pin_relative(policy_parent_fd, relative)
+    } else {
+        openat2(
+            rustix::fs::CWD,
+            source,
+            OFlags::PATH | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )
+    }
+}
+
+/// Install the policy-parent protection: `--tmpfs P`, restore the allowed
+/// existing top-level ordinary entries (regular files/dirs only) and the
+/// explicit descendants via descriptor-pinned binds, then `--remount-ro P`
+/// so the policy parent is read-only and a missing config file stays ENOENT
+/// (never created; the host gains nothing). Failures fail closed.
+#[cfg(unix)]
+fn project_policy_parent(
+    workspace: &Workspace,
+    sandbox: &crate::config::Sandbox,
+    args: &mut Vec<std::ffi::OsString>,
+    fds: &mut Vec<rustix::fd::OwnedFd>,
+    filtered_policy_dests: bool,
+) -> Result<(), String> {
+    use rustix::fs::{FileType, Mode, OFlags, RawDir, ResolveFlags, fstat, openat2};
+    let policy = workspace.policy_anchor();
+    let parent = policy.parent().expect("policy anchor has a parent");
+    let parent_depth = parent.components().count();
+    // The parent must be opened O_RDONLY|O_DIRECTORY (a real fd): children
+    // are enumerated from it with getdents, which EBADFs on O_PATH fds.
+    // RESOLVE_NO_SYMLINKS rejects a symlinked `.e-agent` outright (fail
+    // closed — no symlink fallback is ever used).
+    let parent_fd = match openat2(
+        rustix::fs::CWD,
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    ) {
+        Ok(fd) => fd,
+        // A missing policy parent (or a non-directory at that path) cannot
+        // be projected; the config stays ENOENT and the host gains nothing.
+        // If the generic loop excluded configured destinations under it,
+        // those would be silently hidden — fail closed instead.
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => {
+            if filtered_policy_dests {
+                return Err(format!(
+                    "fail closed: policy destinations under {} are excluded from the generic mount loop, but the policy parent {} does not exist, so the projection cannot restore them",
+                    parent.display(),
+                    parent.display()
+                ));
+            }
+            return Ok(());
+        }
+        // An unreadable (execute-only) parent must NOT be skipped: the
+        // sandbox — same user — could still open `config.toml` by known
+        // filename through the writable workspace bind, bypassing the
+        // protection. Plan construction fails closed instead.
+        Err(rustix::io::Errno::ACCESS) => {
+            return Err(format!(
+                "fail closed: cannot open policy parent {} read-only (execute-only?): the projection cannot enumerate and protect the policy file",
+                parent.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot pin policy parent {}: {error}",
+                parent.display()
+            ));
+        }
+    };
+    let entries = policy_entries_under(sandbox, parent);
+    args.push("--tmpfs".into());
+    args.push(parent.as_os_str().into());
+    // Top-level ordinary children of the policy parent, enumerated from the
+    // pinned fd with single-component names (never followed, never lossy).
+    let mut children: Vec<(std::ffi::CString, rustix::fd::OwnedFd)> = Vec::new();
+    {
+        let mut buffer = Vec::with_capacity(8192);
+        let mut raw = RawDir::new(
+            rustix::io::dup(&parent_fd).map_err(|e| format!("cannot dup policy parent fd: {e}"))?,
+            buffer.spare_capacity_mut(),
+        );
+        while let Some(entry) = raw.next() {
+            let entry = entry
+                .map_err(|e| format!("cannot enumerate policy parent {}: {e}", parent.display()))?;
+            let name = entry.file_name();
+            let bytes = name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let child = match openat2(
+                &parent_fd,
+                name,
+                OFlags::PATH | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS,
+            ) {
+                Ok(fd) => fd,
+                // A symlink (or an entry that vanished mid-enumeration):
+                // hidden, never exposed, never followed.
+                Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOENT) => continue,
+                Err(error) => {
+                    return Err(format!("cannot pin policy parent child {bytes:?}: {error}"));
+                }
+            };
+            let stat =
+                fstat(&child).map_err(|e| format!("cannot stat policy parent child: {e}"))?;
+            let file_type = FileType::from_raw_mode(stat.st_mode);
+            if !file_type.is_file() && !file_type.is_dir() {
+                // FIFOs, sockets, devices: not projected.
+                continue;
+            }
+            children.push((name.to_owned(), child));
+        }
+    }
+    for (name, child) in children {
+        let bytes = name.to_bytes();
+        let dest = parent.join(std::ffi::OsStr::from_bytes(bytes));
+        // The policy file itself is always read-only (an existing config
+        // stays readable; a missing one is never created).
+        let writable = if bytes == b"config.toml" {
+            false
+        } else {
+            child_writable(&entries, &dest, sandbox.workspace_writable)
+        };
+        push_bind(args, fds, child, dest, writable);
+    }
+    // Explicit descendants strictly below the top level, applied after the
+    // top-level binds so deeper mounts keep the winner/depth semantics.
+    // Ancestor-first, descendant-last: a deeper bind must be installed after
+    // its shallower ancestors, otherwise a shallow RO parent bound later
+    // stacks over (shadows) a deep RW child. Same destination: the config
+    // resolver picks the first logical entry in policy order (paths before
+    // mounts, writable before readable), so later duplicates are dropped —
+    // stacking them would let the later mode win.
+    let mut descendants: Vec<&PolicyEntry> = entries
+        .iter()
+        .filter(|entry| entry.dest.components().count() > parent_depth + 1)
+        .collect();
+    descendants.sort_by_key(|entry| entry.dest.components().count());
+    descendants.dedup_by(|a, b| a.dest == b.dest);
+    for entry in descendants {
+        let source_fd = match pin_source(&parent_fd, parent, &entry.source) {
+            Ok(fd) => fd,
+            // Missing configured sources keep the old --bind-try semantics.
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot pin policy descendant {}: {error}",
+                    entry.dest.display()
+                ));
+            }
+        };
+        // Every pinned source must be a regular file or directory: O_PATH
+        // also opens FIFOs/sockets/devices, and projecting one would leak a
+        // descriptor-bound special file into the sandbox. Anything else
+        // fails closed.
+        let stat = fstat(&source_fd).map_err(|e| {
+            format!(
+                "cannot stat policy descendant {}: {e}",
+                entry.dest.display()
+            )
+        })?;
+        let file_type = FileType::from_raw_mode(stat.st_mode);
+        if !file_type.is_file() && !file_type.is_dir() {
+            return Err(format!(
+                "fail closed: policy descendant {} source {} is not a regular file or directory",
+                entry.dest.display(),
+                entry.source.display()
+            ));
+        }
+        push_bind(args, fds, source_fd, entry.dest.clone(), entry.writable);
+    }
+    args.push("--remount-ro".into());
+    args.push(parent.as_os_str().into());
+    Ok(())
+}
+
+/// `pre_exec` closure that clears CLOEXEC on exactly the given fd numbers in
+/// the forked child, so bwrap can bind the descriptor-pinned sources. Every
+/// other fd keeps CLOEXEC and is never inherited. Only async-signal-safe
+/// fcntl syscalls are used.
+#[cfg(unix)]
+pub(super) fn clear_cloexec_pre_exec(
+    numbers: Vec<i32>,
+) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    move || {
+        for raw in &numbers {
+            // SAFETY: the raw numbers were recorded from live OwnedFds held
+            // by the plan for the whole spawn, so they are valid fds of the
+            // forked child; only fcntl runs here.
+            let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(*raw) };
+            rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty())
+                .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+        }
+        Ok(())
+    }
+}
+
+/// Spawn bwrap with a built plan (test hook and TOCTOU verification):
+/// the plan fds stay pinned while the pathnames underneath may be swapped;
+/// the sandbox binds the pinned inodes regardless.
+#[cfg(all(unix, test))]
+pub(super) fn plan_spawn(
+    plan: &BwrapPlan,
+    program: &[std::ffi::OsString],
+) -> std::io::Result<std::process::Child> {
+    let mut cmd = std::process::Command::new("bwrap");
+    cmd.args(&plan.args);
+    cmd.args(program);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let numbers = plan.numbers.clone();
+    if !numbers.is_empty() {
+        // SAFETY: pre_exec runs in the forked child before exec and only
+        // clears CLOEXEC on the plan fds (async-signal-safe fcntl).
+        unsafe { cmd.pre_exec(clear_cloexec_pre_exec(numbers)) };
+    }
+    cmd.spawn()
+}
+
+/// Wrap a shell invocation in bwrap per the resolved policy, returning the
+/// command and the descriptor-pinned plan. The caller must keep the plan
+/// alive until the spawn.
+#[cfg(unix)]
+fn wrap_bash_command(
+    shell: &Shell,
+    workspace: &Workspace,
+    command: &str,
+    protect_git: bool,
+    sandbox: &crate::config::Sandbox,
+) -> Result<(Command, Option<BwrapPlan>), String> {
+    let root = workspace.root();
+    let root_str = root.to_string_lossy().into_owned();
+    let plan = build_bwrap_plan(
+        workspace,
+        sandbox,
+        protect_git,
+        sandbox.network,
+        &root_str,
+        None,
+    )?;
+    let mut cmd = Command::new("bwrap");
+    cmd.args(&plan.args);
+    cmd.arg(shell.executable.clone());
+    cmd.args(shell.command_args(command));
+    // Only inject the default git config when the gh CLI is
+    // actually reachable inside the sandbox: a host-side `gh`
+    // whose executable path falls under a sandbox-mounted
+    // directory. A host without gh (or with gh outside every
+    // mount root) gets no injection at all — zero impact.
+    let gh_visible = gh_visible_in_sandbox(
+        gh_host_path().as_deref(),
+        &sandbox_mount_roots(sandbox, root),
+    );
+    if sandbox.network && gh_visible {
+        // Sandbox default git config, injected via env (equivalent
+        // to a minimal ~/.gitconfig, no file needed): let `git
+        // push` work out of the box by delegating credentials to
+        // the gh CLI (whose config dir is mounted read-only) and
+        // rewriting SSH github.com URLs to HTTPS. GIT_CONFIG_*
+        // requires git >= 2.31; older git silently ignores them,
+        // which is fine (no config is still the current behavior).
+        cmd.env("GIT_CONFIG_COUNT", "2");
+        cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
+        cmd.env("GIT_CONFIG_VALUE_0", "!gh auth git-credential");
+        cmd.env("GIT_CONFIG_KEY_1", "url.https://github.com/.insteadOf");
+        cmd.env("GIT_CONFIG_VALUE_1", "git@github.com:");
+    }
+    // Strip credential env vars so they are not inherited by the
+    // sandboxed command. The agent reads these from the parent
+    // process env directly, not via bash, so removing them here
+    // does not break anything.
+    cmd.env_remove("EXA_API_KEY");
+    cmd.env_remove("OPENAI_API_KEY");
+    cmd.env_remove("ANTHROPIC_API_KEY");
+    cmd.env_remove("DEEPSEEK_API_KEY");
+    cmd.env_remove("MOONSHOT_API_KEY");
+    cmd.env_remove("KIMI_API_KEY");
+    // The plan fds are CLOEXEC in the parent; clear CLOEXEC on exactly
+    // these numbers in the forked child so bwrap can bind them. Nothing
+    // else ever inherits them.
+    let numbers = plan.numbers.clone();
+    if !numbers.is_empty() {
+        // SAFETY: pre_exec runs in the forked child before exec; the
+        // closure only touches the plan fds with async-signal-safe fcntl.
+        unsafe { cmd.pre_exec(clear_cloexec_pre_exec(numbers)) };
+    }
+    Ok((cmd, Some(plan)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -622,62 +1138,24 @@ pub(super) async fn run_bash(
     }
 
     // Build the command: bare bash, or wrapped in bwrap when sandboxed (the
-    // policy lives in `bwrap_args`, shared with run_rust; network defaults on).
-    let mut process = match sandbox {
-        Some(sandbox) => {
-            let root = workspace.root();
-            let root_str = root.to_string_lossy().into_owned();
-            let mut cmd = Command::new("bwrap");
-            cmd.args(bwrap_args(
-                workspace,
-                sandbox,
-                protect_git,
-                sandbox.network,
-                &root_str,
-                None,
-            ));
-            cmd.arg(shell.executable.clone());
-            cmd.args(shell.command_args(command));
-            // Only inject the default git config when the gh CLI is
-            // actually reachable inside the sandbox: a host-side `gh`
-            // whose executable path falls under a sandbox-mounted
-            // directory. A host without gh (or with gh outside every
-            // mount root) gets no injection at all — zero impact.
-            let gh_visible = gh_visible_in_sandbox(
-                gh_host_path().as_deref(),
-                &sandbox_mount_roots(sandbox, root),
-            );
-            if sandbox.network && gh_visible {
-                // Sandbox default git config, injected via env (equivalent
-                // to a minimal ~/.gitconfig, no file needed): let `git
-                // push` work out of the box by delegating credentials to
-                // the gh CLI (whose config dir is mounted read-only) and
-                // rewriting SSH github.com URLs to HTTPS. GIT_CONFIG_*
-                // requires git >= 2.31; older git silently ignores them,
-                // which is fine (no config is still the current behavior).
-                cmd.env("GIT_CONFIG_COUNT", "2");
-                cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
-                cmd.env("GIT_CONFIG_VALUE_0", "!gh auth git-credential");
-                cmd.env("GIT_CONFIG_KEY_1", "url.https://github.com/.insteadOf");
-                cmd.env("GIT_CONFIG_VALUE_1", "git@github.com:");
-            }
-            // Strip credential env vars so they are not inherited by the
-            // sandboxed command. The agent reads these from the parent
-            // process env directly, not via bash, so removing them here
-            // does not break anything.
-            cmd.env_remove("EXA_API_KEY");
-            cmd.env_remove("OPENAI_API_KEY");
-            cmd.env_remove("ANTHROPIC_API_KEY");
-            cmd.env_remove("DEEPSEEK_API_KEY");
-            cmd.env_remove("MOONSHOT_API_KEY");
-            cmd.env_remove("KIMI_API_KEY");
-            cmd
-        }
+    // policy lives in `build_bwrap_plan`, shared with run_rust; network
+    // defaults on). The plan's descriptor pins must stay alive until the
+    // spawn below, so the plan is held here (never dropped with the match
+    // arm) — for foreground and background calls alike.
+    #[cfg(unix)]
+    let (mut process, _plan) = match sandbox {
+        Some(sandbox) => wrap_bash_command(shell, workspace, command, protect_git, sandbox)?,
         None => {
             let mut cmd = Command::new(&shell.executable);
             cmd.args(shell.command_args(command));
-            cmd
+            (cmd, None)
         }
+    };
+    #[cfg(not(unix))]
+    let mut process = {
+        let mut cmd = Command::new(&shell.executable);
+        cmd.args(shell.command_args(command));
+        cmd
     };
     process
         .current_dir(workspace.root())
