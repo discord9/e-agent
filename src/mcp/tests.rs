@@ -20,6 +20,28 @@ while IFS= read -r line; do
 done
 "#;
 
+/// A fake server whose `tools/call` result is a > RESULT_LIMIT payload of
+/// 3-byte UTF-8 characters: byte RESULT_LIMIT (64 KiB, % 3 == 1) lands inside
+/// a character, so a raw `text.truncate(RESULT_LIMIT)` panics. The fixed
+/// implementation must back off to the nearest char boundary.
+const TRUNCATE_SERVER: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  case "$line" in
+    *initialize*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"truncate"}}}\n' "$id"
+      ;;
+    *tools/list*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"big","description":"big payload","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *tools/call*)
+      payload=$(printf '测%.0s' {1..22000})
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$payload"
+      ;;
+  esac
+done
+"#;
+
 /// A fake server that sleeps `$SLEEP` seconds before answering initialize
 /// (0 by default), or never answers at all when `$HANG` is set.
 const SLOW_SERVER: &str = r#"
@@ -157,5 +179,29 @@ async fn connect_all_timeout_returns_empty_when_everything_hangs() {
     assert!(
         elapsed < Duration::from_secs(5),
         "connect_all did not honor the timeout: took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn call_tool_truncates_multibyte_results_at_a_char_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = McpServerConfig {
+        command: vec!["/bin/bash".into(), "-c".into(), TRUNCATE_SERVER.into()],
+        env: HashMap::new(),
+        cwd: None,
+        enabled: true,
+    };
+    let (server, _) = McpServer::connect("truncate", &config, temp.path())
+        .await
+        .unwrap();
+    // 22000 × 3 bytes = 66000 > RESULT_LIMIT (65536, % 3 == 1): the old
+    // `text.truncate(RESULT_LIMIT)` panicked mid-character; the fixed
+    // version must return valid UTF-8 truncated at a char boundary.
+    let output = server.call_tool("big", json!({})).await.unwrap();
+    assert!(output.ends_with("\n...[truncated]"));
+    assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    assert_eq!(
+        output.len(),
+        (RESULT_LIMIT / 3) * 3 + "\n...[truncated]".len()
     );
 }

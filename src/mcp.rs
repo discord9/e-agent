@@ -239,7 +239,14 @@ impl McpServer {
             }
         }
         if text.len() > RESULT_LIMIT {
-            text.truncate(RESULT_LIMIT);
+            // Back off to the nearest UTF-8 char boundary: a raw
+            // `truncate(RESULT_LIMIT)` panics when the byte limit lands inside
+            // a multi-byte character (e.g. CJK).
+            let mut end = RESULT_LIMIT;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
             text.push_str("\n...[truncated]");
         }
         Ok(text)

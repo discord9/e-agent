@@ -842,6 +842,31 @@ async fn read_truncates_long_lines_to_the_byte_limit() {
 }
 
 #[tokio::test]
+async fn read_truncates_multibyte_lines_at_a_char_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    // "测" is 3 bytes in UTF-8 and READ_LIMIT % 3 == 1, so byte READ_LIMIT
+    // always lands inside a character. The old `output.truncate(READ_LIMIT)`
+    // panicked here (`assertion failed: self.is_char_boundary`); the fixed
+    // version must back off to the nearest char boundary.
+    let content = "测".repeat(READ_LIMIT / 3 + 10);
+    std::fs::write(temp.path().join("cjk.txt"), &content).unwrap();
+    let output = read(&temp, json!({"path": "cjk.txt"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(output.ends_with("\n...[truncated]"));
+    // Valid UTF-8 throughout: the truncation point is a char boundary.
+    assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    // Truncated at READ_LIMIT rounded down to a char boundary (65535), plus
+    // the marker on top (same budget semantics as the ASCII case above).
+    assert_eq!(
+        output.len(),
+        (READ_LIMIT / 3) * 3 + "\n...[truncated]".len()
+    );
+    assert!(output.starts_with(&"测".repeat(READ_LIMIT / 3)));
+}
+
+#[tokio::test]
 async fn read_rejects_invalid_paging_arguments() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("file.txt"), "a\n").unwrap();

@@ -67,7 +67,14 @@ impl Tool for ReadFile {
         let page: Vec<&str> = lines.iter().skip(offset - 1).take(limit).copied().collect();
         let mut output = page.join("\n");
         if output.len() > READ_LIMIT {
-            output.truncate(READ_LIMIT);
+            // Back off to the nearest UTF-8 char boundary: a raw
+            // `truncate(READ_LIMIT)` panics when the byte limit lands inside
+            // a multi-byte character (e.g. CJK).
+            let mut end = READ_LIMIT;
+            while end > 0 && !output.is_char_boundary(end) {
+                end -= 1;
+            }
+            output.truncate(end);
             output.push_str("\n...[truncated]");
         }
         if offset > total && offset > 1 {
