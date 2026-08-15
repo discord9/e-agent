@@ -3,7 +3,7 @@
 //! and cleanup, and the sandbox policy surface.
 use super::*;
 #[rustfmt::skip]
-use super::rust::{FAULT_CONFIRM, FAULT_KILL, KillGuard, RunRust, SOURCE_MAX_BYTES, STAGE_TIMEOUT, ScratchGuard, base_dir, create_scratch, create_scratch_once, group_absent, kill_group, reap_confirmed, remove_scratch, resolve_rustc, run_rust_policy, validate_source};
+use super::rust::{FAULT_CONFIRM, FAULT_KILL, KillGuard, RunRust, SOURCE_MAX_BYTES, COMPILE_TIMEOUT, ScratchGuard, base_dir, create_scratch, create_scratch_once, group_absent, kill_group, reap_confirmed, remove_scratch, resolve_rustc, run_rust_policy, validate_source};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ struct Harness { tool: RunRust, base: tempfile::TempDir }
 fn harness(ws: &Workspace, policy: crate::config::Sandbox) -> Option<Harness> {
     if !env_ok() { return None; }
     let base = tempfile::tempdir().unwrap();
-    Some(Harness { tool: RunRust { workspace: ws.clone(), policy, compile_timeout: STAGE_TIMEOUT, run_timeout: Duration::from_secs(30), scratch: Some(base.path().to_path_buf()) }, base })
+    Some(Harness { tool: RunRust { workspace: ws.clone(), policy, compile_timeout: COMPILE_TIMEOUT, run_timeout: Duration::from_secs(30), scratch: Some(base.path().to_path_buf()) }, base })
 }
 #[rustfmt::skip]
 fn hdir(policy: crate::config::Sandbox) -> Option<(Harness, tempfile::TempDir)> {
@@ -85,7 +85,7 @@ async fn statuses_stdin_compile_and_hash_reporting() {
     assert!(h.scratch_empty(), "scratch removed after a normal run");
     // pre-creation proof: a regular-file scratch base would fail create_scratch, yet execute reports only the size error (131073 = SOURCE_MAX_BYTES + 1 bytes)
     let scratch_base = h.base.path().join("blocker"); std::fs::write(&scratch_base, b"x").unwrap();
-    let blocked = RunRust { workspace: h.tool.workspace.clone(), policy: run_rust_policy(None), compile_timeout: STAGE_TIMEOUT, run_timeout: Duration::from_secs(30), scratch: Some(scratch_base) };
+    let blocked = RunRust { workspace: h.tool.workspace.clone(), policy: run_rust_policy(None), compile_timeout: COMPILE_TIMEOUT, run_timeout: Duration::from_secs(30), scratch: Some(scratch_base) };
     let error = blocked.execute(json!({"source": "x".repeat(SOURCE_MAX_BYTES + 1)})).await.unwrap_err();
     assert!(error.contains("run_rust source too large: 131073 bytes") && !error.contains("scratch base") && validate_source(&"x".repeat(SOURCE_MAX_BYTES)).is_ok(), "{error}");
 }
