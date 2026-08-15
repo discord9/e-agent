@@ -91,6 +91,7 @@ const state = {
                              // 缓存（stale 保留 + 面板过滤数据源）
     cancelling: new Set(),   // 正在取消的任务 id（防重复点击）
     composerOpen: false,     // composer 任务面板展开状态（默认收起）
+    finishedCollapsed: true, // 已完成分组折叠状态（默认折叠；header 切换，页面生命周期内保持，刷新重置）
     pollers: new Map(),      // 展开中 bash 行的 output 轮询句柄（key=session_id:id → interval id）
     streams: new Map(),      // 展开中 delegate 行的 SSE AbortController（key=session_id:id）
     streamText: new Map(),   // 展开中 delegate 行的已累积流式文本（key → string，重绘恢复用）

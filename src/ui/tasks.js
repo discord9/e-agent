@@ -268,8 +268,9 @@ function renderComposerTasks() {
   }
 }
 
-/* 已完成小节：挂在面板末尾的只读列表（.tasks-finished 容器，独立于
-   renderTaskList 的 keyed 运行中行）。重建时整体替换；空 → 移除容器。 */
+/* 已完成小节（只读）：默认折叠，header 为真 <button>（aria-expanded/controls，
+   键盘可达），点击切换 state.tasks.finishedCollapsed（页面内保持，刷新重置）；
+   行与「更多」包在 .tasks-finished-body 整体显隐，每次最多 20 条。 */
 function renderFinishedSection(panel, finished) {
   const old = panel.querySelector(".tasks-finished");
   if (!finished.length) {
@@ -278,13 +279,25 @@ function renderFinishedSection(panel, finished) {
   }
   const box = old || el("div", "tasks-finished");
   box.innerHTML = "";
-  const header = el("div", "tasks-finished-header", "已完成 (" + finished.length + ")");
-  box.appendChild(header);
-  const shown = finished.slice(0, 20);   // 面板只读预览，完整列表走 session history
-  for (const t of shown) box.appendChild(buildFinishedRow(t));
+  const header = el("button", "tasks-finished-header", "已完成 (" + finished.length + ")");
+  header.type = "button";                    // 非表单提交
+  const body = el("div", "tasks-finished-body");
+  body.id = "composerTasks-finished-body";   // aria-controls 目标
+  const shown = finished.slice(0, 20);       // 预览上限 20 条
+  for (const t of shown) body.appendChild(buildFinishedRow(t));
   if (finished.length > shown.length) {
-    box.appendChild(el("div", "tasks-finished-more", "… 还有 " + (finished.length - shown.length) + " 条（完整记录在会话历史 / session_entries）"));
+    body.appendChild(el("div", "tasks-finished-more", "… 还有 " + (finished.length - shown.length) + " 条（完整记录在会话历史 / session_entries）"));
   }
+  body.hidden = state.tasks.finishedCollapsed;   // 默认折叠
+  header.setAttribute("aria-expanded", String(!state.tasks.finishedCollapsed));
+  header.setAttribute("aria-controls", body.id);
+  header.addEventListener("click", () => {
+    state.tasks.finishedCollapsed = !state.tasks.finishedCollapsed;
+    body.hidden = state.tasks.finishedCollapsed;
+    header.setAttribute("aria-expanded", String(!state.tasks.finishedCollapsed));
+  });
+  box.appendChild(header);
+  box.appendChild(body);
   if (!old) panel.appendChild(box);
 }
 

@@ -1342,8 +1342,8 @@
     background: var(--base2);
   }
 
-  /* 已完成小节（只读，来自持久化 session_entries）：分隔线 + 弱化样式，
-     与运行中 .task-row 区分；行内复用 .task-line/.kind-badge/.task-meta。 */
+  /* 已完成小节（只读）：默认折叠；header 为 button（aria-expanded 驱动
+     ▸/▾），点击切换 .tasks-finished-body 显隐。 */
   #composerTasks .tasks-finished {
     display: flex;
     flex-direction: column;
@@ -1356,7 +1356,34 @@
     font-size: 12px;
     font-weight: bold;
     color: var(--base01);
+    background: none;
+    border: none;
+    padding: 2px 0;
+    cursor: pointer;
+    text-align: left;
+    font-family: inherit;
+    width: 100%;
   }
+  #composerTasks .tasks-finished-header:hover,
+  #composerTasks .tasks-finished-header:focus-visible {
+    color: var(--base0);
+  }
+  #composerTasks .tasks-finished-header::before {
+    content: "▸";            /* 折叠指示器 */
+    display: inline-block;
+    width: 1em;
+    margin-right: 2px;
+  }
+  #composerTasks .tasks-finished-header[aria-expanded="true"]::before {
+    content: "▾";            /* 展开指示器 */
+  }
+  /* 行容器整体显隐；[hidden] 显式覆盖 display:flex（作者样式压过 UA 默认）。 */
+  #composerTasks .tasks-finished-body {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  #composerTasks .tasks-finished-body[hidden] { display: none; }
   #composerTasks .tasks-finished .task-row {
     border-color: var(--base1);
     opacity: 0.75;

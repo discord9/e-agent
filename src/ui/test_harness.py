@@ -410,6 +410,8 @@ function abortable(promise, signal){
 }
 // 任务输出块测试用：/api/tasks 响应与 output 端点文本（测试中可变）
 let tasksData = [];
+// 已完成任务测试用：/api/tasks/finished 响应（newest first；测试中可变）
+let finishedData = [];
 // 聚合模式：第二台服务器（http://b.local）的独立 /api/tasks 数据源
 let tasksDataB = [];
 // 任务轮询超时测试：B 的 /api/tasks 永不 resolve（挂起，只能被 abort 打断）
@@ -502,6 +504,7 @@ globalThis.fetch=(url,opts={})=>{
   const signal = opts && opts.signal;   // 传给 abort 感知的响应桩
   const m=(opts.method||"GET").toUpperCase();
       if(url==="/api/tasks") return resp(200, tasksData, signal);
+      if(url==="/api/tasks/finished") return resp(200, finishedData, signal);
       if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output")) {
         if (taskOutput404) return resp(404, {}, signal);
         if (taskOutputDelayed) return abortable(new Promise((resolve) => { taskOutputResolve = resolve; }), signal);
@@ -7051,6 +7054,77 @@ async function main(){
     sse404Ids = new Set(_dlSave.sse404Ids); sseOkIds = new Set();
     historyOverrides = new Map(_dlSave.historyOverrides);
     stopSSE();
+
+    // =====================================================================
+    // 已完成分组：默认折叠、真 button/ARIA、点击切换、重绘/重开保持、20 条上限
+    // =====================================================================
+    const fcSave = { ws: state.workspaces, workspace: state.workspace, token: state.token,
+      list: state.tasks.list, byWs: state.tasks.byWorkspace, finished: state.tasks.finished,
+      fByWs: state.tasks.finishedByWorkspace, sig: lastTasksSig, renderedSig: lastTasksRenderedSig };
+    state.workspaces = [{ id: "wsA", name: "服务器A", url: "", token: "tok-a" }];
+    state.workspace = state.workspaces[0]; state.token = "tok-a";
+    state.tasks.byWorkspace = {}; state.tasks.list = [];
+    tasksData = []; finishedData = [{ session_id: "s1", seq: 900, id: 1, kind: "bash",
+      label: "done-build", status: "Finished", exit_code: 0, duration_ms: 1234 }];
+    state.tasks.composerOpen = true; state.tasks.finishedCollapsed = true; lastTasksSig = ""; lastTasksRenderedSig = "";   // 刷新后的初始值
+    await pollTasks(); await flush();
+    let fhdr = elsById["composerTasks"].querySelector(".tasks-finished-header");
+    let fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
+    chk("finished default collapsed + real button/aria",
+        fhdr !== null && fhdr.tag === "button" && fhdr.type === "button"
+        && fhdr.getAttribute("aria-expanded") === "false"
+        && fhdr.getAttribute("aria-controls") === fbody.id
+        && fbody.hidden === true && state.tasks.finishedCollapsed === true,
+        "tag=" + (fhdr && fhdr.tag) + " hidden=" + (fbody && fbody.hidden));
+    fhdr._listeners["click"][0]();
+    chk("finished click expands", fbody.hidden === false
+        && fhdr.getAttribute("aria-expanded") === "true",
+        "hidden=" + fbody.hidden);
+    // pollTasks 数据变化重绘（重建 DOM）→ 展开态保持；关闭面板期间数据变化 → 重开仍保持
+    finishedData = [
+      { session_id: "s1", seq: 900, id: 1, kind: "bash", label: "done-build",
+        status: "Finished", exit_code: 0, duration_ms: 1234 },
+      { session_id: "s1", seq: 901, id: 2, kind: "delegate", label: "子任务X",
+        status: "Finished", exit_code: 0, duration_ms: 99 },
+    ];
+    await pollTasks(); await flush();
+    fhdr = elsById["composerTasks"].querySelector(".tasks-finished-header");
+    fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
+    chk("finished expanded survives poll repaint", fbody.hidden === false
+        && fhdr.getAttribute("aria-expanded") === "true"
+        && elsById["composerTasks"].querySelectorAll(".task-row").length === 2,
+        "hidden=" + fbody.hidden + " rows=" + elsById["composerTasks"].querySelectorAll(".task-row").length);
+    state.tasks.composerOpen = false;
+    finishedData.push({ session_id: "s1", seq: 902, id: 3, kind: "bash", label: "done-test",
+      status: "Finished", exit_code: 1, duration_ms: 5000 });
+    await pollTasks(); await flush();
+    state.tasks.composerOpen = true; renderComposerTasks(); await flush();
+    fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
+    chk("finished expanded survives panel close/reopen", fbody.hidden === false
+        && elsById["composerTasks"].querySelectorAll(".task-row").length === 3,
+        "rows=" + elsById["composerTasks"].querySelectorAll(".task-row").length);
+    // 折叠 → 重开仍折叠；22 条 → 只渲染 20 行 + 「还有 2 条」
+    elsById["composerTasks"].querySelector(".tasks-finished-header")._listeners["click"][0]();
+    state.tasks.composerOpen = false;
+    finishedData = [];
+    for (let i = 0; i < 22; i++) finishedData.push({ session_id: "s1", seq: 1000 + i, id: 100 + i,
+      kind: "bash", label: "bulk-" + i, status: "Finished", exit_code: 0, duration_ms: i * 10 });
+    await pollTasks(); await flush();
+    state.tasks.composerOpen = true; renderComposerTasks(); await flush();
+    fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
+    const moreEl = elsById["composerTasks"].querySelector(".tasks-finished-more");
+    chk("finished cap at 20 rows + collapsed reopen",
+        elsById["composerTasks"].querySelectorAll(".task-row").length === 20
+        && moreEl !== null && moreEl.textContent.includes("还有 2 条")
+        && fbody.hidden === true && state.tasks.finishedCollapsed === true,
+        "rows=" + elsById["composerTasks"].querySelectorAll(".task-row").length
+        + " more=" + (moreEl ? moreEl.textContent : "none"));
+    tasksData = []; tasksDataB = []; finishedData = [];
+    state.tasks.byWorkspace = fcSave.byWs; state.tasks.list = fcSave.list;
+    state.tasks.finished = fcSave.finished; state.tasks.finishedByWorkspace = fcSave.fByWs;
+    state.tasks.composerOpen = false; state.tasks.finishedCollapsed = true;
+    lastTasksSig = fcSave.sig; lastTasksRenderedSig = fcSave.renderedSig;
+    state.workspaces = fcSave.ws; state.workspace = fcSave.workspace; state.token = fcSave.token;
   } catch(e){ console.log("MAIN ERROR:", String(e), "STACK:", e && e.stack); fail++; }
 
   console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
