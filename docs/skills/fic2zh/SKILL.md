@@ -101,6 +101,8 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 
 **回写格式**：`source,target,zh-CN` 追加/覆盖行；source 用英文原词，target 用最终裁定译名。人名策略类裁定（保留英文）可写为注释行或"人名→保留英文"提醒条目。
 
+**术语注释（脚注）**：需解释的译名（缩写/异族语/设定词/易误解词）另建 `glossary_notes.csv`（两列 `source,note`，与术语表同目录）；`build_epub.py` 会自动在术语首次出现处生成 EPUB3 弹出式脚注，缺文件则跳过。
+
 **一致性保障**：glossary 是唯一真源——翻译、统一、校对都对照它；每次回写后，第 5 步对账/第 8 步渲染都以 glossary 为基准校验术语残留。
 
 ### 4. 并行翻译
@@ -139,6 +141,7 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 - 章节标题映射：忠实原作（多线并行的"第 1 周/第 2 周"不加工），专名意译、人名保留英文；两段章合并为一个 `# 标题`。
 - `render_otd.py`（或按书写渲染脚本）输出 `md/`（`**EN**`/`**ZH**` 对照）与 `md_zh/`（纯中文）。**章节标题必须用 `# ` 一级标题**——`build_epub.py` 的 `split_sections` 按 `^# ` 分章，用 `## ` 会把全书并成一章（踩过）。
 - `build_full.py --md md --out <book>_zh_en.md --title ...` + `build_epub.py`（**推荐用 `uv run --with ebooklib python3 build_epub.py ...` 或项目内 `uv add ebooklib` 后直接跑**——脚本依赖 `ebooklib`/`lxml`，用 uv 管理本地依赖，不绑系统 python）。build_full 头部模板按书内置（Vox/Colossus/OTD 各自版权头部）。
+- `build_epub.py --glossary-notes <file>`：指定术语注释 CSV（两列 `source,note`）；缺省取 md 同目录 `glossary_notes.csv`，无该文件则跳过，epub 无脚注。
 - epub 验证：xhtml 数 = 章数 + 2（preface + 结尾），抽查首尾章节标题。
 
 ### 9. 提交
@@ -154,7 +157,7 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 |---|---|---|
 | `translate_tool.py` | 核心 CLI，8 子命令见下 | 见下 |
 | `build_full.py` | 章 md → 全本 md（版权头部按书内置） | `build_full.py --md <book>_zh/md --out <book>_zh_en.md --title ...` |
-| `build_epub.py` | 全本 md → epub | `uv run --with ebooklib python3 build_epub.py --md ... --out ... --title ... --author ...` |
+| `build_epub.py` | 全本 md → epub（自动生成术语脚注：读 md 同目录 glossary_notes.csv，无则跳过） | `uv run --with ebooklib python3 build_epub.py --md ... --out ... --title ... --author ...` |
 | `check_alignment.py` | 对账：检测 en/zh 段落错位 | `check_alignment.py --json-dir <book>_zh/json` |
 | `culture_scan_terms.py` | 扫多译名冲突报告 | `culture_scan_terms.py --min-conf 2` |
 | `scan_zh_terms.py` | 通用术语冲突扫描 | `scan_zh_terms.py <json_dir> <glossary> --out ...` |
@@ -209,9 +212,10 @@ translate_tool.py context --segment segs/ch13_seg0.txt --memory <book>_zh/memory
 【输出】otd_zh/json/chN-segM.json（每段一个）
 【格式】单元素数组 json：{"id","en","zh","summary"}；en 逐字节复制源文件（含换行）；zh 逐段镜像换行/空行结构
 【要求】1) 术语表 <book>_zh/glossary_zh-CN.csv 先读全文，表外新词按该 fandom 通行译名+本作惯例新译并报告；
-2) 人名一律保留英文不音译；3) 对话用「」，嵌套用『』；4) en 拼写错误照实保留、zh 按正确含义译；5) 简体中文
+2) 人名一律保留英文不音译；3) 对话用「」，嵌套用『』；4) en 拼写错误照实保留、zh 按正确含义译；5) 简体中文；
+6) 遇到缩写/异族语/高概念词/易误解译名，顺手登记进 <book>_zh/glossary_notes.csv（source,note 两列，与术语表同目录）
 【验证】python3 -c "…断言 en==源文件、结构正确…" 全部 OK 才算完成
-【返回】summary / changes / verification / 每章 zh 字数 / 新造译名清单 / 不确定处
+【返回】summary / changes / verification / 每章 zh 字数 / 新造译名清单 / 新增 notes 条目清单 / 不确定处
 ```
 
 ## 已验证的坑（踩过，别重踩）
