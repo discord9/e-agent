@@ -72,6 +72,7 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 - 长章：单个 XHTML 很长时仍以"一个 XHTML = 一个 seg"为单位（翻译批次按字数切，一个文件可多批续译，但 en/zh 段落始终一一对应）。
 - 图片 alt、链接文字可译可不译（建议只译正文段落与标题，保持简单）。
 - **DRM 加密的 EPUB 无法直接处理**——需用户先用 Calibre 等去除 DRM 再给。
+- **结构版脚本写盘必须写全 `range(BODY_LAST+1, SPINE_LAST+1)` 的全部非正文页**——正文之后、spine 末尾之前若有非正文页（如 Flux 的 part0078 TIMELINE），只写 SPINE_FIRST..BODY_FIRST 与 SPINE_LAST 会跳写，但 content.opf/toc.ncx 仍引用它 → 悬空 spine 引用，阅读器报错；生成后核对 opf/ncx 引用的每个 xhtml 都真实存在于归档（无悬空引用）。
 - 产出：保留结构的 `<book>_zh_translated.epub`；如需也可另出纯文本版 md/epub（§8）。
 
 ### 2. 切段 + 建基准（先建基准！）
@@ -144,6 +145,7 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 - `render_otd.py`（或按书写渲染脚本）输出 `md/`（`**EN**`/`**ZH**` 对照）与 `md_zh/`（纯中文）。**章节标题必须用 `# ` 一级标题**——`build_epub.py` 的 `split_sections` 按 `^# ` 分章，用 `## ` 会把全书并成一章（踩过）。
 - `build_full.py --md md --out <book>_zh_en.md --title ...` + `build_epub.py`（**推荐用 `uv run --with ebooklib python3 build_epub.py ...` 或项目内 `uv add ebooklib` 后直接跑**——脚本依赖 `ebooklib`/`lxml`，用 uv 管理本地依赖，不绑系统 python）。build_full 头部模板按书内置（Vox/Colossus/OTD 各自版权头部）。**出版书/无原文链接作品（如 Baxter《Raft》）用 `--copyright published`**（内置模板：原著 + 版权归原作者及原出版方 + 非商业声明，可加 `--author` 填原著行）；默认 ch 前缀章会误选 Colossus 头部（硬编码 FFN 链接/Red Flag 作者名），**出版书必须显式指定**。
 - `build_epub.py --glossary-notes <file>`：指定术语注释 CSV（两列 `source,note`）；缺省取 md 同目录 `glossary_notes.csv`，无该文件则跳过，epub 无脚注。
+- **json 反向生成**：渲染管线（render_md.py / build_full.py / build_structure_epub.py）以 json/chN-segM.json 为唯一输入；若 json/ 为空（翻译批直接产出 md/md_zh），渲染前先从定稿 md/md_zh + segs 反向生成 json（格式：list of {id,en,zh,summary}，含标题段，seg 边界按 segs 切分），生成后做双向逐字节校验——每章 chN-segM.json = [{"id": "chN-segM", "en": "<该 seg 的 EN 段（含 Chapter N 标题段）以 \n\n 连接>", "zh": "<对应 ZH 段（含「# 第N章」标题段）>", "summary": ""}]；seg 边界按 segs/chN_seg0.txt 的非空段数切分；生成后校验 en[1:] == md 的 EN 块、zh[1:] == md_zh 段、seg0+seg1 == segs/chN.txt（字节级）。
 - epub 验证：xhtml 数 = 章数 + 2（preface + 结尾），抽查首尾章节标题。
 
 ### 9. 提交
@@ -213,6 +215,7 @@ translate_tool.py context --segment segs/ch13_seg0.txt --memory <book>_zh/memory
 【输入】otd_zh/segs/chN_segM.txt（先 ls 确认；注意 chK 拆两段）
 【输出】otd_zh/json/chN-segM.json（每段一个）
 【格式】单元素数组 json：{"id","en","zh","summary"}；en 逐字节复制源文件（含换行）；zh 逐段镜像换行/空行结构
+【标题段】segs 首段 "Chapter N" 只作为 md/md_zh 首行「# 第N章」标题，不进入正文段落对（md_zh 非空段数 == segs 非空段数、md 的 EN 块数 == segs 段数 − 1）
 【要求】1) 术语表 <book>_zh/glossary_zh-CN.csv 先读全文，表外新词按该 fandom 通行译名+本作惯例新译并报告；
 2) 人名一律保留英文不音译；3) 对话用「」，嵌套用『』；4) en 拼写错误照实保留、zh 按正确含义译；5) 简体中文；
 6) 遇到缩写/异族语/高概念词/易误解译名，顺手登记进 <book>_zh/glossary_notes.csv（source,note 两列，与术语表同目录）
@@ -232,6 +235,8 @@ translate_tool.py context --segment segs/ch13_seg0.txt --memory <book>_zh/memory
 | 系统缺 ebooklib/lxml | 用 `uv run --with ebooklib python3 build_epub.py ...`，本地依赖不污染环境 |
 | 全书头部硬编码版权信息错误 | build_full 内置每书模板，按输出路径选择 |
 | 校对轮改动与并行批次冲突 | 校对按章范围分片，写范围互斥；遗留问题汇总收尾轮 |
+| segs 首段 "Chapter N" 被多译成一个正文段 → md_zh 比 segs 多 1 段、md 多一对 EN/ZH，ch1–4 全部偏移（Flux 批1） | 标题段只作 md/md_zh 首行「# 第N章」，不进入正文段落对；任务模板【标题段】显式声明 |
+| 结构版 epub 写盘只写 SPINE_FIRST..BODY_FIRST 与 SPINE_LAST，跳过正文后、spine 末尾前的非正文页（Flux part0078 TIMELINE）→ content.opf/toc.ncx 悬空引用，阅读器报错 | 写盘写全 range(BODY_LAST+1, SPINE_LAST+1) 的全部非正文页；生成后核对 opf/ncx 引用的每个 xhtml 真实存在 |
 
 ## 验收标准（整本交付）
 
