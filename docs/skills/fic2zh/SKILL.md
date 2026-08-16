@@ -49,6 +49,31 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 - 抽取规则：**SB/SV 论坛**——threadmark 主类帖子、`bbWrapper` 平衡 div、`<br/>` 转段落分隔；剔除引用块/媒体/iframe/spoiler/图片；章末 "Authors note." 起的内容截断删除（正文内嵌的档案体文字保留）。**FFN/AO3 等小说站**——按站内章节页结构提取正文容器，规则另写（见 §0.5③）。
 - 验收：章数 ≥ 期望值；总词数 ≥ 期望（按书的 threadmark/章节目录预估，勿用旧书数字当标准）；抽查无 HTML 残留、无 "View content/Click to expand" 等 UI 文本、章尾自然收束。
 
+### 1.5 输入为 EPUB（保留原书结构，只翻正文）
+
+用户可能直接给 EPUB（FFN/AO3 等站下载、或本地已有）。此时**不重排、不重建**，而是在原 EPUB 结构上只替换英文正文为中文，保留其封面/样式/目录/分章。
+
+**EPUB 结构速览**（本质是 ZIP 容器）：
+- `mimetype` 条目：必须**无压缩（STORED）且是 zip 第一个条目**，内容 `application/epub+zip`——重打包时顺序/压缩方式错了阅读器会拒绝。
+- `META-INF/container.xml`：指向 OPF（`*.opf`）。
+- OPF：`manifest` 列出全部资源文件，`spine` 决定章节阅读顺序（按 spine 顺序遍历即正文顺序）。
+- `nav.xhtml` / `toc.ncx`：目录（章节标题），需与正文标题同步翻译。
+
+**处理步骤**：
+1. **解包**：`python3 -c "import zipfile; zipfile.ZipFile('book.epub').extractall('book_src/')"`；先完整备份原 EPUB。
+2. **提取正文**：按 spine 顺序，用 **lxml 解析**每个 XHTML，把正文段落提取为纯文本（`\n\n` 分段，标题首行），存为 `<book>_raw/chNN.txt`——与网页流程的输入格式一致，**后续 §2–§7 全部复用**（切段基准/en 逐字节断言/翻译批次/对账/统一/校对）。
+3. **翻译**：完全走标准流程（§2–§7），json 的 en 仍逐字节等于提取出的 chNN.txt。
+4. **回填**：译文按段落逐段映射回原 XHTML——**用 lxml 只替换文本节点**（`element.text` / `.tail`），**绝不动标签、属性、class、href、img src**；段落对应靠 en/zh 段落数镜像（已有机制）保证。目录（nav/ncx）里的章节标题同步换成中文标题。
+5. **重打包**：`mimetype` 用 `ZIP_STORED` 且**第一个写入**；其余条目 `ZIP_DEFLATED`；OPF 里 `dc:language` 改 `zh-CN`（可选，其余元数据保留）。
+6. **校验**：重新解包确认结构完整；用阅读器或 `ebooklib` 打开，验证章数、样式、封面与原书一致，正文为中文。
+
+**要点与坑**：
+- **只翻正文文本**——不要用正则改 HTML，必须 lxml/解析器操作，否则极易破坏结构。
+- 长章：单个 XHTML 很长时仍以"一个 XHTML = 一个 seg"为单位（翻译批次按字数切，一个文件可多批续译，但 en/zh 段落始终一一对应）。
+- 图片 alt、链接文字可译可不译（建议只译正文段落与标题，保持简单）。
+- **DRM 加密的 EPUB 无法直接处理**——需用户先用 Calibre 等去除 DRM 再给。
+- 产出：保留结构的 `<book>_zh_translated.epub`；如需也可另出纯文本版 md/epub（§8）。
+
 ### 2. 切段 + 建基准（先建基准！）
 
 - 每章默认 1 段；>3000 词的章按段落边界拆 2 段（中位章 1600 词时约 10% 的章会拆）。
