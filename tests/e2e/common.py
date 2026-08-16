@@ -31,8 +31,7 @@ UI_DIR = REPO_ROOT / "src" / "ui"
 BASE = os.environ.get("EAGENT_BASE", "http://127.0.0.1:18766")
 EXE = os.environ.get(
     "EAGENT_CHROME",
-    "/mnt/nvme_rust/cargo-home/playwright-browsers/chromium_headless_shell-1228/"
-    "chrome-headless-shell-linux64/chrome-headless-shell",
+    "/usr/bin/chromium-headless-shell",
 )
 TOKEN_FILE = Path(os.environ.get(
     "EAGENT_TOKEN_FILE", str(Path.home() / ".local/state/e-agent/server.token"))).expanduser()

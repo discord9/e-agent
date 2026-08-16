@@ -40,9 +40,8 @@ uv run --with playwright python regression.py --all --real     # 含真实 serve
 
 - `uv`（Python 环境管理器）
 - playwright（`uv run --with playwright` 自动提供；已缓存时秒级就绪）
-- chromium headless shell（默认路径
-  `/mnt/nvme_rust/cargo-home/playwright-browsers/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell`，
-  可用环境变量 `EAGENT_CHROME` 覆盖）
+- chromium headless shell（默认路径见 `EAGENT_CHROME` 环境变量，机器相关；本机开发时指向
+  各自的 playwright chromium 安装，可用环境变量 `EAGENT_CHROME` 覆盖）
 
 ## 设计约定（稳定性）
 
