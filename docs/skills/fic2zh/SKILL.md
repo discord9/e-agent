@@ -5,6 +5,8 @@ description: Translate English fanfiction / web novels (Warhammer 40K and other 
 
 # 中文同人小说翻译流水线（fic2zh）
 
+> **Production status（2026-08）**：本流程已连续完整交付 7 本长篇全流程翻译（同人 4 本 + Xeelee 系列合订本 3/10 本），累计 360+ 章、60 万+ 汉字；最近一本《Flux》29 章 12.8 万词端到端通过——8 批并行翻译、术语统一轮 460+ 处替换、4 轮校对 100+ 处修正、对账与 epub 校验全绿。
+
 把英文战锤 40K 同人小说（SpaceBattles / Sufficient Velocity / FanFiction.net）端到端翻译为简体中文，产出**中英对照**与**纯中文**两套 Markdown + EPUB。四本已跑通：Vox Vitae（74 章）、Culture Explores WH40K（157 章）、Colossus（17 段）、Out of the Dark（70 章/23 万字）。
 
 工具脚本随本 skill 分发于 `docs/skills/fic2zh/tools/`（12 个 .py，随主仓库 git 分发）；译文数据在各书目录 `<book>_zh/`（存放于**数据仓库**，本机为 `vox_vitae_toolkit/`，git 与主仓库分离；换环境时只需定位含 `<book>_zh/` 的数据目录即可）。本 skill 管**流程与约定**，术语表按书另建（`<book>_zh/glossary_zh-CN.csv`），不随 skill 分发。
