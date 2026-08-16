@@ -7,7 +7,7 @@ description: Translate SpaceBattles/SufficientVelocity/FanFiction.net Warhammer 
 
 把英文战锤 40K 同人小说（SpaceBattles / Sufficient Velocity / FanFiction.net）端到端翻译为简体中文，产出**中英对照**与**纯中文**两套 Markdown + EPUB。四本已跑通：Vox Vitae（74 章）、Culture Explores WH40K（157 章）、Colossus（17 段）、Out of the Dark（70 章/23 万字）。
 
-工具链在 `vox_vitae_toolkit/`（本仓库子目录），脚本用法见其 `README.md`。本 skill 管**流程与约定**，术语表按书另建（`<book>_zh/glossary_zh-CN.csv`），不随 skill 分发。
+工具链在 `vox_vitae_toolkit/`（工作区内的独立工具仓库，git 与主仓库分离），脚本用法见其 `README.md`。本 skill 管**流程与约定**，术语表按书另建（`<book>_zh/glossary_zh-CN.csv`），不随 skill 分发。
 
 ## When to use
 
