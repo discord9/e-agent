@@ -44,7 +44,7 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 
 ### 1. 抓取
 
-- SB/SV 直连常被 Cloudflare 拦（403），用 wayback machine reader 存档（`web.archive.org/web/2026/...` 年度重定向可拿到较新快照；2022 旧快照可能缺页）。
+- SB/SV 直连常被 Cloudflare 拦（403）。对策按序：① 用 **Playwright**（真实浏览器指纹 + JS 执行，可过大部分 Cloudflare 挑战）抓取；② 仍被拦则**向使用者索要登录 cookie**（`cf_clearance` 等），注入请求头后抓取；③ 兜底：wayback machine reader 存档（`web.archive.org/web/2026/...` 年度重定向可拿到较新快照；2022 旧快照可能缺页）。抓取必须带礼貌间隔（限速），避免触发风控。
 - 抓取脚本产出 `<book>_raw/chNN.txt`（每章一个纯文本：标题首行 + 正文 `\n\n` 分段）+ `manifest.tsv`（章号、post id、标题、词数）。
 - 抽取规则：**SB/SV 论坛**——threadmark 主类帖子、`bbWrapper` 平衡 div、`<br/>` 转段落分隔；剔除引用块/媒体/iframe/spoiler/图片；章末 "Authors note." 起的内容截断删除（正文内嵌的档案体文字保留）。**FFN/AO3 等小说站**——按站内章节页结构提取正文容器，规则另写（见 §0.5③）。
 - 验收：章数 ≥ 期望值；总词数 ≥ 期望（按书的 threadmark/章节目录预估，勿用旧书数字当标准）；抽查无 HTML 残留、无 "View content/Click to expand" 等 UI 文本、章尾自然收束。
