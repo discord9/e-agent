@@ -99,6 +99,8 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 | **④ 校对轮补录**（§7） | 校对发现的术语不一致（人名音译回退、同词多译）修正后，同样回写 glossary（如 Dusk Raiders→黄昏掠夺者、the Anathema→咒缚者） | glossary 补录 |
 | **⑤ 跨书继承**（下一本开始时） | 新书同 fandom（如都是 40K）→ 继承上一本 glossary 作为种子，再按 ① 补充本书特有词 | 下一本 glossary 种子 |
 
+**系列合订本**（多本同系列书在一个合集里，如 Xeelee 10 本合订）：建系列级 `shared_glossary_zh-CN.csv`（与各书目录同级的合集目录下，如 `xeelee_zh/shared_glossary_zh-CN.csv`），收录跨书共享专名（种族/组织/造物/物理概念/天体/科学人物）；**每本种子术语表 = shared_glossary + 本书高频专名扫描补充**；人名各书独立（不同故事不同角色），跨书同角色（如 Michael Poole 贯穿系列）以 shared 为准；两本书译名冲突时以 shared 为准统一，裁定结果回写 shared。
+
 **回写格式**：`source,target,zh-CN` 追加/覆盖行；source 用英文原词，target 用最终裁定译名。人名策略类裁定（保留英文）可写为注释行或"人名→保留英文"提醒条目。
 
 **术语注释（脚注）**：需解释的译名（缩写/异族语/设定词/易误解词）另建 `glossary_notes.csv`（两列 `source,note`，与术语表同目录）；`build_epub.py` 会自动在术语首次出现处生成 EPUB3 弹出式脚注，缺文件则跳过。
