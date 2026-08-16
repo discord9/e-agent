@@ -140,7 +140,7 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 
 - 章节标题映射：忠实原作（多线并行的"第 1 周/第 2 周"不加工），专名意译、人名保留英文；两段章合并为一个 `# 标题`。
 - `render_otd.py`（或按书写渲染脚本）输出 `md/`（`**EN**`/`**ZH**` 对照）与 `md_zh/`（纯中文）。**章节标题必须用 `# ` 一级标题**——`build_epub.py` 的 `split_sections` 按 `^# ` 分章，用 `## ` 会把全书并成一章（踩过）。
-- `build_full.py --md md --out <book>_zh_en.md --title ...` + `build_epub.py`（**推荐用 `uv run --with ebooklib python3 build_epub.py ...` 或项目内 `uv add ebooklib` 后直接跑**——脚本依赖 `ebooklib`/`lxml`，用 uv 管理本地依赖，不绑系统 python）。build_full 头部模板按书内置（Vox/Colossus/OTD 各自版权头部）。
+- `build_full.py --md md --out <book>_zh_en.md --title ...` + `build_epub.py`（**推荐用 `uv run --with ebooklib python3 build_epub.py ...` 或项目内 `uv add ebooklib` 后直接跑**——脚本依赖 `ebooklib`/`lxml`，用 uv 管理本地依赖，不绑系统 python）。build_full 头部模板按书内置（Vox/Colossus/OTD 各自版权头部）。**出版书/无原文链接作品（如 Baxter《Raft》）用 `--copyright published`**（内置模板：原著 + 版权归原作者及原出版方 + 非商业声明，可加 `--author` 填原著行）；默认 ch 前缀章会误选 Colossus 头部（硬编码 FFN 链接/Red Flag 作者名），**出版书必须显式指定**。
 - `build_epub.py --glossary-notes <file>`：指定术语注释 CSV（两列 `source,note`）；缺省取 md 同目录 `glossary_notes.csv`，无该文件则跳过，epub 无脚注。
 - epub 验证：xhtml 数 = 章数 + 2（preface + 结尾），抽查首尾章节标题。
 
@@ -156,7 +156,7 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 | 脚本 | 用途 | 关键调用 |
 |---|---|---|
 | `translate_tool.py` | 核心 CLI，8 子命令见下 | 见下 |
-| `build_full.py` | 章 md → 全本 md（版权头部按书内置） | `build_full.py --md <book>_zh/md --out <book>_zh_en.md --title ...` |
+| `build_full.py` | 章 md → 全本 md（版权头部按书内置） | `build_full.py --md <book>_zh/md --out <book>_zh_en.md --title ...`；出版书加 `--copyright published`（可配 `--author`） |
 | `build_epub.py` | 全本 md → epub（自动生成术语脚注：读 md 同目录 glossary_notes.csv，无则跳过） | `uv run --with ebooklib python3 build_epub.py --md ... --out ... --title ... --author ...` |
 | `check_alignment.py` | 对账：检测 en/zh 段落错位 | `check_alignment.py --json-dir <book>_zh/json` |
 | `culture_scan_terms.py` | 扫多译名冲突报告 | `culture_scan_terms.py --min-conf 2` |

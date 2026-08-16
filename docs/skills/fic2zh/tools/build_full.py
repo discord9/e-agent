@@ -6,7 +6,7 @@
 公共服务翻译性质。
 
 用法:
-    python3 build_full.py [--md DIR] [--out PATH] [--title TITLE] [--copyright FILE]
+    python3 build_full.py [--md DIR] [--out PATH] [--title TITLE] [--copyright NAME|FILE] [--author AUTHOR]
 默认: --md 本脚本同目录 ../vox_vitae_zh/md, --out 本脚本同目录
       ../vox_vitae_zh/vox_vitae_zh_en.md
 """
@@ -72,6 +72,28 @@ HEADER_OTD = """# {title}
 
 """
 
+HEADER_PUBLISHED = """# {title}
+
+{author_line}> **版权声明**：本作品之版权归原作者及原出版方所有，原作者保留一切权益。
+> 本中文译本为**非官方、非商业的公共服务性质翻译**，仅供学习交流之用，
+> 译者不主张对本译本的任何商业权利；如原作者要求，本译本将随时移除。
+> 翻译内容如与原文有出入，一律以原文为准。
+
+---
+
+{toc}
+
+---
+
+"""
+
+BUILTIN_HEADERS = {
+    'vox': HEADER_VOX,
+    'colossus': HEADER_COLOSSUS,
+    'otd': HEADER_OTD,
+    'published': HEADER_PUBLISHED,
+}
+
 
 def chapter_key(fn: str):
     # 序章类（角色创建/邻近文明）排在最前，其余按 Turn 号排序
@@ -100,8 +122,12 @@ def main():
     ap.add_argument('--md', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vox_vitae_zh', 'md'))
     ap.add_argument('--out', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vox_vitae_zh', 'vox_vitae_zh_en.md'))
     ap.add_argument('--title', default='Vox Vitae（生命之声）中文全译本')
+    ap.add_argument('--author', default='',
+                    help='原著作者，用于 published 内置头部模板的「原著」行'
+                         '（如 "Stephen Baxter《Raft》（Xeelee 系列）"）；缺省则头部只写版权声明行')
     ap.add_argument('--copyright', default=None,
-                    help='版权头部模板文件路径（含 {title}/{toc} 占位符）；'
+                    help='版权头部：内置模板名 vox/colossus/otd/published（不区分大小写），'
+                         '或含 {title}/{toc} 占位符的模板文件路径；'
                          '缺省时按章节命名自动选择：全为 ch 前缀用 Colossus 头部，否则用 Vox 头部')
     args = ap.parse_args()
 
@@ -121,15 +147,22 @@ def main():
             body.append(fh.read().rstrip())
 
     if args.copyright:
-        with open(args.copyright, encoding='utf-8') as fh:
-            template = fh.read()
+        key = args.copyright.lower()
+        template = BUILTIN_HEADERS.get(key)
+        if template is None:
+            with open(args.copyright, encoding='utf-8') as fh:
+                template = fh.read()
     elif 'otd' in args.out.lower():
         template = HEADER_OTD
     elif all(f.startswith('ch') for f in files):
         template = HEADER_COLOSSUS
     else:
         template = HEADER_VOX
-    header = template.format(title=args.title, toc='\n'.join(toc_lines))
+    if template is HEADER_PUBLISHED:
+        author_line = '> **原著**：{}\n>\n'.format(args.author) if args.author else ''
+        header = template.format(title=args.title, toc='\n'.join(toc_lines), author_line=author_line)
+    else:
+        header = template.format(title=args.title, toc='\n'.join(toc_lines))
 
     out_dir = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_dir, exist_ok=True)
