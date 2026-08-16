@@ -33,7 +33,7 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 ### 0. 准备（一次性）
 
 - 确认工具脚本位置（`docs/skills/fic2zh/tools/`，随 skill 分发）与译文数据位置（数据仓库下各 `<book>_zh/`，本机为 `vox_vitae_toolkit/`）。
-- 确认目标书的 URL 与章节结构（SpaceBattles threadmarks 清单，或 SV 帖子列表）。
+- 确认目标书的 URL 与章节结构（**站点差异**：SB/SV 等论坛的正文与读者讨论混在帖子流里，靠楼主维护的 **threadmark 目录**索引——抓取时只取 threadmark 指向的帖子；FFN/AO3/Webnovel 等小说站有独立的章节目录/章节列表，无 threadmark 概念，直接按目录抓）。
 
 ### 0.5 新书 / 新站点适配清单
 
@@ -46,8 +46,8 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 
 - SB/SV 直连常被 Cloudflare 拦（403），用 wayback machine reader 存档（`web.archive.org/web/2026/...` 年度重定向可拿到较新快照；2022 旧快照可能缺页）。
 - 抓取脚本产出 `<book>_raw/chNN.txt`（每章一个纯文本：标题首行 + 正文 `\n\n` 分段）+ `manifest.tsv`（章号、post id、标题、词数）。
-- 抽取规则：threadmark 主类、`bbWrapper` 平衡 div、`<br/>` 转段落分隔；剔除引用块/媒体/iframe/spoiler/图片；章末 "Authors note." 起的内容截断删除（正文内嵌的档案体文字保留）。
-- 验收：章数 ≥ 期望值；总词数 ≥ 期望（按书的 threadmarks/目录预估，勿用旧书数字当标准）；抽查无 HTML 残留、无 "View content/Click to expand" 等 UI 文本、章尾自然收束。
+- 抽取规则：**SB/SV 论坛**——threadmark 主类帖子、`bbWrapper` 平衡 div、`<br/>` 转段落分隔；剔除引用块/媒体/iframe/spoiler/图片；章末 "Authors note." 起的内容截断删除（正文内嵌的档案体文字保留）。**FFN/AO3 等小说站**——按站内章节页结构提取正文容器，规则另写（见 §0.5③）。
+- 验收：章数 ≥ 期望值；总词数 ≥ 期望（按书的 threadmark/章节目录预估，勿用旧书数字当标准）；抽查无 HTML 残留、无 "View content/Click to expand" 等 UI 文本、章尾自然收束。
 
 ### 2. 切段 + 建基准（先建基准！）
 
