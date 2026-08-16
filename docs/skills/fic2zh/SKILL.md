@@ -112,7 +112,7 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 
 - 章节标题映射：忠实原作（多线并行的"第 1 周/第 2 周"不加工），专名意译、人名保留英文；两段章合并为一个 `# 标题`。
 - `render_otd.py`（或按书写渲染脚本）输出 `md/`（`**EN**`/`**ZH**` 对照）与 `md_zh/`（纯中文）。**章节标题必须用 `# ` 一级标题**——`build_epub.py` 的 `split_sections` 按 `^# ` 分章，用 `## ` 会把全书并成一章（踩过）。
-- `build_full.py --md md --out <book>_zh_en.md --title ...` + `build_epub.py`（**注意用 `/usr/bin/python3`**，它有 ebooklib；uv python3 没有）。build_full 头部模板按书内置（Vox/Colossus/OTD 各自版权头部）。
+- `build_full.py --md md --out <book>_zh_en.md --title ...` + `build_epub.py`（**推荐用 `uv run --with ebooklib python3 build_epub.py ...` 或项目内 `uv add ebooklib` 后直接跑**——脚本依赖 `ebooklib`/`lxml`，用 uv 管理本地依赖，不绑系统 python）。build_full 头部模板按书内置（Vox/Colossus/OTD 各自版权头部）。
 - epub 验证：xhtml 数 = 章数 + 2（preface + 结尾），抽查首尾章节标题。
 
 ### 9. 提交
@@ -142,7 +142,7 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 | 术语提示逐批漂移 → 跨批不一致 | 任务模板固定；第 6 步统一轮兜底 |
 | API 余额不足整批失败 | 断点恢复：查已交付/缺失，重派缺失段 |
 | build_epub 用 `## ` 章节 → 全书并成 1 章 | 渲染一律 `# ` 一级标题 |
-| uv python3 无 ebooklib | epub 用 /usr/bin/python3 生成 |
+| 系统缺 ebooklib/lxml | 用 `uv run --with ebooklib python3 build_epub.py ...`，本地依赖不污染环境 |
 | 全书头部硬编码版权信息错误 | build_full 内置每书模板，按输出路径选择 |
 | 校对轮改动与并行批次冲突 | 校对按章范围分片，写范围互斥；遗留问题汇总收尾轮 |
 
