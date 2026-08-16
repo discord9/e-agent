@@ -146,6 +146,60 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 - 全部产物（json/segs/glossary/md/epub/raw/manifest）一并 `git add -A && git commit`。
 - 提交信息含：书名、章数/段数/字数、关键裁定、校验结论。
 
+## 工具脚本速览（12 个，位于 tools/）
+
+所有脚本用 `python3` 直接跑（无第三方依赖；`build_epub.py` 例外，见 §8）。**核心是 `translate_tool.py`**，其余按阶段调用。
+
+| 脚本 | 用途 | 关键调用 |
+|---|---|---|
+| `translate_tool.py` | 核心 CLI，8 子命令见下 | 见下 |
+| `build_full.py` | 章 md → 全本 md（版权头部按书内置） | `build_full.py --md <book>_zh/md --out <book>_zh_en.md --title ...` |
+| `build_epub.py` | 全本 md → epub | `uv run --with ebooklib python3 build_epub.py --md ... --out ... --title ... --author ...` |
+| `check_alignment.py` | 对账：检测 en/zh 段落错位 | `check_alignment.py --json-dir <book>_zh/json` |
+| `culture_scan_terms.py` | 扫多译名冲突报告 | `culture_scan_terms.py --min-conf 2` |
+| `scan_zh_terms.py` | 通用术语冲突扫描 | `scan_zh_terms.py <json_dir> <glossary> --out ...` |
+| `culture_unify_terms.py` | 按裁定表批量统一 zh | `culture_unify_terms.py` |
+| `culture_render.py` / `render_otd.py` | 按书渲染 md（对照+纯中文） | `python3 render_otd.py` |
+| `prep.py` / `colossus_prep.py` | 论坛 HTML / 纯文本 → 分段 | `python3 prep.py` |
+| `vote_parser.py` | 投票统计页 → votes.json/md | `vote_parser.py --pages ...` |
+
+### translate_tool.py 子命令与渐进式上下文
+
+**子命令**：`detect`（术语检测）、`extract`（帖子 HTML→正文）、`append`（译文录入记忆）、`summarize`（聚合分层记忆）、`context`（生成接力任务）、`render`（JSON→md）。
+
+**渐进式上下文机制**（Vox 用；OTD 简化版只用术语表+自包含任务）——三份数据配合，解决"子代理是全新上下文、没有全局观"的问题：
+
+```
+memory.jsonl  ──append 逐段写入──▶  每段 {id, en_path, zh_path, summary}
+     │
+     ▼ summarize（按章聚合）
+chapters.json ──▶ L0 每章一行 one_line（全篇脉络） + L1 各段摘要
+     │
+     ▼ context（现场组装）
+[全书梗概] book_summary.txt（开书写，追更更新）  ← 书级，L0 补强
+[术语表] 当前片段命中的术语（硬约束）
+[全篇背景] 最近 3 章 one_line（recent-level）
+[本章回顾] 本章各段摘要
+[上文] 最近 N 段译文（默认 3，截断 1500 字）
+[当前待译片段] 英文原文 + 翻译要求
+```
+
+**用法**：
+```sh
+# 译完一段后录入记忆（--summary 必填，累积成 L0/L1）
+translate_tool.py append --id ch12-seg1 --en segs/ch12_seg1.txt --zh json/ch12-seg1.zh.txt --summary "战斗场景" --memory <book>_zh/memory.jsonl
+# 一批译完，聚合分层记忆
+translate_tool.py summarize --memory <book>_zh/memory.jsonl --out <book>_zh/chapters.json
+# 给接力译者生成任务（自带全书梗概+术语+脉络+上文）
+translate_tool.py context --segment segs/ch13_seg0.txt --memory <book>_zh/memory.jsonl --chapters <book>_zh/chapters.json --chapter ch13 --glossary <book>_zh/glossary_zh-CN.csv
+```
+
+**要点**：
+- `append --summary` 是 L0/L1 的原料，**每段必填且 ≤40 字**（质量决定全局观质量）。
+- `context` 输出**直接粘贴进翻译批次任务**（或由编排方读取后转发给 fixer）。
+- book_summary.txt 与 memory.jsonl 同目录；`context` 自动读取输出 `[全书梗概]`，无文件则跳过（向后兼容）。
+- 术语表是硬约束，memory/chapters 是软参考——冲突以术语表为准。
+
 ## 任务文本模板（翻译批）
 
 ```text
