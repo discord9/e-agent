@@ -318,6 +318,21 @@ def load_chapters(path):
         return None
     return data if isinstance(data, list) else None
 
+def load_book_summary(memory_path):
+    """读 memory.jsonl 同目录的 book_summary.txt（全书梗概，100–200 字；
+    文件缺失时返回 None，向后兼容）。"""
+    if not memory_path:
+        return None
+    p = os.path.join(os.path.dirname(os.path.abspath(memory_path)), 'book_summary.txt')
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding='utf-8') as f:
+            text = f.read().strip()
+    except OSError:
+        return None
+    return text[:600] if text else None
+
 def build_chapter_blocks(chapters, chapter):
     """构造 L0 全篇背景 / L1 本章回顾文本块（无内容时为空字符串）。"""
     l0 = l1 = ''
@@ -444,6 +459,9 @@ def cmd_context(args):
         if chapters:
             l0, l1 = build_chapter_blocks(chapters, args.chapter)
     sys.stdout.write('[术语表] 本次待译片段中检测到的术语（必须使用下列译名，不得自行创造）：\n%s\n' % terms)
+    bs = load_book_summary(args.memory)
+    if bs:
+        sys.stdout.write('[全书梗概] %s\n' % bs)
     if l0:
         sys.stdout.write(l0)
     if l1:
