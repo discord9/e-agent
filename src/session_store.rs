@@ -859,6 +859,19 @@ pub struct UsageRow {
     pub last_ts: i64,
 }
 
+/// Cap for background task output previews. The running-task and
+/// finished-task APIs use the same character-boundary-safe limit.
+pub(crate) const TASK_OUTPUT_LIMIT: usize = 2000;
+
+/// Return a bounded output preview without splitting UTF-8 characters.
+pub(crate) fn task_output_preview(output: &str) -> String {
+    if output.chars().count() > TASK_OUTPUT_LIMIT {
+        output.chars().take(TASK_OUTPUT_LIMIT).collect()
+    } else {
+        output.to_owned()
+    }
+}
+
 /// One finished background task, read back from `session_entries`
 /// (`entry_kind = 'background_completion'`) for the finished-tasks
 /// listing. `finished_at_us` is the row's `event_time` (the durable commit
@@ -873,6 +886,8 @@ pub struct FinishedTask {
     pub seq: i64,
     pub finished_at_us: i64,
     pub id: u64,
+    /// Bounded preview of the completed task output.
+    pub output: String,
     pub label: Option<String>,
     pub started_at_ms: Option<u64>,
     pub duration_ms: Option<u64>,

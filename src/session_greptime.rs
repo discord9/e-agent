@@ -1507,6 +1507,7 @@ impl GreptimeSession {
                 .context("cannot decode finished background task payload")?;
             let crate::agent::SessionEntry::BackgroundCompletion {
                 id,
+                output,
                 label,
                 started_at_ms,
                 duration_ms,
@@ -1524,6 +1525,7 @@ impl GreptimeSession {
                 seq,
                 finished_at_us: datetime_to_us(event_time),
                 id,
+                output: crate::session_store::task_output_preview(&output),
                 label,
                 started_at_ms,
                 duration_ms,

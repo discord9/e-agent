@@ -7142,7 +7142,8 @@ async function main(){
     tasksData = [{ session_id: "s1", id: 7, kind: "bash", label: "cargo build",
       full_command: "cargo build", output: "building", role: null }];
     finishedData = [{ session_id: "s1", seq: 900, id: 1, kind: "bash",
-      label: "done-build", status: "Finished", exit_code: 0, duration_ms: 1234 }];
+      label: "done-build", status: "Finished", exit_code: 0, duration_ms: 1234,
+      output: "completed output" }];
     state.tasks.composerOpen = true; state.tasks.finishedCollapsed = true; lastTasksSig = ""; lastTasksRenderedSig = "";   // 刷新后的初始值
     await pollTasks(); await flush();
     let fhdr = elsById["composerTasks"].querySelector(".tasks-finished-header");
@@ -7159,6 +7160,16 @@ async function main(){
     chk("finished click expands", fbody.hidden === false
         && fhdr.getAttribute("aria-expanded") === "true",
         "hidden=" + fbody.hidden);
+    const finishedRow = fbody.querySelector(".task-row-finished");
+    const finishedOutput = finishedRow.querySelector(".task-output");
+    finishedRow._listeners["click"][0]();
+    chk("finished row click expands output", finishedOutput.hidden === false
+        && finishedRow.getAttribute("aria-expanded") === "true",
+        "hidden=" + finishedOutput.hidden);
+    finishedRow._listeners["click"][0]();
+    chk("finished row click collapses output", finishedOutput.hidden === true
+        && finishedRow.getAttribute("aria-expanded") === "false",
+        "hidden=" + finishedOutput.hidden);
     // pollTasks 数据变化重绘（重建 DOM）→ 展开态保持；关闭面板期间数据变化 → 重开仍保持
     finishedData = [
       { session_id: "s1", seq: 900, id: 1, kind: "bash", label: "done-build",

@@ -1596,6 +1596,7 @@ impl SqliteSession {
                 .map_err(|e| format!("cannot decode finished background task payload: {e}"))?;
             let crate::agent::SessionEntry::BackgroundCompletion {
                 id,
+                output,
                 label,
                 started_at_ms,
                 duration_ms,
@@ -1622,6 +1623,7 @@ impl SqliteSession {
                 seq: int_at(1, "seq")?,
                 finished_at_us: int_at(2, "event_time_us")?,
                 id,
+                output: crate::session_store::task_output_preview(&output),
                 label,
                 started_at_ms,
                 duration_ms,
