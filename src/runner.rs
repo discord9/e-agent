@@ -1516,13 +1516,21 @@ impl SessionRunner {
                     );
                     let budget_left = self.goal_continuation_remaining > 0;
                     if goal_active && !budget_left && self.last_turn_was_continuation {
-                        // Budget exhausted: one final Notice, then Idle.
+                        // Budget exhausted: one final durable Notice, then Idle.
                         // Guarded by `last_turn_was_continuation` so a later
                         // user turn cannot re-emit it.
-                        self.shared
-                            .lock()
-                            .unwrap()
-                            .emit(AgentEvent::Notice(GOAL_CONTINUATION_CAP_NOTICE.into()));
+                        let text = GOAL_CONTINUATION_CAP_NOTICE.to_owned();
+                        if let Err(error) = self
+                            .commit(SessionEntry::Notice { text: text.clone() })
+                            .await
+                        {
+                            self.commit_error(format!(
+                                "persisting goal continuation cap notice: {error:#}"
+                            ))
+                            .await;
+                        } else {
+                            self.shared.lock().unwrap().emit(AgentEvent::Notice(text));
+                        }
                     }
                     if goal_active
                         && budget_left

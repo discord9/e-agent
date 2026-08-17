@@ -6175,19 +6175,27 @@ async fn active_goal_auto_continues_up_to_limit_then_stops_with_cap_notice() {
     assert!(matches!(&*status.borrow(), SessionStatus::Idle));
 
     // Durable persistence: one user prompt + (limit + 1) assistants + limit
-    // continuation notices.
+    // round notices + one cap notice.
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "goal-cont-limit")
         .await
         .unwrap();
-    let notices = loaded
+    let round_notices = loaded
         .entries
         .iter()
         .filter(|entry| {
-            matches!(entry, SessionEntry::Notice { text } if text.contains("[goal continuation"))
+            matches!(entry, SessionEntry::Notice { text } if text.contains("[goal continuation") && text.contains("/10 —"))
         })
         .count();
-    assert_eq!(notices, GOAL_CONTINUATION_LIMIT as usize);
+    assert_eq!(round_notices, GOAL_CONTINUATION_LIMIT as usize);
+    let cap_notices = loaded
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(entry, SessionEntry::Notice { text } if text == GOAL_CONTINUATION_CAP_NOTICE)
+        })
+        .count();
+    assert_eq!(cap_notices, 1);
     let assistants = loaded
         .entries
         .iter()
@@ -6742,8 +6750,8 @@ async fn continuation_entries_persist_and_budget_not_replenished_by_user_turns()
         1,
         "the cap notice is not re-emitted by later user turns"
     );
-    // Durable entries: limit notices + (limit + 2) assistants (initial,
-    // limit continuations, user turn) + the user message.
+    // Durable entries: limit round notices + one cap notice + (limit + 2)
+    // assistants (initial, limit continuations, user turn) + the user message.
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "goal-cont-persist")
         .await
@@ -6753,10 +6761,20 @@ async fn continuation_entries_persist_and_budget_not_replenished_by_user_turns()
             .entries
             .iter()
             .filter(|entry| {
-                matches!(entry, SessionEntry::Notice { text } if text.contains("[goal continuation"))
+                matches!(entry, SessionEntry::Notice { text } if text.contains("[goal continuation") && text.contains("/10 —"))
             })
             .count(),
         GOAL_CONTINUATION_LIMIT as usize
+    );
+    assert_eq!(
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry, SessionEntry::Notice { text } if text == GOAL_CONTINUATION_CAP_NOTICE)
+            })
+            .count(),
+        1
     );
     assert_eq!(
         loaded
