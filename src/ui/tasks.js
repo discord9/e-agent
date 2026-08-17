@@ -151,6 +151,18 @@ function buildFinishedRow(t) {
     line.appendChild(sid);
   }
   row.appendChild(line);
+  const output = t.output != null && String(t.output).trim() !== "" ? String(t.output) : "";
+  if (output) {
+    const pre = el("pre", "task-output", output);
+    pre.hidden = true;
+    row.appendChild(pre);
+    row.setAttribute("aria-expanded", "false");
+    row.addEventListener("click", () => {
+      pre.hidden = !pre.hidden;
+      row.setAttribute("aria-expanded", String(!pre.hidden));
+      updateJumpBottomPosition();
+    });
+  }
   return row;
 }
 

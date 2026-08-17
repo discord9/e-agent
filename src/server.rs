@@ -993,21 +993,11 @@ pub struct TaskMeta {
     pub owner_session: Option<String>,
 }
 
-/// Cap for `TaskMeta.output`. The per-task output tail is already capped at
-/// 16 KiB in the spool; the wire DTO truncates further to this many
-/// characters so a batch of running tasks stays a bounded `/api/tasks`
-/// payload.
-const TASK_OUTPUT_LIMIT: usize = 2000;
-
 /// Map one [`BackgroundTaskInfo`] snapshot to its wire DTO. Pure function so
 /// the field mapping (lossy UTF-8, truncation, display-meta flattening) is
 /// unit-testable without a live task.
 fn task_meta(session_id: &str, info: BackgroundTaskInfo) -> TaskMeta {
-    let output = String::from_utf8_lossy(&info.output);
-    let mut output = output.into_owned();
-    if output.chars().count() > TASK_OUTPUT_LIMIT {
-        output = output.chars().take(TASK_OUTPUT_LIMIT).collect();
-    }
+    let output = crate::session_store::task_output_preview(&String::from_utf8_lossy(&info.output));
     TaskMeta {
         session_id: session_id.to_owned(),
         id: info.id,
@@ -7253,7 +7243,10 @@ model = "deepseek-chat"
         assert_eq!(long.full_command.as_deref(), Some("yes"));
         assert_eq!(long.role.as_deref(), Some("coder"));
         assert_eq!(long.kind, "bash");
-        assert_eq!(long.output.chars().count(), TASK_OUTPUT_LIMIT);
+        assert_eq!(
+            long.output.chars().count(),
+            crate::session_store::TASK_OUTPUT_LIMIT
+        );
         assert!(!long.background, "non-delegate tasks have no display meta");
         assert_eq!(long.workspace, None);
         assert_eq!(long.subagent_session_id, None);
