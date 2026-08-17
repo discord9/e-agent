@@ -1329,6 +1329,22 @@ async fn create_session(
             ),
         ));
     }
+    // `build_session` uses the factory's current model (which is correct for
+    // execution) and idempotently creates metadata if necessary. Read an
+    // existing session's metadata first so a resumed session keeps its
+    // original model in the web-facing live registry.
+    let persisted_model = if explicit_id {
+        state
+            .meta_store
+            .list_meta(root)
+            .await
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+            .into_iter()
+            .find(|meta| meta.session_id == id)
+            .and_then(|meta| meta.model)
+    } else {
+        None
+    };
     let built = build_session(&state.factory, &id).await?;
     let initial_prompt = body.initial_prompt.filter(|p| !p.trim().is_empty());
     let session = Arc::new(LiveSession {
@@ -1337,7 +1353,7 @@ async fn create_session(
         store: built.store,
         background: built.background,
         sessions: built.sessions,
-        model_name: Mutex::new(built.model_name),
+        model_name: Mutex::new(persisted_model.unwrap_or(built.model_name)),
         role_name: built.role_name,
         created_at: chrono::Utc::now(),
     });
@@ -3949,6 +3965,87 @@ mod tests {
             serde_json::from_str(r#"{"id": "web-x", "initial_prompt": "go"}"#).unwrap();
         assert_eq!(with_id.id.as_deref(), Some("web-x"));
         assert_eq!(with_id.initial_prompt.as_deref(), Some("go"));
+    }
+
+    /// Resuming uses the persisted model for web display while the runner
+    /// retains the factory's current model; newly created sessions display
+    /// that current factory model.
+    #[tokio::test]
+    async fn resumed_session_lists_persisted_model_and_fresh_session_lists_current_model() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        SessionStore::Jsonl
+            .create_meta(&root, "historical", Some("X"), None, None, None, None)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(root),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        let app = router(state);
+        let post = |body: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/api/sessions")
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let resumed = post(r#"{"id":"historical"}"#).await;
+        assert_eq!(resumed.status(), StatusCode::CREATED);
+        let fresh = post("{}").await;
+        assert_eq!(fresh.status(), StatusCode::CREATED);
+        let fresh: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(fresh.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fresh["model"], "test-model");
+
+        let listed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            listed
+                .as_array()
+                .expect("session list")
+                .iter()
+                .find(|meta| meta["id"] == "historical")
+                .expect("resumed session is listed")["model"],
+            "X"
+        );
     }
 
     /// `POST /api/sessions {id}` — the web resume entry — must never build
