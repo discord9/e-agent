@@ -646,7 +646,7 @@ pub async fn spawn_btw_subagent(
         backend,
         record_in,
     } = context;
-    let model_name = model.display_name().to_owned();
+    let model_name = model.profile_key();
     let cwd = workspace.root().display().to_string();
     // Load the source session's full history; the fork source is only read,
     // exactly like the `--fork` path in session_factory.
@@ -1116,7 +1116,7 @@ impl Tool for Delegate {
             .reroot(&workspace_path)
             .map_err(|error| format!("invalid `workspace` path `{workspace_arg}`: {error}"))?;
 
-        let model_name = model.display_name().to_string();
+        let model_name = model.profile_key();
         let (resume_id, resume) = match resume {
             Some((id, entries, locations)) => (Some(id), Some((entries, locations))),
             None => (None, None),

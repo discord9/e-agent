@@ -765,7 +765,7 @@ impl SessionFactory {
         .record_background_tasks_in(self.root.clone(), &session, store.clone())
         .with_persist_store(self.backend.clone());
         if let Some(subagent_model) = &subagent_model {
-            let name = subagent_model.display_name().to_owned();
+            let name = subagent_model.profile_key();
             delegate = delegate.with_subagent_model(subagent_model.clone());
             if self.announce {
                 eprintln!("e-agent: subagent model {name}");
@@ -831,7 +831,7 @@ impl SessionFactory {
             agent.set_context_window(window);
         }
 
-        let model_name = main_model.display_name().to_owned();
+        let model_name = main_model.profile_key();
         // Sessions metadata: write the creation snapshot for a brand-new
         // session (model/role from the factory configuration; parent links
         // are None for main sessions). A resumed session (`--session`,

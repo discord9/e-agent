@@ -49,6 +49,13 @@ impl ConfiguredModel {
         }
     }
 
+    /// Full configured profile key, falling back to the wire model name.
+    pub fn profile_key(&self) -> String {
+        self.display
+            .clone()
+            .unwrap_or_else(|| self.name().to_owned())
+    }
+
     /// UI-friendly display name: the short part of the profile key (after the
     /// last '/') when configured, otherwise the wire model name.
     pub fn display_name(&self) -> &str {

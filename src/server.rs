@@ -1648,7 +1648,7 @@ async fn pet_config(State(state): State<Arc<AppState>>) -> Json<PetRuntimeConfig
 /// profile is resolved against the same config the factory was built with
 /// (honoring `--base-url`/`--model` overrides), then installed on the live
 /// runner's agent — the session keeps its history and continues with the
-/// new model. 200 + `{"ok": true, "model": "<display name>"}` on success;
+/// new model. 200 + `{"ok": true, "model": "<profile key>"}` on success;
 /// 400 for an unknown profile / no config; 404 for an unknown session.
 async fn session_model(
     State(state): State<Arc<AppState>>,
@@ -1669,7 +1669,7 @@ async fn session_model(
             format!("unknown model profile `{profile}`: {e:#}"),
         )
     })?;
-    let name = configured.display_name().to_owned();
+    let name = configured.profile_key();
     session.handle().switch_model(Box::new(configured));
     // Mirror the new model into the registry metadata so `GET /api/sessions`
     // (sidebar / composer meta) reflects the switch immediately. Subagent
@@ -2663,9 +2663,9 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
     // summarizer 调用的 token 用量落盘（kind="summarizer"）：走 workspace
     // 级 meta_store（与 sessions 表同 scope），session 维度用该会话 id；
     // JSONL 后端静默跳过，失败只告警不影响总结。model 名用 summarizer
-    // 角色的 display_name（profile 短名，与 create_meta 存 model 的取法一致）。
+    // 角色的 profile_key（与 create_meta 存 model 的取法一致）。
     if let Some(usage) = usage {
-        let model_name = state.factory.summarizer_model().display_name().to_owned();
+        let model_name = state.factory.summarizer_model().profile_key();
         if let Err(error) = state
             .meta_store
             .append_usage(
@@ -4354,9 +4354,9 @@ model = "deepseek-chat"
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["ok"], true);
-        assert_eq!(value["model"], "flash", "display name short part");
+        assert_eq!(value["model"], "deepseek/flash", "full profile key");
         // The registry metadata mirrors the switch for `GET /api/sessions`.
-        assert_eq!(session.model_name(), "flash");
+        assert_eq!(session.model_name(), "deepseek/flash");
 
         let unknown = request(
             format!("/api/sessions/{id}/model"),
