@@ -1133,6 +1133,9 @@ pub struct Agent {
     /// Workspace and server instructions prepended to every model call.
     /// Not persisted in sessions.
     context_prefix: Option<String>,
+    /// Role-derived directive injected into compacted summary projections.
+    /// Not persisted in sessions.
+    compaction_reminder: Option<String>,
     /// Latest goal snapshot, folded from the append-only history
     /// (GoalUpdated entries). Projected into every provider context, so it
     /// survives compaction and resume.
@@ -1187,6 +1190,7 @@ impl Agent {
             context_window: None,
             auto_compacted: false,
             context_prefix: None,
+            compaction_reminder: None,
             goal: None,
             goal_cleared: false,
             entry_locations: Vec::new(),
@@ -1223,6 +1227,12 @@ impl Agent {
     /// sessions.
     pub fn set_context_prefix(&mut self, prefix: String) {
         self.context_prefix = Some(prefix);
+    }
+
+    /// Install a role-derived directive for compacted summary projections.
+    /// Not persisted in sessions.
+    pub fn set_compaction_reminder(&mut self, text: String) {
+        self.compaction_reminder = Some(text);
     }
 
     /// Record in-flight background tasks under this workspace root + session
@@ -1518,12 +1528,16 @@ impl Agent {
                 .get(index)
                 .and_then(|location| location.clone());
             let header = "[compacted summary of earlier conversation]\n";
+            let prefix = match &self.compaction_reminder {
+                Some(reminder) => format!("{header}\n[standing directive: {reminder}]\n\n"),
+                None => header.to_owned(),
+            };
             items.push(ContextItem {
                 message: Message::User {
-                    content: format!("{header}{summary}"),
+                    content: format!("{prefix}{summary}"),
                     images: vec![],
                 },
-                prefix: header.to_owned(),
+                prefix,
                 location: location.clone(),
                 field: Some(FieldId::CompactionSummary),
                 field_total: None,

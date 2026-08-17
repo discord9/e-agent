@@ -5316,3 +5316,58 @@ fn auto_compacted_resets_after_successful_compaction_and_stays_silent_below_thre
     );
     assert!(!agent.take_auto_compact_request());
 }
+
+#[test]
+fn compaction_reminder_is_projected_after_header_and_survives_context_rebuild() {
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.set_compaction_reminder("Keep delegation central.".into());
+    let history = vec![SessionEntry::Compaction {
+        summary: "summary text".into(),
+        retained: vec![],
+        current_prompt_at: None,
+        no_current_prompt: false,
+    }];
+    agent.restore_history(history.clone());
+    assert!(matches!(
+        &agent.context()[0],
+        Message::User { content, .. }
+            if content == "[compacted summary of earlier conversation]\n\n[standing directive: Keep delegation central.]\n\nsummary text"
+    ));
+
+    agent.restore_history(history);
+    assert!(matches!(
+        &agent.context()[0],
+        Message::User { content, .. }
+            if content == "[compacted summary of earlier conversation]\n\n[standing directive: Keep delegation central.]\n\nsummary text"
+    ));
+}
+
+#[test]
+fn compaction_without_reminder_keeps_existing_projection_bytes() {
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![SessionEntry::Compaction {
+        summary: "summary text".into(),
+        retained: vec![],
+        current_prompt_at: None,
+        no_current_prompt: false,
+    }]);
+    assert!(matches!(
+        &agent.context()[0],
+        Message::User { content, .. }
+            if content == "[compacted summary of earlier conversation]\nsummary text"
+    ));
+}

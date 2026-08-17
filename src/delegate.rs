@@ -220,6 +220,7 @@ fn task_label(label: Option<&str>, role: Option<&str>, task: &str) -> String {
 struct DelegatedTask {
     task: String,
     role_prompt: Option<String>,
+    compaction_reminder: Option<String>,
     /// True when the role's frontmatter declared `read_only = true` (or the
     /// caller's policy demands it): the subagent gets no write/edit tools and
     /// its bash runs in a narrowed read-only sandbox with network disabled.
@@ -411,6 +412,9 @@ impl Delegate {
         // runner's read_output verification share this one key); `None` when
         // the state-dir key is unavailable → fields stay full.
         agent = agent.with_receipt_codec(crate::output_receipt::ReceiptCodec::load().ok());
+        if let Some(reminder) = task.compaction_reminder {
+            agent.set_compaction_reminder(reminder);
+        }
         let mut instructions = match task.role_prompt {
             Some(template) => format!(
                 "{template}\n\nYou are running as a subagent inside the e-agent coding assistant (on the `{model_name}` model). Work autonomously on the delegated task with the file/bash tools and, when configured, public web search, then return a concise final answer."
@@ -708,6 +712,7 @@ pub async fn spawn_btw_subagent(
         DelegatedTask {
             task: question.to_owned(),
             role_prompt: None,
+            compaction_reminder: None,
             read_only,
             // btw fork has no role frontmatter: keep the historical
             // subagent default (protect .git).
@@ -924,64 +929,68 @@ impl Tool for Delegate {
         // (.e-agent/agents/<role>.md frontmatter). An unknown role is
         // rejected unless no roles are configured at all; a malformed
         // frontmatter is an error (fail closed — the role is not spawned).
-        let (model, context_window, role_prompt, read_only, protect_git) = match role.as_deref() {
-            Some(role) => {
-                let root = self
-                    .roles_root
-                    .as_deref()
-                    .ok_or("roles are not configured (no workspace roles root)")?;
-                let template = crate::roles::role_template(root, role)
-                    .map_err(|error| format!("cannot read role `{role}`: {error}"))?
-                    .ok_or_else(|| {
-                        let available = crate::roles::available_roles(root);
-                        format!(
-                            "unknown role `{role}` (available: {})",
-                            if available.is_empty() {
-                                "none".into()
-                            } else {
-                                available.join(", ")
-                            }
-                        )
-                    })?;
-                let (model, cw) = match &self.role_model_source {
-                    // Live source (session factory): pick up hot-reloaded
-                    // `[roles]` routing; when the role is not routed, fall
-                    // back to the default subagent model like the snapshot
-                    // path below.
-                    Some(source) => source(role).unwrap_or_else(|| {
-                        (self.subagent_model.clone(), self.subagent_context_window)
-                    }),
-                    // Construction-time snapshot (direct Delegate use/tests).
-                    None => (
-                        self.role_models
-                            .get(role)
-                            .cloned()
-                            .unwrap_or_else(|| self.subagent_model.clone()),
-                        self.role_context_windows
-                            .get(role)
-                            .copied()
-                            .flatten()
-                            .or(self.subagent_context_window),
-                    ),
-                };
-                (
-                    model,
-                    cw,
-                    Some(template.prompt),
-                    template.read_only,
-                    template.protect_git,
-                )
-            }
-            None => (
-                self.subagent_model.clone(),
-                self.subagent_context_window,
-                None,
-                false,
-                // No role: keep the historical subagent default (protect
-                // .git, exactly like the fixer path).
-                true,
-            ),
-        };
+        let (model, context_window, role_prompt, compaction_reminder, read_only, protect_git) =
+            match role.as_deref() {
+                Some(role) => {
+                    let root = self
+                        .roles_root
+                        .as_deref()
+                        .ok_or("roles are not configured (no workspace roles root)")?;
+                    let template = crate::roles::role_template(root, role)
+                        .map_err(|error| format!("cannot read role `{role}`: {error}"))?
+                        .ok_or_else(|| {
+                            let available = crate::roles::available_roles(root);
+                            format!(
+                                "unknown role `{role}` (available: {})",
+                                if available.is_empty() {
+                                    "none".into()
+                                } else {
+                                    available.join(", ")
+                                }
+                            )
+                        })?;
+                    let (model, cw) = match &self.role_model_source {
+                        // Live source (session factory): pick up hot-reloaded
+                        // `[roles]` routing; when the role is not routed, fall
+                        // back to the default subagent model like the snapshot
+                        // path below.
+                        Some(source) => source(role).unwrap_or_else(|| {
+                            (self.subagent_model.clone(), self.subagent_context_window)
+                        }),
+                        // Construction-time snapshot (direct Delegate use/tests).
+                        None => (
+                            self.role_models
+                                .get(role)
+                                .cloned()
+                                .unwrap_or_else(|| self.subagent_model.clone()),
+                            self.role_context_windows
+                                .get(role)
+                                .copied()
+                                .flatten()
+                                .or(self.subagent_context_window),
+                        ),
+                    };
+                    let compaction_reminder = crate::roles::core_directive(&template.prompt);
+                    (
+                        model,
+                        cw,
+                        Some(template.prompt),
+                        compaction_reminder,
+                        template.read_only,
+                        template.protect_git,
+                    )
+                }
+                None => (
+                    self.subagent_model.clone(),
+                    self.subagent_context_window,
+                    None,
+                    None,
+                    false,
+                    // No role: keep the historical subagent default (protect
+                    // .git, exactly like the fixer path).
+                    true,
+                ),
+            };
         let resume = arguments
             .as_object()
             .and_then(|args| args.get("resume"))
@@ -1181,6 +1190,7 @@ impl Tool for Delegate {
             DelegatedTask {
                 task,
                 role_prompt,
+                compaction_reminder,
                 read_only,
                 protect_git,
                 sandbox: task_sandbox,

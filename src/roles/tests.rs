@@ -284,3 +284,28 @@ fn frontmatter_flag_comes_from_the_winning_workspace_layer() {
 
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
 }
+
+#[test]
+fn core_directive_extracts_trimmed_body() {
+    let template =
+        "# Role\n\n## Core directive\n\n  Keep the task scoped.  \n\n  Verify results.\n";
+    assert_eq!(
+        core_directive(template).as_deref(),
+        Some("Keep the task scoped.\nVerify results.")
+    );
+}
+
+#[test]
+fn core_directive_returns_none_when_absent_or_empty() {
+    assert_eq!(core_directive("# Role\n\nNo directive here."), None);
+    assert_eq!(
+        core_directive("## Core directive\n\n   \n\n### Next section\ntext"),
+        None
+    );
+}
+
+#[test]
+fn core_directive_stops_at_next_heading() {
+    let template = "## Core directive\nFirst line\n\n## Details\nSecond line";
+    assert_eq!(core_directive(template).as_deref(), Some("First line"));
+}
