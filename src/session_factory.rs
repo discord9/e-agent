@@ -780,6 +780,9 @@ impl SessionFactory {
         // named roles.
         let role_name = match crate::roles::role_prompt(&self.root, crate::roles::MAIN_ROLE)? {
             Some(orchestrator) => {
+                if let Some(reminder) = crate::roles::core_directive(&orchestrator) {
+                    agent.set_compaction_reminder(reminder);
+                }
                 context.push(orchestrator);
                 Some(crate::roles::MAIN_ROLE.to_owned())
             }

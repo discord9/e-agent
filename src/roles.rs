@@ -12,7 +12,9 @@
 //! prompts. The `delegate` tool lists the available roles and routes each
 //! subagent onto the role's model (from `[roles]` in the config) and prompt.
 //! `main.md` is special: it is the MAIN agent's orchestrator template, not a
-//! delegable role.
+//! delegable role. A template may also contain a `## Core directive` section;
+//! its non-empty body lines through the next Markdown heading form the compacted
+//! conversation reminder for agents installed from that template.
 
 use std::path::{Path, PathBuf};
 
@@ -150,6 +152,31 @@ fn parse_role_template(content: String) -> std::io::Result<RoleTemplate> {
 /// error when a file exists but cannot be read or has malformed frontmatter.
 pub fn role_prompt(workspace: &Path, role: &str) -> std::io::Result<Option<String>> {
     Ok(role_template(workspace, role)?.map(|template| template.prompt))
+}
+
+/// Extract the optional compacted-conversation reminder from a role template.
+/// The body of a `## Core directive` section is trimmed line-by-line, empty
+/// lines are omitted, and the remaining lines are joined with newlines.
+pub fn core_directive(template: &str) -> Option<String> {
+    let mut lines = template.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == "## Core directive" {
+            let directive = lines
+                .take_while(|line| !markdown_heading(line))
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return (!directive.is_empty()).then_some(directive);
+        }
+    }
+    None
+}
+
+/// Whether `line` begins with a Markdown heading as defined by `^#{1,6} `.
+fn markdown_heading(line: &str) -> bool {
+    let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+    (1..=6).contains(&hashes) && line.as_bytes().get(hashes) == Some(&b' ')
 }
 
 /// Role names available across both layers (union), sorted, excluding the
