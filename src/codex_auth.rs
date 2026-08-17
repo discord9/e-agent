@@ -247,10 +247,13 @@ pub async fn login() -> anyhow::Result<CodexAuth> {
             .send()
             .await
             .context("ChatGPT authorization-code exchange failed")?;
-        if !response.status().is_success() {
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
             bail!(
-                "ChatGPT authorization-code exchange failed with HTTP {}",
-                response.status()
+                "ChatGPT authorization-code exchange failed with HTTP {}: {}",
+                status,
+                body.chars().take(500).collect::<String>()
             );
         }
         let returned: TokenResponse = response
