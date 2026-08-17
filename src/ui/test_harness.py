@@ -7382,11 +7382,27 @@ for _sel, _bgvar in [
     if _cr < 4.5:
         _contrast_ok = False
     print(("PASS" if _cr >= 4.5 else "FAIL") + " contrast %.2f:1 %s" % (_cr, _sel))
+# viewport：使用设备 CSS 宽度和 1x 初始比例，同时不得禁止用户缩放（WCAG）。
+# 这也保证 <=480/600px 的现有移动端媒体查询按设备宽度生效。
+_html = open(os.path.join(HERE, 'index.html'), encoding='utf-8').read()
+_viewport_m = re.search(r'<meta\s+name=["\']viewport["\']\s+content=["\']([^"\']+)["\']', _html, re.I)
+_viewport_content = _viewport_m.group(1).lower() if _viewport_m else ''
+_viewport_ok = bool(
+    re.search(r'(^|,)\s*width\s*=\s*device-width\s*(,|$)', _viewport_content)
+    and re.search(r'(^|,)\s*initial-scale\s*=\s*1(?:\.0+)?\s*(,|$)', _viewport_content)
+    and 'maximum-scale' not in _viewport_content
+    and 'user-scalable' not in _viewport_content)
+print(("PASS" if _viewport_ok else "FAIL") + " accessible responsive viewport meta in index.html")
+# visualViewport.resize 同时代表软键盘和 pinch zoom。缩放时必须清除 JS 高度
+# 覆盖，不能把 visual viewport 的缩小高度误当作 layout viewport 高度。
+_zoom_guard_ok = bool(
+    re.search(r'zoomed\s*=\s*vv[^;]*vv\.scale', js)
+    and re.search(r'if\s*\(zoomed\)\s*\{[^}]*removeProperty\(["\']--app-height["\']\)[^}]*return', js, re.S))
+print(("PASS" if _zoom_guard_ok else "FAIL") + " pinch zoom leaves app height to CSS layout viewport")
 # favicon：index.html 的 <head> 必须有内联 SVG data URI 图标（gjs 不渲染页面，
 # 因此与上面的 CSS 段一样做静态断言）；data URI 中的 # 必须已转义为 %23，
 # 否则浏览器把 # 当 fragment 截断，图标静默失效。
-_html = open(os.path.join(HERE, 'index.html'), encoding='utf-8').read()
 _icon_m = re.search(r'<link\s+rel="icon"\s+type="image/svg\+xml"\s+href="(data:image/svg\+xml,[^"]+)"', _html)
 _icon_ok = bool(_icon_m and '%23' in _icon_m.group(1) and '#' not in _icon_m.group(1))
 print(("PASS" if _icon_ok else "FAIL") + " inline SVG favicon data URI in index.html head")
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _empty_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _icon_ok else 1)
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _empty_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok else 1)

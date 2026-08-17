@@ -24,7 +24,7 @@
   [hidden] { display: none !important; }
 
   html, body {
-    /* 布局高度跟随 app.js 的 syncAppHeight()：软键盘弹出时 visualViewport
+    /* 布局高度跟随 sse.js 的 syncAppHeight()：软键盘弹出时 visualViewport
        收缩，--app-height 随之变小，flex 布局自动收缩（顶栏/侧边栏/composer
        都在可视区内）。JS 未跑时回退 100%（老浏览器）/100dvh（见下）。 */
     height: var(--app-height, 100%);

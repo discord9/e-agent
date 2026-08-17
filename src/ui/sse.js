@@ -599,16 +599,23 @@ els.jumpBottomBtn.addEventListener("click", () => {
  * ===================================================================*/
 /* 移动端软键盘弹出时 100dvh 不收缩（键盘是覆盖式：visualViewport 变小但
    布局视口高度不变）→ 底部 composer 被键盘盖住、顶栏/侧边栏被挤出可视区。
-   标准解法：监听 visualViewport 的 resize（键盘弹出/收起触发），动态把
-   visualViewport.height 写入 --app-height，布局用它替代 100dvh（style.css
-   html/body 高度）。桌面 visualViewport.height === innerHeight，设的值等于
-   原高度，无视觉变化。 */
+   键盘打开与 pinch zoom 都会触发 visualViewport.resize；区别是前者保持
+   scale=1，后者会改变 scale。只有未缩放时才能把 visualViewport.height 当成
+   布局高度；缩放时必须回到 CSS 的 100dvh，否则会把已缩小的视觉视口高度
+   再应用给布局，造成顶栏、消息区和 composer 一起收缩/错位。 */
 let appHeightRaf = null;
 function syncAppHeight() {
   if (appHeightRaf !== null) return;        // 节流：合并同帧内连续 resize
   appHeightRaf = requestAnimationFrame(() => {
     appHeightRaf = null;
     const vv = window.visualViewport;
+    const zoomed = vv && Number.isFinite(vv.scale) && Math.abs(vv.scale - 1) > 0.01;
+    if (zoomed) {
+      // Pinch zoom 只改变视觉视口，不应重排布局；同时避免 scrollIntoView
+      // 在每个缩放帧把页面推向输入框。
+      document.documentElement.style.removeProperty("--app-height");
+      return;
+    }
     const h = (vv && vv.height) ? vv.height : window.innerHeight;
     document.documentElement.style.setProperty("--app-height", h + "px");
     // 兜底：布局收缩后 composer 应在可视区底部（body flex column 内）。
@@ -624,9 +631,8 @@ function init() {
   // 桌宠点击时从这里读当前 sessionId / token / 运行中任务。
   window.state = state;
   refreshBanner();
-  // 软键盘适配：初始按当前 visualViewport 高度设置 --app-height；并绑定
-  // visualViewport.resize（键盘弹出/收起触发，iOS Safari 关键路径）+
-  // window.resize（无 visualViewport 的浏览器兜底）。
+  // 软键盘适配：初始同步高度；visualViewport.resize 同时覆盖键盘与缩放，
+  // syncAppHeight 会用 scale 区分两者；window.resize 是旧浏览器兜底。
   syncAppHeight();
   const vv = window.visualViewport;
   if (vv && vv.addEventListener) vv.addEventListener("resize", syncAppHeight);
