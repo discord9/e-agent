@@ -5770,6 +5770,13 @@ async fn update_goal_rejects_wrong_typed_criteria_and_evidence() {
                 tool_calls: vec![],
                 reasoning: None,
             },
+            // The still-active goal starts one non-streaming continuation
+            // turn, which then stops at the anti-spin guard.
+            AssistantMessage {
+                content: Some("continuation done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
         ]),
     };
     let mut agent = Agent::new(
@@ -5865,6 +5872,13 @@ async fn update_goal_rejects_unknown_fields_without_commit() {
             },
             AssistantMessage {
                 content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            // The still-active goal starts one non-streaming continuation
+            // turn, which then stops at the anti-spin guard.
+            AssistantMessage {
+                content: Some("continuation done".into()),
                 tool_calls: vec![],
                 reasoning: None,
             },
@@ -5973,6 +5987,13 @@ async fn get_goal_rejects_unknown_arguments_and_non_object() {
                 tool_calls: vec![],
                 reasoning: None,
             },
+            // The still-active goal starts one non-streaming continuation
+            // turn, which then stops at the anti-spin guard.
+            AssistantMessage {
+                content: Some("continuation done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
         ]),
     };
     let mut agent = Agent::new(
@@ -6025,6 +6046,741 @@ async fn get_goal_rejects_unknown_arguments_and_non_object() {
     // get_goal never mutates: the goal snapshot is untouched.
     assert_eq!(handle.goal().unwrap().revision, goal.revision);
     assert_eq!(handle.goal().unwrap().id, goal.id);
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Goal continuation: natural-end auto-continuation rounds
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// Scripted model that streams a content delta on every call, so a
+/// continuation round counts as "produced content" for the anti-spin check.
+struct StreamingScriptedModel {
+    replies: VecDeque<AssistantMessage>,
+}
+
+#[async_trait]
+impl Model for StreamingScriptedModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        let reply = self.replies.pop_front().expect("unexpected model call");
+        if let Some(callback) = &mut on_delta {
+            callback(ModelDeltaKind::Content, "x");
+        }
+        Ok((reply, None))
+    }
+}
+
+/// Scripted model that streams a content delta on every call and blocks on
+/// one designated call (1-based) until released — used to hold a
+/// continuation round in flight while the test queues a user prompt.
+struct BlockingScriptedModel {
+    replies: VecDeque<AssistantMessage>,
+    block_call: usize,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    call_count: usize,
+}
+
+#[async_trait]
+impl Model for BlockingScriptedModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.call_count += 1;
+        let reply = self.replies.pop_front().expect("unexpected model call");
+        if let Some(callback) = &mut on_delta {
+            callback(ModelDeltaKind::Content, "x");
+        }
+        if self.call_count == self.block_call {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok((reply, None))
+    }
+}
+
+fn gc_text_reply(text: &str) -> AssistantMessage {
+    AssistantMessage {
+        content: Some(text.into()),
+        tool_calls: vec![],
+        reasoning: None,
+    }
+}
+
+fn gc_notice(event: &AgentEvent) -> bool {
+    // Round notices only; the cap notice shares the prefix but is a
+    // distinct event ("cap reached"), so it must not count as a round.
+    matches!(event, AgentEvent::Notice(text) if text.contains("[goal continuation") && !text.contains("cap reached"))
+}
+
+#[tokio::test]
+async fn active_goal_auto_continues_up_to_limit_then_stops_with_cap_notice() {
+    // An active goal + no background + budget left: every natural turn end
+    // starts one more completely normal turn from an empty prompt batch.
+    // The chain runs exactly GOAL_CONTINUATION_LIMIT rounds, then stops
+    // with the cap notice — never a runaway loop.
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut agent = Agent::new(
+        Box::new(StreamingScriptedModel {
+            replies: (0..(GOAL_CONTINUATION_LIMIT as usize + 1))
+                .map(|i| gc_text_reply(&format!("answer {i}")))
+                .collect(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated { goal: Some(goal) }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-cont-limit".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let _task = runner.start(Some("work".into()));
+    let mut status = handle.status();
+    // The cap notice is emitted right before the FINAL Idle, so waiting for
+    // it first makes the later Idle wait unambiguous (the runner returns
+    // to Idle between continuation rounds too).
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE),
+    )
+    .await;
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    let snapshot = handle.snapshot();
+    let continuations = snapshot.iter().filter(|event| gc_notice(event)).count();
+    assert_eq!(
+        continuations, GOAL_CONTINUATION_LIMIT as usize,
+        "exactly the continuation budget must run"
+    );
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|event| {
+                matches!(event, AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE)
+            })
+            .count(),
+        1,
+        "one cap notice when the budget is exhausted"
+    );
+    assert!(matches!(&*status.borrow(), SessionStatus::Idle));
+
+    // Durable persistence: one user prompt + (limit + 1) assistants + limit
+    // continuation notices.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-cont-limit")
+        .await
+        .unwrap();
+    let notices = loaded
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(entry, SessionEntry::Notice { text } if text.contains("[goal continuation"))
+        })
+        .count();
+    assert_eq!(notices, GOAL_CONTINUATION_LIMIT as usize);
+    let assistants = loaded
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                SessionEntry::Message {
+                    message: Message::Assistant(message),
+                } if message.content.is_some()
+            )
+        })
+        .count();
+    assert_eq!(assistants, GOAL_CONTINUATION_LIMIT as usize + 1);
+}
+
+#[tokio::test]
+async fn continuation_round_without_content_delta_stops_chain() {
+    // Anti-spin: a continuation round whose final model round streamed no
+    // content delta stops the chain — a silent model cannot keep the
+    // session self-continuing. The FIRST continuation still runs (the
+    // initial user turn is not itself a continuation), then the mount point
+    // sees a content-less continuation round and parks at Idle.
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                gc_text_reply("initial"),
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated { goal: Some(goal) }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-cont-spin".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let _task = runner.start(Some("work".into()));
+    // The initial user turn ends with a visible answer; only THEN can the
+    // mount point fire, so wait for it before expecting Idle.
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "initial" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    // Exactly one Idle in this scenario (the final one): the first
+    // continuation is followed by the anti-spin stop.
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    let snapshot = handle.snapshot();
+    let continuations = snapshot.iter().filter(|event| gc_notice(event)).count();
+    assert_eq!(
+        continuations, 1,
+        "a content-less continuation round must stop the chain"
+    );
+    assert!(
+        !snapshot
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE)),
+        "no cap notice: the budget was not exhausted"
+    );
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-cont-spin")
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry, SessionEntry::Notice { text } if text.contains("[goal continuation"))
+            })
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn model_completing_goal_in_continuation_round_stops_chain() {
+    // A model-side goal transition in a continuation round naturally stops
+    // the chain: the goal is no longer Active, so the next mount point does
+    // not continue. Exactly one continuation round runs.
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let id = goal.id.clone();
+    let rev = goal.revision;
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                gc_text_reply("first"),
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "update_goal".into(),
+                        arguments: serde_json::json!({
+                            "id": id, "revision": rev, "action": "complete",
+                            "evidence": ["unverified: analysis passed"]
+                        })
+                        .to_string(),
+                    }],
+                    reasoning: None,
+                },
+                gc_text_reply("done"),
+            ]),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated { goal: Some(goal) }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-cont-complete".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let _task = runner.start(Some("work".into()));
+    // Wait for the continuation round's own final answer: the goal is then
+    // durably completed and the mount point has decided NOT to continue.
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "done" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    let snapshot = handle.snapshot();
+    assert_eq!(
+        snapshot.iter().filter(|event| gc_notice(event)).count(),
+        1,
+        "the completing continuation round is the only one"
+    );
+    assert_eq!(
+        handle.goal().unwrap().status,
+        crate::agent::GoalStatus::Completed,
+        "the continuation round completed the goal"
+    );
+    assert!(
+        !snapshot
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE)),
+        "no cap notice: the goal stopped the chain first"
+    );
+}
+
+#[tokio::test]
+async fn user_message_during_continuation_stops_chain_then_resumes() {
+    // A user prompt queued while a continuation round is in flight lands in
+    // `pending`, so the mount point skips the next continuation and the
+    // user turn runs first. The goal is still active and the budget is not
+    // reset, so continuation resumes AFTER the user turn; the interrupt is
+    // proven by the UserPrompt event arriving BEFORE the second
+    // continuation notice.
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    // Initial turn + continuation 1 + user turn + continuations 2..=10.
+    let replies: VecDeque<AssistantMessage> = (0..(GOAL_CONTINUATION_LIMIT as usize + 2))
+        .map(|i| gc_text_reply(&format!("reply {i}")))
+        .collect();
+    let mut agent = Agent::new(
+        Box::new(BlockingScriptedModel {
+            replies,
+            block_call: 2, // continuation round 1
+            entered: entered.clone(),
+            release: release.clone(),
+            call_count: 0,
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated { goal: Some(goal) }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-cont-user".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let _task = runner.start(Some("work".into()));
+
+    // Wait for continuation round 1 to be in flight (blocked in the model),
+    // queue the user prompt, then release the round.
+    entered.notified().await;
+    handle.prompt("user message");
+    release.notify_one();
+
+    // Consume events until the UserPrompt: exactly one continuation notice
+    // (round 1) may precede it; the queued prompt must block round 2.
+    let mut continuations = 0usize;
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::UserPrompt(text) if text == "user message" => break,
+            AgentEvent::Notice(text) if text.contains("[goal continuation") => {
+                continuations += 1;
+            }
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        continuations, 1,
+        "the queued user prompt must block the next continuation"
+    );
+
+    // The chain resumes after the user turn and exhausts the budget.
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE),
+    )
+    .await;
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    let snapshot = handle.snapshot();
+    assert_eq!(
+        snapshot.iter().filter(|event| gc_notice(event)).count(),
+        GOAL_CONTINUATION_LIMIT as usize,
+        "the continuation budget is not reset by a user interrupt"
+    );
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|event| {
+                matches!(event, AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE)
+            })
+            .count(),
+        1
+    );
+
+    // Durable ordering: the 1st continuation notice precedes the user
+    // message, and a later continuation notice follows it.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-cont-user")
+        .await
+        .unwrap();
+    let mut first_notice_seen = false;
+    let mut saw_user = false;
+    let mut notice_after_user = false;
+    for entry in &loaded.entries {
+        match entry {
+            SessionEntry::Notice { text } if text.contains("[goal continuation") => {
+                if !first_notice_seen {
+                    assert!(
+                        !saw_user,
+                        "the 1st continuation notice must precede the user message"
+                    );
+                    first_notice_seen = true;
+                } else if saw_user {
+                    notice_after_user = true;
+                }
+            }
+            SessionEntry::Message {
+                message: Message::User { content, .. },
+            } if content == "user message" => {
+                saw_user = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(first_notice_seen && saw_user && notice_after_user);
+}
+
+async fn assert_no_goal_continuation(
+    temp: &std::path::Path,
+    session: &str,
+    goal_entries: Vec<SessionEntry>,
+) {
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![gc_text_reply("answer")]),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    if !goal_entries.is_empty() {
+        agent.restore_history(goal_entries);
+    }
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.to_path_buf(),
+        session.into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let _task = runner.start(Some("work".into()));
+    // The status watch starts at Idle, so wait for the turn's own answer
+    // first (its natural end is when the mount point could fire), then for
+    // the final Idle.
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "answer" => break,
+            AgentEvent::Error(text) => panic!("turn failed for {session}: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    let snapshot = handle.snapshot();
+    assert!(
+        !snapshot.iter().any(gc_notice),
+        "no goal continuation expected for {session}"
+    );
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::AssistantText(text) if text == "answer"))
+            .count(),
+        1,
+        "exactly one answer for {session}"
+    );
+}
+
+#[tokio::test]
+async fn no_goal_paused_or_blocked_goal_never_self_continue() {
+    let temp = tempfile::tempdir().unwrap();
+    // No goal at all.
+    assert_no_goal_continuation(temp.path(), "goal-none", Vec::new()).await;
+    // Paused.
+    let active = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let paused = crate::agent::transition_goal(
+        Some(&active),
+        &active.id,
+        active.revision,
+        &crate::agent::GoalAction::Pause,
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_no_goal_continuation(
+        temp.path(),
+        "goal-paused",
+        vec![SessionEntry::GoalUpdated { goal: Some(paused) }],
+    )
+    .await;
+    // Blocked.
+    let blocked = crate::agent::transition_goal(
+        Some(&active),
+        &active.id,
+        active.revision,
+        &crate::agent::GoalAction::Block {
+            reason: "stuck".into(),
+        },
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_no_goal_continuation(
+        temp.path(),
+        "goal-blocked",
+        vec![SessionEntry::GoalUpdated {
+            goal: Some(blocked),
+        }],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn blocking_background_preempts_goal_continuation_until_completion() {
+    // A blocking background task suppresses goal continuation: the session
+    // parks at Idle with the goal still active, and only the
+    // background-completion follow-up turn (top-of-loop injection) runs.
+    // That follow-up is a Background-kind turn, so it must NOT itself chain
+    // into goal continuation.
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("cargo build", false)],
+                    reasoning: None,
+                },
+                gc_text_reply("build started, waiting"),
+                gc_text_reply("build done, final"),
+            ]),
+        }),
+        vec![Box::new(MockBackgroundBash {
+            id: 9,
+            label: "cargo build",
+            sender: sender.clone(),
+        })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated { goal: Some(goal) }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-cont-bg".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("run build".into()));
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "build started, waiting" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(
+        !matches!(&*status.borrow(), SessionStatus::Finished(_)),
+        "a blocking background task must keep the session parked"
+    );
+    assert!(
+        !handle.snapshot().iter().any(gc_notice),
+        "goal continuation must not run with a blocking background task"
+    );
+
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("agent must wire the bash completion sender")
+        .send(AgentEvent::BackgroundCompleted {
+            id: 9,
+            output: "build ok".into(),
+            label: Some("cargo build".into()),
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
+        })
+        .unwrap();
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "build done, final" => break,
+            AgentEvent::Error(text) => panic!("follow-up turn failed: {text}"),
+            _ => {}
+        }
+    }
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("build done, final".into())))
+    );
+    task.join().await.unwrap();
+    assert!(
+        !handle.snapshot().iter().any(gc_notice),
+        "the background follow-up turn must not chain into goal continuation"
+    );
+}
+
+#[tokio::test]
+async fn plain_turn_without_goal_finalizes_without_continuation() {
+    // Regression: a plain FinishWhenIdle session with no goal behaves
+    // exactly as before — one turn, finalize, no self-continuation.
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![gc_text_reply("answer")]),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "plain-no-goal".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("work".into()));
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("answer".into())))
+    );
+    task.join().await.unwrap();
+    assert!(!handle.snapshot().iter().any(gc_notice));
+}
+
+#[tokio::test]
+async fn continuation_entries_persist_and_budget_not_replenished_by_user_turns() {
+    // Durability + budget semantics: every continuation round commits a
+    // durable Notice + Assistant entry pair (JSONL). After the budget is
+    // exhausted, a later user turn neither continues (budget stays 0) nor
+    // re-emits the cap notice.
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut agent = Agent::new(
+        Box::new(StreamingScriptedModel {
+            replies: (0..(GOAL_CONTINUATION_LIMIT as usize + 2))
+                .map(|i| gc_text_reply(&format!("answer {i}")))
+                .collect(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated { goal: Some(goal) }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-cont-persist".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let _task = runner.start(Some("work".into()));
+
+    // Budget exhausted: cap notice, then a fresh user turn.
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE),
+    )
+    .await;
+    handle.prompt("anyone there?");
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::UserPrompt(text) if text == "anyone there?" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    // The user turn is running (status Busy when UserPrompt fired): the
+    // next Idle is the final one — the budget is 0, so no continuation can
+    // follow the user turn.
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    let snapshot = handle.snapshot();
+    assert_eq!(
+        snapshot.iter().filter(|event| gc_notice(event)).count(),
+        GOAL_CONTINUATION_LIMIT as usize,
+        "no continuation after the budget is exhausted"
+    );
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|event| {
+                matches!(event, AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE)
+            })
+            .count(),
+        1,
+        "the cap notice is not re-emitted by later user turns"
+    );
+    // Durable entries: limit notices + (limit + 2) assistants (initial,
+    // limit continuations, user turn) + the user message.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-cont-persist")
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry, SessionEntry::Notice { text } if text.contains("[goal continuation"))
+            })
+            .count(),
+        GOAL_CONTINUATION_LIMIT as usize
+    );
+    assert_eq!(
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Message {
+                        message: Message::Assistant(message),
+                    } if message.content.is_some()
+                )
+            })
+            .count(),
+        GOAL_CONTINUATION_LIMIT as usize + 2
+    );
+    assert!(loaded.entries.iter().any(|entry| {
+        matches!(
+            entry,
+            SessionEntry::Message {
+                message: Message::User { content, .. },
+            } if content == "anyone there?"
+        )
+    }));
 }
 
 struct SlowTool {
