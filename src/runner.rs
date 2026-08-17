@@ -1165,7 +1165,27 @@ impl SessionRunner {
                 self.agent.set_model(model);
                 Steering::None
             }
-            SessionCommand::Cancel => self.release_steering(),
+            SessionCommand::Cancel => {
+                self.cancel_goal_continuation();
+                self.release_steering()
+            }
+        }
+    }
+
+    /// A consumed cancel must prevent a just-finished turn, or an already
+    /// armed empty continuation batch, from starting another goal round.
+    /// Empty, non-queued prompts are internal continuation markers (goal or
+    /// background), never human prompt work.
+    fn cancel_goal_continuation(&mut self) {
+        self.turn_just_ended = false;
+        self.pending.retain(|command| {
+            !matches!(
+                command,
+                PendingCommand::Prompt { text, queued: false, .. } if text.is_empty()
+            )
+        });
+        if self.next_turn_kind == NextTurnKind::Goal {
+            self.next_turn_kind = NextTurnKind::User;
         }
     }
     async fn commit_backgrounds(&mut self) -> anyhow::Result<bool> {
@@ -1188,7 +1208,7 @@ impl SessionRunner {
     fn has_prompt_work(&self) -> bool {
         self.pending
             .iter()
-            .any(|command| matches!(command, PendingCommand::Prompt { .. }))
+            .any(|command| matches!(command, PendingCommand::Prompt { queued: true, .. }))
     }
 
     fn release_steering(&self) -> Steering {
@@ -1393,6 +1413,7 @@ impl SessionRunner {
                 OperationFlow::Done(Steering::None)
             }
             WaitOutcome::Released => {
+                self.cancel_goal_continuation();
                 // The in-flight compaction future was dropped: no entry, no
                 // projection. The release is known (the Cancel was consumed
                 // by wait_for_operation); classify from what is now queued.
@@ -1690,6 +1711,7 @@ impl SessionRunner {
                         break 'turn; // 外层循环自然回 Idle
                     }
                     WaitOutcome::Released => {
+                        self.cancel_goal_continuation();
                         // The in-flight model future was dropped (preempted):
                         // its output is never committed. Queued prompts are
                         // consumed by the outer loop; with none queued the
@@ -1752,11 +1774,11 @@ impl SessionRunner {
                     self.agent.emit_event(AgentEvent::AssistantText(text));
                 }
                 if steering != Steering::None && calls.is_empty() {
-                    // Stale release: the round completed naturally (final
-                    // answer, no tool calls) and its output is committed —
-                    // the committed result wins over the racing cancel
-                    // (contract: completed output is never lost). Ignore the
-                    // release; the outer loop finalizes normally.
+                    // The round completed naturally (final answer, no tool
+                    // calls), so preserve its committed output. A racing
+                    // cancel still suppresses its natural-end continuation
+                    // latch; policy below returns to Idle/finalizes normally.
+                    self.turn_just_ended = false;
                 } else if steering != Steering::None {
                     // The round was committed but the turn still had work
                     // (tool calls / more rounds): the release stops it here.
@@ -1811,7 +1833,9 @@ impl SessionRunner {
                     // whether its final model round streamed any content
                     // delta, so a content-less continuation round stops the
                     // chain at the next mount point.
-                    if self.current_turn_kind != NextTurnKind::Background {
+                    if self.current_turn_kind != NextTurnKind::Background
+                        && steering == Steering::None
+                    {
                         self.turn_just_ended = true;
                     }
                     self.last_turn_was_continuation = self.current_turn_kind == NextTurnKind::Goal;
@@ -1922,6 +1946,7 @@ impl SessionRunner {
                     let result = match waited.outcome {
                         WaitOutcome::Completed(result) => result,
                         WaitOutcome::Released => {
+                            self.cancel_goal_continuation();
                             // The in-flight tool future was dropped; the
                             // interrupted tool call is never committed (the
                             // next provider context synthesizes an error
@@ -2014,10 +2039,20 @@ impl SessionRunner {
                 // real Tool result of the batch. Pending commands (if any)
                 // are unaffected: `commit_backgrounds` only drains the
                 // agent's background channel.
-                if let Err(error) = self.commit_backgrounds().await {
-                    self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
-                        .await;
-                    return;
+                match self.commit_backgrounds().await {
+                    Ok(true) => {
+                        // A completion injected at this model-call boundary
+                        // makes the current turn ineligible to arm goal
+                        // continuation; its own top-of-loop follow-up owns
+                        // any later continuation behavior.
+                        self.current_turn_kind = NextTurnKind::Background;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                            .await;
+                        return;
+                    }
                 }
                 // Poll-guard termination: the full sibling batch is durably
                 // committed and the safe point ran — only now emit the

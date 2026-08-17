@@ -6120,6 +6120,196 @@ fn gc_notice(event: &AgentEvent) -> bool {
     matches!(event, AgentEvent::Notice(text) if text.contains("[goal continuation") && !text.contains("cap reached"))
 }
 
+struct CompletingBackgroundTool {
+    sender: Arc<Mutex<Option<mpsc::UnboundedSender<AgentEvent>>>>,
+}
+
+#[async_trait]
+impl Tool for CompletingBackgroundTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "complete_background".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        self.sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("agent must wire the completion sender")
+            .send(AgentEvent::BackgroundCompleted {
+                id: 42,
+                output: "background done".into(),
+                label: Some("test task".into()),
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: Some(0),
+                signal: None,
+                status: None,
+                kind: None,
+            })
+            .unwrap();
+        Ok(ToolOutput::text("tool done"))
+    }
+
+    fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
+        *self.sender.lock().unwrap() = Some(sender);
+    }
+}
+
+#[tokio::test]
+async fn cancel_after_natural_end_before_continuation_mount_suppresses_latch() {
+    // This is the idle release path: a natural turn has ended, but the
+    // continuation mount has not run yet. Cancel must clear the latch before
+    // WaitForInput publishes Idle.
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::new(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (mut runner, _) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-cancel-before-mount".into(),
+        IdlePolicy::WaitForInput,
+    );
+    runner.turn_just_ended = true;
+    assert_eq!(runner.queue(SessionCommand::Cancel), Steering::ReleasedIdle);
+    assert!(!runner.turn_just_ended);
+    assert!(!runner.has_work());
+}
+
+#[tokio::test]
+async fn cancel_after_goal_continuation_marker_armed_removes_marker() {
+    // The durable notice is already committed, but the empty internal prompt
+    // has not started a model call. Cancel must remove that marker rather
+    // than classifying it as queued human work.
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::new(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (mut runner, _) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-cancel-armed".into(),
+        IdlePolicy::WaitForInput,
+    );
+    runner.start_goal_continuation().await;
+    assert!(!runner.has_prompt_work());
+    assert!(runner.has_work());
+    assert_eq!(runner.queue(SessionCommand::Cancel), Steering::ReleasedIdle);
+    assert!(!runner.has_work());
+    assert_eq!(runner.next_turn_kind, NextTurnKind::User);
+}
+
+#[tokio::test]
+async fn cancel_racing_completed_final_goal_round_preserves_answer_without_continuation() {
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let commands = Arc::new(Mutex::new(None));
+    let mut agent = Agent::new(
+        Box::new(CompletingWithCancelModel {
+            reply: Some("completed answer".into()),
+            commands: commands.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated { goal: Some(goal) }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-cancel-racing-final".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    *commands.lock().unwrap() = Some(handle.commands.clone());
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("work".into()));
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "completed answer" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert!(handle.snapshot().iter().any(
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "completed answer")
+    ));
+    assert!(
+        !handle.snapshot().iter().any(gc_notice),
+        "the racing cancel must suppress continuation"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn mid_turn_background_completion_suppresses_goal_continuation() {
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "complete_background".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                gc_text_reply("final answer"),
+            ]),
+        }),
+        vec![Box::new(CompletingBackgroundTool {
+            sender: sender.clone(),
+        })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated { goal: Some(goal) }]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-mid-turn-background".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("work".into()));
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "final answer" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(
+        handle
+            .snapshot()
+            .iter()
+            .any(|event| matches!(event, AgentEvent::BackgroundCompletionNotice { id: 42, .. }))
+    );
+    assert!(
+        !handle.snapshot().iter().any(gc_notice),
+        "a mid-turn completion must not chain into goal continuation"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
 #[tokio::test]
 async fn active_goal_auto_continues_up_to_limit_then_stops_with_cap_notice() {
     // An active goal + no background + budget left: every natural turn end
