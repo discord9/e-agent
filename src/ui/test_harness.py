@@ -438,6 +438,8 @@ let sessionsDataB = [
   {id:"b-orphan",parent_session_id:"missing-b",status:"Idle",entry_count:1,active:true},
 ];
 let sessionsBFail = false;
+// 会话列表瞬态故障测试：network/timeout 不应占用全局 banner，401/403 保持认证提示。
+let sessionsAListFailure = null;
 // perf 回归测试：B 的 /api/sessions GET 延迟（手动 resolve）——验证整轮
 // 渲染一次 + 轮询 setTimeout 链防重入（慢响应期间不叠加、完成后才续调度）
 let sessionsPDelayed = false;
@@ -532,6 +534,10 @@ globalThis.fetch=(url,opts={})=>{
       if(url==="/api/sessions"&&m==="GET") {
         if (opts && opts.signal) pollSignalSeen = true;
         if (sessionsAFail) return resp(500, {}, signal);
+        if (sessionsAListFailure === "network") return Promise.reject(new TypeError("network error"));
+        if (sessionsAListFailure === "timeout") return abortable(new Promise(() => {}), signal);
+        if (sessionsAListFailure === "auth401") return resp(401, {}, signal);
+        if (sessionsAListFailure === "auth403") return resp(403, {}, signal);
         if (sessionsDelayed) return new Promise((resolve) => { sessionsResolve = resolve; });
         return resp(200, sessionsData, signal);
   }
@@ -4856,6 +4862,128 @@ async function main(){
     sessionsBFail = false;
 
     // =====================================================================
+    // 15e) 会话列表瞬态故障：缓存仍可点击；只在 workspace 内轻提示，
+    //      不占用全局 banner。认证失败仍是明确的 banner；成功恢复/空数组
+    //      分别清标记/覆盖 stale 缓存。
+    // =====================================================================
+    sessionsData = [
+      { id: "a1", status: "Idle", title: "瞬态缓存会话", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true },
+    ];
+    state.workspaces = [{ id: "wsTransient", name: "瞬态服务器", url: "", token: "tok-t" }];
+    state.workspace = state.workspaces[0];
+    state.token = "tok-t";
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    elsById["banner"].hidden = true; elsById["bannerText"].textContent = "";
+    await pollAllWorkspaces();
+    await flush();
+
+    sessionsAListFailure = "network";
+    await pollAllWorkspaces();
+    await flush();
+    renderSidebarTree(true);
+    let transientRow = elsById["sidebarTree"].querySelector(".tree-row");
+    chk("transient network: stale rows stay visible/clickable with degraded marker and no banner",
+        state.workspaceErrors["wsTransient"] === "network"
+        && transientRow !== null
+        && elsById["sidebarTree"].querySelector(".ws-degraded") !== null
+        && elsById["sidebarTree"].textContent.includes("列表暂时不可刷新，重试中…")
+        && elsById["banner"].hidden === true,
+        "err=" + state.workspaceErrors["wsTransient"]
+        + " banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    transientRow._listeners["click"][0]();
+    await flush(); await flush();
+    chk("transient network: stale row still opens its session", state.sessionId === "a1",
+        "sid=" + state.sessionId);
+
+    sessionsAListFailure = "timeout";
+    const transientTimeoutStart = scheduledTimeouts.length;
+    const transientTimeoutPoll = pollAllWorkspaces();
+    await flush();
+    let transientAbort = null;
+    for (let i = scheduledTimeouts.length - 1; i >= transientTimeoutStart; i--) {
+      if (scheduledTimeouts[i]) { transientAbort = scheduledTimeouts[i]; break; }
+    }
+    if (transientAbort) transientAbort();
+    await transientTimeoutPoll;
+    await flush();
+    renderSidebarTree(true);
+    transientRow = elsById["sidebarTree"].querySelector(".tree-row");
+    chk("transient timeout: stale rows stay visible/clickable with degraded marker and no banner",
+        state.workspaceErrors["wsTransient"] === "timeout"
+        && transientRow !== null
+        && elsById["sidebarTree"].querySelector(".ws-degraded") !== null
+        && elsById["banner"].hidden === true,
+        "err=" + state.workspaceErrors["wsTransient"]
+        + " abort=" + (transientAbort !== null));
+    state.sessionId = null;
+    transientRow._listeners["click"][0]();
+    await flush(); await flush();
+    chk("transient timeout: stale row still opens its session", state.sessionId === "a1",
+        "sid=" + state.sessionId);
+
+    state.workspaceLists = {};
+    state.workspaceErrors = {};
+    state.lastList = [];
+    state.sessionId = null;
+    sessionsAListFailure = "network";
+    elsById["banner"].hidden = true; elsById["bannerText"].textContent = "";
+    await pollAllWorkspaces();
+    await flush();
+    renderSidebarTree(true);
+    chk("transient first load: neutral retry text without rows or auth banner",
+        elsById["sidebarTree"].querySelector(".tree-row") === null
+        && elsById["sidebarTree"].textContent.includes("正在连接，重试中…")
+        && !elsById["sidebarTree"].textContent.includes("暂无会话")
+        && elsById["banner"].hidden === true,
+        "tree=" + elsById["sidebarTree"].textContent);
+
+    sessionsAListFailure = "auth401";
+    await pollAllWorkspaces();
+    await flush();
+    chk("transient list auth: 401 retains auth banner",
+        state.workspaceErrors["wsTransient"] === "auth"
+        && elsById["bannerText"].textContent.includes("认证失败"),
+        "err=" + state.workspaceErrors["wsTransient"]
+        + " banner=" + JSON.stringify(elsById["bannerText"].textContent));
+    sessionsAListFailure = "auth403";
+    await pollAllWorkspaces();
+    await flush();
+    chk("transient list auth: 403 retains auth banner",
+        state.workspaceErrors["wsTransient"] === "auth"
+        && elsById["bannerText"].textContent.includes("认证失败"),
+        "err=" + state.workspaceErrors["wsTransient"]
+        + " banner=" + JSON.stringify(elsById["bannerText"].textContent));
+
+    sessionsData = [
+      { id: "recovered", status: "Idle", title: "恢复后的会话", created_at: "2024-01-03T00:00:00Z", entry_count: 2, busy: false, active: true },
+    ];
+    sessionsAListFailure = null;
+    await pollAllWorkspaces();
+    await flush();
+    renderSidebarTree(true);
+    chk("transient recovery: success clears degraded marker and replaces stale list",
+        state.workspaceErrors["wsTransient"] === null
+        && state.workspaceLists["wsTransient"].length === 1
+        && state.workspaceLists["wsTransient"][0].id === "recovered"
+        && elsById["sidebarTree"].querySelector(".ws-degraded") === null,
+        "err=" + state.workspaceErrors["wsTransient"]
+        + " ids=" + JSON.stringify(state.workspaceLists["wsTransient"].map((x) => x.id)));
+    sessionsData = [];
+    await pollAllWorkspaces();
+    await flush();
+    renderSidebarTree(true);
+    chk("transient recovery: successful [] replaces stale rows",
+        state.workspaceErrors["wsTransient"] === null
+        && state.workspaceLists["wsTransient"].length === 0
+        && elsById["sidebarTree"].querySelector(".tree-row") === null
+        && elsById["sidebarTree"].textContent.includes("暂无会话"),
+        "len=" + state.workspaceLists["wsTransient"].length);
+    sessionsAListFailure = null;
+
+    // =====================================================================
     // 16) 删除 review 修复验证：后台删除（不切换/不重置当前聊天 + 侧边栏同步
     //     移除被删服务器会话）、confirm 取消、在途轮询写回守卫、首/中/末
     //     active 删除回退。
@@ -6882,6 +7010,12 @@ async function main(){
         _postedIds().includes("dl-404")
         && state.sessionId === "dl-404",
         "sid=" + state.sessionId + " posted=" + JSON.stringify(_postedIds()));
+    const _promptBefore4 = FETCHES.filter((u) => u === "/api/sessions/dl-404/prompt").length;
+    els.promptInput.value = "列表失败时仍可发送";
+    await sendPrompt();
+    chk("deeplink: list failure does not block prompt POST",
+        FETCHES.filter((u) => u === "/api/sessions/dl-404/prompt").length === _promptBefore4 + 1,
+        "prompts=" + (FETCHES.filter((u) => u === "/api/sessions/dl-404/prompt").length - _promptBefore4));
     // 任务面板路径（无深链标记）：unknown 404 仍静默且不恢复（回归）
     state.deepLink = { pending: null, handled: true, probing: false, attemptEpoch: -1 };
     state.lastList = [{ id: "s1", status: "Idle", entry_count: 1, busy: false, active: true }];

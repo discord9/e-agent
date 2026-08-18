@@ -113,7 +113,7 @@ function pollSessions() {
 /* 拉取单个 workspace 的会话列表（只更新缓存，不渲染）：
    - 成功 → state.workspaceLists[ws.id] = list（并清错误标记）
    - 失败（HTTP/网络/格式/认证）→ 保留旧列表（stale），标记
-     state.workspaceErrors[ws.id]（侧边栏显示「无法连接」分组头）
+     state.workspaceErrors[ws.id]（侧边栏按错误类型显示状态）
    激活 workspace 额外同步 state.lastList（既有单服务器路径的唯一数据源）；
    渲染/深链/校验 banner 由 pollAllWorkspaces 整轮完成后统一执行一次
    （afterPollRound）——各 workspace 响应不再各自全量重建树。 */
@@ -160,11 +160,9 @@ async function pollWorkspaceSessions(ws) {
       }
     }
   } catch (e) {
-    // 超时（AbortError）按失败处理：保留旧列表 stale、标记错误，不弹 banner
+    // 超时（AbortError）和网络失败只在 workspace 侧边栏标记：保留旧列表
+    // stale，但不占用全局 banner，避免把可继续使用的会话误报为致命故障。
     err = (e && e.name === "AbortError") ? "timeout" : "network";
-    if (ws === state.workspace && (!navigator.onLine || e instanceof TypeError)) {
-      setBanner("⚠ 无法连接服务器（网络错误）。", true);
-    }
   }
   // 在途请求守卫：请求发出后 workspace 被删除（removeWorkspace）→ 直接丢弃，
   // 绝不写回已删 workspace 的缓存/错误标记，也不重绘（聚合视图已随删除重绘，
@@ -1729,7 +1727,7 @@ function sidebarTreeSig() {
 
 /* force=true 时无视签名强制重绘（筛选输入、展开全部按钮、切换 workspace）
    聚合结构：每个 workspace 一个分组（.tree-ws-section），组头 = 服务器名 +
-   徽章（点击切到该服务器；错误时附加 muted「无法连接」）；
+   徽章（点击切到该服务器；错误时附加对应的状态标记）；
    组内复用既有树逻辑（renderTreeForList：roots/orphans/MAX_TREE_ROOTS/
    「未关联」组/历史子会话组）。孤儿按各自 workspace 的列表判定，绝不跨
    服务器匹配 parent。 */
@@ -1795,7 +1793,13 @@ function renderSidebarTree(force) {
     header.title = ws.url || ws.name;          // hover 显示服务器地址
     const chip = el("span", "ws-chip " + wsChipClass(ws), ws.name);
     header.appendChild(chip);
-    if (err) {
+    if (err === "network" || err === "timeout") {
+      header.appendChild(el("span", "ws-degraded", "列表暂时不可刷新，重试中…"));
+      header.title += "（" + err + "）";
+    } else if (err === "auth") {
+      header.appendChild(el("span", "ws-err", "认证失败"));
+      header.title += "（" + err + "）";
+    } else if (err) {
       header.appendChild(el("span", "ws-err", "无法连接"));
       header.title += "（" + err + "）";
     }
@@ -1840,8 +1844,11 @@ function renderSidebarTree(force) {
     // ---- 组体：既有树逻辑（per-workspace） ----
     const body = el("div", "tree-ws-body");
     if (!list.length) {
-      body.appendChild(el("div", "tree-empty",
-        err ? "无法连接，等待重试…" : "暂无会话"));
+      const emptyText = (err === "network" || err === "timeout")
+        ? "正在连接，重试中…"
+        : err === "auth" ? "认证失败，请检查 Token。"
+        : err ? "无法连接，等待重试…" : "暂无会话";
+      body.appendChild(el("div", "tree-empty", emptyText));
     } else {
       renderTreeForList(body, list, ws.id);
     }

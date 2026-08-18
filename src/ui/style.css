@@ -1685,6 +1685,8 @@
   }
   /* 分组头错误标记：muted 红字（服务器轮询失败，列表保留为 stale） */
   .ws-err { color: var(--red); font-size: 11px; opacity: 0.8; }
+  /* 瞬时网络/超时只提示列表正在重试，不把可用的 stale 会话当作致命错误。 */
+  .ws-degraded { color: var(--base01); font-size: 11px; opacity: 0.8; }
   /* 「当前」标记：激活 workspace 分组头右侧 */
   .ws-cur { color: var(--base01); font-size: 10px; margin-left: auto; flex: 0 0 auto; }
   /* 组头右侧控件组（当前标记 / + / ×）相邻时不再各自推挤：margin-left:auto
