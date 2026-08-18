@@ -550,10 +550,114 @@ pub(super) fn build_bwrap_plan(
     mounts.sort_by_key(|(_, dest, _, workspace)| {
         (std::path::Path::new(dest).components().count(), *workspace)
     });
-    for (source, dest, bind, _) in mounts {
-        args.push(bind.into());
-        args.push(source.into());
-        args.push(dest.into());
+    // Close the ancestor-directory escape: `/home` (and any other empty
+    // mount above the workspace) is a WRITABLE tmpfs, so without an
+    // explicit ancestor bind the sandbox could create siblings of the
+    // workspace bind (e.g. `parent/EVIL`) that never resolve to the
+    // workspace bind — a silent host-looking hole when the same paths
+    // exist on the host, and real pollution where a writable bind
+    // legitimately covers them.
+    //
+    // Guard strategy — HIDE, then rebuild exactly what is authorized:
+    // the nearest EXISTING host ancestor of the workspace is shadowed by
+    // an EMPTY writable tmpfs (`--tmpfs G`), NOT bound from the host.
+    // Mounting any host filesystem — read-only or not — would import its
+    // PRE-EXISTING nested host submounts wholesale, and `--remount-ro`
+    // locks only the named mount point, never those nested mounts: a
+    // writable host submount beneath the guard would stay writable and be
+    // an escape. A tmpfs carries no host mounts at all, so there is
+    // nothing uncontrolled to lock. Only the mounts the plan installs
+    // below the tmpfs ever exist under it — every one of them an explicit
+    // authorization or the exact workspace.
+    //
+    // Visibility trade-off (intentional): unconfigured sibling entries of
+    // the workspace are HIDDEN, not merely read-only — the previous
+    // design exposed them by binding the host ancestor, but doing so is
+    // exactly what imported the nested-submount escape, and no bind-free
+    // bwrap mechanism can show a host directory without its submounts.
+    // Mount order below a guard:
+    //   1. `--tmpfs G` (writable, so bwrap can still create every
+    //      configured mount point below it in depth order);
+    //   2. every configured mount under the guard in ascending depth,
+    //      INCLUDING the exact workspace bind — the empty tmpfs carries
+    //      no pre-existing workspace directory, so bwrap must be able to
+    //      mkdir the mount point while the guard is still writable;
+    //   3. `--remount-ro G` — seals the guard tmpfs itself (per-mount,
+    //      never recursive): no NEW unauthorized mount point can be
+    //      created under it, while every submount installed in step 2
+    //      keeps its own configured mode — the workspace per
+    //      `workspace_writable`, explicit writable grants writable
+    //      (intentional capability grants, never silently narrowed),
+    //      `--ro-bind` mounts read-only (bwrap remounts those itself).
+    //      Mounts under an explicitly configured WRITABLE ancestor keep
+    //      their authority because the guard then sits above that
+    //      ancestor.
+    // A workspace at `/` or a guard that could only be `/` fails closed.
+    // Guard destinations are canonicalized so the tmpfs lands on the real
+    // directory a symlinked ancestor component would resolve to.
+    let mut configured: Vec<(PathBuf, bool)> = Vec::new();
+    for (writable, paths) in [
+        (true, &sandbox.writable_paths),
+        (false, &sandbox.readable_paths),
+    ] {
+        for path in paths {
+            configured.push((PathBuf::from(path), writable));
+        }
+    }
+    for (writable, mounts) in [
+        (true, &sandbox.writable_mounts),
+        (false, &sandbox.readable_mounts),
+    ] {
+        for (_, dest) in mounts {
+            configured.push((PathBuf::from(dest), writable));
+        }
+    }
+    let ancestor_guards = ancestor_guards(root, &configured)?;
+    let under_workspace = |dest: &str| {
+        let dest = Path::new(dest);
+        dest != root && dest.starts_with(root)
+    };
+    // 1+2: guard tmpfs first (bwrap needs it mounted before it can create
+    // mount points below it), then every configured mount except the
+    // workspace subtree in ascending depth. The tmpfs imports NO host
+    // content and NO pre-existing nested host submounts — only the
+    // explicit mounts installed here exist under it.
+    for (source, dest) in &ancestor_guards {
+        debug_assert_eq!(source, dest, "guard tmpfs sources carry no host path");
+        args.push("--tmpfs".into());
+        args.push(dest.as_os_str().into());
+    }
+    for (source, dest, bind, workspace_flag) in &mounts {
+        if !workspace_flag && !under_workspace(dest) {
+            args.push((*bind).into());
+            args.push((*source).into());
+            args.push((*dest).into());
+        }
+    }
+    // 3: the exact workspace bind, then mounts strictly under it. These
+    // must also precede the guard lock: bwrap creates the mount points by
+    // mkdir inside the guard tmpfs, which the lock would make read-only
+    // (the guard tmpfs starts EMPTY — unlike a host bind it carries no
+    // pre-existing workspace directory to mount over).
+    args.push(workspace_bind.into());
+    args.push(root_str.as_str().into());
+    args.push(root_str.as_str().into());
+    for (source, dest, bind, workspace_flag) in &mounts {
+        if !workspace_flag && under_workspace(dest) {
+            args.push((*bind).into());
+            args.push((*source).into());
+            args.push((*dest).into());
+        }
+    }
+    // 4: lock the guard tmpfs read-only. `--remount-ro` is per-mount
+    // (never recursive), which is exactly right here: the lock seals the
+    // guard tmpfs so no NEW unauthorized mount point can be created under
+    // it, while every submount installed above — the workspace and the
+    // explicit grants — keeps its own configured mode. `--ro-bind`
+    // submounts were already remounted read-only by bwrap itself.
+    for (_, dest) in &ancestor_guards {
+        args.push("--remount-ro".into());
+        args.push(dest.as_os_str().into());
     }
 
     // Protect the startup policy anchor: a descriptor-pinned projection
@@ -609,6 +713,115 @@ pub(super) fn build_bwrap_plan(
     }
     let numbers = fds.iter().map(|fd| fd.as_raw_fd()).collect();
     Ok(BwrapPlan { args, fds, numbers })
+}
+
+/// Compute the ancestor guards closing the ancestor escape (see
+/// `build_bwrap_plan`): for the workspace parent, walk up while an
+/// explicitly configured WRITABLE destination covers the current directory
+/// (that coverage is an intentional capability grant, so the guard moves
+/// to ITS parent instead of silently narrowing it), then pin the nearest
+/// existing host ancestor to be shadowed by an EMPTY writable tmpfs
+/// (`--tmpfs`) — hiding it instead of importing it. Importing the host
+/// directory (even read-only) would also import its pre-existing nested
+/// host submounts, and `--remount-ro` locks only the named mount point,
+/// never nested mounts: a writable nested submount would be an escape.
+/// An explicit READ-ONLY configured mount already covers the directory —
+/// no guard needed there.
+///
+/// Fail-closed rules:
+/// - workspace root `/` (no parent): Err — the escape cannot be bounded.
+/// - no existing ancestor below `/`: Err — protection cannot be established.
+/// - the guard would have to be `/` itself: Err — shadowing `/` is the
+///   exact overreach this fix must never perform.
+///
+/// Returns `(canonical, dest)` pairs ordered ancestor-first; the canonical
+/// path is audit-only (the tmpfs mounts no source) and proves the guard
+/// destination resolves to the intended real directory when an ancestor
+/// component is a symlink. The exact workspace bind stays last and keeps
+/// its configured mode.
+#[cfg(unix)]
+pub(super) fn ancestor_guards(
+    root: &Path,
+    configured: &[(PathBuf, bool)],
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let mut dir = root.parent().ok_or_else(|| {
+        format!(
+            "fail closed: workspace root {} has no parent; the sandbox ancestor protection cannot be established",
+            root.display()
+        )
+    })?;
+    let mut guards = Vec::new();
+    // True once the walk moved up through explicitly-writable coverage: the
+    // remaining path to / is then covered by that writable bind over the
+    // private root tmpfs, which maps to nothing on the host.
+    let mut covered_by_grant = false;
+    loop {
+        // Explicitly configured WRITABLE coverage is an intentional grant:
+        // keep its authority and protect ITS parent instead.
+        if configured
+            .iter()
+            .any(|(dest, writable)| *writable && dir.starts_with(dest))
+        {
+            covered_by_grant = true;
+            dir = dir.parent().ok_or_else(|| {
+                format!(
+                    "fail closed: an explicitly writable path covers {} up to /; the ancestor protection cannot be established without binding /",
+                    dir.display()
+                )
+            })?;
+            continue;
+        }
+        // Explicitly configured READ-ONLY coverage is already safe as-is.
+        if configured
+            .iter()
+            .any(|(dest, writable)| !*writable && dir.starts_with(dest))
+        {
+            break;
+        }
+        if dir == Path::new("/") {
+            // Reached the private sandbox root tmpfs through an explicit
+            // writable grant: writes there cannot resolve to host paths.
+            if covered_by_grant {
+                break;
+            }
+            return Err(format!(
+                "fail closed: protecting the workspace ancestor of {} would require binding / read-only, which the sandbox must never do",
+                root.display()
+            ));
+        }
+        // /tmp is a private tmpfs (or the run_rust private scratch bind)
+        // that never maps to host paths: nothing under it can escape to the
+        // host, so no guard is needed for scratch workspaces.
+        if dir == Path::new("/tmp") {
+            break;
+        }
+        // /home is always the sandbox's own writable tmpfs (mounted before
+        // every bind): a workspace under it REQUIRES a guard — this is the
+        // exact incident shape (`/home` tmpfs + exact child bind left the
+        // writable parent tmpfs covering real host siblings).
+        if !dir.is_dir() {
+            // A missing ancestor cannot host a write that escapes: no
+            // pathname resolution can pass it, and no later mount binds
+            // over it (guards are the only mounts ever installed at or
+            // above the workspace). Walk up to the nearest existing one.
+            dir = dir.parent().ok_or_else(|| {
+                format!(
+                    "fail closed: no existing ancestor found while protecting the workspace ancestor of {}",
+                    root.display()
+                )
+            })?;
+            continue;
+        }
+        let canonical = std::fs::canonicalize(dir).map_err(|error| {
+            format!(
+                "fail closed: cannot canonicalize the workspace ancestor {}: {error}",
+                dir.display()
+            )
+        })?;
+        guards.push((canonical, dir.to_path_buf()));
+        break;
+    }
+    Ok(guards)
 }
 
 /// True when a configured destination is the policy parent itself or lies

@@ -4746,3 +4746,778 @@ fn mark_failed_if_empty_fills_only_empty_slots() {
         "completed preserved"
     );
 }
+
+// --- Ancestor-boundary protection (sandbox mount escape regression) ---
+//
+// Incident: bwrap mounts /home as a WRITABLE tmpfs and only the exact
+// workspace as a writable bind, so the workspace parent stayed a writable
+// tmpfs and sandboxed bash could create siblings (`parent/OUTSIDE`,
+// `parent/bin/...`). The fix installs the nearest existing host ancestor
+// of the workspace as an explicit read-only bind before the workspace
+// bind (see `ancestor_guards` in tools/bash.rs).
+
+#[cfg(unix)]
+fn ancestor_bash(workspace_dir: &std::path::Path, sandbox: crate::config::Sandbox) -> Bash {
+    Bash {
+        workspace: Workspace::new(workspace_dir).unwrap(),
+        timeout: Some(Duration::from_secs(20)),
+        sender: None,
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
+        sandbox: Some(sandbox),
+        protect_git: false,
+        shell: Shell::detect().unwrap(),
+        owner_session: None,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_workspace_parent_is_protected_foreground() {
+    // Real bwrap path, temp host layout `parent/workspace`: writes inside
+    // the workspace succeed, writes to the parent/siblings fail and never
+    // touch the host.
+    let Some(sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    let parent = tempfile::tempdir().unwrap();
+    let workspace_dir = parent.path().join("workspace");
+    std::fs::create_dir(&workspace_dir).unwrap();
+    std::fs::create_dir(parent.path().join("bin")).unwrap();
+    let tool = ancestor_bash(&workspace_dir, sandbox);
+    // Inside the workspace: writable as configured.
+    tool.execute(json!({"command": "echo hi > inside.txt"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(workspace_dir.join("inside.txt")).unwrap(),
+        "hi\n"
+    );
+    // The workspace parent is the read-only ancestor guard: creating
+    // siblings of the workspace must fail.
+    let outside = parent.path().join("OUTSIDE");
+    let result = tool
+        .execute(json!({"command": format!("touch {}/OUTSIDE", parent.path().display())}))
+        .await;
+    assert!(result.is_err(), "write to workspace parent must fail");
+    assert!(!outside.exists(), "host must never gain the escape file");
+    // Existing sibling directories are visible but read-only too.
+    let result = tool
+        .execute(json!({"command": format!("touch {}/bin/EVIL", parent.path().display())}))
+        .await;
+    assert!(result.is_err(), "write to a sibling directory must fail");
+    assert!(!parent.path().join("bin/EVIL").exists());
+    // Existing sibling directories are now HIDDEN entirely: the guard
+    // shadows the host parent with an empty tmpfs, because importing the
+    // host directory would also import pre-existing writable nested host
+    // submounts (`--remount-ro` locks only the named mount point, never
+    // nested mounts). The path exists (the tmpfs mount point) but the
+    // host sibling must not be reachable.
+    let listing = tool
+        .execute(json!({"command": format!("ls {}", parent.path().display())}))
+        .await
+        .unwrap()
+        .content;
+    assert!(listing.contains("workspace"), "{listing}");
+    assert!(
+        !listing.contains("bin"),
+        "unconfigured host siblings must be hidden, not imported: {listing}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_workspace_parent_is_protected_background_and_detached() {
+    // The non-detached background and detached paths run through the same
+    // `run_bash` / `build_bwrap_plan` as the foreground; verify the
+    // boundary holds through both real spawn paths, not only argv shape.
+    let Some(sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    let parent = tempfile::tempdir().unwrap();
+    let workspace_dir = parent.path().join("workspace");
+    std::fs::create_dir(&workspace_dir).unwrap();
+
+    // Non-detached background: completion carries the command output.
+    let (bash, mut receiver) = background_bash(&parent, Duration::from_secs(30));
+    let mut bash = bash;
+    bash.workspace = Workspace::new(&workspace_dir).unwrap();
+    bash.sandbox = Some(sandbox.clone());
+    let started = bash
+        .execute(json!({
+            "command": format!("touch {}/OUTSIDE_BG && echo ESCAPED || echo BLOCKED", parent.path().display()),
+            "background": true
+        }))
+        .await
+        .unwrap()
+        .content;
+    assert!(started.starts_with("started background task"), "{started}");
+    let event = tokio::time::timeout(Duration::from_secs(20), receiver.recv())
+        .await
+        .expect("timed out waiting for the background completion")
+        .unwrap();
+    let AgentEvent::BackgroundCompleted { output, .. } = event else {
+        panic!("expected BackgroundCompleted");
+    };
+    assert!(output.contains("BLOCKED"), "{output}");
+    assert!(!parent.path().join("OUTSIDE_BG").exists(), "{output}");
+
+    // Detached: no completion is delivered, so the command writes a
+    // sentinel INSIDE the workspace (the only writable place) to prove it
+    // ran, while the parent write must still be blocked on the host.
+    let (bash, _rx) = background_bash(&parent, Duration::from_secs(30));
+    let mut bash = bash;
+    bash.workspace = Workspace::new(&workspace_dir).unwrap();
+    bash.sandbox = Some(sandbox);
+    let started = bash
+        .execute(json!({
+            "command": format!(
+                "touch {}/OUTSIDE_DETACHED; touch detached-ran",
+                parent.path().display()
+            ),
+            "background": true,
+            "detached": true
+        }))
+        .await
+        .unwrap()
+        .content;
+    assert!(started.starts_with("started background task"), "{started}");
+    // No completion event for detached tasks: poll the in-workspace
+    // sentinel (host-visible, workspace is writable through the bind).
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !workspace_dir.join("detached-ran").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached sandboxed command never ran"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !parent.path().join("OUTSIDE_DETACHED").exists(),
+        "detached bash escaped the ancestor boundary"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_read_only_workspace_parent_guard_keeps_workspace_read_only() {
+    // With workspace_writable = false the workspace bind stays read-only
+    // AND the ancestor guard must not accidentally re-open anything.
+    let Some(mut sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    sandbox.workspace_writable = false;
+    let parent = tempfile::tempdir().unwrap();
+    let workspace_dir = parent.path().join("workspace");
+    std::fs::create_dir(&workspace_dir).unwrap();
+    let tool = ancestor_bash(&workspace_dir, sandbox);
+    assert!(
+        tool.execute(json!({"command": "touch denied"}))
+            .await
+            .is_err(),
+        "read-only workspace must reject writes"
+    );
+    assert!(
+        tool.execute(json!({"command": format!("touch {}/OUTSIDE", parent.path().display())}))
+            .await
+            .is_err(),
+        "parent must stay protected"
+    );
+    assert!(!workspace_dir.join("denied").exists());
+    assert!(!parent.path().join("OUTSIDE").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_explicit_writable_ancestor_keeps_its_grant() {
+    // INTENTIONAL CAPABILITY GRANT: an explicitly configured writable
+    // ancestor of the workspace keeps its writable authority — the fix
+    // must not silently narrow it. The guard then protects the grant's
+    // OWN parent, so unconfigured higher siblings stay read-only.
+    let Some(mut sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    let grandparent = tempfile::tempdir().unwrap();
+    let parent = grandparent.path().join("parent");
+    let workspace_dir = parent.join("workspace");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::create_dir(&workspace_dir).unwrap();
+    sandbox.writable_paths = vec![parent.to_str().unwrap().to_owned()];
+    let tool = ancestor_bash(&workspace_dir, sandbox);
+    // The configured writable ancestor retains its grant: siblings of the
+    // workspace under it are writable — this is the configured behavior.
+    tool.execute(json!({"command": format!("touch {}/GRANTED", parent.display())}))
+        .await
+        .unwrap();
+    assert!(parent.join("GRANTED").exists());
+    // The grandparent above the grant is the guard: read-only.
+    assert!(
+        tool.execute(json!({"command": format!("touch {}/OUTSIDE", grandparent.path().display())}))
+            .await
+            .is_err(),
+        "unconfigured ancestor above the grant must be protected"
+    );
+    assert!(!grandparent.path().join("OUTSIDE").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_home_tmpfs_shape_parent_guard_regression() {
+    // Reproduce the incident shape with temp dirs: the workspace lives two
+    // levels below a tmpfs-mounted ancestor (like /home), and only the
+    // exact child was bound writable. The parent must now be read-only.
+    let Some(sandbox) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    let home_like = tempfile::tempdir().unwrap();
+    let user_like = home_like.path().join("user");
+    let parent = user_like.join("openclaw_sandbox");
+    let workspace_dir = parent.join("closure");
+    std::fs::create_dir(&user_like).unwrap();
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::create_dir(&workspace_dir).unwrap();
+    let tool = ancestor_bash(&workspace_dir, sandbox);
+    tool.execute(json!({"command": "touch inside.txt"}))
+        .await
+        .unwrap();
+    assert!(workspace_dir.join("inside.txt").exists());
+    assert!(
+        tool.execute(json!({"command": format!("touch {}/WRITE_TEST", parent.display())}))
+            .await
+            .is_err(),
+        "the incident write must now fail"
+    );
+    assert!(!parent.join("WRITE_TEST").exists());
+    assert!(
+        tool.execute(json!({"command": format!("mkdir -p {}/bin && touch {}/bin/x", parent.display(), parent.display())}))
+            .await
+            .is_err(),
+        "the incident bin/ write must now fail"
+    );
+    assert!(!parent.join("bin").exists());
+}
+
+/// True when this process can create mounts in a private user+mount
+/// namespace (the prerequisite for staging a nested host submount).
+#[cfg(unix)]
+fn can_unshare_mounts() -> bool {
+    std::process::Command::new("unshare")
+        .args(["-rm", "true"])
+        .status()
+        .ok()
+        .is_some_and(|status| status.success())
+}
+
+/// Run a REAL bwrap invocation (the production `build_bwrap_plan`
+/// argument vector plus the shell program, exactly as `run_bash` spawns
+/// it) as a synchronous child process in the CURRENT process's mount
+/// namespace. Used by the nested-submount test, which runs inside a
+/// staged `unshare -rm` namespace: the bwrap child inherits that staged
+/// mount namespace, so the nested tmpfs is genuinely present before
+/// bwrap builds its own mounts. Any spawn or non-zero exit is an Err —
+/// never silently converted into the expected `blocked` outcome.
+#[cfg(unix)]
+fn run_real_bwrap_in_current_namespace(
+    workspace_dir: &std::path::Path,
+    sandbox: &crate::config::Sandbox,
+    shell_script: &str,
+) -> Result<String, String> {
+    use std::os::unix::process::CommandExt;
+    let workspace = Workspace::new(workspace_dir).map_err(|e| format!("workspace: {e}"))?;
+    let root_str = workspace.root().to_string_lossy().into_owned();
+    let plan = super::bash::build_bwrap_plan(
+        &workspace,
+        sandbox,
+        false,
+        sandbox.network,
+        &root_str,
+        None,
+    )?;
+    let shell = Shell::detect().map_err(|e| format!("shell detect: {e}"))?;
+    let mut cmd = std::process::Command::new("bwrap");
+    cmd.args(&plan.args);
+    cmd.arg(&shell.executable);
+    cmd.args(shell.command_args(shell_script));
+    let numbers = plan.numbers.clone();
+    if !numbers.is_empty() {
+        // SAFETY: pre_exec runs in the forked child before exec; the
+        // closure only touches the plan fds with async-signal-safe fcntl.
+        unsafe { cmd.pre_exec(super::bash::clear_cloexec_pre_exec(numbers)) };
+    }
+    let output = cmd.output().map_err(|e| format!("bwrap spawn: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.status.success() {
+        return Err(format!(
+            "bwrap exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(stdout)
+}
+
+/// Body of the nested-submount test, executed INSIDE the staged
+/// `unshare -rm` user+mount namespace via `--test-threads=1` recursion.
+/// The nested tmpfs is mounted by the caller before this runs; every
+/// setup/verification/bwrap failure here is a hard panic (a real test
+/// failure), never a masked `blocked`.
+#[cfg(unix)]
+fn nested_host_submount_test_body() {
+    let sandbox = crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        writable_paths: Vec::new(),
+        readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
+    };
+    let parent = tempfile::tempdir().unwrap();
+    let workspace_dir = parent.path().join("workspace");
+    let nested = parent.path().join("nested");
+    std::fs::create_dir(&workspace_dir).unwrap();
+    std::fs::create_dir(&nested).unwrap();
+    let parent_str = parent.path().to_string_lossy().into_owned();
+    let nested_str = nested.to_string_lossy().into_owned();
+
+    // Stage the nested tmpfs as a REAL pre-existing writable submount
+    // under the guarded ancestor, in THIS process's private mount
+    // namespace. Any mount failure is a fatal setup error.
+    let status = std::process::Command::new("mount")
+        .args(["-t", "tmpfs", "tmpfs", &nested_str])
+        .status()
+        .expect("failed to spawn mount");
+    assert!(
+        status.success(),
+        "staging the nested tmpfs failed: {status}"
+    );
+
+    // Sanity, from THIS namespace: the nested tmpfs must be a writable
+    // mount point BEFORE bwrap runs. Remove the sentinel afterwards so
+    // only sandbox-produced artifacts count below.
+    let sentinel = nested.join("STAGING_SENTINEL");
+    std::fs::write(&sentinel, b"staged\n").expect("the staged tmpfs must be writable");
+    std::fs::remove_file(&sentinel).unwrap();
+    let mounted = std::fs::read_to_string("/proc/self/mountinfo")
+        .expect("mountinfo must be readable inside the staged namespace");
+    assert!(
+        mounted.contains(&format!(" {nested_str} ")),
+        "the nested tmpfs must be a mount point in the staged namespace"
+    );
+
+    // Run the REAL sandboxed bwrap command from within this staged mount
+    // namespace: the nested submount is genuinely present before bwrap
+    // builds its own mounts. In-sandbox assertions are hard shell
+    // failures (no `|| echo blocked` masking): the sandboxed bash must
+    // see the guard as an EMPTY tmpfs (the nested host submount and its
+    // pre-staged content hidden) and must fail to write through either
+    // the nested path or the guard itself.
+    let script = format!(
+        "set -eu; \
+         command -v mountpoint >/dev/null || {{ echo MOUNTPOINT-UNAVAILABLE; exit 1; }}; \
+         mountpoint -q / || {{ echo MOUNTPOINT-SELFTEST-FAILED; exit 1; }}; \
+         if mp_err=$(mountpoint -q {nested_str} 2>&1); then \
+             echo NESTED-STILL-A-MOUNT; exit 1; \
+         elif [ $? -ne 1 ]; then \
+             echo \"MOUNTPOINT-ERROR: $mp_err\"; exit 1; \
+         fi; \
+         if [ -e {nested_str} ]; then echo NESTED-VISIBLE; exit 1; fi; \
+         if touch {nested_str}/ESCAPED 2>/dev/null; then echo NESTED-WRITABLE; exit 1; fi; \
+         if touch {parent_str}/NESTED_WRITE 2>/dev/null; then echo GUARD-WRITABLE; exit 1; fi; \
+         echo blocked"
+    );
+    let out = run_real_bwrap_in_current_namespace(&workspace_dir, &sandbox, &script)
+        .unwrap_or_else(|e| panic!("sandboxed bwrap run failed inside the staged namespace: {e}"));
+    assert_eq!(
+        out.trim(),
+        "blocked",
+        "sandboxed bash must see neither the nested submount nor the guard as writable: {out}"
+    );
+
+    // While the staged namespace is still alive, verify from THIS
+    // namespace that no artifact landed through the namespace-local
+    // tmpfs, then unmount it and verify the HOST underlying directory is
+    // untouched too.
+    assert!(
+        !nested.join("ESCAPED").exists(),
+        "write through a nested host submount under the guard must never land"
+    );
+    let status = std::process::Command::new("umount")
+        .arg(&nested_str)
+        .status()
+        .expect("failed to spawn umount");
+    assert!(
+        status.success(),
+        "umount of the nested tmpfs failed: {status}"
+    );
+    assert!(
+        !nested.join("ESCAPED").exists(),
+        "the host directory beneath the nested submount must be untouched"
+    );
+    assert!(
+        !parent.path().join("NESTED_WRITE").exists(),
+        "the guard itself must stay read-only on the host"
+    );
+    eprintln!(
+        "NESTED-EVIDENCE: staged tmpfs at {nested_str} was verified writable and present in \
+         /proc/self/mountinfo of the staged namespace; the real bwrap command ran inside that \
+         same namespace, saw no nested mount point (`mountpoint -q` inside bwrap), wrote nothing \
+         through it, and the guard stayed read-only (probe output: {})",
+        out.trim()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sandbox_nested_host_submount_under_guard_cannot_escape() {
+    // A pre-existing WRITABLE nested host submount beneath the guarded
+    // ancestor must not leak into the sandbox: a host bind of the guard
+    // would import it wholesale and `--remount-ro` locks only the named
+    // mount point, never nested mounts — so the guard must be an empty
+    // tmpfs that hides it.
+    //
+    // Two-phase test so the REAL bwrap invocation inherits the staged
+    // mount namespace (nsenter-inside-bwrap cannot see the staging
+    // namespace's /proc once bwrap unshares its own PID namespace — that
+    // was the false positive this replaces):
+    //   phase 1 (this process): `unshare -rm` re-executes the test
+    //     binary running ONLY this test with `--test-threads=1`;
+    //   phase 2 (inside the namespace): the same test function mounts a
+    //     real writable tmpfs at parent/nested, verifies it via
+    //     /proc/self/mountinfo, runs the real bwrap sandbox with the
+    //     submount already present, and asserts no artifact lands.
+    if std::env::var_os("E_AGENT_NESTED_SUBMOUNT_PHASE2").is_some() {
+        nested_host_submount_test_body();
+        return;
+    }
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping nested-submount sandbox test");
+        return;
+    }
+    if !can_unshare_mounts() {
+        eprintln!(
+            "user+mount namespaces unavailable (unshare -rm failed); skipping nested-submount sandbox test"
+        );
+        return;
+    }
+    if !can_mount_tmpfs_in_userns() {
+        eprintln!(
+            "tmpfs mounts in a user namespace unavailable; skipping nested-submount sandbox test"
+        );
+        return;
+    }
+    // Phase 1: re-run this exact test inside a private user+mount
+    // namespace. Failure to spawn or a non-zero exit is a FATAL test
+    // failure — prerequisites were verified above.
+    let exe = std::env::current_exe().expect("cannot locate the test binary");
+    let output = std::process::Command::new("unshare")
+        .args(["-rm", "--", &exe.to_string_lossy()])
+        .args([
+            "--exact",
+            "tools::tests::sandbox_nested_host_submount_under_guard_cannot_escape",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("E_AGENT_NESTED_SUBMOUNT_PHASE2", "1")
+        .output()
+        .expect("failed to spawn the namespaced test child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("namespaced nested-submount child output:\n{stdout}\n{stderr}");
+    assert!(
+        output.status.success(),
+        "namespaced nested-submount test failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the namespaced test must have actually run: {stdout}"
+    );
+    assert!(
+        !stdout.contains("0 passed"),
+        "the namespaced test was filtered out: {stdout}"
+    );
+}
+
+/// True when a private user+mount namespace can mount a tmpfs (kernel
+/// may allow `unshare -rm` but forbid tmpfs mounts, e.g. some container
+/// seccomp/AppArmor profiles).
+#[cfg(unix)]
+fn can_mount_tmpfs_in_userns() -> bool {
+    // Local setup failures (tempdir/create_dir) are FATAL test errors,
+    // not a masked environment skip; only the external capability check
+    // (unshare/mount/tmpfs) may legitimately report "unavailable".
+    let probe = tempfile::tempdir().expect("probe tempdir must be creatable");
+    let target = probe.path().join("mnt");
+    std::fs::create_dir(&target).expect("probe mount target dir must be creatable");
+    let output = std::process::Command::new("unshare")
+        .args([
+            "-rm",
+            "mount",
+            "-t",
+            "tmpfs",
+            "tmpfs",
+            &target.to_string_lossy(),
+        ])
+        .output()
+        .expect("failed to spawn the unshare/mount tmpfs probe");
+    let ok = output.status.success();
+    if !ok {
+        eprintln!(
+            "tmpfs-in-userns probe failed (status {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    ok
+}
+
+#[cfg(unix)]
+#[test]
+fn ancestor_guard_plan_ordering_and_edge_cases() {
+    // Pure plan tests (no bwrap needed): the guard is an --ro-bind at the
+    // workspace parent installed BEFORE the workspace bind, and no later
+    // generic mount re-opens the parent.
+    // Pure plan construction needs no bwrap installation: build the
+    // policy struct directly so these tests also run where bwrap is
+    // missing.
+    let base = crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        writable_paths: Vec::new(),
+        readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
+    };
+    let parent = tempfile::tempdir().unwrap();
+    let workspace_dir = parent.path().join("workspace");
+    std::fs::create_dir(&workspace_dir).unwrap();
+    // The policy-parent projection only runs when the policy parent
+    // exists on the host; create it (with a config) so the plan really
+    // contains the descriptor-pinned projection.
+    std::fs::create_dir(workspace_dir.join(".e-agent")).unwrap();
+    std::fs::write(workspace_dir.join(".e-agent/config.toml"), b"").unwrap();
+    let workspace = Workspace::new(&workspace_dir).unwrap();
+    let root_str = workspace.root().to_string_lossy().into_owned();
+    let plan =
+        super::bash::build_bwrap_plan(&workspace, &base, false, true, &root_str, None).unwrap();
+    let args: Vec<String> = plan
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let parent_str = parent.path().to_string_lossy().into_owned();
+    let guard = args
+        .windows(2)
+        .position(|w| w[0] == "--tmpfs" && w[1] == parent_str)
+        .expect("ancestor guard tmpfs missing from the plan");
+    let lock = args
+        .windows(2)
+        .position(|w| w[0] == "--remount-ro" && w[1] == parent_str)
+        .expect("ancestor guard --remount-ro lock missing from the plan");
+    let workspace_bind = args
+        .windows(3)
+        .rposition(|w| {
+            (w[0] == "--bind" || w[0] == "--ro-bind") && w[1] == root_str && w[2] == root_str
+        })
+        .expect("workspace bind missing from the plan");
+    assert!(
+        guard < workspace_bind && workspace_bind < lock,
+        "ancestor guard must be shadowed first and locked after the workspace bind: {args:?}"
+    );
+    // Nothing after the lock re-binds the parent itself.
+    assert!(
+        !args[lock..]
+            .windows(3)
+            .any(|w| (w[0] == "--bind" || w[0] == "--ro-bind") && w[2] == parent_str),
+        "the workspace parent must never be re-bound after its lock: {args:?}"
+    );
+    // The descriptor-pinned policy-parent projection must remain present
+    // and correctly ordered: its `--tmpfs <root>/.e-agent` shadows the
+    // policy parent AFTER the workspace bind, so no bind (workspace,
+    // alias or explicit descendant) can shadow the policy file.
+    let policy_parent_str = workspace
+        .policy_anchor()
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let projection = args
+        .windows(2)
+        .position(|w| w[0] == "--tmpfs" && w[1] == policy_parent_str)
+        .unwrap_or_else(|| panic!("policy-parent projection missing from the plan: {args:?}"));
+    let projection_lock = args
+        .windows(2)
+        .rposition(|w| w[0] == "--remount-ro" && w[1] == policy_parent_str)
+        .expect("policy-parent projection lock missing from the plan");
+    assert!(
+        workspace_bind < projection && projection < projection_lock,
+        "policy projection must shadow the policy parent after the workspace bind: {args:?}"
+    );
+
+    // Edge case: workspace at / fails closed (no parent to protect) —
+    // `ancestor_guards` is the fail-closed decision point.
+    let error = super::bash::ancestor_guards(std::path::Path::new("/"), &[])
+        .expect_err("workspace at / must fail closed");
+    assert!(error.contains("fail closed"), "{error}");
+
+    // Edge case: a direct parent that requires guarding / fails closed too.
+    let error = super::bash::ancestor_guards(std::path::Path::new("/anything"), &[])
+        .expect_err("a guard at / must fail closed");
+    assert!(error.contains("fail closed"), "{error}");
+
+    // Edge case: missing intermediate ancestors are skipped — the guard
+    // lands on the nearest EXISTING ancestor.
+    let gone = parent.path().join("gone");
+    let deeper = gone.join("deeper");
+    std::fs::create_dir_all(&deeper).unwrap();
+    // The workspace root must exist (Workspace::new canonicalizes it); its
+    // PARENT `gone` then disappears before the plan is built.
+    let deep_ws = Workspace::new(&deeper).unwrap();
+    std::fs::remove_dir_all(&gone).unwrap();
+    let deep_root = deep_ws.root().to_string_lossy().into_owned();
+    let plan =
+        super::bash::build_bwrap_plan(&deep_ws, &base, false, true, &deep_root, None).unwrap();
+    let args: Vec<String> = plan
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    // The guard skipped the missing parent and pinned the nearest existing
+    // ancestor (the temp root), locked read-only before the workspace bind.
+    let root_temp = parent.path().to_string_lossy().into_owned();
+    let guard = args
+        .windows(2)
+        .position(|w| w[0] == "--tmpfs" && w[1] == root_temp)
+        .unwrap_or_else(|| panic!("guard must shadow the nearest existing ancestor: {args:?}"));
+    let lock = args
+        .windows(2)
+        .position(|w| w[0] == "--remount-ro" && w[1] == root_temp)
+        .expect("guard lock missing");
+    let workspace_bind = args
+        .windows(3)
+        .rposition(|w| {
+            (w[0] == "--bind" || w[0] == "--ro-bind") && w[1] == deep_root && w[2] == deep_root
+        })
+        .expect("workspace bind missing");
+    assert!(guard < workspace_bind && workspace_bind < lock, "{args:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn ancestor_guard_symlinked_ancestor_resolves_to_canonical_target() {
+    // Regression: when an ancestor component of the workspace is a
+    // symlink, the guard must shadow the REAL (canonical) directory, not
+    // the lexical symlink path — otherwise the resolved host directory
+    // stays reachable and the guard lands on the wrong mount point.
+    // Pure plan construction needs no bwrap installation: build the
+    // policy struct directly so these tests also run where bwrap is
+    // missing.
+    let base = crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        writable_paths: Vec::new(),
+        readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
+    };
+    // Host layout: tempdir/real/workspace, tempdir/link -> real.
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    let workspace_dir = real.join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // Enter the workspace THROUGH the symlink so the guard walk starts
+    // from the lexical path.
+    let workspace = Workspace::new(link.join("workspace")).unwrap();
+    let root_str = workspace.root().to_string_lossy().into_owned();
+    let plan =
+        super::bash::build_bwrap_plan(&workspace, &base, false, true, &root_str, None).unwrap();
+    let args: Vec<String> = plan
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let canonical_parent = std::fs::canonicalize(&real).unwrap();
+    let canonical_parent_str = canonical_parent.to_string_lossy().into_owned();
+    // `ancestor_guards` must pin the canonical target (audit source ==
+    // guard destination: the tmpfs has no host source).
+    let guards =
+        super::bash::ancestor_guards(workspace.root(), &[]).expect("guard computation failed");
+    assert_eq!(
+        guards,
+        vec![(canonical_parent.clone(), canonical_parent)],
+        "symlinked ancestor must resolve to its canonical target: {guards:?}"
+    );
+    // The plan must shadow the CANONICAL directory, ordered before its
+    // lock and the workspace bind.
+    let guard = args
+        .windows(2)
+        .position(|w| w[0] == "--tmpfs" && w[1] == canonical_parent_str)
+        .expect("guard must shadow the canonical target of the symlinked ancestor");
+    let lock = args
+        .windows(2)
+        .position(|w| w[0] == "--remount-ro" && w[1] == canonical_parent_str)
+        .expect("guard lock missing for the canonical target");
+    let workspace_bind = args
+        .windows(3)
+        .rposition(|w| {
+            (w[0] == "--bind" || w[0] == "--ro-bind") && w[1] == root_str && w[2] == root_str
+        })
+        .expect("workspace bind missing");
+    assert!(guard < workspace_bind && workspace_bind < lock, "{args:?}");
+    // The lexical symlink path must never be mounted directly.
+    let link_parent = link.to_string_lossy().into_owned();
+    assert!(
+        !args.windows(3).any(|w| w[2] == link_parent)
+            && !args
+                .windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == link_parent),
+        "the symlink path must never be a mount destination: {args:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ancestor_guard_skips_tmp_scratch_and_policy_paths_untouched() {
+    // /tmp scratch workspaces need no guard (private tmpfs / host scratch
+    // bind); the policy-parent projection must be unaffected by guards.
+    // Pure plan construction needs no bwrap installation: build the
+    // policy struct directly so these tests also run where bwrap is
+    // missing.
+    let base = crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        writable_paths: Vec::new(),
+        readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
+    };
+    let scratch = std::env::temp_dir().join(format!("e-agent-guard-test-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let workspace = Workspace::new(&scratch).unwrap();
+    let root_str = workspace.root().to_string_lossy().into_owned();
+    let plan =
+        super::bash::build_bwrap_plan(&workspace, &base, false, true, &root_str, None).unwrap();
+    let args: Vec<String> = plan
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !args.windows(3).any(|w| {
+            (w[0] == "--ro-bind" || w[0] == "--bind") && (w[1] == "/tmp" || w[2] == "/tmp")
+        }) && !args
+            .windows(2)
+            .any(|w| w[0] == "--remount-ro" && w[1] == "/tmp"),
+        "/tmp scratch workspaces must gain no guard bind and no guard lock: {args:?}"
+    );
+    std::fs::remove_dir_all(&scratch).unwrap();
+}
