@@ -4516,132 +4516,49 @@ async fn background_event_sender_is_shared_across_clones() {
     assert!(started.is_ok(), "spawn failed: {:?}", started);
 }
 
-// --- gh-in-sandbox visibility (sandbox default git config injection) ---
-
 #[cfg(unix)]
 #[test]
-fn gh_path_visible_inside_mounted_root() {
-    use std::path::{Path, PathBuf};
-    let mounts = vec![PathBuf::from("/usr"), PathBuf::from("/bin")];
-    // A gh binary under a system read-only bind is reachable.
-    assert!(path_visible_in_sandbox(Path::new("/usr/bin/gh"), &mounts));
-    // The path itself being a mount root also counts.
-    assert!(path_visible_in_sandbox(Path::new("/usr"), &mounts));
-    assert!(path_visible_in_sandbox(Path::new("/bin"), &mounts));
-}
+fn sandbox_bash_does_not_apply_git_command_scope_config() {
+    use std::ffi::OsStr;
 
-#[cfg(unix)]
-#[test]
-fn gh_path_not_visible_outside_mounts() {
-    use std::path::{Path, PathBuf};
-    let mounts = vec![PathBuf::from("/usr"), PathBuf::from("/bin")];
-    // /home is a fresh tmpfs in the sandbox; an unmounted ~/.local is
-    // NOT reachable even though it exists on the host.
-    assert!(!path_visible_in_sandbox(
-        Path::new("/home/user/.local/bin/gh"),
-        &mounts
-    ));
-    // A directory that merely shares a prefix with a mount root is not
-    // covered.
-    assert!(!path_visible_in_sandbox(Path::new("/usrx/bin/gh"), &mounts));
-    // A relative path resolves nowhere meaningful inside the sandbox.
-    assert!(!path_visible_in_sandbox(Path::new("bin/gh"), &mounts));
-}
-
-#[test]
-fn gh_visible_requires_a_host_path() {
-    use std::path::{Path, PathBuf};
-    let mounts = vec![PathBuf::from("/usr")];
-    // No host gh -> never visible, regardless of mounts.
-    assert!(!gh_visible_in_sandbox(None, &mounts));
-    // Host gh under a mounted root -> visible.
-    assert!(gh_visible_in_sandbox(
-        Some(Path::new("/usr/bin/gh")),
-        &mounts
-    ));
-    // Host gh outside every mount root -> not visible.
-    assert!(!gh_visible_in_sandbox(
-        Some(Path::new("/opt/gh/bin/gh")),
-        &mounts
-    ));
-}
-
-#[cfg(unix)]
-#[test]
-fn gh_in_path_requires_an_executable_file() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
-    let dir = tempfile::tempdir().unwrap();
-    let gh = dir.path().join("gh");
-    std::fs::write(&gh, b"#!/bin/sh\n").unwrap();
-    let path = std::env::join_paths([dir.path()]).unwrap();
-    // Present but not executable: not found (would fail in the sandbox).
-    assert_eq!(gh_in_path(Some(&path)), None);
-    // Same file made executable: found.
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(gh_in_path(Some(&path)), Some(PathBuf::from(&gh)));
-    // Empty/missing PATH: not found.
-    assert_eq!(gh_in_path(None), None);
-}
-
-#[test]
-fn sandbox_mount_roots_cover_system_and_configured_paths() {
-    use std::path::{Path, PathBuf};
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
     let sandbox = crate::config::Sandbox {
         enabled: true,
         network: true,
         workspace_writable: true,
-        writable_paths: vec!["/mnt/nvme_rust".into()],
-        readable_paths: vec!["/home/user/.config/gh".into()],
-        readable_mounts: vec![("/home/user/.local".into(), "/home/user/.local".into())],
-        writable_mounts: vec![],
+        writable_paths: Vec::new(),
+        readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
     };
-    let roots = sandbox_mount_roots(&sandbox, Path::new("/ws"));
-    for expected in [
-        "/dev",
-        "/proc",
-        "/usr",
-        "/bin",
-        "/lib",
-        "/lib64",
-        "/etc",
-        "/mnt/nvme_rust",
-        "/home/user/.config/gh",
-        "/home/user/.local",
-        "/ws",
+    let (command, _plan) = wrap_bash_command(
+        &Shell::detect().unwrap(),
+        &workspace,
+        "true",
+        false,
+        &sandbox,
+    )
+    .unwrap();
+
+    // `get_envs` lists only values explicitly applied to this Command, not
+    // arbitrary process environment inherited by its child. None of the
+    // Git command-scope keys may be e-agent overrides.
+    for name in [
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_KEY_1",
+        "GIT_CONFIG_VALUE_1",
     ] {
         assert!(
-            roots.contains(&PathBuf::from(expected)),
-            "missing mount root {expected}"
+            !command
+                .as_std()
+                .get_envs()
+                .any(|(configured, _)| configured == OsStr::new(name)),
+            "sandbox command must not force {name}"
         );
     }
-}
-
-#[test]
-fn gh_visible_in_sandbox_respects_configured_mounts() {
-    use std::path::Path;
-    let sandbox = crate::config::Sandbox {
-        enabled: true,
-        network: true,
-        workspace_writable: true,
-        writable_paths: vec![],
-        readable_paths: vec!["/home/user/.local".into()],
-        readable_mounts: vec![],
-        writable_mounts: vec![],
-    };
-    let mounts = sandbox_mount_roots(&sandbox, Path::new("/ws"));
-    // gh under a configured readable path -> visible.
-    assert!(gh_visible_in_sandbox(
-        Some(Path::new("/home/user/.local/bin/gh")),
-        &mounts
-    ));
-    // gh under a path that is NOT mounted -> not visible.
-    assert!(!gh_visible_in_sandbox(
-        Some(Path::new("/opt/gh/bin/gh")),
-        &mounts
-    ));
-    // No host gh -> not visible.
-    assert!(!gh_visible_in_sandbox(None, &mounts));
 }
 
 #[test]
