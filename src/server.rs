@@ -1137,8 +1137,59 @@ fn apply_subagent_label(meta: &mut SessionMeta, label: Option<String>) {
     meta.label = label;
 }
 
+/// Threshold for logging slow `GET /api/sessions` requests: total handler
+/// time at or above this (or any degraded error path) emits one
+/// `eprintln!` line with per-phase durations and counts. Conservative so
+/// normal requests stay silent. Never logs session ids/titles/paths.
+const LIST_SESSIONS_SLOW_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Per-phase timings of one `list_sessions` call, in milliseconds.
+#[derive(Default, Clone, Copy)]
+struct ListSessionsTiming {
+    live_ms: u128,
+    list_meta_ms: u128,
+    labels_ms: u128,
+    child_scan_ms: u128,
+    merge_ms: u128,
+    total_ms: u128,
+}
+
+/// Build the slow-request log line, or `None` when the request was fast
+/// and clean. Pure so the threshold/format is unit-testable.
+#[allow(clippy::too_many_arguments)]
+fn list_sessions_slow_log(
+    timing: ListSessionsTiming,
+    degraded: bool,
+    live: usize,
+    historical: usize,
+    merged: usize,
+    subagent_labels: usize,
+) -> Option<String> {
+    if !degraded && timing.total_ms < LIST_SESSIONS_SLOW_THRESHOLD.as_millis() {
+        return None;
+    }
+    Some(format!(
+        "e-agent: GET /api/sessions {}: total={}ms live={}ms list_meta={}ms labels={}ms child_scan={}ms merge={}ms counts(live={} historical={} merged={} subagent_labels={})",
+        if degraded { "degraded" } else { "slow" },
+        timing.total_ms,
+        timing.live_ms,
+        timing.list_meta_ms,
+        timing.labels_ms,
+        timing.child_scan_ms,
+        timing.merge_ms,
+        live,
+        historical,
+        merged,
+        subagent_labels,
+    ))
+}
+
 async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMeta>> {
+    let request_start = std::time::Instant::now();
+    let mut timing = ListSessionsTiming::default();
+    let mut degraded = false;
     let root = state.factory.root();
+    let phase_start = std::time::Instant::now();
     let mut active: Vec<SessionMeta> = Vec::with_capacity(state.registry.list().len());
     // Main-registry ids: an entry restored/resumed into the main registry
     // already carries its real status/busy/active from `session_meta`, so
@@ -1149,15 +1200,22 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
         main_registry_ids.insert(id.clone());
         active.push(session_meta(&id, &session, root).await);
     }
+    timing.live_ms = phase_start.elapsed().as_millis();
+    let live_count = active.len();
+    let phase_start = std::time::Instant::now();
     // Historical sessions from the metadata table (Greptime/SQLite audit
     // table; JSONL `.meta.jsonl` sidecars).
     let historical = match state.meta_store.list_meta(root).await {
         Ok(list) => list,
         Err(error) => {
             eprintln!("e-agent: cannot list session metadata: {error:#}");
+            degraded = true;
             Vec::new()
         }
     };
+    timing.list_meta_ms = phase_start.elapsed().as_millis();
+    let historical_count = historical.len();
+    let phase_start = std::time::Instant::now();
     let mut merged = merge_session_metas(active, historical);
     // Subagent items carry the task-panel label of their delegate task,
     // which lives in `running_tasks` (the sessions metadata table has no
@@ -1179,6 +1237,7 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
                         }
                         Err(error) => {
                             eprintln!("e-agent: cannot look up subagent label: {error:#}");
+                            degraded = true;
                         }
                     }
                 }
@@ -1186,8 +1245,12 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
         }
         Err(error) => {
             eprintln!("e-agent: cannot look up subagent labels: {error:#}");
+            degraded = true;
         }
     }
+    timing.labels_ms = phase_start.elapsed().as_millis();
+    let subagent_label_count = labels.len();
+    let phase_start = std::time::Instant::now();
     // Live subagent handles live in their parent session's `Sessions`
     // registry, not the main registry, so `session_meta` never sees their
     // real status. Snapshot them AFTER the async label queries so every
@@ -1213,6 +1276,8 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
             }
         }
     }
+    timing.child_scan_ms = phase_start.elapsed().as_millis();
+    let phase_start = std::time::Instant::now();
     for meta in &mut merged {
         if meta.parent_session_id.is_none() {
             continue;
@@ -1236,6 +1301,18 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
         if let Some(label) = labels.get(&meta.id) {
             apply_subagent_label(meta, label.clone());
         }
+    }
+    timing.merge_ms = phase_start.elapsed().as_millis();
+    timing.total_ms = request_start.elapsed().as_millis();
+    if let Some(message) = list_sessions_slow_log(
+        timing,
+        degraded,
+        live_count,
+        historical_count,
+        merged.len(),
+        subagent_label_count,
+    ) {
+        eprintln!("{message}");
     }
     Json(merged)
 }
@@ -3331,6 +3408,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn list_sessions_slow_log_is_silent_below_threshold_and_clean() {
+        let timing = ListSessionsTiming {
+            total_ms: LIST_SESSIONS_SLOW_THRESHOLD.as_millis() - 1,
+            ..ListSessionsTiming::default()
+        };
+        assert!(list_sessions_slow_log(timing, false, 1, 2, 3, 0).is_none());
+    }
+
+    #[test]
+    fn list_sessions_slow_log_fires_at_threshold() {
+        let timing = ListSessionsTiming {
+            total_ms: LIST_SESSIONS_SLOW_THRESHOLD.as_millis(),
+            ..ListSessionsTiming::default()
+        };
+        let message = list_sessions_slow_log(timing, false, 1, 2, 3, 0).unwrap();
+        assert!(message.starts_with("e-agent: GET /api/sessions slow:"));
+        assert!(message.contains("total=1000ms"));
+        assert!(message.contains("counts(live=1 historical=2 merged=3 subagent_labels=0)"));
+    }
+
+    #[test]
+    fn list_sessions_slow_log_fires_when_degraded_even_if_fast() {
+        let message =
+            list_sessions_slow_log(ListSessionsTiming::default(), true, 0, 0, 0, 0).unwrap();
+        assert!(message.starts_with("e-agent: GET /api/sessions degraded:"));
     }
 
     #[test]
