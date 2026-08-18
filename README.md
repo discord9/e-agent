@@ -736,53 +736,26 @@ session, and a verifier agent.
 
 ## Session output receipts (`eout1`) and the `read_output` tool
 
-Sessions persist every entry LOSSLESSLY (full GreptimeDB / SQLite / JSONL
-transcripts; `Agent::context()` and persisted `Compaction.retained` stay
-full/byte-exact). Only the *provider request copies* are bounded: an
-eligible oversized persisted field — background-completion output,
-`Message::Tool.content` (all persisted builtin/MCP/delegate results),
-`Notice.text`, historical user/assistant content, and
-`Compaction.summary`/`retained` — is projected as a UTF-8-safe head+tail
-plus a MAC-protected receipt (`read_output` ref) instead of the full text.
-System messages, the session goal, the CURRENT actual user prompt, tool
-call ids/names/arguments, reasoning, and images are always kept exact.
+Sessions persist entries losslessly; only oversized provider-request fields are
+shown as a UTF-8-safe head/tail projection with a `read_output` ref. New refs
+are durable direct numeric references: `eout1.<entry-id>.<field-code>` (for
+example `eout1.12.t`). They persist across restart because they name a durable
+entry in the current session: JSONL uses its 0-based nonblank entry ordinal;
+SQLite and Greptime use logical session-local `seq` and read that seq's latest
+row. Field codes are `b` background output, `t` tool content, `n` notice text,
+`a` assistant content, `u` user content, `s` compaction summary, and `r`
+compaction retained data. The runner always binds a direct ref to its current
+store, workspace, and session; a ref contains no backend or session selector.
 
-- **`eout1` receipt**: `eout1.<base64url JSON>` carrying the field code,
-  backend kind, workspace fingerprint (a hash — never a path), session id,
-  the exact physical key (`ordinal` on JSONL; `seq`+`event_time_us` on
-  SQLite/Greptime), the entry's payload SHA-256, the total field byte
-  length, and an HMAC-SHA256 tag over all of it. The key is a dedicated
-  32-byte secret at `$XDG_STATE_HOME/e-agent/receipt.key` (fallback
-  `~/.config/e-agent/receipt.key`), created atomically with mode 0600,
-  stable across restarts, and never the web token. Receipts contain no
-  credentials, connection strings, or paths.
-- **Exact-version reads**: located keys pin the exact physical row
-  (`seq`+`event_time`/`ordinal`) plus the payload hash — never
-  "latest wins". A same-seq later write cannot retarget an old ref, and
-  `read_output` re-checks the hash, the field, and the total size on every
-  read (stable error classes: `invalid`, `unavailable`, `integrity`,
-  `utf8-boundary`, `out-of-range`).
-- **JSONL ordinal serialization is Unix-only (best-effort on Windows)**:
-  on Unix, cross-process JSONL append ordinals — the physical key of
-  every JSONL receipt — are serialized by an exclusive advisory `flock`
-  over the whole count+append+sync+location window; Windows has no
-  `flock`, so concurrent JSONL writers are serialized only within one
-  process. Multi-process Windows deployments should use the SQLite or
-  GreptimeDB backends.
-- **`read_output`**: always-on read-only tool on main, read-only main,
-  ordinary/read-only subagents, and btw forks. Closed schema (`ref`
-  required, `offset` default 0, `limit` default 16 KiB / max 32 KiB);
-  returns a JSON page `{"offset","length","text","next_offset",
-  "total_bytes","sha256"}` with UTF-8-boundary-safe paging. No listing,
-  search, path traversal, or DB access — possession of a valid receipt is a
-  bearer capability for exactly that one field.
-- **Durable-before-ref**: receipts are only issued from located keys
-  returned by the durable append, so a ref always resolves to a persisted
-  row. In this stage an entry WITHOUT a located key (legacy/test
-  in-memory) or with an unavailable receipt key file is left FULL
-  (fail-open — the field is projected byte-exact, never an unusable ref);
-  the total-budget stage that degrades *many medium* messages (and fails
-  closed on unlocatable fields) comes later.
+Historical self-contained `eout1.<base64url JSON>` refs remain accepted. Their
+location/field/size JSON is parsed directly and any old `m` member is ignored,
+so persisted history containing old long refs remains readable.
+
+`read_output` is always available and takes `ref`, byte `offset` (default 0),
+and `limit` (default 12 KiB, maximum 32 KiB). It returns a UTF-8-safe JSON page
+with offsets, full-field SHA-256, and `next_offset`; the newest `read_output`
+tool result is kept full in the next provider request so the requested page is
+actually visible to the model.
 
 Non-goal (this stage): the total context-window estimator that degrades
 *many medium* messages, and per-tool output-cap expansion for producers that

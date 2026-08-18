@@ -280,7 +280,7 @@ fn tools_with_background_and_exa_key(
     tools.extend(goal_tools());
     // The always-on, read-only `read_output` tool (every session: main,
     // read-only main, ordinary/read-only subagents, btw forks). The runner
-    // intercepts it by name with the session's store + receipt codec.
+    // intercepts it by name with the session's store.
     tools.push(Box::new(ReadOutput));
     tools
 }

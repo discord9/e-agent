@@ -408,10 +408,6 @@ impl Delegate {
         if let Some(window) = context_window {
             agent.set_context_window(window);
         }
-        // The `eout1` receipt codec (bounded provider projections + the
-        // runner's read_output verification share this one key); `None` when
-        // the state-dir key is unavailable → fields stay full.
-        agent = agent.with_receipt_codec(crate::output_receipt::ReceiptCodec::load().ok());
         if let Some(reminder) = task.compaction_reminder {
             agent.set_compaction_reminder(reminder);
         }

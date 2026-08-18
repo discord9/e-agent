@@ -1679,16 +1679,8 @@ fn background_completion_and_notice_coexist_in_context() {
 // The canonical `context()` is FULL/LOSSLESS (no bounding at all); only
 // request copies (`context_request`, and the compaction request derived
 // from it) bound eligible oversized persisted fields, replacing them with a
-// UTF-8-safe head+tail plus a MAC-protected eout1 receipt (`read_output`
+// UTF-8-safe head+tail plus a direct eout1 ref (`read_output`
 // ref). A field without a located key stays FULL (never an unusable ref).
-
-/// A codec bound to a tempdir key, so projection tests are hermetic and
-/// deterministic.
-fn test_codec() -> (tempfile::TempDir, crate::output_receipt::ReceiptCodec) {
-    let dir = tempfile::tempdir().unwrap();
-    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(dir.path()).unwrap();
-    (dir, codec)
-}
 
 /// A JSONL located key for `ordinal` inside a tempdir-backed session file.
 fn jsonl_location(root: &std::path::Path, session: &str, ordinal: i64) -> EntryLocation {
@@ -1780,7 +1772,7 @@ fn context_request_passes_small_outputs_through_byte_identical() {
     // passes through the REQUEST copy byte-identical — no marker, no
     // receipt, no truncation (the bounded projection only engages on
     // oversized fields).
-    let (_dir, codec) = test_codec();
+
     let output = "small output\n".repeat(10);
     assert!(output.len() <= PROJECTION_THRESHOLD);
     let mut agent = Agent::new(
@@ -1790,8 +1782,7 @@ fn context_request_passes_small_outputs_through_byte_identical() {
             delays: Default::default(),
         }),
         vec![],
-    )
-    .with_receipt_codec(Some(codec));
+    );
     let root = tempfile::tempdir().unwrap();
     let session = "proj-small".to_owned();
     let mut location = jsonl_location(root.path(), &session, 0);
@@ -1833,7 +1824,6 @@ fn context_request_passes_small_outputs_through_byte_identical() {
 
 #[test]
 fn context_request_bounds_oversized_background_completion_with_receipt() {
-    let (_dir, codec) = test_codec();
     let output = format!(
         "{}{}{}",
         "h".repeat(PROJECTION_HEAD_BYTES),
@@ -1847,8 +1837,7 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
             delays: Default::default(),
         }),
         vec![],
-    )
-    .with_receipt_codec(Some(codec));
+    );
     let root = tempfile::tempdir().unwrap();
     let session = "proj-test".to_owned();
     let mut location = jsonl_location(root.path(), &session, 0);
@@ -1909,11 +1898,7 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
             + format!("\n[truncated: 14 bytes omitted; read_output ref={receipt}]\n").len()
             + PROJECTION_TAIL_BYTES,
     );
-    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(_dir.path()).unwrap();
-    let verified = codec.verify(receipt).unwrap();
-    assert_eq!(verified.location, location);
-    assert_eq!(verified.field, FieldId::BgOutput);
-    assert_eq!(verified.total, output.len());
+    assert_eq!(receipt, "eout1.0.b");
     // The persisted entry keeps the FULL output untouched.
     assert!(matches!(
         agent.history().first().unwrap(),
@@ -1923,7 +1908,6 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
 
 #[test]
 fn context_request_bounds_oversized_tool_content_with_receipt() {
-    let (_dir, codec) = test_codec();
     let content = format!(
         "{}{}{}",
         "a".repeat(PROJECTION_HEAD_BYTES),
@@ -1948,8 +1932,7 @@ fn context_request_bounds_oversized_tool_content_with_receipt() {
             delays: Default::default(),
         }),
         vec![],
-    )
-    .with_receipt_codec(Some(codec));
+    );
     let root = tempfile::tempdir().unwrap();
     let session = "proj-test".to_owned();
     let mut location = jsonl_location(root.path(), &session, 1);
@@ -1996,7 +1979,6 @@ fn context_request_bounds_oversized_tool_content_with_receipt() {
 
 #[test]
 fn context_request_bounds_notice_and_historical_user_content() {
-    let (_dir, codec) = test_codec();
     let huge = "z".repeat(PROJECTION_THRESHOLD + 10);
     let user = SessionEntry::Message {
         message: Message::User {
@@ -2012,8 +1994,7 @@ fn context_request_bounds_notice_and_historical_user_content() {
             delays: Default::default(),
         }),
         vec![],
-    )
-    .with_receipt_codec(Some(codec));
+    );
     let root = tempfile::tempdir().unwrap();
     let session = "proj-test".to_owned();
     let mut loc_user = jsonl_location(root.path(), &session, 0);
@@ -2052,7 +2033,6 @@ fn context_request_bounds_notice_and_historical_user_content() {
 
 #[test]
 fn context_request_keeps_current_user_and_system_full() {
-    let (_dir, codec) = test_codec();
     let huge = "y".repeat(PROJECTION_THRESHOLD + 10);
     let current = SessionEntry::Message {
         message: Message::User {
@@ -2067,8 +2047,7 @@ fn context_request_keeps_current_user_and_system_full() {
             delays: Default::default(),
         }),
         vec![],
-    )
-    .with_receipt_codec(Some(codec));
+    );
     agent.set_context_prefix("SYSTEM-PREFIX".into());
     let root = tempfile::tempdir().unwrap();
     let session = "proj-test".to_owned();
@@ -2089,7 +2068,6 @@ fn context_request_keeps_current_user_and_system_full() {
 
 #[test]
 fn context_request_keeps_goal_tool_calls_and_reasoning_exact() {
-    let (_dir, codec) = test_codec();
     let huge = "w".repeat(PROJECTION_THRESHOLD + 10);
     let tool_call = call("call-1", "bash", r#"{"command":"ls"}"#);
     let mut agent = Agent::new(
@@ -2099,8 +2077,7 @@ fn context_request_keeps_goal_tool_calls_and_reasoning_exact() {
             delays: Default::default(),
         }),
         vec![],
-    )
-    .with_receipt_codec(Some(codec));
+    );
     let assistant = SessionEntry::Message {
         message: Message::Assistant(AssistantMessage {
             content: Some(huge.clone()),
@@ -2155,7 +2132,7 @@ fn context_request_keeps_goal_tool_calls_and_reasoning_exact() {
 fn context_request_leaves_unlocated_fields_full() {
     // Legacy/test in-memory entries have no located key: oversized fields
     // stay FULL — never an unusable receipt ref.
-    let (_dir, codec) = test_codec();
+
     let huge = "v".repeat(PROJECTION_THRESHOLD + 10);
     let mut agent = Agent::new(
         Box::new(ScriptedModel {
@@ -2164,8 +2141,7 @@ fn context_request_leaves_unlocated_fields_full() {
             delays: Default::default(),
         }),
         vec![],
-    )
-    .with_receipt_codec(Some(codec));
+    );
     agent.restore_history(vec![SessionEntry::Notice { text: huge.clone() }]);
     let msgs = agent.context_request();
     assert_eq!(msgs.len(), 1);
@@ -2177,7 +2153,7 @@ fn context_request_leaves_unlocated_fields_full() {
 }
 
 #[test]
-fn context_request_without_codec_leaves_everything_full() {
+fn context_request_with_location_uses_direct_ref() {
     let huge = "u".repeat(PROJECTION_THRESHOLD + 10);
     let mut agent = Agent::new(
         Box::new(ScriptedModel {
@@ -2196,8 +2172,8 @@ fn context_request_without_codec_leaves_everything_full() {
     agent.restore_located(vec![entry], vec![Some(loc)]);
     let msgs = agent.context_request();
     assert!(
-        matches!(&msgs[0], Message::User { content, .. } if content == &huge),
-        "no codec → leave full"
+        matches!(&msgs[0], Message::User { content, .. } if content.contains("ref=eout1.0.n") && !content.contains(&huge)),
+        "persisted location should issue a direct ref"
     );
 }
 
@@ -2209,7 +2185,7 @@ async fn compaction_retained_stays_full_and_request_is_bounded() {
     // current turn FULL (lossless), and the compaction REQUEST carries
     // only the bounded projection of the pre-turn history.
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let (_dir, codec) = test_codec();
+
     let model = ScriptedModel {
         replies: vec![AssistantMessage {
             content: Some("summary".into()),
@@ -2226,7 +2202,7 @@ async fn compaction_retained_stays_full_and_request_is_bounded() {
         "OMITTED-MIDDLE",
         "t".repeat(PROJECTION_TAIL_BYTES)
     );
-    let mut agent = Agent::new(Box::new(model), vec![]).with_receipt_codec(Some(codec));
+    let mut agent = Agent::new(Box::new(model), vec![]);
     let root = tempfile::tempdir().unwrap();
     let session = "proj-test".to_owned();
     let mut loc = jsonl_location(root.path(), &session, 0);
@@ -2370,7 +2346,7 @@ async fn compaction_split_uses_actual_user_not_background_completion() {
     // user-SHAPED message") would have compacted the current turn and
     // retained only the completion.
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let (_dir, codec) = test_codec();
+
     let model = ScriptedModel {
         replies: vec![AssistantMessage {
             content: Some("summary".into()),
@@ -2380,7 +2356,7 @@ async fn compaction_split_uses_actual_user_not_background_completion() {
         requests: requests.clone(),
         delays: Default::default(),
     };
-    let mut agent = Agent::new(Box::new(model), vec![]).with_receipt_codec(Some(codec));
+    let mut agent = Agent::new(Box::new(model), vec![]);
     agent.restore_history(vec![
         Message::User {
             content: "earlier question".into(),
@@ -2467,7 +2443,7 @@ fn resumed_projection_keeps_actual_user_provenance() {
     // `current_prompt_at`: on RESUME the retained projection marks exactly
     // that message as the current prompt — a background completion earlier
     // in the retained array is NOT the current prompt and stays boundable.
-    let (_dir, codec) = test_codec();
+
     let huge = "p".repeat(PROJECTION_THRESHOLD + 10);
     let retained = vec![
         // A user-shaped background completion projected into the retained
@@ -2496,8 +2472,7 @@ fn resumed_projection_keeps_actual_user_provenance() {
             delays: Default::default(),
         }),
         vec![],
-    )
-    .with_receipt_codec(Some(codec));
+    );
     let root = tempfile::tempdir().unwrap();
     let session = "resumed-prov".to_owned();
     let mut loc = jsonl_location(root.path(), &session, 0);
@@ -2525,10 +2500,7 @@ fn resumed_projection_keeps_actual_user_provenance() {
     let ref_start = content.find("ref=eout1.").unwrap() + "ref=".len();
     let ref_end = content[ref_start..].find(']').unwrap() + ref_start;
     let receipt = &content[ref_start..ref_end];
-    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(_dir.path()).unwrap();
-    let verified = codec.verify(receipt).unwrap();
-    assert_eq!(verified.field, FieldId::CompactionRetained);
-    assert_eq!(verified.total, serde_json::to_vec(&retained).unwrap().len());
+    assert_eq!(receipt, "eout1.0.r");
 }
 
 #[test]
@@ -2537,7 +2509,7 @@ fn context_request_bounds_second_retained_projection() {
     // the FIRST user is the current prompt (full), the SECOND user-shaped
     // message is a projection and is bounded with a compaction_retained
     // receipt.
-    let (_dir, codec) = test_codec();
+
     let huge = "p".repeat(PROJECTION_THRESHOLD + 10);
     let retained = vec![
         Message::User {
@@ -2562,8 +2534,7 @@ fn context_request_bounds_second_retained_projection() {
             delays: Default::default(),
         }),
         vec![],
-    )
-    .with_receipt_codec(Some(codec));
+    );
     let root = tempfile::tempdir().unwrap();
     let session = "retained-2".to_owned();
     let mut loc = jsonl_location(root.path(), &session, 0);
@@ -2583,10 +2554,7 @@ fn context_request_bounds_second_retained_projection() {
     let ref_start = content.find("ref=eout1.").unwrap() + "ref=".len();
     let ref_end = content[ref_start..].find(']').unwrap() + ref_start;
     let receipt = &content[ref_start..ref_end];
-    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(_dir.path()).unwrap();
-    let verified = codec.verify(receipt).unwrap();
-    assert_eq!(verified.field, FieldId::CompactionRetained);
-    assert_eq!(verified.total, serde_json::to_vec(&retained).unwrap().len());
+    assert_eq!(receipt, "eout1.0.r");
 }
 
 #[tokio::test]
@@ -2596,7 +2564,7 @@ async fn compaction_request_bounds_oversized_completion_before_later_user() {
     // compaction REQUEST carries at most the bounded completion, while the
     // retained tail keeps the later user turn verbatim (FULL).
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let (_dir, codec) = test_codec();
+
     let model = ScriptedModel {
         replies: vec![AssistantMessage {
             content: Some("summary".into()),
@@ -2613,7 +2581,7 @@ async fn compaction_request_bounds_oversized_completion_before_later_user() {
         "OMITTED-MIDDLE",
         "t".repeat(PROJECTION_TAIL_BYTES)
     );
-    let mut agent = Agent::new(Box::new(model), vec![]).with_receipt_codec(Some(codec));
+    let mut agent = Agent::new(Box::new(model), vec![]);
     let root = tempfile::tempdir().unwrap();
     let session = "proj-test".to_owned();
     let mut loc = jsonl_location(root.path(), &session, 0);
@@ -2702,7 +2670,7 @@ async fn context_request_retained_receipt_binds_the_full_retained_array() {
     // array: `read_output` returns the full array (which contains the
     // message), and the receipt's total binds the array length — so the
     // read reconstructs exactly the persisted field.
-    let (_dir, codec) = test_codec();
+
     let huge = "q".repeat(PROJECTION_THRESHOLD + 10);
     let retained = vec![
         Message::Assistant(AssistantMessage {
@@ -2735,8 +2703,7 @@ async fn context_request_retained_receipt_binds_the_full_retained_array() {
             delays: Default::default(),
         }),
         vec![],
-    )
-    .with_receipt_codec(Some(codec));
+    );
     let root = tempfile::tempdir().unwrap();
     let session = "retained-test".to_owned();
     let mut loc = jsonl_location(root.path(), &session, 0);
@@ -2754,21 +2721,15 @@ async fn context_request_retained_receipt_binds_the_full_retained_array() {
     let ref_start = content.find("ref=eout1.").unwrap() + "ref=".len();
     let ref_end = content[ref_start..].find(']').unwrap() + ref_start;
     let receipt = &content[ref_start..ref_end];
-    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(_dir.path()).unwrap();
-    let verified = codec.verify(receipt).unwrap();
-    assert_eq!(verified.field, FieldId::CompactionRetained);
-    // The bound total is the WHOLE retained array's byte length.
-    let expected_total = serde_json::to_vec(&retained).unwrap().len();
-    assert_eq!(verified.total, expected_total);
-    assert!(
-        verified.total > huge.len(),
-        "array total covers all messages"
-    );
-    // Reconstruct through a real JSONL persistence layer: persist the
-    // compaction, then read_field returns the exact retained array.
+    assert_eq!(receipt, "eout1.0.r");
+    // Reconstruct through a real JSONL persistence layer and resolve the
+    // direct ref using the current session only.
     crate::session::Session::append_located(root.path(), &session, &[compaction]).unwrap();
     let store = crate::session_store::SessionStore::Jsonl;
-    let bytes = store.read_field(root.path(), &verified).await.unwrap();
+    let bytes = store
+        .read_field_direct(root.path(), &session, 0, FieldId::CompactionRetained)
+        .await
+        .unwrap();
     assert_eq!(bytes, serde_json::to_vec(&retained).unwrap());
 }
 
@@ -4281,7 +4242,7 @@ fn single_task_retained_background_completion_is_not_the_current_prompt() {
     // mistaking it for the current prompt (the old `None` read as legacy
     // provenance and fell back to the first user-shaped retained message,
     // keeping the completion full as if it were the prompt).
-    let (_dir, codec) = test_codec();
+
     let huge = "p".repeat(PROJECTION_THRESHOLD + 10);
     let retained = vec![
         Message::Assistant(AssistantMessage {
@@ -4318,8 +4279,7 @@ fn single_task_retained_background_completion_is_not_the_current_prompt() {
         }),
         vec![],
     )
-    .with_compaction_mode(CompactionMode::SingleTask)
-    .with_receipt_codec(Some(codec));
+    .with_compaction_mode(CompactionMode::SingleTask);
     let root = tempfile::tempdir().unwrap();
     let session = "single-task-bg".to_owned();
     let mut loc = jsonl_location(root.path(), &session, 0);
@@ -5370,4 +5330,49 @@ fn compaction_without_reminder_keeps_existing_projection_bytes() {
         Message::User { content, .. }
             if content == "[compacted summary of earlier conversation]\nsummary text"
     ));
+}
+
+#[test]
+fn latest_read_output_result_stays_full_in_request_context() {
+    let huge = "page ".repeat(PROJECTION_THRESHOLD);
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    let root = tempfile::tempdir().unwrap();
+    let location = jsonl_location(root.path(), "latest-read-output", 0);
+    agent.restore_located(
+        vec![
+            SessionEntry::Message {
+                message: Message::Assistant(AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "id".into(),
+                        name: "read_output".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                }),
+            },
+            SessionEntry::Message {
+                message: Message::Tool {
+                    call_id: "id".into(),
+                    name: "read_output".into(),
+                    content: huge.clone(),
+                    images: vec![],
+                    is_error: false,
+                    synthetic: false,
+                },
+            },
+        ],
+        vec![Some(location.clone()), Some(location)],
+    );
+    let Message::Tool { content, .. } = &agent.context_request()[1] else {
+        panic!("expected tool result")
+    };
+    assert_eq!(content, &huge);
 }

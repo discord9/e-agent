@@ -5,7 +5,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
-use crate::output_receipt::{FieldId, ReceiptCodec, bound_field};
+use crate::output_receipt::{FieldId, bound_field};
 use crate::session_store::EntryLocation;
 
 /// Content of the synthetic error result inserted for every tool call left
@@ -879,7 +879,7 @@ pub enum SessionEntry {
     /// A structured background completion entry. Persisted in the session
     /// log with the full output. The TUI renders a truncated preview; the
     /// provider REQUEST copy bounds the output (UTF-8-safe head+tail plus a
-    /// MAC-protected `read_output` receipt, see
+    /// session-local `read_output` ref, see
     /// [`crate::output_receipt`]) so an oversized completion can never
     /// blow up the provider context — the persisted entry stays full.
     /// Backwards-compatible: old `Notice` entries are read without guessing
@@ -1146,16 +1146,8 @@ pub struct Agent {
     goal_cleared: bool,
     /// Exact physical located keys of the persisted history, aligned 1:1
     /// with `history` (`None` = the entry has no located key: legacy/test
-    /// in-memory entries, entries pushed without a location). The bounded
-    /// provider projection turns a `Some` location into a MAC-protected
-    /// `eout1` receipt; a `None` location leaves the field full.
+    /// in-memory entries, entries pushed without a location).
     entry_locations: Vec<Option<EntryLocation>>,
-    /// The `eout1` receipt codec used by [`Self::context_request`] and
-    /// `prepare_compaction`'s bounded request. `None` (tests, or when the
-    /// state-dir key is unavailable) disables bounding: oversized fields
-    /// stay full and no receipts are issued. The runner clones it for
-    /// `read_output` verification.
-    receipt_codec: Option<ReceiptCodec>,
     /// How compaction picks its retained tail (see [`CompactionMode`]).
     /// Set by the caller — never inferred from the history. Main by
     /// default; delegated subagents (src/delegate.rs) opt into
@@ -1194,7 +1186,6 @@ impl Agent {
             goal: None,
             goal_cleared: false,
             entry_locations: Vec::new(),
-            receipt_codec: None,
             compaction_mode: CompactionMode::Main,
         }
     }
@@ -1206,21 +1197,6 @@ impl Agent {
     pub fn with_compaction_mode(mut self, mode: CompactionMode) -> Self {
         self.compaction_mode = mode;
         self
-    }
-
-    /// Install the `eout1` receipt codec used for bounded provider
-    /// projections (the runner/`read_output` verifier uses the same key).
-    /// `None` disables bounding (fields stay full). Production callers pass
-    /// `ReceiptCodec::load().ok()`; tests pass a codec from a tempdir key.
-    pub fn with_receipt_codec(mut self, codec: Option<ReceiptCodec>) -> Self {
-        self.receipt_codec = codec;
-        self
-    }
-
-    /// The installed receipt codec (the runner clones it for `read_output`
-    /// verification, so the agent and its runner always share one key).
-    pub(crate) fn receipt_codec(&self) -> Option<&ReceiptCodec> {
-        self.receipt_codec.as_ref()
     }
 
     /// Extra system context prepended to every model call. Not persisted in
@@ -1463,11 +1439,11 @@ impl Agent {
     /// except that eligible oversized persisted fields (background
     /// completion output, tool content, notice text, historical
     /// user/assistant content, compaction summary/retained) are projected
-    /// as a UTF-8-safe head+tail plus a MAC-protected `eout1` receipt
+    /// as a UTF-8-safe head+tail plus a session-local `eout1` ref
     /// (`read_output` ref). System messages, the session goal, the CURRENT
     /// actual user message, tool call ids/names/arguments, reasoning, and
     /// images are kept exact. A field is left full when no located key
-    /// exists for its entry or when the receipt codec is unavailable —
+    /// exists for its entry or when no registry is installed —
     /// never an unusable ref.
     pub fn context_request(&self) -> Vec<Message> {
         self.repaired_items()
@@ -1660,6 +1636,13 @@ impl Agent {
         if let Some(last) = items.iter().rposition(|item| item.actual_user) {
             items[last].keep_full = true;
         }
+        // The newest pager result must be complete in the next provider
+        // request: it is precisely the page the model asked to inspect.
+        if let Some(last) = items.iter().rposition(
+            |item| matches!(&item.message, Message::Tool { name, .. } if name == "read_output"),
+        ) {
+            items[last].keep_full = true;
+        }
         items
     }
 
@@ -1678,12 +1661,8 @@ impl Agent {
                 Message::System { .. } => return item.message.clone(),
             },
         };
-        // Receipt only when a located key exists; a legacy/test in-memory
-        // entry without a key stays FULL (the total-budget stage will fail
-        // closed later). Same for an unavailable receipt codec.
-        let Some(codec) = &self.receipt_codec else {
-            return item.message.clone();
-        };
+        // Receipt only when a persisted location exists; legacy/test in-memory
+        // entries stay full.
         let Some(location) = &item.location else {
             return item.message.clone();
         };
@@ -1691,7 +1670,7 @@ impl Agent {
         match &item.message {
             Message::User { content, images } => {
                 let rest = &content[item.prefix.len()..];
-                let bounded = bound_field(codec, rest, location, field, field_total(rest.len()));
+                let bounded = bound_field(rest, location, field, field_total(rest.len()));
                 Message::User {
                     content: format!("{}{}", item.prefix, bounded),
                     images: images.clone(),
@@ -1702,7 +1681,6 @@ impl Agent {
                 let mut assistant = assistant.clone();
                 if let Some(content) = &assistant.content {
                     assistant.content = Some(bound_field(
-                        codec,
                         content,
                         location,
                         field,
@@ -1723,13 +1701,7 @@ impl Agent {
                 Message::Tool {
                     call_id: call_id.clone(),
                     name: name.clone(),
-                    content: bound_field(
-                        codec,
-                        content,
-                        location,
-                        field,
-                        field_total(content.len()),
-                    ),
+                    content: bound_field(content, location, field, field_total(content.len())),
                     images: images.clone(),
                     is_error: *is_error,
                     synthetic: *synthetic,
@@ -2125,7 +2097,7 @@ impl Agent {
         let mut produced_content_delta = false;
         // The BOUNDED request copy: canonical `context()` stays full and
         // lossless; oversized eligible persisted fields are projected as
-        // head+tail + a MAC-protected `read_output` receipt.
+        // head+tail + a session-local `read_output` ref.
         let mut context = self.context_request();
         // Non-vision models cannot consume image parts. Strip them from the
         // *request* only, so the wire gate never rejects the whole history

@@ -708,6 +708,32 @@ impl SqliteSession {
         Ok(located)
     }
 
+    /// Direct current-session read by logical seq, selecting the newest row.
+    pub async fn read_field_direct(
+        &self,
+        seq: i64,
+        field: crate::output_receipt::FieldId,
+    ) -> Result<Vec<u8>, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT payload FROM session_entries WHERE workspace_id = ?1 AND session_id = ?2 AND seq = ?3 ORDER BY event_time_us DESC LIMIT 1",
+            (self.workspace_id.as_str(), self.session_id.as_str(), seq),
+        ).await.map_err(|e| format!("cannot read entry: {e}"))?;
+        let payload = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot read entry: {e}"))?
+            .ok_or_else(|| "entry not found".to_string())?
+            .get_value(0)
+            .map_err(|e| format!("cannot read entry: {e}"))?
+            .as_text()
+            .cloned()
+            .ok_or_else(|| "entry payload is not text".to_string())?;
+        let entry: SessionEntry =
+            serde_json::from_str(&payload).map_err(|e| format!("cannot decode entry: {e}"))?;
+        field_bytes(&entry, field).ok_or_else(|| "entry does not carry that field".to_string())
+    }
+
     /// Exact-version field read: verify the receipt binding against this
     /// store (backend kind, workspace fingerprint, session), SELECT the
     /// payload pinned by `seq` + `event_time_us` (never latest-wins),

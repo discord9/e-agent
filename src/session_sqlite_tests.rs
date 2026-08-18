@@ -823,18 +823,14 @@ async fn append_full_overlap_returns_actual_committed_locations() {
     assert_eq!(locs_a, locs_b, "retry must return the committed rows");
 
     // Every returned location resolves through read_field with a receipt.
-    let codec_dir = tempfile::tempdir().unwrap();
-    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(codec_dir.path()).unwrap();
     for (i, loc) in locs_b.iter().enumerate() {
         let content = &["first", "second"][i];
-        let receipt = codec
-            .issue(
-                loc,
-                crate::output_receipt::FieldId::UserContent,
-                content.len(),
-            )
-            .unwrap();
-        let verified = codec.verify(&receipt).unwrap();
+        let receipt = crate::output_receipt::issue_legacy_for_test(
+            loc,
+            crate::output_receipt::FieldId::UserContent,
+            content.len(),
+        );
+        let verified = crate::output_receipt::verify_legacy_for_test(&receipt).unwrap();
         let bytes = writer_b.read_field(&verified).await.unwrap();
         assert_eq!(bytes, content.as_bytes(), "location must resolve");
     }
@@ -910,18 +906,14 @@ async fn append_partial_overlap_returns_actual_locations() {
     let loaded = writer_b.load().await.unwrap();
     assert_eq!(loaded.len(), 5);
     // Every returned location resolves through read_field.
-    let codec_dir = tempfile::tempdir().unwrap();
-    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(codec_dir.path()).unwrap();
     let contents = ["c", "d", "e"];
     for (i, loc) in locs_retry.iter().enumerate() {
-        let receipt = codec
-            .issue(
-                loc,
-                crate::output_receipt::FieldId::UserContent,
-                contents[i].len(),
-            )
-            .unwrap();
-        let verified = codec.verify(&receipt).unwrap();
+        let receipt = crate::output_receipt::issue_legacy_for_test(
+            loc,
+            crate::output_receipt::FieldId::UserContent,
+            contents[i].len(),
+        );
+        let verified = crate::output_receipt::verify_legacy_for_test(&receipt).unwrap();
         let bytes = writer_b.read_field(&verified).await.unwrap();
         assert_eq!(bytes, contents[i].as_bytes(), "location must resolve");
     }
@@ -1074,16 +1066,12 @@ async fn load_located_hashes_exact_raw_payload_bytes() {
     );
     // A receipt issued against that location resolves through read_field
     // (under the old re-serialization hashing it would fail integrity).
-    let codec_dir = tempfile::tempdir().unwrap();
-    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(codec_dir.path()).unwrap();
-    let receipt = codec
-        .issue(
-            loc,
-            crate::output_receipt::FieldId::UserContent,
-            "variant".len(),
-        )
-        .unwrap();
-    let verified = codec.verify(&receipt).unwrap();
+    let receipt = crate::output_receipt::issue_legacy_for_test(
+        loc,
+        crate::output_receipt::FieldId::UserContent,
+        "variant".len(),
+    );
+    let verified = crate::output_receipt::verify_legacy_for_test(&receipt).unwrap();
     let bytes = session.read_field(&verified).await.unwrap();
     assert_eq!(bytes, b"variant");
 }

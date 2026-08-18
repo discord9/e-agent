@@ -1,39 +1,20 @@
-//! The always-on, read-only `read_output` tool: pages the exact full
-//! persisted field named by a MAC-protected `eout1` receipt (the `ref`
-//! embedded in bounded provider projections). Registered on every session —
-//! main, read-only main, ordinary/read-only subagents, and btw forks — and
-//! intercepted by the session runner (which holds the store + the receipt
-//! codec), exactly like the goal tools. The fallback `execute` only fires
-//! on direct `Agent::run` paths (tests) and refuses.
-//!
-//! Security model: possession of a valid receipt is a bearer read
-//! capability for exactly one persisted field. The runner only resolves
-//! receipts whose MAC verifies (constant-time, dedicated restart-stable
-//! key) and whose session matches the runner's own session; the store
-//! re-checks the workspace fingerprint and the pinned entry hash. There is
-//! no listing, search, path traversal, or DB access beyond the pinned
-//! field, and the schema is CLOSED (`additionalProperties: false`).
-//!
-//! Error classes are stable and model-facing: `invalid`, `unavailable`,
-//! `integrity`, `utf8-boundary`, `out-of-range` (see
-//! [`crate::output_receipt::ReceiptErrorKind`]). No backend credentials,
-//! connection strings, or paths ever appear in the output or errors.
+//! The always-on `read_output` tool pages full persisted fields named by an
+//! `eout1` ref. Direct numeric refs are bound to the runner's current
+//! session/store; historical long refs are decoded for compatibility.
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::agent::{Tool, ToolOutput, ToolSpec};
-use crate::output_receipt::{
-    FieldPage, MAX_RECEIPT_LEN, ReceiptCodec, ReceiptError, ReceiptErrorKind,
-};
+use crate::output_receipt::{FieldPage, MAX_RECEIPT_LEN, OutputRef, ReceiptError, parse_ref};
 use crate::session_store::SessionStore;
 
 /// `read_output` page size bounds (bytes).
-pub const READ_OUTPUT_DEFAULT_LIMIT: usize = 16 * 1024;
+pub const READ_OUTPUT_DEFAULT_LIMIT: usize = 12 * 1024;
 pub const READ_OUTPUT_MAX_LIMIT: usize = 32 * 1024;
 
 /// The always-on `read_output` tool. Zero state: the runner intercepts
-/// execution by name with the session's store + codec.
+/// execution by name with the session's store.
 pub struct ReadOutput;
 
 #[async_trait]
@@ -47,7 +28,7 @@ impl Tool for ReadOutput {
                           retained text). Pass the `ref` string from the `[truncated: ...; \
                           read_output ref=...]` marker verbatim. `offset` is the byte offset \
                           into the full field (default 0); `limit` is the maximum bytes to \
-                          return (default 16384, max 32768). The response is a JSON page: \
+                          return (default 12288, max 32768). The response is a JSON page: \
                           {\"offset\", \"length\", \"text\", \"next_offset\", \"total_bytes\", \
                           \"sha256\"} — keep paging with `next_offset` until it is null. \
                           Never fabricate a `ref`; if a message has no `ref`, the full text is \
@@ -70,7 +51,7 @@ impl Tool for ReadOutput {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 32768,
-                        "description": "maximum bytes to return (default 16384)"
+                        "description": "maximum bytes to return (default 12288)"
                     }
                 },
                 "required": ["ref"],
@@ -84,7 +65,7 @@ impl Tool for ReadOutput {
 }
 
 /// Parse the closed `read_output` arguments: `ref` (required string),
-/// optional `offset` (default 0) and `limit` (default 16384, max 32768).
+/// optional `offset` (default 0) and `limit` (default 12288, max 32768).
 /// Unknown fields are rejected (closed schema). Returns `(ref, offset,
 /// limit)` or a plain model-facing error.
 pub fn parse_arguments(arguments: &serde_json::Value) -> Result<(String, usize, usize), String> {
@@ -136,46 +117,49 @@ pub fn parse_arguments(arguments: &serde_json::Value) -> Result<(String, usize, 
     Ok((reference, offset, limit))
 }
 
-/// Execute one `read_output` call against the session's store: verify the
-/// receipt, resolve the exact persisted field, page it, and render the
-/// closed JSON page. `session` must equal the receipt's session (a receipt
-/// is a bearer capability scoped to the session that issued it). Errors are
-/// plain strings with the stable `read_output error: <class>: <detail>`
-/// shape.
+/// Execute one `read_output` call against the session's store: resolve the
+/// ref, page the exact persisted field, and render the closed JSON page.
 pub async fn execute(
     store: &SessionStore,
     root: &std::path::Path,
     session: &str,
-    codec: &ReceiptCodec,
     reference: &str,
     offset: usize,
     limit: usize,
 ) -> Result<String, String> {
-    let page = match resolve_page(store, root, session, codec, reference, offset, limit).await {
+    let page = match resolve_page(store, root, session, reference, offset, limit).await {
         Ok(page) => page,
-        Err(error) => return Err(format!("read_output error: {error}")),
+        Err(error) => return Err(format!("read_output error: {}", error.detail)),
     };
     Ok(render_page(&page))
 }
 
-/// Verify + resolve + page (pure-ish; the store I/O is the only await).
+/// Resolve + page (the store I/O is the only await).
 async fn resolve_page(
     store: &SessionStore,
     root: &std::path::Path,
     session: &str,
-    codec: &ReceiptCodec,
     reference: &str,
     offset: usize,
     limit: usize,
 ) -> Result<FieldPage, ReceiptError> {
-    let verified = codec.verify(reference)?;
-    if verified.location.session != session {
-        return Err(ReceiptError::new(
-            ReceiptErrorKind::Integrity,
-            "ref is for a different session than the one issuing this call",
-        ));
-    }
-    let bytes = match store.read_field(root, &verified).await {
+    let bytes = match parse_ref(reference)? {
+        OutputRef::Direct { entry_id, field } => {
+            store
+                .read_field_direct(root, session, entry_id, field)
+                .await
+        }
+        OutputRef::Legacy(verified) => {
+            if verified.location.session != session {
+                return Err(ReceiptError::new(
+                    crate::output_receipt::ReceiptErrorKind::Invalid,
+                    "ref not found",
+                ));
+            }
+            store.read_field(root, &verified).await
+        }
+    };
+    let bytes = match bytes {
         Ok(bytes) => bytes,
         Err(error) => {
             // The store error may carry backend connection strings, paths,
@@ -183,7 +167,7 @@ async fn resolve_page(
             // internally only and return a fixed, pathless message.
             eprintln!("read_output: cannot read persisted field: {error:#}");
             return Err(ReceiptError::new(
-                ReceiptErrorKind::Integrity,
+                crate::output_receipt::ReceiptErrorKind::Invalid,
                 "cannot read the persisted field",
             ));
         }
@@ -216,12 +200,10 @@ mod tests {
         assert!(err.contains("`db`"), "{err}");
     }
 
-    /// Schema regression: the `ref` property carries the codec's encoded
-    /// length bound (`maxLength` = [`MAX_RECEIPT_LEN`]) so an oversized
-    /// receipt is rejected at the schema layer, matching
-    /// `ReceiptCodec::verify`'s pre-decode bound.
+    /// Schema regression: the `ref` property carries the long-form encoded
+    /// length bound (`maxLength` = [`MAX_RECEIPT_LEN`]).
     #[test]
-    fn ref_schema_max_length_matches_the_codec_bound() {
+    fn ref_schema_max_length_matches_the_receipt_bound() {
         let parameters = ReadOutput.spec().parameters;
         assert_eq!(
             parameters["properties"]["ref"]["maxLength"],
@@ -314,42 +296,20 @@ mod tests {
     /// logged internally only and never reaches the model.
     #[tokio::test]
     async fn execute_maps_store_failures_to_pathless_errors() {
-        use crate::output_receipt::{FieldId, ReceiptCodec};
-        use crate::session_store::{EntryLocation, LocatedKey, SessionStore};
+        use crate::session_store::SessionStore;
 
-        let codec_dir = tempfile::tempdir().unwrap();
-        let codec = ReceiptCodec::load_from_dir(codec_dir.path()).unwrap();
         let root = tempfile::tempdir().unwrap();
         // The session's `.jsonl` path is a DIRECTORY: opening it fails with
         // a path-bearing io error inside `Session::read_field`.
         let sess_dir = root.path().join(".e-agent/sessions");
         std::fs::create_dir_all(&sess_dir).unwrap();
         std::fs::create_dir(sess_dir.join("sess.jsonl")).unwrap();
-        let location = EntryLocation {
-            backend: "jsonl",
-            fingerprint: crate::session_store::workspace_root_fingerprint(root.path()),
-            backend_fp: crate::session_store::backend_instance_fingerprint(
-                "jsonl",
-                &crate::session_store::derive_workspace_id(root.path()),
-            ),
-            session: "sess".into(),
-            key: LocatedKey::Jsonl { ordinal: 0 },
-            entry_hash: "0".repeat(64),
-        };
-        let receipt = codec.issue(&location, FieldId::BgOutput, 3).unwrap();
-        let text = execute(
-            &SessionStore::Jsonl,
-            root.path(),
-            "sess",
-            &codec,
-            &receipt,
-            0,
-            100,
-        )
-        .await
-        .unwrap_err();
+        let receipt = "eout1.0.b";
+        let text = execute(&SessionStore::Jsonl, root.path(), "sess", receipt, 0, 100)
+            .await
+            .unwrap_err();
         assert!(
-            text.starts_with("read_output error: integrity: cannot read the persisted field"),
+            text.starts_with("read_output error: cannot read the persisted field"),
             "{text}"
         );
         assert!(

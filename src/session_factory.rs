@@ -801,12 +801,6 @@ impl SessionFactory {
         if let Some(rounds) = max_rounds {
             agent = agent.max_tool_rounds(rounds);
         }
-        // The `eout1` receipt codec (bounded provider projections + the
-        // runner's read_output verification share this one key). `None`
-        // when the state-dir key is unavailable → oversized fields stay
-        // full and no receipts are issued (fail-open until the total-budget
-        // stage fails closed).
-        agent = agent.with_receipt_codec(crate::output_receipt::ReceiptCodec::load().ok());
         let loaded = store.load_located(&self.root, &session).await?;
         let legacy = loaded.legacy;
         agent.restore_located(loaded.entries, loaded.locations);

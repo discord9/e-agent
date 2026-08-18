@@ -420,6 +420,41 @@ impl Session {
         Ok(bytes)
     }
 
+    /// Direct current-session field read by durable JSONL nonblank ordinal.
+    pub fn read_field_direct(
+        root: &Path,
+        name: &str,
+        ordinal: i64,
+        field: crate::output_receipt::FieldId,
+    ) -> anyhow::Result<Vec<u8>> {
+        use crate::output_receipt::{ReceiptError, ReceiptErrorKind};
+        if ordinal < 0 {
+            return Err(ReceiptError::new(ReceiptErrorKind::Invalid, "invalid entry id").into());
+        }
+        let path = session_path(root, name, "jsonl")?;
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("cannot open session {}", path.display()))?;
+        let entry = std::io::BufReader::new(file)
+            .lines()
+            .map_while(|line| line.ok())
+            .filter(|line| !line.trim().is_empty())
+            .nth(ordinal as usize)
+            .ok_or_else(|| ReceiptError::new(ReceiptErrorKind::Unavailable, "entry not found"))?;
+        let entry: SessionEntry = serde_json::from_str(&entry).map_err(|error| {
+            ReceiptError::new(
+                ReceiptErrorKind::Unavailable,
+                format!("cannot decode entry: {error}"),
+            )
+        })?;
+        crate::output_receipt::field_bytes(&entry, field).ok_or_else(|| {
+            ReceiptError::new(
+                ReceiptErrorKind::Unavailable,
+                "entry does not carry that field",
+            )
+            .into()
+        })
+    }
+
     /// Rewrite the whole log (used once to migrate legacy sessions).
     pub fn rewrite(root: &Path, name: &str, entries: &[SessionEntry]) -> anyhow::Result<()> {
         let path = session_path(root, name, "jsonl")?;
@@ -1200,7 +1235,9 @@ mod tests {
 
     // ── Located keys: append_located / load_located / read_field ──────
 
-    use crate::output_receipt::{FieldId, ReceiptCodec, VerifiedRef, page_field};
+    use crate::output_receipt::{
+        FieldId, VerifiedRef, issue_legacy_for_test, page_field, verify_legacy_for_test,
+    };
     use crate::session_store::{LoadedLocated, LocatedKey};
 
     fn located_entries() -> Vec<SessionEntry> {
@@ -1265,6 +1302,42 @@ mod tests {
         let empty = Session::load_located(temp.path(), "nope").unwrap();
         assert!(empty.entries.is_empty());
         assert!(empty.locations.is_empty());
+    }
+
+    #[test]
+    fn direct_field_read_survives_reconstructed_jsonl_session_and_stays_current_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let one = vec![SessionEntry::Message {
+            message: crate::agent::Message::Tool {
+                call_id: "a".into(),
+                name: "x".into(),
+                content: "first".into(),
+                images: vec![],
+                is_error: false,
+                synthetic: false,
+            },
+        }];
+        let two = vec![SessionEntry::Message {
+            message: crate::agent::Message::Tool {
+                call_id: "b".into(),
+                name: "x".into(),
+                content: "second".into(),
+                images: vec![],
+                is_error: false,
+                synthetic: false,
+            },
+        }];
+        Session::append(temp.path(), "one", &one).unwrap();
+        Session::append(temp.path(), "two", &two).unwrap();
+        // A reconstructed context needs only root + current session + durable ordinal.
+        assert_eq!(
+            Session::read_field_direct(temp.path(), "one", 0, FieldId::ToolContent).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            Session::read_field_direct(temp.path(), "two", 0, FieldId::ToolContent).unwrap(),
+            b"second"
+        );
     }
 
     #[test]
@@ -1388,12 +1461,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let entries = located_entries();
         let locations = Session::append_located(temp.path(), "loc", &entries).unwrap();
-        let codec = ReceiptCodec::load_from_dir(temp.path()).unwrap();
         // Page the persisted "big-output" field.
-        let receipt = codec
-            .issue(&locations[1], FieldId::BgOutput, "big-output".len())
-            .unwrap();
-        let verified = codec.verify(&receipt).unwrap();
+        let receipt = issue_legacy_for_test(&locations[1], FieldId::BgOutput, "big-output".len());
+        let verified = verify_legacy_for_test(&receipt).unwrap();
         let bytes = Session::read_field(temp.path(), &verified).unwrap();
         assert_eq!(bytes, b"big-output");
         let page = page_field(&bytes, 0, 2048).unwrap();
@@ -1417,10 +1487,8 @@ mod tests {
             kind: None,
         };
         let more = Session::append_located(temp.path(), "loc", &[entry]).unwrap();
-        let receipt = codec
-            .issue(&more[0], FieldId::BgOutput, output.len())
-            .unwrap();
-        let verified = codec.verify(&receipt).unwrap();
+        let receipt = issue_legacy_for_test(&more[0], FieldId::BgOutput, output.len());
+        let verified = verify_legacy_for_test(&receipt).unwrap();
         let bytes = Session::read_field(temp.path(), &verified).unwrap();
         assert_eq!(bytes, output.as_bytes());
         let mut rebuilt = Vec::new();
@@ -1515,7 +1583,7 @@ mod tests {
     /// against another root.
     #[test]
     fn read_field_rejects_foreign_workspace_root() {
-        use crate::output_receipt::{FieldId, ReceiptCodec};
+        use crate::output_receipt::{FieldId, issue_legacy_for_test, verify_legacy_for_test};
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let session = "sess";
@@ -1530,12 +1598,10 @@ mod tests {
             status: None,
             kind: None,
         };
-        let codec_dir = tempfile::tempdir().unwrap();
-        let codec = ReceiptCodec::load_from_dir(codec_dir.path()).unwrap();
         let locations =
             Session::append_located(dir_a.path(), session, std::slice::from_ref(&entry)).unwrap();
-        let receipt = codec.issue(&locations[0], FieldId::BgOutput, 3).unwrap();
-        let verified = codec.verify(&receipt).unwrap();
+        let receipt = issue_legacy_for_test(&locations[0], FieldId::BgOutput, 3);
+        let verified = verify_legacy_for_test(&receipt).unwrap();
         // The owning root resolves; a different root is rejected with an
         // integrity binding error (different workspace / instance).
         assert_eq!(

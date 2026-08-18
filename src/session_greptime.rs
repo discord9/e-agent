@@ -644,6 +644,24 @@ impl GreptimeSession {
         Ok(located)
     }
 
+    /// Direct current-session read by logical seq, selecting the newest row.
+    pub async fn read_field_direct(
+        &self,
+        seq: i64,
+        field: crate::output_receipt::FieldId,
+    ) -> Result<Vec<u8>> {
+        let rows = self.client.query(
+            "SELECT payload FROM session_entries WHERE workspace_id = $1 AND session_id = $2 AND seq = $3 ORDER BY event_time DESC LIMIT 1",
+            &[&self.workspace_id, &self.session_id, &seq],
+        ).await.context("cannot read entry")?;
+        let payload: String = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("entry not found"))?
+            .get("payload");
+        let entry: SessionEntry = serde_json::from_str(&payload).context("cannot decode entry")?;
+        field_bytes(&entry, field).ok_or_else(|| anyhow::anyhow!("entry does not carry that field"))
+    }
+
     /// Exact-version field read: verify the receipt binding against this
     /// store (backend kind, workspace fingerprint, backend-instance
     /// fingerprint, session), SELECT every physical row at the pinned
@@ -3468,7 +3486,7 @@ mod tests {
     /// old ref; `read_field` re-checks the pinned event_time + hash.
     #[tokio::test]
     async fn located_append_load_read_exact_version() {
-        use crate::output_receipt::{FieldId, ReceiptCodec};
+        use crate::output_receipt::{FieldId, issue_legacy_for_test, verify_legacy_for_test};
         use crate::session_store::LocatedKey;
 
         let conn = conn_str();
@@ -3479,8 +3497,6 @@ mod tests {
         let wid = workspace_id();
         let sid = format!("test-gt-located-{}", crate::session::new_id());
         let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let codec = ReceiptCodec::load_from_dir(dir.path()).unwrap();
 
         let entry_a = Message::User {
             content: "version-A".into(),
@@ -3543,31 +3559,25 @@ mod tests {
 
         // The OLD receipt still reads the OLD physical row (pinned
         // event_time + hash), never the retargeted newer version.
-        let old_ref = codec
-            .issue(&loc_a, FieldId::UserContent, "version-A".len())
-            .unwrap();
+        let old_ref = issue_legacy_for_test(&loc_a, FieldId::UserContent, "version-A".len());
         let bytes = session
-            .read_field(&codec.verify(&old_ref).unwrap())
+            .read_field(&verify_legacy_for_test(&old_ref).unwrap())
             .await
             .unwrap();
         assert_eq!(bytes, b"version-A");
         // A receipt for the new location reads version B.
-        let new_ref = codec
-            .issue(&new_loc, FieldId::UserContent, "version-B".len())
-            .unwrap();
+        let new_ref = issue_legacy_for_test(&new_loc, FieldId::UserContent, "version-B".len());
         let bytes = session
-            .read_field(&codec.verify(&new_ref).unwrap())
+            .read_field(&verify_legacy_for_test(&new_ref).unwrap())
             .await
             .unwrap();
         assert_eq!(bytes, b"version-B");
         // Tampering the pinned hash fails with integrity.
         let mut tampered = loc_a.clone();
         tampered.entry_hash = "0".repeat(64);
-        let bad_ref = codec
-            .issue(&tampered, FieldId::UserContent, "version-A".len())
-            .unwrap();
+        let bad_ref = issue_legacy_for_test(&tampered, FieldId::UserContent, "version-A".len());
         let err = session
-            .read_field(&codec.verify(&bad_ref).unwrap())
+            .read_field(&verify_legacy_for_test(&bad_ref).unwrap())
             .await
             .unwrap_err();
         assert!(
@@ -3580,7 +3590,7 @@ mod tests {
     /// rows (same seq, event_time, hash) — never freshly generated keys.
     #[tokio::test]
     async fn append_full_overlap_returns_actual_committed_locations() {
-        use crate::output_receipt::{FieldId, ReceiptCodec};
+        use crate::output_receipt::{FieldId, issue_legacy_for_test, verify_legacy_for_test};
         let conn = conn_str();
         if conn == "skipped" {
             eprintln!("skipping: GREPTIME_PG not set");
@@ -3613,15 +3623,11 @@ mod tests {
         assert_eq!(locs_a, locs_b, "retry must return the committed rows");
 
         // Every returned location resolves through read_field.
-        let dir = tempfile::tempdir().unwrap();
-        let codec = ReceiptCodec::load_from_dir(dir.path()).unwrap();
         for (i, loc) in locs_b.iter().enumerate() {
             let content = &["first", "second"][i];
-            let receipt = codec
-                .issue(loc, FieldId::UserContent, content.len())
-                .unwrap();
+            let receipt = issue_legacy_for_test(loc, FieldId::UserContent, content.len());
             let bytes = writer_b
-                .read_field(&codec.verify(&receipt).unwrap())
+                .read_field(&verify_legacy_for_test(&receipt).unwrap())
                 .await
                 .unwrap();
             assert_eq!(bytes, content.as_bytes(), "location must resolve");
@@ -3632,7 +3638,7 @@ mod tests {
     /// accepted prefix and the exact inserted rows for the suffix.
     #[tokio::test]
     async fn append_partial_overlap_returns_actual_locations() {
-        use crate::output_receipt::{FieldId, ReceiptCodec};
+        use crate::output_receipt::{FieldId, issue_legacy_for_test, verify_legacy_for_test};
         let conn = conn_str();
         if conn == "skipped" {
             eprintln!("skipping: GREPTIME_PG not set");
@@ -3688,15 +3694,11 @@ mod tests {
             "accepted prefix must re-read the actual committed rows"
         );
         // Suffix (seq 4): contiguous, resolves via read_field.
-        let dir = tempfile::tempdir().unwrap();
-        let codec = ReceiptCodec::load_from_dir(dir.path()).unwrap();
         let contents = ["c", "d", "e"];
         for (i, loc) in locs_retry.iter().enumerate() {
-            let receipt = codec
-                .issue(loc, FieldId::UserContent, contents[i].len())
-                .unwrap();
+            let receipt = issue_legacy_for_test(loc, FieldId::UserContent, contents[i].len());
             let bytes = writer_b
-                .read_field(&codec.verify(&receipt).unwrap())
+                .read_field(&verify_legacy_for_test(&receipt).unwrap())
                 .await
                 .unwrap();
             assert_eq!(bytes, contents[i].as_bytes(), "location must resolve");
@@ -3791,7 +3793,7 @@ mod tests {
     /// arbitrary-row `query_opt` behavior would be ambiguous).
     #[tokio::test]
     async fn read_field_exact_key_folds_identical_and_rejects_divergent_duplicates() {
-        use crate::output_receipt::{FieldId, ReceiptCodec};
+        use crate::output_receipt::{FieldId, issue_legacy_for_test, verify_legacy_for_test};
         let conn = conn_str();
         if conn == "skipped" {
             eprintln!("skipping: GREPTIME_PG not set");
@@ -3800,8 +3802,6 @@ mod tests {
         let wid = workspace_id();
         let sid = format!("test-gt-exactdup-{}", crate::session::new_id());
         let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let codec = ReceiptCodec::load_from_dir(dir.path()).unwrap();
 
         let entry: SessionEntry = Message::User {
             content: "dup".into(),
@@ -3830,11 +3830,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let receipt = codec
-            .issue(&loc, FieldId::UserContent, "dup".len())
-            .unwrap();
+        let receipt = issue_legacy_for_test(&loc, FieldId::UserContent, "dup".len());
         let bytes = session
-            .read_field(&codec.verify(&receipt).unwrap())
+            .read_field(&verify_legacy_for_test(&receipt).unwrap())
             .await
             .unwrap();
         assert_eq!(bytes, b"dup");
@@ -3863,7 +3861,7 @@ mod tests {
             .await
             .unwrap();
         let err = session
-            .read_field(&codec.verify(&receipt).unwrap())
+            .read_field(&verify_legacy_for_test(&receipt).unwrap())
             .await
             .unwrap_err();
         assert!(
@@ -3877,7 +3875,7 @@ mod tests {
     /// stored in the DB must still produce a receipt that resolves.
     #[tokio::test]
     async fn load_located_hashes_exact_raw_payload_bytes() {
-        use crate::output_receipt::{FieldId, ReceiptCodec};
+        use crate::output_receipt::{FieldId, issue_legacy_for_test, verify_legacy_for_test};
         let conn = conn_str();
         if conn == "skipped" {
             eprintln!("skipping: GREPTIME_PG not set");
@@ -3923,13 +3921,9 @@ mod tests {
         );
         // A receipt issued against that location resolves (under the old
         // re-serialization hashing it would fail integrity).
-        let dir = tempfile::tempdir().unwrap();
-        let codec = ReceiptCodec::load_from_dir(dir.path()).unwrap();
-        let receipt = codec
-            .issue(loc, FieldId::UserContent, "variant".len())
-            .unwrap();
+        let receipt = issue_legacy_for_test(loc, FieldId::UserContent, "variant".len());
         let bytes = session
-            .read_field(&codec.verify(&receipt).unwrap())
+            .read_field(&verify_legacy_for_test(&receipt).unwrap())
             .await
             .unwrap();
         assert_eq!(bytes, b"variant");

@@ -2396,7 +2396,6 @@ impl Tool for HugeOutputTool {
 #[tokio::test]
 async fn runner_durable_before_ref_for_oversized_tool_content() {
     let temp = tempfile::tempdir().unwrap();
-    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(temp.path()).unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let agent = Agent::new(
         Box::new(ScriptedContextCaptureModel {
@@ -2426,8 +2425,7 @@ async fn runner_durable_before_ref_for_oversized_tool_content() {
             calls: calls.clone(),
         }),
         vec![Box::new(HugeOutputTool)],
-    )
-    .with_receipt_codec(Some(codec));
+    );
     let (runner, handle) = SessionRunner::new(
         agent,
         SessionStore::Jsonl,
@@ -2484,11 +2482,15 @@ async fn runner_durable_before_ref_for_oversized_tool_content() {
     let ref_start = bounded.find("ref=eout1.").unwrap() + "ref=".len();
     let ref_end = bounded[ref_start..].find(']').unwrap() + ref_start;
     let receipt = &bounded[ref_start..ref_end];
-    let codec = crate::output_receipt::ReceiptCodec::load_from_dir(temp.path()).unwrap();
-    let verified = codec.verify(receipt).unwrap();
-    assert_eq!(verified.location.session, "durable-ref");
-    assert_eq!(verified.field, crate::output_receipt::FieldId::ToolContent);
-    let bytes = store.read_field(temp.path(), &verified).await.unwrap();
+    let parsed = crate::output_receipt::parse_ref(receipt).unwrap();
+    let crate::output_receipt::OutputRef::Direct { entry_id, field } = parsed else {
+        panic!("expected a direct short ref, got legacy: {receipt}");
+    };
+    assert_eq!(field, crate::output_receipt::FieldId::ToolContent);
+    let bytes = store
+        .read_field_direct(temp.path(), "durable-ref", entry_id, field)
+        .await
+        .unwrap();
     assert_eq!(
         bytes,
         tool.as_bytes(),

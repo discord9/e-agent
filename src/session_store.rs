@@ -27,9 +27,6 @@ use tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
 use crate::agent::{Message, SessionEntry};
 use std::io::{BufRead, Write};
 
@@ -274,64 +271,20 @@ pub(crate) fn workspace_root_fingerprint(root: &Path) -> String {
 /// bound exists so a receipt can never carry an unbounded session string.
 pub const MAX_SESSION_ID_LEN: usize = 128;
 
-/// Fingerprint of a backend instance for receipt output: hex
-/// HMAC-SHA256 (truncated to 32 hex chars) over `backend_kind` + NUL +
-/// the normalized instance identity, keyed by the receipt secret — the
-/// resolved SQLite database path, the Greptime connection string, or the
-/// JSONL workspace root. Receipts carry only this keyed digest (the raw
-/// path / connection string never appears in a receipt or an error), and
-/// `read_field` rejects a receipt bound to a different backend instance
-/// (e.g. another database file or a different GreptimeDB) before
-/// querying.
-///
-/// Keying matters: an UNKEYED hash of a low-entropy connection string
-/// (a default SQLite path, a well-known DSN) is an offline verifier —
-/// anyone holding a receipt could confirm it came from a guessed instance
-/// by hashing the guess. With the receipt secret in the HMAC, the
-/// published digest cannot be recomputed without the key.
+/// Fingerprint of a backend instance for receipt output: hex SHA-256
+/// (truncated to 32 hex chars) over `backend_kind` + NUL + the normalized
+/// instance identity — the resolved SQLite database path, the Greptime
+/// connection string, or the JSONL workspace root. Legacy receipts carry
+/// only this one-way digest (the raw path / connection string never
+/// appears in a receipt or an error), and `read_field` rejects a receipt
+/// bound to a different backend instance (e.g. another database file or a
+/// different GreptimeDB) before querying.
 pub(crate) fn backend_instance_fingerprint(backend_kind: &str, instance: &str) -> String {
-    match crate::output_receipt::ReceiptCodec::load() {
-        Ok(codec) => keyed_backend_instance_fingerprint(codec.key(), backend_kind, instance),
-        Err(_) => {
-            // Keyless environment (no state dir / key unavailable): no
-            // receipt is ever issued or verified here, so this digest is
-            // never published. Keep plain append/load paths deterministic
-            // with the historical unkeyed SHA-256.
-            let mut identity = String::with_capacity(backend_kind.len() + 1 + instance.len());
-            identity.push_str(backend_kind);
-            identity.push('\0');
-            identity.push_str(instance);
-            crate::agent::image_sha256(identity.as_bytes())[..32].to_string()
-        }
-    }
-}
-
-/// The keyed core of [`backend_instance_fingerprint`]: HMAC-SHA256 over
-/// `backend_kind` + NUL + `instance` with the receipt key, truncated to
-/// 16 bytes (32 hex chars). Exposed for tests: the same instance under
-/// two different keys must yield two different fingerprints.
-pub(crate) fn keyed_backend_instance_fingerprint(
-    key: &[u8; 32],
-    backend_kind: &str,
-    instance: &str,
-) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(backend_kind.as_bytes());
-    mac.update(&[0]);
-    mac.update(instance.as_bytes());
-    let tag = mac.finalize().into_bytes();
-    hex_encode_truncated(&tag)
-}
-
-/// Lowercase hex of the first 16 bytes (32 hex chars) — the truncation
-/// applied to every fingerprint published in a receipt.
-fn hex_encode_truncated(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut hex = String::with_capacity(32);
-    for byte in bytes.iter().take(16) {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    let mut identity = String::with_capacity(backend_kind.len() + 1 + instance.len());
+    identity.push_str(backend_kind);
+    identity.push('\0');
+    identity.push_str(instance);
+    crate::agent::image_sha256(identity.as_bytes())[..32].to_string()
 }
 
 /// Lexically normalize a SQLite database path for backend-instance
@@ -729,7 +682,7 @@ impl LocatedKey {
 /// (the serialized `SessionEntry` line/row). Aligned 1:1 with the agent
 /// history by [`crate::agent::Agent::restore_locations`]; the provider
 /// projection (`src/output_receipt.rs`) turns a location into a
-/// MAC-protected `eout1` receipt, and `read_output` resolves the receipt
+/// direct `eout1.<entry-id>.<field-code>` ref, and `read_output` resolves the ref
 /// back to this location.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntryLocation {
@@ -1492,6 +1445,35 @@ impl SessionStore {
                 .lock()
                 .await
                 .read_field(verified)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Direct current-session field read for a durable numeric output ref.
+    /// The backend/session are selected only by this already-bound store.
+    pub async fn read_field_direct(
+        &self,
+        root: &Path,
+        session_id: &str,
+        entry_id: i64,
+        field: crate::output_receipt::FieldId,
+    ) -> Result<Vec<u8>> {
+        match self {
+            SessionStore::Jsonl => Session::read_field_direct(root, session_id, entry_id, field),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session
+                    .lock()
+                    .await
+                    .read_field_direct(entry_id, field)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .read_field_direct(entry_id, field)
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -4335,7 +4317,7 @@ mod tests {
         #[tokio::test]
         async fn sqlite_same_seq_later_version_never_retargets_old_ref() {
             use crate::agent::Message;
-            use crate::output_receipt::{FieldId, ReceiptCodec};
+            use crate::output_receipt::{FieldId, issue_legacy_for_test, verify_legacy_for_test};
 
             let (_dir, path) = temp_db();
             let root = std::env::temp_dir();
@@ -4343,7 +4325,6 @@ mod tests {
             let store = SessionStore::connect(&backend(&path), &root, &session)
                 .await
                 .expect("connect sqlite store");
-            let codec = ReceiptCodec::load_from_dir(_dir.path()).unwrap();
 
             // Version A at seq 0.
             let entry_a = SessionEntry::Message {
@@ -4418,10 +4399,8 @@ mod tests {
             assert_ne!(new_loc.entry_hash, loc_a.entry_hash);
 
             // The OLD receipt still reads the OLD physical row exactly.
-            let old_ref = codec
-                .issue(&loc_a, FieldId::UserContent, "version-A".len())
-                .unwrap();
-            let verified = codec.verify(&old_ref).unwrap();
+            let old_ref = issue_legacy_for_test(&loc_a, FieldId::UserContent, "version-A".len());
+            let verified = verify_legacy_for_test(&old_ref).unwrap();
             let bytes = store
                 .read_field(&root, &verified)
                 .await
@@ -4429,10 +4408,8 @@ mod tests {
             assert_eq!(bytes, b"version-A");
 
             // A receipt issued for the NEW location reads version B.
-            let new_ref = codec
-                .issue(&new_loc, FieldId::UserContent, "version-B".len())
-                .unwrap();
-            let verified = codec.verify(&new_ref).unwrap();
+            let new_ref = issue_legacy_for_test(&new_loc, FieldId::UserContent, "version-B".len());
+            let verified = verify_legacy_for_test(&new_ref).unwrap();
             let bytes = store
                 .read_field(&root, &verified)
                 .await
@@ -4461,7 +4438,7 @@ mod tests {
             drop(conn);
             drop(db);
             let err = store
-                .read_field(&root, &codec.verify(&old_ref).unwrap())
+                .read_field(&root, &verify_legacy_for_test(&old_ref).unwrap())
                 .await
                 .expect_err("deleted pinned row must fail the old ref");
             let msg = format!("{err:#}");
@@ -4477,7 +4454,9 @@ mod tests {
         #[tokio::test]
         async fn sqlite_receipt_page_reconstruction() {
             use crate::agent::Message;
-            use crate::output_receipt::{FieldId, ReceiptCodec, page_field};
+            use crate::output_receipt::{
+                FieldId, issue_legacy_for_test, page_field, verify_legacy_for_test,
+            };
 
             let (_dir, path) = temp_db();
             let root = std::env::temp_dir();
@@ -4485,7 +4464,6 @@ mod tests {
             let store = SessionStore::connect(&backend(&path), &root, &session)
                 .await
                 .expect("connect sqlite store");
-            let codec = ReceiptCodec::load_from_dir(_dir.path()).unwrap();
             let content = format!("{}{}{}", "x".repeat(20_000), "MIDDLE", "y".repeat(10_000));
             let entry = SessionEntry::Message {
                 message: Message::Tool {
@@ -4501,10 +4479,8 @@ mod tests {
                 .append_located(&root, &session, std::slice::from_ref(&entry))
                 .await
                 .expect("append");
-            let receipt = codec
-                .issue(&locations[0], FieldId::ToolContent, content.len())
-                .unwrap();
-            let verified = codec.verify(&receipt).unwrap();
+            let receipt = issue_legacy_for_test(&locations[0], FieldId::ToolContent, content.len());
+            let verified = verify_legacy_for_test(&receipt).unwrap();
             let bytes = store
                 .read_field(&root, &verified)
                 .await

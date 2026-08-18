@@ -465,13 +465,6 @@ pub struct SessionRunner {
     /// Resolved from `[delegate] finalize_wait_secs` by the session factory;
     /// consumed only at the FinishWhenIdle idle point.
     finalize_wait: Option<Duration>,
-    /// The session's `eout1` receipt codec, cloned from the agent at
-    /// construction (agent and runner always share one key): the bounded
-    /// projections the agent issues receipts with are verified here for
-    /// `read_output`. `None` when the agent has no codec (tests / no state
-    /// dir) — `read_output` then fails `unavailable`, and no receipts were
-    /// issued either.
-    receipt_codec: Option<crate::output_receipt::ReceiptCodec>,
     #[cfg(test)]
     before_finalize: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -514,9 +507,6 @@ impl SessionRunner {
             shared: shared.clone(),
             commands: tx,
         };
-        // The runner's receipt codec is the agent's (they must share one
-        // key: the agent issues receipts, the runner verifies them).
-        let receipt_codec = agent.receipt_codec().cloned();
         (
             Self {
                 agent,
@@ -529,7 +519,6 @@ impl SessionRunner {
                 policy,
                 last_answer: None,
                 finalize_wait: None,
-                receipt_codec,
                 #[cfg(test)]
                 before_finalize: None,
             },
@@ -869,26 +858,17 @@ impl SessionRunner {
     }
 
     /// Intercepted `read_output` tool execution (the always-on read-only
-    /// pager for bounded provider projections): verify the `eout1` receipt
-    /// with the session's codec (constant-time MAC), resolve the exact
-    /// persisted field through the session store, page it, and render the
-    /// closed JSON page. The receipt must name THIS session (a receipt is a
-    /// bearer capability scoped to its own session). Stable error classes:
-    /// invalid / unavailable / integrity / utf8-boundary / out-of-range.
+    /// pager for bounded provider projections): resolve the session-local
+    /// `eout1` ref (or a historical long ref), read the persisted field,
+    /// page it, and render the closed JSON page.
     async fn execute_read_output(&mut self, call: &ToolCall) -> Result<ToolOutput, String> {
         let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
             .map_err(|error| format!("invalid JSON arguments: {error}"))?;
         let (reference, offset, limit) = crate::tools::output::parse_arguments(&arguments)?;
-        let Some(codec) = &self.receipt_codec else {
-            return Err(
-                "read_output error: unavailable: no receipt codec (receipt key unavailable)".into(),
-            );
-        };
         let text = crate::tools::output::execute(
             &self.store,
             &self.root,
             &self.session,
-            codec,
             &reference,
             offset,
             limit,
@@ -1632,7 +1612,7 @@ impl SessionRunner {
                         continue;
                     }
                     // read_output is intercepted by the runner: it needs the
-                    // session's store + receipt codec (a plain tool cannot
+                    // session's store + ref registry (a plain tool cannot
                     // reach them). Its result is committed like any other
                     // tool result — and is itself an eligible persisted
                     // field (`tool_content`), so an oversized page is
