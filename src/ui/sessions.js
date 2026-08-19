@@ -97,6 +97,7 @@ function afterPollRound() {
   applyValidation(validateSessions(state.lastList || []));
   if (state.sessionId) {
     updateComposerMeta();               // model/role 可能随轮询更新（幂等）
+    updateCurrentSessionBusy();         // 当前会话 busy 可能随轮询变化
     const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
     if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
   }
@@ -545,10 +546,19 @@ function openWith(id, withHistory, onReady, wsId, epoch, timeoutMs) {
    内容没变就不动 DOM。两者都空 → hidden。 */
 /* 顶部会话标识：有标题 → 标题（可点击重命名）+ id 小字；无标题 → 完整 id。
    数据来自 state.lastList；标题点击复用 enterRename（同侧边栏编辑）。 */
+function updateCurrentSessionBusy() {
+  if (!els.chatBusy) return;
+  const current = state.sessionId && (state.lastList || []).find((s) => s.id === state.sessionId);
+  // 与侧栏主点相同，busy 字段是权威状态源；只查询当前打开的 id，避免其它
+  // 会话（包括其 subagent）的活动渗入聊天标题。
+  els.chatBusy.hidden = !(current && current.busy === true);
+}
+
 function renderChatSessionId(id) {
   const el0 = els.chatSessionId;
   if (!el0) return;
   const s = (state.lastList || []).find((x) => x.id === id);
+  updateCurrentSessionBusy();
   const title = s && s.title ? String(s.title) : "";
   el0.innerHTML = "";
   const t = el("span", "chat-sid-title", title || id);
@@ -2029,6 +2039,7 @@ function clearCurrentSession() {
   els.promptInput.value = "";
   els.backParentBtn.hidden = true;
   els.chatSessionId.textContent = "";
+  updateCurrentSessionBusy();
   els.usageInfo.textContent = "";
   history.replaceState(null, "", "/");
   applyStatus("Idle");

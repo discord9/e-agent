@@ -1158,6 +1158,7 @@
     .composer-status.busy::before,
     .composer-status.compacting::before,
     .busy-dot.busy,
+    .busy-dot-wrap .main-dot.busy,
     .busy-dot-wrap .orbit-dot {
       animation: none;
     }

@@ -115,7 +115,8 @@ const els = {
   banner: $("banner"), bannerText: $("bannerText"), bannerClose: $("bannerClose"),
   tokenInput: $("tokenInput"), tokenToggle: $("tokenToggle"),
   chatView: $("chatView"), chatEmpty: $("chatEmpty"),
-  chatSessionId: $("chatSessionId"), chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
+  chatBusy: $("chatBusy"), chatSessionId: $("chatSessionId"),
+  chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
   messages: $("messages"), promptInput: $("promptInput"), queueBar: $("queueBar"),
   goalBar: $("goalBar"),
   slashMenu: $("slashMenu"), forkMenu: $("forkMenu"),
@@ -361,6 +362,7 @@ async function switchWorkspace(id, epoch) {
   // ---- 清空当前会话，保留唯一的聊天内容区 ----
   els.chatView.classList.remove("hidden");
   els.chatView.classList.add("no-session");
+  updateCurrentSessionBusy();
   els.topActions.hidden = false;
   els.backParentBtn.hidden = true;
   els.messages.innerHTML = "";

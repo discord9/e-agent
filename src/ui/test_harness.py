@@ -242,7 +242,7 @@ class El {
 }
 const elsById={};
 for(const id of ["topActions","backParentBtn","connState","banner","bannerText","bannerClose","tokenInput","tokenToggle","chatView","chatEmpty",
-  "chatSessionId","chatStatus",
+  "chatBusy","chatSessionId","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn",
   "queueBar","goalBar","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
   "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks","forkMenu",
@@ -3257,11 +3257,38 @@ async function main(){
     tokInp._listeners["blur"][0]();
     chk("token blur defers collapse", tokInp.hidden === false, "hidden=" + tokInp.hidden);
 
+    // ---- 顶部 busy 点：复用侧栏 busy-dot-wrap/main-dot busy 表现，只跟随
+    // 当前打开会话；其它会话 busy 不得点亮，清空会话后隐藏。 ----
+    const _savedList = state.lastList;
+    const _savedSid = state.sessionId;
+    state.sessionId = "current-busy";
+    state.lastList = [
+      { id: "current-busy", busy: true },
+      { id: "other-idle", busy: false },
+    ];
+    updateCurrentSessionBusy();
+    chk("header busy dot follows current busy session",
+        elsById["chatBusy"].hidden === false,
+        "hidden=" + elsById["chatBusy"].hidden);
+    state.sessionId = "other-idle";
+    updateCurrentSessionBusy();
+    chk("header busy dot hides for current idle session",
+        elsById["chatBusy"].hidden === true,
+        "hidden=" + elsById["chatBusy"].hidden);
+    state.lastList = [{ id: "background-busy", busy: true }];
+    updateCurrentSessionBusy();
+    chk("header ignores another session busy state",
+        elsById["chatBusy"].hidden === true,
+        "hidden=" + elsById["chatBusy"].hidden);
+    state.sessionId = null;
+    updateCurrentSessionBusy();
+    chk("header busy dot hides without open session",
+        elsById["chatBusy"].hidden === true,
+        "hidden=" + elsById["chatBusy"].hidden);
+
     // ---- Bug A：缺 model/role 的会话 → composerMeta hidden（动作按钮落左的
     // 前置条件）；布局修复（.composer-actions margin-left:auto）由 python 侧
     // 校验 style.css（DOM 桩无真实布局，无法断言像素位置） ----
-    const _savedList = state.lastList;
-    const _savedSid = state.sessionId;
     state.lastList = [{ id: "noid", model: "", role: null, parent_session_id: null,
                         status: "Idle", entry_count: 0, active: false }];
     state.sessionId = "noid";
@@ -7419,6 +7446,15 @@ _spin_ok = bool(re.search(r'\.composer-status\.busy::before[^{]*\{[^}]*animation
                 and re.search(r'@keyframes\s+composer-status-spin', _css)
                 and re.search(r'prefers-reduced-motion: reduce', _css))
 print(("PASS" if _spin_ok else "FAIL") + " composer-status spinner + reduced-motion in style.css")
+# 聊天标题 busy 点直接复用侧栏 24px SVG/main-dot.busy；不新增动画定义，且
+# reduced-motion 必须显式覆盖 SVG 主点（旧规则只覆盖了 HTML .busy-dot）。
+_header_html = open(os.path.join(HERE, 'index.html'), encoding='utf-8').read()
+_header_busy_ok = bool(
+    re.search(r'id="chatBusy"\s+class="busy-dot-wrap"[^>]*hidden', _header_html)
+    and re.search(r'<circle\s+class="main-dot busy"\s+cx="12"\s+cy="12"\s+r="3"', _header_html)
+    and len(re.findall(r'@keyframes\s+pulse\b', _css)) == 1
+    and re.search(r'prefers-reduced-motion:\s*reduce[\s\S]*?\.busy-dot-wrap\s+\.main-dot\.busy', _css))
+print(("PASS" if _header_busy_ok else "FAIL") + " header reuses sidebar busy dot + reduced-motion")
 # 置顶聚合行的 workspace 标记必须保持紧凑且不参与 flex 收缩；否则空 span
 # 不可见，或再次挤占会话标题空间。
 _marker = re.search(r'\.tree-row\s+\.ws-pin-label\s*\{([^}]*)\}', _css)
@@ -7539,4 +7575,4 @@ print(("PASS" if _zoom_guard_ok else "FAIL") + " pinch zoom leaves app height to
 _icon_m = re.search(r'<link\s+rel="icon"\s+type="image/svg\+xml"\s+href="(data:image/svg\+xml,[^"]+)"', _html)
 _icon_ok = bool(_icon_m and '%23' in _icon_m.group(1) and '#' not in _icon_m.group(1))
 print(("PASS" if _icon_ok else "FAIL") + " inline SVG favicon data URI in index.html head")
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _marker_ok and _empty_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok else 1)
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _header_busy_ok and _marker_ok and _empty_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok else 1)

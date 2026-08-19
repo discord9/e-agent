@@ -73,6 +73,11 @@
 <!-- ============ 对话视图 ============ -->
 <main id="chatView" class="view no-session">
   <div class="chat-head">
+    <span id="chatBusy" class="busy-dot-wrap" role="img" aria-label="当前会话处理中" hidden>
+      <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">
+        <circle class="main-dot busy" cx="12" cy="12" r="3" aria-hidden="true"></circle>
+      </svg>
+    </span>
     <span id="chatSessionId" class="dim chat-session-id"></span>
     <span id="chatStatus" class="status-chip idle">空闲</span>
     <span id="usageInfo" class="dim"></span>
