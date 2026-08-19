@@ -548,10 +548,21 @@ function openWith(id, withHistory, onReady, wsId, epoch, timeoutMs) {
    数据来自 state.lastList；标题点击复用 enterRename（同侧边栏编辑）。 */
 function updateCurrentSessionBusy() {
   if (!els.chatBusy) return;
-  const current = state.sessionId && (state.lastList || []).find((s) => s.id === state.sessionId);
-  // 与侧栏主点相同，busy 字段是权威状态源；只查询当前打开的 id，避免其它
-  // 会话（包括其 subagent）的活动渗入聊天标题。
-  els.chatBusy.hidden = !(current && current.busy === true);
+  const list = state.lastList || [];
+  const current = state.sessionId && list.find((s) => s.id === state.sessionId);
+  if (!current) {
+    els.chatBusy.hidden = true;
+    els.chatBusy.innerHTML = "";
+    els.chatBusy.setAttribute("aria-label", "当前会话状态");
+    return;
+  }
+  // 仅使用激活 workspace 的当前会话、其直属子会话及该 workspace 中明确
+  // 归属于当前会话的任务。其它 workspace / 父会话即使 busy 也不能渗入标题。
+  const kids = list.filter((s) => s.parent_session_id === current.id);
+  const runningKidCount = renderSessionBusyDot(els.chatBusy, current, kids, state.workspace.id);
+  // 标题状态标记在主会话与子任务都空闲时保持安静；主会话空闲但仍有存活
+  // 子任务时必须显示绿色中心点和环绕点，不能只按 current.busy 门控。
+  els.chatBusy.hidden = current.busy !== true && runningKidCount === 0;
 }
 
 function renderChatSessionId(id) {
@@ -1744,6 +1755,9 @@ function sidebarTreeSig() {
 function renderSidebarTree(force) {
   const tree = els.sidebarTree;
   if (!tree) return;
+  // pollTasks 也经此入口；在侧栏签名去重之前刷新标题，确保子任务生命周期
+  // 无论侧栏开关状态都立即反映到当前会话的共享状态 SVG。
+  updateCurrentSessionBusy();
   const sig = sidebarTreeSig();
   if (state.renameActive && !force) return;  // 保留正在编辑的标题输入框
   if (state.sidebar.draggingPin && !force) return;   // 拖拽中暂停轮询重建：被 capture 的行节点被替换会打断拖拽（同 renameActive 保护；不更新 lastTreeSig，finish 里 force 补齐）
@@ -2046,6 +2060,60 @@ function clearCurrentSession() {
   if (!state.sidebar.open) openSidebar();
 }
 
+/* 侧栏与当前会话标题共用的完整状态 SVG：中心点只表达主 agent，环绕点
+   表达该 workspace、该父会话的活动任务。调用方负责自身可见性；SVG 的尺寸、
+   class、几何、徽章和 aria 语义只有这一处来源，避免标题退化成简化静态点。 */
+function renderSessionBusyDot(target, s, kids, wsId) {
+  // 环绕点数量 = 该父会话的全部后台任务数（/api/tasks：bash 后台任务 +
+  // delegate subagent 任务）；任务快照未加载时回退 running 子会话计数。
+  const wsTasks = tasksForWorkspace(wsId);
+  const parentTasks = wsTasks
+    ? wsTasks.filter((t) => t.session_id === s.id)
+    : null;
+  const runningKidCount = parentTasks === null
+    ? (kids || []).filter(isSubagentRunning).length
+    : parentTasks.length;
+  const hasRunningKids = runningKidCount > 0;
+  target.setAttribute("role", "img");
+  target.setAttribute("aria-label", (s.busy ? "会话处理中" : "会话空闲")
+    + (hasRunningKids ? "，" + runningKidCount + " 个任务处理中" : ""));
+
+  // 24px SVG 中心点与轨道点共享坐标系，在任意 DPR 下保持严格同心。
+  // 最多显示 6 个轨道槽；超过 6 个时显示 5 点并把右上槽让给 +N 徽章。
+  const hasOverflow = runningKidCount > 6;
+  const visibleKidDots = hasOverflow ? 5 : Math.min(runningKidCount, 6);
+  const R = 8;
+  let circles = "";
+  for (let i = 0; i < visibleKidDots; i++) {
+    const t = parentTasks ? parentTasks[i] : null;
+    const green = t !== null && taskIsWaitingGreen(t, kids);
+    const slotDeg = hasOverflow ? [0, 120, 180, 240, 300][i] : (360 * i) / visibleKidDots;
+    const title = parentTasks
+      ? taskDotTitle(t, i + 1, runningKidCount)
+      : "子任务 " + (i + 1) + "/" + runningKidCount;
+    circles += `<circle class="orbit-dot${green ? " green" : ""}" cx="12" cy="12" r="2"` +
+      ` transform="rotate(${slotDeg} 12 12) translate(0 ${-R})"` +
+      ` aria-hidden="true"><title>${escapeHtml(title)}</title></circle>`;
+  }
+  if (hasOverflow) {
+    const extra = runningKidCount - 5;
+    const a = Math.PI / 3;
+    const bx = 12 + R * Math.sin(a), by = 12 - R * Math.cos(a);
+    const badgeTitle = parentTasks
+      ? "共 " + runningKidCount + " 个任务处理中"
+      : "共 " + runningKidCount + " 个子任务处理中";
+    circles += `<g class="orbit-badge" aria-hidden="true">` +
+      `<circle cx="${bx.toFixed(1)}" cy="${by.toFixed(1)}" r="4"></circle>` +
+      `<text x="${bx.toFixed(1)}" y="${by.toFixed(1)}">${extra}</text>` +
+      `<title>${escapeHtml(badgeTitle)}</title></g>`;
+  }
+  target.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">` +
+    circles +
+    `<circle class="main-dot${s.busy ? " busy" : ""}" cx="12" cy="12" r="3" aria-hidden="true"></circle>` +
+    `</svg>`;
+  return runningKidCount;
+}
+
 function buildTreeRoot(s, kids, wsId) {
   const node = el("div", "tree-node");
   const row = el("div", "tree-row"
@@ -2063,88 +2131,9 @@ function buildTreeRoot(s, kids, wsId) {
       toggleSidebarNode(wsId + ":" + s.id, toggle, kids, wsId, s.id);
     });
   }
-  // 环绕点数量 = 该父会话的全部后台任务数（/api/tasks：bash 后台任务 +
-  // delegate subagent 任务，与任务面板 2s 轮询对齐）；任务面板未加载
-  // （tasksForWorkspace 返回 null：byWorkspace 无缓存且聚合 list 无该 ws
-  // 任务，侧边栏先渲染）时回退 running 子会话计数，避免闪烁。主点只表达
-  // 父会话自身状态；每个环绕点对应一个任务：bash 任务恒红（一直在跑），
-  // delegate 任务按对应 subagent 会话的 busy 判定——busy:true 红点，
-  // busy:false（Idle 在等）绿点。
-  // 数据源按本 workspace：优先 byWorkspace[wsId] 的 per-ws 权威快照
-  // （pollTasks 每轮写入；切换 workspace 瞬间聚合 list 尚未含目标 ws 时
-  // 仍有缓存 → dot 不闪），缓存缺失才从聚合 list 过滤（聚合 list 本身是
-  // 各 ws 快照的合并视图，按 _ws 标记精确过滤，防御跨 workspace 同 id）。
-  const wsTasks = tasksForWorkspace(wsId);
-  const parentTasks = wsTasks
-    ? wsTasks.filter((t) => t.session_id === s.id)
-    : null;   // 未加载 → 回退 kids 计数
-  const runningKidCount = parentTasks === null
-    ? kids.filter(isSubagentRunning).length
-    : parentTasks.length;
-  const hasRunningKids = runningKidCount > 0;
   const dot = el("span", "busy-dot-wrap");
-  dot.setAttribute("role", "img");
-  dot.setAttribute("aria-label", (s.busy ? "会话处理中" : "会话空闲")
-    + (hasRunningKids ? "，" + runningKidCount + " 个任务处理中" : ""));
-
-  // 整个状态点用一个 SVG 矢量渲染：主点 + 环绕点同为 <circle>，共享
-  // viewBox 坐标系（中心 (12,12)），数学上严格同心，浏览器统一光栅化——
-  // 根治此前「主点 translate(-50%) 居中、环绕点 transform-origin 居中」
-  // 两套机制下 4px/6px 偶数点在非整数 DPR（如 1.25×）各自独立 snap 到物理
-  // 像素网格产生的半像素错位（放大后可见为环相对主点偏移）。SVG 内所有点
-  // 一次性光栅化，任何 DPR/缩放下都严格同心。
-  // 环上最多画六个点；更多任务由第七个位置的 +N 汇总，避免
-  // 小尺寸侧栏状态标记过密。位置按任务列表顺序均匀选取。
-  // 溢出（任务数 >6）时：环绕点只画 5 个、把右上 60° 槽位让给「+N」徽章
-  // ——徽章作为环的「第 6 个节点」放在该槽位（中心 18.9,8），与圆点同一
-  // viewBox 坐标系、同为 SVG、圆形语言统一，不再像旧 HTML 矩形徽章那样压在
-  // 正上/右上两个环绕点上。N≤6 时 6 个环绕点均匀分布、无徽章。
-  const hasOverflow = runningKidCount > 6;
-  const visibleKidDots = hasOverflow ? 5 : Math.min(runningKidCount, 6);
-  // R=8 由不重叠约束标定：主点半径 3 + 环绕点半径 2 = 5，中心距 8 留出
-  // 3px 净间隙，环绕点与主点清晰分开不粘连；点缘最远 12+8+2=22 ≤ 24 不
-  // 溢出 viewBox。正圆上任意 N 个等角点相邻弦长严格相等，环始终匀称不歪。
-  const R = 8;   // 正圆半径（主点中心到环绕点中心的距离）
-  let circles = "";
-  for (let i = 0; i < visibleKidDots; i++) {
-    const t = parentTasks ? parentTasks[i] : null;
-    // delegate 任务在等（对应 subagent busy:false）→ 绿点；其余（bash /
-    // busy:true / 找不到会话）→ 红点。回退模式（tasks 未加载）全红。
-    const green = t !== null && taskIsWaitingGreen(t, kids);
-    // SVG transform="rotate(θ 12 12) translate(0 -R)"：与 CSS 相同从右往左
-    // 应用——circle 中心先在 (12,12)，translate(0,-R) 上移到 (12,12-R)，
-    // 再绕 viewBox 中心 (12,12) 顺时针转 θ（SVG rotate(a cx cy) 指定旋转
-    // 中心，正值顺时针），点中心精确落在半径 R 的圆上。
-    // 溢出时环绕点只有 5 个：均匀取 6 槽位中除右上 60° 外的 5 个
-    // （0/120/180/240/300），空出右上给徽章；否则 N 个点均匀环绕。
-    const slotDeg = hasOverflow ? [0, 120, 180, 240, 300][i] : (360 * i) / visibleKidDots;
-    const title = parentTasks
-      ? taskDotTitle(t, i + 1, runningKidCount)
-      : "子任务 " + (i + 1) + "/" + runningKidCount;
-    circles += `<circle class="orbit-dot${green ? " green" : ""}" cx="12" cy="12" r="2"` +
-      ` transform="rotate(${slotDeg} 12 12) translate(0 ${-R})"` +
-      ` aria-hidden="true"><title>${escapeHtml(title)}</title></circle>`;
-  }
-  // 「+N」徽章：圆形，放在右上 60° 槽位（中心 = (12,12) + R·(sin60°,−cos60°)
-  // ≈ (18.9,8)），r=4.5（直径 9px）与相邻环绕点净距 +1px 不压点、在 viewBox
-  // 内。SVG <circle> 底 + <text> 数字，与环绕点同坐标系、统一光栅化。
-  if (hasOverflow) {
-    const extra = runningKidCount - 5;   // 未画出的任务数（第 6 个起计入徽章）
-    const a = Math.PI / 3;               // 60°（右上槽位）
-    const bx = 12 + R * Math.sin(a), by = 12 - R * Math.cos(a);
-    const badgeTitle = parentTasks
-      ? "共 " + runningKidCount + " 个任务处理中"
-      : "共 " + runningKidCount + " 个子任务处理中";
-    circles += `<g class="orbit-badge" aria-hidden="true">` +
-      `<circle cx="${bx.toFixed(1)}" cy="${by.toFixed(1)}" r="4"></circle>` +
-      `<text x="${bx.toFixed(1)}" y="${by.toFixed(1)}">${extra}</text>` +
-      `<title>${escapeHtml(badgeTitle)}</title></g>`;
-  }
-  // 主点最后画（叠在环绕点之上）：busy → 橙，idle → 绿（class 控制 fill）。
-  dot.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">` +
-    circles +
-    `<circle class="main-dot${s.busy ? " busy" : ""}" cx="12" cy="12" r="3" aria-hidden="true"></circle>` +
-    `</svg>`;
+  const runningKidCount = renderSessionBusyDot(dot, s, kids, wsId);
+  const hasRunningKids = runningKidCount > 0;
   // 有标题：两行（title 行 + 完整 id 行）；无标题：一行完整 id。
   // 单行 ellipsis 截断的长 id 无法区分会话，双行让 title/id 都可见。
   const hasTitle = !!s.title;

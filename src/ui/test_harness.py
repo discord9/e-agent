@@ -17,7 +17,7 @@ JS_FILES = ['app.js', 'render.js', 'sessions.js', 'tasks.js', 'sse.js']
 js = "\n".join(open(os.path.join(HERE, f), encoding='utf-8').read() for f in JS_FILES)
 vendor_js = open(os.path.join(HERE, 'vendor', 'marked.min.js'), encoding='utf-8').read()
 
-MODE = os.environ.get('MODE', 'open')   # 'open' = openSession path, 'direct' = loadHistory
+MODE = os.environ.get('MODE', 'open')   # 'open' = full openSession path, 'direct' = loadHistory, 'header' = focused header checks
 DEEP_LINK = os.environ.get('DEEP_LINK', '')   # 注入 ?session=<id> 到 location.search（init 启动时解析）
 TRACE = os.environ.get('TRACE') == '1'
 # gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；页面 JS 里的 new TextDecoder() 换成桩工厂。
@@ -658,6 +658,16 @@ async function main(){
     state.globalToken="test-token";   // 全局回退 token（workspaceToken 的兜底）
     state.token="test-token";         // 激活 workspace 派生 token（兼容既有引用）
     await pollSessions();
+    if (MODE === 'header') {
+      let focusedFail=0;
+      const focusedChk=(name, ok, extra)=>{
+        if(!ok) focusedFail++;
+        console.log((ok?"PASS":"FAIL")+" "+name+(extra?"  "+extra:""));
+      };
+      runHeaderChecks(focusedChk);
+      console.log(focusedFail===0 ? "ALL PASS" : focusedFail+" FAILURES");
+      imports.system.exit(0);
+    }
     renderSidebarTree(true);
     chk("sidebar rows rendered", elsById["sidebarTree"].querySelector(".tree-row") !== null);
     // 会话操作全部迁入树行：置顶 / 归档 / 删除均可从唯一导航完成。
@@ -3257,34 +3267,122 @@ async function main(){
     tokInp._listeners["blur"][0]();
     chk("token blur defers collapse", tokInp.hidden === false, "hidden=" + tokInp.hidden);
 
-    // ---- 顶部 busy 点：复用侧栏 busy-dot-wrap/main-dot busy 表现，只跟随
-    // 当前打开会话；其它会话 busy 不得点亮，清空会话后隐藏。 ----
+  function runHeaderChecks(chk){
+    // ---- 顶部会话状态：与侧栏共用完整 SVG（中心点、子任务轨道、溢出徽章），
+    // 且严格限定为激活 workspace 当前打开会话。 ----
     const _savedList = state.lastList;
     const _savedSid = state.sessionId;
+    const _savedTaskList = state.tasks.list;
+    const _savedTaskByWs = state.tasks.byWorkspace;
+    const _activeWsId = state.workspace.id;
+    state.tasks.list = [];
+    state.tasks.byWorkspace = {};
+
     state.sessionId = "current-busy";
     state.lastList = [
       { id: "current-busy", busy: true },
-      { id: "other-idle", busy: false },
+      { id: "other-busy", busy: true },
     ];
     updateCurrentSessionBusy();
-    chk("header busy dot follows current busy session",
-        elsById["chatBusy"].hidden === false,
-        "hidden=" + elsById["chatBusy"].hidden);
-    state.sessionId = "other-idle";
+    chk("header renders current main busy dot",
+        elsById["chatBusy"].hidden === false
+        && !!elsById["chatBusy"].querySelector(".main-dot.busy")
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot").length === 0,
+        "html=" + elsById["chatBusy"].innerHTML);
+
+    // main idle 不隐藏仍存活的 child；无 task 快照时与侧栏一样回退 busy child。
+    state.lastList = [
+      { id: "current-busy", busy: false },
+      { id: "current-child", parent_session_id: "current-busy", busy: true, status: "Busy" },
+      { id: "other-busy", busy: true },
+      { id: "other-child", parent_session_id: "other-busy", busy: true, status: "Busy" },
+    ];
     updateCurrentSessionBusy();
-    chk("header busy dot hides for current idle session",
-        elsById["chatBusy"].hidden === true,
-        "hidden=" + elsById["chatBusy"].hidden);
+    chk("header shows active child orbit while main idle",
+        elsById["chatBusy"].hidden === false
+        && !!elsById["chatBusy"].querySelector(".main-dot")
+        && elsById["chatBusy"].querySelector(".main-dot.busy") === null
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot").length === 1,
+        "hidden=" + elsById["chatBusy"].hidden + " html=" + elsById["chatBusy"].innerHTML);
+
+    // 权威 task 快照：7 个当前父任务 => 5 个点 + +2；其它父和其它 workspace
+    // 的任务均不得计入。idle delegate 对应 busy:false child，轨道点为 green。
+    const _currentTasks = [];
+    for (let i = 0; i < 7; i++) _currentTasks.push({
+      session_id: "current-busy", id: i + 1, kind: i === 0 ? "delegate" : "bash",
+      subagent_session_id: i === 0 ? "current-child" : null,
+    });
+    state.lastList = [
+      { id: "current-busy", busy: false },
+      { id: "current-child", parent_session_id: "current-busy", busy: false, status: "Idle" },
+      { id: "other-busy", busy: true },
+    ];
+    state.tasks.byWorkspace[_activeWsId] = _currentTasks.concat([
+      { session_id: "other-busy", id: 99, kind: "bash" },
+    ]);
+    state.tasks.list = state.tasks.byWorkspace[_activeWsId].concat([
+      { session_id: "current-busy", id: 100, kind: "bash", _ws: "another-workspace" },
+    ]);
+    updateCurrentSessionBusy();
+    const _headerBadge = elsById["chatBusy"].querySelector(".orbit-badge text");
+    chk("header renders orbit overflow badge",
+        elsById["chatBusy"].querySelectorAll(".orbit-dot").length === 5
+        && !!_headerBadge && _headerBadge.textContent === "2",
+        "dots=" + elsById["chatBusy"].querySelectorAll(".orbit-dot").length
+          + " badge=" + (_headerBadge && _headerBadge.textContent));
+    chk("header preserves waiting delegate green orbit",
+        elsById["chatBusy"].querySelectorAll(".orbit-dot.green").length === 1,
+        "green=" + elsById["chatBusy"].querySelectorAll(".orbit-dot.green").length);
+    chk("header isolates current session and workspace tasks",
+        elsById["chatBusy"]._attrs["aria-label"].includes("7 个任务处理中")
+        && !elsById["chatBusy"]._attrs["aria-label"].includes("8 个"),
+        "label=" + elsById["chatBusy"]._attrs["aria-label"]);
+
+    // 侧栏与标题调用同一 helper，产出的 SVG class/geometry/徽章必须逐字一致。
+    const _sidebarDot = new El("span");
+    _sidebarDot.className = "busy-dot-wrap";
+    renderSessionBusyDot(_sidebarDot, state.lastList[0], [state.lastList[1]], _activeWsId);
+    chk("header and sidebar share exact status svg",
+        _sidebarDot.innerHTML === elsById["chatBusy"].innerHTML
+        && !!elsById["chatBusy"].querySelector(".main-dot")
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot").length === 5,
+        "header=" + elsById["chatBusy"].innerHTML + " sidebar=" + _sidebarDot.innerHTML);
+
+    state.tasks.byWorkspace[_activeWsId] = [];
+    state.tasks.list = [];
+    state.lastList = [
+      { id: "current-busy", busy: false },
+      { id: "other-busy", busy: true },
+      { id: "other-child", parent_session_id: "other-busy", busy: true, status: "Busy" },
+    ];
+    updateCurrentSessionBusy();
+    chk("header hides idle current with no child activity",
+        elsById["chatBusy"].hidden === true
+        && !!elsById["chatBusy"].querySelector(".main-dot")
+        && elsById["chatBusy"].querySelector(".main-dot.busy") === null
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot").length === 0,
+        "hidden=" + elsById["chatBusy"].hidden + " html=" + elsById["chatBusy"].innerHTML);
     state.lastList = [{ id: "background-busy", busy: true }];
     updateCurrentSessionBusy();
     chk("header ignores another session busy state",
-        elsById["chatBusy"].hidden === true,
+        elsById["chatBusy"].hidden === true && elsById["chatBusy"].innerHTML === "",
         "hidden=" + elsById["chatBusy"].hidden);
     state.sessionId = null;
     updateCurrentSessionBusy();
-    chk("header busy dot hides without open session",
-        elsById["chatBusy"].hidden === true,
-        "hidden=" + elsById["chatBusy"].hidden);
+    chk("header hides and clears without open session",
+        elsById["chatBusy"].hidden === true && elsById["chatBusy"].innerHTML === "",
+        "hidden=" + elsById["chatBusy"].hidden + " html=" + elsById["chatBusy"].innerHTML);
+
+    state.tasks.list = _savedTaskList;
+    state.tasks.byWorkspace = _savedTaskByWs;
+
+  }
+
+    const _savedList = state.lastList;
+    const _savedSid = state.sessionId;
+    const _savedTaskList = state.tasks.list;
+    const _savedTaskByWs = state.tasks.byWorkspace;
+    runHeaderChecks(chk);
 
     // ---- Bug A：缺 model/role 的会话 → composerMeta hidden（动作按钮落左的
     // 前置条件）；布局修复（.composer-actions margin-left:auto）由 python 侧
@@ -7413,7 +7511,8 @@ async function main(){
   imports.system.exit(0);
 }
 main();
-'''.replace('MODE === \'direct\'', 'true' if MODE == 'direct' else 'false')
+'''.replace('MODE === \'direct\'', 'true' if MODE == 'direct' else 'false') \
+   .replace("MODE === 'header'", 'true' if MODE == 'header' else 'false')
 
 # DEEP_LINK env → location.search 注入（init() 启动时 URL 解析入口）
 HARNESS = HARNESS.replace('__DEEP_LINK_SEARCH__', ('?session=' + DEEP_LINK) if DEEP_LINK else '')
@@ -7446,15 +7545,18 @@ _spin_ok = bool(re.search(r'\.composer-status\.busy::before[^{]*\{[^}]*animation
                 and re.search(r'@keyframes\s+composer-status-spin', _css)
                 and re.search(r'prefers-reduced-motion: reduce', _css))
 print(("PASS" if _spin_ok else "FAIL") + " composer-status spinner + reduced-motion in style.css")
-# 聊天标题 busy 点直接复用侧栏 24px SVG/main-dot.busy；不新增动画定义，且
-# reduced-motion 必须显式覆盖 SVG 主点（旧规则只覆盖了 HTML .busy-dot）。
+# 标题只保留共享 helper 的挂载点，不再内置简化静态 SVG；主点和轨道动画
+# 均由 busy-dot-wrap 现有 class 驱动，并在 reduced-motion 下完整关闭。
 _header_html = open(os.path.join(HERE, 'index.html'), encoding='utf-8').read()
+_sessions_js = open(os.path.join(HERE, 'sessions.js'), encoding='utf-8').read()
 _header_busy_ok = bool(
-    re.search(r'id="chatBusy"\s+class="busy-dot-wrap"[^>]*hidden', _header_html)
-    and re.search(r'<circle\s+class="main-dot busy"\s+cx="12"\s+cy="12"\s+r="3"', _header_html)
+    re.search(r'id="chatBusy"\s+class="busy-dot-wrap"[^>]*hidden[^>]*>\s*</span>', _header_html)
+    and len(re.findall(r'function\s+renderSessionBusyDot\s*\(', _sessions_js)) == 1
+    and re.search(r'renderSessionBusyDot\(els\.chatBusy,\s*current,\s*kids,\s*state\.workspace\.id\)', _sessions_js)
+    and re.search(r'renderSessionBusyDot\(dot,\s*s,\s*kids,\s*wsId\)', _sessions_js)
     and len(re.findall(r'@keyframes\s+pulse\b', _css)) == 1
-    and re.search(r'prefers-reduced-motion:\s*reduce[\s\S]*?\.busy-dot-wrap\s+\.main-dot\.busy', _css))
-print(("PASS" if _header_busy_ok else "FAIL") + " header reuses sidebar busy dot + reduced-motion")
+    and re.search(r'prefers-reduced-motion:\s*reduce[\s\S]*?\.busy-dot-wrap\s+\.main-dot\.busy[\s\S]*?\.busy-dot-wrap\s+\.orbit-dot', _css))
+print(("PASS" if _header_busy_ok else "FAIL") + " shared header/sidebar status svg + reduced-motion")
 # 置顶聚合行的 workspace 标记必须保持紧凑且不参与 flex 收缩；否则空 span
 # 不可见，或再次挤占会话标题空间。
 _marker = re.search(r'\.tree-row\s+\.ws-pin-label\s*\{([^}]*)\}', _css)
@@ -7575,4 +7677,6 @@ print(("PASS" if _zoom_guard_ok else "FAIL") + " pinch zoom leaves app height to
 _icon_m = re.search(r'<link\s+rel="icon"\s+type="image/svg\+xml"\s+href="(data:image/svg\+xml,[^"]+)"', _html)
 _icon_ok = bool(_icon_m and '%23' in _icon_m.group(1) and '#' not in _icon_m.group(1))
 print(("PASS" if _icon_ok else "FAIL") + " inline SVG favicon data URI in index.html head")
+if MODE == 'header':
+    sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _header_busy_ok else 1)
 sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _header_busy_ok and _marker_ok and _empty_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok else 1)
