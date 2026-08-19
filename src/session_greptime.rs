@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tokio_postgres::NoTls;
 
 use crate::agent::SessionEntry;
@@ -164,7 +165,7 @@ CREATE TABLE IF NOT EXISTS usage_entries (
 pub struct GreptimeSession {
     client: tokio_postgres::Client,
     /// Next sequence number for appends within this session.
-    next_seq: i64,
+    next_seq: AtomicI64,
     workspace_id: String,
     session_id: String,
     /// Hex SHA-256 of the backend-instance identity (backend kind + the
@@ -468,9 +469,9 @@ impl GreptimeSession {
                 None
             };
 
-        let mut session = Self {
+        let session = Self {
             client,
-            next_seq: 0,
+            next_seq: AtomicI64::new(0),
             workspace_id: workspace_id.to_string(),
             session_id: session_id.to_string(),
             backend_fp: crate::session_store::backend_instance_fingerprint("greptime", conn),
@@ -479,9 +480,12 @@ impl GreptimeSession {
 
         // Seed next_seq from the DB's current max seq (see db_max_seq).
         let max_seq = session.db_max_seq().await?;
-        session.next_seq = max_seq.checked_add(1).context(format!(
-            "max_seq overflow in connect for session '{session_id}'"
-        ))?;
+        session.next_seq.store(
+            max_seq.checked_add(1).context(format!(
+                "max_seq overflow in connect for session '{session_id}'"
+            ))?,
+            Ordering::Release,
+        );
         Ok(session)
     }
 
@@ -515,15 +519,15 @@ impl GreptimeSession {
     pub fn advance_next_seq_from_snapshot_len(&mut self, len: usize) -> Result<()> {
         let next: i64 = i64::try_from(len)
             .context("snapshot length overflowed i64 (impossible for a real session)")?;
-        if next < self.next_seq {
+        if next < self.next_seq.load(Ordering::Acquire) {
             anyhow::bail!(
                 "next_seq rewind: current={}, requested={}; \
                  monotonic advance only (use snapshot length, not DB row count)",
-                self.next_seq,
+                self.next_seq.load(Ordering::Acquire),
                 next,
             );
         }
-        self.next_seq = next;
+        self.next_seq.store(next, Ordering::Release);
         Ok(())
     }
 
@@ -532,7 +536,7 @@ impl GreptimeSession {
     /// sessions list — no DB query, unlike the sessions-table
     /// `entry_count` snapshot which only refreshes on touch.
     pub fn entry_count(&self) -> i64 {
-        self.next_seq
+        self.next_seq.load(Ordering::Acquire)
     }
 
     /// Load all entries for this session, deduplicated by seq (latest
@@ -1218,7 +1222,7 @@ impl GreptimeSession {
     /// latest-winning or advertising a location that the logical read path
     /// would not pick. This is the strongest guarantee this backend can
     /// provide: the ambiguity is detected and reported, never hidden.
-    pub async fn append_located(&mut self, entries: &[SessionEntry]) -> Result<Vec<EntryLocation>> {
+    pub async fn append_located(&self, entries: &[SessionEntry]) -> Result<Vec<EntryLocation>> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
@@ -1227,7 +1231,7 @@ impl GreptimeSession {
         // Validate the complete write range before any DB write.
         // All seqs from base_seq..base_seq+n must be representable as i64
         // and the final cursor must also be in range.
-        let base_seq = self.next_seq;
+        let base_seq = self.next_seq.load(Ordering::Acquire);
         let n_i64 = i64::try_from(n).context("append count overflowed i64")?;
         let final_cursor = base_seq.checked_add(n_i64).ok_or_else(|| {
             anyhow::anyhow!(
@@ -1309,10 +1313,13 @@ impl GreptimeSession {
                 let committed = self.read_winning_rows(base_seq, overlap_hi).await?;
                 // The DB may have advanced beyond our batch (foreign rows);
                 // resume past the true max so we never reuse foreign seqs.
-                self.next_seq = db_max.checked_add(1).context(format!(
-                    "max_seq overflow advancing next_seq after idempotent                      retry in session '{}'",
-                    self.session_id
-                ))?;
+                self.next_seq.store(
+                    db_max.checked_add(1).context(format!(
+                        "max_seq overflow advancing next_seq after idempotent retry in session '{}'",
+                        self.session_id
+                    ))?,
+                    Ordering::Release,
+                );
                 return Ok(committed);
             }
             // Partial overlap: the matching prefix stays committed; insert
@@ -1344,7 +1351,7 @@ impl GreptimeSession {
                 &self.backend_fp,
                 &self.session_id,
             ));
-            self.next_seq = final_cursor;
+            self.next_seq.store(final_cursor, Ordering::Release);
             return Ok(committed);
         }
 
@@ -1365,7 +1372,7 @@ impl GreptimeSession {
 
         // Advance next_seq only after all chunks succeed, so a partial
         // failure does not shift sequence numbers on retry.
-        self.next_seq = final_cursor;
+        self.next_seq.store(final_cursor, Ordering::Release);
 
         // The prepped rows ARE the committed physical rows (no overlap).
         Ok(prepped_locations(
@@ -1378,7 +1385,7 @@ impl GreptimeSession {
 
     /// Append new entries, discarding the located keys (plain-append call
     /// sites that do not issue receipts). See [`Self::append_located`].
-    pub async fn append(&mut self, entries: &[SessionEntry]) -> Result<()> {
+    pub async fn append(&self, entries: &[SessionEntry]) -> Result<()> {
         self.append_located(entries).await.map(|_| ())
     }
 
@@ -1443,7 +1450,7 @@ impl GreptimeSession {
     /// session's) so the workspace-scoped meta store can record usage for
     /// any session id, and the store facade passes them through.
     pub async fn append_usage(
-        &mut self,
+        &self,
         workspace_id: &str,
         session_id: &str,
         model: &str,
@@ -1978,7 +1985,7 @@ impl GreptimeSession {
             last_active_at: now,
             model: model.map(str::to_owned),
             role: role.map(str::to_owned),
-            entry_count: self.next_seq,
+            entry_count: self.next_seq.load(Ordering::Acquire),
             parent_session_id: parent_session_id.map(str::to_owned),
             parent_task_id,
             title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
@@ -2008,7 +2015,7 @@ impl GreptimeSession {
         };
         let mut meta = meta;
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        meta.entry_count = self.next_seq;
+        meta.entry_count = self.next_seq.load(Ordering::Acquire);
         self.insert_meta(&mut meta).await
     }
 
@@ -2713,7 +2720,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         let entries = test_entries();
         session.append(&entries).await.unwrap();
 
@@ -2733,7 +2740,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-finished-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         let entries = vec![
             SessionEntry::BackgroundCompletion {
@@ -2905,7 +2912,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-usage-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         // 空表 → 空汇总。
         assert!(session.usage_summary().await.unwrap().is_empty());
@@ -3004,7 +3011,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-usage-seq-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         // Commit an assistant entry through the normal located path and
         // recover its ACTUAL session_entries.seq.
@@ -3098,11 +3105,11 @@ mod tests {
         let sid = format!("test-gt-reconn-{}", crate::session::new_id());
         let entries = test_entries();
 
-        let mut s1 = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let s1 = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         s1.append(&entries[..3]).await.unwrap();
         drop(s1);
 
-        let mut s2 = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let s2 = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         s2.append(&entries[3..]).await.unwrap();
 
         let loaded = s2.load().await.unwrap();
@@ -3122,12 +3129,12 @@ mod tests {
         let wid = workspace_id();
         let sid = format!("test-gt-retry-{}", crate::session::new_id());
         let entries = test_entries();
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         // First write: seq 0..3
         session.append(&entries[..3]).await.unwrap();
         // Simulate reconnect-retry: same seq range, but new event_times
-        session.next_seq = 0;
+        session.next_seq.store(0, Ordering::Release);
         session.append(&entries[..3]).await.unwrap();
 
         // With the new dedup (group by seq, latest event_time wins), each
@@ -3161,7 +3168,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-payload-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         // First write: seq 0 with "old_content"
         let old_entry: SessionEntry = Message::User {
@@ -3180,7 +3187,7 @@ mod tests {
             .await
             .unwrap();
         // Retry same seq 0 with a different payload → conflict error.
-        session.next_seq = 0;
+        session.next_seq.store(0, Ordering::Release);
         let err = session
             .append(std::slice::from_ref(&new_entry))
             .await
@@ -3211,9 +3218,9 @@ mod tests {
         let entries = test_entries();
 
         // Writer A: writes seqs 0..2 (2 entries).
-        let mut writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         writer_a.append(&entries[..2]).await.unwrap();
-        assert_eq!(writer_a.next_seq, 2);
+        assert_eq!(writer_a.next_seq.load(Ordering::Acquire), 2);
         // A metadata snapshot row (any writer path — create_meta/touch/
         // set_title/set_pinned/backfill — stamps the writer identity), so
         // the conflict error below can name the latest snapshot writer.
@@ -3225,15 +3232,15 @@ mod tests {
 
         // Writer A2: a second concurrent writer (fresh connect, as a TUI +
         // Web pair or a second process would do) appends seqs 2..4.
-        let mut writer_a2 = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let writer_a2 = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         writer_a2.append(&entries[2..4]).await.unwrap();
-        assert_eq!(writer_a2.next_seq, 4);
+        assert_eq!(writer_a2.next_seq.load(Ordering::Acquire), 4);
         drop(writer_a2);
 
         // Writer B holds a stale next_seq (=2, from before A2's write) and
         // appends DIFFERENT content for seqs 2..4 → must be a conflict.
-        let mut writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
-        writer_b.next_seq = 2;
+        let writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_b.next_seq.store(2, Ordering::Release);
         let foreign: Vec<SessionEntry> = vec![
             Message::User {
                 content: "b-writer divergent 2".into(),
@@ -3267,10 +3274,11 @@ mod tests {
 
         // Idempotent retry: writer B re-appends A2's EXACT seqs 2..4 →
         // Ok (folded as its own earlier commit), no duplicate rows.
-        writer_b.next_seq = 2;
+        writer_b.next_seq.store(2, Ordering::Release);
         writer_b.append(&entries[2..4]).await.unwrap();
         assert_eq!(
-            writer_b.next_seq, 4,
+            writer_b.next_seq.load(Ordering::Acquire),
+            4,
             "cursor resumes past the committed rows"
         );
         let loaded = writer_b.load().await.unwrap();
@@ -3296,16 +3304,20 @@ mod tests {
         let wid = workspace_id();
         let sid = format!("test-gt-ownretry-{}", crate::session::new_id());
         let entries = test_entries();
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         // First append: seqs 0..2.
         session.append(&entries[..2]).await.unwrap();
-        assert_eq!(session.next_seq, 2);
+        assert_eq!(session.next_seq.load(Ordering::Acquire), 2);
         // Retry with the cursor the caller still holds after the (errored)
         // first attempt: same seqs, same payloads.
-        session.next_seq = 0;
+        session.next_seq.store(0, Ordering::Release);
         session.append(&entries[..2]).await.unwrap();
-        assert_eq!(session.next_seq, 2, "idempotent retry keeps the cursor");
+        assert_eq!(
+            session.next_seq.load(Ordering::Acquire),
+            2,
+            "idempotent retry keeps the cursor"
+        );
 
         let loaded = session.load().await.unwrap();
         assert_eq!(
@@ -3336,23 +3348,27 @@ mod tests {
         let entries = test_entries();
 
         // Writer A: seqs 0..2.
-        let mut writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         writer_a.append(&entries[..2]).await.unwrap();
         drop(writer_a);
 
         // The "first chunk" of writer B's slice: seqs 2..4 committed by
         // another connection (same content B will retry).
-        let mut writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
-        writer_b.next_seq = 2;
+        let writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_b.next_seq.store(2, Ordering::Release);
         writer_b.append(&entries[2..4]).await.unwrap();
-        assert_eq!(writer_b.next_seq, 4);
+        assert_eq!(writer_b.next_seq.load(Ordering::Acquire), 4);
         // Simulate the error: B still holds the pre-append cursor.
-        writer_b.next_seq = 2;
+        writer_b.next_seq.store(2, Ordering::Release);
 
         // Retry the full 4-entry slice: overlap [2,4) matches, remainder
         // [4,6) is inserted at seqs 4,5.
         writer_b.append(&entries[2..6]).await.unwrap();
-        assert_eq!(writer_b.next_seq, 6, "cursor advances past the remainder");
+        assert_eq!(
+            writer_b.next_seq.load(Ordering::Acquire),
+            6,
+            "cursor advances past the remainder"
+        );
 
         let loaded = writer_b.load().await.unwrap();
         assert_eq!(
@@ -3379,7 +3395,7 @@ mod tests {
         let entries = test_entries();
 
         // Writer A: write seq 0..2 (3 entries)
-        let mut writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         writer_a.append(&entries[..3]).await.unwrap();
         drop(writer_a);
 
@@ -3387,7 +3403,7 @@ mod tests {
         let mut writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         // Simulate concurrent writer A' appending seq 3..4 between connect and load.
-        let mut writer_a2 = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let writer_a2 = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         writer_a2.append(&entries[3..5]).await.unwrap();
         drop(writer_a2);
 
@@ -3406,7 +3422,8 @@ mod tests {
             .advance_next_seq_from_snapshot_len(loaded.len())
             .unwrap();
         assert_eq!(
-            writer_b.next_seq, 5,
+            writer_b.next_seq.load(Ordering::Acquire),
+            5,
             "next_seq updated from loaded snapshot"
         );
 
@@ -3428,7 +3445,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-seq-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         let entries = test_entries();
 
         // Append a slice of 5 entries in one call; verify all 5 recovered.
@@ -3459,7 +3476,7 @@ mod tests {
         let wid_b = derive_workspace_id(Path::new("/tmp/e-agent-workspace-b"));
         let sid = format!("shared-session-name-{}", crate::session::new_id());
 
-        let mut sa = GreptimeSession::connect(&conn, &wid_a, &sid).await.unwrap();
+        let sa = GreptimeSession::connect(&conn, &wid_a, &sid).await.unwrap();
         let sb = GreptimeSession::connect(&conn, &wid_b, &sid).await.unwrap();
 
         let user_msg = Message::User {
@@ -3496,7 +3513,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-located-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         let entry_a = Message::User {
             content: "version-A".into(),
@@ -3611,13 +3628,13 @@ mod tests {
             .into(),
         ];
 
-        let mut writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         let locs_a = writer_a.append_located(&entries).await.unwrap();
         assert_eq!(locs_a.len(), 2);
         drop(writer_a);
 
-        let mut writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
-        writer_b.next_seq = 0; // committed-then-errored retry reuses seqs
+        let writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        writer_b.next_seq.store(0, Ordering::Release); // committed-then-errored retry reuses seqs
         let locs_b = writer_b.append_located(&entries).await.unwrap();
 
         assert_eq!(locs_a, locs_b, "retry must return the committed rows");
@@ -3669,13 +3686,13 @@ mod tests {
             .into(),
         ];
 
-        let mut writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let writer_a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         writer_a.append(&entries[..2]).await.unwrap();
         drop(writer_a);
 
-        let mut writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let writer_b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         let locs_first = writer_b.append_located(&entries[2..4]).await.unwrap();
-        writer_b.next_seq = 2; // errored retry
+        writer_b.next_seq.store(2, Ordering::Release); // errored retry
         let mut more: Vec<SessionEntry> = entries[2..].to_vec();
         more.push(
             Message::User {
@@ -3719,7 +3736,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-failclosed-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         let entry: SessionEntry = Message::User {
             content: "mine".into(),
@@ -3801,7 +3818,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-exactdup-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         let entry: SessionEntry = Message::User {
             content: "dup".into(),
@@ -3938,7 +3955,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-seg-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         let early: Vec<SessionEntry> = vec![
             Message::User {
@@ -4072,7 +4089,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-paged-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         let early: Vec<SessionEntry> = vec![
             Message::User {
@@ -4216,7 +4233,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-dup-page-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         let user = |i: u32| SessionEntry::Message {
             message: Message::User {
@@ -4298,7 +4315,7 @@ mod tests {
         // segment): dup rows on seqs 4,5; limit-2 pages of the oldest
         // branch.
         let sid_b = format!("test-gt-dup-page-b-{}", crate::session::new_id());
-        let mut session_b = GreptimeSession::connect(&conn, &wid, &sid_b).await.unwrap();
+        let session_b = GreptimeSession::connect(&conn, &wid, &sid_b).await.unwrap();
         let plain: Vec<SessionEntry> = (0..6).map(user).collect();
         session_b.append(&plain).await.unwrap();
         let prepped: Vec<(i64, chrono::NaiveDateTime, String, String, bool)> = [4i64, 5i64]
@@ -4356,7 +4373,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-tie-page-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         let user = |i: u32| SessionEntry::Message {
             message: Message::User {
@@ -4459,7 +4476,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-tie-conflict-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         let user = |content: &str| SessionEntry::Message {
             message: Message::User {
@@ -4683,7 +4700,7 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-newer-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
         let early: Vec<SessionEntry> = vec![
             Message::User {
@@ -4804,7 +4821,7 @@ mod tests {
         // A session with no compaction at all: load_oldest reports nothing
         // older (the head segment already covers everything).
         let sid_none = format!("test-gt-nocomp-{}", crate::session::new_id());
-        let mut no_comp = GreptimeSession::connect(&conn, &wid, &sid_none)
+        let no_comp = GreptimeSession::connect(&conn, &wid, &sid_none)
             .await
             .unwrap();
         no_comp.append(&early).await.unwrap();
@@ -5204,15 +5221,15 @@ mod tests {
         let entries = test_entries();
         let mut s = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         s.append(&entries[..3]).await.unwrap();
-        assert_eq!(s.next_seq, 3);
+        assert_eq!(s.next_seq.load(Ordering::Acquire), 3);
 
         // Normal advance: 3 → 10
         s.advance_next_seq_from_snapshot_len(10).unwrap();
-        assert_eq!(s.next_seq, 10);
+        assert_eq!(s.next_seq.load(Ordering::Acquire), 10);
 
         // Same value is allowed (no-op advance).
         s.advance_next_seq_from_snapshot_len(10).unwrap();
-        assert_eq!(s.next_seq, 10);
+        assert_eq!(s.next_seq.load(Ordering::Acquire), 10);
     }
 
     // ------------------------------------------------------------------
@@ -5774,13 +5791,13 @@ mod tests {
         }
         let wid = workspace_id();
         let sid = format!("test-gt-meta-seq-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         let entries = test_entries();
 
         // entry_count = next_seq (MAX(seq)+1 at connect, advanced by
         // append) — not a physical row count.
         session.append(&entries[..3]).await.unwrap();
-        assert_eq!(session.next_seq, 3);
+        assert_eq!(session.next_seq.load(Ordering::Acquire), 3);
         session
             .create_meta(&sid, Some("m"), None, None, None, None)
             .await
@@ -5794,7 +5811,7 @@ mod tests {
 
         // A touch after more appends carries the advanced next_seq.
         session.append(&entries[3..5]).await.unwrap();
-        assert_eq!(session.next_seq, 5);
+        assert_eq!(session.next_seq.load(Ordering::Acquire), 5);
         session.touch_meta().await.unwrap();
         let list = session.list_meta().await.unwrap();
         let latest = list
@@ -6326,7 +6343,7 @@ mod tests {
         // other tests share the default workspace id.
         let wid = derive_workspace_id(Path::new("/tmp/e-agent-backfill-test"));
         let sid = format!("test-gt-bf-{}", crate::session::new_id());
-        let mut session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
         let entries = test_entries();
 
         // Pre-table session: transcript rows, no metadata rows.

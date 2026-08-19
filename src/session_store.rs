@@ -5,9 +5,8 @@
 //! Each variant holds whatever state its backend needs:
 //!
 //! - **Jsonl** — stateless marker; every call provides `root` + `name`.
-//! - **Greptime** — a connected + session-bound client behind a Mutex so
-//!   `&self` methods work everywhere (including the delegate's closure-based
-//!   the runner persistence path).
+//! - **Greptime** — a connected + session-bound client shared by immutable
+//!   references; tokio-postgres provides concurrent query/write dispatch.
 //! - **Sqlite** — a connected + session-bound client behind a Mutex, same
 //!   shape as Greptime; the session id is bound at connect time and the
 //!   database file is shared across sessions.
@@ -771,12 +770,12 @@ pub enum SessionStore {
     /// Default file-based JSONL backend. Stateless — delegates to
     /// `session::Session` static methods.
     Jsonl,
-    /// GreptimeDB-backed session storage behind a mutex so `&self` methods
-    /// work from any context.
+    /// GreptimeDB-backed session storage. The client is shared by immutable
+    /// references so database operations are not application-serialized.
     #[cfg(feature = "greptime")]
     Greptime {
         /// The connected Greptime session client, session-bound.
-        session: Arc<Mutex<crate::session_greptime::GreptimeSession>>,
+        session: Arc<crate::session_greptime::GreptimeSession>,
         /// Connection string, preserved so the backend config can be
         /// recovered for subagent session binding.
         conn: String,
@@ -889,7 +888,7 @@ impl SessionStore {
                 )
                 .await?;
                 Ok(SessionStore::Greptime {
-                    session: Arc::new(Mutex::new(session)),
+                    session: Arc::new(session),
                     conn: conn.clone(),
                 })
             }
@@ -936,7 +935,7 @@ impl SessionStore {
                 )
                 .await?;
                 Ok(SessionStore::Greptime {
-                    session: Arc::new(Mutex::new(session)),
+                    session: Arc::new(session),
                     conn: conn.clone(),
                 })
             }
@@ -993,7 +992,7 @@ impl SessionStore {
             SessionStore::Jsonl => Session::load(root, name),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
-                let entries = { session.lock().await.load().await? };
+                let entries = { session.load().await? };
                 Ok(LoadedSession {
                     entries,
                     legacy: false,
@@ -1040,7 +1039,7 @@ impl SessionStore {
                 .map_err(anyhow::Error::from)?
             }
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => Ok(session.lock().await.entry_count()),
+            SessionStore::Greptime { session, .. } => Ok(session.entry_count()),
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => Ok(session.lock().await.entry_count()),
         }
@@ -1059,7 +1058,7 @@ impl SessionStore {
             SessionStore::Jsonl => Session::load(root, name),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
-                let entries = { session.lock().await.load_head().await? };
+                let entries = { session.load_head().await? };
                 Ok(LoadedSession {
                     entries,
                     legacy: false,
@@ -1136,11 +1135,7 @@ impl SessionStore {
                 // The head segment is `[last_comp, ∞)`; see the
                 // `HEAD_OPEN_SENTINEL` doc comment for the cursor
                 // contract this reuse of `load_older` implements.
-                session
-                    .lock()
-                    .await
-                    .load_older(HEAD_OPEN_SENTINEL, limit)
-                    .await
+                session.load_older(HEAD_OPEN_SENTINEL, limit).await
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
@@ -1200,9 +1195,7 @@ impl SessionStore {
                 }
             }
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => {
-                session.lock().await.load_older(before_seq, limit).await
-            }
+            SessionStore::Greptime { session, .. } => session.load_older(before_seq, limit).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -1232,7 +1225,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => Ok((Vec::new(), None)),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session.lock().await.load_oldest().await,
+            SessionStore::Greptime { session, .. } => session.load_oldest().await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -1264,9 +1257,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => Ok((Vec::new(), None)),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => {
-                session.lock().await.load_newer(_after_seq).await
-            }
+            SessionStore::Greptime { session, .. } => session.load_newer(_after_seq).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -1289,7 +1280,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => Ok(None),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session.lock().await.head_seq().await,
+            SessionStore::Greptime { session, .. } => session.head_seq().await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -1319,7 +1310,7 @@ impl SessionStore {
                     .collect())
             }
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session.lock().await.load_with_seq().await,
+            SessionStore::Greptime { session, .. } => session.load_with_seq().await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -1341,7 +1332,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => Session::append(root, name, entries),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session.lock().await.append(entries).await,
+            SessionStore::Greptime { session, .. } => session.append(entries).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -1373,9 +1364,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => Session::append_located(root, name, entries),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => {
-                session.lock().await.append_located(entries).await
-            }
+            SessionStore::Greptime { session, .. } => session.append_located(entries).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -1397,7 +1386,7 @@ impl SessionStore {
             SessionStore::Jsonl => Session::load_located(root, name),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
-                let rows = session.lock().await.load_located().await?;
+                let rows = session.load_located().await?;
                 Ok(LoadedLocated {
                     entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
                     locations: rows.into_iter().map(|(loc, _)| Some(loc)).collect(),
@@ -1437,9 +1426,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => Session::read_field(root, verified),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => {
-                session.lock().await.read_field(verified).await
-            }
+            SessionStore::Greptime { session, .. } => session.read_field(verified).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -1463,11 +1450,7 @@ impl SessionStore {
             SessionStore::Jsonl => Session::read_field_direct(root, session_id, entry_id, field),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
-                session
-                    .lock()
-                    .await
-                    .read_field_direct(entry_id, field)
-                    .await
+                session.read_field_direct(entry_id, field).await
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
@@ -1513,8 +1496,6 @@ impl SessionStore {
             SessionStore::Greptime { session, .. } => {
                 let workspace_id = derive_workspace_id(root);
                 session
-                    .lock()
-                    .await
                     .append_usage(&workspace_id, session_id, model, kind, seq, usage)
                     .await
             }
@@ -1549,11 +1530,7 @@ impl SessionStore {
             SessionStore::Jsonl => Ok(Vec::new()),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
-                session
-                    .lock()
-                    .await
-                    .finished_tasks(&workspace_id, limit)
-                    .await
+                session.finished_tasks(&workspace_id, limit).await
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
@@ -1573,7 +1550,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => Ok(Vec::new()),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session.lock().await.usage_summary().await,
+            SessionStore::Greptime { session, .. } => session.usage_summary().await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -1599,9 +1576,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => Ok(Vec::new()),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => {
-                session.lock().await.usage_for_sessions(session_ids).await
-            }
+            SessionStore::Greptime { session, .. } => session.usage_for_sessions(session_ids).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -1673,7 +1648,7 @@ impl SessionStore {
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle) => {
                         handle.spawn(async move {
-                            if let Err(error) = greptime.lock().await.touch_meta().await {
+                            if let Err(error) = greptime.touch_meta().await {
                                 eprintln!("e-agent: cannot touch session metadata: {error:#}");
                             }
                         });
@@ -1743,8 +1718,6 @@ impl SessionStore {
                 ..
             } => {
                 greptime_session
-                    .lock()
-                    .await
                     .create_meta(
                         session,
                         model,
@@ -1782,7 +1755,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => jsonl_list_meta(root),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session.lock().await.list_meta().await,
+            SessionStore::Greptime { session, .. } => session.list_meta().await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -1804,7 +1777,7 @@ impl SessionStore {
             SessionStore::Greptime {
                 session: greptime_session,
                 ..
-            } => greptime_session.lock().await.delete_meta(session).await,
+            } => greptime_session.delete_meta(session).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite {
                 session: sqlite_session,
@@ -1833,13 +1806,7 @@ impl SessionStore {
             SessionStore::Greptime {
                 session: greptime_session,
                 ..
-            } => {
-                greptime_session
-                    .lock()
-                    .await
-                    .set_title(session, title)
-                    .await
-            }
+            } => greptime_session.set_title(session, title).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite {
                 session: sqlite_session,
@@ -1868,13 +1835,7 @@ impl SessionStore {
             SessionStore::Greptime {
                 session: greptime_session,
                 ..
-            } => {
-                greptime_session
-                    .lock()
-                    .await
-                    .set_pinned(session, pinned)
-                    .await
-            }
+            } => greptime_session.set_pinned(session, pinned).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite {
                 session: sqlite_session,
@@ -1903,13 +1864,7 @@ impl SessionStore {
             SessionStore::Greptime {
                 session: greptime_session,
                 ..
-            } => {
-                greptime_session
-                    .lock()
-                    .await
-                    .set_archived(session, archived)
-                    .await
-            }
+            } => greptime_session.set_archived(session, archived).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite {
                 session: sqlite_session,
@@ -1934,9 +1889,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => jsonl_backfill_sessions(root),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => {
-                session.lock().await.backfill_sessions().await
-            }
+            SessionStore::Greptime { session, .. } => session.backfill_sessions().await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
@@ -2001,8 +1954,6 @@ impl SessionStore {
                     Ok(handle) => {
                         handle.spawn(async move {
                             if let Err(error) = greptime
-                                .lock()
-                                .await
                                 .record_task_start(
                                     &session_id,
                                     id,
@@ -2072,9 +2023,7 @@ impl SessionStore {
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle) => {
                         handle.spawn(async move {
-                            if let Err(error) =
-                                greptime.lock().await.clear_task(&session_id, id).await
-                            {
+                            if let Err(error) = greptime.clear_task(&session_id, id).await {
                                 eprintln!("e-agent: cannot clear background task: {error:#}");
                             }
                         });
@@ -2126,11 +2075,7 @@ impl SessionStore {
                 ..
             } => {
                 let session_id = session.to_owned();
-                greptime_session
-                    .lock()
-                    .await
-                    .take_unfinished_tasks(&session_id)
-                    .await
+                greptime_session.take_unfinished_tasks(&session_id).await
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite {
@@ -2168,8 +2113,6 @@ impl SessionStore {
             } => {
                 let session_id = session.to_owned();
                 greptime_session
-                    .lock()
-                    .await
                     .unfinished_owner_all_dead(&session_id)
                     .await
             }
@@ -2205,8 +2148,6 @@ impl SessionStore {
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
                 session
-                    .lock()
-                    .await
                     .take_unfinished_tasks_for_subagent(_subagent_session_id)
                     .await
             }
@@ -2242,8 +2183,6 @@ impl SessionStore {
             } => {
                 let session_id = session.to_owned();
                 greptime_session
-                    .lock()
-                    .await
                     .task_full_command(&session_id, task_id)
                     .await
             }
@@ -2287,11 +2226,7 @@ impl SessionStore {
             SessionStore::Jsonl => Ok(jsonl_label_for_subagent(root, _subagent_session_id)),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
-                session
-                    .lock()
-                    .await
-                    .label_for_subagent(_subagent_session_id)
-                    .await
+                session.label_for_subagent(_subagent_session_id).await
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
@@ -2328,9 +2263,7 @@ impl SessionStore {
                     .map(Some)
             }
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => {
-                session.lock().await.all_subagent_labels().await.map(Some)
-            }
+            SessionStore::Greptime { session, .. } => session.all_subagent_labels().await.map(Some),
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
