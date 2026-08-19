@@ -187,11 +187,7 @@ pub struct GreptimeSession {
 }
 
 impl GreptimeSession {
-    /// Connect and ensure the table exists. `conn` is a tokio-postgres
-    /// connection string, e.g. "host=127.0.0.1 port=4002 dbname=public".
-    /// `workspace_id` is derived from the canonical workspace root and
-    /// scopes sessions to their workspace.
-    pub async fn connect(conn: &str, workspace_id: &str, session_id: &str) -> Result<Self> {
+    async fn connect_client(conn: &str) -> Result<tokio_postgres::Client> {
         let (client, connection) = tokio_postgres::connect(conn, NoTls)
             .await
             .context("cannot connect to GreptimeDB")?;
@@ -200,6 +196,35 @@ impl GreptimeSession {
                 eprintln!("greptime session connection error: {e}");
             }
         });
+        Ok(client)
+    }
+
+    /// Connect a workspace/session-bound reader without running any setup.
+    /// This is intentionally only a connection and driver spawn: no DDL,
+    /// migration, schema probe, backfill, or write is performed.
+    pub async fn connect_read_only(
+        conn: &str,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<Self> {
+        let client = Self::connect_client(conn).await?;
+        let backend_fp = crate::session_store::backend_instance_fingerprint("greptime", conn);
+        Ok(Self {
+            client,
+            next_seq: AtomicI64::new(0),
+            workspace_id: workspace_id.to_owned(),
+            session_id: session_id.to_owned(),
+            backend_fp,
+            cached_meta: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Connect and ensure the table exists. `conn` is a tokio-postgres
+    /// connection string, e.g. "host=127.0.0.1 port=4002 dbname=public".
+    /// `workspace_id` is derived from the canonical workspace root and
+    /// scopes sessions to their workspace.
+    pub async fn connect(conn: &str, workspace_id: &str, session_id: &str) -> Result<Self> {
+        let client = Self::connect_client(conn).await?;
         client
             .execute(CREATE_TABLE, &[])
             .await

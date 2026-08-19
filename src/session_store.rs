@@ -1816,6 +1816,25 @@ impl SessionStore {
         }
     }
 
+    /// Connect a request-local Greptime read session without setup. Other
+    /// backends retain their existing shared/store behavior.
+    #[cfg(feature = "greptime")]
+    pub async fn connect_meta_read_only(backend: &SessionBackend, root: &Path) -> Result<Self> {
+        let SessionBackend::Greptime { conn } = backend else {
+            anyhow::bail!("read-only Greptime store requires the Greptime backend");
+        };
+        let session = crate::session_greptime::GreptimeSession::connect_read_only(
+            conn,
+            &derive_workspace_id(root),
+            META_STORE_SENTINEL,
+        )
+        .await?;
+        Ok(SessionStore::Greptime {
+            session: Arc::new(session),
+            conn: conn.clone(),
+        })
+    }
+
     /// List metadata and collect backend timings for the server's slow-path
     /// diagnostic. The ordinary `list_meta` API above remains data-only.
     pub async fn list_meta_with_diagnostics(

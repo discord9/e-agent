@@ -1173,6 +1173,7 @@ struct ListSessionsTiming {
     labels_ms: u128,
     child_scan_ms: u128,
     merge_ms: u128,
+    connect_ms: u128,
     total_ms: u128,
     list_meta_diagnostics: Option<ListMetaDiagnostics>,
 }
@@ -1192,9 +1193,10 @@ fn list_sessions_slow_log(
         return None;
     }
     Some(format!(
-        "e-agent: GET /api/sessions {}: total={}ms live={}ms list_meta={}ms labels={}ms child_scan={}ms merge={}ms counts(live={} historical={} merged={} subagent_labels={}){}",
+        "e-agent: GET /api/sessions {}: total={}ms connect={}ms live={}ms list_meta={}ms labels={}ms child_scan={}ms merge={}ms counts(live={} historical={} merged={} subagent_labels={}){}",
         if degraded { "degraded" } else { "slow" },
         timing.total_ms,
+        timing.connect_ms,
         timing.live_ms,
         timing.list_meta_ms,
         timing.labels_ms,
@@ -1217,6 +1219,29 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
     let mut timing = ListSessionsTiming::default();
     let mut degraded = false;
     let root = state.factory.root();
+    // Greptime reads deliberately use one ephemeral client for this request.
+    // A failed ephemeral connect is degraded, never redirected to the shared
+    // startup store (which would reintroduce its head-of-line queue).
+    #[cfg(feature = "greptime")]
+    let connect_start = std::time::Instant::now();
+    #[cfg(feature = "greptime")]
+    let mut request_read_store = None;
+    #[cfg(feature = "greptime")]
+    let mut request_read_failed = false;
+    #[cfg(feature = "greptime")]
+    if matches!(
+        state.factory.backend(),
+        crate::config::SessionBackend::Greptime { .. }
+    ) {
+        match SessionStore::connect_meta_read_only(state.factory.backend(), root).await {
+            Ok(store) => request_read_store = Some(store),
+            Err(error) => {
+                eprintln!("e-agent: cannot open sessions read connection: {error:#}");
+                request_read_failed = true;
+            }
+        }
+        timing.connect_ms = connect_start.elapsed().as_millis();
+    }
     let phase_start = std::time::Instant::now();
     let mut active: Vec<SessionMeta> = Vec::with_capacity(state.registry.list().len());
     // Main-registry ids: an entry restored/resumed into the main registry
@@ -1233,7 +1258,23 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
     let phase_start = std::time::Instant::now();
     // Historical sessions from the metadata table (Greptime/SQLite audit
     // table; JSONL `.meta.jsonl` sidecars).
-    let historical = match state.meta_store.list_meta_with_diagnostics(root).await {
+    let historical_result = {
+        #[cfg(feature = "greptime")]
+        if let Some(store) = request_read_store.as_ref() {
+            store.list_meta_with_diagnostics(root).await
+        } else if request_read_failed {
+            Err(anyhow!(
+                "ephemeral Greptime sessions read connection unavailable"
+            ))
+        } else {
+            state.meta_store.list_meta_with_diagnostics(root).await
+        }
+        #[cfg(not(feature = "greptime"))]
+        {
+            state.meta_store.list_meta_with_diagnostics(root).await
+        }
+    };
+    let historical = match historical_result {
         Ok((list, diagnostics)) => {
             timing.list_meta_diagnostics = Some(diagnostics);
             list
@@ -1257,7 +1298,23 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
     // per-item loop: each lookup is a cheap indexed query, not a file
     // scan.
     let mut labels: HashMap<String, Option<String>> = HashMap::new();
-    match state.meta_store.all_subagent_labels(root).await {
+    let labels_result = {
+        #[cfg(feature = "greptime")]
+        if let Some(store) = request_read_store.as_ref() {
+            store.all_subagent_labels(root).await
+        } else if request_read_failed {
+            Err(anyhow!(
+                "ephemeral Greptime sessions read connection unavailable"
+            ))
+        } else {
+            state.meta_store.all_subagent_labels(root).await
+        }
+        #[cfg(not(feature = "greptime"))]
+        {
+            state.meta_store.all_subagent_labels(root).await
+        }
+    };
+    match labels_result {
         Ok(Some(all)) => labels = all,
         Ok(None) => {
             for meta in &merged {
@@ -3491,6 +3548,7 @@ mod tests {
         let message = list_sessions_slow_log(timing, false, 1, 2, 3, 0).unwrap();
         assert!(message.starts_with("e-agent: GET /api/sessions slow:"));
         assert!(message.contains("total=1000ms"));
+        assert!(message.contains("connect=0ms"));
         assert!(message.contains("counts(live=1 historical=2 merged=3 subagent_labels=0)"));
     }
 
@@ -3551,6 +3609,7 @@ mod tests {
     fn list_sessions_slow_log_includes_backend_diagnostics() {
         let timing = ListSessionsTiming {
             total_ms: LIST_SESSIONS_SLOW_THRESHOLD.as_millis(),
+            connect_ms: 7,
             list_meta_diagnostics: Some(ListMetaDiagnostics {
                 backend: "sqlite",
                 connection_lock_wait_ms: 12,
