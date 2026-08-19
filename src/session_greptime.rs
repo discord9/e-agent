@@ -162,6 +162,10 @@ CREATE TABLE IF NOT EXISTS usage_entries (
 )
 "#;
 
+fn advance_cursor(cursor: &AtomicI64, next: i64) {
+    cursor.fetch_max(next, Ordering::AcqRel);
+}
+
 pub struct GreptimeSession {
     client: tokio_postgres::Client,
     /// Next sequence number for appends within this session.
@@ -178,8 +182,7 @@ pub struct GreptimeSession {
     /// parent/title/pinned) without re-reading them. `None` = no row yet
     /// (brand-new session, or a subagent whose parent has not written its
     /// row yet).
-    /// Interior mutability because every touch path takes `&self` while
-    /// the store hands the session out behind a tokio Mutex.
+    /// Interior mutability because every touch path takes `&self`.
     cached_meta: std::sync::Mutex<Option<SessionMeta>>,
 }
 
@@ -469,23 +472,21 @@ impl GreptimeSession {
                 None
             };
 
+        let backend_fp = crate::session_store::backend_instance_fingerprint("greptime", conn);
         let session = Self {
             client,
             next_seq: AtomicI64::new(0),
             workspace_id: workspace_id.to_string(),
             session_id: session_id.to_string(),
-            backend_fp: crate::session_store::backend_instance_fingerprint("greptime", conn),
+            backend_fp,
             cached_meta: std::sync::Mutex::new(cached_meta),
         };
 
         // Seed next_seq from the DB's current max seq (see db_max_seq).
         let max_seq = session.db_max_seq().await?;
-        session.next_seq.store(
-            max_seq.checked_add(1).context(format!(
-                "max_seq overflow in connect for session '{session_id}'"
-            ))?,
-            Ordering::Release,
-        );
+        session.advance_next_seq(max_seq.checked_add(1).context(format!(
+            "max_seq overflow in connect for session '{session_id}'"
+        ))?);
         Ok(session)
     }
 
@@ -527,8 +528,15 @@ impl GreptimeSession {
                 next,
             );
         }
-        self.next_seq.store(next, Ordering::Release);
+        self.advance_next_seq(next);
         Ok(())
+    }
+
+    /// Advance the append cursor without allowing a concurrent append to
+    /// publish a newer value and then be regressed by this operation.
+    #[inline]
+    fn advance_next_seq(&self, next: i64) {
+        advance_cursor(&self.next_seq, next);
     }
 
     /// The session's live entry count (`next_seq` = `MAX(seq)+1`,
@@ -1313,13 +1321,10 @@ impl GreptimeSession {
                 let committed = self.read_winning_rows(base_seq, overlap_hi).await?;
                 // The DB may have advanced beyond our batch (foreign rows);
                 // resume past the true max so we never reuse foreign seqs.
-                self.next_seq.store(
-                    db_max.checked_add(1).context(format!(
-                        "max_seq overflow advancing next_seq after idempotent retry in session '{}'",
-                        self.session_id
-                    ))?,
-                    Ordering::Release,
-                );
+                self.advance_next_seq(db_max.checked_add(1).context(format!(
+                    "max_seq overflow advancing next_seq after idempotent retry in session '{}'",
+                    self.session_id
+                ))?);
                 return Ok(committed);
             }
             // Partial overlap: the matching prefix stays committed; insert
@@ -1351,7 +1356,7 @@ impl GreptimeSession {
                 &self.backend_fp,
                 &self.session_id,
             ));
-            self.next_seq.store(final_cursor, Ordering::Release);
+            self.advance_next_seq(final_cursor);
             return Ok(committed);
         }
 
@@ -1372,7 +1377,7 @@ impl GreptimeSession {
 
         // Advance next_seq only after all chunks succeed, so a partial
         // failure does not shift sequence numbers on retry.
-        self.next_seq.store(final_cursor, Ordering::Release);
+        self.advance_next_seq(final_cursor);
 
         // The prepped rows ARE the committed physical rows (no overlap).
         Ok(prepped_locations(
@@ -1867,21 +1872,23 @@ impl GreptimeSession {
         Ok(())
     }
 
-    /// The full snapshot the next touch must carry: the cached row when
-    /// present, otherwise a read-on-miss of the table (a subagent's first
-    /// touch reads back the row its parent wrote at spawn time — R3).
-    /// Absence is never cached: a parent may create the row between
-    /// touches, and the next touch must see it.
+    /// Read the current full snapshot for the bound session. Mutations read
+    /// the database even when this instance has a cache: another
+    /// GreptimeSession may have deleted or replaced the row while this
+    /// instance was idle. Metadata writes intentionally use the database's
+    /// optimistic last-write-wins semantics. Delete-vs-touch races remain a
+    /// documented limitation until database-level conditional/versioned
+    /// writes are available.
     async fn effective_meta(&self) -> Result<Option<SessionMeta>> {
-        if let Some(cached) = self.cached_meta.lock().unwrap().clone() {
-            return Ok(Some(cached));
-        }
         match self.load_meta_row(&self.session_id).await? {
             Some(meta) => {
                 *self.cached_meta.lock().unwrap() = Some(meta.clone());
                 Ok(Some(meta))
             }
-            None => Ok(None),
+            None => {
+                *self.cached_meta.lock().unwrap() = None;
+                Ok(None)
+            }
         }
     }
 
@@ -2016,7 +2023,9 @@ impl GreptimeSession {
         let mut meta = meta;
         meta.last_active_at = us_to_datetime(next_event_time_us());
         meta.entry_count = self.next_seq.load(Ordering::Acquire);
-        self.insert_meta(&mut meta).await
+        self.insert_meta(&mut meta).await?;
+        *self.cached_meta.lock().unwrap() = Some(meta);
+        Ok(())
     }
 
     /// Manually name a session: append one full snapshot row carrying the
@@ -2608,6 +2617,25 @@ mod tests {
     use super::*;
     use crate::agent::{AssistantMessage, Message};
     use std::path::Path;
+
+    #[test]
+    fn greptime_session_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<GreptimeSession>();
+    }
+
+    #[test]
+    fn cursor_advancement_is_monotonic_under_concurrency() {
+        use std::sync::Arc;
+        let cursor = Arc::new(AtomicI64::new(0));
+        std::thread::scope(|scope| {
+            for next in [3, 11, 7, 19, 5, 23, 13, 29] {
+                let cursor = Arc::clone(&cursor);
+                scope.spawn(move || advance_cursor(&cursor, next));
+            }
+        });
+        assert_eq!(cursor.load(Ordering::Acquire), 29);
+    }
 
     fn conn_str() -> String {
         std::env::var("GREPTIME_PG").unwrap_or_else(|_| {
