@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent::{
-    AssistantMessage, Model, ModelDeltaKind, Tool, ToolOutput, Usage, repair_tool_pairs,
+    AssistantMessage, Model, ModelDeltaKind, POLL_GUARD_ERROR, Tool, ToolOutput, Usage,
+    repair_tool_pairs,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -6012,13 +6013,17 @@ impl Tool for SlowTool {
 
 /// Wait for the poll-guard termination notice; panic on a failed turn.
 async fn wait_for_termination_notice(live: &mut tokio::sync::broadcast::Receiver<AgentEvent>) {
-    loop {
-        match live.recv().await.unwrap() {
-            AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE => break,
-            AgentEvent::Error(text) => panic!("turn failed: {text}"),
-            _ => {}
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            match live.recv().await.unwrap() {
+                AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE => break,
+                AgentEvent::Error(text) => panic!("turn failed: {text}"),
+                _ => {}
+            }
         }
-    }
+    })
+    .await
+    .expect("poll-guard termination notice timed out");
 }
 
 fn poll_call(id: &str) -> ToolCall {
@@ -6042,48 +6047,17 @@ fn tool_entries(entries: &[SessionEntry]) -> Vec<&Message> {
         .collect()
 }
 
-/// c1 normal, c2/c3 real POLL_ERROR (non-synthetic, image-less), last
-/// entry = the ordinary sibling (id/name/content) after the 3rd poll.
-fn assert_poll_guard_batch(entries: &[SessionEntry], last: (&str, &str, &str)) {
-    let tools = tool_entries(entries);
-    assert!(
-        tools.len() >= 4,
-        "full sibling batch committed: {}",
-        tools.len()
-    );
-    assert!(matches!(
-        tools[0],
-        Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
-            if call_id == "c1" && content == "No background tasks running."
-    ));
-    for (idx, id) in [(1usize, "c2"), (2, "c3")] {
-        assert!(matches!(
-            tools[idx],
-            Message::Tool { call_id, content, is_error: true, synthetic: false, images, .. }
-                if call_id == id && content == crate::agent::POLL_GUARD_ERROR && images.is_empty()
-        ));
-    }
-    assert!(matches!(
-        tools[tools.len() - 1],
-        Message::Tool { call_id, name, content, is_error: false, synthetic: false, .. }
-            if call_id == last.0 && name == last.1 && content == last.2
-    ));
-}
-
 #[tokio::test]
-async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
-    // Subagent runner (btw-fork shape): a [poll x3, bash, slow] batch —
-    // the 3rd poll latches, but the whole batch is durably committed
-    // (every sibling keeps a real ToolResult, no sentinel on disk), the
-    // mid-batch background completion is committed at the
-    // commit_backgrounds safe point BEFORE the termination notice, then
-    // the turn ends; a queued prompt starts a new turn with a reset guard.
+async fn poll_guard_runner_repeated_empty_polls_never_terminate_the_turn() {
+    // Regression: a turn that polls `get_background_tasks` repeatedly with
+    // NO running tasks must never latch the poll guard — the turn ends
+    // with the real final answer, not the termination sentinel (which left
+    // the runner's last_answer None).
     let temp = tempfile::tempdir().unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
     let (_main_tools, background) = crate::tools::builtins(workspace.clone(), None, false, None);
-    let mut tools =
+    let tools =
         crate::tools::builtins_with_background(workspace, background, None, false, true, None);
-    tools.push(Box::new(SlowTool { millis: 300 }));
     let agent = Agent::new(
         Box::new(ScriptedAssistantModel {
             replies: vec![
@@ -6093,14 +6067,102 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
                         poll_call("c1"),
                         poll_call("c2"),
                         poll_call("c3"),
+                        poll_call("c4"),
+                        poll_call("c5"),
+                    ],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![poll_call("c6"), poll_call("c7"), poll_call("c8")],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("finished".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        tools,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "poll-guard-empty".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, _) = handle.attach();
+    let task = runner.start(Some("poll a lot".into()));
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "finished" => break,
+            AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE => {
+                panic!("empty polls must never terminate the turn")
+            }
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    drop(task);
+
+    // Every poll kept its plain "no tasks" ToolResult — no POLL_GUARD_ERROR
+    // content, no sentinel anywhere in the durable session file.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "poll-guard-empty")
+        .await
+        .unwrap();
+    let tools = tool_entries(&loaded.entries);
+    assert_eq!(tools.len(), 8, "all eight polls committed");
+    for message in tools {
+        assert!(matches!(
+            message,
+            Message::Tool { content, is_error: false, synthetic: false, .. }
+                if content == "No background tasks running."
+        ));
+    }
+    assert!(
+        !std::fs::read_to_string(temp.path().join(".e-agent/sessions/poll-guard-empty.jsonl"))
+            .unwrap()
+            .contains(crate::agent::POLL_GUARD_SENTINEL)
+    );
+}
+
+#[tokio::test]
+async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
+    // Subagent runner: a [bash, poll x3, slow] batch. The real background
+    // task is started before all three polls and remains live for them. The
+    // third unchanged poll latches the guard, but the whole batch is durably
+    // committed (including the sibling slow result and the non-synthetic
+    // ToolResults). The background completion is committed at the
+    // commit_backgrounds safe point BEFORE the termination notice, then a
+    // following turn observes an empty snapshot with a reset guard.
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    let (_main_tools, background) = crate::tools::builtins(workspace.clone(), None, false, None);
+    let mut tools =
+        crate::tools::builtins_with_background(workspace, background, None, false, true, None);
+    tools.push(Box::new(SlowTool { millis: 2500 }));
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![
                         ToolCall {
-                            id: "c4".into(),
+                            id: "c0".into(),
                             name: "bash".into(),
-                            arguments: r#"{"command":"sleep 0.1; echo done","background":true}"#
+                            arguments: r#"{"command":"sleep 2; echo done","background":true}"#
                                 .into(),
                         },
+                        poll_call("c1"),
+                        poll_call("c2"),
+                        poll_call("c3"),
                         ToolCall {
-                            id: "c5".into(),
+                            id: "c4".into(),
                             name: "slow_test".into(),
                             arguments: "{}".into(),
                         },
@@ -6109,7 +6171,7 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
                 },
                 AssistantMessage {
                     content: None,
-                    tool_calls: vec![poll_call("c6")],
+                    tool_calls: vec![poll_call("c6"), poll_call("c6b"), poll_call("c6c")],
                     reasoning: None,
                 },
                 AssistantMessage {
@@ -6135,7 +6197,7 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
     wait_for_termination_notice(&mut live).await;
 
     // Safe-point ordering: the completion notice precedes the termination
-    // notice in the shared log.
+    // notice in the shared log, and the durable file has no sentinel.
     let snapshot = handle.snapshot();
     let completion_idx = snapshot
         .iter()
@@ -6146,18 +6208,44 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
         .position(|event| matches!(event, AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE))
         .expect("termination notice emitted");
     assert!(completion_idx < notice_idx);
-
-    // Durable reload: full batch with real ToolResults, the completion
-    // entry, and no sentinel in the session file.
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "poll-guard-runner")
         .await
         .unwrap();
-    assert_poll_guard_batch(&loaded.entries, ("c5", "slow_test", "slow done"));
+    let tools = tool_entries(&loaded.entries);
+    assert_eq!(tools.len(), 5, "all first-batch sibling calls committed");
+    assert!(matches!(
+        tools[0],
+        Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
+            if call_id == "c0" && content.starts_with("started background task 1:")
+    ));
+    assert!(matches!(
+        tools[1],
+        Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
+            if call_id == "c1" && content.starts_with("1 background task(s) running:")
+    ));
+    for (entry, id) in [(tools[2], "c2"), (tools[3], "c3")] {
+        assert!(matches!(
+            entry,
+            Message::Tool { call_id, content, is_error: true, synthetic: false, .. }
+                if call_id == id && content == POLL_GUARD_ERROR
+        ));
+    }
+    assert!(matches!(
+        tools[4],
+        Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
+            if call_id == "c4" && content == "slow done"
+    ));
+    assert!(tools.iter().all(|entry| matches!(
+        entry,
+        Message::Tool {
+            synthetic: false,
+            ..
+        }
+    )));
     assert!(loaded.entries.iter().any(|entry| matches!(
         entry,
-        SessionEntry::BackgroundCompletion { id: 1, output, .. }
-            if output.contains("exit code: 0") || output.contains("echo done")
+        SessionEntry::BackgroundCompletion { id: 1, output, .. } if output.contains("done")
     )));
     assert!(
         !std::fs::read_to_string(
@@ -6168,11 +6256,15 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
         .contains(crate::agent::POLL_GUARD_SENTINEL)
     );
 
-    // Next turn (queued prompt): guard reset — c6's first poll is normal.
+    // Next turn (queued prompt): the bash task completed → the snapshot is
+    // empty, so the guard never latches and the real answer arrives.
     handle.prompt("turn two");
     loop {
         match live.recv().await.unwrap() {
             AgentEvent::AssistantText(text) if text == "finished" => break,
+            AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE => {
+                panic!("empty polls must not terminate turn two")
+            }
             AgentEvent::Error(text) => panic!("turn two failed: {text}"),
             _ => {}
         }
@@ -6181,12 +6273,14 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
         .load(temp.path(), "poll-guard-runner")
         .await
         .unwrap();
-    assert_eq!(tool_entries(&loaded.entries).len(), 6);
-    assert!(matches!(
-        tool_entries(&loaded.entries)[5],
-        Message::Tool { call_id, content, is_error: false, .. }
-            if call_id == "c6" && content == "No background tasks running."
-    ));
+    assert_eq!(tool_entries(&loaded.entries).len(), 8);
+    for (idx, id) in [(5usize, "c6"), (6, "c6b"), (7, "c6c")] {
+        assert!(matches!(
+            tool_entries(&loaded.entries)[idx],
+            Message::Tool { call_id, content, is_error: false, .. }
+                if call_id == id && content == "No background tasks running."
+        ));
+    }
 
     drop(handle);
     drop(task);

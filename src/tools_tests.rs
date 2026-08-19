@@ -3648,12 +3648,48 @@ async fn get_background_tasks_marks_the_calling_subagent_itself() {
 }
 
 #[tokio::test]
+async fn subagent_poll_guard_never_escalates_on_empty_snapshots() {
+    // Empty polls never escalate, no matter how often repeated: with no
+    // running tasks there is nothing to wait for. 10 polls (well past the
+    // subagent threshold 3) all return the plain output — no reminder, no
+    // sentinel.
+    let tool = GetBackgroundTasks::new(
+        BackgroundTasks::new(Some(Duration::from_secs(30)), None),
+        None,
+        Some(SUBAGENT_POLL_GUARD_THRESHOLD),
+    );
+    for _ in 0..10 {
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap().content,
+            "No background tasks running."
+        );
+    }
+}
+
+#[tokio::test]
+async fn main_poll_guard_never_escalates_on_empty_snapshots() {
+    // Same for the main-agent guard (threshold 5): 10 empty polls never
+    // produce the reminder or the sentinel.
+    let tool = GetBackgroundTasks::new(
+        BackgroundTasks::new(Some(Duration::from_secs(30)), None),
+        None,
+        Some(MAIN_POLL_GUARD_THRESHOLD),
+    );
+    for _ in 0..10 {
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap().content,
+            "No background tasks running."
+        );
+    }
+}
+
+#[tokio::test]
 async fn subagent_poll_guard_escalates_on_unchanged_snapshot_and_resets_on_change() {
-    // The subagent-only guard: 1st poll of a snapshot is normal, the 2nd is
-    // the model-facing POLL_ERROR, the 3rd is the internal termination
-    // sentinel. Any ID-set change (new task, cancellation, completion) and
-    // the per-turn hook reset the count; the empty snapshot escalates the
-    // same 1/2/3 way.
+    // The subagent-only guard on a REAL non-empty snapshot: 1st poll is
+    // normal, the 2nd is the model-facing POLL_ERROR, the 3rd is the
+    // internal termination sentinel. Any ID-set change (new task,
+    // cancellation, completion), an interleaved empty poll, and the
+    // per-turn hook reset the count.
     let temp = tempfile::tempdir().unwrap();
     let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
     let background = bash.background.clone();
@@ -3663,11 +3699,13 @@ async fn subagent_poll_guard_escalates_on_unchanged_snapshot_and_resets_on_chang
         Some(SUBAGENT_POLL_GUARD_THRESHOLD),
     );
 
-    // Empty snapshot: 1st normal, 2nd POLL_ERROR, 3rd sentinel.
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap().content,
-        "No background tasks running."
-    );
+    // A real task snapshot: 1st normal, 2nd POLL_ERROR, 3rd sentinel.
+    bash.execute(json!({"command": "echo hello; sleep 30", "background": true}))
+        .await
+        .unwrap();
+    assert_eq!(background.running().len(), 1);
+    let output = tool.execute(json!({})).await.unwrap().content;
+    assert!(output.starts_with("1 background task(s) running:"));
     assert_eq!(
         tool.execute(json!({})).await.unwrap_err(),
         crate::agent::POLL_GUARD_ERROR
@@ -3677,44 +3715,44 @@ async fn subagent_poll_guard_escalates_on_unchanged_snapshot_and_resets_on_chang
         crate::agent::POLL_GUARD_SENTINEL
     );
 
-    // Turn hook: a fresh true turn resets even with the same snapshot.
-    tool.on_turn_start();
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap().content,
-        "No background tasks running."
-    );
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap_err(),
-        crate::agent::POLL_GUARD_ERROR
-    );
+    // An empty poll (task cancelled) clears the guard: repeated empty
+    // polls never escalate…
+    background.cancel(1);
+    let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+    for _ in 0..10 {
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap().content,
+            "No background tasks running."
+        );
+    }
 
-    // A new task is an ID-set change: back to a normal poll.
-    bash.execute(json!({"command": "echo hello; sleep 30", "background": true}))
+    // …and a later real snapshot starts counting fresh: 1st normal, 2nd
+    // POLL_ERROR — NOT the sentinel.
+    bash.execute(json!({"command": "echo again; sleep 30", "background": true}))
         .await
         .unwrap();
     assert_eq!(background.running().len(), 1);
     let output = tool.execute(json!({})).await.unwrap().content;
     assert!(
         output.starts_with("1 background task(s) running:"),
-        "snapshot change must reset to a normal poll: {output}"
+        "empty poll must reset the guard: {output}"
     );
     assert_eq!(
         tool.execute(json!({})).await.unwrap_err(),
         crate::agent::POLL_GUARD_ERROR
     );
 
-    // Cancelling is an ID-set change too: back to normal.
-    background.cancel(1);
-    let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap().content,
-        "No background tasks running."
-    );
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap_err(),
-        crate::agent::POLL_GUARD_ERROR
-    );
+    // Turn hook: a fresh true turn resets even with the same snapshot.
+    tool.on_turn_start();
+    let output = tool.execute(json!({})).await.unwrap().content;
+    assert!(output.starts_with("1 background task(s) running:"));
+
     // Different subagent instances own their tools: independent counts.
+    background.cancel(2);
+    let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+    bash.execute(json!({"command": "sleep 30", "background": true}))
+        .await
+        .unwrap();
     let tool_a = GetBackgroundTasks::new(
         background.clone(),
         None,
@@ -3725,18 +3763,14 @@ async fn subagent_poll_guard_escalates_on_unchanged_snapshot_and_resets_on_chang
         None,
         Some(SUBAGENT_POLL_GUARD_THRESHOLD),
     );
-    assert_eq!(
-        tool_a.execute(json!({})).await.unwrap().content,
-        "No background tasks running."
-    );
+    let output = tool_a.execute(json!({})).await.unwrap().content;
+    assert!(output.starts_with("1 background task(s) running:"));
     assert_eq!(
         tool_a.execute(json!({})).await.unwrap_err(),
         crate::agent::POLL_GUARD_ERROR
     );
-    assert_eq!(
-        tool_b.execute(json!({})).await.unwrap().content,
-        "No background tasks running."
-    );
+    let output = tool_b.execute(json!({})).await.unwrap().content;
+    assert!(output.starts_with("1 background task(s) running:"));
     assert_eq!(
         tool_a.execute(json!({})).await.unwrap_err(),
         crate::agent::POLL_GUARD_SENTINEL
@@ -3806,25 +3840,44 @@ async fn subagent_poll_guard_completion_resets_and_output_growth_does_not() {
 #[tokio::test]
 async fn main_poll_guard_escalates_1_2_normal_3_4_reminder_5_sentinel() {
     // The main-agent guard (5th-poll termination threshold): the 1st and
-    // 2nd unchanged-snapshot polls are normal, the 3rd and 4th return the
-    // model-facing POLL_ERROR, the 5th returns the internal termination
-    // sentinel (softer than the subagent 2/3 escalation). A snapshot
-    // change and the per-turn hook reset the count.
+    // 2nd unchanged-snapshot polls of a REAL task are normal, the 3rd and
+    // 4th return the model-facing POLL_ERROR, the 5th returns the internal
+    // termination sentinel (softer than the subagent 2/3 escalation).
+    // Empty snapshots never escalate, clear the guard, and the per-turn
+    // hook resets the count.
     let temp = tempfile::tempdir().unwrap();
     let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
     let background = bash.background.clone();
     let mut tool =
         GetBackgroundTasks::new(background.clone(), None, Some(MAIN_POLL_GUARD_THRESHOLD));
 
-    // Empty snapshot: 1st and 2nd normal, 3rd and 4th POLL_ERROR, 5th sentinel.
+    // Empty polls never escalate (10 polls, well past the threshold)…
+    for _ in 0..10 {
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap().content,
+            "No background tasks running."
+        );
+    }
+    // …and the per-turn hook leaves that untouched.
+    tool.on_turn_start();
     assert_eq!(
         tool.execute(json!({})).await.unwrap().content,
         "No background tasks running."
     );
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap().content,
-        "No background tasks running."
+
+    // A REAL task snapshot escalates: 1st and 2nd normal, 3rd and 4th
+    // POLL_ERROR, 5th sentinel.
+    bash.execute(json!({"command": "echo hello; sleep 30", "background": true}))
+        .await
+        .unwrap();
+    assert_eq!(background.running().len(), 1);
+    let output = tool.execute(json!({})).await.unwrap().content;
+    assert!(
+        output.starts_with("1 background task(s) running:"),
+        "first poll of a real snapshot is normal: {output}"
     );
+    let output = tool.execute(json!({})).await.unwrap().content;
+    assert!(output.starts_with("1 background task(s) running:"));
     assert_eq!(
         tool.execute(json!({})).await.unwrap_err(),
         crate::agent::POLL_GUARD_ERROR
@@ -3840,23 +3893,26 @@ async fn main_poll_guard_escalates_1_2_normal_3_4_reminder_5_sentinel() {
 
     // Turn hook: a fresh true turn resets even with the same snapshot.
     tool.on_turn_start();
+    let output = tool.execute(json!({})).await.unwrap().content;
+    assert!(output.starts_with("1 background task(s) running:"));
+
+    // Cancelling empties the snapshot: empty polls are normal again and
+    // clear the guard, so a later real snapshot starts counting fresh.
+    background.cancel(1);
+    let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
     assert_eq!(
         tool.execute(json!({})).await.unwrap().content,
         "No background tasks running."
     );
-
-    // A new task is an ID-set change: back to a normal poll.
-    bash.execute(json!({"command": "echo hello; sleep 30", "background": true}))
+    bash.execute(json!({"command": "echo fresh; sleep 30", "background": true}))
         .await
         .unwrap();
-    assert_eq!(background.running().len(), 1);
     let output = tool.execute(json!({})).await.unwrap().content;
     assert!(
         output.starts_with("1 background task(s) running:"),
-        "snapshot change must reset to a normal poll: {output}"
+        "empty poll must reset the guard: {output}"
     );
-
-    background.cancel(1);
+    background.cancel(2);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
 }
 

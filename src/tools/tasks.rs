@@ -31,13 +31,14 @@ pub(super) struct GetBackgroundTasks {
     /// agent (and any caller without a session id) passes `None`.
     pub(super) self_session_id: Option<String>,
     /// Unchanged-snapshot poll guard: `Some(threshold)` enables escalation —
-    /// consecutive `get_background_tasks` calls with an unchanged
+    /// consecutive `get_background_tasks` calls with an unchanged NON-EMPTY
     /// running-task snapshot within one turn return the model-facing
     /// [`crate::agent::POLL_GUARD_ERROR`] from the `threshold - 2` poll and
     /// the internal termination sentinel ([`crate::agent::POLL_GUARD_SENTINEL`])
     /// from the `threshold` poll onward; the batch loops map the sentinel to
     /// POLL_GUARD_ERROR content and use it to end the turn after the full
-    /// sibling batch. `None` disables the guard. Subagents use threshold 3
+    /// sibling batch. Empty snapshots never escalate and clear any guard
+    /// state. `None` disables the guard. Subagents use threshold 3
     /// (reminder on the 2nd poll), the main agent threshold 5 (reminder on
     /// the 3rd and 4th).
     pub(super) poll_guard: Option<u8>,
@@ -89,13 +90,25 @@ impl Tool for GetBackgroundTasks {
 
     async fn execute(&self, _arguments: Value) -> Result<ToolOutput, String> {
         let tasks = self.background.running();
+        // Empty snapshots never escalate: with no running tasks there is
+        // nothing to wait for, so repeated polls stay the plain "no tasks"
+        // output and never latch the reminder/sentinel. Any observed
+        // non-empty guard state is cleared so a later real snapshot starts
+        // counting fresh (an empty poll is also an ID-set change from any
+        // previous non-empty snapshot).
+        if tasks.is_empty() {
+            if self.poll_guard.is_some() {
+                *self.guard.lock().unwrap() = PollGuardState::default();
+            }
+            return Ok(ToolOutput::text("No background tasks running."));
+        }
         // Poll guard: escalate on the SORTED running-task ID snapshot. Any
         // ID-set change (new task, completion, cancellation) resets the
-        // count; output growth or task ordering never does. The empty
-        // snapshot escalates the same way, starting at the configured
-        // threshold: the `threshold - 2` poll (never before the second)
-        // returns the model-facing reminder, `threshold` and beyond the
-        // internal termination sentinel.
+        // count; output growth or task ordering never does. A repeated
+        // non-empty snapshot escalates at the configured threshold: the
+        // `threshold - 2` poll (never before the second) returns the
+        // model-facing reminder, `threshold` and beyond the internal
+        // termination sentinel.
         if let Some(threshold) = self.poll_guard {
             let mut ids: Vec<u64> = tasks.iter().map(|task| task.id).collect();
             ids.sort_unstable();
@@ -116,9 +129,6 @@ impl Tool for GetBackgroundTasks {
             if guard.count >= reminder_start {
                 return Err(crate::agent::POLL_GUARD_ERROR.to_owned());
             }
-        }
-        if tasks.is_empty() {
-            return Ok(ToolOutput::text("No background tasks running."));
         }
         let mut out = format!("{} background task(s) running:\n", tasks.len());
         for task in tasks.iter() {

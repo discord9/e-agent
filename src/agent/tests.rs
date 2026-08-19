@@ -685,10 +685,11 @@ async fn keeps_transcript_across_runs() {
 
 #[tokio::test]
 async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn() {
-    // Subagent toolset on a direct Agent::run: [poll x3, read_file] — the
-    // 3rd unchanged-snapshot poll fires the guard, but the turn ends only
-    // AFTER the full batch committed real ToolResults (no synthetic holes,
-    // no sentinel in history/UI). The next run resets the guard.
+    // Subagent toolset on a direct Agent::run: [background bash, poll x3,
+    // read_file] — the 3rd unchanged poll of the REAL task snapshot fires
+    // the guard, but the turn ends only AFTER the full batch committed
+    // real ToolResults (no synthetic holes, no sentinel in history/UI).
+    // The next run resets the guard.
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("x.txt"), "hello").unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
@@ -703,6 +704,7 @@ async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn
             AssistantMessage {
                 content: None,
                 tool_calls: vec![
+                    call("c0", "bash", r#"{"command":"sleep 60","background":true}"#),
                     call("c1", "get_background_tasks", "{}"),
                     call("c2", "get_background_tasks", "{}"),
                     call("c3", "get_background_tasks", "{}"),
@@ -712,7 +714,10 @@ async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn
             },
             AssistantMessage {
                 content: None,
-                tool_calls: vec![call("c5", "get_background_tasks", "{}")],
+                tool_calls: vec![
+                    call("c5", "cancel_background_task", r#"{"id":1}"#),
+                    call("c6", "get_background_tasks", "{}"),
+                ],
                 reasoning: None,
             },
             AssistantMessage {
@@ -740,13 +745,13 @@ async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn
             _ => None,
         })
         .collect();
-    assert_eq!(tools.len(), 4, "every sibling call has a Tool result");
+    assert_eq!(tools.len(), 5, "every sibling call has a Tool result");
     assert!(matches!(
-        tools[0],
+        tools[1],
         Message::Tool { call_id, content, is_error: false, synthetic: false, images, .. }
-            if call_id == "c1" && content == "No background tasks running." && images.is_empty()
+            if call_id == "c1" && content.starts_with("1 background task(s) running:") && images.is_empty()
     ));
-    for (idx, id) in [(1usize, "c2"), (2, "c3")] {
+    for (idx, id) in [(2usize, "c2"), (3, "c3")] {
         assert!(matches!(
             tools[idx],
             Message::Tool { call_id, content, is_error: true, synthetic: false, images, .. }
@@ -754,7 +759,7 @@ async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn
         ));
     }
     assert!(matches!(
-        tools[3],
+        tools[4],
         Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
             if call_id == "c4" && content == "hello"
     ));
@@ -777,7 +782,8 @@ async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn
     )));
 
     assert_eq!(agent.run("turn two".into()).await.unwrap(), "all done");
-    // The last committed Tool entry is c5's normal poll (guard reset).
+    // The active task is cancelled first; the following empty poll proves
+    // that cancellation resets the guard and bypasses escalation.
     let last_tool = agent.history().iter().rev().find_map(|entry| match entry {
         SessionEntry::Message {
             message: message @ Message::Tool { .. },
@@ -787,18 +793,19 @@ async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn
     assert!(matches!(
         last_tool,
         Some(Message::Tool { call_id, content, is_error: false, .. })
-            if call_id == "c5" && content == "No background tasks running."
+            if call_id == "c6" && content == "No background tasks running."
     ));
 }
 
 #[tokio::test]
 async fn poll_guard_main_builtins_carry_the_guard() {
-    // Main-agent builtins now carry the unchanged-snapshot poll guard with
-    // the softer 5th-poll threshold: in a [poll x5, read_file] batch the
-    // 1st and 2nd polls are normal, the 3rd and 4th return the
-    // model-facing POLL_ERROR, and the 5th returns the sentinel — the turn
-    // ends only AFTER the full sibling batch (no synthetic holes, no
-    // sentinel in history/UI), and the next run starts with a reset guard.
+    // Main-agent builtins carry the unchanged-snapshot poll guard with the
+    // softer 5th-poll threshold on REAL task snapshots: in a [background
+    // bash, poll x5, read_file] batch the 1st and 2nd polls are normal,
+    // the 3rd and 4th return the model-facing POLL_ERROR, and the 5th
+    // returns the sentinel — the turn ends only AFTER the full sibling
+    // batch (no synthetic holes, no sentinel in history/UI), and the next
+    // run starts with a reset guard.
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("x.txt"), "hello").unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
@@ -811,6 +818,7 @@ async fn poll_guard_main_builtins_carry_the_guard() {
             AssistantMessage {
                 content: None,
                 tool_calls: vec![
+                    call("c0", "bash", r#"{"command":"sleep 60","background":true}"#),
                     call("c1", "get_background_tasks", "{}"),
                     call("c2", "get_background_tasks", "{}"),
                     call("c3", "get_background_tasks", "{}"),
@@ -822,7 +830,10 @@ async fn poll_guard_main_builtins_carry_the_guard() {
             },
             AssistantMessage {
                 content: None,
-                tool_calls: vec![call("c7", "get_background_tasks", "{}")],
+                tool_calls: vec![
+                    call("c7", "cancel_background_task", r#"{"id":1}"#),
+                    call("c8", "get_background_tasks", "{}"),
+                ],
                 reasoning: None,
             },
             AssistantMessage {
@@ -850,15 +861,15 @@ async fn poll_guard_main_builtins_carry_the_guard() {
             _ => None,
         })
         .collect();
-    assert_eq!(tools.len(), 6, "every sibling call has a Tool result");
-    for (idx, id) in [(0usize, "c1"), (1, "c2")] {
+    assert_eq!(tools.len(), 7, "every sibling call has a Tool result");
+    for (idx, id) in [(1usize, "c1"), (2, "c2")] {
         assert!(matches!(
             tools[idx],
             Message::Tool { call_id, content, is_error: false, synthetic: false, images, .. }
-                if call_id == id && content == "No background tasks running." && images.is_empty()
+                if call_id == id && content.starts_with("1 background task(s) running:") && images.is_empty()
         ));
     }
-    for (idx, id) in [(2usize, "c3"), (3, "c4"), (4, "c5")] {
+    for (idx, id) in [(3usize, "c3"), (4, "c4"), (5, "c5")] {
         assert!(matches!(
             tools[idx],
             Message::Tool { call_id, content, is_error: true, synthetic: false, images, .. }
@@ -866,7 +877,7 @@ async fn poll_guard_main_builtins_carry_the_guard() {
         ));
     }
     assert!(matches!(
-        tools[5],
+        tools[6],
         Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
             if call_id == "c6" && content == "hello"
     ));
@@ -887,7 +898,8 @@ async fn poll_guard_main_builtins_carry_the_guard() {
         AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE
     )));
 
-    // Next run: guard reset — c7's first poll is normal again.
+    // The active task is cancelled first; c8 is then an empty poll, proving
+    // the guard reset and empty snapshots bypass escalation.
     assert_eq!(agent.run("turn two".into()).await.unwrap(), "all done");
     let last_tool = agent.history().iter().rev().find_map(|entry| match entry {
         SessionEntry::Message {
@@ -898,7 +910,7 @@ async fn poll_guard_main_builtins_carry_the_guard() {
     assert!(matches!(
         last_tool,
         Some(Message::Tool { call_id, content, is_error: false, .. })
-            if call_id == "c7" && content == "No background tasks running."
+            if call_id == "c8" && content == "No background tasks running."
     ));
 }
 
