@@ -590,7 +590,9 @@ On Linux/macOS every `bash` call—main agent and subagents alike—is wrapped i
 `bwrap`: system directories are mounted read-only, the workspace is mounted
 read-write (`workspace_writable = false` makes it read-only), `/tmp` and `/home`
 are fresh tmpfs, PID/IPC/UTS namespaces are unshared, and TIOCSTI is blocked via
-`--new-session`. Network stays available by default; `network = false` unshares
+`--new-session`. Main-agent Bash gets a fresh writable private `/tmp`; delegated
+subagent Bash gets an empty private read-only `/tmp`, so cross-command artifacts
+belong in the workspace. Network stays available by default; `network = false` unshares
 it. When the host uses systemd-resolved, the stub resolver at
 `/run/systemd/resolve` is mounted read-only so DNS resolution via the symlinked
 `/etc/resolv.conf` works inside the sandbox. The restriction constrains the

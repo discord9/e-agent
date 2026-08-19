@@ -160,6 +160,7 @@ pub fn builtins_with_background(
         read_only,
         bash_timeout,
         self_session_id,
+        true,
         // Subagents: enable the unchanged-snapshot poll guard on
         // get_background_tasks with a 3rd-poll termination threshold (each
         // subagent instance owns its tools, so guards are independent per
@@ -189,6 +190,7 @@ fn builtins_with_exa_key(
         bash_timeout,
         // The main agent has no own session id to annotate.
         None,
+        false,
         // Main builtins carry the unchanged-snapshot poll guard with a
         // 5th-poll termination threshold: the 3rd and 4th consecutive
         // unchanged polls return the reminder, the 5th ends the turn
@@ -227,6 +229,7 @@ fn tools_with_background_and_exa_key(
     read_only: bool,
     bash_timeout: Option<Duration>,
     self_session_id: Option<String>,
+    tmp_read_only: bool,
     poll_guard: Option<u8>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools = if read_only {
@@ -264,6 +267,7 @@ fn tools_with_background_and_exa_key(
             // bash 后台任务在共享 registry 里标注真正的发起者。GetBackgroundTasks
             // 后面还要用 self_session_id，这里 clone。
             self_session_id.clone(),
+            tmp_read_only,
         )
     {
         tools.push(tool);

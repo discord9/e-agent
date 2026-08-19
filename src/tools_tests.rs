@@ -1081,6 +1081,7 @@ async fn bash_timeout_kills_its_background_process_group() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     assert!(
         tool.execute(json!({"command": "sleep 30 & echo $! > child.pid; wait"}))
@@ -1114,6 +1115,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     let plain_desc = plain.spec().description;
     #[cfg(windows)]
@@ -1142,6 +1144,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     let desc = sandboxed.spec().description;
     #[cfg(windows)]
@@ -1193,6 +1196,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     let desc_ro = sandboxed_ro.spec().description;
     #[cfg(windows)]
@@ -1227,6 +1231,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     let desc_main = sandboxed_main.spec().description;
     assert!(
@@ -1432,6 +1437,7 @@ async fn background_bash_uses_the_facade_sandbox_not_the_registry_one() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     bash.set_event_sender(sender.clone());
     bash.background.set_event_sender(sender);
@@ -1470,6 +1476,7 @@ fn background_bash(
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     bash.set_event_sender(sender.clone());
     // This helper also exercises BackgroundTasks directly in a few tests.
@@ -1507,6 +1514,7 @@ async fn sandbox_allows_workspace_writes_but_not_outside() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     // Writing inside the workspace succeeds.
     tool.execute(json!({"command": "echo hi > inside.txt"}))
@@ -1575,6 +1583,7 @@ async fn sandbox_mounts_configured_dests_at_their_configured_paths() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     // The configured readable dest is visible inside the sandbox with the
     // canonical source's content, and it is read-only.
@@ -1621,6 +1630,7 @@ async fn sandbox_can_disable_network() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     // No loopback either in a fresh net namespace: connecting anywhere fails.
     let result = tool
@@ -1685,6 +1695,7 @@ async fn sandbox_read_only_workspace_rejects_bash_and_file_tool_writes() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     assert!(
         tool.execute(json!({"command": "touch bash-file"}))
@@ -1832,6 +1843,7 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     assert!(
         read_only
@@ -1853,6 +1865,7 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     writable
         .execute(json!({"command": "touch workspace-wins"}))
@@ -1881,6 +1894,7 @@ async fn sandbox_read_only_workspace_allows_explicit_writable_child() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     tool.execute(json!({"command": "touch child/allowed"}))
         .await
@@ -1923,6 +1937,7 @@ async fn sandbox_reroot_keeps_startup_policy_anchor_read_only() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     assert!(
         tool.execute(json!({"command": "echo no > ../.e-agent/config.toml"}))
@@ -1952,6 +1967,7 @@ async fn sandbox_missing_policy_cannot_be_created_through_writable_e_agent_child
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     assert!(
         tool.execute(json!({"command": "touch .e-agent/config.toml"}))
@@ -1974,6 +1990,7 @@ fn policy_bash(workspace: Workspace, sandbox: crate::config::Sandbox) -> Bash {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     }
 }
 
@@ -2482,6 +2499,7 @@ async fn sandbox_policy_anchor_rerooted_worktree_git_stays_read_only() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     // Reading git metadata works (git commands read it).
     let out = tool
@@ -2542,6 +2560,7 @@ async fn sandbox_policy_anchor_rerooted_worktree_git_pointer_stays_read_only() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     let out = tool
         .execute(json!({"command": "cat .git"}))
@@ -2600,6 +2619,7 @@ async fn sandbox_policy_anchor_rerooted_worktree_git_read_only_background_bash()
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     bash.set_event_sender(sender);
     let start = bash
@@ -2839,6 +2859,7 @@ async fn sandbox_ro_parent_allows_rw_child_override() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     tool.execute(json!({"command": format!("touch '{}/yes'", child.display())}))
         .await
@@ -2876,6 +2897,7 @@ async fn sandbox_extra_writable_and_readable_paths() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     let cache_path = cache.path().to_string_lossy().into_owned();
     let data_path = data.path().to_string_lossy().into_owned();
@@ -2920,6 +2942,7 @@ async fn sandbox_protects_workspace_git_directory() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     // Reading .git/HEAD must succeed (git commands read metadata).
     let out = tool
@@ -2963,6 +2986,7 @@ async fn sandbox_protects_workspace_git_file_linked_worktree() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     // Reading the .git pointer must succeed.
     let out = tool
@@ -3004,6 +3028,7 @@ async fn sandbox_mounts_systemd_resolve_when_present() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     // Check whether /run/systemd/resolve exists on this host.
     let host_has_resolve = std::path::Path::new("/run/systemd/resolve").exists();
@@ -3054,6 +3079,7 @@ async fn sandbox_cat_etc_resolv_conf_works() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     // /etc/resolv.conf is always mounted (--ro-bind-try). Its contents
     // depend on the host config; we just check it is readable.
@@ -3092,6 +3118,7 @@ async fn sandbox_dns_resolution_live_smoke() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     // Live DNS resolution: this is a network-dependent smoke test.
     // Skip if /run/systemd/resolve does not exist on the host (no
@@ -3304,6 +3331,7 @@ async fn background_without_timeout_runs_to_completion() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     bash.set_event_sender(sender.clone());
     bash.background.set_event_sender(sender);
@@ -4142,6 +4170,7 @@ async fn sandbox_does_not_protect_git_when_protect_git_is_false() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     // Writing to .git/HEAD must succeed (main agent orchestrates git).
     let write = tool
@@ -4186,6 +4215,7 @@ async fn sandbox_does_not_protect_git_file_when_protect_git_is_false() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     // Overwriting the .git pointer must succeed.
     let write = tool
@@ -4225,6 +4255,7 @@ async fn background_bash_inherits_protect_git_from_parent_bash() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     bash.set_event_sender(sender);
 
@@ -4263,6 +4294,7 @@ async fn shared_registry_clone_drop_does_not_kill_another_bash_origin() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     bash.set_event_sender(origin_tx);
     // Dropping an unrelated facade must not tear down the shared registry.
@@ -4292,6 +4324,7 @@ async fn shared_bash_facades_keep_completions_at_their_origins() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     let mut second = Bash {
         workspace,
@@ -4302,6 +4335,7 @@ async fn shared_bash_facades_keep_completions_at_their_origins() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     };
     first.set_event_sender(first_tx);
     second.set_event_sender(second_tx);
@@ -4823,6 +4857,7 @@ fn ancestor_bash(workspace_dir: &std::path::Path, sandbox: crate::config::Sandbo
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
+        tmp_read_only: false,
     }
 }
 
@@ -5576,4 +5611,126 @@ fn ancestor_guard_skips_tmp_scratch_and_policy_paths_untouched() {
         "/tmp scratch workspaces must gain no guard bind and no guard lock: {args:?}"
     );
     std::fs::remove_dir_all(&scratch).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn common_construction_owner_attribution_does_not_select_tmp_policy() {
+    let Some(policy) = sandbox() else {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let tools = super::tools_with_background_and_exa_key(
+        workspace,
+        BackgroundTasks::new(None, Some(policy.clone())),
+        None,
+        Some(policy),
+        false,
+        false,
+        None,
+        Some("owner-only".into()),
+        false,
+        None,
+    );
+    let bash = tools
+        .into_iter()
+        .find(|tool| tool.spec().name == "bash")
+        .unwrap();
+    let output = bash
+        .execute(json!({"command": "touch /tmp/e-agent-owner-attribution-tmp-test"}))
+        .await
+        .unwrap();
+    assert!(output.content.contains("exit code: 0"), "{output:?}");
+    assert!(!std::path::Path::new("/tmp/e-agent-owner-attribution-tmp-test").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn sandbox_tmp_policy_plan_differs_only_for_subagents() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let policy = sandbox().unwrap_or(crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        writable_paths: Vec::new(),
+        readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
+    });
+    let root = workspace.root().to_string_lossy().into_owned();
+    let main =
+        super::bash::build_bwrap_plan(&workspace, &policy, false, true, &root, None).unwrap();
+    let sub = super::bash::build_bwrap_plan_with_tmp_policy(
+        &workspace, &policy, true, true, &root, None, true,
+    )
+    .unwrap();
+    let main_args: Vec<String> = main
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into())
+        .collect();
+    let sub_args: Vec<String> = sub
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into())
+        .collect();
+    assert!(sub_args.windows(2).any(|pair| pair == ["--tmpfs", "/tmp"]));
+    assert!(
+        sub_args
+            .windows(2)
+            .any(|pair| pair == ["--remount-ro", "/tmp"])
+    );
+    assert!(
+        !main_args
+            .windows(2)
+            .any(|pair| pair == ["--remount-ro", "/tmp"])
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sandbox_facade_tmp_is_writable_for_main_and_read_only_for_subagent() {
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let policy = sandbox().unwrap();
+    let main_path = "/tmp/e-agent-main-tmp-test";
+    let sub_path = "/tmp/e-agent-subagent-tmp-test";
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_file(sub_path);
+    let make = |tmp_read_only| Bash {
+        workspace: workspace.clone(),
+        timeout: Some(Duration::from_secs(10)),
+        sender: None,
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), Some(policy.clone())),
+        sandbox: Some(policy.clone()),
+        protect_git: false,
+        shell: Shell::detect().unwrap(),
+        owner_session: None,
+        tmp_read_only,
+    };
+    let main = make(false);
+    let output = main
+        .execute(json!({"command": format!("touch {main_path}")}))
+        .await
+        .unwrap();
+    assert!(output.content.contains("exit code: 0"), "{output:?}");
+    assert!(!std::path::Path::new(main_path).exists());
+    let sub = make(true);
+    let output = sub
+        .execute(json!({"command": format!("mkdir {sub_path} 2>&1")}))
+        .await
+        .unwrap_err();
+    let output = ToolOutput::text(output);
+    assert!(
+        output.content.contains("exit code:") || output.content.contains("Read-only file system"),
+        "{output:?}"
+    );
+    assert!(!std::path::Path::new(sub_path).exists());
 }
