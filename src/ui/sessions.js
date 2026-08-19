@@ -120,6 +120,8 @@ function pollSessions() {
    （afterPollRound）——各 workspace 响应不再各自全量重建树。 */
 async function pollWorkspaceSessions(ws) {
   if (!workspaceToken(ws)) return;   // 全局 token 也未配置：跳过（不显示错误）
+  if (!state.workspaceListPending) state.workspaceListPending = {};
+  state.workspaceListPending[ws.id] = true;
   let list = null;
   let err = null;
   try {
@@ -176,6 +178,7 @@ async function pollWorkspaceSessions(ws) {
     if (state.workspaceLists[ws.id] === undefined) state.workspaceLists[ws.id] = [];
     state.workspaceErrors[ws.id] = err;   // 保留旧列表（stale），标记错误
   }
+  state.workspaceListPending[ws.id] = false;
   if (ws === state.workspace) {
     // 激活 workspace 的列表缓存 → lastList（既有单服务器路径的唯一数据源）；
     // 渲染/深链/校验统一由 pollAllWorkspaces 整轮完成后执行（afterPollRound）
@@ -199,11 +202,41 @@ function maybeHandleDeepLink() {
   const target = state.deepLink.pending;
   const ws = state.workspace;
   if (!ws) return;
+  const listFresh = state.workspaceErrors[ws.id] === null;
+  const listPending = state.workspaceListPending && state.workspaceListPending[ws.id];
+  // A history 404 that raced the first list response is not proof that the
+  // session is gone. Leave the URL pending until that first fresh result
+  // classifies it through the normal active/resume paths.
+  if (state.deepLink.waitingForList) {
+    if (listPending || !listFresh) return;     // failed/stale list: retry later
+    state.deepLink.waitingForList = false;
+    const listed = (state.lastList || []).find((s) => s.id === target);
+    if (listed) {
+      state.deepLink.handled = true;
+      state.deepLink.pending = null;
+      if (listed.active === false) {
+        const claimed = ++sessionOpenEpoch;
+        state.deepLink.probing = true;
+        state.deepLink.attemptEpoch = claimed;
+        resumeSession(ws.id, target, claimed, DEEP_LINK_HISTORY_TIMEOUT_MS);
+      } else {
+        // The probe already initialized this session and its history returned
+        // 404.  Fresh active evidence is authoritative: enter the existing
+        // live SSE/snapshot path without issuing history a second time.
+        openWith(target, false, undefined, ws.id, sessionOpenEpoch);
+      }
+    } else {
+      state.deepLink.handled = true;
+      state.deepLink.pending = null;
+      setBanner("⚠ 会话不存在或已被删除。");
+    }
+    return;
+  }
   const hit = (state.lastList || []).find((s) => s.id === target);
   // 只有成功轮询过的列表（workspaceErrors === null）才算 fresh 命中；
   // stale/失败/过期缓存里的命中不可信 → 落到 probe 路径（列表缺失不是
   // 权威不存在）。
-  if (hit && state.workspaceErrors[ws.id] === null) {
+  if (hit && listFresh) {
     state.deepLink.handled = true;
     state.deepLink.pending = null;
     if (hit.active === false) {
@@ -396,7 +429,24 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     // （陈旧响应绝不渲染到新激活的服务器/会话，也不起 SSE）。
     if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== id) return "stale";
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return "auth"; }
-    if (res.status === 404) { setBanner("⚠ 会话不存在或已被删除。"); return "gone"; }
+    if (res.status === 404) {
+      // During the initial deep-link race, history can answer before the
+      // current workspace's first session list. A 404 is not authoritative
+      // until that list has classified the session.
+      if (state.deepLink.waitingForList && state.deepLink.pending === id) {
+        return "pending";
+      }
+      if (state.deepLink.probing && state.deepLink.attemptEpoch === epoch
+          && state.workspaceErrors[wsId] !== null) {
+        state.deepLink.probing = false;
+        state.deepLink.attemptEpoch = -1;
+        state.deepLink.pending = id;
+        state.deepLink.handled = false;
+        state.deepLink.waitingForList = true;
+        return "pending";
+      }
+      setBanner("⚠ 会话不存在或已被删除。"); return "gone";
+    }
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== id) return "stale";
@@ -530,8 +580,13 @@ function openWith(id, withHistory, onReady, wsId, epoch, timeoutMs) {
     if (state.sessionId !== id) return;           // 已切换会话：丢弃过期回调
     fetchSessionUsage(id, wsId, epoch);           // 拉持久化累计用量（重启后仍有数）
     if (r === "auth" || r === "gone") {
-      // 深链 attempt 终止（无流可恢复）：清标记，防止残留标记污染后续
-      // 非深链会话的 SSE 404 分类（标记与 epoch 绑定，此处显式清更稳）
+      state.deepLink.probing = false;
+      state.deepLink.attemptEpoch = -1;
+      return;
+    }
+    if (r === "pending") {
+      // History 404 raced the first list; the list completion will choose
+      // the active live path or the inactive resume path.
       state.deepLink.probing = false;
       state.deepLink.attemptEpoch = -1;
       return;

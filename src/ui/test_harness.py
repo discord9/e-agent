@@ -456,6 +456,8 @@ let sessionsBFormat = false;
 // 直连刚结束的 subagent」时列表刷新未完成（旧缓存仍 active:true）
 let sessionsDelayed = false;
 let sessionsResolve = null;
+// refresh deep-link race: history 404 arrives before the first list result
+let refreshDeepLinkHistory = null;
 let bGetDelayed = false;
 let bGetResolve = null;
 let sessionsBCreateFail = false;
@@ -524,6 +526,10 @@ globalThis.fetch=(url,opts={})=>{
       if (_mOk && sseOkIds.has(_mOk[1])) return resp(200, streamEmpty(), signal);
       // 深链测试：history 响应覆盖（404/401/网络失败/hang 超时/delay 迟到）
       const _mHist = /^\/api\/sessions\/([^/]+)\/history/.exec(url);
+      if (_mHist && refreshDeepLinkHistory && _mHist[1] === "refresh-race") {
+        if (refreshDeepLinkHistory-- > 0) return resp(404, {}, signal);
+        return resp(200, {entries: [], next_before_seq: null}, signal);
+      }
       if (_mHist && historyOverrides.has(_mHist[1])) {
         const o = historyOverrides.get(_mHist[1]);
         if (o.netfail) return Promise.reject(new TypeError("network error"));
@@ -688,6 +694,68 @@ async function main(){
         FETCH_OPTS.filter((f) => !f.url.endsWith("/events"))
           .every((f) => f.cache === "no-store"),
         "caches=" + JSON.stringify([...new Set(FETCH_OPTS.map((f) => f.cache))]));
+
+    if (MODE === 'refresh-deep-link') {
+      const refreshReset = (list, failure) => {
+        sessionsData = list;
+        sessionsAListFailure = failure || null;
+        sessionsDelayed = false;
+        sessionsResolve = null;
+        refreshDeepLinkHistory = null;
+        state.workspace = state.workspaces[0];
+        state.workspaceLists = {};
+        state.workspaceErrors = {};
+        state.workspaceListPending = {};
+        state.lastList = [];
+        state.sessionId = null;
+        state.deepLink = {pending: "refresh-race", handled: false, probing: false,
+          attemptEpoch: -1, waitingForList: false};
+        elsById["banner"].hidden = true;
+        elsById["bannerText"].textContent = "";
+        location.search = "?session=refresh-race";
+      };
+      // Every history request returns 404 while the initial list is delayed.
+      refreshReset([{id:"refresh-race", status:"Busy", active:true}], null);
+      sessionsDelayed = true;
+      refreshDeepLinkHistory = 99;
+      sseOkIds.add("refresh-race");
+      init();
+      await flush();
+      chk("refresh deep link 404 stays pending before list",
+          state.deepLink.pending === "refresh-race"
+          && !elsById["bannerText"].textContent.includes("不存在"),
+          "pending=" + state.deepLink.pending);
+      sessionsResolve(resp(200, sessionsData));
+      await flush(); await flush(); await flush(); await flush(); await flush();
+      const _raceHistory = FETCHES.filter((u) => u.includes("/api/sessions/refresh-race/history")).length;
+      const _raceEvents = FETCHES.filter((u) => u === "/api/sessions/refresh-race/events").length;
+      chk("refresh deep link fresh active list opens SSE automatically",
+          state.sessionId === "refresh-race"
+          && _raceHistory === 1
+          && _raceEvents === 1
+          && FETCHES.indexOf("/api/sessions/refresh-race/events") > FETCHES.findIndex((u) => u.includes("/api/sessions/refresh-race/history"))
+          && !elsById["bannerText"].textContent.includes("不存在"),
+          "history=" + _raceHistory + " events=" + _raceEvents);
+      sseOkIds.delete("refresh-race");
+      // A fresh successful list that omits the target is authoritative.
+      refreshReset([], null);
+      refreshDeepLinkHistory = 1;
+      await pollSessions(); await flush(); await flush();
+      chk("refresh deep link fresh absence shows gone",
+          state.deepLink.pending === null
+          && elsById["bannerText"].textContent.includes("不存在"));
+      // A failed list remains retryable and must not classify the target gone.
+      refreshReset([], "http500");
+      refreshDeepLinkHistory = 1;
+      sessionsDelayed = true;
+      init();
+      await flush(); await flush();
+      chk("refresh deep link list failure stays pending",
+          state.deepLink.pending === "refresh-race"
+          && !elsById["bannerText"].textContent.includes("不存在"));
+      console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
+      imports.system.exit(0);
+    }
 
     if (MODE === 'direct') {
       state.sessionId = "s1";   // loadHistory 现在按 (wsId, sid, epoch) 三重校验发起上下文
@@ -7583,7 +7651,8 @@ async function main(){
 main();
 '''.replace('MODE === \'direct\'', 'true' if MODE == 'direct' else 'false') \
    .replace("MODE === 'header'", 'true' if MODE == 'header' else 'false') \
-   .replace("MODE === 'composer-history'", 'true' if MODE == 'composer-history' else 'false')
+   .replace("MODE === 'composer-history'", 'true' if MODE == 'composer-history' else 'false') \
+   .replace("MODE === 'refresh-deep-link'", 'true' if MODE == 'refresh-deep-link' else 'false')
 
 # DEEP_LINK env → location.search 注入（init() 启动时 URL 解析入口）
 HARNESS = HARNESS.replace('__DEEP_LINK_SEARCH__', ('?session=' + DEEP_LINK) if DEEP_LINK else '')
