@@ -61,7 +61,7 @@ use crate::agent::{AgentEvent, Message, Model, SessionEntry, preview};
 use crate::delegate::Sessions;
 use crate::runner::{IdlePolicy, SessionHandle, SessionStatus, SessionTask};
 use crate::session_factory::{SessionBuild, SessionFactory, UnfinishedPolicy};
-use crate::session_store::{FinishedTask, SessionStore};
+use crate::session_store::{FinishedTask, ListMetaDiagnostics, SessionStore};
 use crate::tools::{BackgroundTaskInfo, BackgroundTasks};
 
 /// Heartbeat interval for SSE connections (comment line `: ping`).
@@ -1174,6 +1174,7 @@ struct ListSessionsTiming {
     child_scan_ms: u128,
     merge_ms: u128,
     total_ms: u128,
+    list_meta_diagnostics: Option<ListMetaDiagnostics>,
 }
 
 /// Build the slow-request log line, or `None` when the request was fast
@@ -1191,7 +1192,7 @@ fn list_sessions_slow_log(
         return None;
     }
     Some(format!(
-        "e-agent: GET /api/sessions {}: total={}ms live={}ms list_meta={}ms labels={}ms child_scan={}ms merge={}ms counts(live={} historical={} merged={} subagent_labels={})",
+        "e-agent: GET /api/sessions {}: total={}ms live={}ms list_meta={}ms labels={}ms child_scan={}ms merge={}ms counts(live={} historical={} merged={} subagent_labels={}){}",
         if degraded { "degraded" } else { "slow" },
         timing.total_ms,
         timing.live_ms,
@@ -1203,6 +1204,11 @@ fn list_sessions_slow_log(
         historical,
         merged,
         subagent_labels,
+        timing
+            .list_meta_diagnostics
+            .as_ref()
+            .map(|d| format!(" {}", d.format_for_log()))
+            .unwrap_or_default(),
     ))
 }
 
@@ -1227,8 +1233,11 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
     let phase_start = std::time::Instant::now();
     // Historical sessions from the metadata table (Greptime/SQLite audit
     // table; JSONL `.meta.jsonl` sidecars).
-    let historical = match state.meta_store.list_meta(root).await {
-        Ok(list) => list,
+    let historical = match state.meta_store.list_meta_with_diagnostics(root).await {
+        Ok((list, diagnostics)) => {
+            timing.list_meta_diagnostics = Some(diagnostics);
+            list
+        }
         Err(error) => {
             eprintln!("e-agent: cannot list session metadata: {error:#}");
             degraded = true;
@@ -3490,6 +3499,72 @@ mod tests {
         let message =
             list_sessions_slow_log(ListSessionsTiming::default(), true, 0, 0, 0, 0).unwrap();
         assert!(message.starts_with("e-agent: GET /api/sessions degraded:"));
+    }
+
+    #[test]
+    fn list_meta_diagnostics_format_contains_only_safe_backend_fields() {
+        let greptime = ListMetaDiagnostics {
+            backend: "greptime",
+            facade_lock_wait_ms: 11,
+            backend_operation_ms: 22,
+            query_ms: 33,
+            row_decode_ms: 44,
+            logical_rows: 55,
+            ..Default::default()
+        };
+        assert_eq!(
+            greptime.format_for_log(),
+            "backend=greptime facade_lock_wait=11ms backend_op=22ms query=33ms decode=44ms rows=55"
+        );
+
+        let sqlite = ListMetaDiagnostics {
+            backend: "sqlite",
+            facade_lock_wait_ms: 1,
+            connection_lock_wait_ms: 2,
+            backend_operation_ms: 3,
+            query_iteration_ms: 4,
+            row_decode_ms: 5,
+            logical_rows: 6,
+            ..Default::default()
+        };
+        assert_eq!(
+            sqlite.format_for_log(),
+            "backend=sqlite facade_lock_wait=1ms conn_lock_wait=2ms backend_op=3ms query_iter=4ms decode=5ms rows=6"
+        );
+
+        let jsonl = ListMetaDiagnostics {
+            backend: "jsonl",
+            backend_operation_ms: 7,
+            filesystem_parse_ms: 8,
+            sidecars_seen: 9,
+            sidecars_opened: 10,
+            logical_rows: 11,
+            ..Default::default()
+        };
+        assert_eq!(
+            jsonl.format_for_log(),
+            "backend=jsonl facade_lock_wait=0ms backend_op=7ms fs_parse=8ms sidecars(seen=9 opened=10) rows=11"
+        );
+    }
+
+    #[test]
+    fn list_sessions_slow_log_includes_backend_diagnostics() {
+        let timing = ListSessionsTiming {
+            total_ms: LIST_SESSIONS_SLOW_THRESHOLD.as_millis(),
+            list_meta_diagnostics: Some(ListMetaDiagnostics {
+                backend: "sqlite",
+                connection_lock_wait_ms: 12,
+                logical_rows: 34,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let message = list_sessions_slow_log(timing, false, 0, 34, 34, 0).unwrap();
+        assert!(message.contains("backend=sqlite"));
+        assert!(message.contains("conn_lock_wait=12ms"));
+        assert!(message.contains("rows=34"));
+        assert!(!message.contains("session_id"));
+        assert!(!message.contains("SELECT"));
     }
 
     #[test]

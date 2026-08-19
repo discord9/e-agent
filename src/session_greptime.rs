@@ -2138,6 +2138,13 @@ impl GreptimeSession {
     /// `last_active_at` per session (explicit GROUP BY + JOIN — correct
     /// whether or not the engine auto-dedups same-PK rows at read time).
     pub async fn list_meta(&self) -> Result<Vec<SessionMeta>> {
+        Ok(self.list_meta_diagnostic().await?.0)
+    }
+
+    pub async fn list_meta_diagnostic(
+        &self,
+    ) -> Result<(Vec<SessionMeta>, crate::session_store::ListMetaDiagnostics)> {
+        let query_started = std::time::Instant::now();
         let rows = self
             .client
             .query(
@@ -2156,7 +2163,9 @@ impl GreptimeSession {
             )
             .await
             .context("cannot list session metadata")?;
-        Ok(rows
+        let query_ms = query_started.elapsed().as_millis();
+        let decode_started = std::time::Instant::now();
+        let out = rows
             .iter()
             .map(|row| SessionMeta {
                 session_id: row.get("session_id"),
@@ -2173,7 +2182,18 @@ impl GreptimeSession {
                 writer: row.get("writer"),
                 label: None, // label lives in running_tasks, resolved at list time
             })
-            .collect())
+            .collect::<Vec<_>>();
+        let decode_ms = decode_started.elapsed().as_millis();
+        Ok((
+            out.clone(),
+            crate::session_store::ListMetaDiagnostics {
+                backend: "greptime",
+                query_ms,
+                row_decode_ms: decode_ms,
+                logical_rows: out.len(),
+                ..Default::default()
+            },
+        ))
     }
 
     /// The full lifecycle trace of one session: every snapshot row, oldest

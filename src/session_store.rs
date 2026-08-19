@@ -32,6 +32,56 @@ use std::io::{BufRead, Write};
 use crate::config::SessionBackend;
 use crate::session::{LoadedSession, Session};
 
+/// Safe, bounded timing information for one metadata listing. This contains
+/// only backend names, durations, and row/file counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListMetaDiagnostics {
+    pub backend: &'static str,
+    pub facade_lock_wait_ms: u128,
+    pub backend_operation_ms: u128,
+    pub query_ms: u128,
+    pub row_decode_ms: u128,
+    pub logical_rows: usize,
+    pub connection_lock_wait_ms: u128,
+    pub query_iteration_ms: u128,
+    pub sidecars_seen: usize,
+    pub sidecars_opened: usize,
+    pub filesystem_parse_ms: u128,
+}
+
+impl ListMetaDiagnostics {
+    pub fn format_for_log(&self) -> String {
+        match self.backend {
+            "greptime" => format!(
+                "backend=greptime facade_lock_wait={}ms backend_op={}ms query={}ms decode={}ms rows={}",
+                self.facade_lock_wait_ms,
+                self.backend_operation_ms,
+                self.query_ms,
+                self.row_decode_ms,
+                self.logical_rows,
+            ),
+            "sqlite" => format!(
+                "backend=sqlite facade_lock_wait={}ms conn_lock_wait={}ms backend_op={}ms query_iter={}ms decode={}ms rows={}",
+                self.facade_lock_wait_ms,
+                self.connection_lock_wait_ms,
+                self.backend_operation_ms,
+                self.query_iteration_ms,
+                self.row_decode_ms,
+                self.logical_rows,
+            ),
+            _ => format!(
+                "backend=jsonl facade_lock_wait={}ms backend_op={}ms fs_parse={}ms sidecars(seen={} opened={}) rows={}",
+                self.facade_lock_wait_ms,
+                self.backend_operation_ms,
+                self.filesystem_parse_ms,
+                self.sidecars_seen,
+                self.sidecars_opened,
+                self.logical_rows,
+            ),
+        }
+    }
+}
+
 /// Sentinel session id for a workspace-scoped metadata store: only the
 /// `workspace_id` bound at connect time is used by `list_meta` /
 /// `backfill_sessions`; `delete_meta` takes its target explicitly, so the
@@ -1766,6 +1816,43 @@ impl SessionStore {
         }
     }
 
+    /// List metadata and collect backend timings for the server's slow-path
+    /// diagnostic. The ordinary `list_meta` API above remains data-only.
+    pub async fn list_meta_with_diagnostics(
+        &self,
+        root: &Path,
+    ) -> Result<(Vec<SessionMeta>, ListMetaDiagnostics)> {
+        match self {
+            SessionStore::Jsonl => {
+                let started = std::time::Instant::now();
+                let (rows, mut diagnostic) = jsonl_list_meta_diagnostic(root)?;
+                diagnostic.backend_operation_ms = started.elapsed().as_millis();
+                Ok((rows, diagnostic))
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                let operation_started = std::time::Instant::now();
+                let (rows, mut diagnostic) = session.list_meta_diagnostic().await?;
+                diagnostic.backend_operation_ms = operation_started.elapsed().as_millis();
+                Ok((rows, diagnostic))
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => {
+                let started = std::time::Instant::now();
+                let guard = session.lock().await;
+                let wait_ms = started.elapsed().as_millis();
+                let operation_started = std::time::Instant::now();
+                let (rows, mut diagnostic) = guard
+                    .list_meta_diagnostic()
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                diagnostic.facade_lock_wait_ms = wait_ms;
+                diagnostic.backend_operation_ms = operation_started.elapsed().as_millis();
+                Ok((rows, diagnostic))
+            }
+        }
+    }
+
     /// Hide a session from the sessions list by deleting ALL of its
     /// metadata rows (Greptime/SQLite) or the whole sidecar file (JSONL).
     /// The transcript is untouched, so resume still works.
@@ -2511,24 +2598,38 @@ fn jsonl_touch_meta(root: &Path, session: &str) -> anyhow::Result<()> {
 /// they can never be mistaken for sessions. Sorted
 /// newest-activity-first, matching the SQLite query's ORDER BY.
 fn jsonl_list_meta(root: &Path) -> anyhow::Result<Vec<SessionMeta>> {
+    Ok(jsonl_list_meta_diagnostic(root)?.0)
+}
+
+fn jsonl_list_meta_diagnostic(
+    root: &Path,
+) -> anyhow::Result<(Vec<SessionMeta>, ListMetaDiagnostics)> {
+    let started = std::time::Instant::now();
     let directory = root.join(".e-agent/sessions");
+    let mut diagnostic = ListMetaDiagnostics {
+        backend: "jsonl",
+        ..Default::default()
+    };
     let Ok(entries) = std::fs::read_dir(&directory) else {
-        return Ok(Vec::new()); // no sessions directory yet
+        diagnostic.filesystem_parse_ms = started.elapsed().as_millis();
+        return Ok((Vec::new(), diagnostic));
     };
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        // Session ids cannot contain `.`, so `<id>.meta.jsonl` is
-        // unambiguous: the only files with this suffix are sidecars.
         let Some(session_id) = name.strip_suffix(".meta.jsonl") else {
             continue;
         };
+        diagnostic.sidecars_seen += 1;
         if let Some(meta) = jsonl_read_meta_snapshot(root, session_id)? {
+            diagnostic.sidecars_opened += 1;
             out.push(meta);
         }
     }
     out.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
-    Ok(out)
+    diagnostic.logical_rows = out.len();
+    diagnostic.filesystem_parse_ms = started.elapsed().as_millis();
+    Ok((out, diagnostic))
 }
 
 /// `delete_meta` for the JSONL backend: remove the session's sidecar file.

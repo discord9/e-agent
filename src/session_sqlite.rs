@@ -2121,7 +2121,16 @@ impl SqliteSession {
     /// `last_active_at` per session (explicit GROUP BY + JOIN — correct
     /// whether or not the engine auto-dedups same-PK rows at read time).
     pub async fn list_meta(&self) -> Result<Vec<SessionMeta>, String> {
+        Ok(self.list_meta_diagnostic().await?.0)
+    }
+
+    pub async fn list_meta_diagnostic(
+        &self,
+    ) -> Result<(Vec<SessionMeta>, crate::session_store::ListMetaDiagnostics), String> {
+        let lock_started = std::time::Instant::now();
         let conn = self.conn.lock().await;
+        let connection_lock_wait_ms = lock_started.elapsed().as_millis();
+        let query_started = std::time::Instant::now();
         let mut rows = conn
             .query(
                 "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
@@ -2139,12 +2148,16 @@ impl SqliteSession {
             )
             .await
             .map_err(|e| format!("cannot list session metadata: {e}"))?;
+        let query_ms = query_started.elapsed().as_millis();
+        let iteration_started = std::time::Instant::now();
+        let mut decode_ms = 0;
         let mut out = Vec::new();
         while let Some(row) = rows
             .next()
             .await
             .map_err(|e| format!("cannot list session metadata: {e}"))?
         {
+            let decode_started = std::time::Instant::now();
             let session_id = row
                 .get_value(0)
                 .map_err(|e| format!("cannot list session metadata: {e}"))?
@@ -2154,8 +2167,19 @@ impl SqliteSession {
                     "cannot list session metadata: session_id is not text".to_string()
                 })?;
             out.push(meta_from_row_values(&row, &session_id)?);
+            decode_ms += decode_started.elapsed().as_millis();
         }
-        Ok(out)
+        let query_iteration_ms = iteration_started.elapsed().as_millis();
+        let diagnostic = crate::session_store::ListMetaDiagnostics {
+            backend: "sqlite",
+            connection_lock_wait_ms,
+            query_ms,
+            query_iteration_ms,
+            row_decode_ms: decode_ms,
+            logical_rows: out.len(),
+            ..Default::default()
+        };
+        Ok((out, diagnostic))
     }
 
     /// The full lifecycle trace of one session: every snapshot row, oldest
