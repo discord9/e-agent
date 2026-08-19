@@ -5498,9 +5498,8 @@ mod tests {
         );
 
         // Rewrite the owner to a definitely-dead pid → all rows dead →
-        // true. Only provable with an exported hostname: with none, the
-        // owner's hostname falls back to "unknown" and stays unjudgeable
-        // → alive (P2-2), which the else-branch asserts instead.
+        // true. A known-host dead pid is probed; a valid legacy `unknown`
+        // identity is explicitly treated as dead.
         match probeable_hostname() {
             Some(hostname) => {
                 session
@@ -5528,12 +5527,12 @@ mod tests {
                         &[&"2000000000@unknown#deadbeef", &wid, &sid],
                     )
                     .await
-                    .expect("rewrite owner to unjudgeable pid");
+                    .expect("rewrite owner to legacy unknown pid");
                 assert!(
-                    !session
+                    session
                         .unfinished_owner_all_dead(&sid)
                         .await
-                        .expect("probe with unjudgeable owner")
+                        .expect("probe with legacy unknown owner")
                 );
             }
         }
@@ -5575,9 +5574,8 @@ mod tests {
             .unwrap_or_else(|_| "unknown".to_owned())
     }
 
-    /// The environment's exported hostname, when there is one: only then
-    /// can a hand-built owner identity reach the pid-probe path (P2-2
-    /// makes an unset hostname unjudgeable → conservative alive).
+    /// The currently resolved hostname, when it is known, for hand-built
+    /// owner identities that exercise the process probe path.
     fn probeable_hostname() -> Option<String> {
         let host = hostname_now();
         (host != "unknown").then_some(host)

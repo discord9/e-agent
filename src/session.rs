@@ -1136,57 +1136,35 @@ mod tests {
         ));
 
         // Rewrite the record with a definitely-dead owner → all dead.
-        // Reachable only with an exported hostname: with none, the owner's
-        // hostname falls back to "unknown" and the record is unjudgeable
-        // → alive (P2-2), which the else-branch asserts instead.
+        // Both a known-host dead pid and the explicit legacy `unknown` host
+        // compatibility identity are accepted as definitely dead.
         let path = temp
             .path()
             .join(".e-agent/sessions/dead-probe.background.jsonl");
-        let probeable = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .ok()
-            .filter(|h| !h.is_empty() && h != "unknown");
-        match probeable {
-            Some(hostname) => {
-                let dead = format!("2000000000@{hostname}#deadbeef");
-                std::fs::write(
-                    &path,
-                    format!("{{\"id\":1,\"label\":\"sleep 100\",\"owner\":\"{dead}\"}}\n"),
-                )
-                .unwrap();
-                assert!(Session::unfinished_owner_all_dead(
-                    temp.path(),
-                    "dead-probe"
-                ));
+        let dead = "2000000000@unknown#deadbeef";
+        std::fs::write(
+            &path,
+            format!("{{\"id\":1,\"label\":\"sleep 100\",\"owner\":\"{dead}\"}}\n"),
+        )
+        .unwrap();
+        assert!(Session::unfinished_owner_all_dead(
+            temp.path(),
+            "dead-probe"
+        ));
 
-                // Mixed: one dead owner + one live owner → not all dead.
-                std::fs::write(
-                    &path,
-                    format!(
-                        "{{\"id\":1,\"label\":\"a\",\"owner\":\"{dead}\"}}\n{{\"id\":2,\"label\":\"b\",\"owner\":\"{}\"}}\n",
-                        crate::session_store::process_identity()
-                    ),
-                )
-                .unwrap();
-                assert!(!Session::unfinished_owner_all_dead(
-                    temp.path(),
-                    "dead-probe"
-                ));
-            }
-            None => {
-                // No exported hostname: an "unknown"-hostname owner is
-                // unjudgeable → alive → not all dead, even for a dead pid.
-                std::fs::write(
-                    &path,
-                    "{\"id\":1,\"label\":\"sleep 100\",\"owner\":\"2000000000@unknown#deadbeef\"}\n",
-                )
-                .unwrap();
-                assert!(!Session::unfinished_owner_all_dead(
-                    temp.path(),
-                    "dead-probe"
-                ));
-            }
-        }
+        // Mixed: one dead owner + one live owner → not all dead.
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"id\":1,\"label\":\"a\",\"owner\":\"{dead}\"}}\n{{\"id\":2,\"label\":\"b\",\"owner\":\"{}\"}}\n",
+                crate::session_store::process_identity()
+            ),
+        )
+        .unwrap();
+        assert!(!Session::unfinished_owner_all_dead(
+            temp.path(),
+            "dead-probe"
+        ));
 
         // A foreign hostname owner cannot be judged → alive → false.
         let foreign = format!(

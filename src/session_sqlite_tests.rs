@@ -3038,9 +3038,8 @@ async fn running_tasks_owner_column_liveness_probe() {
     }
 
     // Rewrite the owner to a definitely-dead pid → all rows dead → true.
-    // Only provable with an exported hostname: with none, the owner's
-    // hostname falls back to "unknown" and stays unjudgeable → alive
-    // (P2-2), which the else-branch asserts instead.
+    // A known-host dead pid is probed; a valid legacy `unknown` identity is
+    // explicitly treated as dead.
     match probeable_hostname() {
         Some(hostname) => {
             {
@@ -3065,8 +3064,6 @@ async fn running_tasks_owner_column_liveness_probe() {
             );
         }
         None => {
-            // Unjudgeable "unknown"-hostname owner: treated as alive →
-            // not all dead, even though the pid itself cannot exist.
             {
                 let conn = session.conn.lock().await;
                 conn.execute(
@@ -3082,10 +3079,10 @@ async fn running_tasks_owner_column_liveness_probe() {
                 .unwrap();
             }
             assert!(
-                !session
+                session
                     .unfinished_owner_all_dead(&sid)
                     .await
-                    .expect("probe with unjudgeable owner")
+                    .expect("probe with legacy unknown owner")
             );
         }
     }
@@ -3142,9 +3139,8 @@ fn hostname_now() -> String {
         .unwrap_or_else(|_| "unknown".to_owned())
 }
 
-/// The environment's exported hostname, when there is one: only then can
-/// a hand-built owner identity reach the pid-probe path (P2-2 makes an
-/// unset hostname unjudgeable → conservative alive).
+/// The currently resolved hostname, when it is known, for hand-built
+/// owner identities that exercise the process probe path.
 fn probeable_hostname() -> Option<String> {
     let host = hostname_now();
     (host != "unknown").then_some(host)
@@ -3311,7 +3307,7 @@ async fn store_facade_unfinished_owner_all_dead_e2e() {
 
     // 手改 owner 为不存在的 pid（同一 hostname）→ 全部 dead → true。
     // 仅当环境导出了 hostname 时可证明；否则 owner 侧 hostname 回退为
-    // "unknown" → 不可判断 → alive（P2-2），走 else 分支断言保守结果。
+    // A valid legacy `unknown` identity is explicitly considered dead.
     match probeable_hostname() {
         Some(hostname) => {
             {
@@ -3351,12 +3347,12 @@ async fn store_facade_unfinished_owner_all_dead_e2e() {
                 ("2000000000@unknown#deadbeef", workspace_id(), sid.as_str()),
             )
             .await
-            .expect("rewrite owner to unjudgeable pid");
+            .expect("rewrite owner to legacy unknown pid");
             assert!(
-                !store
+                store
                     .unfinished_owner_all_dead(root, &sid)
                     .await
-                    .expect("probe with unjudgeable owner")
+                    .expect("probe with legacy unknown owner")
             );
         }
     }

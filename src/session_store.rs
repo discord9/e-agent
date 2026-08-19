@@ -100,20 +100,71 @@ const META_STORE_SENTINEL: &str = "_meta";
 /// Why not just `pid`? A pid alone is ambiguous: the OS reuses pids across
 /// restarts, so two snapshots written by *different* processes could carry
 /// the same pid. Why not rely on `hostname`? `HOSTNAME` is not guaranteed
-/// to be set (hence the `COMPUTERNAME` fallback for Windows, then
-/// `"unknown"`). The `nonce` disambiguates pid reuse: a simple hash of the
+/// to be set, so the resolver also consults the OS hostname before falling
+/// back to `"unknown"`. The `nonce` disambiguates pid reuse: a simple hash of the
 /// boot-time `SystemTime` nanos XORed with the pid — no new dependency,
 /// and different processes (or restarts with a reused pid) get different
 /// values with overwhelming probability.
 static PROCESS_IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Resolve the host name used in process identities and owner probes.
+/// Environment variables are preferred because they are the established
+/// container/Windows source; Unix's OS hostname is the next shared source.
+fn resolve_hostname<E, F, C>(env: E, os_file: F, command: C) -> String
+where
+    E: Fn(&str) -> Option<String>,
+    F: Fn() -> Option<String>,
+    C: Fn() -> Option<String>,
+{
+    for name in ["HOSTNAME", "COMPUTERNAME"] {
+        if let Some(hostname) = env(name).filter(|value| !value.trim().is_empty()) {
+            return hostname.trim().to_owned();
+        }
+    }
+    os_file()
+        .and_then(|hostname| {
+            let hostname = hostname.trim();
+            (!hostname.is_empty()).then(|| hostname.to_owned())
+        })
+        .or_else(|| {
+            command().and_then(|hostname| {
+                let hostname = hostname.trim();
+                (!hostname.is_empty()).then(|| hostname.to_owned())
+            })
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 /// The current process's identity string (see [`PROCESS_IDENTITY`]).
 pub(crate) fn process_identity() -> &'static str {
     PROCESS_IDENTITY.get_or_init(|| {
         let pid = std::process::id();
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "unknown".to_owned());
+        let hostname = resolve_hostname(
+            |name| std::env::var(name).ok(),
+            || {
+                #[cfg(unix)]
+                {
+                    std::fs::read_to_string("/etc/hostname").ok()
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            },
+            || {
+                #[cfg(not(windows))]
+                {
+                    std::process::Command::new("hostname")
+                        .output()
+                        .ok()
+                        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                }
+                #[cfg(windows)]
+                {
+                    None
+                }
+            },
+        );
         let nonce = {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -137,11 +188,13 @@ pub(crate) fn process_identity() -> &'static str {
 /// notice. Only a *definite* dead owner returns false:
 ///
 /// - malformed identity (no `@`/`#`, unparsable pid) → true
+/// - a syntactically valid legacy identity with hostname `"unknown"` and a
+///   parseable pid → false (the explicit legacy compatibility rule)
 /// - hostname differs from the current process's → true (a record from
 ///   another machine cannot be probed here)
-/// - either hostname fell back to `"unknown"` (no HOSTNAME/COMPUTERNAME
-///   on one machine) → true: the machines cannot be compared, and probing
-///   a foreign pid risks a false "dead" across machines
+/// - the current hostname is `"unknown"` (all hostname sources were
+///   unavailable) → true: the machines cannot be compared, and probing a
+///   foreign pid risks a false "dead" across machines
 /// - the probe itself fails (e.g. `kill` missing) → true
 /// - unix (Linux and other /proc platforms): `kill -0 <pid>` — exit 0
 ///   means alive; a non-zero exit is ESRCH (definitely dead) OR EPERM
@@ -166,26 +219,52 @@ pub(crate) fn owner_alive(identity: &str) -> bool {
     let Some((pid_str, rest)) = identity.split_once('@') else {
         return true; // malformed: cannot judge
     };
-    let Some((hostname, _nonce)) = rest.split_once('#') else {
+    let Some((hostname, nonce)) = rest.split_once('#') else {
         return true; // malformed: cannot judge
     };
-    let hostname_now = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown".to_owned());
-    // Either side falling back to "unknown" makes the two machines
-    // incomparable: the record could be from a different machine whose
-    // hostname env is also unset, and probing its pid there could report
-    // a live process as dead. Sacrifice the same-machine notice in a bare
-    // environment to eliminate that cross-machine misreport.
-    if hostname == "unknown" || hostname_now == "unknown" {
+    if nonce.is_empty() {
+        return true; // malformed: cannot judge
+    }
+    let Ok(pid) = pid_str.parse::<u32>() else {
+        return true; // unparsable pid: cannot judge
+    };
+    if hostname == "unknown" {
+        return false; // legacy valid identity: explicitly considered dead
+    }
+    let hostname_now = resolve_hostname(
+        |name| std::env::var(name).ok(),
+        || {
+            #[cfg(unix)]
+            {
+                std::fs::read_to_string("/etc/hostname").ok()
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        },
+        || {
+            #[cfg(not(windows))]
+            {
+                std::process::Command::new("hostname")
+                    .output()
+                    .ok()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            }
+            #[cfg(windows)]
+            {
+                None
+            }
+        },
+    );
+    // A current "unknown" hostname cannot be compared with a known record;
+    // preserve the conservative behavior when every current source is absent.
+    if hostname_now == "unknown" {
         return true; // cannot judge: conservative
     }
     if hostname != hostname_now {
         return true; // record from another machine: cannot judge
     }
-    let Ok(pid) = pid_str.parse::<u32>() else {
-        return true; // unparsable pid: cannot judge
-    };
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         // No new dependency (no libc): probe via the `kill` command.
@@ -3401,6 +3480,74 @@ mod tests {
     /// identity) is alive (conservative — the caller keeps Preserve
     /// instead of misreporting).
     #[test]
+    fn hostname_resolver_prefers_env_and_trims_values() {
+        let hostname = resolve_hostname(
+            |name| match name {
+                "HOSTNAME" => Some("  env-host  ".to_owned()),
+                _ => Some("computer-host".to_owned()),
+            },
+            || Some(" file-host\n".to_owned()),
+            || Some(" command-host\n".to_owned()),
+        );
+        assert_eq!(hostname, "env-host");
+    }
+
+    #[test]
+    fn hostname_resolver_uses_trimmed_os_file_when_env_missing() {
+        let hostname = resolve_hostname(
+            |_| None,
+            || Some("  os-host\n".to_owned()),
+            || panic!("command must not run when the OS hostname is available"),
+        );
+        assert_eq!(hostname, "os-host");
+    }
+
+    #[test]
+    fn hostname_resolver_falls_back_to_command_or_unknown() {
+        assert_eq!(
+            resolve_hostname(
+                |_| None,
+                || Some(" \n".to_owned()),
+                || { Some(" command-host\n".to_owned()) }
+            ),
+            "command-host"
+        );
+        assert_eq!(
+            resolve_hostname(|_| None, || None, || Some(" \n".to_owned())),
+            "unknown"
+        );
+        assert_eq!(resolve_hostname(|_| None, || None, || None), "unknown");
+    }
+
+    #[test]
+    fn legacy_unknown_owners_are_dead_but_missing_owner_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = "legacy-unknown-owner";
+        let path = temp
+            .path()
+            .join(".e-agent/sessions/legacy-unknown-owner.background.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "{\"id\":1,\"label\":\"a\",\"owner\":\"2000000000@unknown#nonce\"}\n",
+        )
+        .unwrap();
+        assert!(crate::session::Session::unfinished_owner_all_dead(
+            temp.path(),
+            session
+        ));
+        std::fs::write(
+            &path,
+            "{\"id\":1,\"label\":\"a\",\"owner\":\"2000000000@unknown#nonce\"}\n{\"id\":2,\"label\":\"old\",\"owner\":null}\n",
+        )
+        .unwrap();
+        assert!(!crate::session::Session::unfinished_owner_all_dead(
+            temp.path(),
+            session
+        ));
+    }
+
+    #[test]
     fn owner_alive_is_conservative_and_spot_checks_liveness() {
         // Our own identity: pid exists, hostname matches → alive
         // (kill -0 succeeds on the same uid).
@@ -3411,12 +3558,8 @@ mod tests {
         );
 
         // The dead-pid probe path (`kill -0` ESRCH + no /proc entry) is
-        // only reachable when the environment exports a real hostname:
-        // with no HOSTNAME/COMPUTERNAME either side is "unknown" and
-        // owner_alive is unjudgeable → alive (P2-2). Assert the
-        // deterministic conservative outcome in that case, and the real
-        // probe (kill -0 + /proc fallback) when a hostname is exported
-        // (CI runners and most dev shells).
+        // reachable when the resolved hostname is real. Legacy valid
+        // `unknown` identities are handled as definitely dead below.
         if let Some(hostname) = probeable_hostname() {
             // Pids that cannot exist (well-formed `pid@hostname#nonce`
             // shape, but far above any real pid_max): `kill -0` reports
@@ -3428,11 +3571,6 @@ mod tests {
                 !owner_alive(&dead2),
                 "well-formed but non-existent pid must probe as dead"
             );
-        } else {
-            assert!(
-                owner_alive("2000000000@unknown#deadbeef"),
-                "unprobeable hostname keeps even a dead pid conservative"
-            );
         }
 
         // Different hostname (even with our own pid) → cannot judge → alive.
@@ -3442,18 +3580,10 @@ mod tests {
             "foreign hostname must be conservative (alive)"
         );
 
-        // A hostname that fell back to "unknown" (either side) cannot be
-        // compared across machines → conservative alive, even for a pid
-        // that would otherwise probe dead. Sacrificing the bare-environment
-        // same-machine notice eliminates the cross-machine false-dead.
-        assert!(
-            owner_alive(&format!("{}@unknown#nonce", std::process::id())),
-            "record-side unknown hostname must be conservative (alive)"
-        );
-        assert!(
-            owner_alive("2000000000@unknown#deadbeef"),
-            "unknown hostname wins over a dead pid (conservative)"
-        );
+        // Valid legacy unknown-host identities are explicitly considered
+        // dead, regardless of the current host resolution.
+        assert!(!owner_alive("2000000000@unknown#deadbeef"));
+        assert!(!owner_alive("1@unknown#nonce"));
 
         // Malformed identities → cannot judge → alive.
         assert!(owner_alive(""), "empty identity is conservative");
@@ -3462,12 +3592,16 @@ mod tests {
             "no @ separator is conservative"
         );
         assert!(
-            owner_alive("12345@hostname-without-nonce"),
-            "no # separator is conservative"
+            owner_alive("12345@unknown"),
+            "unknown hostname without nonce is malformed"
         );
         assert!(
-            owner_alive("abc@myhost#nonce"),
+            owner_alive("abc@unknown#nonce"),
             "unparsable pid is conservative"
+        );
+        assert!(
+            owner_alive("12345@hostname-without-nonce"),
+            "no # separator is conservative"
         );
     }
 
@@ -3496,15 +3630,10 @@ mod tests {
         ));
     }
 
-    /// The environment's exported hostname, when there is one: only then
-    /// can a hand-built identity match `owner_alive`'s hostname check and
-    /// reach the pid-probe path (P2-2 makes an unset hostname unjudgeable
-    /// → conservative alive).
     fn probeable_hostname() -> Option<String> {
-        let host = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .ok()?;
-        (!host.is_empty() && host != "unknown").then_some(host)
+        let (_, rest) = process_identity().split_once('@')?;
+        let (host, _) = rest.split_once('#')?;
+        (host != "unknown").then_some(host.to_owned())
     }
 
     /// JSONL `load_older` pages by ABSOLUTE position (there is no seq
