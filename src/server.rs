@@ -364,39 +364,6 @@ async fn connect_zombie_scan_meta_store(
     SessionStore::connect_meta(backend, root).await
 }
 
-/// Run best-effort restart recovery to completion before exposing the
-/// listener. Per-session scan errors remain handled by the scan itself.
-async fn recover_zombie_background_tasks(
-    backend: &crate::config::SessionBackend,
-    root: &std::path::Path,
-) {
-    let scan_meta_store = match connect_zombie_scan_meta_store(backend, root).await {
-        Ok(store) => Some(store),
-        Err(error) => {
-            eprintln!(
-                "e-agent: zombie scan: cannot connect dedicated metadata store; recovery skipped: {error:#}"
-            );
-            None
-        }
-    };
-    if let Some(scan_meta_store) = scan_meta_store {
-        let scan_backend = backend.clone();
-        scan_zombie_background_tasks(scan_meta_store, &scan_backend, root).await;
-    }
-}
-
-async fn bind_after_zombie_recovery(
-    backend: &crate::config::SessionBackend,
-    root: &std::path::Path,
-    host: &str,
-    port: u16,
-) -> anyhow::Result<tokio::net::TcpListener> {
-    recover_zombie_background_tasks(backend, root).await;
-    tokio::net::TcpListener::bind((host, port))
-        .await
-        .with_context(|| format!("cannot bind {host}:{port}"))
-}
-
 /// Bind, authenticate, and serve until Ctrl-C. The factory is resolved once
 /// here and reused by every session `build()`.
 pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Result<()> {
@@ -425,6 +392,14 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
         summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
         shutdown: watch::channel(()).0,
     });
+    eprintln!(
+        "e-agent: serving on http://{host}:{port} (token: {}; also at {})",
+        state.token,
+        token_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<no state dir>".to_owned())
+    );
+
     // 启动可观测性：canonical workspace root、backend 类型、workspace_id
     // 短 hash、PID。workspace_id 由 canonical root 派生（见
     // session_greptime::derive_workspace_id），短 hash 便于多实例日志对照；
@@ -436,13 +411,36 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
         short_workspace_id(state.factory.root()),
         std::process::id()
     );
-    // 僵尸后台任务扫描：使用独立的 workspace meta store，并在绑定监听
-    // socket 前等待扫描完成。这样会话 attach/resume 不能与现有
-    // subagent_session_id -> running_tasks -> parent Notice recovery 竞态。
-    // 扫描仍是 best-effort，连接或单会话错误只记录并降级，不阻塞启动。
-    let listener =
-        bind_after_zombie_recovery(state.factory.backend(), state.factory.root(), host, port)
-            .await?;
+    // 僵尸后台任务扫描：使用独立的 workspace meta store，再 spawn 一个异步
+    // 任务，启动即扫（不等第一次请求）。这不能 clone state.meta_store：Greptime
+    // 的 clone 会共享同一个 tokio-postgres Client，扫描的批量探测会因此阻塞
+    // 正常的会话列表请求。JSONL 仍是无状态 store，SQLite 仍使用原有文件锁。
+    let scan_meta_store = match connect_zombie_scan_meta_store(
+        state.factory.backend(),
+        state.factory.root(),
+    )
+    .await
+    {
+        Ok(store) => Some(store),
+        Err(error) => {
+            // 扫描本来就是启动后的 best-effort recovery；保留该策略，但让
+            // failure visible instead of silently disabling recovery.
+            eprintln!(
+                "e-agent: zombie scan: cannot connect dedicated metadata store; recovery skipped: {error:#}"
+            );
+            None
+        }
+    };
+    if let Some(scan_meta_store) = scan_meta_store {
+        let scan_backend = state.factory.backend().clone();
+        let scan_root = state.factory.root().to_path_buf();
+        tokio::spawn(async move {
+            scan_zombie_background_tasks(scan_meta_store, &scan_backend, &scan_root).await;
+        });
+    }
+    let listener = tokio::net::TcpListener::bind((host, port))
+        .await
+        .with_context(|| format!("cannot bind {host}:{port}"))?;
     // Ctrl-C 触发 graceful shutdown：axum 停 accept，放行 in-flight 请求收尾
     // （持久化写入在 handler 响应前已同步落盘，drain 截断不影响数据安全）。
     // 但 graceful shutdown 会无限等待 in-flight 连接——浏览器标签页挂着的
@@ -3441,100 +3439,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn startup_binds_only_after_zombie_scan_injects_subagent_notice() {
-        let Some(hostname) = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .ok()
-            .filter(|host| !host.is_empty() && host != "unknown")
-        else {
-            return;
-        };
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        let path = root.join("sessions.db");
-        let backend = crate::config::SessionBackend::Sqlite {
-            path: Some(path.to_string_lossy().into_owned()),
-        };
-        let meta_store = SessionStore::connect_meta(&backend, root)
-            .await
-            .expect("metadata store");
-        meta_store
-            .create_meta(root, "parent", None, None, None, None, None)
-            .await
-            .expect("parent metadata");
-        meta_store
-            .create_meta(
-                root,
-                "child",
-                None,
-                None,
-                Some("parent"),
-                Some(7),
-                Some("delegate"),
-            )
-            .await
-            .expect("child metadata");
-
-        // Simulate an existing dead delegate row. The scan must consume the
-        // subagent_session_id row and append its Notice to the parent before
-        // this helper makes the listener available.
-        let dead_owner = format!("2000000000@{hostname}#dead");
-        let workspace_id = crate::session_store::derive_workspace_id(root);
-        let db = turso::Builder::new_local(path.to_str().unwrap())
-            .build()
-            .await
-            .expect("open database");
-        let conn = db.connect().expect("database connection");
-        conn.execute(
-            "INSERT INTO running_tasks \
-             (workspace_id, session_id, task_id, label, subagent_session_id, \
-              started_at_us, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
-            (
-                workspace_id.as_str(),
-                "parent",
-                7i64,
-                "delegate work",
-                "child",
-                dead_owner.as_str(),
-            ),
-        )
-        .await
-        .expect("dead delegate row");
-        drop(conn);
-        drop(db);
-
-        let listener = bind_after_zombie_recovery(&backend, root, "127.0.0.1", 0)
-            .await
-            .expect("startup must bind");
-        assert!(listener.local_addr().expect("listener address").port() > 0);
-        let parent_store = SessionStore::connect(&backend, root, "parent")
-            .await
-            .expect("parent store");
-        let entries = parent_store
-            .load(root, "parent")
-            .await
-            .expect("parent history")
-            .entries;
-        assert!(entries.iter().any(|entry| {
-            matches!(entry, SessionEntry::Notice { text } if text.contains("delegate work"))
-        }));
-    }
-
-    #[cfg(feature = "greptime")]
-    #[tokio::test]
-    async fn startup_scan_failure_degrades_without_preventing_bind() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let backend = crate::config::SessionBackend::Greptime {
-            conn: "not a postgres connection string".to_owned(),
-        };
-        let listener = bind_after_zombie_recovery(&backend, dir.path(), "127.0.0.1", 0)
-            .await
-            .expect("scan failure must not prevent startup");
-        assert!(listener.local_addr().expect("listener address").port() > 0);
     }
 
     #[cfg(feature = "sqlite")]
