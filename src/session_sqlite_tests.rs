@@ -4546,7 +4546,7 @@ async fn zombie_scan_consumes_dead_rows_and_injects_one_parent_notice() {
     }
     drop(parent_session);
     // 跑扫描。
-    crate::server::scan_zombie_background_tasks(&meta_store, &backend, &root).await;
+    crate::server::scan_zombie_background_tasks(meta_store, &backend, &root).await;
     // 父会话：恰好 1 条 Notice，含两个子会话 label 和自己的任务。
     let parent_store = crate::session_store::SessionStore::connect(&backend, &root, &parent)
         .await

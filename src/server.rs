@@ -184,8 +184,8 @@ fn killed_notice_text(own: &[String], killed_subagents: &[(String, usize)]) -> O
 /// 幂等性：所有消费都是原子 take（SQLite/Greptime DELETE、JSONL 删记录
 /// 文件），消费后下次扫描 take 为空、不再触发；与并发 resume 的竞态
 /// （两遍之间 resume 抢先把行消费掉）可接受——谁先 take 谁生效，与
-/// 现有幂等语义一致。探测用 workspace 级 meta store（session id 是参数，
-/// 零额外连接）；只有需要消费+注入时才按会话 connect 一个 store。
+/// 现有幂等语义一致。探测用启动时独立连接的 workspace 级 meta store
+/// （session id 是参数）；只有需要消费+注入时才按会话 connect 一个 store。
 ///
 /// JSONL 没有按 subagent_session_id 的消费原语
 /// （`take_unfinished_background_for_subagent` 恒空），子会话的 delegate
@@ -193,7 +193,7 @@ fn killed_notice_text(own: &[String], killed_subagents: &[(String, usize)]) -> O
 /// 会话的 Notice 里；「不注入子会话、label 消失、父会话单条 Notice」
 /// 的语义不变。任何单会话失败只 eprintln，不阻塞启动、不 panic。
 pub(crate) async fn scan_zombie_background_tasks(
-    meta_store: &SessionStore,
+    meta_store: SessionStore,
     backend: &crate::config::SessionBackend,
     root: &std::path::Path,
 ) {
@@ -354,6 +354,16 @@ pub(crate) async fn scan_zombie_background_tasks(
     }
 }
 
+/// Connect the metadata store dedicated to startup zombie recovery. It must
+/// not be a clone of the request store: Greptime clones share one client and
+/// therefore one request queue.
+async fn connect_zombie_scan_meta_store(
+    backend: &crate::config::SessionBackend,
+    root: &std::path::Path,
+) -> anyhow::Result<SessionStore> {
+    SessionStore::connect_meta(backend, root).await
+}
+
 /// Bind, authenticate, and serve until Ctrl-C. The factory is resolved once
 /// here and reused by every session `build()`.
 pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Result<()> {
@@ -401,19 +411,31 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
         short_workspace_id(state.factory.root()),
         std::process::id()
     );
-    // 僵尸后台任务扫描：spawn 一个异步任务，启动即扫（不等第一次请求）。
-    // 上次进程退出时被杀的后台任务重启后静默消失（/api/tasks 只列 live
-    // registry），这里把「N 个后台任务随进程被杀」汇总 Notice 只注入到
-    // 父会话（子会话只消费不注入、不复活），用户下次打开父会话就能看到
-    // 提示。不阻塞启动；与用户首次 resume 同一会话的竞态可接受（take
-    // 原子消费，谁先执行谁生效，天然幂等——见
-    // scan_zombie_background_tasks 的文档）。
+    // 僵尸后台任务扫描：使用独立的 workspace meta store，再 spawn 一个异步
+    // 任务，启动即扫（不等第一次请求）。这不能 clone state.meta_store：Greptime
+    // 的 clone 会共享同一个 tokio-postgres Client，扫描的批量探测会因此阻塞
+    // 正常的会话列表请求。JSONL 仍是无状态 store，SQLite 仍使用原有文件锁。
+    let scan_meta_store = match connect_zombie_scan_meta_store(
+        state.factory.backend(),
+        state.factory.root(),
+    )
+    .await
     {
-        let scan_meta_store = state.meta_store.clone();
+        Ok(store) => Some(store),
+        Err(error) => {
+            // 扫描本来就是启动后的 best-effort recovery；保留该策略，但让
+            // failure visible instead of silently disabling recovery.
+            eprintln!(
+                "e-agent: zombie scan: cannot connect dedicated metadata store; recovery skipped: {error:#}"
+            );
+            None
+        }
+    };
+    if let Some(scan_meta_store) = scan_meta_store {
         let scan_backend = state.factory.backend().clone();
         let scan_root = state.factory.root().to_path_buf();
         tokio::spawn(async move {
-            scan_zombie_background_tasks(&scan_meta_store, &scan_backend, &scan_root).await;
+            scan_zombie_background_tasks(scan_meta_store, &scan_backend, &scan_root).await;
         });
     }
     let listener = tokio::net::TcpListener::bind((host, port))
@@ -3408,6 +3430,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn zombie_scan_gets_a_distinct_metadata_store_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.db");
+        let backend = crate::config::SessionBackend::Sqlite {
+            path: Some(path.to_string_lossy().into_owned()),
+        };
+        let request_store = SessionStore::connect_meta(&backend, dir.path())
+            .await
+            .expect("request metadata store");
+        let scan_store = connect_zombie_scan_meta_store(&backend, dir.path())
+            .await
+            .expect("scan metadata store");
+        match (request_store, scan_store) {
+            (
+                SessionStore::Sqlite {
+                    session: request_session,
+                    ..
+                },
+                SessionStore::Sqlite {
+                    session: scan_session,
+                    ..
+                },
+            ) => assert!(
+                !Arc::ptr_eq(&request_session, &scan_session),
+                "startup scan must not receive a clone of the request metadata store"
+            ),
+            _ => panic!("expected SQLite metadata stores"),
+        }
     }
 
     #[test]
