@@ -498,6 +498,16 @@ els.sendBtn.addEventListener("click", sendPrompt);
 els.cancelBtn.addEventListener("click", cancelTurn);
 els.compactBtn.addEventListener("click", compactSession);
 els.promptInput.addEventListener("keydown", (e) => {
+  // 空 composer 的 ↑ 恢复当前会话最近一条用户消息。与 sendPrompt 一样用
+  // trim 判空；IME、任意修饰键和菜单导航均保持浏览器/既有行为。仅在确实
+  // 找到并恢复候选时阻止默认光标移动。
+  if (e.key === "ArrowUp" && !e.isComposing && e.keyCode !== 229
+      && !e.altKey && !e.ctrlKey
+      && !e.metaKey && !e.shiftKey && !forkMenu.open && !slashMenu.open
+      && !els.promptInput.value.trim() && restoreLatestUserMessage()) {
+    e.preventDefault();
+    return;
+  }
   // fork 面板开着时优先处理：↑↓ 移动选中、Enter/Tab 选中、Esc 关闭
   // （fork 面板与 slash 菜单不会同时开——input 事件在 fork 面板开着时
   //  跳过 updateSlashMenu——但顺序上仍先判 forkMenu.open）。
@@ -522,20 +532,7 @@ els.promptInput.addEventListener("keydown", (e) => {
     else sendPrompt();
   }
 });
-els.promptInput.addEventListener("input", () => {
-  autosizeInput();
-  // 草稿实时同步进会话缓存（per-ws 键）：openSession 之外的路径
-  // （scheduleReconnect/restartTransport 的 openWith→loadHistory）不经过
-  // saveSessionState，这里兜底保证缓存里的 draft 与输入框一致。条目只在
-  // 切走时由 saveSessionState 创建；当前会话尚无条目（从未切走过）时跳过
-  // ——输入框本身就是草稿源，无需复制（也不制造残缺缓存条目）。
-  if (state.sessionId) {
-    const st = state.sessionStates[state.workspace.id + ":" + state.sessionId];
-    if (st) st.draft = els.promptInput.value;
-  }
-  if (forkMenu.open) return;   // fork 面板开着：不弹 slash 菜单，避免两面板重叠
-  updateSlashMenu();
-});
+els.promptInput.addEventListener("input", refreshComposerInput);
 els.promptInput.addEventListener("blur", () => { closeSlashMenu(); closeForkMenu(); });   // 失焦关闭菜单/面板
 els.messages.addEventListener("scroll", (ev) => {
   // 只有用户主动滚动才处理；程序滚动（scrollTop 赋值）不碰 userScrolled。

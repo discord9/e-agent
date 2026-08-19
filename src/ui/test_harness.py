@@ -17,7 +17,7 @@ JS_FILES = ['app.js', 'render.js', 'sessions.js', 'tasks.js', 'sse.js']
 js = "\n".join(open(os.path.join(HERE, f), encoding='utf-8').read() for f in JS_FILES)
 vendor_js = open(os.path.join(HERE, 'vendor', 'marked.min.js'), encoding='utf-8').read()
 
-MODE = os.environ.get('MODE', 'open')   # 'open' = full openSession path, 'direct' = loadHistory, 'header' = focused header checks
+MODE = os.environ.get('MODE', 'open')   # 'open' = full suite; 'composer-history' = focused ArrowUp checks
 DEEP_LINK = os.environ.get('DEEP_LINK', '')   # 注入 ?session=<id> 到 location.search（init 启动时解析）
 TRACE = os.environ.get('TRACE') == '1'
 # gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；页面 JS 里的 new TextDecoder() 换成桩工厂。
@@ -703,6 +703,76 @@ async function main(){
     openSession("s1");
     await flush();
     await flush();
+
+    if (MODE === 'composer-history') {
+      const pin = elsById["promptInput"];
+      const keyup = (extra) => {
+        let prevented = false;
+        const ev = Object.assign({ key: "ArrowUp", isComposing: false,
+          altKey: false, ctrlKey: false, metaKey: false, shiftKey: false,
+          preventDefault(){ prevented = true; } }, extra || {});
+        for (const fn of pin._listeners["keydown"] || []) fn(ev);
+        return prevented;
+      };
+      const fetchBefore = FETCHES.length;
+
+      // history 渲染出的当前会话用户消息可恢复；trim 判空与发送校验一致。
+      pin.value = "   \n";
+      const restored = keyup();
+      chk("composer history restores latest current-session user message",
+          restored && pin.value === "再来一次",
+          "value=" + JSON.stringify(pin.value));
+      chk("composer restore places caret at end",
+          pin.selectionStart === pin.value.length && pin.selectionEnd === pin.value.length,
+          "caret=" + pin.selectionStart + "/" + pin.selectionEnd);
+      chk("composer restore refreshes autosize", pin.style.height !== undefined,
+          "height=" + pin.style.height);
+
+      // live UserPrompt is rendered before/independently of assistant success; an error
+      // after it must not remove the retry source.
+      appendUserMsg("失败请求仍可编辑");
+      appendError("模型请求失败");
+      pin.value = "";
+      chk("composer restores local user message after failed request",
+          keyup() && pin.value === "失败请求仍可编辑",
+          "value=" + JSON.stringify(pin.value));
+
+      // Nonempty, IME, and every modifier preserve normal textarea ArrowUp behavior.
+      pin.value = "已有文本";
+      chk("composer nonempty ArrowUp is unchanged", !keyup() && pin.value === "已有文本");
+      for (const variant of [
+        ["composition", {isComposing:true}], ["IME keyCode", {keyCode:229}],
+        ["Alt", {altKey:true}],
+        ["Control", {ctrlKey:true}], ["Meta", {metaKey:true}],
+        ["Shift", {shiftKey:true}],
+      ]) {
+        pin.value = "";
+        chk("composer " + variant[0] + " ArrowUp is unchanged",
+            !keyup(variant[1]) && pin.value === "");
+      }
+
+      // Candidate lookup is only the currently rendered session projection. Cached
+      // messages belonging to another session/workspace are deliberately invisible.
+      state.sessionStates[state.workspace.id + ":other"] = {
+        html: elsById["messages"].innerHTML, scrollTop:0,
+        nextBeforeSeq:null, olderDone:true, draft:"" };
+      state.sessionStates["other-workspace:s1"] = state.sessionStates[state.workspace.id + ":other"];
+      state.sessionId = "empty-current";
+      elsById["messages"].innerHTML = "";
+      pin.value = "";
+      chk("composer does not restore another session or workspace message",
+          !keyup() && pin.value === "");
+      state.sessionId = null;
+      chk("composer no-session ArrowUp is unchanged", !keyup() && pin.value === "");
+      state.sessionId = "empty-current";
+      chk("composer no-candidate ArrowUp is unchanged", !keyup() && pin.value === "");
+      chk("composer history restore has no network side effect",
+          FETCHES.length === fetchBefore,
+          "before=" + fetchBefore + " after=" + FETCHES.length);
+
+      console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
+      imports.system.exit(0);
+    }
 
     const t = allText();
     chk("initSource set", state.initSource!=null, "="+state.initSource);
@@ -7512,7 +7582,8 @@ async function main(){
 }
 main();
 '''.replace('MODE === \'direct\'', 'true' if MODE == 'direct' else 'false') \
-   .replace("MODE === 'header'", 'true' if MODE == 'header' else 'false')
+   .replace("MODE === 'header'", 'true' if MODE == 'header' else 'false') \
+   .replace("MODE === 'composer-history'", 'true' if MODE == 'composer-history' else 'false')
 
 # DEEP_LINK env → location.search 注入（init() 启动时 URL 解析入口）
 HARNESS = HARNESS.replace('__DEEP_LINK_SEARCH__', ('?session=' + DEEP_LINK) if DEEP_LINK else '')

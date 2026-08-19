@@ -803,6 +803,10 @@ function appendUserMsg(text) {
   // 新回合开始：恢复自动跟随（用户发了新消息，理应看到后续输出）
   userScrolled = false;
   const msg = el("div", "msg msg-user");
+  // 保留用户输入的原文，供空 composer 的 ↑ 恢复。使用消息 DOM 而不是独立
+  // 历史栈：它会随现有 per-workspace/per-session 视图缓存一起保存和恢复，
+  // live UserPrompt（包括随后失败的回合）也会立即进入同一来源。
+  msg.setAttribute("data-user-text", String(text == null ? "" : text));
   const who = el("span", "who", "you>");
   const body = el("div", "msg-body");
   body.innerHTML = renderMarkdown(text);

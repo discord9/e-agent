@@ -1332,6 +1332,45 @@ function autosizeInput() {
   t.style.height = Math.min(t.scrollHeight, 160) + "px";
 }
 
+/* composer 内容变化后的统一刷新。键盘恢复与真实 input 事件共用它，确保
+   自动增高、per-session 草稿和斜杠菜单状态不会因程序赋值而不同步。 */
+function refreshComposerInput() {
+  autosizeInput();
+  if (state.sessionId) {
+    const st = state.sessionStates[state.workspace.id + ":" + state.sessionId];
+    if (st) st.draft = els.promptInput.value;
+  }
+  if (forkMenu.open) return;
+  updateSlashMenu();
+}
+
+/* 当前消息视图就是现有的 session-local 用户消息投影：history、live
+   UserPrompt（即使该回合随后失败）以及会话视图缓存恢复都走 appendUserMsg。
+   从后往前找有文本的用户消息；不访问其它 session 缓存，也不发请求。 */
+function latestCurrentSessionUserText() {
+  if (!state.sessionId) return null;
+  const messages = els.messages.querySelectorAll(".msg-user");
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const text = messages[i].getAttribute("data-user-text");
+    if (typeof text === "string" && text.trim()) return text;
+  }
+  return null;
+}
+
+function restoreLatestUserMessage() {
+  const text = latestCurrentSessionUserText();
+  if (text === null) return false;
+  els.promptInput.value = text;
+  refreshComposerInput();
+  const end = text.length;
+  if (typeof els.promptInput.setSelectionRange === "function") {
+    els.promptInput.setSelectionRange(end, end);
+  } else {
+    els.promptInput.selectionStart = els.promptInput.selectionEnd = end;
+  }
+  return true;
+}
+
 /* token 变化后重启传输（轮询 / SSE） */
 function restartTransport() {
   // 每次 token 重连声明独立代次：即使 workspace/session 未变，上一 token 的
