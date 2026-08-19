@@ -108,7 +108,7 @@ def _iter_inline_blocks(md_body: str):
     i, n = 0, len(lines)
 
     def is_quote(s: str) -> bool:
-        return s.startswith(">")
+        return s == ">" or s.startswith("> ")
 
     def is_list_item(s: str) -> bool:
         return s.startswith("- ")
@@ -347,7 +347,7 @@ def markdown_to_html(text: str, gloss=None) -> str:
     i, n = 0, len(lines)
 
     def is_quote(s: str) -> bool:
-        return s.startswith(">")
+        return s == ">" or s.startswith("> ")
 
     def is_list_item(s: str) -> bool:
         return s.startswith("- ")
