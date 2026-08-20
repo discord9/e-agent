@@ -797,7 +797,7 @@ def main() -> None:
         )
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.spine = ["nav", preface, *chapter_items]
+    book.spine = [preface, *chapter_items]
 
     epub.write_epub(str(out_path), book)
 

@@ -140,8 +140,10 @@ class BuildEpubTests(unittest.TestCase):
             self.assertIn("<ul>", body)
             opf = archive.read("EPUB/content.opf").decode()
             self.assertIn("<dc:title>结构化书</dc:title>", opf)
-            spine = re.findall(r'<itemref idref="(chapter_[0-9]+)"', opf)
+            self.assertRegex(opf, r'<item[^>]+id="nav"[^>]+properties="nav"')
+            spine = re.findall(r'<itemref idref="([^"]+)"', opf)
             self.assertEqual(spine, ["chapter_0", "chapter_1", "chapter_2", "chapter_3"])
+            self.assertNotIn('idref="nav"', opf)
 
     def test_json_without_discussion_and_cli_overrides(self):
         document = self._document(with_discussion=False)
@@ -151,6 +153,10 @@ class BuildEpubTests(unittest.TestCase):
             opf = archive.read("EPUB/content.opf").decode()
             self.assertIn("<dc:title>覆盖标题</dc:title>", opf)
             self.assertIn("<dc:creator id=\"creator\">覆盖作者</dc:creator>", opf)
+            self.assertRegex(opf, r'<item[^>]+id="nav"[^>]+properties="nav"')
+            spine = re.findall(r'<itemref idref="([^"]+)"', opf)
+            self.assertEqual(spine, ["chapter_0", "chapter_1"])
+            self.assertNotIn('idref="nav"', opf)
             nav = archive.read("EPUB/nav.xhtml").decode()
             self.assertNotIn("chap_002.xhtml", nav)
             nav_root = etree.fromstring(nav.encode())
@@ -261,6 +267,11 @@ class BuildEpubTests(unittest.TestCase):
                 preface = archive.read("EPUB/preface.xhtml").decode()
                 self.assertIn("<b>bold</b>", preface)
                 self.assertIn("<blockquote><p>quoted preface</p></blockquote>", preface)
+                opf = archive.read("EPUB/content.opf").decode()
+                self.assertRegex(opf, r'<item[^>]+id="nav"[^>]+properties="nav"')
+                spine = re.findall(r'<itemref idref="([^"]+)"', opf)
+                self.assertEqual(spine, ["chapter_0", "chapter_1"])
+                self.assertNotIn('idref="nav"', opf)
 
     def test_old_markdown_parser_fixture_still_passes(self):
         test_quote_marker_fixture()
