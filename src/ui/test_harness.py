@@ -503,6 +503,11 @@ let forkCandidatesDelayed = false;
 let forkCandidatesResolve = null;
 let forkPostDelayed = false;
 let forkPostResolve = null;
+// composer-history prompt POST controls: exercise acceptance timing and stale
+// continuations without involving a server or queue snapshot.
+let promptPostDeferred = false;
+let promptPostResolve = null;
+let promptPostStatus = 202;
 globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
   FETCH_HEADERS.push({ url, method: (opts.method||"GET").toUpperCase(), headers: opts.headers || {} });
@@ -632,7 +637,10 @@ globalThis.fetch=(url,opts={})=>{
   }
   if(url==="/api/models") return resp(200, ["chatgpt/sol","chatgpt/terra","deepseek/flash","deepseek/high","deepseek/fast","kimi/k3"], signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/model")&&m==="POST") return resp(200,{ok:true,model:"sol"},signal);
-  if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) return resp(202,{},signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) {
+    if (promptPostDeferred) return abortable(new Promise((resolve) => { promptPostResolve = resolve; }), signal);
+    return resp(promptPostStatus, {}, signal);
+  }
   if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{},signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/compact")) return resp(202,{},signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/pin")&&m==="PUT") return resp(204,null,signal);
@@ -837,6 +845,77 @@ async function main(){
       chk("composer history restore has no network side effect",
           FETCHES.length === fetchBefore,
           "before=" + fetchBefore + " after=" + FETCHES.length);
+
+      // Accepted-but-not-rendered prompts are a separate ledger from queue UI.
+      state.pendingPrompts.clear();
+      state.sessionId = "s1";
+      state.workspace = state.workspaces[0];
+      state.status = "Idle";
+      els.messages.innerHTML = "";
+      appendUserMsg("旧消息");
+      promptPostDeferred = true;
+      pin.value = "新消息";
+      const deferredSend = sendPrompt();
+      await flush();
+      chk("pre-202 pending is not ArrowUp-restorable",
+          keyup() && pin.value === "旧消息"
+          && state.pendingPrompts.get(state.workspace.id + ":s1")[0].accepted === false);
+      promptPostResolve({ok:true, status:202, json:async()=>({}), text:async()=>""});
+      await deferredSend; await flush();
+      pin.value = "";
+      chk("deferred 202 restores accepted prompt before rendered history",
+          keyup() && pin.value === "新消息");
+
+      // Durable UserPrompt consumes exactly one ledger item, but rendered
+      // history remains the fallback source.
+      applyLiveEvent("UserPrompt", {text:"新消息"});
+      pin.value = "";
+      chk("durable UserPrompt removes ledger and keeps rendered fallback",
+          keyup() && pin.value === "新消息"
+          && !state.pendingPrompts.has("" + state.workspace.id + ":s1"));
+
+      promptPostDeferred = false;
+      promptPostStatus = 500;
+      pin.value = "失败新文本";
+      await sendPrompt(); await flush();
+      pin.value = "";
+      chk("failed POST falls back to old rendered message",
+          keyup() && pin.value === "新消息");
+      promptPostStatus = 202;
+
+      // Identical accepted texts are removed FIFO, one durable event at a time.
+      state.pendingPrompts.clear();
+      pin.value = "重复"; await sendPrompt(); await flush();
+      pin.value = "重复"; await sendPrompt(); await flush();
+      const dupKey = state.workspace.id + ":s1";
+      chk("duplicate accepted prompts are retained twice", state.pendingPrompts.get(dupKey).length === 2);
+      applyLiveEvent("UserPrompt", {text:"重复"});
+      chk("duplicate UserPrompt consumes one FIFO record", state.pendingPrompts.get(dupKey).length === 1);
+      applyLiveEvent("UserPrompt", {text:"重复"});
+      chk("duplicate UserPrompt consumes second FIFO record", !state.pendingPrompts.has(dupKey));
+
+      // A delayed continuation from a switched-away workspace/session is
+      // discarded and cannot become the new session's ArrowUp candidate.
+      state.pendingPrompts.clear();
+      state.sessionId = "s1"; state.workspace = state.workspaces[0];
+      pin.value = "stale prompt";
+      promptPostDeferred = true;
+      const staleSend = sendPrompt(); await flush();
+      const staleWs = state.workspace;
+      // Model a real session switch: its view is replaced, so the old DOM
+      // projection is not a fallback for the newly opened session.
+      els.messages.innerHTML = "";
+      state.sessionId = "other-session";
+      state.workspace = {id:"other-workspace", url:"", token:"tok-other"};
+      ++sessionOpenEpoch;
+      promptPostResolve({ok:true, status:202, json:async()=>({}), text:async()=>""});
+      await staleSend; await flush();
+      pin.value = "";
+      chk("stale deferred response cannot become current candidate",
+          !keyup() && pin.value === ""
+          && !state.pendingPrompts.has(staleWs.id + ":s1"));
+      state.sessionId = "s1"; state.workspace = staleWs;
+      promptPostDeferred = false;
 
       console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
       imports.system.exit(0);

@@ -354,9 +354,14 @@ function handleSSEBlock(block, id, wsId, epoch) {
 function applyLiveEvent(name, payload) {
   const acc = state.acc;
   switch (name) {
-    case "UserPrompt":
-      appendUserMsg(pickText(payload, ["text", "prompt", "content"]));
+    case "UserPrompt": {
+      const text = pickText(payload, ["text", "prompt", "content"]);
+      // Durable UserPrompt is the only event that consumes a pending prompt;
+      // queued/consumed display events deliberately do not touch this ledger.
+      removeMatchingPendingPrompt(state.workspace.id, state.sessionId, text);
+      appendUserMsg(text);
       break;
+    }
     case "AssistantText":
       setAssistantText(pickText(payload, ["text", "content"]), acc);
       break;

@@ -1294,15 +1294,35 @@ async function sendPrompt() {
     setBanner("⚠ 会话已结束，无法发送消息。", true);
     return;
   }
+  // Keep a pre-HTTP record so every outcome has one lifecycle. It is not
+  // ArrowUp-visible until the server accepts the request with 202.
+  const sid = state.sessionId, wid = state.workspace.id, ep = sessionOpenEpoch;
+  const record = addPendingPrompt(wid, sid, ep, text);
+  const stillCurrent = () => state.sessionId === sid
+    && state.workspace.id === wid && sessionOpenEpoch === ep;
   els.promptInput.value = "";
   autosizeInput();
   try {
-    const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId) + "/prompt",
+    const res = await apiFor(state.workspaces.find((w) => w.id === wid) || state.workspace,
+      "/api/sessions/" + encodeURIComponent(sid) + "/prompt",
       { method: "POST", body: JSON.stringify({ text }) });
-    if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
+    if (res.status === 401 || res.status === 403) {
+      discardPendingPrompt(record);
+      if (stillCurrent()) setBanner("⚠ 认证失败：请检查 Token。");
+      return;
+    }
     if (res.status !== 202) throw new Error("HTTP " + res.status);
+    if (!stillCurrent()) {
+      discardPendingPrompt(record);
+      return;
+    }
+    // UserPrompt may have arrived while the HTTP continuation was pending. In
+    // that case its FIFO removal wins and this response must not add it back.
+    const records = state.pendingPrompts.get(pendingPromptKey(wid, sid));
+    if (records && records.indexOf(record) >= 0) record.accepted = true;
   } catch (e) {
-    setBanner("⚠ 发送失败：" + e.message);
+    discardPendingPrompt(record);
+    if (stillCurrent()) setBanner("⚠ 发送失败：" + e.message);
   }
 }
 
@@ -1399,6 +1419,47 @@ function refreshComposerInput() {
   updateSlashMenu();
 }
 
+/* Prompts accepted by the HTTP endpoint may not have rendered yet: keep this
+   separate from the queue-bar snapshot, which is only a display projection. */
+function pendingPromptKey(wsId, sid) { return wsId + ":" + sid; }
+
+function addPendingPrompt(wsId, sid, epoch, text) {
+  const key = pendingPromptKey(wsId, sid);
+  const record = { wsId, sid, epoch, text, accepted: false };
+  const records = state.pendingPrompts.get(key) || [];
+  records.push(record);
+  state.pendingPrompts.set(key, records);
+  return record;
+}
+
+function discardPendingPrompt(record) {
+  const key = pendingPromptKey(record.wsId, record.sid);
+  const records = state.pendingPrompts.get(key);
+  if (!records) return;
+  const i = records.indexOf(record);
+  if (i < 0) return;
+  records.splice(i, 1);
+  if (!records.length) state.pendingPrompts.delete(key);
+}
+
+function removeMatchingPendingPrompt(wsId, sid, text) {
+  const records = state.pendingPrompts.get(pendingPromptKey(wsId, sid));
+  if (!records) return;
+  // FIFO is important when two accepted prompts have identical text.
+  const record = records.find((item) => item.text === text);
+  if (record) discardPendingPrompt(record);
+}
+
+function acceptedPendingPromptText() {
+  if (!state.sessionId || !state.workspace) return null;
+  const records = state.pendingPrompts.get(pendingPromptKey(state.workspace.id, state.sessionId));
+  if (!records) return null;
+  for (let i = records.length - 1; i >= 0; i--) {
+    if (records[i].accepted) return records[i].text;
+  }
+  return null;
+}
+
 /* 当前消息视图就是现有的 session-local 用户消息投影：history、live
    UserPrompt（即使该回合随后失败）以及会话视图缓存恢复都走 appendUserMsg。
    从后往前找有文本的用户消息；不访问其它 session 缓存，也不发请求。 */
@@ -1413,7 +1474,7 @@ function latestCurrentSessionUserText() {
 }
 
 function restoreLatestUserMessage() {
-  const text = latestCurrentSessionUserText();
+  const text = acceptedPendingPromptText() || latestCurrentSessionUserText();
   if (text === null) return false;
   els.promptInput.value = text;
   refreshComposerInput();

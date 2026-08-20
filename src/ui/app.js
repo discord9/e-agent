@@ -73,6 +73,7 @@ const state = {
   queue: [],                 // 排队提示（FIFO；最多显示 3 条 + "+N"）
   queueExpanded: false,      // 排队条是否展开显示全部（默认收起）
   queues: {},                // wsId:sessionId -> queued prompt 快照（方案 B：切走保存、切回恢复；可能过期）
+  pendingPrompts: new Map(), // wsId:sessionId -> in-flight/accepted prompt records (not queue snapshots)
   deepLink: { pending: null, handled: false, probing: false, attemptEpoch: -1 },
   // URL ?session= 深链：pending=待打开 id；handled=已消费（一次性）；
   // probing+attemptEpoch=深链 attempt 标记（防重复发起 + SSE 404 恢复判定）
