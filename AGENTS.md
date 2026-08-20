@@ -30,10 +30,6 @@ default, GreptimeDB, SQLite). Keep it that way.
    shrink it.
 5. **Line budget.** Production code stays small. If a change roughly doubles
    a file, shrink the behavior, not just the formatting.
-6. **Concrete justification.** Every new entity must have a present, concrete
-   problem, invariant, or failure justification.
-7. **Evidence-based review.** Review feedback is evidence, not automatic scope;
-   accept it only for a bug, contract, invariant, or credible regression risk.
 
 Historical context: the predecessor project died from protocol crates, event
 sourcing, subagent frameworks, and permission systems built before a single
