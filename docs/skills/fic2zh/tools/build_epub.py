@@ -17,6 +17,7 @@ when either file is missing the feature is skipped gracefully.
 import argparse
 import csv
 import html
+import json
 import re
 import zipfile
 from pathlib import Path
@@ -424,6 +425,133 @@ def split_sections(md_text: str):
     return sections
 
 
+def json_inline(text: str, gloss=None) -> str:
+    """Render JSON text as escaped plain text; Markdown syntax is inert."""
+    text = html.escape(text)
+    return gloss.annotate(text) if gloss is not None else text
+
+
+def json_blocks_to_html(blocks, gloss=None) -> str:
+    """Render the deliberately small structured-JSON block vocabulary."""
+    out = []
+    for block in blocks:
+        kind = block["type"]
+        if kind == "paragraph":
+            out.append(f"<p>{json_inline(block['text'], gloss)}</p>")
+        elif kind == "blockquote":
+            inner = "".join(
+                f"<p>{json_inline(paragraph['text'], gloss)}</p>"
+                for paragraph in block["blocks"]
+            )
+            out.append(f"<blockquote>{inner}</blockquote>")
+        else:  # list
+            items = "".join(f"<li>{json_inline(item, gloss)}</li>"
+                            for item in block["items"])
+            out.append(f"<ul>{items}</ul>")
+    return "\n".join(out)
+
+
+def _json_inline_blocks(blocks):
+    """Return escaped inline values in the same order as JSON rendering."""
+    result = []
+    for block in blocks:
+        if block["type"] == "paragraph":
+            result.append(html.escape(block["text"]))
+        elif block["type"] == "blockquote":
+            result.extend(html.escape(p["text"]) for p in block["blocks"])
+        else:
+            result.extend(html.escape(item) for item in block["items"])
+    return result
+
+
+def _json_error(message):
+    raise SystemExit(f"invalid JSON input: {message}")
+
+
+def _validate_json_block(block, where):
+    if not isinstance(block, dict) or block.get("type") not in {
+        "paragraph", "blockquote", "list"
+    }:
+        _json_error(f"{where} has an illegal block type")
+    kind = block["type"]
+    if kind == "paragraph":
+        if not isinstance(block.get("text"), str):
+            _json_error(f"{where}.text must be a string")
+    elif kind == "list":
+        if (not isinstance(block.get("items"), list)
+                or any(not isinstance(item, str) for item in block["items"])):
+            _json_error(f"{where}.items must be a list of strings")
+    else:
+        children = block.get("blocks")
+        if not isinstance(children, list):
+            _json_error(f"{where}.blocks must be a list")
+        for i, child in enumerate(children):
+            if (not isinstance(child, dict)
+                    or child.get("type") != "paragraph"
+                    or not isinstance(child.get("text"), str)):
+                _json_error(f"{where}.blocks[{i}] must be a paragraph")
+
+
+def _validate_json_document(document):
+    if not isinstance(document, dict) or not isinstance(document.get("title"), str):
+        _json_error("root.title must be a string")
+    if "author" in document and not isinstance(document["author"], str):
+        _json_error("root.author must be a string")
+    preface = document.get("preface")
+    if not isinstance(preface, dict):
+        _json_error("preface must be an object")
+    required_preface = {"id", "kind", "parent_id", "title", "blocks"}
+    missing_preface = required_preface - preface.keys()
+    if missing_preface:
+        _json_error(f"preface missing field {sorted(missing_preface)[0]}")
+    if not isinstance(preface["id"], str) or not preface["id"]:
+        _json_error("preface.id must be a non-empty string")
+    if preface["kind"] != "preface":
+        _json_error("preface.kind must be 'preface'")
+    if preface["parent_id"] is not None:
+        _json_error("preface.parent_id must be null")
+    if not isinstance(preface["title"], str):
+        _json_error("preface.title must be a string")
+    if not isinstance(preface["blocks"], list):
+        _json_error("preface.blocks must be a list")
+    for i, block in enumerate(preface["blocks"]):
+        _validate_json_block(block, f"preface.blocks[{i}]")
+    sections = document.get("sections")
+    if not isinstance(sections, list):
+        _json_error("sections must be a list")
+    ids = {preface["id"]}
+    seen_chapters = set()
+    for i, section in enumerate(sections):
+        where = f"sections[{i}]"
+        if not isinstance(section, dict):
+            _json_error(f"{where} must be an object")
+        if "parent_id" not in section:
+            _json_error(f"{where}.parent_id is required")
+        sid = section.get("id")
+        if not isinstance(sid, str) or not sid or sid in ids:
+            _json_error(f"{where}.id is missing or duplicated")
+        ids.add(sid)
+        if section.get("kind") not in {"chapter", "discussion"}:
+            _json_error(f"{where}.kind must be 'chapter' or 'discussion'")
+        if not isinstance(section.get("title"), str):
+            _json_error(f"{where}.title must be a string")
+        if not isinstance(section.get("blocks"), list):
+            _json_error(f"{where}.blocks must be a list")
+        for j, block in enumerate(section["blocks"]):
+            _validate_json_block(block, f"{where}.blocks[{j}]")
+    for i, section in enumerate(sections):
+        parent = section.get("parent_id")
+        kind = section["kind"]
+        if kind == "discussion":
+            if parent not in seen_chapters:
+                _json_error(f"sections[{i}].parent_id must reference a previous top-level chapter")
+        elif parent is not None:
+            _json_error(f"sections[{i}].parent_id must be null for chapter")
+        if kind == "chapter":
+            seen_chapters.add(section["id"])
+    return preface, sections
+
+
 def xhtml_fragment(title: str, body: str) -> str:
     """Fragment for a preface/chapter: noteref <style> + <h1> + body.
 
@@ -469,10 +597,12 @@ class _StyledEpubHtml(epub.EpubHtml):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--md", default=str(SRC), help="输入全本 Markdown 文件（默认 Vox 全本）")
+    input_group = ap.add_mutually_exclusive_group()
+    input_group.add_argument("--md", help="输入全本 Markdown 文件（默认 Vox 全本）")
+    input_group.add_argument("--json", dest="json_path", help="输入结构化 JSON 文件")
     ap.add_argument("--out", default=str(OUT), help="输出 EPUB 文件（默认 Vox epub）")
-    ap.add_argument("--title", default=BOOK_TITLE, help="书名（默认 Vox Vitae（生命之声）中文全译本）")
-    ap.add_argument("--author", default=AUTHOR, help="作者署名（默认 Neablis 原著 / 社区翻译）")
+    ap.add_argument("--title", default=None, help="书名（显式值覆盖输入文件）")
+    ap.add_argument("--author", default=None, help="作者署名（显式值覆盖输入文件）")
     ap.add_argument("--glossary", default=None,
                     help="术语表 CSV（source,target）；缺省取 --md 同目录 glossary_zh-CN.csv"
                          "（Vox 默认即 vox_vitae_zh/glossary_zh-CN.csv）")
@@ -481,10 +611,11 @@ def main() -> None:
                          "文件不存在时跳过注释功能")
     args = ap.parse_args()
 
-    md_path = Path(args.md)
+    json_mode = args.json_path is not None
+    md_path = Path(args.md or SRC)
+    input_path = Path(args.json_path) if json_mode else md_path
     out_path = Path(args.out)
-    title = args.title
-    md_dir = md_path.resolve().parent
+    md_dir = input_path.resolve().parent
     # 术语表/注释默认跟随输入全本所在目录：Vox 运行解析到 vox_vitae_zh/…，
     # Colossus 运行解析到 colossus_zh/…（其 glossary_notes.csv 不存在 -> 功能跳过）。
     glossary_csv = Path(args.glossary) if args.glossary else md_dir / "glossary_zh-CN.csv"
@@ -492,30 +623,45 @@ def main() -> None:
         Path(args.glossary_notes) if args.glossary_notes else md_dir / "glossary_notes.csv"
     )
 
-    md_text = md_path.read_text(encoding="utf-8")
-    sections = split_sections(md_text)
-
-    # Section 0 is the book-title section -> preface (copyright + TOC).
-    if not sections:
-        raise SystemExit("no sections found in the markdown")
-    title0, body0 = sections[0]
-    assert title0 == title, f"unexpected first heading: {title0!r}"
-    chapters = sections[1:]
-    print(f"total '# ' sections: {len(sections)} (1 preface + {len(chapters)} chapters)")
-    print(f"preface: {PREFACE_TITLE}")
-    for idx, (t, _) in enumerate(chapters, 1):
-        print(f"  {idx:3d}. {t}")
+    if json_mode:
+        document = json.loads(input_path.read_text(encoding="utf-8"))
+        preface_data, json_sections = _validate_json_document(document)
+        title = args.title if args.title is not None else document["title"]
+        author = args.author if args.author is not None else document.get("author", AUTHOR)
+        body0 = json_blocks_to_html(preface_data["blocks"])
+        preface_title = preface_data["title"]
+        chapters = json_sections
+        print(f"total JSON sections: {len(chapters)} (explicit preface + sections)")
+    else:
+        title = args.title if args.title is not None else BOOK_TITLE
+        author = args.author if args.author is not None else AUTHOR
+        md_text = md_path.read_text(encoding="utf-8")
+        sections = split_sections(md_text)
+        # Section 0 is the book-title section -> preface (copyright + TOC).
+        if not sections:
+            raise SystemExit("no sections found in the markdown")
+        title0, body0 = sections[0]
+        assert title0 == title, f"unexpected first heading: {title0!r}"
+        preface_title = PREFACE_TITLE
+        chapters = sections[1:]
+        print(f"total '# ' sections: {len(sections)} (1 preface + {len(chapters)} chapters)")
+    print(f"preface: {preface_title}")
+    for idx, section in enumerate(chapters, 1):
+        print(f"  {idx:3d}. {section['title'] if json_mode else section[0]}")
 
     book = epub.EpubBook()
     book.set_identifier(out_path.stem)
     book.set_title(title)
     book.set_language(LANG)
-    book.add_author(args.author)
+    book.add_author(author)
 
     # Term footnotes: merge glossary_zh-CN.csv with glossary_notes.csv
     # (empty when the notes file is missing -> feature skipped, no crash).
     all_notes = load_glossary_notes(glossary_csv, glossary_notes_csv)
-    chapter_bodies = [body for _, body in chapters]
+    chapter_bodies = (
+        [section["blocks"] for section in chapters]
+        if json_mode else [body for _, body in chapters]
+    )
 
     # First pass: simulate the annotation pass exactly (same chapter/block
     # order, same first-occurrence replacement via _first_match_replace) to
@@ -534,7 +680,9 @@ def main() -> None:
             for src, tgt, note in all_notes
         ]
         chapter_blocks = [
-            [block for block in _iter_inline_blocks(body)] for body in chapter_bodies
+            (_json_inline_blocks(blocks) if json_mode
+             else list(_iter_inline_blocks(blocks)))
+            for blocks in chapter_bodies
         ]
         sim_t_placeholder = "\x00GLOSS_NOTE_0_T\x00"
         sim_s_placeholder = "\x00GLOSS_NOTE_0_S\x00"
@@ -589,37 +737,58 @@ def main() -> None:
 
     # preface chapter
     preface = _StyledEpubHtml(
-        title=PREFACE_TITLE,
+        title=preface_title,
         file_name="preface.xhtml",
         lang=LANG,
     )
-    preface.content = xhtml_fragment(title, markdown_to_html(body0))
+    preface_body = body0 if json_mode else markdown_to_html(body0)
+    preface.content = xhtml_fragment(preface_title, preface_body)
     book.add_item(preface)
 
     # chapters: annotate first in-book occurrences, then append each chapter's
     # popup-footnote asides (same document, so the noteref opens a popup).
     chapter_items = []
-    for idx, (title, body) in enumerate(chapters, 1):
+    chapter_by_id = {}
+    for idx, section in enumerate(chapters, 1):
+        section_title = section["title"] if json_mode else section[0]
+        section_body = section["blocks"] if json_mode else section[1]
         chap_key = f"chap_{idx:03d}"
         gloss.begin_chapter(
             chap_key, chapter_numbers[idx - 1] if chapter_numbers else {}
         )
         item = _StyledEpubHtml(
-            title=title,
+            title=section_title,
             file_name=f"{chap_key}.xhtml",
             lang=LANG,
         )
+        rendered = (json_blocks_to_html(section_body, gloss) if json_mode
+                    else markdown_to_html(section_body, gloss))
         item.content = xhtml_fragment(
-            title, markdown_to_html(body, gloss) + gloss.render_footnotes()
+            section_title, rendered + gloss.render_footnotes()
         )
         book.add_item(item)
         chapter_items.append(item)
+        if json_mode:
+            chapter_by_id[section["id"]] = item
 
-    book.toc = (
-        epub.Section(PREFACE_TITLE),
-        preface,
-        *chapter_items,
-    )
+    if json_mode:
+        toc_sections = []
+        for section, item in zip(chapters, chapter_items):
+            if section["kind"] == "discussion":
+                continue
+            children = [
+                (child_item, [])
+                for child, child_item in zip(chapters, chapter_items)
+                if child.get("parent_id") == section["id"]
+            ]
+            toc_sections.append((item, children))
+        book.toc = (epub.Section(preface_title), preface, *toc_sections)
+    else:
+        book.toc = (
+            epub.Section(preface_title),
+            preface,
+            *chapter_items,
+        )
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
     book.spine = ["nav", preface, *chapter_items]
@@ -630,10 +799,11 @@ def main() -> None:
     with zipfile.ZipFile(out_path) as z:
         names = z.namelist()
     size = out_path.stat().st_size
-    src_size = md_path.stat().st_size
+    src_size = input_path.stat().st_size
     print(f"wrote {out_path} ({size} bytes, {len(names)} zip entries)")
-    assert size > 30_000, "output too small"
-    assert size > 0.15 * src_size, "output implausibly small vs input"
+    if not json_mode:
+        assert size > 30_000, "output too small"
+        assert size > 0.15 * src_size, "output implausibly small vs input"
     assert "mimetype" in names and "META-INF/container.xml" in names
 
 
