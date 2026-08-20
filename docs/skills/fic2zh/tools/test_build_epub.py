@@ -122,6 +122,8 @@ class BuildEpubTests(unittest.TestCase):
             self.assertEqual(top_links[1].find("x:a", ns).get("href"), "chap_001.xhtml")
             self.assertEqual(top_links[1].find("x:ol/x:li/x:a", ns).get("href"), "chap_002.xhtml")
             self.assertEqual(top_links[2].find("x:a", ns).get("href"), "chap_003.xhtml")
+            self.assertIsNotNone(top_links[1].find("x:ol", ns))
+            self.assertIsNone(top_links[2].find("x:ol", ns))
             self.assertIn("chap_001.xhtml", nav)
             self.assertLess(nav.index("chap_001.xhtml"), nav.index("chap_002.xhtml"))
             chapter_link = nav.index('href="chap_001.xhtml"')
@@ -151,6 +153,24 @@ class BuildEpubTests(unittest.TestCase):
             self.assertIn("<dc:creator id=\"creator\">覆盖作者</dc:creator>", opf)
             nav = archive.read("EPUB/nav.xhtml").decode()
             self.assertNotIn("chap_002.xhtml", nav)
+            nav_root = etree.fromstring(nav.encode())
+            ns = {"x": "http://www.w3.org/1999/xhtml"}
+            toc = nav_root.find(".//x:nav", ns)
+            top_links = toc.find("x:ol", ns).findall("x:li", ns)
+            self.assertEqual(len(top_links), 2)
+            self.assertTrue(all(link.find("x:ol", ns) is None for link in top_links[1:]))
+
+    def test_json_discussion_nesting_only_for_explicit_children(self):
+        result, output = self._run_json(self._document())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with zipfile.ZipFile(io.BytesIO(output)) as archive:
+            nav = archive.read("EPUB/nav.xhtml").decode()
+            nav_root = etree.fromstring(nav.encode())
+            ns = {"x": "http://www.w3.org/1999/xhtml"}
+            toc = nav_root.find(".//x:nav", ns)
+            top_links = toc.find("x:ol", ns).findall("x:li", ns)
+            self.assertIsNotNone(top_links[1].find("x:ol", ns))
+            self.assertIsNone(top_links[2].find("x:ol", ns))
 
     def test_json_newlines_escape_and_markdown_inert(self):
         document = self._document(with_discussion=False)

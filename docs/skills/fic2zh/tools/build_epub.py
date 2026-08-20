@@ -787,7 +787,7 @@ def main() -> None:
                 for child, child_item in zip(chapters, chapter_items)
                 if child.get("parent_id") == section["id"]
             ]
-            toc_sections.append((item, children))
+            toc_sections.append((item, children) if children else item)
         book.toc = (epub.Section(preface_title), preface, *toc_sections)
     else:
         book.toc = (
