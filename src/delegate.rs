@@ -23,7 +23,10 @@ use serde_json::{Value, json};
 use crate::agent::{Agent, AgentEvent, CompactionMode, Tool, ToolOutput, ToolSpec, preview};
 use crate::config::SessionBackend;
 use crate::model::ConfiguredModel;
-use crate::runner::{IdlePolicy, SessionHandle, SessionResult, SessionRunner};
+use crate::runner::{
+    IdlePolicy, RecoveryBatch, RecoveryScope, SessionBootstrap, SessionHandle, SessionResult,
+    SessionRunner,
+};
 use crate::session_store::SessionStore;
 use crate::tools::{BackgroundTasks, TaskExit, new_exit_slot};
 use crate::workspace::Workspace;
@@ -379,11 +382,13 @@ impl Delegate {
             Vec<crate::agent::SessionEntry>,
             Vec<Option<crate::session_store::EntryLocation>>,
         )>,
+        bootstrap: Option<SessionBootstrap>,
         policy: IdlePolicy,
         finalize_wait: Option<std::time::Duration>,
         compaction_mode: CompactionMode,
     ) -> Result<(SessionHandle, crate::runner::SessionTask), String> {
         let model_name = model.display_name().to_owned();
+        let resumed = resume.is_some();
         let agents_instructions = workspace
             .read_to_string("AGENTS.md")
             .ok()
@@ -451,6 +456,36 @@ impl Delegate {
         let store = SessionStore::connect(&persist.backend, &persist.root, &persist.session_id)
             .await
             .map_err(|e| format!("subagent failed: {e:#}"))?;
+        let (own_recovery, delegate_recovery) = if resumed {
+            let own = store
+                .peek_unfinished_background(&persist.root, &persist.session_id)
+                .await
+                .map_err(|e| format!("cannot load unfinished tasks: {e:#}"))?;
+            let delegates = store
+                .peek_unfinished_background_for_subagent(&persist.root, &persist.session_id)
+                .await
+                .map_err(|e| format!("cannot load unfinished tasks: {e:#}"))?;
+            (own, delegates)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let bootstrap = bootstrap.unwrap_or(SessionBootstrap {
+            recovery_batches: [
+                (!own_recovery.is_empty()).then_some(RecoveryBatch {
+                    scope: RecoveryScope::Session,
+                    tasks: own_recovery,
+                }),
+                (!delegate_recovery.is_empty()).then_some(RecoveryBatch {
+                    scope: RecoveryScope::Subagent,
+                    tasks: delegate_recovery,
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            legacy: false,
+            initial_entries: Vec::new(),
+        });
         // 把 subagent 的后台 bash 任务记到它自己的 session 名下：after_tool_entry
         // 借此登记 subagent 的 bash 任务（此前 background_record 为 None，subagent
         // 的 bash 任务既不进 running_tasks 重启后丢失，面板也定位不到发起者）。
@@ -458,8 +493,16 @@ impl Delegate {
         // take_unfinished_background 按 session 消费（服务器僵尸扫描对子会话行组
         // 单独消费），与主会话路径兼容。
         agent.record_background_tasks_in(persist.root.clone(), &persist.session_id, store.clone());
-        let (runner, handle) =
-            SessionRunner::new(agent, store, persist.root, persist.session_id, policy);
+        let (runner, handle) = SessionRunner::new_with_bootstrap(
+            agent,
+            store,
+            persist.root,
+            persist.session_id,
+            policy,
+            bootstrap,
+        )
+        .await
+        .map_err(|e| format!("subagent bootstrap failed: {e:#}"))?;
         let runner = runner.with_finalize_wait(finalize_wait);
         let runner_task = runner.start(Some(task.task));
         Ok((handle, runner_task))
@@ -666,40 +709,11 @@ pub async fn spawn_btw_subagent(
         session_id: session_id.clone(),
         backend: backend.clone(),
     };
-    // Persist the fork entries into the fresh subagent session BEFORE the
-    // runner starts: the runner only appends new entries, restored history
-    // is never written back (the delegate `resume` path relies on the
-    // entries already living in the file). JSONL rewrite / Greptime append
-    // mirror the main-session fork path.
-    let fork_store = SessionStore::connect(&backend, &persist.root, &session_id)
-        .await
-        .map_err(|e| format!("btw fork failed: {e:#}"))?;
-    match &backend {
-        SessionBackend::Jsonl => fork_store
-            .rewrite(&persist.root, &session_id, &fork_entries)
-            .await
-            .map_err(|e| format!("btw fork failed: {e:#}"))?,
-        // Greptime: fresh session (no rows, next_seq = 0); append writes
-        // contiguous seqs with fresh timestamps (the fork marker's
-        // provenance fields are payload-only).
-        SessionBackend::Greptime { .. } => fork_store
-            .append(&persist.root, &session_id, &fork_entries)
-            .await
-            .map_err(|e| format!("btw fork failed: {e:#}"))?,
-        // SQLite: same append-only semantics as Greptime (a fresh session
-        // has no rows, so append writes contiguous seqs from 0).
-        SessionBackend::Sqlite { .. } => fork_store
-            .append(&persist.root, &session_id, &fork_entries)
-            .await
-            .map_err(|e| format!("btw fork failed: {e:#}"))?,
-    }
-    // The fork entries now live durably in the fresh session: load their
-    // exact physical located keys so the subagent's provider projections
-    // can issue receipts for oversized copied fields.
-    let located = fork_store
-        .load_located(&persist.root, &session_id)
-        .await
-        .map_err(|e| format!("btw fork failed: {e:#}"))?;
+    let fork_bootstrap = SessionBootstrap {
+        recovery_batches: Vec::new(),
+        legacy: false,
+        initial_entries: fork_entries,
+    };
     let (handle, runner_task) = Delegate::start_runner(
         model,
         context_window,
@@ -717,7 +731,8 @@ pub async fn spawn_btw_subagent(
             interactive: true,
         },
         persist,
-        Some((located.entries, located.locations)),
+        None,
+        Some(fork_bootstrap),
         IdlePolicy::WaitForInput,
         // A btw fork never finalizes on its own (WaitForInput), so the
         // finalize wait does not apply; keep the runner's default.
@@ -1009,9 +1024,9 @@ impl Tool for Delegate {
                 // removes finished ones), so a hit here always means "still
                 // running"; the subagent continues on its own and needs no
                 // resume. Cross-process rows are deliberately NOT consulted
-                // here: this path is the zombie-row recovery mechanism
-                // (`take_unfinished_background_for_subagent` below consumes
-                // them), so blocking on a surviving row would deadlock it.
+                // here: resume probes every persisted claim and proceeds only when all
+                // matching owners are definitely dead; otherwise it preserves
+                // the records for the live or unjudgeable owner.
                 if self
                     .sessions
                     .list()
@@ -1027,55 +1042,30 @@ impl Tool for Delegate {
                     .persist_root
                     .clone()
                     .ok_or("`resume` requires subagent session persistence (disabled in tests)")?;
-                // Connect a temporary store bound to the resumed session id
-                // so we load from the correct rows, not the main session's.
+                // Load the transcript first to distinguish a missing session from
+                // an existing session with recoverable claims. This is read-only.
                 let temp_store = SessionStore::connect(&self.persist_backend, &root, &id)
                     .await
                     .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
-                let mut located = temp_store
+                let located = temp_store
                     .load_located(&root, &id)
                     .await
                     .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
                 if located.entries.is_empty() {
                     return Err(format!("no such subagent session: `{id}`"));
                 }
-                // Consume any background-task records left by a process that
-                // died while this subagent's background delegates were
-                // running, so the resumed subagent knows what died with it.
-                // Greptime: the running_tasks table is global, so the lookup
-                // works across parent sessions. JSONL: records live only in
-                // the parent session's file (never a per-subagent file), so
-                // there is nothing to consume.
-                let unfinished = temp_store
-                    .take_unfinished_background_for_subagent(&root, &id)
+                let own_dead = temp_store
+                    .unfinished_owner_all_dead(&root, &id)
                     .await
-                    .map_err(|error| {
-                        format!("cannot load unfinished tasks for session `{id}`: {error:#}")
-                    })?;
-                if !unfinished.is_empty() {
-                    let notice = format!(
-                        "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
-                        unfinished.len(),
-                        unfinished.join("\n")
-                    );
-                    let entry = crate::agent::SessionEntry::Notice {
-                        text: notice.clone(),
-                    };
-                    // Persist immediately (mirrors the main-agent resume
-                    // path) so a crash-before-first-turn cannot inject the
-                    // same notice again on the next resume. The located key
-                    // rides along so the resumed subagent's projection can
-                    // issue a receipt for the notice.
-                    let notice_locations = temp_store
-                        .append_located(&root, &id, std::slice::from_ref(&entry))
-                        .await
-                        .map_err(|error| {
-                            format!("cannot persist resume notice for session `{id}`: {error:#}")
-                        })?;
-                    // Append (NOT restore_history, which would wipe the
-                    // resumed history).
-                    located.entries.push(entry);
-                    located.locations.push(notice_locations.into_iter().next());
+                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
+                let delegate_dead = temp_store
+                    .unfinished_owner_all_dead_for_subagent(&root, &id)
+                    .await
+                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
+                if !own_dead || !delegate_dead {
+                    return Err(format!(
+                        "cannot resume session `{id}`: unfinished task owner is still live or cannot be judged"
+                    ));
                 }
                 Some((id, located.entries, located.locations))
             }
@@ -1194,6 +1184,7 @@ impl Tool for Delegate {
             },
             persist,
             resume,
+            None,
             IdlePolicy::FinishWhenIdle,
             self.finalize_wait,
             CompactionMode::SingleTask,

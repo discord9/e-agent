@@ -24,7 +24,9 @@ use crate::config::{AuthMode, Config, ResolvedModel, Sandbox, resolve_sandbox};
 use crate::delegate::{Delegate, Sessions};
 use crate::mcp;
 use crate::model::{ConfiguredModel, OpenAiModel};
-use crate::runner::{IdlePolicy, SessionHandle, SessionRunner};
+use crate::runner::{
+    IdlePolicy, RecoveryBatch, RecoveryScope, SessionBootstrap, SessionHandle, SessionRunner,
+};
 use crate::session_store::SessionStore;
 use crate::tools::{BackgroundTasks, builtins_with_bash_timeout};
 use crate::workspace::Workspace;
@@ -63,7 +65,7 @@ pub enum UnfinishedPolicy {
 /// 直接 `apply_entry_located` 让后续 provider 投影能对 Notice 文本发 receipt）；
 /// 无记录返回 `None`。build_session 的 Consume 路径使用；server 启动时的
 /// 僵尸扫描已改为两遍汇总设计（只往父会话注入、子会话只消费不注入，见
-/// server.rs `scan_zombie_background_tasks`），不再调用本函数。
+/// server attach uses runner bootstrap instead，不再调用本函数。
 ///
 /// 只写存储、不要求 live agent：Notice 是普通持久化条目，会话下次
 /// `restore_history` 时自然读到。调用方若手头有刚建好的 agent（build
@@ -72,35 +74,7 @@ pub enum UnfinishedPolicy {
 ///
 /// 幂等性：记录被消费后 take 再取为空，重复调用返回 `None`；与并发
 /// resume 的竞态由消费的原子性保证——谁先 take 谁注入。
-pub(crate) async fn inject_killed_notice(
-    store: &SessionStore,
-    root: &Path,
-    session: &str,
-) -> anyhow::Result<Option<(SessionEntry, crate::session_store::EntryLocation)>> {
-    let unfinished = store.take_unfinished_background(root, session).await?;
-    if unfinished.is_empty() {
-        return Ok(None);
-    }
-    let notice = format!(
-        "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
-        unfinished.len(),
-        unfinished.join("\n")
-    );
-    let entry = SessionEntry::Notice {
-        text: notice.clone(),
-    };
-    // 立即持久化：注入后进程崩溃也不会在下次启动时重复注入（记录已被
-    // 消费，take 再取为空——天然幂等）。
-    let locations = store
-        .append_located(root, session, std::slice::from_ref(&entry))
-        .await?;
-    let location = locations
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("append_located returned no location for the injected notice"))?;
-    Ok(Some((entry, location)))
-}
-
+///
 /// Everything resolved once at startup and shared by every built session.
 pub struct SessionFactory {
     workspace: Workspace,
@@ -245,15 +219,6 @@ impl SessionFactory {
             .as_ref()
             .map(|c| c.session_backend())
             .unwrap_or_default();
-        // Migrate pre-session-id JSONL files unconditionally: the
-        // migration is idempotent and only touches `.e-agent/sessions/
-        // *.jsonl` legacy files, so it is harmless (and keeps the data
-        // bridge alive) for users on the SQLite/Greptime backends. The
-        // default backend is SQLite now, but a workspace may still hold
-        // legacy JSONL files from before the switch.
-        for (old, new) in crate::session::migrate_legacy(&root) {
-            eprintln!("e-agent: migrated session {old} -> {new}");
-        }
         // Web search reads EXA_API_KEY from the process env (tools.rs and
         // subagents pick it up there). When unset, fall back to the
         // `[web_search]` config section by injecting it into the env once at
@@ -631,8 +596,44 @@ impl SessionFactory {
         policy: IdlePolicy,
         unfinished: UnfinishedPolicy,
     ) -> anyhow::Result<SessionBuild> {
+        self.build_internal(id, fork_from, max_rounds, policy, unfinished, None)
+            .await
+    }
+
+    /// Build a server fork using the handler-reserved final session id.
+    /// Unlike the legacy CLI/TUI fork path, this never generates or replaces
+    /// the target id internally.
+    pub async fn build_fork(
+        &self,
+        target_id: &str,
+        source: String,
+        at: Option<usize>,
+        policy: IdlePolicy,
+        unfinished: UnfinishedPolicy,
+    ) -> anyhow::Result<SessionBuild> {
+        self.build_internal(
+            target_id,
+            Some((source, at)),
+            None,
+            policy,
+            unfinished,
+            Some(target_id),
+        )
+        .await
+    }
+
+    async fn build_internal(
+        &self,
+        id: &str,
+        fork_from: Option<(String, Option<usize>)>,
+        max_rounds: Option<usize>,
+        policy: IdlePolicy,
+        unfinished: UnfinishedPolicy,
+        fork_target: Option<&str>,
+    ) -> anyhow::Result<SessionBuild> {
         let mut session = id.to_owned();
         let mut store = SessionStore::connect(&self.backend, &self.root, &session).await?;
+        let mut bootstrap_entries = Vec::new();
         if let Some((source, at)) = fork_from {
             // Fork: copy the source session's history up to a completed-turn
             // boundary into a brand-new session id. The source is only read;
@@ -665,24 +666,11 @@ impl SessionFactory {
             let mut fork_entries = Vec::with_capacity(prefix.len() + 1);
             fork_entries.extend(prefix);
             fork_entries.push(marker);
-            let new_id = crate::session::new_id_prefixed("fork-");
+            let new_id = fork_target
+                .map(str::to_owned)
+                .unwrap_or_else(|| crate::session::new_id_prefixed("fork-"));
             store = SessionStore::connect(&self.backend, &self.root, &new_id).await?;
-            match self.backend {
-                // Atomic create-or-replace for a brand-new JSONL session file.
-                crate::config::SessionBackend::Jsonl => {
-                    store.rewrite(&self.root, &new_id, &fork_entries).await?
-                }
-                // Greptime: fresh session (no rows, next_seq = 0); append
-                // writes contiguous seqs with fresh timestamps. The marker's
-                // provenance fields are payload-only.
-                crate::config::SessionBackend::Greptime { .. } => {
-                    store.append(&self.root, &new_id, &fork_entries).await?
-                }
-                // SQLite: same append-only semantics as Greptime.
-                crate::config::SessionBackend::Sqlite { .. } => {
-                    store.append(&self.root, &new_id, &fork_entries).await?
-                }
-            }
+            bootstrap_entries = fork_entries;
             eprintln!("e-agent: forked session: {new_id}");
             session = new_id;
         }
@@ -805,24 +793,27 @@ impl SessionFactory {
         let legacy = loaded.legacy;
         agent.restore_located(loaded.entries, loaded.locations);
         agent.record_background_tasks_in(self.root.clone(), &session, store.clone());
-        if matches!(unfinished, UnfinishedPolicy::Consume) {
-            // Process-level startup only: the previous owner is dead, so its
-            // tasks really were killed with the process. Preserve skips this
-            // entirely — the server may be attaching to a session that is
-            // still live in another process, and that owner clears its own
-            // records via ack_background_entry → clear_background_task.
-            if let Some((entry, location)) =
-                inject_killed_notice(&store, &self.root, &session).await?
+        let recovery_labels = if matches!(unfinished, UnfinishedPolicy::Consume) {
+            store
+                .peek_unfinished_background(&self.root, &session)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let bootstrap = SessionBootstrap {
+            recovery_batches: if matches!(unfinished, UnfinishedPolicy::Consume)
+                && !recovery_labels.is_empty()
             {
-                // 共享函数已把 Notice 持久化到存储；这里再 apply 进刚建好的
-                // agent 内存历史（不是 restore_history，避免清掉恢复的历史），
-                // 让首轮 prompt 立即看到，并带上 located key 供投影发 receipt。
-                agent.apply_entry_located(entry, Some(location));
-            }
-        }
-        if legacy {
-            store.rewrite(&self.root, &session, agent.history()).await?;
-        }
+                vec![RecoveryBatch {
+                    scope: RecoveryScope::Session,
+                    tasks: recovery_labels,
+                }]
+            } else {
+                Vec::new()
+            },
+            legacy,
+            initial_entries: bootstrap_entries,
+        };
 
         if let Some(window) = main_context_window {
             agent.set_context_window(window);
@@ -846,13 +837,15 @@ impl SessionFactory {
                 None, // main sessions keep manual naming; title is a subagent-spawn concern
             )
             .await?;
-        let (runner, handle) = SessionRunner::new(
+        let (runner, handle) = SessionRunner::new_with_bootstrap(
             agent,
             store.clone(),
             self.root.clone(),
             session.clone(),
             policy,
-        );
+            bootstrap,
+        )
+        .await?;
         let runner = runner.with_finalize_wait(finalize_wait);
         Ok(SessionBuild {
             runner,

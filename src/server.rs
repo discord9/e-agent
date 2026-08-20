@@ -120,21 +120,12 @@ fn short_workspace_id(root: &std::path::Path) -> String {
     format!("{hash:08x}")
 }
 
-/// 一条「随进程被杀」汇总 Notice 的文本。`own` 是该会话自己的死行
-/// （已格式化的 `task {id}: {label}` 行）；`killed_subagents` 是
-/// （子会话 label, 该子会话的死 delegate 行数）列表——父会话把被杀子
-/// 会话汇总成一行。两者都为空 → `None`（扫描跳过，不注入空 Notice）。
-/// 头部 N 统计自己的任务 + 各子会话的 delegate 行数（每条 delegate 行
-/// 就是一个被杀的后台任务）。纯函数，便于单测。
+#[cfg(test)]
 fn killed_notice_text(own: &[String], killed_subagents: &[(String, usize)]) -> Option<String> {
     if own.is_empty() && killed_subagents.is_empty() {
         return None;
     }
-    let n = own.len()
-        + killed_subagents
-            .iter()
-            .map(|(_, count)| count)
-            .sum::<usize>();
+    let n = own.len() + killed_subagents.iter().map(|(_, n)| n).sum::<usize>();
     let mut text = format!(
         "[e-agent exited with {n} background task(s) still running; they were killed with the process. Re-run them if still needed:]"
     );
@@ -156,214 +147,6 @@ fn killed_notice_text(own: &[String], killed_subagents: &[(String, usize)]) -> O
     Some(text)
 }
 
-/// 启动时的僵尸后台任务扫描：上次进程退出时被杀的后台任务在重启后
-/// 静默消失（`/api/tasks` 只列 live registry，重启后恒空）。遍历
-/// list_meta 所有会话，探测未完成记录的全部 owner 是否已死
-/// （`unfinished_owner_all_dead`，任何不确定性保守 false）；**只往父
-/// 会话注入一条汇总 Notice，绝不复活子会话**（不向子会话 append 任何
-/// entry、不改 last_active_at、不留新内容）。
-///
-/// 两遍扫描：
-/// - 第一遍（只读探测，不消费）：每个会话的行组（`session_id = 该会话`）
-///   是否全死。parent_session_id 为空 → 父会话（死组记入 dead_main）；
-///   非空 → 子会话（死组记入 dead_child——通常为空，子会话只有被
-///   resume 后跑过 bash 才可能留下自己的行）。
-/// - 第二遍（消费 + 汇总）：
-///   1. 子会话名下的死 delegate 行（`subagent_session_id = 子会话`，
-///      物理上记在父会话的行组里）：父会话行组全死（dead_main）→ 这些
-///      行随父一起死，用 `take_unfinished_background_for_subagent` 消费
-///      （label 从侧边栏自然消失），label + 数量汇总到父会话；父会话
-///      已删（不在 list_meta）→ 该子会话的死行单独消费、无处汇总
-///      （eprintln 记录）。
-///   2. 子会话自己的死行组（dead_child）：take 消费，不注入任何 entry。
-///   3. 父会话（dead_main）：先 take 自己的死行（子会话的 delegate 行
-///      已被第 1 步消费，剩下的是自己的 bash 行 + 已删子会话的 delegate
-///      行），再拼上第 1 步的汇总 → 一条 Notice append。自己的死行与
-///      子会话汇总都为空 → 跳过。
-///
-/// 幂等性：所有消费都是原子 take（SQLite/Greptime DELETE、JSONL 删记录
-/// 文件），消费后下次扫描 take 为空、不再触发；与并发 resume 的竞态
-/// （两遍之间 resume 抢先把行消费掉）可接受——谁先 take 谁生效，与
-/// 现有幂等语义一致。探测用启动时独立连接的 workspace 级 meta store
-/// （session id 是参数）；只有需要消费+注入时才按会话 connect 一个 store。
-///
-/// JSONL 没有按 subagent_session_id 的消费原语
-/// （`take_unfinished_background_for_subagent` 恒空），子会话的 delegate
-/// 行随父会话自己的 take 一并消费，以旧格式 `(session: …)` 内联在父
-/// 会话的 Notice 里；「不注入子会话、label 消失、父会话单条 Notice」
-/// 的语义不变。任何单会话失败只 eprintln，不阻塞启动、不 panic。
-pub(crate) async fn scan_zombie_background_tasks(
-    meta_store: SessionStore,
-    backend: &crate::config::SessionBackend,
-    root: &std::path::Path,
-) {
-    let metas = match meta_store.list_meta(root).await {
-        Ok(metas) => metas,
-        Err(error) => {
-            eprintln!("e-agent: zombie scan: cannot list sessions: {error:#}");
-            return;
-        }
-    };
-    // 第一遍：只读探测，不消费任何行。
-    let mut all: HashSet<&str> = HashSet::new();
-    let mut dead_main: Vec<&str> = Vec::new(); // parent 为空（父会话）
-    let mut dead_child: Vec<&str> = Vec::new(); // parent 非空（子会话）
-    for meta in &metas {
-        all.insert(meta.session_id.as_str());
-        match meta_store
-            .unfinished_owner_all_dead(root, &meta.session_id)
-            .await
-        {
-            Ok(true) => match meta.parent_session_id {
-                None => dead_main.push(&meta.session_id),
-                Some(_) => dead_child.push(&meta.session_id),
-            },
-            Ok(false) => {} // 仍有存活 owner 或无法判定：留给 owner/Preserve 自行清理
-            Err(error) => {
-                eprintln!(
-                    "e-agent: zombie scan: cannot probe session {}: {error:#}",
-                    meta.session_id
-                );
-            }
-        }
-    }
-    // 第二遍 (1)：子会话名下的死 delegate 行。父会话行组全死 → 随父一起
-    // 死，消费并汇总到父；父会话已删（不在 list_meta）→ 单独消费、无处
-    // 汇总（eprintln 记录）。父会话在 list_meta 但行组未全死 → 跳过，
-    // 行留给 live 进程自行清理。
-    let dead_main_set: HashSet<&str> = dead_main.iter().copied().collect();
-    let mut children_summary: HashMap<&str, Vec<(String, usize)>> = HashMap::new();
-    for meta in &metas {
-        let Some(parent) = meta.parent_session_id.as_deref() else {
-            continue; // 父会话（parent 为空）在 (3) 处理
-        };
-        let parent_dead = dead_main_set.contains(parent);
-        if !parent_dead && all.contains(parent) {
-            continue;
-        }
-        let store = match SessionStore::connect(backend, root, &meta.session_id).await {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!(
-                    "e-agent: zombie scan: cannot connect session {}: {error:#}",
-                    meta.session_id
-                );
-                continue;
-            }
-        };
-        // 先取 label（消费后 label 查询就空了），再消费死行。
-        let label = match store.label_for_subagent(root, &meta.session_id).await {
-            Ok(label) => label.unwrap_or_else(|| meta.session_id.clone()),
-            Err(error) => {
-                eprintln!(
-                    "e-agent: zombie scan: cannot look up subagent label for session {}: {error:#}",
-                    meta.session_id
-                );
-                meta.session_id.clone()
-            }
-        };
-        let rows = match store
-            .take_unfinished_background_for_subagent(root, &meta.session_id)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                eprintln!(
-                    "e-agent: zombie scan: cannot consume subagent tasks for session {}: {error:#}",
-                    meta.session_id
-                );
-                continue;
-            }
-        };
-        if rows.is_empty() {
-            continue;
-        }
-        if parent_dead {
-            children_summary
-                .entry(parent)
-                .or_default()
-                .push((label, rows.len()));
-        } else {
-            eprintln!(
-                "e-agent: zombie scan: consumed {} killed delegate task(s) of orphan subagent {} (parent {} is gone from the session list)",
-                rows.len(),
-                meta.session_id,
-                parent
-            );
-        }
-    }
-    // 第二遍 (2)：子会话自己的死行组。消费（清理 label 与记录），但
-    // 不注入任何 entry——子会话不被复活。
-    for child in &dead_child {
-        let store = match SessionStore::connect(backend, root, child).await {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("e-agent: zombie scan: cannot connect session {child}: {error:#}");
-                continue;
-            }
-        };
-        if let Err(error) = store.take_unfinished_background(root, child).await {
-            eprintln!(
-                "e-agent: zombie scan: cannot consume own tasks of subagent session {child}: {error:#}"
-            );
-        }
-    }
-    // 第二遍 (3)：父会话。自己的死行 + 子会话汇总 → 一条 Notice。
-    let mut injected = 0usize;
-    for parent in dead_main {
-        let store = match SessionStore::connect(backend, root, parent).await {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("e-agent: zombie scan: cannot connect session {parent}: {error:#}");
-                continue;
-            }
-        };
-        let own = match store.take_unfinished_background(root, parent).await {
-            Ok(own) => own,
-            Err(error) => {
-                eprintln!(
-                    "e-agent: zombie scan: cannot consume own tasks of session {parent}: {error:#}"
-                );
-                continue;
-            }
-        };
-        let killed_subagents = children_summary.remove(parent).unwrap_or_default();
-        let Some(text) = killed_notice_text(&own, &killed_subagents) else {
-            continue; // 自己的死行与子会话汇总都为空：跳过
-        };
-        let entry = SessionEntry::Notice { text };
-        match store
-            .append(root, parent, std::slice::from_ref(&entry))
-            .await
-        {
-            Ok(()) => {
-                injected += 1;
-                eprintln!(
-                    "e-agent: zombie scan: injected killed-task notice into session {parent}"
-                );
-            }
-            Err(error) => {
-                eprintln!(
-                    "e-agent: zombie scan: cannot inject notice into session {parent}: {error:#}"
-                );
-            }
-        }
-    }
-    if injected > 0 {
-        eprintln!("e-agent: zombie scan: injected {injected} killed-task notice(s)");
-    }
-}
-
-/// Connect the metadata store dedicated to startup zombie recovery. It must
-/// not be a clone of the request store: Greptime clones share one client and
-/// therefore one request queue.
-async fn connect_zombie_scan_meta_store(
-    backend: &crate::config::SessionBackend,
-    root: &std::path::Path,
-) -> anyhow::Result<SessionStore> {
-    SessionStore::connect_meta(backend, root).await
-}
-
 /// Bind, authenticate, and serve until Ctrl-C. The factory is resolved once
 /// here and reused by every session `build()`.
 pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Result<()> {
@@ -373,21 +156,14 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
     // without restarting the server.
     factory.spawn_config_watcher();
     let token = load_or_create_token()?;
-    // Sessions-metadata store, connected once at bootstrap. Greptime/
-    // SQLite: create the audit table and run the one-time backfill of
-    // sessions that predate it (L3: never inside connect). Jsonl: the
-    // backfill writes first-line `.meta.jsonl` sidecars for transcripts
-    // that predate the sidecar format.
-    let meta_store = SessionStore::connect_meta(factory.backend(), factory.root()).await?;
-    meta_store
-        .backfill_sessions(factory.root())
-        .await
-        .context("cannot backfill session metadata")?;
+    // Metadata storage is opened lazily by request handlers. Startup must be
+    // storage-free: connecting SQLite/Greptime can run migrations/DDL.
     let state = Arc::new(AppState {
         factory,
         registry: Arc::new(SessionRegistry::default()),
         token,
-        meta_store,
+        #[cfg(test)]
+        meta_store: SessionStore::Jsonl,
         summaries: Arc::new(Mutex::new(HashMap::new())),
         summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
         shutdown: watch::channel(()).0,
@@ -411,33 +187,6 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
         short_workspace_id(state.factory.root()),
         std::process::id()
     );
-    // 僵尸后台任务扫描：使用独立的 workspace meta store，再 spawn 一个异步
-    // 任务，启动即扫（不等第一次请求）。这不能 clone state.meta_store：Greptime
-    // 的 clone 会共享同一个 tokio-postgres Client，扫描的批量探测会因此阻塞
-    // 正常的会话列表请求。JSONL 仍是无状态 store，SQLite 仍使用原有文件锁。
-    let scan_meta_store = match connect_zombie_scan_meta_store(
-        state.factory.backend(),
-        state.factory.root(),
-    )
-    .await
-    {
-        Ok(store) => Some(store),
-        Err(error) => {
-            // 扫描本来就是启动后的 best-effort recovery；保留该策略，但让
-            // failure visible instead of silently disabling recovery.
-            eprintln!(
-                "e-agent: zombie scan: cannot connect dedicated metadata store; recovery skipped: {error:#}"
-            );
-            None
-        }
-    };
-    if let Some(scan_meta_store) = scan_meta_store {
-        let scan_backend = state.factory.backend().clone();
-        let scan_root = state.factory.root().to_path_buf();
-        tokio::spawn(async move {
-            scan_zombie_background_tasks(scan_meta_store, &scan_backend, &scan_root).await;
-        });
-    }
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .with_context(|| format!("cannot bind {host}:{port}"))?;
@@ -513,9 +262,9 @@ pub struct AppState {
     pub factory: SessionFactory,
     pub registry: Arc<SessionRegistry>,
     pub token: String,
-    /// Workspace-scoped sessions-metadata store: historical sessions for
-    /// `GET /api/sessions` (Greptime/SQLite audit table, JSONL sidecar)
-    /// and `delete_meta` hiding.
+    /// Test-only compatibility field for direct router unit fixtures. Production
+    /// handlers always obtain the configured backend through `meta_store()`.
+    #[cfg(test)]
     pub meta_store: SessionStore,
     /// session_id -> (总结文本, 生成时间戳): written at the end of every
     /// turn with real activity, read by the desktop pet via
@@ -530,6 +279,13 @@ pub struct AppState {
     /// 毫秒级完成——`SHUTDOWN_DRAIN_TIMEOUT` 硬截止线因此只是兜底。
     /// 每个 SSE 连接通过 `subscribe()` 取自己的接收端。
     pub shutdown: watch::Sender<()>,
+}
+
+async fn meta_store(state: &AppState) -> anyhow::Result<SessionStore> {
+    match state.factory.backend() {
+        crate::config::SessionBackend::Jsonl => Ok(SessionStore::Jsonl),
+        _ => SessionStore::connect_meta(state.factory.backend(), state.factory.root()).await,
+    }
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -779,32 +535,76 @@ impl LiveSession {
 /// an atomic `attach()` (snapshot + live + status with no gap), so a shared
 /// fanout list would duplicate that mechanism ("one adapter, no seam").
 #[derive(Default)]
+struct RegistryInner {
+    live: HashMap<String, Arc<LiveSession>>,
+    creating: HashSet<String>,
+}
+
+#[derive(Default)]
 pub struct SessionRegistry {
-    inner: Mutex<HashMap<String, Arc<LiveSession>>>,
+    inner: Mutex<RegistryInner>,
+}
+
+pub struct SessionReservation {
+    registry: Arc<SessionRegistry>,
+    id: Option<String>,
 }
 
 impl SessionRegistry {
+    pub fn reserve(self: &Arc<Self>, id: &str) -> Result<SessionReservation, bool> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.live.contains_key(id) || !inner.creating.insert(id.to_owned()) {
+            return Err(inner.live.contains_key(id));
+        }
+        Ok(SessionReservation {
+            registry: self.clone(),
+            id: Some(id.to_owned()),
+        })
+    }
+
     pub fn insert(&self, id: String, session: Arc<LiveSession>) {
-        self.inner.lock().unwrap().insert(id, session);
+        let mut inner = self.inner.lock().unwrap();
+        inner.creating.remove(&id);
+        inner.live.insert(id, session);
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<LiveSession>> {
-        self.inner.lock().unwrap().get(id).cloned()
+        self.inner.lock().unwrap().live.get(id).cloned()
     }
 
     pub fn remove(&self, id: &str) -> Option<Arc<LiveSession>> {
-        self.inner.lock().unwrap().remove(id)
+        self.inner.lock().unwrap().live.remove(id)
     }
 
-    /// Snapshot of `(id, session)` pairs; the caller may hold them beyond a
-    /// registry lock.
+    /// Snapshot of live `(id, session)` pairs; creating sessions are omitted.
     pub fn list(&self) -> Vec<(String, Arc<LiveSession>)> {
         self.inner
             .lock()
             .unwrap()
+            .live
             .iter()
             .map(|(id, session)| (id.clone(), session.clone()))
             .collect()
+    }
+}
+
+impl SessionReservation {
+    pub fn publish(mut self, session: Arc<LiveSession>) {
+        let id = self
+            .id
+            .take()
+            .expect("session reservation already published");
+        let mut inner = self.registry.inner.lock().unwrap();
+        inner.creating.remove(&id);
+        inner.live.insert(id, session);
+    }
+}
+
+impl Drop for SessionReservation {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.registry.inner.lock().unwrap().creating.remove(&id);
+        }
     }
 }
 
@@ -1267,11 +1067,19 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
                 "ephemeral Greptime sessions read connection unavailable"
             ))
         } else {
-            state.meta_store.list_meta_with_diagnostics(root).await
+            async {
+                let store = meta_store(&state).await?;
+                store.list_meta_with_diagnostics(root).await
+            }
+            .await
         }
         #[cfg(not(feature = "greptime"))]
         {
-            state.meta_store.list_meta_with_diagnostics(root).await
+            async {
+                let store = meta_store(&state).await?;
+                store.list_meta_with_diagnostics(root).await
+            }
+            .await
         }
     };
     let historical = match historical_result {
@@ -1307,11 +1115,19 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
                 "ephemeral Greptime sessions read connection unavailable"
             ))
         } else {
-            state.meta_store.all_subagent_labels(root).await
+            async {
+                let store = meta_store(&state).await?;
+                store.all_subagent_labels(root).await
+            }
+            .await
         }
         #[cfg(not(feature = "greptime"))]
         {
-            state.meta_store.all_subagent_labels(root).await
+            async {
+                let store = meta_store(&state).await?;
+                store.all_subagent_labels(root).await
+            }
+            .await
         }
     };
     match labels_result {
@@ -1319,7 +1135,12 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
         Ok(None) => {
             for meta in &merged {
                 if meta.parent_session_id.is_some() {
-                    match state.meta_store.label_for_subagent(root, &meta.id).await {
+                    match async {
+                        let store = meta_store(&state).await?;
+                        store.label_for_subagent(root, &meta.id).await
+                    }
+                    .await
+                    {
                         Ok(label) => {
                             labels.insert(meta.id.clone(), label);
                         }
@@ -1433,12 +1254,19 @@ async fn create_session(
         }
         None => crate::session::new_id_prefixed("web-"),
     };
-    if state.registry.get(&id).is_some() {
-        return Err(error(
-            StatusCode::CONFLICT,
-            format!("session {id} already exists"),
-        ));
-    }
+    let reservation = match state.registry.reserve(&id) {
+        Ok(reservation) => reservation,
+        Err(live) => {
+            return Err(error(
+                StatusCode::CONFLICT,
+                if live {
+                    format!("session {id} already exists")
+                } else {
+                    format!("session {id} is currently being created")
+                },
+            ));
+        }
+    };
     // Resume guard (concurrent-write conflicts #46/#49): resuming a
     // subagent that is still running would build a SECOND runner over the
     // same session file — both would append, and Greptime/SQLite reject
@@ -1468,8 +1296,9 @@ async fn create_session(
     // (UnfinishedPolicy::Consume) or a delegate `resume` consumes them.
     let root = state.factory.root();
     if explicit_id
-        && state
-            .meta_store
+        && meta_store(&state)
+            .await
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
             .label_for_subagent(root, &id)
             .await
             .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
@@ -1489,8 +1318,9 @@ async fn create_session(
     // existing session's metadata first so a resumed session keeps its
     // original model in the web-facing live registry.
     let persisted_model = if explicit_id {
-        state
-            .meta_store
+        meta_store(&state)
+            .await
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
             .list_meta(root)
             .await
             .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
@@ -1512,7 +1342,7 @@ async fn create_session(
         role_name: built.role_name,
         created_at: chrono::Utc::now(),
     });
-    state.registry.insert(id.clone(), session.clone());
+    reservation.publish(session.clone());
     // 桌宠总结：每个 turn（Busy→Idle）结束时后台生成一句话中文总结并缓存。
     // 监听任务订阅 runner 的 status watch（不改 runner.rs）；会话删除/运行器
     // 退出（watch sender drop）时自动结束。
@@ -2019,18 +1849,24 @@ async fn session_title(
         // rename lands on the same rows the meta_store fallback would use.
         Ok(SessionRef::Subagent { entry, .. }) => entry.store.clone(),
         Err(_) => {
-            let historical = state
-                .meta_store
-                .list_meta(root)
-                .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let historical = {
+                let store = meta_store(&state)
+                    .await
+                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                store
+                    .list_meta(root)
+                    .await
+                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+            };
             if !historical.iter().any(|m| m.session_id == id) {
                 return Err(error(
                     StatusCode::NOT_FOUND,
                     format!("session {id} not found"),
                 ));
             }
-            state.meta_store.clone()
+            meta_store(&state)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
         }
     };
     store
@@ -2063,18 +1899,24 @@ async fn session_pin(
         Ok(SessionRef::Live(session)) => session.store.clone(),
         Ok(SessionRef::Subagent { entry, .. }) => entry.store.clone(),
         Err(_) => {
-            let historical = state
-                .meta_store
-                .list_meta(root)
-                .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let historical = {
+                let store = meta_store(&state)
+                    .await
+                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                store
+                    .list_meta(root)
+                    .await
+                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+            };
             if !historical.iter().any(|m| m.session_id == id) {
                 return Err(error(
                     StatusCode::NOT_FOUND,
                     format!("session {id} not found"),
                 ));
             }
-            state.meta_store.clone()
+            meta_store(&state)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
         }
     };
     store
@@ -2107,18 +1949,24 @@ async fn session_archive(
         Ok(SessionRef::Live(session)) => session.store.clone(),
         Ok(SessionRef::Subagent { entry, .. }) => entry.store.clone(),
         Err(_) => {
-            let historical = state
-                .meta_store
-                .list_meta(root)
-                .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let historical = {
+                let store = meta_store(&state)
+                    .await
+                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                store
+                    .list_meta(root)
+                    .await
+                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+            };
             if !historical.iter().any(|m| m.session_id == id) {
                 return Err(error(
                     StatusCode::NOT_FOUND,
                     format!("session {id} not found"),
                 ));
             }
-            state.meta_store.clone()
+            meta_store(&state)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
         }
     };
     store
@@ -2175,8 +2023,9 @@ async fn delete_session(
     // (Greptime/SQLite audit table; JSONL sidecar file). The transcript
     // stays, so a later resume still works.
     let root = state.factory.root();
-    state
-        .meta_store
+    meta_store(&state)
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
         .delete_meta(root, &id)
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
@@ -2205,10 +2054,11 @@ async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<TaskMeta>> {
             // 补上——数据持久化在 DB，重启后 UI 仍能显示完整命令。查不到
             // （行已消费/该字段缺失/NULL）保持 None，与旧行为一致。
             if meta.full_command.is_none() {
-                match state
-                    .meta_store
-                    .task_full_command(root, &session_id, meta.id)
-                    .await
+                match async {
+                    let store = meta_store(&state).await?;
+                    store.task_full_command(root, &session_id, meta.id).await
+                }
+                .await
                 {
                     Ok(Some(command)) => meta.full_command = Some(command),
                     Ok(None) => {}
@@ -2243,10 +2093,11 @@ const FINISHED_TASKS_LIMIT: usize = 100;
 
 async fn finished_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<FinishedTask>> {
     let root = state.factory.root();
-    match state
-        .meta_store
-        .finished_tasks(root, FINISHED_TASKS_LIMIT)
-        .await
+    match async {
+        let store = meta_store(&state).await?;
+        store.finished_tasks(root, FINISHED_TASKS_LIMIT).await
+    }
+    .await
     {
         Ok(tasks) => Json(tasks),
         Err(error) => {
@@ -2676,15 +2527,24 @@ async fn session_fork(
         Some(at) if at > 0 => at,
         _ => return Err(error(StatusCode::BAD_REQUEST, "at must be 1-based")),
     };
-    // Resolve the source first (404 before any build work); the store is
-    // only needed for the existence check — `build` re-connects by id.
+    // Reserve the final target before any factory await. The reservation
+    // covers source resolution, target connect, bootstrap, and publication.
+    let target_id = crate::session::new_id_prefixed("fork-");
+    let reservation = state.registry.reserve(&target_id).map_err(|_| {
+        error(
+            StatusCode::CONFLICT,
+            format!("session {target_id} was created concurrently"),
+        )
+    })?;
+    // Resolve the source (404 before target build work); the reservation is
+    // intentionally held while this awaited lookup completes.
     resolve_session_store(&state, &id).await?;
     let built = state
         .factory
-        .build(
-            &id,
-            Some((id.clone(), Some(at))),
-            None,
+        .build_fork(
+            &target_id,
+            id.clone(),
+            Some(at),
             IdlePolicy::WaitForInput,
             // Deliberately NOT the owner-liveness probe of `build_session`:
             // this builds a brand-new `fork-…` session. Unfinished
@@ -2705,6 +2565,7 @@ async fn session_fork(
             }
         })?;
     let new_id = built.session.clone();
+    debug_assert_eq!(new_id, target_id);
     let session = Arc::new(LiveSession {
         handle: built.handle,
         task: built.runner.start(None),
@@ -2715,7 +2576,7 @@ async fn session_fork(
         role_name: built.role_name,
         created_at: chrono::Utc::now(),
     });
-    state.registry.insert(new_id.clone(), session);
+    reservation.publish(session);
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "id": new_id })),
@@ -2837,17 +2698,20 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
     // 角色的 profile_key（与 create_meta 存 model 的取法一致）。
     if let Some(usage) = usage {
         let model_name = state.factory.summarizer_model().profile_key();
-        if let Err(error) = state
-            .meta_store
-            .append_usage(
-                state.factory.root(),
-                id,
-                &model_name,
-                "summarizer",
-                None,
-                &usage,
-            )
-            .await
+        if let Err(error) = async {
+            let store = meta_store(state).await?;
+            store
+                .append_usage(
+                    state.factory.root(),
+                    id,
+                    &model_name,
+                    "summarizer",
+                    None,
+                    &usage,
+                )
+                .await
+        }
+        .await
         {
             eprintln!("e-agent: cannot record summarizer usage: {error:#}");
         }
@@ -3040,7 +2904,12 @@ async fn session_usage(
     // 子会话集合：元数据里 parent_session_id == id 的会话（含已结束的）。
     // list_meta 失败降级为只查本会话——用量行不应因元数据问题整体消失。
     let mut ids = vec![id.clone()];
-    match state.meta_store.list_meta(root).await {
+    match async {
+        let store = meta_store(&state).await?;
+        store.list_meta(root).await
+    }
+    .await
+    {
         Ok(metas) => {
             for meta in metas {
                 if meta.parent_session_id.as_deref() == Some(id.as_str()) {
@@ -3052,7 +2921,12 @@ async fn session_usage(
             eprintln!("e-agent: cannot list session metadata for usage: {error:#}");
         }
     }
-    let rows = match state.meta_store.usage_for_sessions(root, &ids).await {
+    let rows = match async {
+        let store = meta_store(&state).await?;
+        store.usage_for_sessions(root, &ids).await
+    }
+    .await
+    {
         Ok(rows) => rows,
         Err(error) => {
             eprintln!("e-agent: cannot query session usage: {error:#}");
@@ -3496,38 +3370,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn zombie_scan_gets_a_distinct_metadata_store_connection() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("sessions.db");
-        let backend = crate::config::SessionBackend::Sqlite {
-            path: Some(path.to_string_lossy().into_owned()),
-        };
-        let request_store = SessionStore::connect_meta(&backend, dir.path())
-            .await
-            .expect("request metadata store");
-        let scan_store = connect_zombie_scan_meta_store(&backend, dir.path())
-            .await
-            .expect("scan metadata store");
-        match (request_store, scan_store) {
-            (
-                SessionStore::Sqlite {
-                    session: request_session,
-                    ..
-                },
-                SessionStore::Sqlite {
-                    session: scan_session,
-                    ..
-                },
-            ) => assert!(
-                !Arc::ptr_eq(&request_session, &scan_session),
-                "startup scan must not receive a clone of the request metadata store"
-            ),
-            _ => panic!("expected SQLite metadata stores"),
-        }
     }
 
     #[test]
@@ -5560,6 +5402,34 @@ model = "deepseek-chat"
             .await
             .expect("event frame fits");
         String::from_utf8(bytes.to_vec()).expect("event frame is utf-8")
+    }
+
+    #[test]
+    fn registry_reservation_is_scoped_and_invisible_until_published() {
+        let registry = Arc::new(SessionRegistry::default());
+        let reservation = registry.reserve("creating").unwrap();
+        assert!(registry.list().is_empty());
+        assert!(registry.get("creating").is_none());
+        assert!(registry.reserve("creating").is_err());
+        drop(reservation);
+        assert!(registry.reserve("creating").is_ok());
+    }
+
+    #[test]
+    fn registry_reservation_allows_only_one_builder() {
+        let registry = Arc::new(SessionRegistry::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let other = registry.clone();
+        let gate = barrier.clone();
+        let thread = std::thread::spawn(move || {
+            let reservation = other.reserve("barrier").unwrap();
+            gate.wait();
+            reservation
+        });
+        barrier.wait();
+        assert!(registry.reserve("barrier").is_err());
+        drop(thread.join().unwrap());
+        assert!(registry.reserve("barrier").is_ok());
     }
 
     #[tokio::test]

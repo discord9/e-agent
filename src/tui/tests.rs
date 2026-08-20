@@ -4353,7 +4353,11 @@ fn fork_session_file(root: &std::path::Path) -> Option<std::path::PathBuf> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("fork-") && name.ends_with(".jsonl"))
+                .is_some_and(|name| {
+                    name.starts_with("fork-")
+                        && name.ends_with(".jsonl")
+                        && !name.ends_with(".meta.jsonl")
+                })
         })
         .collect();
     assert!(
@@ -4369,6 +4373,9 @@ fn fork_state(root: &std::path::Path, session_id: &str) -> TuiState {
     TuiState {
         store: Some(crate::session_store::SessionStore::Jsonl),
         backend: Some(crate::config::SessionBackend::Jsonl),
+        factory: Some(std::sync::Arc::new(
+            crate::session_factory::SessionFactory::test_factory(root.to_path_buf()),
+        )),
         root: root.to_path_buf(),
         session_id: session_id.to_string(),
         ..Default::default()

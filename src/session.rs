@@ -111,6 +111,18 @@ pub fn migrate_legacy(root: &Path) -> Vec<(String, String)> {
     migrated
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnfinishedTask {
+    pub task_id: u64,
+    pub label: String,
+    pub subagent_session_id: Option<String>,
+    pub session_id: Option<String>,
+    pub owner_identity: Option<String>,
+    pub started_at: Option<i64>,
+    /// JSONL has no task timestamp column; the raw record identifies the exact line.
+    pub raw: Option<String>,
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct LegacySession {
     version: u32,
@@ -461,6 +473,14 @@ impl Session {
         let directory = path.parent().unwrap();
         std::fs::create_dir_all(directory)
             .with_context(|| format!("cannot create session directory {}", directory.display()))?;
+        let lock_path = path.with_extension("jsonl.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        lock_jsonl_exclusive(&lock_file, "transcript rewrite")?;
         let temporary = directory.join(format!(".{name}.{}.tmp", std::process::id()));
         {
             let mut file = std::fs::File::create(&temporary)
@@ -492,6 +512,21 @@ impl Session {
     /// 持久化在 JSONL 的 `"full_command"` 字段里，旧记录没有该字段 → 读回
     /// `None`（兼容）。`take_unfinished_background` 消费时仍只回 label
     /// （Notice 文本不变），完整命令通过 [`Self::task_full_command`] 单独取。
+    fn background_mutation_lock(root: &Path, session: &str) -> anyhow::Result<std::fs::File> {
+        let path = background_record_path(root, session)?.with_extension("jsonl.lock");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        lock_jsonl_exclusive(&file, "background mutation")?;
+        Ok(file)
+    }
+
     pub fn record_background_start(
         root: &Path,
         session: &str,
@@ -501,6 +536,7 @@ impl Session {
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let path = background_record_path(root, session)?;
+        let _lock = Self::background_mutation_lock(root, session)?;
         let directory = path.parent().unwrap();
         std::fs::create_dir_all(directory)?;
         #[cfg(unix)]
@@ -530,16 +566,41 @@ impl Session {
         Ok(())
     }
 
+    fn rewrite_background_file(path: &Path, lines: &[String]) -> anyhow::Result<()> {
+        if lines.is_empty() {
+            let _ = std::fs::remove_file(path);
+            return Ok(());
+        }
+        let temporary = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
+        let mut file = std::fs::File::create(&temporary)?;
+        for line in lines {
+            writeln!(file, "{line}")?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    }
+
     /// Forget one task: its completion arrived while the process was alive.
     pub fn clear_background_task(root: &Path, session: &str, id: u64) {
-        let Ok(path) = background_record_path(root, session) else {
-            return;
-        };
+        if let Err(error) = Self::clear_background_task_checked(root, session, id) {
+            eprintln!("e-agent: cannot clear JSONL background task: {error:#}");
+        }
+    }
+
+    pub(crate) fn clear_background_task_checked(
+        root: &Path,
+        session: &str,
+        id: u64,
+    ) -> anyhow::Result<()> {
+        let path = background_record_path(root, session)?;
+        let _lock = Self::background_mutation_lock(root, session)?;
         let Ok(file) = std::fs::File::open(&path) else {
-            return;
+            return Ok(());
         };
         let mut kept = Vec::new();
-        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line?;
             let matches = serde_json::from_str::<serde_json::Value>(&line)
                 .ok()
                 .and_then(|record| record["id"].as_u64())
@@ -548,44 +609,123 @@ impl Session {
                 kept.push(line);
             }
         }
-        if kept.is_empty() {
-            let _ = std::fs::remove_file(&path);
-            return;
-        }
-        if let Ok(mut file) = std::fs::File::create(&path) {
-            for line in kept {
-                let _ = writeln!(file, "{line}");
-            }
-            let _ = file.sync_all();
-        }
+        Self::rewrite_background_file(&path, &kept)
     }
 
-    /// Tasks recorded by a previous process that died before their
-    /// completion arrived. Consumes the file; the caller injects the
-    /// returned labels into the new session so the model can react
-    /// (re-run the commands, apologize, ...). Only this session's own
-    /// records are returned; other sessions' files are untouched.
-    pub fn take_unfinished_background(root: &Path, session: &str) -> Vec<String> {
+    /// Read unfinished records without changing them. Each returned record is
+    /// an exact consume token, not merely display text.
+    pub(crate) fn peek_unfinished_background(root: &Path, session: &str) -> Vec<UnfinishedTask> {
         let Ok(path) = background_record_path(root, session) else {
             return Vec::new();
         };
         let Ok(file) = std::fs::File::open(&path) else {
             return Vec::new();
         };
-        let mut labels = Vec::new();
-        for line in std::io::BufReader::new(file).lines() {
+        let mut tasks = Vec::new();
+        for (occurrence, line) in std::io::BufReader::new(file).lines().enumerate() {
             let Ok(line) = line else { break };
             if line.trim().is_empty() {
                 continue;
             }
             if let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) {
-                let id = record["id"].as_u64().unwrap_or(0);
-                let label = record["label"].as_str().unwrap_or("?");
-                let sid = record["session_id"].as_str();
-                labels.push(format_unfinished(id, label, sid));
+                tasks.push(UnfinishedTask {
+                    task_id: record["id"].as_u64().unwrap_or(0),
+                    label: record["label"].as_str().unwrap_or("?").to_owned(),
+                    subagent_session_id: record["session_id"].as_str().map(str::to_owned),
+                    session_id: Some(session.to_owned()),
+                    owner_identity: record["owner"].as_str().map(str::to_owned),
+                    started_at: None,
+                    raw: Some(background_token(session, occurrence, &line)),
+                });
             }
         }
-        let _ = std::fs::remove_file(&path);
+        tasks
+    }
+
+    /// Consume only the exact records returned by a preceding peek.
+    pub(crate) fn consume_unfinished_background(
+        root: &Path,
+        session: &str,
+        tasks: &[UnfinishedTask],
+    ) -> anyhow::Result<()> {
+        let path = background_record_path(root, session)?;
+        let mut wanted = std::collections::HashMap::<(String, usize), String>::new();
+        for task in tasks {
+            let token = task
+                .raw
+                .as_deref()
+                .ok_or_else(|| anyhow!("missing JSONL unfinished-task token"))?;
+            let (file_session, occurrence, line) = parse_background_token(token)?;
+            if wanted.insert((file_session, occurrence), line).is_some() {
+                return Err(anyhow!("duplicate JSONL unfinished-task token"));
+            }
+        }
+        let mut files = Vec::new();
+        if path.exists() {
+            files.push((session.to_owned(), path));
+        }
+        for entry in std::fs::read_dir(root.join(".e-agent/sessions"))? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(file_session) = name.strip_suffix(".background.jsonl")
+                && file_session != session
+                && wanted.keys().any(|(s, _)| s == file_session)
+            {
+                files.push((file_session.to_owned(), entry.path()));
+            }
+        }
+        let mut lock_sessions: Vec<String> = wanted.keys().map(|(s, _)| s.clone()).collect();
+        lock_sessions.sort();
+        lock_sessions.dedup();
+        let _locks: Vec<_> = lock_sessions
+            .iter()
+            .map(|session| Self::background_mutation_lock(root, session))
+            .collect::<anyhow::Result<_>>()?;
+        let mut found = std::collections::HashSet::new();
+        let mut rewrites = Vec::new();
+        for (file_session, file_path) in files {
+            let file = std::fs::File::open(&file_path)?;
+            let mut kept = Vec::new();
+            for (occurrence, line) in std::io::BufReader::new(file).lines().enumerate() {
+                let line = line?;
+                let key = (file_session.clone(), occurrence);
+                if line.trim().is_empty() {
+                    if wanted.contains_key(&key) {
+                        return Err(anyhow!("JSONL unfinished-task token changed"));
+                    }
+                    kept.push(line);
+                    continue;
+                }
+                if let Some(expected) = wanted.get(&key) {
+                    if expected != &line {
+                        return Err(anyhow!("JSONL unfinished-task token changed"));
+                    }
+                    found.insert(key);
+                    continue;
+                }
+                kept.push(line);
+            }
+            if wanted.keys().any(|(s, _)| s == &file_session) {
+                rewrites.push((file_path, kept));
+            }
+        }
+        if found.len() != wanted.len() {
+            return Err(anyhow!("JSONL unfinished-task token missing or ambiguous"));
+        }
+        for (file_path, kept) in rewrites {
+            Self::rewrite_background_file(&file_path, &kept)?;
+        }
+        Ok(())
+    }
+
+    /// Compatibility wrapper retained for unit tests that exercise the old API.
+    pub fn take_unfinished_background(root: &Path, session: &str) -> Vec<String> {
+        let tasks = Self::peek_unfinished_background(root, session);
+        let labels = tasks
+            .iter()
+            .map(|t| format_unfinished(t.task_id, &t.label, t.subagent_session_id.as_deref()))
+            .collect();
+        let _ = Self::consume_unfinished_background(root, session, &tasks);
         labels
     }
 
@@ -633,6 +773,55 @@ impl Session {
     /// carries an owner that is definitely dead returns true. A
     /// missing/unreadable file returns true: no records means nothing to
     /// consume (the Consume path is a no-op).
+    pub(crate) fn peek_unfinished_background_for_subagent(
+        root: &Path,
+        subagent: &str,
+    ) -> anyhow::Result<Vec<UnfinishedTask>> {
+        let dir = root.join(".e-agent/sessions");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(parent) = name.strip_suffix(".background.jsonl") else {
+                continue;
+            };
+            let file = std::fs::File::open(entry.path())?;
+            for (occurrence, line) in std::io::BufReader::new(file).lines().enumerate() {
+                let line = line?;
+                let record: serde_json::Value = serde_json::from_str(&line)?;
+                if record["session_id"].as_str() != Some(subagent) {
+                    continue;
+                }
+                out.push(UnfinishedTask {
+                    task_id: record["id"].as_u64().unwrap_or(0),
+                    label: record["label"].as_str().unwrap_or("?").to_owned(),
+                    subagent_session_id: Some(subagent.to_owned()),
+                    session_id: Some(parent.to_owned()),
+                    owner_identity: record["owner"].as_str().map(str::to_owned),
+                    started_at: None,
+                    raw: Some(background_token(parent, occurrence, &line)),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn unfinished_owner_all_dead_for_subagent(root: &Path, subagent: &str) -> bool {
+        let Ok(tasks) = Self::peek_unfinished_background_for_subagent(root, subagent) else {
+            return false;
+        };
+        tasks.iter().all(|task| {
+            task.owner_identity.as_deref().is_some_and(|owner| {
+                !owner.contains("@unknown#") && !crate::session_store::owner_alive(owner)
+            })
+        })
+    }
+
     pub fn unfinished_owner_all_dead(root: &Path, session: &str) -> bool {
         let Ok(path) = background_record_path(root, session) else {
             return true;
@@ -678,6 +867,27 @@ pub(crate) fn format_unfinished(
     }
 }
 
+fn background_token(session: &str, occurrence: usize, line: &str) -> String {
+    format!("{session}\0{occurrence}\0{line}")
+}
+
+fn parse_background_token(token: &str) -> anyhow::Result<(String, usize, String)> {
+    let mut parts = token.splitn(3, '\0');
+    let session = parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid JSONL token"))?
+        .to_owned();
+    let occurrence = parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid JSONL token"))?
+        .parse()?;
+    let line = parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid JSONL token"))?
+        .to_owned();
+    Ok((session, occurrence, line))
+}
+
 fn background_record_path(root: &Path, session: &str) -> anyhow::Result<std::path::PathBuf> {
     if session.is_empty()
         || !session
@@ -710,19 +920,66 @@ fn session_path(root: &Path, name: &str, extension: &str) -> anyhow::Result<std:
 /// for the whole count+serialize+append+sync+location window so the
 /// counted ordinal base is the true physical position even with
 /// concurrent writers.
-#[cfg(unix)]
-fn lock_session_append(file: &std::fs::File, path: &Path) -> anyhow::Result<()> {
-    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive)
-        .with_context(|| format!("cannot lock session file {}", path.display()))
+fn lock_jsonl_exclusive(file: &std::fs::File, what: &str) -> anyhow::Result<()> {
+    lock_platform_exclusive(file).with_context(|| format!("cannot lock JSONL {what} file"))
 }
 
-#[cfg(not(unix))]
-fn lock_session_append(_file: &std::fs::File, _path: &Path) -> anyhow::Result<()> {
-    // No flock on non-Unix platforms: the count-then-append window is
-    // serialized only within this process. Cross-process JSONL appends on
-    // Windows remain best-effort (documented limitation of the legacy
-    // file backend).
+#[cfg(unix)]
+fn lock_platform_exclusive(file: &std::fs::File) -> anyhow::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn lock_platform_exclusive(file: &std::fs::File) -> anyhow::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut std::ffi::c_void,
+    }
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
+    // SAFETY: The declaration matches the Windows API ABI; the handle and
+    // OVERLAPPED pointer remain valid for the synchronous call.
+    unsafe extern "system" {
+        fn LockFileEx(
+            handle: *mut std::ffi::c_void,
+            flags: u32,
+            reserved: u32,
+            low: u32,
+            high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        event: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as *mut _,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_platform_exclusive(_file: &std::fs::File) -> anyhow::Result<()> {
+    anyhow::bail!("JSONL transcript locking is unsupported on this platform")
 }
 
 /// Serialize + append one batch to a JSONL session file under ONE
@@ -743,13 +1000,21 @@ fn append_batch_locked(
         .with_context(|| format!("cannot create session directory {}", directory.display()))?;
     #[cfg(unix)]
     let created = !path.exists();
+    let lock_path = path.with_extension("jsonl.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("cannot lock session {}", path.display()))?;
+    lock_jsonl_exclusive(&lock_file, "transcript mutation")?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .read(true)
         .open(&path)
         .with_context(|| format!("cannot append session {}", path.display()))?;
-    lock_session_append(&file, &path)?;
     // Count through the locked fd: the count is the ordinal base of the
     // lines this batch appends. After the count the fd is at EOF and
     // writes go to the physical end (O_APPEND).
@@ -1197,6 +1462,95 @@ mod tests {
             temp.path(),
             "dead-probe"
         ));
+    }
+
+    #[test]
+    fn jsonl_parent_claim_liveness_is_conservative() {
+        let temp = tempfile::tempdir().unwrap();
+        Session::record_background_start(temp.path(), "parent", 1, "delegate", None, Some("sub"))
+            .unwrap();
+        assert!(!Session::unfinished_owner_all_dead_for_subagent(
+            temp.path(),
+            "sub"
+        ));
+        let path = temp
+            .path()
+            .join(".e-agent/sessions/parent.background.jsonl");
+        std::fs::write(
+            &path,
+            "{\"id\":1,\"label\":\"delegate\",\"session_id\":\"sub\"}\n",
+        )
+        .unwrap();
+        assert!(!Session::unfinished_owner_all_dead_for_subagent(
+            temp.path(),
+            "sub"
+        ));
+    }
+
+    #[test]
+    fn jsonl_exact_consume_preserves_identical_appended_record() {
+        let temp = tempfile::tempdir().unwrap();
+        Session::record_background_start(temp.path(), "same", 1, "x", None, None).unwrap();
+        let tasks = Session::peek_unfinished_background(temp.path(), "same");
+        Session::record_background_start(temp.path(), "same", 1, "x", None, None).unwrap();
+        Session::consume_unfinished_background(temp.path(), "same", &tasks).unwrap();
+        let remaining =
+            std::fs::read_to_string(temp.path().join(".e-agent/sessions/same.background.jsonl"))
+                .unwrap();
+        assert_eq!(remaining.lines().count(), 1);
+    }
+
+    #[test]
+    fn jsonl_exact_consume_rejects_changed_or_missing_token() {
+        let temp = tempfile::tempdir().unwrap();
+        Session::record_background_start(temp.path(), "bad", 1, "x", None, None).unwrap();
+        let mut tasks = Session::peek_unfinished_background(temp.path(), "bad");
+        std::fs::write(
+            temp.path().join(".e-agent/sessions/bad.background.jsonl"),
+            "changed\n",
+        )
+        .unwrap();
+        assert!(Session::consume_unfinished_background(temp.path(), "bad", &tasks).is_err());
+        tasks[0].raw = Some("bad\099\0missing".into());
+        assert!(Session::consume_unfinished_background(temp.path(), "bad", &tasks).is_err());
+    }
+    #[test]
+    fn jsonl_corrupt_parent_claim_blocks_owner_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".e-agent/sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("parent.background.jsonl"), "not-json\n").unwrap();
+        assert!(!Session::unfinished_owner_all_dead_for_subagent(
+            temp.path(),
+            "sub"
+        ));
+    }
+
+    #[test]
+    fn jsonl_later_file_token_failure_leaves_earlier_file_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        Session::record_background_start(temp.path(), "parent-a", 1, "a", None, Some("sub"))
+            .unwrap();
+        Session::record_background_start(temp.path(), "parent-b", 2, "b", None, Some("sub"))
+            .unwrap();
+        let a_before = std::fs::read_to_string(
+            temp.path()
+                .join(".e-agent/sessions/parent-a.background.jsonl"),
+        )
+        .unwrap();
+        let mut tasks =
+            Session::peek_unfinished_background_for_subagent(temp.path(), "sub").unwrap();
+        tasks.sort_by_key(|task| task.session_id.clone());
+        tasks[1].raw = Some("parent-b\099\0changed".to_owned());
+        assert!(Session::consume_unfinished_background(temp.path(), "parent-a", &tasks).is_err());
+        assert_eq!(
+            std::fs::read_to_string(
+                temp.path()
+                    .join(".e-agent/sessions/parent-a.background.jsonl")
+            )
+            .unwrap(),
+            a_before
+        );
     }
 
     #[test]

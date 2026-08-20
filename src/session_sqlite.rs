@@ -2465,59 +2465,127 @@ impl SqliteSession {
     /// completion arrived. Consumes (deletes) all rows for the session and
     /// returns the labels so the caller can inject the "killed on exit"
     /// notice. Rows scoped to another session are untouched.
-    pub async fn take_unfinished_tasks(&self, session_id: &str) -> Result<Vec<String>, String> {
+    pub(crate) async fn peek_unfinished_tasks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::session::UnfinishedTask>, String> {
         let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT task_id, label, subagent_session_id FROM running_tasks \
-                 WHERE workspace_id = ?1 AND session_id = ?2",
-                (self.workspace_id.as_str(), session_id),
-            )
-            .await
-            .map_err(|e| format!("cannot load unfinished background tasks: {e}"))?;
-        let mut labels = Vec::new();
-        let mut non_empty = false;
+        let mut rows = conn.query("SELECT task_id, label, subagent_session_id, started_at_us FROM running_tasks WHERE workspace_id = ?1 AND session_id = ?2", (self.workspace_id.as_str(), session_id)).await.map_err(|e| format!("cannot load unfinished background tasks: {e}"))?;
+        let mut tasks = Vec::new();
         while let Some(row) = rows
             .next()
             .await
             .map_err(|e| format!("cannot load unfinished background tasks: {e}"))?
         {
-            non_empty = true;
             let task_id = row
                 .get_value(0)
-                .map_err(|e| format!("cannot load unfinished background tasks: {e}"))?
+                .map_err(|e| e.to_string())?
                 .as_integer()
                 .copied()
-                .ok_or_else(|| {
-                    "cannot load unfinished background tasks: task_id is not an integer".to_string()
-                })?;
+                .unwrap_or_default();
             let label = row
                 .get_value(1)
-                .map_err(|e| format!("cannot load unfinished background tasks: {e}"))?
+                .map_err(|e| e.to_string())?
                 .as_text()
                 .cloned()
-                .ok_or_else(|| {
-                    "cannot load unfinished background tasks: label is not text".to_string()
-                })?;
-            let subagent = row
+                .unwrap_or_default();
+            let sub = row
                 .get_value(2)
-                .map_err(|e| format!("cannot load unfinished background tasks: {e}"))?
+                .map_err(|e| e.to_string())?
                 .as_text()
                 .cloned();
-            labels.push(crate::session::format_unfinished(
-                task_id.max(0) as u64,
-                &label,
-                subagent.as_deref(),
-            ));
+            let started = row
+                .get_value(3)
+                .map_err(|e| e.to_string())?
+                .as_integer()
+                .copied()
+                .unwrap_or_default();
+            tasks.push(crate::session::UnfinishedTask {
+                task_id: task_id.max(0) as u64,
+                label,
+                subagent_session_id: sub,
+                session_id: Some(session_id.to_owned()),
+                started_at: Some(started),
+                raw: None,
+                owner_identity: None,
+            });
         }
-        if non_empty {
-            conn.execute(
-                "DELETE FROM running_tasks \
-                 WHERE workspace_id = ?1 AND session_id = ?2",
-                (self.workspace_id.as_str(), session_id),
-            )
-            .await
-            .map_err(|e| format!("cannot clear unfinished background tasks: {e}"))?;
+        Ok(tasks)
+    }
+
+    pub(crate) async fn consume_unfinished_tasks(
+        &self,
+        session_id: &str,
+        tasks: &[crate::session::UnfinishedTask],
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        for task in tasks {
+            let subagent = task.subagent_session_id.as_deref();
+            let changed = if let Some(subagent) = subagent {
+                conn.execute("DELETE FROM running_tasks WHERE workspace_id = ?1 AND session_id = ?2 AND task_id = ?3 AND label = ?4 AND subagent_session_id = ?5 AND started_at_us = ?6", (self.workspace_id.as_str(), session_id, task.task_id as i64, task.label.as_str(), subagent, task.started_at.unwrap_or_default())).await
+            } else {
+                conn.execute("DELETE FROM running_tasks WHERE workspace_id = ?1 AND session_id = ?2 AND task_id = ?3 AND label = ?4 AND subagent_session_id IS NULL AND started_at_us = ?5", (self.workspace_id.as_str(), session_id, task.task_id as i64, task.label.as_str(), task.started_at.unwrap_or_default())).await
+            }.map_err(|e| format!("cannot clear unfinished background tasks: {e}"))?;
+            if changed == 0 {
+                return Err("unfinished background task consume matched no row".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn consume_unfinished_tasks_for_subagent(
+        &self,
+        id: &str,
+        tasks: &[crate::session::UnfinishedTask],
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        for task in tasks {
+            let Some(parent_session_id) = task.session_id.as_deref() else {
+                continue;
+            };
+            let changed = conn.execute("DELETE FROM running_tasks WHERE workspace_id = ?1 AND session_id = ?2 AND subagent_session_id = ?3 AND task_id = ?4 AND label = ?5 AND started_at_us = ?6", (self.workspace_id.as_str(), parent_session_id, id, task.task_id as i64, task.label.as_str(), task.started_at.unwrap_or_default())).await.map_err(|e| format!("cannot clear unfinished subagent tasks: {e}"))?;
+            if changed == 0 {
+                return Err("unfinished subagent task consume matched no row".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn take_unfinished_tasks(&self, id: &str) -> Result<Vec<String>, String> {
+        let tasks = self.peek_unfinished_tasks(id).await?;
+        let labels = tasks
+            .iter()
+            .map(|task| {
+                crate::session::format_unfinished(
+                    task.task_id,
+                    &task.label,
+                    task.subagent_session_id.as_deref(),
+                )
+            })
+            .collect();
+        if !tasks.is_empty() {
+            self.consume_unfinished_tasks(id, &tasks)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(labels)
+    }
+
+    #[cfg(test)]
+    pub async fn take_unfinished_tasks_for_subagent(
+        &self,
+        id: &str,
+    ) -> Result<Vec<String>, String> {
+        let tasks = self.peek_unfinished_tasks_for_subagent(id).await?;
+        let labels = tasks
+            .iter()
+            .map(|task| crate::session::format_unfinished(task.task_id, &task.label, None))
+            .collect();
+        if !tasks.is_empty() {
+            self.consume_unfinished_tasks_for_subagent(id, &tasks)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         Ok(labels)
     }
@@ -2565,65 +2633,82 @@ impl SqliteSession {
         Ok(true)
     }
 
+    pub(crate) async fn unfinished_owner_all_dead_for_subagent(
+        &self,
+        id: &str,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query("SELECT owner_identity FROM running_tasks WHERE workspace_id = ?1 AND subagent_session_id = ?2", (self.workspace_id.as_str(), id)).await.map_err(|e| format!("cannot load unfinished subagent task owners: {e}"))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot load unfinished subagent task owners: {e}"))?
+        {
+            let owner = row
+                .get_value(0)
+                .map_err(|e| e.to_string())?
+                .as_text()
+                .cloned();
+            match owner {
+                Some(owner) if !crate::session_store::owner_alive(&owner) => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     /// Same as [`Self::take_unfinished_tasks`] but keyed by
     /// `subagent_session_id`: the rows a killed parent left for one of its
     /// background delegate subagents. The table is global (unlike JSONL
     /// per-session files), so a resumed subagent can look up its own
     /// leftovers from any parent session. The subagent session id is
     /// implied by the lookup, so labels carry no `(session: …)` suffix.
-    pub async fn take_unfinished_tasks_for_subagent(
+    pub(crate) async fn peek_unfinished_tasks_for_subagent(
         &self,
         subagent_session_id: &str,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<crate::session::UnfinishedTask>, String> {
         let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT task_id, label FROM running_tasks \
-                 WHERE workspace_id = ?1 AND subagent_session_id = ?2",
-                (self.workspace_id.as_str(), subagent_session_id),
-            )
-            .await
-            .map_err(|e| format!("cannot load unfinished subagent tasks: {e}"))?;
-        let mut labels = Vec::new();
-        let mut non_empty = false;
+        let mut rows = conn.query("SELECT task_id, label, session_id, started_at_us FROM running_tasks WHERE workspace_id = ?1 AND subagent_session_id = ?2", (self.workspace_id.as_str(), subagent_session_id)).await.map_err(|e| format!("cannot load unfinished subagent tasks: {e}"))?;
+        let mut tasks = Vec::new();
         while let Some(row) = rows
             .next()
             .await
             .map_err(|e| format!("cannot load unfinished subagent tasks: {e}"))?
         {
-            non_empty = true;
-            let task_id = row
+            let id = row
                 .get_value(0)
-                .map_err(|e| format!("cannot load unfinished subagent tasks: {e}"))?
+                .map_err(|e| e.to_string())?
                 .as_integer()
                 .copied()
-                .ok_or_else(|| {
-                    "cannot load unfinished subagent tasks: task_id is not an integer".to_string()
-                })?;
+                .unwrap_or_default();
             let label = row
                 .get_value(1)
-                .map_err(|e| format!("cannot load unfinished subagent tasks: {e}"))?
+                .map_err(|e| e.to_string())?
                 .as_text()
                 .cloned()
-                .ok_or_else(|| {
-                    "cannot load unfinished subagent tasks: label is not text".to_string()
-                })?;
-            labels.push(crate::session::format_unfinished(
-                task_id.max(0) as u64,
-                &label,
-                None,
-            ));
+                .unwrap_or_default();
+            let parent = row
+                .get_value(2)
+                .map_err(|e| e.to_string())?
+                .as_text()
+                .cloned();
+            let started = row
+                .get_value(3)
+                .map_err(|e| e.to_string())?
+                .as_integer()
+                .copied()
+                .unwrap_or_default();
+            tasks.push(crate::session::UnfinishedTask {
+                task_id: id.max(0) as u64,
+                label,
+                subagent_session_id: Some(subagent_session_id.to_owned()),
+                session_id: parent,
+                started_at: Some(started),
+                raw: None,
+                owner_identity: None,
+            });
         }
-        if non_empty {
-            conn.execute(
-                "DELETE FROM running_tasks \
-                 WHERE workspace_id = ?1 AND subagent_session_id = ?2",
-                (self.workspace_id.as_str(), subagent_session_id),
-            )
-            .await
-            .map_err(|e| format!("cannot clear unfinished subagent tasks: {e}"))?;
-        }
-        Ok(labels)
+        Ok(tasks)
     }
 
     /// The task-panel label for a subagent session: the label of the newest

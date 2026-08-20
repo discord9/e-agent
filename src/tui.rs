@@ -970,12 +970,6 @@ async fn handle_fork(command: ForkCommand, state: &mut TuiState) {
         ));
         return;
     };
-    let Some(backend) = state.backend.clone() else {
-        state.push_agent_event(AgentEvent::Notice(
-            "无法 fork：TUI 未接线（缺少会话后端）".to_string(),
-        ));
-        return;
-    };
     let root = match &state.record_in {
         Some(record) => record.root.clone(),
         None => state.root.clone(),
@@ -1009,7 +1003,7 @@ async fn handle_fork(command: ForkCommand, state: &mut TuiState) {
         )));
         return;
     }
-    let (boundary_index, boundary_seq) = boundaries[boundaries.len() - n];
+    let (boundary_index, _boundary_seq) = boundaries[boundaries.len() - n];
     let at = boundary_index + 1; // 1-based full-history index, inclusive.
     let entries: Vec<SessionEntry> = with_seq.into_iter().map(|(_, entry)| entry).collect();
     let prefix = match crate::agent::fork_prefix(&entries, Some(at)) {
@@ -1019,47 +1013,31 @@ async fn handle_fork(command: ForkCommand, state: &mut TuiState) {
             return;
         }
     };
-    let new_id = crate::session::new_id_prefixed("fork-");
-    let fork_store =
-        match crate::session_store::SessionStore::connect(&backend, &root, &new_id).await {
-            Ok(store) => store,
-            Err(error) => {
-                state.push_agent_event(AgentEvent::Notice(format!("无法 fork：{error:#}")));
-                return;
-            }
-        };
-    // The marker sits at the fork point: source prefix first, then the
-    // marker (seq = the boundary's original seq), then the new session's
-    // own messages — same layout as `SessionFactory::build`'s fork branch.
-    let marker = SessionEntry::ForkedFrom {
-        source: session_id,
-        at: prefix.len(),
-        // JSONL has no event_time column; kept as an optional provenance slot.
-        event_time: None,
-        seq: Some(boundary_seq),
-    };
     let prefix_len = prefix.len();
-    let mut fork_entries = Vec::with_capacity(prefix_len + 1);
-    fork_entries.extend(prefix);
-    fork_entries.push(marker);
-    let result = match backend {
-        // Atomic create-or-replace for a brand-new JSONL session file.
-        crate::config::SessionBackend::Jsonl => {
-            fork_store.rewrite(&root, &new_id, &fork_entries).await
-        }
-        // Greptime: fresh session (no rows); append writes contiguous seqs.
-        crate::config::SessionBackend::Greptime { .. } => {
-            fork_store.append(&root, &new_id, &fork_entries).await
-        }
-        // SQLite: same append-only semantics as Greptime.
-        crate::config::SessionBackend::Sqlite { .. } => {
-            fork_store.append(&root, &new_id, &fork_entries).await
-        }
+    let new_id = crate::session::new_id_prefixed("fork-");
+    let Some(factory) = state.factory.clone() else {
+        state.push_agent_event(AgentEvent::Notice(
+            "无法 fork：TUI 未接线（缺少 factory）".into(),
+        ));
+        return;
     };
+    let result = factory
+        .build(
+            &new_id,
+            Some((session_id.clone(), Some(at))),
+            None,
+            crate::runner::IdlePolicy::WaitForInput,
+            crate::session_factory::UnfinishedPolicy::Preserve,
+        )
+        .await;
     match result {
-        Ok(()) => state.push_agent_event(AgentEvent::Notice(format!(
-            "已 fork 到新会话：{new_id}（保留 {prefix_len} 条历史）。新终端用 --session {new_id} 打开。"
-        ))),
+        Ok(built) => {
+            let effective = built.session.clone();
+            let _task = built.runner.start(None);
+            state.push_agent_event(AgentEvent::Notice(format!(
+                "已 fork 到新会话：{effective}（保留 {prefix_len} 条历史）。新终端用 --session {effective} 打开。"
+            )));
+        }
         Err(error) => state.push_agent_event(AgentEvent::Notice(format!("无法 fork：{error:#}"))),
     }
 }

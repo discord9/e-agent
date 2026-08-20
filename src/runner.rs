@@ -450,6 +450,22 @@ enum PendingCommand {
     Goal(GoalCommand),
 }
 
+pub enum RecoveryScope {
+    Session,
+    Subagent,
+}
+
+pub(crate) struct RecoveryBatch {
+    pub(crate) scope: RecoveryScope,
+    pub(crate) tasks: Vec<crate::session::UnfinishedTask>,
+}
+
+pub(crate) struct SessionBootstrap {
+    pub(crate) recovery_batches: Vec<RecoveryBatch>,
+    pub(crate) legacy: bool,
+    pub(crate) initial_entries: Vec<SessionEntry>,
+}
+
 pub struct SessionRunner {
     agent: Agent,
     store: SessionStore,
@@ -465,6 +481,7 @@ pub struct SessionRunner {
     /// Resolved from `[delegate] finalize_wait_secs` by the session factory;
     /// consumed only at the FinishWhenIdle idle point.
     finalize_wait: Option<Duration>,
+    bootstrap: Option<SessionBootstrap>,
     #[cfg(test)]
     before_finalize: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -519,11 +536,80 @@ impl SessionRunner {
                 policy,
                 last_answer: None,
                 finalize_wait: None,
+                bootstrap: None,
                 #[cfg(test)]
                 before_finalize: None,
             },
             handle,
         )
+    }
+
+    pub(crate) async fn new_with_bootstrap(
+        agent: Agent,
+        store: SessionStore,
+        root: PathBuf,
+        session: String,
+        policy: IdlePolicy,
+        bootstrap: SessionBootstrap,
+    ) -> anyhow::Result<(Self, SessionHandle)> {
+        let (mut runner, handle) = Self::new(agent, store, root, session, policy);
+        runner.bootstrap = Some(bootstrap);
+        runner.bootstrap().await?;
+        Ok((runner, handle))
+    }
+
+    async fn bootstrap(&mut self) -> anyhow::Result<()> {
+        let Some(bootstrap) = self.bootstrap.take() else {
+            return Ok(());
+        };
+        if bootstrap.legacy {
+            self.store
+                .rewrite(&self.root, &self.session, self.agent.history())
+                .await?;
+        }
+        for entry in bootstrap.initial_entries {
+            self.commit(entry).await?;
+        }
+        if !bootstrap.recovery_batches.is_empty() {
+            let tasks: Vec<&crate::session::UnfinishedTask> = bootstrap
+                .recovery_batches
+                .iter()
+                .flat_map(|batch| batch.tasks.iter())
+                .collect();
+            let text = format!(
+                "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
+                tasks.len(),
+                tasks
+                    .iter()
+                    .map(|t| crate::session::format_unfinished(
+                        t.task_id,
+                        &t.label,
+                        t.subagent_session_id.as_deref()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            self.commit(SessionEntry::Notice { text }).await?;
+            for batch in &bootstrap.recovery_batches {
+                match batch.scope {
+                    RecoveryScope::Session => {
+                        self.store
+                            .consume_unfinished_background(&self.root, &self.session, &batch.tasks)
+                            .await?
+                    }
+                    RecoveryScope::Subagent => {
+                        self.store
+                            .consume_unfinished_background_for_subagent(
+                                &self.root,
+                                &self.session,
+                                &batch.tasks,
+                            )
+                            .await?
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Cap the `FinishWhenIdle` wait for blocking background tasks (see
@@ -591,6 +677,7 @@ impl SessionRunner {
                 status: status.clone(),
                 kind: kind.clone(),
             }),
+            SessionEntry::Notice { text } => Some(AgentEvent::Notice(text.clone())),
             // Goal updates fan out as one live event after durable commit
             // (UI Notice line + GoalBar refresh), never as a user prompt.
             SessionEntry::GoalUpdated { goal } => {

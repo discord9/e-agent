@@ -30,7 +30,7 @@ use crate::agent::{Message, SessionEntry};
 use std::io::{BufRead, Write};
 
 use crate::config::SessionBackend;
-use crate::session::{LoadedSession, Session};
+use crate::session::{LoadedSession, Session, UnfinishedTask};
 
 /// Safe, bounded timing information for one metadata listing. This contains
 /// only backend names, durations, and row/file counts.
@@ -2247,20 +2247,20 @@ impl SessionStore {
     /// completion arrived. Consumes the record (file or table rows) and
     /// returns the labels so the caller can inject the "killed on exit"
     /// notice. Only this session's own records are returned.
-    pub async fn take_unfinished_background(
+    pub(crate) async fn peek_unfinished_background(
         &self,
         root: &Path,
         session: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<UnfinishedTask>> {
         match self {
-            SessionStore::Jsonl => Ok(Session::take_unfinished_background(root, session)),
+            SessionStore::Jsonl => Ok(Session::peek_unfinished_background(root, session)),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
                 session: greptime_session,
                 ..
             } => {
                 let session_id = session.to_owned();
-                greptime_session.take_unfinished_tasks(&session_id).await
+                greptime_session.peek_unfinished_tasks(&session_id).await
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite {
@@ -2271,11 +2271,68 @@ impl SessionStore {
                 sqlite_session
                     .lock()
                     .await
-                    .take_unfinished_tasks(&session_id)
+                    .peek_unfinished_tasks(&session_id)
                     .await
                     .map_err(anyhow::Error::msg)
             }
         }
+    }
+
+    /// Consume exactly the records represented by a prior peek.
+    pub(crate) async fn consume_unfinished_background(
+        &self,
+        root: &Path,
+        session: &str,
+        tasks: &[UnfinishedTask],
+    ) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => {
+                Session::consume_unfinished_background(root, session, tasks)?;
+                Ok(())
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: backend_session,
+                ..
+            } => backend_session
+                .consume_unfinished_tasks(session, tasks)
+                .await
+                .map_err(anyhow::Error::msg),
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: backend_session,
+                ..
+            } => backend_session
+                .lock()
+                .await
+                .consume_unfinished_tasks(session, tasks)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn take_unfinished_background(
+        &self,
+        root: &Path,
+        session: &str,
+    ) -> Result<Vec<String>> {
+        let tasks = self.peek_unfinished_background(root, session).await?;
+        let labels = tasks
+            .iter()
+            .map(|t| {
+                crate::session::format_unfinished(
+                    t.task_id,
+                    &t.label,
+                    t.subagent_session_id.as_deref(),
+                )
+            })
+            .collect();
+        if !tasks.is_empty() {
+            self.consume_unfinished_background(root, session, &tasks)
+                .await?;
+        }
+        Ok(labels)
     }
 
     /// Probe whether every unfinished background-task record for `session`
@@ -2317,30 +2374,96 @@ impl SessionStore {
         }
     }
 
+    pub(crate) async fn unfinished_owner_all_dead_for_subagent(
+        &self,
+        root: &Path,
+        id: &str,
+    ) -> Result<bool> {
+        match self {
+            SessionStore::Jsonl => Ok(Session::unfinished_owner_all_dead_for_subagent(root, id)),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session.unfinished_owner_all_dead_for_subagent(id).await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .unfinished_owner_all_dead_for_subagent(id)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     /// Like [`Self::take_unfinished_background`] but scoped to rows whose
     /// `subagent_session_id` matches — used when resuming a subagent
     /// session so it learns what died with its background delegates. The
     /// Greptime/SQLite table is global and supports the cross-session
-    /// lookup; JSONL has no per-subagent record file, so it always reports
-    /// nothing.
-    pub async fn take_unfinished_background_for_subagent(
+    /// lookup; JSONL discovers parent claim files by subagent session id.
+    pub(crate) async fn peek_unfinished_background_for_subagent(
         &self,
-        _root: &Path,
-        _subagent_session_id: &str,
-    ) -> Result<Vec<String>> {
+        root: &Path,
+        subagent_session_id: &str,
+    ) -> Result<Vec<UnfinishedTask>> {
         match self {
-            SessionStore::Jsonl => Ok(Vec::new()),
+            SessionStore::Jsonl => {
+                Session::peek_unfinished_background_for_subagent(root, subagent_session_id)
+            }
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
                 session
-                    .take_unfinished_tasks_for_subagent(_subagent_session_id)
+                    .peek_unfinished_tasks_for_subagent(subagent_session_id)
                     .await
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
                 .await
-                .take_unfinished_tasks_for_subagent(_subagent_session_id)
+                .peek_unfinished_tasks_for_subagent(subagent_session_id)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn take_unfinished_background_for_subagent(
+        &self,
+        root: &Path,
+        id: &str,
+    ) -> Result<Vec<String>> {
+        let tasks = self
+            .peek_unfinished_background_for_subagent(root, id)
+            .await?;
+        let labels = tasks
+            .iter()
+            .map(|t| crate::session::format_unfinished(t.task_id, &t.label, None))
+            .collect();
+        if !tasks.is_empty() {
+            self.consume_unfinished_background_for_subagent(root, id, &tasks)
+                .await?;
+        }
+        Ok(labels)
+    }
+
+    /// Consume subagent records after its runner commits the recovery Notice.
+    pub(crate) async fn consume_unfinished_background_for_subagent(
+        &self,
+        root: &Path,
+        id: &str,
+        tasks: &[UnfinishedTask],
+    ) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => Session::consume_unfinished_background(root, id, tasks),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session
+                .consume_unfinished_tasks_for_subagent(id, tasks)
+                .await
+                .map_err(anyhow::Error::msg),
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .consume_unfinished_tasks_for_subagent(id, tasks)
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -4373,663 +4496,6 @@ mod tests {
                 message.contains("cannot load unfinished background task owners"),
                 "probe error must carry context: {message}"
             );
-        }
-
-        /// `inject_killed_notice` 的端到端契约（build_session 的 Consume
-        /// 路径；server 启动僵尸扫描已改为两遍汇总、只往父会话注入，不再
-        /// 调用它——见 server.rs `scan_zombie_background_tasks`）：dead-owner
-        /// 的 running_tasks 行 → 消费 + Notice 追加到存储（无 live agent 也能
-        /// 注入）；再次调用幂等返回 None。与 resume 路径同源，天然幂等。
-        #[tokio::test]
-        async fn sqlite_inject_killed_notice_consumes_and_appends_without_live_agent() {
-            let (_dir, path) = temp_db();
-            let root = std::env::temp_dir();
-            let session = format!("test-store-inject-{}", crate::session::new_id());
-            let store = SessionStore::connect(&backend(&path), &root, &session)
-                .await
-                .expect("connect sqlite store");
-
-            // 只在一个可探测的 hostname 环境下才能构造「确定已死」的 owner
-            // （无 HOSTNAME/COMPUTERNAME 时 owner_alive 保守 alive，探测不可
-            // 达）；否则断言保守行为：不注入。
-            let Some(hostname) = probeable_hostname() else {
-                let injected =
-                    crate::session_factory::inject_killed_notice(&store, &root, &session)
-                        .await
-                        .expect("inject with unprobeable hostname");
-                assert!(injected.is_none(), "unprobeable hostname must not inject");
-                return;
-            };
-            let dead_owner = format!("2000000000@{hostname}#deadbeef");
-
-            // 直接插两条 owner 全死的 running_tasks 行（record_background_start
-            // 写的是当前进程的存活 identity，这里要模拟上次进程的死记录）。
-            let workspace_id = derive_workspace_id(&root);
-            let db = turso::Builder::new_local(path.to_str().unwrap())
-                .build()
-                .await
-                .expect("open db");
-            let conn = db.connect().expect("connect raw");
-            for (task_id, label) in [(1u64, "sleep 100"), (2, "cargo build")] {
-                conn.execute(
-                    "INSERT INTO running_tasks \
-                     (workspace_id, session_id, task_id, label, subagent_session_id, \
-                      started_at_us, owner_identity) \
-                     VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5)",
-                    (
-                        workspace_id.as_str(),
-                        session.as_str(),
-                        task_id as i64,
-                        label,
-                        dead_owner.as_str(),
-                    ),
-                )
-                .await
-                .expect("insert dead-owner running_tasks row");
-            }
-            drop(conn);
-            drop(db);
-
-            // 探测：全部 owner 已死。
-            assert!(
-                store
-                    .unfinished_owner_all_dead(&root, &session)
-                    .await
-                    .expect("probe"),
-                "dead-owner rows must probe all-dead"
-            );
-
-            // 注入：无 live agent（没有 Agent，只有 store）也能拿到 Notice +
-            // 其精确 located key（seq + event_time_us + payload hash）。
-            let (entry, location) =
-                crate::session_factory::inject_killed_notice(&store, &root, &session)
-                    .await
-                    .expect("inject killed notice")
-                    .expect("rows must inject a notice");
-            let SessionEntry::Notice { text } = &entry else {
-                panic!("injected entry must be a Notice, got {entry:?}");
-            };
-            assert!(
-                text.contains("2 background task(s)"),
-                "count in notice: {text}"
-            );
-            assert!(text.contains("sleep 100"), "label in notice: {text}");
-            assert!(text.contains("cargo build"), "label in notice: {text}");
-            // The located key is exact: backend + fingerprint + session +
-            // a sqlite seq/event_time pin and a non-empty entry hash.
-            assert_eq!(location.backend, "sqlite");
-            assert_eq!(location.session, session);
-            assert_eq!(location.fingerprint.len(), 32);
-            let crate::session_store::LocatedKey::Sqlite { seq, event_time_us } = location.key
-            else {
-                panic!("sqlite location must carry a seq+event_time_us pin");
-            };
-            assert!(seq >= 0 && event_time_us > 0);
-            assert_eq!(location.entry_hash.len(), 64);
-
-            // 记录已被消费：再 take 为空、再注入为 None（幂等）。
-            let labels = store
-                .take_unfinished_background(&root, &session)
-                .await
-                .expect("take after inject");
-            assert!(labels.is_empty(), "rows must be consumed: {labels:?}");
-            let again = crate::session_factory::inject_killed_notice(&store, &root, &session)
-                .await
-                .expect("second inject");
-            assert!(again.is_none(), "second inject must be a no-op");
-
-            // Notice 已持久化：会话下次加载（resume/attach 的 restore_history）
-            // 能看到它——不依赖任何 live agent。
-            let loaded = store.load(&root, &session).await.expect("load session");
-            let notices: Vec<&SessionEntry> = loaded
-                .entries
-                .iter()
-                .filter(|e| matches!(e, SessionEntry::Notice { .. }))
-                .collect();
-            assert_eq!(notices.len(), 1, "exactly one persisted Notice");
-            assert_eq!(notices[0], &entry, "persisted Notice is the injected one");
-        }
-
-        /// Exact-version semantics through the SQLite store: a receipt pins
-        /// (seq, event_time_us, payload hash) — a SAME-SEQ later version
-        /// (a newer event_time_us row with different payload, appended
-        /// directly) must NEVER retarget an old ref. The old receipt still
-        /// reads the old physical row; a fresh receipt reads the new one;
-        /// deleting the pinned row fails the old ref with integrity.
-        #[tokio::test]
-        async fn sqlite_same_seq_later_version_never_retargets_old_ref() {
-            use crate::agent::Message;
-            use crate::output_receipt::{FieldId, issue_legacy_for_test, verify_legacy_for_test};
-
-            let (_dir, path) = temp_db();
-            let root = std::env::temp_dir();
-            let session = format!("test-store-exact-ver-{}", crate::session::new_id());
-            let store = SessionStore::connect(&backend(&path), &root, &session)
-                .await
-                .expect("connect sqlite store");
-
-            // Version A at seq 0.
-            let entry_a = SessionEntry::Message {
-                message: Message::User {
-                    content: "version-A".into(),
-                    images: vec![],
-                },
-            };
-            let locations_a = store
-                .append_located(&root, &session, std::slice::from_ref(&entry_a))
-                .await
-                .expect("append A");
-            let loc_a = locations_a[0].clone();
-            let LocatedKey::Sqlite {
-                seq,
-                event_time_us: et_a,
-            } = loc_a.key
-            else {
-                panic!("sqlite location expected");
-            };
-
-            // Version B at the SAME seq with a LATER event_time_us and a
-            // DIFFERENT payload (simulated concurrent/retry write that
-            // landed a newer row for the same logical position).
-            let entry_b = SessionEntry::Message {
-                message: Message::User {
-                    content: "version-B".into(),
-                    images: vec![],
-                },
-            };
-            let payload_b = serde_json::to_string(&entry_b).unwrap();
-            let db = turso::Builder::new_local(path.to_str().unwrap())
-                .build()
-                .await
-                .expect("open db");
-            let conn = db.connect().expect("connect raw");
-            conn.execute(
-                "INSERT INTO session_entries \
-                 (workspace_id, session_id, seq, event_time_us, entry_kind, payload, schema_version, is_error) \
-                 VALUES (?1, ?2, ?3, ?4, 'message', ?5, 1, 0)",
-                (
-                    derive_workspace_id(&root).as_str(),
-                    session.as_str(),
-                    seq,
-                    et_a + 1, // strictly later
-                    payload_b.as_str(),
-                ),
-            )
-            .await
-            .expect("insert later version B");
-            drop(conn);
-            drop(db);
-
-            // The READ path shows the newer version (latest event_time wins).
-            let loaded = store.load(&root, &session).await.expect("load");
-            assert_eq!(loaded.entries.len(), 1);
-            assert!(matches!(
-                &loaded.entries[0],
-                SessionEntry::Message { message: Message::User { content, .. } } if content == "version-B"
-            ));
-            // load_located reports the WINNING location (seq, later et).
-            let located = store
-                .load_located(&root, &session)
-                .await
-                .expect("load_located");
-            assert_eq!(located.entries.len(), 1);
-            let new_loc = located.locations[0].clone().expect("location");
-            assert!(matches!(
-                new_loc.key,
-                LocatedKey::Sqlite { seq: s, event_time_us: et } if s == seq && et == et_a + 1
-            ));
-            assert_ne!(new_loc.entry_hash, loc_a.entry_hash);
-
-            // The OLD receipt still reads the OLD physical row exactly.
-            let old_ref = issue_legacy_for_test(&loc_a, FieldId::UserContent, "version-A".len());
-            let verified = verify_legacy_for_test(&old_ref).unwrap();
-            let bytes = store
-                .read_field(&root, &verified)
-                .await
-                .expect("old ref must stay pinned to version A");
-            assert_eq!(bytes, b"version-A");
-
-            // A receipt issued for the NEW location reads version B.
-            let new_ref = issue_legacy_for_test(&new_loc, FieldId::UserContent, "version-B".len());
-            let verified = verify_legacy_for_test(&new_ref).unwrap();
-            let bytes = store
-                .read_field(&root, &verified)
-                .await
-                .expect("new ref reads version B");
-            assert_eq!(bytes, b"version-B");
-
-            // Deleting the pinned row makes the OLD ref fail with integrity
-            // (never a silently retargeted read).
-            let db = turso::Builder::new_local(path.to_str().unwrap())
-                .build()
-                .await
-                .expect("open db");
-            let conn = db.connect().expect("connect raw");
-            conn.execute(
-                "DELETE FROM session_entries \
-                 WHERE workspace_id = ?1 AND session_id = ?2 AND seq = ?3 AND event_time_us = ?4",
-                (
-                    derive_workspace_id(&root).as_str(),
-                    session.as_str(),
-                    seq,
-                    et_a,
-                ),
-            )
-            .await
-            .expect("delete pinned row");
-            drop(conn);
-            drop(db);
-            let err = store
-                .read_field(&root, &verify_legacy_for_test(&old_ref).unwrap())
-                .await
-                .expect_err("deleted pinned row must fail the old ref");
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("integrity") || msg.contains("not found"),
-                "old ref must fail closed: {msg}"
-            );
-        }
-
-        /// End-to-end read_output reconstruction on the SQLite store: bound
-        /// an oversized tool result with a receipt, read the exact full
-        /// field through the facade, and page it back byte-exactly.
-        #[tokio::test]
-        async fn sqlite_receipt_page_reconstruction() {
-            use crate::agent::Message;
-            use crate::output_receipt::{
-                FieldId, issue_legacy_for_test, page_field, verify_legacy_for_test,
-            };
-
-            let (_dir, path) = temp_db();
-            let root = std::env::temp_dir();
-            let session = format!("test-store-page-{}", crate::session::new_id());
-            let store = SessionStore::connect(&backend(&path), &root, &session)
-                .await
-                .expect("connect sqlite store");
-            let content = format!("{}{}{}", "x".repeat(20_000), "MIDDLE", "y".repeat(10_000));
-            let entry = SessionEntry::Message {
-                message: Message::Tool {
-                    call_id: "call_1".into(),
-                    name: "bash".into(),
-                    content: content.clone(),
-                    is_error: false,
-                    synthetic: false,
-                    images: vec![],
-                },
-            };
-            let locations = store
-                .append_located(&root, &session, std::slice::from_ref(&entry))
-                .await
-                .expect("append");
-            let receipt = issue_legacy_for_test(&locations[0], FieldId::ToolContent, content.len());
-            let verified = verify_legacy_for_test(&receipt).unwrap();
-            let bytes = store
-                .read_field(&root, &verified)
-                .await
-                .expect("read_field");
-            assert_eq!(bytes, content.as_bytes());
-            // Page chain (offset 0, limit 7000, next) is lossless.
-            let mut rebuilt = Vec::new();
-            let mut offset = Some(0usize);
-            while let Some(next) = offset {
-                let page = page_field(&bytes, next, 7000).unwrap();
-                assert!(std::str::from_utf8(page.text.as_bytes()).is_ok());
-                rebuilt.extend_from_slice(page.text.as_bytes());
-                offset = page.next_offset;
-            }
-            assert_eq!(rebuilt, content.as_bytes());
-        }
-
-        /// `load_head_page` on the SQLite store: the bounded head page
-        /// must never strand the truncated part of the head segment —
-        /// the returned cursor feeds straight back into `load_older` and
-        /// the whole chain covers every entry exactly once (the
-        /// `GET /history` initial-render bug this fixes).
-        #[tokio::test]
-        async fn sqlite_load_head_page_pages_without_losing_segments() {
-            use crate::agent::Message;
-
-            let (_dir, path) = temp_db();
-            let root = std::env::temp_dir();
-
-            let user = |i: u32| SessionEntry::Message {
-                message: Message::User {
-                    content: format!("m{i}"),
-                    images: vec![],
-                },
-            };
-            let comp = |summary: &str| SessionEntry::Compaction {
-                summary: summary.into(),
-                retained: vec![],
-                current_prompt_at: None,
-                no_current_prompt: false,
-            };
-
-            // ---- No compaction: the whole session is one head segment.
-            // With no limit the whole session comes back with a None
-            // cursor (nothing older to page)...
-            let session_a = format!("test-store-head-page-a-{}", crate::session::new_id());
-            let store_a = SessionStore::connect(&backend(&path), &root, &session_a)
-                .await
-                .expect("connect sqlite store A");
-            let plain = vec![user(1), user(2), user(3)];
-            store_a
-                .append(&root, &session_a, &plain)
-                .await
-                .expect("append A");
-            let (page, cursor) = store_a
-                .load_head_page(&root, &session_a, None)
-                .await
-                .expect("load_head_page A without limit");
-            assert_eq!(page, plain, "no-compaction session returned whole");
-            assert_eq!(cursor, None, "no compaction → no older cursor");
-            // ...and a bounded page still pages through the rest of the
-            // session (nothing is stranded).
-            let (page, cursor) = store_a
-                .load_head_page(&root, &session_a, Some(2))
-                .await
-                .expect("load_head_page A with limit");
-            assert_eq!(page, vec![user(2), user(3)], "newest limit entries");
-            assert_eq!(cursor, Some(1), "cursor = oldest seq of the page");
-            let (rest, cursor) = store_a
-                .load_older(&root, &session_a, cursor.unwrap(), Some(2))
-                .await
-                .expect("load_older A");
-            assert_eq!(rest, vec![user(1)], "remaining entry reachable");
-            assert_eq!(cursor, None, "seq 0 page → nothing older");
-
-            // ---- Compaction with head ≤ limit: whole head segment +
-            // cursor = the opening compaction's seq.
-            let session_b = format!("test-store-head-page-b-{}", crate::session::new_id());
-            let store_b = SessionStore::connect(&backend(&path), &root, &session_b)
-                .await
-                .expect("connect sqlite store B");
-            // seqs: 0,1 early; 2 comp1; 3,4 middle; 5 comp2; 6,7 latest.
-            let mut all = vec![user(1), user(2)];
-            all.push(comp("c1"));
-            all.extend([user(3), user(4)]);
-            all.push(comp("c2"));
-            all.extend([user(5), user(6)]);
-            store_b
-                .append(&root, &session_b, &all)
-                .await
-                .expect("append B");
-            let (page, cursor) = store_b
-                .load_head_page(&root, &session_b, Some(3))
-                .await
-                .expect("load_head_page B with limit");
-            assert_eq!(
-                page,
-                vec![comp("c2"), user(5), user(6)],
-                "head ≤ limit → whole head segment"
-            );
-            assert_eq!(cursor, Some(5), "cursor = opening compaction seq");
-
-            // ---- Compaction with head > limit: newest `limit` entries,
-            // cursor = oldest seq of the page; paging back with that
-            // cursor reaches the cut-off part, then crosses compaction
-            // boundaries — every entry is covered exactly once.
-            let session_c = format!("test-store-head-page-c-{}", crate::session::new_id());
-            let store_c = SessionStore::connect(&backend(&path), &root, &session_c)
-                .await
-                .expect("connect sqlite store C");
-            // seqs: 0,1 early; 2 comp1; 3,4 middle; 5 comp2; 6..9 latest.
-            let mut all = vec![user(1), user(2)];
-            all.push(comp("c1"));
-            all.extend([user(3), user(4)]);
-            all.push(comp("c2"));
-            all.extend([user(5), user(6), user(7), user(8)]);
-            store_c
-                .append(&root, &session_c, &all)
-                .await
-                .expect("append C");
-
-            let mut paged: Vec<SessionEntry> = Vec::new();
-            let mut cursor: Option<i64> = Some(i64::MAX); // head open sentinel
-            loop {
-                let (entries, next) = match cursor {
-                    Some(i64::MAX) => store_c
-                        .load_head_page(&root, &session_c, Some(2))
-                        .await
-                        .expect("head page"),
-                    Some(before) => store_c
-                        .load_older(&root, &session_c, before, Some(2))
-                        .await
-                        .expect("older page"),
-                    None => break,
-                };
-                paged.extend(entries);
-                cursor = next;
-            }
-            // Verify exactly-once coverage: the paged chain must contain every
-            // session entry, with no gaps and no duplicates. Page boundaries
-            // depend on the compaction layout (the opening compaction rides with
-            // each page), so compare as multisets — the newest-first page order
-            // and per-page chronological order are already spot-checked below.
-            assert_eq!(
-                paged.len(),
-                all.len(),
-                "paged chain must not lose or duplicate entries"
-            );
-            for want in &all {
-                assert!(paged.contains(want), "paged chain missing entry: {want:?}");
-            }
-
-            // Spot-check the boundary page explicitly: the first page is
-            // the newest 2 of the head, and its cursor pages into the
-            // cut-off head part (not past the head into older segments).
-            let (page, cursor) = store_c
-                .load_head_page(&root, &session_c, Some(2))
-                .await
-                .expect("head page C");
-            assert_eq!(page, vec![user(7), user(8)], "newest 2 of head");
-            let (next, _) = store_c
-                .load_older(&root, &session_c, cursor.unwrap(), Some(2))
-                .await
-                .expect("older page C");
-            assert_eq!(
-                next,
-                vec![user(5), user(6)],
-                "cut-off head part reachable via cursor"
-            );
-        }
-
-        /// End-to-end: a real tool-call/tool-result session written through
-        /// the store, fully closed, then reopened (simulating a TUI/process
-        /// restart) and replayed — every entry back, in order, with the
-        /// compaction-aware segmented views intact.
-        #[tokio::test]
-        async fn sqlite_e2e_reopen_replays_full_tool_session() {
-            use crate::agent::{AssistantMessage, Message};
-
-            let (_dir, path) = temp_db();
-            let root = std::env::temp_dir();
-            let session = format!("test-e2e-replay-{}", crate::session::new_id());
-
-            let tool_call = Message::Assistant(AssistantMessage {
-                content: Some("let me check".into()),
-                tool_calls: vec![crate::agent::ToolCall {
-                    id: "call_1".into(),
-                    name: "bash".into(),
-                    arguments: "ls".into(),
-                }],
-                reasoning: Some("thinking".into()),
-            })
-            .into();
-            let tool_result = Message::Tool {
-                call_id: "call_1".into(),
-                name: "bash".into(),
-                content: "src\n".into(),
-                is_error: false,
-                synthetic: false,
-                images: vec![],
-            }
-            .into();
-            let tool_error = Message::Tool {
-                call_id: "call_2".into(),
-                name: "bash".into(),
-                content: "command not found: nope".into(),
-                is_error: true,
-                synthetic: false,
-                images: vec![],
-            }
-            .into();
-            let entries = vec![
-                Message::System {
-                    content: "You are an agent".into(),
-                }
-                .into(),
-                Message::User {
-                    content: "run ls".into(),
-                    images: vec![],
-                }
-                .into(),
-                tool_call,
-                tool_result,
-                tool_error,
-                SessionEntry::Notice {
-                    text: "background task 3 completed".into(),
-                },
-                // Compaction in the MIDDLE: the head segment = compaction +
-                // everything after it, the older segment = everything before.
-                SessionEntry::Compaction {
-                    summary: "compressed".into(),
-                    retained: vec![],
-                    current_prompt_at: None,
-                    no_current_prompt: false,
-                },
-                Message::User {
-                    content: "and now?".into(),
-                    images: vec![],
-                }
-                .into(),
-                Message::Assistant(AssistantMessage {
-                    content: Some("all good".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                })
-                .into(),
-            ];
-
-            // Writer A: connect, append, fully close (drop).
-            {
-                let store = SessionStore::connect(&backend(&path), &root, &session)
-                    .await
-                    .expect("connect e2e store A");
-                store
-                    .append(&root, &session, &entries)
-                    .await
-                    .expect("append e2e session");
-            }
-
-            // Writer B: full reopen on the same file — the TUI/process
-            // restart view. Everything must come back in order.
-            let store = SessionStore::connect(&backend(&path), &root, &session)
-                .await
-                .expect("reconnect e2e store B");
-            let loaded = store.load(&root, &session).await.expect("replay load");
-            assert_eq!(loaded.entries.len(), entries.len(), "no entries lost");
-            for (i, (got, want)) in loaded.entries.iter().zip(entries.iter()).enumerate() {
-                assert_eq!(got, want, "entry {i} must replay identically");
-            }
-
-            // Seq provenance is contiguous 0..n after the restart.
-            let with_seq = store
-                .load_with_seq(&root, &session)
-                .await
-                .expect("load_with_seq after restart");
-            assert_eq!(with_seq.len(), entries.len());
-            for (i, (seq, _)) in with_seq.iter().enumerate() {
-                assert_eq!(*seq, i as i64, "contiguous seq after restart");
-            }
-
-            // Compaction-aware segmentation survives the restart: head =
-            // [compaction .. end], older = [start .. compaction).
-            let head = store
-                .load_head(&root, &session)
-                .await
-                .expect("load_head after restart");
-            assert_eq!(head.entries, entries[6..], "head = compaction + tail");
-            let (older, cursor) = store
-                .load_older(&root, &session, 6, None)
-                .await
-                .expect("load_older after restart");
-            assert_eq!(older, entries[..6], "older = everything before compaction");
-            assert_eq!(cursor, None, "oldest segment reached");
-            assert_eq!(
-                store.head_seq(&root, &session).await.expect("head_seq"),
-                Some(6),
-                "head opens at the compaction seq"
-            );
-        }
-
-        /// End-to-end concurrent writers through the store: two live stores
-        /// on the same file+session both believe they own seq 0; the second
-        /// writer to land wins, the stale one is rejected with the
-        /// `concurrent write conflict` contract substring and writes
-        /// nothing.
-        #[tokio::test]
-        async fn sqlite_e2e_concurrent_writers_through_store_one_rejected() {
-            use crate::agent::Message;
-
-            let (_dir, path) = temp_db();
-            let root = std::env::temp_dir();
-            let session = format!("test-e2e-conflict-{}", crate::session::new_id());
-
-            let writer_a = |prefix: &str| -> Vec<SessionEntry> {
-                vec![
-                    Message::User {
-                        content: format!("{prefix}-1"),
-                        images: vec![],
-                    }
-                    .into(),
-                    Message::User {
-                        content: format!("{prefix}-2"),
-                        images: vec![],
-                    }
-                    .into(),
-                ]
-            };
-
-            // Both connect before anything is written: each derives
-            // next_seq = 0 from the (empty) DB file.
-            let store_a = SessionStore::connect(&backend(&path), &root, &session)
-                .await
-                .expect("connect writer A");
-            let store_b = SessionStore::connect(&backend(&path), &root, &session)
-                .await
-                .expect("connect writer B");
-
-            // B lands first: seqs 0,1 with B's payload.
-            store_b
-                .append(&root, &session, &writer_a("b"))
-                .await
-                .expect("writer B append lands");
-
-            // A is stale (still thinks it owns seq 0) and appends DIFFERENT
-            // content for the same seqs → the concurrent-write detection
-            // must reject it before any INSERT.
-            let err = store_a
-                .append(&root, &session, &writer_a("a"))
-                .await
-                .expect_err("stale writer must be rejected");
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("concurrent write conflict"),
-                "contract substring missing: {msg}"
-            );
-            assert!(msg.contains(&session), "error must name the session: {msg}");
-
-            // The rejected writer wrote nothing: a fresh reopen sees only
-            // B's rows, in order.
-            let store_c = SessionStore::connect(&backend(&path), &root, &session)
-                .await
-                .expect("connect writer C");
-            let loaded = store_c
-                .load(&root, &session)
-                .await
-                .expect("load after rejection");
-            assert_eq!(loaded.entries, writer_a("b"), "only B's rows survive");
         }
 
         /// End-to-end background-task recovery across a restart: a task
