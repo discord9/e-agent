@@ -152,6 +152,29 @@ class BuildEpubTests(unittest.TestCase):
             nav = archive.read("EPUB/nav.xhtml").decode()
             self.assertNotIn("chap_002.xhtml", nav)
 
+    def test_json_newlines_escape_and_markdown_inert(self):
+        document = self._document(with_discussion=False)
+        document["sections"][0]["blocks"] = [
+            {"type": "paragraph", "text": "paragraph one\nparagraph two <>& # > - **bold**"},
+            {"type": "blockquote", "blocks": [
+                {"type": "paragraph", "text": "quote one\nquote two"},
+                {"type": "paragraph", "text": "quote <>& # > - **text**"},
+            ]},
+            {"type": "list", "items": ["item one\nitem two <>& # > - **text**"]},
+        ]
+        result, output = self._run_json(document)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with zipfile.ZipFile(io.BytesIO(output)) as archive:
+            body = archive.read("EPUB/chap_001.xhtml").decode()
+            self.assertIn("paragraph one<br/>paragraph two &lt;&gt;&amp; # &gt; - **bold**", body)
+            self.assertIn("<blockquote><p>quote one<br/>quote two</p>", body)
+            self.assertIn("quote &lt;&gt;&amp; # &gt; - **text**", body)
+            self.assertIn("<li>item one<br/>item two &lt;&gt;&amp; # &gt; - **text**</li>", body)
+            self.assertNotIn("<b>", body)
+            for name in archive.namelist():
+                if name.endswith(".xhtml"):
+                    etree.fromstring(archive.read(name))
+
     def test_json_rejects_duplicate_and_invalid_parent(self):
         duplicate = self._document(with_discussion=False)
         duplicate["sections"].append(dict(duplicate["sections"][0]))

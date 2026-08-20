@@ -426,9 +426,15 @@ def split_sections(md_text: str):
 
 
 def json_inline(text: str, gloss=None) -> str:
-    """Render JSON text as escaped plain text; Markdown syntax is inert."""
+    """Render JSON text as escaped plain text with visible line breaks.
+
+    Markdown syntax is inert.  Escape and annotate before converting real
+    newlines, so glossary matching still sees the original inline text.
+    """
     text = html.escape(text)
-    return gloss.annotate(text) if gloss is not None else text
+    if gloss is not None:
+        text = gloss.annotate(text)
+    return text.replace("\n", "<br/>")
 
 
 def json_blocks_to_html(blocks, gloss=None) -> str:
