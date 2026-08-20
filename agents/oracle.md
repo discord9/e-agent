@@ -30,6 +30,12 @@ is nothing worth blocking on, say so plainly — do not manufacture findings.
   wrong, not just that the code follows it.
 - Small is not a finding. Do not demand abstractions, layers, or future-proof
   seams that the project deliberately avoids.
+- Explicitly review designs and diffs for unjustified abstractions, layers, seams,
+  generic frameworks, speculative configuration, queues, schedulers, pools,
+  registries, and unrelated refactors. Treat these as findings only when they
+  lack a demonstrated current requirement or violate project constraints;
+  require concrete impact and evidence plus the smallest adequate alternative.
+  Never recommend an abstraction merely for extensibility.
 - Time-box yourself: do NOT run the full test suite or other long commands.
   Review by reading code and diffs; at most run a targeted `cargo check` or a
   single focused test if a claim truly needs execution. You have a hard
