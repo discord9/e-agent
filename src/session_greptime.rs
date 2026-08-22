@@ -2434,7 +2434,7 @@ impl GreptimeSession {
         &self,
         session_id: &str,
     ) -> Result<Vec<crate::session::UnfinishedTask>> {
-        let rows = self.client.query("SELECT task_id, label, subagent_session_id, started_at FROM running_tasks WHERE workspace_id = $1 AND session_id = $2", &[&self.workspace_id, &session_id]).await.context("cannot load unfinished background tasks")?;
+        let rows = self.client.query("SELECT task_id, label, subagent_session_id, started_at, owner_identity FROM running_tasks WHERE workspace_id = $1 AND session_id = $2", &[&self.workspace_id, &session_id]).await.context("cannot load unfinished background tasks")?;
         Ok(rows
             .iter()
             .map(|row| crate::session::UnfinishedTask {
@@ -2444,7 +2444,7 @@ impl GreptimeSession {
                 session_id: Some(session_id.to_owned()),
                 started_at: Some(crate::session_store::datetime_to_us(row.get("started_at"))),
                 raw: None,
-                owner_identity: None,
+                owner_identity: row.get("owner_identity"),
             })
             .collect())
     }
@@ -2577,7 +2577,7 @@ impl GreptimeSession {
         &self,
         subagent_session_id: &str,
     ) -> Result<Vec<crate::session::UnfinishedTask>> {
-        let rows = self.client.query("SELECT task_id, label, session_id, started_at FROM running_tasks WHERE workspace_id = $1 AND subagent_session_id = $2", &[&self.workspace_id, &subagent_session_id]).await.context("cannot load unfinished subagent tasks")?;
+        let rows = self.client.query("SELECT task_id, label, session_id, started_at, owner_identity FROM running_tasks WHERE workspace_id = $1 AND subagent_session_id = $2", &[&self.workspace_id, &subagent_session_id]).await.context("cannot load unfinished subagent tasks")?;
         Ok(rows
             .iter()
             .map(|row| crate::session::UnfinishedTask {
@@ -2587,7 +2587,7 @@ impl GreptimeSession {
                 session_id: Some(row.get("session_id")),
                 started_at: Some(crate::session_store::datetime_to_us(row.get("started_at"))),
                 raw: None,
-                owner_identity: None,
+                owner_identity: row.get("owner_identity"),
             })
             .collect())
     }

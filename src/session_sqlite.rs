@@ -2470,7 +2470,7 @@ impl SqliteSession {
         session_id: &str,
     ) -> Result<Vec<crate::session::UnfinishedTask>, String> {
         let conn = self.conn.lock().await;
-        let mut rows = conn.query("SELECT task_id, label, subagent_session_id, started_at_us FROM running_tasks WHERE workspace_id = ?1 AND session_id = ?2", (self.workspace_id.as_str(), session_id)).await.map_err(|e| format!("cannot load unfinished background tasks: {e}"))?;
+        let mut rows = conn.query("SELECT task_id, label, subagent_session_id, started_at_us, owner_identity FROM running_tasks WHERE workspace_id = ?1 AND session_id = ?2", (self.workspace_id.as_str(), session_id)).await.map_err(|e| format!("cannot load unfinished background tasks: {e}"))?;
         let mut tasks = Vec::new();
         while let Some(row) = rows
             .next()
@@ -2500,6 +2500,11 @@ impl SqliteSession {
                 .as_integer()
                 .copied()
                 .unwrap_or_default();
+            let owner = row
+                .get_value(4)
+                .map_err(|e| e.to_string())?
+                .as_text()
+                .cloned();
             tasks.push(crate::session::UnfinishedTask {
                 task_id: task_id.max(0) as u64,
                 label,
@@ -2507,7 +2512,7 @@ impl SqliteSession {
                 session_id: Some(session_id.to_owned()),
                 started_at: Some(started),
                 raw: None,
-                owner_identity: None,
+                owner_identity: owner,
             });
         }
         Ok(tasks)
@@ -2668,7 +2673,7 @@ impl SqliteSession {
         subagent_session_id: &str,
     ) -> Result<Vec<crate::session::UnfinishedTask>, String> {
         let conn = self.conn.lock().await;
-        let mut rows = conn.query("SELECT task_id, label, session_id, started_at_us FROM running_tasks WHERE workspace_id = ?1 AND subagent_session_id = ?2", (self.workspace_id.as_str(), subagent_session_id)).await.map_err(|e| format!("cannot load unfinished subagent tasks: {e}"))?;
+        let mut rows = conn.query("SELECT task_id, label, session_id, started_at_us, owner_identity FROM running_tasks WHERE workspace_id = ?1 AND subagent_session_id = ?2", (self.workspace_id.as_str(), subagent_session_id)).await.map_err(|e| format!("cannot load unfinished subagent tasks: {e}"))?;
         let mut tasks = Vec::new();
         while let Some(row) = rows
             .next()
@@ -2698,6 +2703,11 @@ impl SqliteSession {
                 .as_integer()
                 .copied()
                 .unwrap_or_default();
+            let owner = row
+                .get_value(4)
+                .map_err(|e| e.to_string())?
+                .as_text()
+                .cloned();
             tasks.push(crate::session::UnfinishedTask {
                 task_id: id.max(0) as u64,
                 label,
@@ -2705,7 +2715,7 @@ impl SqliteSession {
                 session_id: parent,
                 started_at: Some(started),
                 raw: None,
-                owner_identity: None,
+                owner_identity: owner,
             });
         }
         Ok(tasks)

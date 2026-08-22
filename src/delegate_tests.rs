@@ -1167,6 +1167,102 @@ async fn resume_rejects_a_still_running_subagent_session() {
     );
 }
 
+#[tokio::test]
+async fn resume_denial_reports_blocking_owner_scopes_and_reasons() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("sessions");
+    let id = "sub-owner-diagnostic";
+    const LABEL_SENTINEL: &str = "task-label-secret-sentinel";
+    const COMMAND_SENTINEL: &str = "command-secret-sentinel";
+    const TRANSCRIPT_SENTINEL: &str = "transcript-secret-sentinel";
+    const CREDENTIAL_SENTINEL: &str = "credential-secret-sentinel";
+    const PATH_SENTINEL: &str = "/private/path-secret-sentinel";
+    crate::session::Session::append(
+        &root,
+        id,
+        &[crate::agent::SessionEntry::from(
+            crate::agent::Message::User {
+                content: format!("{TRANSCRIPT_SENTINEL} {CREDENTIAL_SENTINEL} {PATH_SENTINEL}"),
+                images: vec![],
+            },
+        )],
+    )
+    .unwrap();
+    crate::session::Session::record_background_start(
+        &root,
+        id,
+        1,
+        LABEL_SENTINEL,
+        Some(COMMAND_SENTINEL),
+        None,
+    )
+    .unwrap();
+    crate::session::Session::record_background_start(
+        &root,
+        "parent-owner-diagnostic",
+        2,
+        "parent label is not reported",
+        None,
+        Some(id),
+    )
+    .unwrap();
+    let own_path = root
+        .join(".e-agent/sessions")
+        .join(format!("{id}.background.jsonl"));
+    let parent_path = root
+        .join(".e-agent/sessions")
+        .join("parent-owner-diagnostic.background.jsonl");
+    std::fs::write(
+        own_path,
+        format!(
+            "{{\"id\":1,\"label\":\"private\",\"owner\":\"{}\"}}\n",
+            crate::session_store::process_identity()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        parent_path,
+        format!(
+            "{{\"id\":2,\"label\":\"private\",\"owner\":\"{}@foreign-host#nonce\",\"session_id\":\"{id}\"}}\n",
+            std::process::id()
+        ),
+    )
+    .unwrap();
+
+    let mut tool = delegate_with_url(temp.path(), "http://localhost".into()).persist_sessions(root);
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+    let error = tool
+        .execute(json!({
+            "task": "follow-up",
+            "resume": id,
+            "workspace": temp.path().to_str().unwrap(),
+            "background": false
+        }))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("own: blocked (owner 1: PID alive)"),
+        "{error}"
+    );
+    assert!(
+        error.contains("delegate: blocked (owner 1: foreign hostname)"),
+        "{error}"
+    );
+    for sentinel in [
+        LABEL_SENTINEL,
+        COMMAND_SENTINEL,
+        TRANSCRIPT_SENTINEL,
+        CREDENTIAL_SENTINEL,
+        PATH_SENTINEL,
+    ] {
+        assert!(
+            !error.contains(sentinel),
+            "diagnostic leaked {sentinel}: {error}"
+        );
+    }
+}
+
 #[test]
 fn resume_loads_the_previous_transcript_as_starting_context() {
     // The core resume invariant: a persisted sub- session can be loaded

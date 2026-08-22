@@ -1063,8 +1063,13 @@ impl Tool for Delegate {
                     .await
                     .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
                 if !own_dead || !delegate_dead {
+                    let diagnostics = temp_store
+                        .resume_owner_diagnostics(&root, &id, own_dead, delegate_dead)
+                        .await;
                     return Err(format!(
-                        "cannot resume session `{id}`: unfinished task owner is still live or cannot be judged"
+                        "cannot resume session `{id}`: unfinished task owners block resume ({}); \
+                         retry after the blocked owners finish or ownership can be judged",
+                        diagnostics.format()
                     ));
                 }
                 Some((id, located.entries, located.locations))

@@ -215,21 +215,37 @@ pub(crate) fn process_identity() -> &'static str {
 /// The `nonce` is deliberately ignored: liveness is per pid+hostname, and
 /// a reused pid answers "some process with that pid is alive", which is
 /// exactly the conservative outcome.
-pub(crate) fn owner_alive(identity: &str) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerLiveness {
+    MissingOwner,
+    Malformed,
+    UnknownHostname,
+    ForeignHostname,
+    CurrentHostnameUnavailable,
+    PidAlive,
+    PidAbsent,
+    ProbeUncertainty,
+}
+
+/// Safe, bounded classification for diagnostics. This is the same probe used
+/// by `owner_alive`; the enum adds only a reason for its conservative answer.
+pub(crate) fn classify_owner(identity: Option<&str>) -> OwnerLiveness {
+    let Some(identity) = identity else {
+        return OwnerLiveness::MissingOwner;
+    };
     let Some((pid_str, rest)) = identity.split_once('@') else {
-        return true; // malformed: cannot judge
+        return OwnerLiveness::Malformed;
     };
-    let Some((hostname, nonce)) = rest.split_once('#') else {
-        return true; // malformed: cannot judge
+    let Some((hostname, _nonce)) = rest.split_once('#') else {
+        return OwnerLiveness::Malformed;
     };
-    if nonce.is_empty() {
-        return true; // malformed: cannot judge
-    }
+    // The nonce is audit metadata only. Preserve the historical probe
+    // behavior for legacy identities that omit it.
     let Ok(pid) = pid_str.parse::<u32>() else {
-        return true; // unparsable pid: cannot judge
+        return OwnerLiveness::Malformed;
     };
     if hostname == "unknown" {
-        return false; // legacy valid identity: explicitly considered dead
+        return OwnerLiveness::UnknownHostname;
     }
     let hostname_now = resolve_hostname(
         |name| std::env::var(name).ok(),
@@ -257,21 +273,14 @@ pub(crate) fn owner_alive(identity: &str) -> bool {
             }
         },
     );
-    // A current "unknown" hostname cannot be compared with a known record;
-    // preserve the conservative behavior when every current source is absent.
     if hostname_now == "unknown" {
-        return true; // cannot judge: conservative
+        return OwnerLiveness::CurrentHostnameUnavailable;
     }
     if hostname != hostname_now {
-        return true; // record from another machine: cannot judge
+        return OwnerLiveness::ForeignHostname;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        // No new dependency (no libc): probe via the `kill` command.
-        // `kill -0` never signals; it only checks existence + permission.
-        // stdout/stderr are silenced: a dead pid makes `kill` print
-        // "No such process" to stderr, which would be noise on every
-        // server restart that consumes zombie records.
         match std::process::Command::new("kill")
             .arg("-0")
             .arg(pid.to_string())
@@ -279,27 +288,19 @@ pub(crate) fn owner_alive(identity: &str) -> bool {
             .stderr(std::process::Stdio::null())
             .status()
         {
-            Ok(status) if status.success() => true, // alive and signalable
+            Ok(status) if status.success() => OwnerLiveness::PidAlive,
             Ok(_) => {
-                // Non-zero exit: ESRCH (no such process — definitely
-                // dead) or EPERM (alive but owned by another user).
-                // /proc is world-readable on Linux, so its existence is
-                // authoritative regardless of permissions: present →
-                // alive (EPERM), absent → dead (ESRCH). This closes the
-                // one real false-dead path.
-                std::path::Path::new(&format!("/proc/{pid}")).exists()
+                if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    OwnerLiveness::PidAlive
+                } else {
+                    OwnerLiveness::PidAbsent
+                }
             }
-            Err(_) => true, // probe failed: conservative
+            Err(_) => OwnerLiveness::ProbeUncertainty,
         }
     }
     #[cfg(target_os = "macos")]
     {
-        // macOS has no /proc, so a non-zero exit cannot be disambiguated
-        // via the filesystem. `kill -0`'s stderr names the reason,
-        // though: "Operation not permitted" (EPERM — the process is
-        // alive but owned by another user) vs "No such process" (ESRCH —
-        // definitely dead). Read it; anything unclassifiable falls back
-        // to conservative alive. stdout stays null (unused).
         match std::process::Command::new("kill")
             .arg("-0")
             .arg(pid.to_string())
@@ -307,9 +308,18 @@ pub(crate) fn owner_alive(identity: &str) -> bool {
             .stderr(std::process::Stdio::piped())
             .output()
         {
-            Ok(out) if out.status.success() => true, // alive and signalable
-            Ok(out) => classify_kill_stderr(&String::from_utf8_lossy(&out.stderr)),
-            Err(_) => true, // probe failed: conservative
+            Ok(out) if out.status.success() => OwnerLiveness::PidAlive,
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if stderr.contains("Operation not permitted") {
+                    OwnerLiveness::PidAlive
+                } else if stderr.contains("No such process") {
+                    OwnerLiveness::PidAbsent
+                } else {
+                    OwnerLiveness::ProbeUncertainty
+                }
+            }
+            Err(_) => OwnerLiveness::ProbeUncertainty,
         }
     }
     #[cfg(windows)]
@@ -320,19 +330,132 @@ pub(crate) fn owner_alive(identity: &str) -> bool {
         };
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
-            // ERROR_ACCESS_DENIED: the process exists but belongs to
-            // another user (cross-user server attach) — alive, not dead.
-            // Any other NULL error means the pid truly does not exist.
-            return unsafe { GetLastError() == ERROR_ACCESS_DENIED };
+            return if unsafe { GetLastError() == ERROR_ACCESS_DENIED } {
+                OwnerLiveness::PidAlive
+            } else {
+                OwnerLiveness::PidAbsent
+            };
         }
-        unsafe {
-            CloseHandle(handle);
-        }
-        true
+        unsafe { CloseHandle(handle) };
+        OwnerLiveness::PidAlive
     }
     #[cfg(not(any(unix, windows)))]
     {
-        true
+        OwnerLiveness::ProbeUncertainty
+    }
+}
+
+pub(crate) fn owner_alive(identity: &str) -> bool {
+    classify_owner(Some(identity)).is_alive()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResumeOwnerDiagnostics {
+    own: Vec<OwnerLiveness>,
+    delegate: Vec<OwnerLiveness>,
+}
+
+impl ResumeOwnerDiagnostics {
+    fn reason_list(reasons: &[OwnerLiveness]) -> String {
+        reasons
+            .iter()
+            .enumerate()
+            .map(|(index, reason)| format!("owner {}: {}", index + 1, reason.description()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub(crate) fn format(&self) -> String {
+        let own = if self.own.is_empty() {
+            "clear".to_owned()
+        } else {
+            format!("blocked ({})", Self::reason_list(&self.own))
+        };
+        let delegate = if self.delegate.is_empty() {
+            "clear".to_owned()
+        } else {
+            format!("blocked ({})", Self::reason_list(&self.delegate))
+        };
+        format!("own: {own}; delegate: {delegate}")
+    }
+}
+
+impl OwnerLiveness {
+    /// Exactly the pre-change `owner_alive` truth table: only the explicit
+    /// legacy unknown-host compatibility result and a definite absent PID are
+    /// dead; every malformed, foreign, unavailable, or uncertain result is
+    /// conservatively alive.
+    fn is_alive(self) -> bool {
+        !matches!(self, Self::UnknownHostname | Self::PidAbsent)
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::MissingOwner => "owner missing",
+            Self::Malformed => "malformed owner identity",
+            Self::UnknownHostname => "unknown hostname",
+            Self::ForeignHostname => "foreign hostname",
+            Self::CurrentHostnameUnavailable => "current hostname unavailable",
+            Self::PidAlive => "PID alive",
+            Self::PidAbsent => "PID absent",
+            Self::ProbeUncertainty => "probe uncertainty",
+        }
+    }
+}
+
+/// Build resume-denial detail from the same owner classifications used by the
+/// existing all-dead gates. Only safe reason labels are retained; identities,
+/// task labels, commands, and storage locations never enter the report.
+fn blocked_owner_diagnostics(
+    tasks: &[crate::session::UnfinishedTask],
+    unknown_hostname_blocks: bool,
+) -> Vec<OwnerLiveness> {
+    tasks
+        .iter()
+        .filter_map(|task| {
+            let reason = classify_owner(task.owner_identity.as_deref());
+            let blocks = match task.owner_identity.as_deref() {
+                None => true,
+                Some(owner) if unknown_hostname_blocks && owner.contains("@unknown#") => true,
+                Some(_) => reason.is_alive(),
+            };
+            blocks.then_some(reason)
+        })
+        .collect()
+}
+
+impl SessionStore {
+    /// Explain a denial after the existing boolean gates have rejected resume.
+    /// A failed detail read is reported as uncertainty, without changing the
+    /// gate result or consuming any row.
+    pub(crate) async fn resume_owner_diagnostics(
+        &self,
+        root: &Path,
+        id: &str,
+        own_dead: bool,
+        delegate_dead: bool,
+    ) -> ResumeOwnerDiagnostics {
+        let own_tasks = self.peek_unfinished_background(root, id).await;
+        let delegate_tasks = self.peek_unfinished_background_for_subagent(root, id).await;
+        let mut own = own_tasks
+            .as_ref()
+            .map(|tasks| blocked_owner_diagnostics(tasks, false))
+            .unwrap_or_default();
+        // JSONL retains its historical extra guard for legacy `@unknown#`
+        // owners; DB backends use `owner_alive` directly. Match the existing
+        // backend-specific gate, rather than changing either gate here.
+        let delegate_unknown_blocks = matches!(self, SessionStore::Jsonl);
+        let mut delegate = delegate_tasks
+            .as_ref()
+            .map(|tasks| blocked_owner_diagnostics(tasks, delegate_unknown_blocks))
+            .unwrap_or_default();
+        if !own_dead && own.is_empty() {
+            own.push(OwnerLiveness::ProbeUncertainty);
+        }
+        if !delegate_dead && delegate.is_empty() {
+            delegate.push(OwnerLiveness::ProbeUncertainty);
+        }
+        ResumeOwnerDiagnostics { own, delegate }
     }
 }
 
@@ -3668,6 +3791,38 @@ mod tests {
             temp.path(),
             session
         ));
+    }
+
+    #[test]
+    fn owner_identity_classification_reports_safe_reasons() {
+        assert_eq!(classify_owner(None), OwnerLiveness::MissingOwner);
+        assert_eq!(
+            classify_owner(Some("not-an-identity")),
+            OwnerLiveness::Malformed
+        );
+        assert_eq!(
+            classify_owner(Some("2000000000@unknown#nonce")),
+            OwnerLiveness::UnknownHostname
+        );
+        assert_eq!(
+            classify_owner(Some("2000000000@foreign-host#nonce")),
+            OwnerLiveness::ForeignHostname
+        );
+        assert_eq!(
+            classify_owner(Some(process_identity())),
+            OwnerLiveness::PidAlive
+        );
+        let host = probeable_hostname().expect("test host must be probeable");
+        assert_eq!(
+            classify_owner(Some(&format!("{}@{host}#", std::process::id()))),
+            OwnerLiveness::PidAlive
+        );
+        assert!(owner_alive(&format!("{}@{host}#", std::process::id())));
+        assert_eq!(
+            classify_owner(Some(&format!("2000000000@{host}#"))),
+            OwnerLiveness::PidAbsent
+        );
+        assert!(!owner_alive(&format!("2000000000@{host}#")));
     }
 
     #[test]
