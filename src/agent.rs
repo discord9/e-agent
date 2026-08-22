@@ -70,8 +70,7 @@ const RETAIN_TAIL: usize = 20;
 pub enum CompactionMode {
     /// Main-agent sessions (SessionFactory/REPL/TUI/web and btw forks): the
     /// current prompt is the LAST actual-user message, and compaction keeps
-    /// the whole current turn verbatim — even when it is the session's
-    /// first and only user turn.
+    /// that prompt plus the bounded recent activity tail.
     #[default]
     Main,
     /// Delegated subagent sessions: a single initial prompt followed by a
@@ -1833,10 +1832,9 @@ impl Agent {
         result.map(|answer| (answer, injected_at_end))
     }
 
-    /// Summarize everything before the current turn and append it as a
-    /// compaction entry. The current turn is kept verbatim inside the entry
-    /// so the derived context still sees it, while the full history stays
-    /// append-only.
+    /// Summarize the replaced history and append a compaction entry. Main
+    /// retains the current prompt plus a bounded recent activity tail, while
+    /// the full history stays append-only.
     pub async fn compact(&mut self) -> anyhow::Result<String> {
         let prepared = self.prepare_compaction().await?;
         let summary = prepared.summary;
@@ -1853,55 +1851,43 @@ impl Agent {
     pub(crate) async fn prepare_compaction(&mut self) -> anyhow::Result<CompactionOutput> {
         // The canonical FULL context (lossless; never bounded here) and its
         // item metadata. The bounded compaction REQUEST is derived from the
-        // same items below; the retained tail stays the full message slice.
+        // same items below; the retained projection is reconstructed below.
         let items = self.repaired_items();
         let context: Vec<Message> = items.iter().map(|item| item.message.clone()).collect();
-        // `split` is the retained-tail start: everything before it is
-        // compacted, everything from it on stays verbatim in the context.
-        // The split is driven by the session's EXPLICIT compaction mode
-        // (never by a user-count heuristic, which misclassifies a main
-        // session whose FIRST turn is a long tool loop) and, within the
-        // Main branch, by ACTUAL-USER provenance — never by message shape:
-        // background completions and notices are projected as user
-        // messages, so "last user-shaped message" would happily compact the
-        // current turn when a completion arrived after the prompt. The last
-        // actual-user item IS the current prompt.
-        let split = match self.compaction_mode {
+        // Main retains the current prompt separately from a bounded recent
+        // activity tail. The compacted request and retained projection are
+        // therefore deliberately non-contiguous.
+        let (split, current_prompt) = match self.compaction_mode {
             CompactionMode::Main => {
-                // Main-agent sessions: the current turn starts at the last
-                // actual-user message; compact everything before it and
-                // keep that turn verbatim — even when it is the session's
-                // FIRST (and only) user turn, so a long tool loop can never
-                // compact its own prompt away.
-                let Some(last_actual_user) = items.iter().rposition(|item| item.actual_user) else {
+                let Some(current_prompt) = items.iter().rposition(|item| item.actual_user) else {
                     anyhow::bail!("nothing to compact");
                 };
-                last_actual_user
+                let candidate = (current_prompt + 1).max(context.len().saturating_sub(RETAIN_TAIL));
+                // Never cut through an assistant tool-call batch. Move a
+                // tool cut backward to the assistant that opened the batch,
+                // retaining that complete batch even if the tail exceeds
+                // RETAIN_TAIL by its size. This also keeps pending calls and
+                // their synthetic results together after repair_item_pairs.
+                let split = if candidate < context.len()
+                    && matches!(context[candidate], Message::Tool { .. })
+                {
+                    context[..candidate]
+                        .iter()
+                        .rposition(|message| matches!(message, Message::Assistant(_)))
+                        .unwrap_or(candidate)
+                } else {
+                    candidate
+                };
+                (split, Some(current_prompt))
             }
             CompactionMode::SingleTask => {
-                // Single-task (subagent) sessions: the initial prompt is
-                // the only real user and the rest of the history is a
-                // tool-call loop (the System context prefix is never a
-                // user), so there is no "conversation before the current
-                // turn" to compact — and after the first compaction the
-                // retained tail contains NO actual user at all, so repeated
-                // compaction must work without one. Compact everything
-                // except a retained tail of the most recent tool activity
-                // (which contains no real user).
+                // Single-task behavior is a bounded tool-activity window;
+                // repeated compaction must work without an actual user.
                 let start = context.len().saturating_sub(RETAIN_TAIL);
                 if start == 0 {
-                    // The whole context fits in the retained tail — nothing
-                    // left to compact.
                     anyhow::bail!("nothing to compact");
                 }
-                // The retained tail must start on an Assistant message so
-                // every retained Tool result has a matching tool_call in
-                // the window (and the compacted window ends on a completed
-                // tool pair). Scan forward from the cut for the first
-                // Assistant; if the tail window contains none (degenerate
-                // all-Tool tail), extend the search backward to the nearest
-                // Assistant.
-                match context[start..]
+                let split = match context[start..]
                     .iter()
                     .position(|message| matches!(message, Message::Assistant(_)))
                 {
@@ -1913,33 +1899,29 @@ impl Agent {
                         Some(index) => index,
                         None => anyhow::bail!("nothing to compact"),
                     },
-                }
+                };
+                (split, None)
             }
         };
-        // Skip the context prefix (System messages) — only compact if
-        // there is actual conversation history (at least one assistant or
-        // tool message). SingleTask compacts everything before the
-        // retained tool window, so the pre-window decides. Main keeps the
-        // whole current turn (from the last actual user on) verbatim, so a
-        // FIRST turn that is a long tool loop must still compact with the
-        // whole turn — prompt included — retained: the check then covers
-        // the whole context, not just the pre-window.
-        let has_conversation = |messages: &[Message]| {
-            messages
-                .iter()
-                .any(|msg| matches!(msg, Message::Assistant(_) | Message::Tool { .. }))
-        };
+        // Do not call the model unless the portion actually replaced by the
+        // compaction contains assistant/tool activity. In Main mode the
+        // current prompt is retained and supplied to the summary request,
+        // so a short first turn is correctly a no-op.
         let compactable = match self.compaction_mode {
-            CompactionMode::Main => has_conversation(&context),
-            CompactionMode::SingleTask => has_conversation(&context[..split]),
+            CompactionMode::Main => items[..split].iter().enumerate().any(|(index, item)| {
+                index != current_prompt.unwrap_or(usize::MAX)
+                    && matches!(item.message, Message::Assistant(_) | Message::Tool { .. })
+            }),
+            CompactionMode::SingleTask => items[..split]
+                .iter()
+                .any(|item| matches!(item.message, Message::Assistant(_) | Message::Tool { .. })),
         };
         if !compactable {
             anyhow::bail!("nothing to compact");
         }
-        // The compaction REQUEST is the bounded projection of everything
-        // before the retained window: oversized persisted fields are
-        // head+tail + receipt, exactly like a normal provider call. The
-        // persisted Compaction.retained below is the FULL context slice.
+        // Main's request includes the current prompt and older activity from
+        // its turn; the retained vector below is [prompt] + [recent tail].
+        // SingleTask keeps the historical contiguous request window.
         let mut request: Vec<Message> = items[..split]
             .iter()
             .map(|item| self.project_item(item))
@@ -1957,7 +1939,16 @@ impl Agent {
             content: COMPACTION_SUMMARY_PROMPT.into(),
             images: vec![],
         });
-        let retained = &context[split..];
+        let retained = match self.compaction_mode {
+            CompactionMode::Main => {
+                let current_prompt = current_prompt.expect("Main compaction has a prompt");
+                let mut retained = Vec::with_capacity(1 + context.len() - split);
+                retained.push(context[current_prompt].clone());
+                retained.extend_from_slice(&context[split..]);
+                retained
+            }
+            CompactionMode::SingleTask => context[split..].to_vec(),
+        };
         let model = &mut self.model;
         let event_handler = &mut self.event_handler;
         let mut on_delta = |kind: ModelDeltaKind, delta: &str| {
@@ -1982,18 +1973,15 @@ impl Agent {
         Ok(CompactionOutput {
             entry: SessionEntry::Compaction {
                 summary: summary.clone(),
-                retained: retained.to_vec(),
+                retained,
                 // Preserve the actual-user provenance through the
-                // persisted entry: the retained tail opens with the
-                // current prompt exactly when the split landed on an
-                // actual-user item (main sessions). Single-task
-                // tool-window tails carry no actual user → `None`, plus
-                // the explicit `no_current_prompt` marker so a resume
-                // never falls back to the first user-shaped retained
-                // message (a retained background completion must not be
-                // misread as the current prompt).
-                current_prompt_at: items[split].actual_user.then_some(0),
-                no_current_prompt: !items[split].actual_user,
+                // persisted entry: Main reconstructs retained as the
+                // current prompt followed by its activity tail, so it is
+                // always Some(0). Single-task tool-window tails carry no
+                // actual user → `None`, plus the explicit marker so resume
+                // never mistakes a background completion for the prompt.
+                current_prompt_at: (self.compaction_mode == CompactionMode::Main).then_some(0),
+                no_current_prompt: self.compaction_mode == CompactionMode::SingleTask,
             },
             summary,
             usage,

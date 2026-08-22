@@ -601,6 +601,94 @@ fn context_pairs_real_result_across_a_compaction_snapshot() {
     assert_eq!(repair_tool_pairs(context.clone()), context);
 }
 
+#[tokio::test]
+async fn main_pending_batch_boundary_keeps_late_result_after_repair() {
+    // More than RETAIN_TAIL pending calls force the nominal cut into the
+    // synthetic-result portion of the batch. The Main boundary must move
+    // backward to the initiating Assistant, and a real result arriving after
+    // compaction must replace the synthetic placeholder during projection.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let calls: Vec<ToolCall> = (0..(RETAIN_TAIL + 1))
+        .map(|index| call(&format!("pending-{index}"), "bash", "{}"))
+        .collect();
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some("summary".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests,
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "earlier".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("done earlier".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: "current".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: None,
+            tool_calls: calls.clone(),
+            reasoning: None,
+        })
+        .into(),
+    ]);
+
+    agent.compact().await.unwrap();
+    assert!(matches!(
+        agent.history().last(),
+        Some(SessionEntry::Compaction { retained, .. })
+            if retained.len() > RETAIN_TAIL + 1
+                && matches!(retained.get(1), Some(Message::Assistant(_)))
+    ));
+
+    for (index, call) in calls.iter().enumerate() {
+        agent.push_entry(
+            Message::Tool {
+                call_id: call.id.clone(),
+                name: "bash".into(),
+                content: if index == RETAIN_TAIL {
+                    "late real result".into()
+                } else {
+                    format!("real result {index}")
+                },
+                images: vec![],
+                is_error: false,
+                synthetic: false,
+            }
+            .into(),
+        );
+    }
+    let context = agent.context();
+    assert!(context.iter().any(|message| matches!(
+        message,
+        Message::Tool { call_id, content, synthetic: false, .. }
+            if call_id == &calls[RETAIN_TAIL].id && content == "late real result"
+    )));
+    assert!(!context.iter().any(|message| matches!(
+        message,
+        Message::Tool {
+            synthetic: true,
+            ..
+        }
+    )));
+    assert_eq!(repair_tool_pairs(context.clone()), context);
+}
+
 fn message_tool_content(message: &Message) -> &str {
     match message {
         Message::Tool { content, .. } => content,
@@ -1224,7 +1312,13 @@ async fn compacts_everything_before_the_current_turn() {
     ));
     assert_eq!(&context[1..], current_turn.as_slice());
     let requests = requests.lock().unwrap();
-    assert_eq!(requests[0].len(), 6);
+    // The current prompt is also supplied to the summary request so the
+    // older activity from its turn remains meaningful to the summarizer.
+    assert_eq!(requests[0].len(), 7);
+    assert!(matches!(
+        requests[0].get(5),
+        Some(Message::User { content, .. }) if content == "recent request"
+    ));
     assert!(matches!(
         requests[0].last().unwrap(),
         Message::User { content, .. } if content.contains("Summarize the earlier conversation")
@@ -2325,7 +2419,7 @@ async fn compaction_retained_stays_full_and_request_is_bounded() {
         message,
         Message::User { content, .. } if content.contains("OMITTED-MIDDLE")
     )));
-    assert_eq!(request.len(), 4); // 3 pre-turn messages + summary prompt
+    assert_eq!(request.len(), 5); // pre-turn + current prompt + summary prompt
 
     // The NEXT request (after the compaction): the retained projection
     // uses the persisted provenance — the current prompt (retained[0]) is
@@ -2440,12 +2534,13 @@ async fn compaction_split_uses_actual_user_not_background_completion() {
         ]
     );
     assert_eq!(*current_prompt_at, Some(0));
-    // The compaction request carried ONLY the pre-turn exchange.
+    // The request carries the current prompt as context while summarizing
+    // older activity from its turn; only the bounded tail is reconstructed.
     let request = &requests.lock().unwrap()[0];
-    assert_eq!(request.len(), 3); // earlier question + answer + summary prompt
-    assert!(!request.iter().any(|message| matches!(
+    assert_eq!(request.len(), 4); // prior exchange + prompt + summary prompt
+    assert!(request.iter().any(|message| matches!(
         message,
-        Message::User { content, .. } if content.contains("the actual prompt")
+        Message::User { content, .. } if content == "the actual prompt"
     )));
 }
 
@@ -2646,7 +2741,7 @@ async fn compaction_request_bounds_oversized_completion_before_later_user() {
 
     // The compaction request carries the BOUNDED completion projection.
     let request = &requests.lock().unwrap()[0];
-    assert_eq!(request.len(), 5); // original turn + bounded completion + summary prompt
+    assert_eq!(request.len(), 6); // original turn + current prompt + bounded completion + summary prompt
     assert!(request.iter().any(|message| matches!(
         message,
         Message::User { content, .. }
@@ -4013,8 +4108,8 @@ async fn main_single_user_long_tool_loop_keeps_prompt_in_retained() {
     // Audit regression (HIGH): a MAIN session whose FIRST turn is a long
     // tool loop has exactly one actual user. The old user-count heuristic
     // took the tool-tail branch and compacted the sole prompt away; with
-    // the explicit Main mode the whole current turn — prompt included —
-    // stays verbatim in retained.
+    // explicit Main mode keeps the prompt plus a bounded, batch-complete
+    // recent activity tail in retained.
     let summary = "The session's first request asked for the compaction change; the assistant is still working through the long tool loop.";
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
@@ -4074,7 +4169,8 @@ async fn main_single_user_long_tool_loop_keeps_prompt_in_retained() {
     };
     // The sole prompt is retained VERBATIM as retained[0] and marked as
     // the current prompt — never compacted into the summary.
-    assert_eq!(retained.len(), 61, "the whole first turn is retained");
+    // Main retains the prompt plus only the existing bounded activity tail.
+    assert_eq!(retained.len(), RETAIN_TAIL + 1);
     assert!(matches!(
         retained.first(),
         Some(Message::User { content, .. }) if content == "original goal"

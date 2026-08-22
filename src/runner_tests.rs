@@ -1701,7 +1701,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
     // Prior conversation so there is something before the current turn to
     // compact (prepare_compaction requires an assistant/tool message before
     // the retained user turn).
-    agent.restore_history(vec![
+    let mut prior_history = vec![
         Message::User {
             content: "old question".into(),
             images: vec![],
@@ -1713,7 +1713,37 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
             reasoning: None,
         })
         .into(),
-    ]);
+    ];
+    // Keep enough completed activity before the current prompt that the
+    // second high-usage round has genuinely replaceable context after the
+    // first compaction. The test still exercises the latch, not a no-op.
+    for index in 0..15 {
+        let id = format!("prior-{index}");
+        prior_history.push(
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: id.clone(),
+                    name: "keep_alive".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning: None,
+            })
+            .into(),
+        );
+        prior_history.push(
+            Message::Tool {
+                call_id: id,
+                name: "keep_alive".into(),
+                content: "ok".into(),
+                images: vec![],
+                is_error: false,
+                synthetic: false,
+            }
+            .into(),
+        );
+    }
+    agent.restore_history(prior_history);
     let (runner, handle) = SessionRunner::new(
         agent,
         SessionStore::Jsonl,
@@ -1871,11 +1901,16 @@ async fn successful_auto_compact_resets_latch_and_fires_again_on_next_big_round(
                 (
                     AssistantMessage {
                         content: None,
-                        tool_calls: vec![ToolCall {
-                            id: "call-2".into(),
-                            name: "keep_alive".into(),
-                            arguments: "{}".into(),
-                        }],
+                        // A materially large second activity batch makes
+                        // the second compaction replace the completed first
+                        // batch rather than becoming a short-turn no-op.
+                        tool_calls: (0..21)
+                            .map(|index| ToolCall {
+                                id: format!("call-2-{index}"),
+                                name: "keep_alive".into(),
+                                arguments: "{}".into(),
+                            })
+                            .collect(),
                         reasoning: None,
                     },
                     Some(Usage {
