@@ -813,10 +813,8 @@ impl SessionRunner {
     /// a completely normal turn begun from an empty prompt batch — the
     /// same machinery as the background-completion follow-up — preceded by
     /// a DURABLE `SessionEntry::Notice` (persisted, applied to the agent
-    /// history, and fanned out) so the UI and the model context both see
-    /// the round marker; `commit` does not fan out Notice entries itself,
-    /// so the live `AgentEvent::Notice` is emitted here, after the durable
-    /// append. The model already receives the session goal as a System
+    /// history, and fanned out by `commit`) so the UI and the model context
+    /// both see the round marker. The model already receives the session goal as a System
     /// message on every provider call, so no extra goal injection is
     /// needed. No `Message::User` is fabricated: the Notice's user-shaped
     /// projection carries `actual_user: false`, so it can never be
@@ -828,17 +826,12 @@ impl SessionRunner {
             "[goal continuation {round}/{} — session goal still active, continuing…]",
             GOAL_CONTINUATION_LIMIT
         );
-        if let Err(error) = self
-            .commit(SessionEntry::Notice { text: text.clone() })
-            .await
-        {
+        if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
             // Persistence failure: surface as an Error entry and still run
             // the continuation (the turn's own commits fail closed if the
             // store is truly broken).
             self.commit_error(format!("persisting goal continuation notice: {error:#}"))
                 .await;
-        } else {
-            self.shared.lock().unwrap().emit(AgentEvent::Notice(text));
         }
         self.next_turn_kind = NextTurnKind::Goal;
         self.pending.push_back(PendingCommand::Prompt {
@@ -1541,16 +1534,11 @@ impl SessionRunner {
                         // Guarded by `last_turn_was_continuation` so a later
                         // user turn cannot re-emit it.
                         let text = GOAL_CONTINUATION_CAP_NOTICE.to_owned();
-                        if let Err(error) = self
-                            .commit(SessionEntry::Notice { text: text.clone() })
-                            .await
-                        {
+                        if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
                             self.commit_error(format!(
                                 "persisting goal continuation cap notice: {error:#}"
                             ))
                             .await;
-                        } else {
-                            self.shared.lock().unwrap().emit(AgentEvent::Notice(text));
                         }
                     }
                     if goal_active
