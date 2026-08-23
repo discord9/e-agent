@@ -6186,10 +6186,205 @@ async fn cancel_after_natural_end_before_continuation_mount_suppresses_latch() {
 }
 
 #[tokio::test]
-async fn cancel_after_goal_continuation_marker_armed_removes_marker() {
-    // The durable notice is already committed, but the empty internal prompt
-    // has not started a model call. Cancel must remove that marker rather
-    // than classifying it as queued human work.
+async fn resumed_goal_with_three_continuations_runs_seven_more_then_caps_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut history = vec![SessionEntry::GoalUpdated { goal: Some(goal) }];
+    history.extend((1..=3).map(|round| SessionEntry::Notice {
+        text: format!(
+            "[goal continuation {round}/{GOAL_CONTINUATION_LIMIT} — session goal still active, continuing…]"
+        ),
+    }));
+    SessionStore::Jsonl
+        .append(temp.path(), "goal-resume-three", &history)
+        .await
+        .unwrap();
+    let history = SessionStore::Jsonl
+        .load(temp.path(), "goal-resume-three")
+        .await
+        .unwrap()
+        .entries;
+    let mut agent = Agent::new(
+        Box::new(StreamingScriptedModel {
+            replies: (0..8)
+                .map(|i| gc_text_reply(&format!("resume reply {i}")))
+                .collect(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(history);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-resume-three".into(),
+        IdlePolicy::WaitForInput,
+    );
+    assert_eq!(runner.goal_continuation_remaining, 7);
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("real user turn".into()));
+
+    let mut live_rounds = 0;
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if gc_notice(&AgentEvent::Notice(text.clone())) => {
+                live_rounds += 1;
+            }
+            AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    assert_eq!(live_rounds, 7);
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    let snapshot = handle.snapshot();
+    assert_eq!(snapshot.iter().filter(|event| gc_notice(event)).count(), 10);
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE))
+            .count(),
+        1
+    );
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-resume-three")
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Notice { text } if text.contains("[goal continuation") && text.contains("/10 —")))
+            .count(),
+        10
+    );
+    assert_eq!(
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Notice { text } if text == GOAL_CONTINUATION_CAP_NOTICE))
+            .count(),
+        1
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn resumed_capped_goal_user_turn_starts_no_continuations_or_second_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut history = vec![SessionEntry::GoalUpdated { goal: Some(goal) }];
+    history.extend((1..=GOAL_CONTINUATION_LIMIT).map(|round| SessionEntry::Notice {
+        text: format!(
+            "[goal continuation {round}/{GOAL_CONTINUATION_LIMIT} — session goal still active, continuing…]"
+        ),
+    }));
+    history.push(SessionEntry::Notice {
+        text: GOAL_CONTINUATION_CAP_NOTICE.into(),
+    });
+    SessionStore::Jsonl
+        .append(temp.path(), "goal-resume-capped", &history)
+        .await
+        .unwrap();
+    let history = SessionStore::Jsonl
+        .load(temp.path(), "goal-resume-capped")
+        .await
+        .unwrap()
+        .entries;
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from([gc_text_reply("user answer")]),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(history);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-resume-capped".into(),
+        IdlePolicy::WaitForInput,
+    );
+    assert_eq!(runner.goal_continuation_remaining, 0);
+    assert!(runner.goal_continuation_cap_noticed);
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("real user turn".into()));
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::UserPrompt(text) if text == "real user turn" => break,
+            AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE => {
+                panic!("reconstructed cap Notice was emitted live again")
+            }
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    let snapshot = handle.snapshot();
+    assert_eq!(snapshot.iter().filter(|event| gc_notice(event)).count(), 10);
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE))
+            .count(),
+        1
+    );
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-resume-capped")
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Notice { text } if text == GOAL_CONTINUATION_CAP_NOTICE))
+            .count(),
+        1
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn prompt_before_goal_continuation_start_discards_marker_without_charge() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::new(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (mut runner, _) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-prompt-before-start".into(),
+        IdlePolicy::WaitForInput,
+    );
+    runner.arm_goal_continuation();
+    assert_eq!(
+        runner.queue(SessionCommand::Prompt("real prompt".into())),
+        Steering::None
+    );
+    assert_eq!(runner.next_turn_kind, NextTurnKind::User);
+    assert_eq!(runner.goal_continuation_remaining, GOAL_CONTINUATION_LIMIT);
+    assert!(!runner.pending.iter().any(|command| matches!(
+        command,
+        PendingCommand::Prompt { text, queued: false, .. } if text.is_empty()
+    )));
+    assert!(!runner.agent.history().iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Notice { text } if text.contains("[goal continuation")
+    )));
+}
+
+#[tokio::test]
+async fn cancel_before_goal_continuation_start_discards_marker_without_charge() {
+    // Arming is not charging: cancel before the empty internal prompt starts
+    // must remove the marker without a durable Notice or budget decrement.
     let temp = tempfile::tempdir().unwrap();
     let agent = Agent::new(
         Box::new(ScriptedAssistantModel {
@@ -6204,9 +6399,11 @@ async fn cancel_after_goal_continuation_marker_armed_removes_marker() {
         "goal-cancel-armed".into(),
         IdlePolicy::WaitForInput,
     );
-    runner.start_goal_continuation().await;
+    runner.arm_goal_continuation();
     assert!(!runner.has_prompt_work());
     assert!(runner.has_work());
+    assert_eq!(runner.goal_continuation_remaining, GOAL_CONTINUATION_LIMIT);
+    assert_eq!(runner.agent.history().iter().filter(|entry| matches!(entry, SessionEntry::Notice { text } if text.contains("[goal continuation"))).count(), 0);
     assert_eq!(runner.queue(SessionCommand::Cancel), Steering::ReleasedIdle);
     assert!(!runner.has_work());
     assert_eq!(runner.next_turn_kind, NextTurnKind::User);

@@ -514,6 +514,8 @@ pub struct SessionRunner {
     turn_just_ended: bool,
     /// Goal-continuation budget, decremented once per continuation round.
     goal_continuation_remaining: u32,
+    /// Whether the durable cap Notice has already been emitted.
+    goal_continuation_cap_noticed: bool,
     /// Anti-spin bookkeeping from the last natural turn end: whether that
     /// turn was itself a goal continuation and whether its final model
     /// round streamed any content delta. A continuation round that
@@ -552,6 +554,14 @@ impl SessionRunner {
         // the agent (resume fold: newest GoalUpdated wins — reuse the
         // agent's own fold instead of a second reverse scan).
         let goal = agent.goal();
+        let continuation_rounds = agent
+            .history()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Notice { text } if text.starts_with("[goal continuation ") && text.contains("/10 —")))
+            .count() as u32;
+        let cap_noticed = agent.history().iter().any(|entry| {
+            matches!(entry, SessionEntry::Notice { text } if text == GOAL_CONTINUATION_CAP_NOTICE)
+        });
         let shared = Arc::new(Mutex::new(Shared {
             log: replay,
             events,
@@ -583,7 +593,12 @@ impl SessionRunner {
                 next_turn_kind: NextTurnKind::User,
                 current_turn_kind: NextTurnKind::User,
                 turn_just_ended: false,
-                goal_continuation_remaining: GOAL_CONTINUATION_LIMIT,
+                goal_continuation_remaining: if cap_noticed {
+                    0
+                } else {
+                    GOAL_CONTINUATION_LIMIT.saturating_sub(continuation_rounds)
+                },
+                goal_continuation_cap_noticed: cap_noticed,
                 last_turn_was_continuation: false,
                 last_turn_produced_delta: false,
                 finalize_wait: None,
@@ -809,16 +824,20 @@ impl SessionRunner {
         self.shared.lock().unwrap().emit(AgentEvent::Error(text));
     }
 
-    /// Start one goal-continuation round (idle mount point). The round is
-    /// a completely normal turn begun from an empty prompt batch — the
-    /// same machinery as the background-completion follow-up — preceded by
-    /// a DURABLE `SessionEntry::Notice` (persisted, applied to the agent
-    /// history, and fanned out by `commit`) so the UI and the model context
-    /// both see the round marker. The model already receives the session goal as a System
-    /// message on every provider call, so no extra goal injection is
-    /// needed. No `Message::User` is fabricated: the Notice's user-shaped
-    /// projection carries `actual_user: false`, so it can never be
-    /// mistaken for a real user prompt.
+    /// Arm a possible goal-continuation batch. Charging and the durable
+    /// Notice happen only after this marker is classified as a Goal turn.
+    fn arm_goal_continuation(&mut self) {
+        self.next_turn_kind = NextTurnKind::Goal;
+        self.pending.push_back(PendingCommand::Prompt {
+            text: String::new(),
+            queued: false,
+            image: None,
+        });
+    }
+
+    /// Commit the marker for a Goal turn after the pending batch has been
+    /// classified. A real prompt or cancellation therefore discards the arm
+    /// without consuming budget or writing a Notice.
     async fn start_goal_continuation(&mut self) {
         let round = GOAL_CONTINUATION_LIMIT - self.goal_continuation_remaining + 1;
         self.goal_continuation_remaining -= 1;
@@ -827,18 +846,9 @@ impl SessionRunner {
             GOAL_CONTINUATION_LIMIT
         );
         if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
-            // Persistence failure: surface as an Error entry and still run
-            // the continuation (the turn's own commits fail closed if the
-            // store is truly broken).
             self.commit_error(format!("persisting goal continuation notice: {error:#}"))
                 .await;
         }
-        self.next_turn_kind = NextTurnKind::Goal;
-        self.pending.push_back(PendingCommand::Prompt {
-            text: String::new(),
-            queued: false,
-            image: None,
-        });
     }
 
     /// Apply + persist one human goal command. Errors are plain strings
@@ -1129,6 +1139,7 @@ impl SessionRunner {
     fn queue(&mut self, command: SessionCommand) -> Steering {
         match command {
             SessionCommand::Prompt(prompt) => {
+                self.discard_armed_goal_for_prompt();
                 self.pending.push_back(PendingCommand::Prompt {
                     text: prompt,
                     queued: true,
@@ -1137,6 +1148,7 @@ impl SessionRunner {
                 Steering::None
             }
             SessionCommand::PromptWithImage { text, image } => {
+                self.discard_armed_goal_for_prompt();
                 self.pending.push_back(PendingCommand::Prompt {
                     text,
                     queued: true,
@@ -1162,6 +1174,20 @@ impl SessionRunner {
                 self.cancel_goal_continuation();
                 self.release_steering()
             }
+        }
+    }
+
+    /// A prompt joined to an armed empty continuation makes the batch a user
+    /// turn; the arm is discarded before it can be charged.
+    fn discard_armed_goal_for_prompt(&mut self) {
+        if self.next_turn_kind == NextTurnKind::Goal {
+            self.pending.retain(|command| {
+                !matches!(
+                    command,
+                    PendingCommand::Prompt { text, queued: false, .. } if text.is_empty()
+                )
+            });
+            self.next_turn_kind = NextTurnKind::User;
         }
     }
 
@@ -1529,11 +1555,16 @@ impl SessionRunner {
                         Some(GoalStatus::Active)
                     );
                     let budget_left = self.goal_continuation_remaining > 0;
-                    if goal_active && !budget_left && self.last_turn_was_continuation {
+                    if goal_active
+                        && !budget_left
+                        && self.last_turn_was_continuation
+                        && !self.goal_continuation_cap_noticed
+                    {
                         // Budget exhausted: one final durable Notice, then Idle.
                         // Guarded by `last_turn_was_continuation` so a later
                         // user turn cannot re-emit it.
                         let text = GOAL_CONTINUATION_CAP_NOTICE.to_owned();
+                        self.goal_continuation_cap_noticed = true;
                         if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
                             self.commit_error(format!(
                                 "persisting goal continuation cap notice: {error:#}"
@@ -1546,7 +1577,7 @@ impl SessionRunner {
                         && !self.agent.has_blocking_background()
                         && (!self.last_turn_was_continuation || self.last_turn_produced_delta)
                     {
-                        self.start_goal_continuation().await;
+                        self.arm_goal_continuation();
                         continue;
                     }
                 }
@@ -1652,6 +1683,9 @@ impl SessionRunner {
                 NextTurnKind::User
             };
             self.turn_just_ended = false;
+            if self.current_turn_kind == NextTurnKind::Goal {
+                self.start_goal_continuation().await;
+            }
             self.status(SessionStatus::Busy);
             if !prompt.is_empty() {
                 let image_rejected = image.is_some() && !self.agent.supports_vision();

@@ -5484,3 +5484,32 @@ fn latest_read_output_result_stays_full_in_request_context() {
     };
     assert_eq!(content, &huge);
 }
+
+#[tokio::test]
+async fn empty_content_delta_does_not_count_as_produced_content() {
+    struct EmptyDeltaModel;
+    #[async_trait]
+    impl Model for EmptyDeltaModel {
+        async fn complete(
+            &mut self,
+            _: &[Message],
+            _: &[ToolSpec],
+            mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+        ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+            if let Some(callback) = &mut on_delta {
+                callback(ModelDeltaKind::Content, "");
+            }
+            Ok((
+                AssistantMessage {
+                    content: Some("answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            ))
+        }
+    }
+    let mut agent = Agent::new(Box::new(EmptyDeltaModel), vec![]);
+    let round = agent.complete_round(&[]).await.unwrap();
+    assert!(!round.produced_content_delta);
+}
