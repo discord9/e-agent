@@ -2,21 +2,12 @@
 
 use crate::{
     agent::{
-        Agent, AgentEvent, CompactionOutput, GoalStatus, ImagePart, Message, Model,
+        Agent, AgentEvent, CompactionOutput, ImagePart, Message, Model,
         POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry, ToolCall, ToolOutput, ToolSpec,
         is_poll_guard_terminate, tool_error_content,
     },
     session_store::{LocatedKey, SessionStore},
 };
-
-/// How many automatic continuation turns a session may start after a
-/// natural turn end while its goal stays Active (Codex-style continuation,
-/// bounded so a runaway loop is impossible).
-const GOAL_CONTINUATION_LIMIT: u32 = 10;
-/// Emitted (live event + replay log) when the continuation budget is
-/// exhausted and the goal is still Active.
-const GOAL_CONTINUATION_CAP_NOTICE: &str =
-    "[goal continuation cap reached (10/10) — session goal still active, awaiting input]";
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -475,20 +466,6 @@ pub(crate) struct SessionBootstrap {
     pub(crate) initial_entries: Vec<SessionEntry>,
 }
 
-/// What the next turn to start is when it begins from an EMPTY prompt
-/// batch. Both empty-prompt continuations — the background-completion
-/// follow-up pushed by `commit_backgrounds` at the top of the loop and the
-/// goal continuation pushed at the idle mount point — are armed only while
-/// `pending` is empty at their respective loop points, so at most one can
-/// be pending at a time; a real user prompt joined into the batch discards
-/// the marker and the turn is a plain user turn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NextTurnKind {
-    User,
-    Background,
-    Goal,
-}
-
 pub struct SessionRunner {
     agent: Agent,
     store: SessionStore,
@@ -499,30 +476,6 @@ pub struct SessionRunner {
     pending: VecDeque<PendingCommand>,
     policy: IdlePolicy,
     last_answer: Option<String>,
-    /// Armed marker for the NEXT turn to start, consumed at
-    /// `take_prompt_batch` (see [`NextTurnKind`]).
-    next_turn_kind: NextTurnKind,
-    /// Kind of the turn currently running (set at turn start; the natural
-    /// end consults it for goal-continuation bookkeeping).
-    current_turn_kind: NextTurnKind,
-    /// Latch: the immediately preceding turn ended NATURALLY (final model
-    /// round with no tool calls). Cleared at every turn start and by any
-    /// human prompt/command wake-up at the idle select; set only at the
-    /// natural end of a non-background turn. The goal-continuation mount
-    /// point fires only while this is set, so neither the very first turn
-    /// of a session nor a turn woken from idle can self-continue.
-    turn_just_ended: bool,
-    /// Goal-continuation budget, decremented once per continuation round.
-    goal_continuation_remaining: u32,
-    /// Whether the durable cap Notice has already been emitted.
-    goal_continuation_cap_noticed: bool,
-    /// Anti-spin bookkeeping from the last natural turn end: whether that
-    /// turn was itself a goal continuation and whether its final model
-    /// round streamed any content delta. A continuation round that
-    /// produced no content stops the chain (the model has nothing more to
-    /// say), so a goal cannot keep the session spinning.
-    last_turn_was_continuation: bool,
-    last_turn_produced_delta: bool,
     /// Upper bound for waiting on blocking background tasks before
     /// finalizing a `FinishWhenIdle` session (`None` = wait indefinitely).
     /// Resolved from `[delegate] finalize_wait_secs` by the session factory;
@@ -554,14 +507,6 @@ impl SessionRunner {
         // the agent (resume fold: newest GoalUpdated wins — reuse the
         // agent's own fold instead of a second reverse scan).
         let goal = agent.goal();
-        let continuation_rounds = agent
-            .history()
-            .iter()
-            .filter(|entry| matches!(entry, SessionEntry::Notice { text } if text.starts_with("[goal continuation ") && text.contains("/10 —")))
-            .count() as u32;
-        let cap_noticed = agent.history().iter().any(|entry| {
-            matches!(entry, SessionEntry::Notice { text } if text == GOAL_CONTINUATION_CAP_NOTICE)
-        });
         let shared = Arc::new(Mutex::new(Shared {
             log: replay,
             events,
@@ -590,17 +535,6 @@ impl SessionRunner {
                 pending: VecDeque::new(),
                 policy,
                 last_answer: None,
-                next_turn_kind: NextTurnKind::User,
-                current_turn_kind: NextTurnKind::User,
-                turn_just_ended: false,
-                goal_continuation_remaining: if cap_noticed {
-                    0
-                } else {
-                    GOAL_CONTINUATION_LIMIT.saturating_sub(continuation_rounds)
-                },
-                goal_continuation_cap_noticed: cap_noticed,
-                last_turn_was_continuation: false,
-                last_turn_produced_delta: false,
                 finalize_wait: None,
                 bootstrap: None,
                 #[cfg(test)]
@@ -822,33 +756,6 @@ impl SessionRunner {
             }
         }
         self.shared.lock().unwrap().emit(AgentEvent::Error(text));
-    }
-
-    /// Arm a possible goal-continuation batch. Charging and the durable
-    /// Notice happen only after this marker is classified as a Goal turn.
-    fn arm_goal_continuation(&mut self) {
-        self.next_turn_kind = NextTurnKind::Goal;
-        self.pending.push_back(PendingCommand::Prompt {
-            text: String::new(),
-            queued: false,
-            image: None,
-        });
-    }
-
-    /// Commit the marker for a Goal turn after the pending batch has been
-    /// classified. A real prompt or cancellation therefore discards the arm
-    /// without consuming budget or writing a Notice.
-    async fn start_goal_continuation(&mut self) -> anyhow::Result<()> {
-        let round = GOAL_CONTINUATION_LIMIT - self.goal_continuation_remaining + 1;
-        let text = format!(
-            "[goal continuation {round}/{} — session goal still active, continuing…]",
-            GOAL_CONTINUATION_LIMIT
-        );
-        // The durable Notice is the receipt for this round. Do not charge the
-        // budget, or let the turn reach the provider, until that receipt exists.
-        self.commit(SessionEntry::Notice { text }).await?;
-        self.goal_continuation_remaining -= 1;
-        Ok(())
     }
 
     /// Apply + persist one human goal command. Errors are plain strings
@@ -1139,7 +1046,6 @@ impl SessionRunner {
     fn queue(&mut self, command: SessionCommand) -> Steering {
         match command {
             SessionCommand::Prompt(prompt) => {
-                self.discard_armed_goal_for_prompt();
                 self.pending.push_back(PendingCommand::Prompt {
                     text: prompt,
                     queued: true,
@@ -1148,7 +1054,6 @@ impl SessionRunner {
                 Steering::None
             }
             SessionCommand::PromptWithImage { text, image } => {
-                self.discard_armed_goal_for_prompt();
                 self.pending.push_back(PendingCommand::Prompt {
                     text,
                     queued: true,
@@ -1170,41 +1075,7 @@ impl SessionRunner {
                 self.agent.set_model(model);
                 Steering::None
             }
-            SessionCommand::Cancel => {
-                self.cancel_goal_continuation();
-                self.release_steering()
-            }
-        }
-    }
-
-    /// A prompt joined to an armed empty continuation makes the batch a user
-    /// turn; the arm is discarded before it can be charged.
-    fn discard_armed_goal_for_prompt(&mut self) {
-        if self.next_turn_kind == NextTurnKind::Goal {
-            self.pending.retain(|command| {
-                !matches!(
-                    command,
-                    PendingCommand::Prompt { text, queued: false, .. } if text.is_empty()
-                )
-            });
-            self.next_turn_kind = NextTurnKind::User;
-        }
-    }
-
-    /// A consumed cancel must prevent a just-finished turn, or an already
-    /// armed empty continuation batch, from starting another goal round.
-    /// Empty, non-queued prompts are internal continuation markers (goal or
-    /// background), never human prompt work.
-    fn cancel_goal_continuation(&mut self) {
-        self.turn_just_ended = false;
-        self.pending.retain(|command| {
-            !matches!(
-                command,
-                PendingCommand::Prompt { text, queued: false, .. } if text.is_empty()
-            )
-        });
-        if self.next_turn_kind == NextTurnKind::Goal {
-            self.next_turn_kind = NextTurnKind::User;
+            SessionCommand::Cancel => self.release_steering(),
         }
     }
     async fn commit_backgrounds(&mut self) -> anyhow::Result<bool> {
@@ -1227,7 +1098,7 @@ impl SessionRunner {
     fn has_prompt_work(&self) -> bool {
         self.pending
             .iter()
-            .any(|command| matches!(command, PendingCommand::Prompt { queued: true, .. }))
+            .any(|command| matches!(command, PendingCommand::Prompt { .. }))
     }
 
     fn release_steering(&self) -> Steering {
@@ -1432,7 +1303,6 @@ impl SessionRunner {
                 OperationFlow::Done(Steering::None)
             }
             WaitOutcome::Released => {
-                self.cancel_goal_continuation();
                 // The in-flight compaction future was dropped: no entry, no
                 // projection. The release is known (the Cancel was consumed
                 // by wait_for_operation); classify from what is now queued.
@@ -1457,12 +1327,6 @@ impl SessionRunner {
         loop {
             match self.commit_backgrounds().await {
                 Ok(true) if self.pending.is_empty() => {
-                    // Background-completion follow-up turn: armed with the
-                    // Background marker so its natural end never chains
-                    // into goal continuation (the background-injection
-                    // scenario's own continuation mechanism is this
-                    // top-of-loop path).
-                    self.next_turn_kind = NextTurnKind::Background;
                     self.pending.push_back(PendingCommand::Prompt {
                         text: String::new(),
                         queued: false,
@@ -1534,54 +1398,6 @@ impl SessionRunner {
                     }
                     continue;
                 }
-                // Goal continuation mount point (Codex-style): a NATURAL
-                // turn end with the goal still Active, no queued input, no
-                // blocking background task, budget left, and a previous
-                // continuation round that actually produced content starts
-                // a fresh, fully normal turn from an empty prompt batch —
-                // exactly like the background-completion follow-up. The
-                // `turn_just_ended` latch distinguishes this from the very
-                // first turn of a session and from turns woken by human
-                // input, so neither can self-continue. Background-completion
-                // follow-up turns never arm the latch (their own
-                // continuation is the top-of-loop `commit_backgrounds`
-                // path), so the background-injection scenario does not
-                // chain into goal continuation. A model-side goal
-                // transition (complete/pause/block) naturally stops the
-                // chain here: the goal is no longer Active.
-                if self.turn_just_ended {
-                    let goal_active = matches!(
-                        self.agent.goal().as_ref().map(|goal| goal.status),
-                        Some(GoalStatus::Active)
-                    );
-                    let budget_left = self.goal_continuation_remaining > 0;
-                    if goal_active && !budget_left && !self.goal_continuation_cap_noticed {
-                        // Budget exhausted: one final durable Notice, then Idle.
-                        // The durable cap flag prevents later user turns from
-                        // re-emitting it. This also repairs a resume after the
-                        // tenth round committed but the cap Notice did not.
-                        let text = GOAL_CONTINUATION_CAP_NOTICE.to_owned();
-                        if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
-                            self.terminate(
-                                SessionResult::Failed(format!(
-                                    "persisting goal continuation cap notice: {error:#}"
-                                )),
-                                Vec::new(),
-                            )
-                            .await;
-                            return;
-                        }
-                        self.goal_continuation_cap_noticed = true;
-                    }
-                    if goal_active
-                        && budget_left
-                        && !self.agent.has_blocking_background()
-                        && (!self.last_turn_was_continuation || self.last_turn_produced_delta)
-                    {
-                        self.arm_goal_continuation();
-                        continue;
-                    }
-                }
                 self.status(SessionStatus::Idle);
                 if self.policy == IdlePolicy::FinishWhenIdle
                     && !self.agent.has_blocking_background()
@@ -1621,12 +1437,6 @@ impl SessionRunner {
                             let first = self.queue(command);
                             let drained = self.drain_ready_commands();
                             let steering = self.merge_steering(first, drained);
-                            // A human prompt/command woke the runner: the
-                            // natural-end latch must not survive (the goal
-                            // continuation mount point fires only for a
-                            // turn that just ended naturally, never for one
-                            // woken by human input).
-                            self.turn_just_ended = false;
                             // A release at the idle select. `merge_steering`
                             // recomputes the classification from the final
                             // queue state, so a release with prompts queued
@@ -1671,31 +1481,6 @@ impl SessionRunner {
                 }
             }
             let (prompt, image, consumed) = self.take_prompt_batch();
-            // A fresh turn consumes the armed continuation marker: an
-            // empty batch keeps it (background follow-up / goal
-            // continuation), a real user prompt joined into the batch makes
-            // this a plain user turn. The natural-end latch is cleared so a
-            // stale latch from an earlier turn can never fire at the next
-            // mount point.
-            let armed = std::mem::replace(&mut self.next_turn_kind, NextTurnKind::User);
-            self.current_turn_kind = if prompt.is_empty() {
-                armed
-            } else {
-                NextTurnKind::User
-            };
-            self.turn_just_ended = false;
-            if self.current_turn_kind == NextTurnKind::Goal
-                && let Err(error) = self.start_goal_continuation().await
-            {
-                self.terminate(
-                    SessionResult::Failed(format!(
-                        "persisting goal continuation notice: {error:#}"
-                    )),
-                    Vec::new(),
-                )
-                .await;
-                return;
-            }
             self.status(SessionStatus::Busy);
             if !prompt.is_empty() {
                 let image_rejected = image.is_some() && !self.agent.supports_vision();
@@ -1743,7 +1528,6 @@ impl SessionRunner {
                         break 'turn; // 外层循环自然回 Idle
                     }
                     WaitOutcome::Released => {
-                        self.cancel_goal_continuation();
                         // The in-flight model future was dropped (preempted):
                         // its output is never committed. Queued prompts are
                         // consumed by the outer loop; with none queued the
@@ -1806,11 +1590,11 @@ impl SessionRunner {
                     self.agent.emit_event(AgentEvent::AssistantText(text));
                 }
                 if steering != Steering::None && calls.is_empty() {
-                    // The round completed naturally (final answer, no tool
-                    // calls), so preserve its committed output. A racing
-                    // cancel still suppresses its natural-end continuation
-                    // latch; policy below returns to Idle/finalizes normally.
-                    self.turn_just_ended = false;
+                    // Stale release: the round completed naturally (final
+                    // answer, no tool calls) and its output is committed —
+                    // the committed result wins over the racing cancel
+                    // (contract: completed output is never lost). Ignore the
+                    // release; the outer loop finalizes normally.
                 } else if steering != Steering::None {
                     // The round was committed but the turn still had work
                     // (tool calls / more rounds): the release stops it here.
@@ -1856,22 +1640,6 @@ impl SessionRunner {
                     }
                 }
                 if calls.is_empty() {
-                    // Natural turn end. A background-completion follow-up
-                    // turn does NOT arm the latch: the background-injection
-                    // scenario's continuation mechanism is the top-of-loop
-                    // `commit_backgrounds` path, so such a turn never chains
-                    // into goal continuation. The anti-spin bookkeeping
-                    // records whether THIS turn was a continuation and
-                    // whether its final model round streamed any content
-                    // delta, so a content-less continuation round stops the
-                    // chain at the next mount point.
-                    if self.current_turn_kind != NextTurnKind::Background
-                        && steering == Steering::None
-                    {
-                        self.turn_just_ended = true;
-                    }
-                    self.last_turn_was_continuation = self.current_turn_kind == NextTurnKind::Goal;
-                    self.last_turn_produced_delta = streamed;
                     break 'turn;
                 }
                 // Poll guard: the terminating unchanged-snapshot
@@ -1978,7 +1746,6 @@ impl SessionRunner {
                     let result = match waited.outcome {
                         WaitOutcome::Completed(result) => result,
                         WaitOutcome::Released => {
-                            self.cancel_goal_continuation();
                             // The in-flight tool future was dropped; the
                             // interrupted tool call is never committed (the
                             // next provider context synthesizes an error
@@ -2071,20 +1838,10 @@ impl SessionRunner {
                 // real Tool result of the batch. Pending commands (if any)
                 // are unaffected: `commit_backgrounds` only drains the
                 // agent's background channel.
-                match self.commit_backgrounds().await {
-                    Ok(true) => {
-                        // A completion injected at this model-call boundary
-                        // makes the current turn ineligible to arm goal
-                        // continuation; its own top-of-loop follow-up owns
-                        // any later continuation behavior.
-                        self.current_turn_kind = NextTurnKind::Background;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
-                            .await;
-                        return;
-                    }
+                if let Err(error) = self.commit_backgrounds().await {
+                    self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                        .await;
+                    return;
                 }
                 // Poll-guard termination: the full sibling batch is durably
                 // committed and the safe point ran — only now emit the

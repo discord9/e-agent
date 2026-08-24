@@ -2100,7 +2100,7 @@ impl Agent {
         let model = &mut self.model;
         let event_handler = &mut self.event_handler;
         let mut on_delta = |kind: ModelDeltaKind, delta: &str| {
-            if kind == ModelDeltaKind::Content && !delta.is_empty() {
+            if kind == ModelDeltaKind::Content {
                 produced_content_delta = true;
             }
             let event = match kind {
