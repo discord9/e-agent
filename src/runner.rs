@@ -838,17 +838,17 @@ impl SessionRunner {
     /// Commit the marker for a Goal turn after the pending batch has been
     /// classified. A real prompt or cancellation therefore discards the arm
     /// without consuming budget or writing a Notice.
-    async fn start_goal_continuation(&mut self) {
+    async fn start_goal_continuation(&mut self) -> anyhow::Result<()> {
         let round = GOAL_CONTINUATION_LIMIT - self.goal_continuation_remaining + 1;
-        self.goal_continuation_remaining -= 1;
         let text = format!(
             "[goal continuation {round}/{} — session goal still active, continuing…]",
             GOAL_CONTINUATION_LIMIT
         );
-        if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
-            self.commit_error(format!("persisting goal continuation notice: {error:#}"))
-                .await;
-        }
+        // The durable Notice is the receipt for this round. Do not charge the
+        // budget, or let the turn reach the provider, until that receipt exists.
+        self.commit(SessionEntry::Notice { text }).await?;
+        self.goal_continuation_remaining -= 1;
+        Ok(())
     }
 
     /// Apply + persist one human goal command. Errors are plain strings
@@ -1555,22 +1555,23 @@ impl SessionRunner {
                         Some(GoalStatus::Active)
                     );
                     let budget_left = self.goal_continuation_remaining > 0;
-                    if goal_active
-                        && !budget_left
-                        && self.last_turn_was_continuation
-                        && !self.goal_continuation_cap_noticed
-                    {
+                    if goal_active && !budget_left && !self.goal_continuation_cap_noticed {
                         // Budget exhausted: one final durable Notice, then Idle.
-                        // Guarded by `last_turn_was_continuation` so a later
-                        // user turn cannot re-emit it.
+                        // The durable cap flag prevents later user turns from
+                        // re-emitting it. This also repairs a resume after the
+                        // tenth round committed but the cap Notice did not.
                         let text = GOAL_CONTINUATION_CAP_NOTICE.to_owned();
-                        self.goal_continuation_cap_noticed = true;
                         if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
-                            self.commit_error(format!(
-                                "persisting goal continuation cap notice: {error:#}"
-                            ))
+                            self.terminate(
+                                SessionResult::Failed(format!(
+                                    "persisting goal continuation cap notice: {error:#}"
+                                )),
+                                Vec::new(),
+                            )
                             .await;
+                            return;
                         }
+                        self.goal_continuation_cap_noticed = true;
                     }
                     if goal_active
                         && budget_left
@@ -1683,8 +1684,17 @@ impl SessionRunner {
                 NextTurnKind::User
             };
             self.turn_just_ended = false;
-            if self.current_turn_kind == NextTurnKind::Goal {
-                self.start_goal_continuation().await;
+            if self.current_turn_kind == NextTurnKind::Goal
+                && let Err(error) = self.start_goal_continuation().await
+            {
+                self.terminate(
+                    SessionResult::Failed(format!(
+                        "persisting goal continuation notice: {error:#}"
+                    )),
+                    Vec::new(),
+                )
+                .await;
+                return;
             }
             self.status(SessionStatus::Busy);
             if !prompt.is_empty() {

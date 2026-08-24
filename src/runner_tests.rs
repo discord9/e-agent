@@ -6272,6 +6272,147 @@ async fn resumed_goal_with_three_continuations_runs_seven_more_then_caps_once() 
 }
 
 #[tokio::test]
+async fn goal_continuation_notice_failure_does_not_charge_or_call_model() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions_dir = temp.path().join(".e-agent/sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    std::fs::create_dir_all(sessions_dir.join("goal-round-failure.jsonl")).unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::new(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated { goal: Some(goal) }]);
+    let (mut runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-round-failure".into(),
+        IdlePolicy::WaitForInput,
+    );
+    runner.arm_goal_continuation();
+    assert_eq!(runner.goal_continuation_remaining, GOAL_CONTINUATION_LIMIT);
+    runner.run().await;
+    assert_eq!(runner.goal_continuation_remaining, GOAL_CONTINUATION_LIMIT);
+    assert!(matches!(
+        *handle.status().borrow(),
+        SessionStatus::Finished(SessionResult::Failed(_))
+    ));
+    assert!(!runner.agent.history().iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Notice { text } if text.contains("[goal continuation")
+    )));
+}
+
+#[tokio::test]
+async fn goal_continuation_cap_failure_does_not_set_flag_or_idle() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions_dir = temp.path().join(".e-agent/sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    std::fs::create_dir_all(sessions_dir.join("goal-cap-failure.jsonl")).unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::new(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::GoalUpdated { goal: Some(goal) }]);
+    let (mut runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-cap-failure".into(),
+        IdlePolicy::WaitForInput,
+    );
+    runner.goal_continuation_remaining = 0;
+    runner.turn_just_ended = true;
+    runner.last_turn_was_continuation = true;
+    runner.run().await;
+    assert!(!runner.goal_continuation_cap_noticed);
+    assert!(matches!(
+        *handle.status().borrow(),
+        SessionStatus::Finished(SessionResult::Failed(_))
+    ));
+    assert!(!runner.agent.history().iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Notice { text } if text == GOAL_CONTINUATION_CAP_NOTICE
+    )));
+}
+
+#[tokio::test]
+async fn resumed_ten_rounds_without_cap_emits_one_cap_on_natural_end() {
+    let temp = tempfile::tempdir().unwrap();
+    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut history = vec![SessionEntry::GoalUpdated { goal: Some(goal) }];
+    history.extend((1..=GOAL_CONTINUATION_LIMIT).map(|round| SessionEntry::Notice {
+        text: format!(
+            "[goal continuation {round}/{GOAL_CONTINUATION_LIMIT} — session goal still active, continuing…]"
+        ),
+    }));
+    SessionStore::Jsonl
+        .append(temp.path(), "goal-resume-no-cap", &history)
+        .await
+        .unwrap();
+    let history = SessionStore::Jsonl
+        .load(temp.path(), "goal-resume-no-cap")
+        .await
+        .unwrap()
+        .entries;
+    let mut agent = Agent::new(
+        Box::new(StreamingScriptedModel {
+            replies: VecDeque::from([gc_text_reply("natural answer")]),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(history);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-resume-no-cap".into(),
+        IdlePolicy::WaitForInput,
+    );
+    assert_eq!(runner.goal_continuation_remaining, 0);
+    assert!(!runner.goal_continuation_cap_noticed);
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("natural turn".into()));
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    let snapshot = handle.snapshot();
+    assert_eq!(snapshot.iter().filter(|event| gc_notice(event)).count(), 10);
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Notice(text) if text == GOAL_CONTINUATION_CAP_NOTICE))
+            .count(),
+        1
+    );
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-resume-no-cap")
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Notice { text } if text == GOAL_CONTINUATION_CAP_NOTICE))
+            .count(),
+        1
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
 async fn resumed_capped_goal_user_turn_starts_no_continuations_or_second_cap() {
     let temp = tempfile::tempdir().unwrap();
     let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
