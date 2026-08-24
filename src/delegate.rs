@@ -189,10 +189,6 @@ pub struct Delegate {
     /// Session backend configuration for subagent persistence (not a
     /// connected store — each subagent connects its own).
     persist_backend: SessionBackend,
-    /// Upper bound for a `FinishWhenIdle` subagent's wait on its blocking
-    /// background tasks (`None` = wait indefinitely). Resolved from
-    /// `[delegate] finalize_wait_secs` by the session factory.
-    finalize_wait: Option<std::time::Duration>,
 }
 
 /// Where a subagent writes its own session file.
@@ -258,7 +254,6 @@ impl Delegate {
             sandbox: None,
             record_in: None,
             persist_backend: SessionBackend::default(),
-            finalize_wait: None,
         }
     }
 
@@ -325,15 +320,6 @@ impl Delegate {
         self.sandbox.as_ref().map(crate::tools::read_only_sandbox)
     }
 
-    /// Cap a `FinishWhenIdle` subagent's wait on its blocking background
-    /// tasks (see `[delegate] finalize_wait_secs`); `None` waits
-    /// indefinitely. The subagent finalizes on expiry without cancelling
-    /// the tasks, which keep running in the shared registry.
-    pub fn with_finalize_wait(mut self, wait: Option<std::time::Duration>) -> Self {
-        self.finalize_wait = wait;
-        self
-    }
-
     /// Record subagent background tasks in the parent session's record so a
     /// restart can warn about killed subagents alongside killed bash tasks.
     pub fn record_background_tasks_in(
@@ -384,7 +370,6 @@ impl Delegate {
         )>,
         bootstrap: Option<SessionBootstrap>,
         policy: IdlePolicy,
-        finalize_wait: Option<std::time::Duration>,
         compaction_mode: CompactionMode,
     ) -> Result<(SessionHandle, crate::runner::SessionTask), String> {
         let model_name = model.display_name().to_owned();
@@ -503,7 +488,6 @@ impl Delegate {
         )
         .await
         .map_err(|e| format!("subagent bootstrap failed: {e:#}"))?;
-        let runner = runner.with_finalize_wait(finalize_wait);
         let runner_task = runner.start(Some(task.task));
         Ok((handle, runner_task))
     }
@@ -734,9 +718,6 @@ pub async fn spawn_btw_subagent(
         None,
         Some(fork_bootstrap),
         IdlePolicy::WaitForInput,
-        // A btw fork never finalizes on its own (WaitForInput), so the
-        // finalize wait does not apply; keep the runner's default.
-        None,
         // A btw fork is an interactive main-style conversation (real user
         // turns, current turn kept verbatim).
         CompactionMode::Main,
@@ -1191,7 +1172,6 @@ impl Tool for Delegate {
             resume,
             None,
             IdlePolicy::FinishWhenIdle,
-            self.finalize_wait,
             CompactionMode::SingleTask,
         )
         .await?;

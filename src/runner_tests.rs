@@ -3722,92 +3722,8 @@ async fn empty_content_without_tool_calls_is_a_natural_turn_end() {
 }
 
 #[tokio::test]
-async fn finish_when_idle_times_out_while_background_task_still_runs() {
-    // A blocking (non-detached) background task keeps a FinishWhenIdle
-    // session from finalizing. With a `finalize_wait` cap, the runner
-    // finalizes as Completed once the wait expires — the work is done —
-    // WITHOUT cancelling the task: it stays registered in the shared
-    // registry (where the parent agent can still read or cancel it), and a
-    // Notice announces the finalize.
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
-    let (tools, background) = crate::tools::builtins(workspace, None, false, None);
-    let agent = Agent::new(
-        Box::new(ScriptedAssistantModel {
-            replies: vec![
-                AssistantMessage {
-                    content: None,
-                    tool_calls: vec![background_bash_call("sleep 30", false)],
-                    reasoning: None,
-                },
-                AssistantMessage {
-                    content: Some("build started, waiting".into()),
-                    tool_calls: vec![],
-                    reasoning: None,
-                },
-            ]
-            .into(),
-        }),
-        tools,
-    );
-    let (runner, handle) = SessionRunner::new(
-        agent,
-        SessionStore::Jsonl,
-        temp.path().into(),
-        "finalize-wait-timeout".into(),
-        IdlePolicy::FinishWhenIdle,
-    );
-    let runner = runner.with_finalize_wait(Some(std::time::Duration::from_millis(500)));
-    let (_, mut live, mut status) = handle.attach();
-    let task = runner.start(Some("run build".into()));
-
-    loop {
-        match live.recv().await.unwrap() {
-            AgentEvent::AssistantText(text) if text == "build started, waiting" => break,
-            AgentEvent::Error(text) => panic!("turn failed: {text}"),
-            _ => {}
-        }
-    }
-    // The wait cap expires: the runner emits a Notice and finalizes as
-    // Completed with the last answer, never calling the model again.
-    loop {
-        match live.recv().await.unwrap() {
-            AgentEvent::Notice(text)
-                if text.contains("finalizing with 1 background task(s) still running") =>
-            {
-                break;
-            }
-            AgentEvent::Error(text) => panic!("turn failed: {text}"),
-            _ => {}
-        }
-    }
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))),
-    )
-    .await
-    .expect("finalize_wait expiry must finalize the FinishWhenIdle session");
-    assert_eq!(
-        result,
-        SessionStatus::Finished(SessionResult::Completed(Some(
-            "build started, waiting".into()
-        )))
-    );
-    task.join().await.unwrap();
-
-    // The background task was NOT cancelled: it is still running in the
-    // shared registry after the subagent finalized.
-    let tasks = background.running();
-    assert_eq!(tasks.len(), 1, "task must stay registered: {tasks:?}");
-    assert_eq!(tasks[0].kind, "bash");
-    // Explicitly cancel to avoid leaking the sleep process past the test.
-    background.cancel(tasks[0].id);
-    assert!(background.running().is_empty());
-}
-
-#[tokio::test]
-async fn finish_when_idle_without_finalize_wait_keeps_waiting() {
-    // Control: without a `finalize_wait` (None = disabled), the session
+async fn finish_when_idle_waits_indefinitely_for_blocking_completion() {
+    // Control: without a finite timeout, the session
     // must NOT finalize early while a blocking background task runs; it
     // only finalizes after the completion is delivered and the model runs
     // its final round.
@@ -3866,7 +3782,7 @@ async fn finish_when_idle_without_finalize_wait_keeps_waiting() {
     .await;
     assert!(
         early.is_err(),
-        "without finalize_wait the session must keep waiting for the background task"
+        "the session must keep waiting for the background task"
     );
 
     // Deliver the completion: normal path resumes and finalizes.
@@ -4838,12 +4754,11 @@ async fn steer_hard_abort_still_drops_in_flight_operation_immediately() {
 #[tokio::test]
 async fn steer_cancel_while_idle_waiting_on_blocking_background_finalizes_cancelled_immediately() {
     // B1: a FinishWhenIdle session parked at the idle select waiting for a
-    // blocking background task (finalize_wait cap set) must finalize
+    // blocking background task must finalize
     // Cancelled IMMEDIATELY on a cancel — it must not keep sleeping out the
-    // finalize_wait cap. The background task is NOT cancelled (it stays in
-    // the shared registry), and no "finalizing with N task(s)" timeout
-    // Notice is emitted: the session ends through the release path, not the
-    // timeout path.
+    // the idle wait. The background task is NOT cancelled (it stays in
+    // the shared registry), and the session ends through the explicit Cancel
+    // path, rather than remaining indefinitely blocked on the background task.
     let temp = tempfile::tempdir().unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
     let (tools, background) = crate::tools::builtins(workspace, None, false, None);
@@ -4872,10 +4787,8 @@ async fn steer_cancel_while_idle_waiting_on_blocking_background_finalizes_cancel
         "steer-bg-cancel".into(),
         IdlePolicy::FinishWhenIdle,
     );
-    // Long cap: the test proves the cancel finalizes LONG before this cap
-    // could expire (a timeout finalize would emit the "finalizing with …"
-    // Notice and would take the whole cap).
-    let runner = runner.with_finalize_wait(Some(std::time::Duration::from_secs(60)));
+    // The explicit Cancel must finalize immediately; without it, the session
+    // would remain indefinitely blocked on the unfinished background task.
     let (_, mut live, mut status) = handle.attach();
     let task = runner.start(Some("run build".into()));
 
@@ -4887,30 +4800,24 @@ async fn steer_cancel_while_idle_waiting_on_blocking_background_finalizes_cancel
         }
     }
     // The session parks at Idle: the unfinished blocking background task
-    // prevents natural finalization and the finalize_wait cap is far away.
+    // prevents natural finalization.
     wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
 
     handle.cancel();
 
-    // The release finalizes Cancelled immediately (well under the 60s cap).
+    // The explicit Cancel finalizes Cancelled immediately instead of leaving
+    // the session indefinitely blocked on the unfinished background task.
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))),
     )
     .await
-    .expect("cancel at the idle select must finalize Cancelled immediately, not sleep out finalize_wait");
+    .expect(
+        "cancel at the idle select must finalize Cancelled immediately, without waiting for task completion",
+    );
     assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
     task.join().await.unwrap();
 
-    // No "finalizing with N background task(s)" Notice: the session ended
-    // through the release path, not the finalize_wait timeout path.
-    assert!(
-        !handle.snapshot().iter().any(|event| matches!(
-            event,
-            AgentEvent::Notice(text) if text.contains("finalizing with")
-        )),
-        "the release path must not emit the finalize_wait timeout Notice"
-    );
     // The background task was NOT cancelled: it is still registered in the
     // shared registry after the subagent finalized.
     let tasks = background.running();
@@ -4931,7 +4838,7 @@ async fn steer_cancel_then_prompt_at_idle_with_blocking_background_runs_queued_t
     // so the queued prompt opens a fresh turn that completes naturally; the
     // later background completion then injects the empty synthetic prompt
     // and drives a final round — the session finalizes Completed through
-    // that round, never via the finalize_wait timeout.
+    // that round, rather than remaining indefinitely blocked.
     let temp = tempfile::tempdir().unwrap();
     let sender = Arc::new(Mutex::new(None));
     let agent = Agent::new(
@@ -4973,10 +4880,9 @@ async fn steer_cancel_then_prompt_at_idle_with_blocking_background_runs_queued_t
         "steer-bg-cancel-prompt".into(),
         IdlePolicy::FinishWhenIdle,
     );
-    // Long cap: if the release wrongly fell through to the timeout path the
-    // session would finalize as Completed("build started, waiting") with
-    // the "finalizing with …" Notice instead of running the queued turn.
-    let runner = runner.with_finalize_wait(Some(std::time::Duration::from_secs(60)));
+    // Without the explicit Cancel plus queued prompt, the session would
+    // remain indefinitely blocked on the unfinished background task instead
+    // of running the queued turn.
     let (_, mut live, mut status) = handle.attach();
     let task = runner.start(Some("run build".into()));
 
@@ -5042,14 +4948,6 @@ async fn steer_cancel_then_prompt_at_idle_with_blocking_background_runs_queued_t
         SessionStatus::Finished(SessionResult::Completed(Some("bg done, final".into())))
     );
     task.join().await.unwrap();
-    // Neither the release nor the completion path used the timeout Notice.
-    assert!(
-        !handle.snapshot().iter().any(|event| matches!(
-            event,
-            AgentEvent::Notice(text) if text.contains("finalizing with")
-        )),
-        "the session must finalize through the completion round, not the finalize_wait timeout"
-    );
 }
 
 #[tokio::test]

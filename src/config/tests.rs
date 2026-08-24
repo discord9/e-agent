@@ -1511,9 +1511,6 @@ timeout_secs = 1800
 [bash]
 timeout_secs = 30
 
-[delegate]
-finalize_wait_secs = 600
-
 [tui]
 submit = "enter"
 newline = "alt+enter"
@@ -1544,7 +1541,6 @@ loop_ms = 1200
     assert!(config.session.is_some());
     assert!(config.background.is_some());
     assert!(config.bash.is_some());
-    assert!(config.delegate.is_some());
     assert!(config.tui.is_some());
     assert!(config.pet.is_some());
 }
@@ -1804,77 +1800,22 @@ timeout_secs = 120
 }
 
 #[test]
-fn resolve_finalize_wait_defaults_and_global() {
-    let temp = tempfile::tempdir().unwrap();
-    // No config at all → default 600s.
-    let t = resolve_finalize_wait(None, temp.path()).unwrap();
-    assert_eq!(t, Some(Duration::from_secs(600)));
-
-    // Global config sets a value.
-    let path = write_config(
-        temp.path(),
-        r#"
-default = "kimi/k3"
-[providers.kimi]
-base_url = "https://test.test/v1"
-api_key_file = "key"
-[models."kimi/k3"]
-model = "k3"
-[delegate]
-finalize_wait_secs = 120
-"#,
-    );
-    let config = Config::from_path(&path).unwrap();
-    let t = resolve_finalize_wait(Some(&config), temp.path()).unwrap();
-    assert_eq!(t, Some(Duration::from_secs(120)));
-}
-
-#[test]
-fn resolve_finalize_wait_workspace_override_and_zero() {
+fn finalize_wait_secs_is_rejected_as_unknown_config() {
     let temp = tempfile::tempdir().unwrap();
     let path = write_config(
         temp.path(),
-        r#"
-default = "kimi/k3"
-[providers.kimi]
+        r#"default = "demo/main"
+[providers.demo]
 base_url = "https://test.test/v1"
 api_key_file = "key"
-[models."kimi/k3"]
-model = "k3"
+[models."demo/main"]
+model = "main"
 [delegate]
-finalize_wait_secs = 120
+finalize_wait_secs = 1
 "#,
     );
-    let config = Config::from_path(&path).unwrap();
-
-    // Workspace .e-agent/config.toml overrides global.
-    let ws = temp.path().join("ws");
-    std::fs::create_dir_all(ws.join(".e-agent")).unwrap();
-    std::fs::write(
-        ws.join(".e-agent/config.toml"),
-        "[delegate]\nfinalize_wait_secs = 5\n",
-    )
-    .unwrap();
-    let t = resolve_finalize_wait(Some(&config), &ws).unwrap();
-    assert_eq!(t, Some(Duration::from_secs(5)));
-
-    // finalize_wait_secs = 0 → None (wait indefinitely).
-    std::fs::write(
-        ws.join(".e-agent/config.toml"),
-        "[delegate]\nfinalize_wait_secs = 0\n",
-    )
-    .unwrap();
-    let t = resolve_finalize_wait(Some(&config), &ws).unwrap();
-    assert_eq!(t, None);
-
-    // Workspace without [delegate] falls back to global.
-    std::fs::write(
-        ws.join(".e-agent/config.toml"),
-        "[sandbox]\nenabled = true\n",
-    )
-    .unwrap();
-    let t = resolve_finalize_wait(Some(&config), &ws).unwrap();
-    assert_eq!(t, Some(Duration::from_secs(120)));
+    let error = Config::from_path(&path).unwrap_err();
+    assert!(format!("{error:#}").contains("unknown field"), "{error:#}");
 }
 
 #[test]

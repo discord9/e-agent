@@ -711,8 +711,6 @@ impl SessionFactory {
             crate::config::resolve_background_timeout(config.as_ref(), &self.root).unwrap_or(None);
         let bash_timeout =
             crate::config::resolve_bash_timeout(config.as_ref(), &self.root).unwrap_or(None);
-        let finalize_wait =
-            crate::config::resolve_finalize_wait(config.as_ref(), &self.root).unwrap_or(None);
         #[rustfmt::skip]
         let tools_workspace = self.skills_workspace.clone().unwrap_or_else(|| self.workspace.clone());
         let (mut tools, background) = builtins_with_bash_timeout(
@@ -749,7 +747,6 @@ impl SessionFactory {
         .with_subagent_context_window(subagent_context_window)
         .with_roles_root(self.root.clone())
         .with_sandbox(self.sandbox.clone())
-        .with_finalize_wait(finalize_wait)
         .record_background_tasks_in(self.root.clone(), &session, store.clone())
         .with_persist_store(self.backend.clone());
         if let Some(subagent_model) = &subagent_model {
@@ -846,7 +843,6 @@ impl SessionFactory {
             bootstrap,
         )
         .await?;
-        let runner = runner.with_finalize_wait(finalize_wait);
         Ok(SessionBuild {
             runner,
             handle,

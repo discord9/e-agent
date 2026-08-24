@@ -37,9 +37,6 @@ pub struct Config {
     /// Optional `[bash]` policy (foreground bash timeout).
     #[serde(default)]
     bash: Option<BashConfig>,
-    /// Optional `[delegate]` policy (FinishWhenIdle finalize wait).
-    #[serde(default)]
-    delegate: Option<DelegateConfig>,
     #[serde(default)]
     code_mode: Option<CodeModeConfig>,
     /// Optional `[tui]` submit/newline key mapping. A project-level
@@ -120,24 +117,6 @@ pub struct CodeModeConfig {
     #[serde(default)]
     pub enabled: bool,
 }
-
-/// Delegate subagent policy, from `[delegate]`.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-pub struct DelegateConfig {
-    /// Upper bound, in seconds, that a `FinishWhenIdle` subagent waits for
-    /// its blocking background tasks to finish before finalizing anyway.
-    /// `0` disables the wait (wait forever). Absent defaults to
-    /// [`DEFAULT_FINALIZE_WAIT_SECS`].
-    #[serde(default)]
-    pub finalize_wait_secs: Option<u64>,
-}
-
-/// Default FinishWhenIdle finalize wait: 10 minutes. The default background
-/// task timeout is 30 minutes, but a subagent that already finished its
-/// work should not wait that long — 10 minutes covers most background
-/// tasks, and on expiry the subagent finalizes while the tasks keep running
-/// in the shared registry (the parent agent can still read or cancel them).
-pub const DEFAULT_FINALIZE_WAIT_SECS: u64 = 10 * 60;
 
 /// The `[tui]` section: submit/newline key mapping. A project-level
 /// `[tui]` section replaces the global one wholesale (see
@@ -1004,8 +983,7 @@ pub fn resolve_background_timeout(
 /// would otherwise be silently dropped. Every legal section is declared
 /// below: the merged ones (`default`, `[models]`, `[mcp]`, `[roles]`,
 /// `[tui]`, `[pet]`) are applied by `merged_with_project`; `[sandbox]`, `[bash]`,
-/// `[background]` and `[delegate]` are consumed by their own
-/// workspace-aware resolvers; and `[providers]`, `[web_search]`,
+/// `[background]` is consumed by its own workspace-aware resolver; and `[providers]`, `[web_search]`,
 /// `[session]` are white-listed for compatibility — they parse but stay
 /// global-only and are silently ignored by the project layer (a project
 /// file that carried them before this strictness was added keeps starting).
@@ -1030,8 +1008,6 @@ struct ProjectConfig {
     bash: Option<BashConfig>,
     /// `[background]` override, consumed by `resolve_background_timeout`.
     background: Option<BackgroundConfig>,
-    /// `[delegate]` override, consumed by `resolve_finalize_wait`.
-    delegate: Option<DelegateConfig>,
     /// Whole-section `[tui]` replacement; absent keeps the global section.
     tui: Option<TuiConfig>,
     /// Whole-section `[pet]` replacement; absent keeps the global section.
@@ -1110,40 +1086,6 @@ fn project_bash(workspace: &Path) -> anyhow::Result<Option<BashConfig>> {
     let parsed: ProjectConfig = toml::from_str(&source)
         .with_context(|| format!("cannot parse project config {}", path.display()))?;
     Ok(parsed.bash)
-}
-
-/// Resolve the FinishWhenIdle finalize-wait policy for a workspace:
-/// workspace `<workspace>/.e-agent/config.toml` `[delegate]` overrides the
-/// global config; `finalize_wait_secs = 0` disables the wait (`None` — the
-/// subagent waits indefinitely); absent everywhere returns the default
-/// 600s. Mirrors `resolve_background_timeout`/`project_background`.
-pub fn resolve_finalize_wait(
-    config: Option<&Config>,
-    workspace: &Path,
-) -> anyhow::Result<Option<Duration>> {
-    let global = config
-        .and_then(|c| c.delegate.as_ref())
-        .and_then(|d| d.finalize_wait_secs);
-    let local = project_delegate(workspace)?.and_then(|d| d.finalize_wait_secs);
-    match local.or(global) {
-        Some(0) => Ok(None),
-        Some(secs) => Ok(Some(Duration::from_secs(secs))),
-        None => Ok(Some(Duration::from_secs(DEFAULT_FINALIZE_WAIT_SECS))),
-    }
-}
-
-/// Read `[delegate]` from `<workspace>/.e-agent/config.toml` (same pattern
-/// as `project_background`); `None` when absent.
-fn project_delegate(workspace: &Path) -> anyhow::Result<Option<DelegateConfig>> {
-    let path = workspace.join(".e-agent/config.toml");
-    let source = match std::fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
-    };
-    let parsed: ProjectConfig = toml::from_str(&source)
-        .with_context(|| format!("cannot parse project config {}", path.display()))?;
-    Ok(parsed.delegate)
 }
 
 fn project_sandbox(workspace: &Path) -> anyhow::Result<Option<ProjectSandbox>> {

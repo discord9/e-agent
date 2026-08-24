@@ -12,7 +12,6 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 use tokio::{
     sync::{broadcast, mpsc, watch},
@@ -476,11 +475,6 @@ pub struct SessionRunner {
     pending: VecDeque<PendingCommand>,
     policy: IdlePolicy,
     last_answer: Option<String>,
-    /// Upper bound for waiting on blocking background tasks before
-    /// finalizing a `FinishWhenIdle` session (`None` = wait indefinitely).
-    /// Resolved from `[delegate] finalize_wait_secs` by the session factory;
-    /// consumed only at the FinishWhenIdle idle point.
-    finalize_wait: Option<Duration>,
     bootstrap: Option<SessionBootstrap>,
     #[cfg(test)]
     before_finalize: Option<Box<dyn FnOnce() + Send>>,
@@ -535,7 +529,6 @@ impl SessionRunner {
                 pending: VecDeque::new(),
                 policy,
                 last_answer: None,
-                finalize_wait: None,
                 bootstrap: None,
                 #[cfg(test)]
                 before_finalize: None,
@@ -610,14 +603,6 @@ impl SessionRunner {
             }
         }
         Ok(())
-    }
-
-    /// Cap the `FinishWhenIdle` wait for blocking background tasks (see
-    /// `[delegate] finalize_wait_secs`). `None` keeps the historical
-    /// behavior: wait for the background tasks indefinitely.
-    pub fn with_finalize_wait(mut self, wait: Option<Duration>) -> Self {
-        self.finalize_wait = wait;
-        self
     }
 
     pub fn start(mut self, initial_prompt: Option<String>) -> SessionTask {
@@ -1408,47 +1393,14 @@ impl SessionRunner {
                     }
                     continue;
                 }
-                // A FinishWhenIdle session that already finished its work
-                // waits here for its blocking background tasks. Cap that
-                // wait: a stuck task (hung I/O, `timeout_secs = 0`, zombie
-                // grandchild inside bwrap) must not keep a delegate
-                // subagent — and its parent task — alive forever. On
-                // timeout the session finalizes as Completed WITHOUT
-                // cancelling the tasks: they keep running in the shared
-                // registry, where the parent agent can still read their
-                // output or cancel them from the task panel; completion
-                // events delivered to this session's now-closed channel
-                // are dropped harmlessly. `None` keeps the historical
-                // wait-indefinitely behavior; steering v2 has no
-                // cross-turn "cancelled" keep-alive state to carve out
-                // (a release either starts a new turn or finalizes
-                // immediately at the operation boundary).
-                let wait = if self.policy == IdlePolicy::FinishWhenIdle
-                    && self.agent.has_blocking_background()
-                {
-                    self.finalize_wait
-                } else {
-                    None
-                };
-                let sleep = wait.unwrap_or(Duration::ZERO);
+                // FinishWhenIdle waits indefinitely for blocking background
+                // tasks. Their completion is injected as a follow-up turn.
                 tokio::select! { biased;
                     command = self.commands.recv() => match command {
                         Some(command) => {
                             let first = self.queue(command);
                             let drained = self.drain_ready_commands();
                             let steering = self.merge_steering(first, drained);
-                            // A release at the idle select. `merge_steering`
-                            // recomputes the classification from the final
-                            // queue state, so a release with prompts queued
-                            // is `ReleasedWithPrompts` and falls through
-                            // below — the outer loop consumes the queued
-                            // batch and the turns started from it decide the
-                            // end naturally. Only the no-prompts
-                            // (`ReleasedIdle`) case is finalized right here
-                            // (emergency cancel on FinishWhenIdle), so
-                            // `!has_prompt_work()` is the exact discriminator
-                            // and there is no released-with-prompts branch to
-                            // run at this site.
                             if steering != Steering::None
                                 && !self.has_prompt_work()
                                 && self.release_after_preempt(steering)
@@ -1466,17 +1418,6 @@ impl SessionRunner {
                         if ready { continue; }
                         self.terminate(SessionResult::Closed, Vec::new()).await;
                         return;
-                    }
-                    _ = tokio::time::sleep(sleep), if wait.is_some() => {
-                        let n = self.agent.background_task_ids().len();
-                        self.shared.lock().unwrap().emit(AgentEvent::Notice(format!(
-                            "finalizing with {n} background task(s) still running"
-                        )));
-                        let result = SessionResult::Completed(self.last_answer.clone());
-                        if self.finalize_when_idle(result) {
-                            return;
-                        }
-                        continue;
                     }
                 }
             }
