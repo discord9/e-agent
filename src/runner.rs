@@ -1074,8 +1074,44 @@ impl SessionRunner {
             let Some(entry) = self.agent.peek_background_entry() else {
                 return Ok(any);
             };
-            self.commit(entry).await?;
-            self.agent.ack_background_entry();
+            // Persist the completion first, but do not apply or publish it
+            // until its owner row is durably clear. Resume may therefore
+            // never observe a live completion paired with a stale owner.
+            let locations = self
+                .store
+                .append_located(&self.root, &self.session, std::slice::from_ref(&entry))
+                .await?;
+            let location = locations.into_iter().next();
+            self.agent
+                .ack_background_entry()
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let event = match &entry {
+                SessionEntry::BackgroundCompletion {
+                    id,
+                    output,
+                    label,
+                    started_at_ms,
+                    duration_ms,
+                    exit_code,
+                    signal,
+                    status,
+                    kind,
+                } => AgentEvent::BackgroundCompletionNotice {
+                    id: *id,
+                    output: output.clone(),
+                    label: label.clone(),
+                    started_at_ms: *started_at_ms,
+                    duration_ms: *duration_ms,
+                    exit_code: *exit_code,
+                    signal: signal.clone(),
+                    status: status.clone(),
+                    kind: kind.clone(),
+                },
+                _ => unreachable!("peek_background_entry returns a completion"),
+            };
+            self.agent.apply_entry_located(entry, location);
+            self.agent.emit_event(event);
             any = true;
         }
     }
@@ -1748,7 +1784,10 @@ impl SessionRunner {
                             .await;
                         return;
                     }
-                    self.agent.after_tool_entry(&call, &result);
+                    if let Err(error) = self.agent.after_tool_entry(&call, &result).await {
+                        self.terminate(SessionResult::Failed(error), pending).await;
+                        return;
+                    }
                     self.agent.emit_event(AgentEvent::ToolResult {
                         is_error,
                         content: tool_text,

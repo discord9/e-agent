@@ -1801,7 +1801,7 @@ impl Agent {
         // mid-tool-batch, and manual/auto compaction never do.
         self.start_turn();
         self.drain_background();
-        self.inject_pending_background();
+        self.inject_pending_background().await?;
         // Reset the auto-compact latch at the start of each new user turn so
         // a failed compaction doesn't permanently prevent future attempts.
         self.auto_compacted = false;
@@ -1828,7 +1828,7 @@ impl Agent {
         // of waiting for the next prompt. run() then loops so the model
         // reacts to them right away.
         let injected_at_end = !self.pending_background.is_empty();
-        self.inject_pending_background();
+        self.inject_pending_background().await?;
         result.map(|answer| (answer, injected_at_end))
     }
 
@@ -2008,11 +2008,11 @@ impl Agent {
         self.emit(event);
     }
 
-    pub(crate) fn after_tool_entry(
+    pub(crate) async fn after_tool_entry(
         &mut self,
         call: &ToolCall,
         result: &Result<ToolOutput, String>,
-    ) {
+    ) -> Result<(), String> {
         if result.is_ok()
             && (call.name == "bash" || call.name == "pwsh")
             && is_background_call(call)
@@ -2031,16 +2031,24 @@ impl Agent {
                     .and_then(|args| args["command"].as_str().map(str::to_owned))
                     .unwrap_or_else(|| call.arguments.clone());
                 let label = preview(&command, 100);
-                record.store.record_background_start(
-                    &record.root,
-                    &record.session,
-                    id,
-                    &label,
-                    Some(&command),
-                    None,
-                );
+                if let Err(error) = record
+                    .store
+                    .record_background_start_durable(
+                        &record.root,
+                        &record.session,
+                        id,
+                        &label,
+                        Some(&command),
+                        None,
+                    )
+                    .await
+                {
+                    self.running_background.remove(&id);
+                    return Err(format!("cannot record background task owner: {error:#}"));
+                }
             }
         }
+        Ok(())
     }
 
     fn push_message(&mut self, message: Message) {
@@ -2129,7 +2137,7 @@ impl Agent {
             }
             rounds += 1;
             self.drain_background();
-            self.inject_pending_background();
+            self.inject_pending_background().await?;
             let round = self.complete_round(specs).await?;
             let RoundOutput {
                 assistant,
@@ -2186,7 +2194,9 @@ impl Agent {
                 if is_poll_guard_terminate(&result) {
                     poll_terminate = true;
                 }
-                self.after_tool_entry(call, &result);
+                self.after_tool_entry(call, &result)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
                 // One canonical image-bearing Tool entry: the text summary
                 // plus the structured image references ride on the Tool
                 // message itself (no marker parsing, no synthetic User).
@@ -2240,12 +2250,15 @@ impl Agent {
         }
     }
 
-    fn inject_pending_background(&mut self) {
+    async fn inject_pending_background(&mut self) -> anyhow::Result<()> {
         while !self.pending_background.is_empty() {
             let entry = self.peek_background_entry().expect("pending entry");
             self.apply_entry(entry);
-            self.ack_background_entry();
+            self.ack_background_entry()
+                .await
+                .map_err(anyhow::Error::msg)?;
         }
+        Ok(())
     }
 
     pub(crate) fn drain_background_ready(&mut self) {
@@ -2312,15 +2325,23 @@ impl Agent {
             )
     }
 
-    pub(crate) fn ack_background_entry(&mut self) {
-        if let Some((id, _output, _label, _trace)) = self.pending_background.pop_front() {
-            self.running_background.remove(&id);
-            if let Some(record) = &self.background_record {
-                record
-                    .store
-                    .clear_background_task(&record.root, &record.session, id);
-            }
+    pub(crate) async fn ack_background_entry(&mut self) -> Result<(), String> {
+        let Some((id, _output, _label, _trace)) = self.pending_background.front() else {
+            return Ok(());
+        };
+        if let Some(record) = &self.background_record {
+            record
+                .store
+                .clear_background_task_durable(&record.root, &record.session, *id)
+                .await
+                .map_err(|error| format!("cannot clear background task owner: {error:#}"))?;
         }
+        let (id, _output, _label, _trace) = self
+            .pending_background
+            .pop_front()
+            .expect("background entry remains pending until durable clear");
+        self.running_background.remove(&id);
+        Ok(())
     }
 
     pub(crate) fn take_auto_compact_request(&mut self) -> bool {

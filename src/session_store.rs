@@ -2317,6 +2317,49 @@ impl SessionStore {
         }
     }
 
+    /// Record a background task and wait until the owner row is durable.
+    /// Callers that must order task execution after ownership use this path;
+    /// the synchronous facade above remains for best-effort UI bookkeeping.
+    pub(crate) async fn record_background_start_durable(
+        &self,
+        root: &Path,
+        session: &str,
+        id: u64,
+        label: &str,
+        full_command: Option<&str>,
+        subagent_session_id: Option<&str>,
+    ) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => Session::record_background_start(
+                root,
+                session,
+                id,
+                label,
+                full_command,
+                subagent_session_id,
+            ),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                greptime_session
+                    .record_task_start(session, id, label, full_command, subagent_session_id)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: sqlite_session,
+                ..
+            } => sqlite_session
+                .lock()
+                .await
+                .record_task_start(session, id, label, full_command, subagent_session_id)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     /// Forget one task: its completion arrived while the process was alive.
     pub fn clear_background_task(&self, root: &Path, session: &str, id: u64) {
         match self {
@@ -2363,6 +2406,33 @@ impl SessionStore {
                     }
                 }
             }
+        }
+    }
+
+    /// Clear a background task and wait until the owner row is gone.
+    pub(crate) async fn clear_background_task_durable(
+        &self,
+        root: &Path,
+        session: &str,
+        id: u64,
+    ) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => Session::clear_background_task_checked(root, session, id),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => greptime_session.clear_task(session, id).await,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: sqlite_session,
+                ..
+            } => sqlite_session
+                .lock()
+                .await
+                .clear_task(session, id)
+                .await
+                .map_err(anyhow::Error::msg),
         }
     }
 
@@ -4508,6 +4578,46 @@ mod tests {
                 loaded.entries.len(),
                 entries.len(),
                 "transcript survives delete_meta"
+            );
+        }
+
+        #[tokio::test]
+        async fn sqlite_background_task_durable_facade_orders_start_and_clear() {
+            let (_dir, path) = temp_db();
+            let root = std::env::temp_dir();
+            let session = format!("test-store-bg-durable-{}", crate::session::new_id());
+            let store = SessionStore::connect(&backend(&path), &root, &session)
+                .await
+                .expect("connect sqlite store");
+
+            store
+                .record_background_start_durable(
+                    &root,
+                    &session,
+                    17,
+                    "cargo test",
+                    Some("cargo test"),
+                    None,
+                )
+                .await
+                .expect("durable start");
+            let tasks = store
+                .peek_unfinished_background(&root, &session)
+                .await
+                .expect("peek immediately after start");
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].task_id, 17);
+
+            store
+                .clear_background_task_durable(&root, &session, 17)
+                .await
+                .expect("durable clear");
+            assert!(
+                store
+                    .peek_unfinished_background(&root, &session)
+                    .await
+                    .expect("peek immediately after clear")
+                    .is_empty()
             );
         }
 
