@@ -438,9 +438,9 @@ command set through its slash-command menu):
 - `/fork [N]` — fork a new session from the last (or the N-th) completed
   turn boundary.
 - `/undo` — undo the most recent file operation (`edit_file` / `write_file`).
-- `/goal` / `/goal set <目标>` / `/goal pause|resume|clear` — view the
-  session's goal, create a new one (human-only), or pause/resume/clear the
-  current one.
+- `/goal` / `/goal set <目标>` / `/goal pause|resume|clear` / `/goal continue`
+  — view the session's goal, create a new one (human-only), pause/resume/clear
+  the current one, or reset its live runner continuation budget.
 - `/help [命令]` — show the command list, or per-command usage detail
   (`/help fork`); an unknown command name prints a hint back to the list.
 - `/model <profile>` — switch the session's model at runtime (not listed by
@@ -716,7 +716,7 @@ profile provides a context window, the agent also compacts automatically at
 ## Session goals
 
 Every session can carry at most one current goal — a minimal persistence
-layer (a deliberate subset of a DSH-style goal system, no scheduler/rounds/
+layer (a deliberate subset of a DSH-style goal system, with no scheduler or
 verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
 `status` (`active|paused|blocked|completed`), `progress`, `evidence`,
 `blocked_reason`.
@@ -745,6 +745,21 @@ verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
 - **Forks inherit**: `--fork`/`/fork`/btw forks copy the source prefix up to
   the fork boundary, including goal updates before it; the forked session
   folds the newest snapshot naturally.
+- **Automatic continuation**: after a natural turn ends with the goal still
+  active, no queued human input, and no blocking background task, the same
+  runner can start up to ten additional goal turns. The budget is runner-local:
+  it is shared across goals and human turns in that runner, but resets when the
+  runner is reconstructed. Round and cap labels are live-only UI events; they
+  are not persisted or sent to the provider. `/goal continue` resets the
+  runner-local budget to ten, clears its cap latch, and makes one immediate
+  request when the goal is active and otherwise eligible. It is one-shot (no
+  deferred intent), and its acknowledgement is live-only/non-persistent; a
+  later Prompt, Cancel, or background completion may take precedence. A
+  continuation continues again only when its final structured assistant
+  message has non-empty content. Prompt/Cancel wins before a continuation
+  starts; a ready background completion replaces it with one background
+  follow-up, and background turns never chain into goal continuation.
+  Reaching the cap or anti-spin stop does not change an active goal's status.
 - **Subagent isolation**: subagents get the goal tools but their runner
   applies them against the subagent's own (usually empty) goal state — a
   subagent can never take a mutable reference to its parent's goal.
@@ -752,10 +767,10 @@ verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
   fixed GoalBar (`🎯 [status] objective`); the UI shows evidence/`unverified`
   only, never a claim of independent verification.
 
-Non-goals (deliberately out of scope): todo/plan/workflow stages, auto goal
-rounds / max rounds, deadlines, reminders, goal DAGs / multiple goals per
-session, and goal-specific verification (the verifier role independently
-checks risky product changes before integration).
+Non-goals (deliberately out of scope): todo/plan/workflow stages, deadlines,
+reminders, goal DAGs / multiple goals per session, and goal-specific
+verification (the verifier role independently checks risky product changes
+before integration).
 
 ## Session output receipts (`eout1`) and the `read_output` tool
 
@@ -1313,10 +1328,9 @@ main-agent-only: subagents and btw forks neither inherit the index nor the
 read capability. The same-name override is a full replacement, not a merge
 or concatenation.
 Session goals are a single-current-goal persistence layer only: no
-todo/plan/workflow stages, no auto goal rounds / max rounds, no deadlines,
-no reminders, no goal DAGs / multiple goals per session, no goal verifier
-agent, and no scheduler/driver — the goal is a snapshot with a CAS, not a
-task runner.
+todo/plan/workflow stages, no deadlines, no reminders, no goal DAGs /
+multiple goals per session, no goal verifier agent, and no scheduler/driver —
+the goal is a snapshot with a CAS, not a task runner.
 
 GreptimeDB-specific non-goals (when built with `--features greptime`):
 

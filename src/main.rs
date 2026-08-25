@@ -662,6 +662,11 @@ async fn repl(
                 ),
                 None => eprintln!("no goal set（创建：/goal set <目标>）"),
             },
+            "/goal continue" => {
+                if !handle.reset_goal_continuation() {
+                    eprintln!("goal command not accepted: session is finished or closed");
+                }
+            }
             command if command.starts_with("/goal ") => {
                 // Human goal mutation through the SAME SessionHandle
                 // transport as the TUI/web (no second persistence path);
@@ -686,7 +691,7 @@ async fn repl(
                         handle.goal_command(e_agent::runner::GoalCommand::Action(action));
                     }
                     _ => eprintln!(
-                        "用法：/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal（查看）"
+                        "用法：/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal continue（重置 runner 本地 10 回合预算）；/goal（查看）"
                     ),
                 }
             }

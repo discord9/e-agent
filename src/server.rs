@@ -24,7 +24,7 @@
 //! | POST   | `/api/sessions/{id}/model`         | switch the session's model at runtime |
 //! | POST   | `/api/sessions/{id}/undo`         | undo the most recent file operation |
 //! | GET    | `/api/sessions/{id}/goal`         | current goal snapshot (or null)     |
-//! | POST   | `/api/sessions/{id}/goal`         | create / pause / resume / clear the goal |
+//! | POST   | `/api/sessions/{id}/goal`         | create / pause / resume / clear / continue the goal |
 //! | PUT    | `/api/sessions/{id}/title`        | rename a session                  |
 //! | DELETE | `/api/sessions/{id}`              | cancel + remove from the registry  |
 //! | GET    | `/api/tasks`                        | running background tasks, all sessions |
@@ -1563,7 +1563,8 @@ async fn session_goal_get(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GoalBody {
-    /// "set" (create, human-only) | "pause" | "resume" | "clear".
+    /// "set" (create, human-only) | "pause" | "resume" | "clear" |
+    /// "continue" (reset the runner-local continuation budget).
     action: String,
     /// Required for `set`.
     objective: Option<String>,
@@ -1572,10 +1573,12 @@ struct GoalBody {
 
 /// `POST /api/sessions/{id}/goal` — human goal mutation, applied by the
 /// runner (which re-validates atomically and persists a `GoalUpdated`
-/// entry; results/errors fan out over SSE). 202 Accepted (async, like
-/// prompt/compact); 400/409 for input the runner would reject, 409 when
-/// the session is finished or its command channel is closed (the mutation
-/// could never apply); 404 for an unknown session.
+/// entry; results/errors fan out over SSE). The `continue` action is the
+/// exception: it only resets the live runner's continuation budget and does
+/// not mutate or persist the goal. 202 Accepted (async, like prompt/compact);
+/// 400/409 for input the runner would reject, 409 when the session is
+/// finished or its command channel is closed (the operation could never
+/// apply); 404 for an unknown session.
 async fn session_goal_post(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1600,6 +1603,21 @@ async fn session_goal_post(
             StatusCode::CONFLICT,
             "session is finished: cannot modify its goal",
         ));
+    }
+    if body.action == "continue" {
+        if body.objective.is_some() || body.success_criteria.is_some() {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "goal continue does not accept objective or success_criteria",
+            ));
+        }
+        if !handle.reset_goal_continuation() {
+            return Err(error(
+                StatusCode::CONFLICT,
+                "session is finished or its command channel is closed: goal continuation not accepted",
+            ));
+        }
+        return Ok(StatusCode::ACCEPTED);
     }
     let command = match body.action.as_str() {
         "set" => {
@@ -1647,7 +1665,9 @@ async fn session_goal_post(
         other => {
             return Err(error(
                 StatusCode::BAD_REQUEST,
-                format!("unknown goal action `{other}` (known: set, pause, resume, clear)"),
+                format!(
+                    "unknown goal action `{other}` (known: set, pause, resume, clear, continue)"
+                ),
             ));
         }
     };
@@ -5096,6 +5116,31 @@ model = "deepseek-chat"
             panic!("goal condition not met in time");
         }
 
+        // `continue` is a live-only runner command: with no goal it is
+        // accepted, but it must not change the snapshot or append an entry.
+        let before_continue = handle.snapshot();
+        let (_, mut live, _) = handle.attach();
+        assert_eq!(
+            post_goal(app.clone(), r#"{"action":"continue"}"#.to_owned()).await,
+            StatusCode::ACCEPTED
+        );
+        let acknowledgement = tokio::time::timeout(std::time::Duration::from_secs(5), live.recv())
+            .await
+            .expect("continue acknowledgement timeout")
+            .expect("continue live event");
+        assert!(matches!(
+            acknowledgement,
+            AgentEvent::Notice(text)
+                if text.contains("budget reset") && text.contains("no goal is set")
+        ));
+        assert!(handle.goal().is_none());
+        assert_eq!(handle.snapshot(), before_continue);
+        let after_continue = SessionStore::Jsonl
+            .load(temp.path(), "web-goal")
+            .await
+            .unwrap();
+        assert!(after_continue.entries.is_empty());
+
         // Fresh session: GET → null.
         assert!(get_goal(app.clone()).await["goal"].is_null());
 
@@ -5475,6 +5520,23 @@ model = "deepseek-chat"
             response.status(),
             StatusCode::CONFLICT,
             "closed command channel must 409, never a hollow 202"
+        );
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/web-goal-closed/goal")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"action":"continue"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "closed command channel must reject continuation"
         );
     }
 

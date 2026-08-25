@@ -1190,6 +1190,11 @@ fn parse_goal_distinguishes_show_set_and_actions() {
         parse_goal("/goal clear"),
         Some(GoalCommand::Action(crate::agent::GoalAction::Clear))
     );
+    assert_eq!(
+        parse_goal("  /goal continue  "),
+        Some(GoalCommand::Continue)
+    );
+    assert_eq!(parse_goal("/goal continue now"), Some(GoalCommand::Usage));
     assert_eq!(parse_goal("/goal nope"), Some(GoalCommand::Usage));
     // Not a goal command: stays a prompt.
     assert_eq!(parse_goal("/goalx"), None);
@@ -1285,6 +1290,23 @@ fn attached_goal_commands_use_the_attached_handle_never_prompt_history() {
         ))) => {}
         Ok(_) | Err(_) => panic!("expected Goal(Action(Pause)) on the attached channel"),
     }
+
+    // /goal continue -> attached handle's continuation reset, no Prompt.
+    state
+        .attached
+        .as_mut()
+        .unwrap()
+        .input
+        .insert("/goal continue");
+    state.handle_attached_key(enter, 80);
+    assert!(matches!(
+        source.try_recv(),
+        Ok(crate::runner::SessionCommand::ResetGoalContinuation)
+    ));
+    assert!(
+        source.try_recv().is_err(),
+        "/goal continue must not queue a prompt"
+    );
 
     // /compact stays a plain prompt to the attached runner.
     state.attached.as_mut().unwrap().input.insert("/compact");
