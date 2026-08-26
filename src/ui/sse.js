@@ -673,8 +673,12 @@ function init() {
       stopPolling();
       stopTasksPolling();
     } else {
-      startPolling();
-      pollSessions();
+      if (shouldPollSessions()) {
+        startPolling();
+        pollSessions();
+      } else {
+        stopPolling();
+      }
       startTasksPolling();
       pollTasks();
     }

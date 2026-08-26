@@ -108,6 +108,8 @@ function afterPollRound() {
    语义不变——现在等于聚合轮询全部 workspace；经 runPollRound 与定时轮询
    （setTimeout 链）共用同一个 in-flight 守卫，同一时刻只有一轮在途。 */
 function pollSessions() {
+  // 初始加载、workspace 切换和打开抽屉都需要立即刷新；周期调用只由
+  // pollRound 的 shouldPollSessions 守卫续调度。
   return runPollRound();
 }
 
@@ -1515,9 +1517,11 @@ function restartTransport() {
    「新鲜一轮」排队到在途轮询之后，多个并发请求合并为同一轮。 */
 const POLL_INTERVAL_MS = 2000;
 
-/* 侧边栏是唯一会话导航：无论抽屉是否展开都保持聚合轮询，让 busy、
-   新会话和归档状态在下次打开侧边栏时已是最新。 */
-function shouldPollSessions() { return true; }
+/* 会话列表只为可见的侧边栏服务；document.hidden 也纳入条件，作为
+   visibilitychange 停止轮询的真实状态反映。 */
+function shouldPollSessions() {
+  return state.sidebar.open && !els.sidebar.hidden && !document.hidden;
+}
 
 /* 单一 in-flight 守卫（promise 串行链）：同一时刻只有一轮轮询在途。
    无在途轮询 → 立即启动一轮；有在途轮询 → 把「新鲜一轮」排队到其后
@@ -1564,7 +1568,9 @@ function startPollRound(gen) {
 
 function startPolling() {
   stopPolling();
-  state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
+  if (shouldPollSessions()) {
+    state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
+  }
 }
 function stopPolling() {
   state.pollGen++;   // 使在途轮询的 finally 续调度失效（stop 后不再续）
@@ -1618,12 +1624,14 @@ function openSidebar() {
   // （桌面：width 0→280px；手机：translateX(-100%)→0）
   requestAnimationFrame(() => requestAnimationFrame(() => els.sidebar.classList.add("open")));
   pollTasks();   // 打开时立即刷新树内任务分组（统一轮询常驻，这里只求即时性）
+  startPolling();
   refreshSessionsForSidebar();
 }
 
 function closeSidebar() {
   if (!state.sidebar.open) return;
   state.sidebar.open = false;
+  stopPolling();                        // 抽屉关闭后不再周期拉取会话列表
   persistSidebarOpen();                // 跨刷新保持关闭状态
   els.sidebarOverlay.hidden = true;
   els.sidebar.classList.remove("open");

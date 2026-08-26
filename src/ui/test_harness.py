@@ -257,8 +257,10 @@ elsById["tasksToggleBar"].appendChild(_togLabel);
 const _ls={};
 globalThis.localStorage={ getItem:k=>_ls[k]??null, setItem:(k,v)=>{_ls[k]=v;}, removeItem:k=>{delete _ls[k];} };
 const _docEl = new El("html");
+const _docListeners={};
 globalThis.document={ createElement:t=>new El(t), createComment:t=>new El("#comment"),
-  getElementById:id=>elsById[id], addEventListener(){}, documentElement:_docEl };
+  getElementById:id=>elsById[id], addEventListener(type,fn){ _docListeners[type]=fn; },
+  dispatchEvent(e){ if(_docListeners[e.type]) _docListeners[e.type](e); }, documentElement:_docEl };
 globalThis.navigator={ onLine:true };
 globalThis.confirm=()=>true;
 // gjs 自带 window 全局（不可整体替换）：就地补上页面需要的属性
@@ -6455,21 +6457,45 @@ async function main(){
         "calls=" + renderSidebarTreeCalls);
     elsById["sidebar"].hidden = false;
 
-    // 侧边栏是唯一导航：抽屉关闭、打开会话时轮询都保持常驻。
+    // 会话列表轮询只在侧边栏可见时保持常驻；关闭时停止周期请求，但
+    // 打开侧边栏仍立即刷新一次。
     stopPolling();
     state.sidebar.open = false;
+    const closedSessionFetches = FETCHES.filter((u) => u.endsWith("/api/sessions")).length;
     startPolling();
-    chk("perf navigation polling starts", state.pollTimer !== null, "timer=" + String(state.pollTimer));
+    chk("perf closed sidebar does not schedule polling",
+        state.pollTimer === null && !shouldPollSessions(),
+        "timer=" + String(state.pollTimer));
+    await flush();
+    chk("perf closed sidebar skips repeated fetch",
+        FETCHES.filter((u) => u.endsWith("/api/sessions")).length === closedSessionFetches,
+        "fetches=" + (FETCHES.filter((u) => u.endsWith("/api/sessions")).length - closedSessionFetches));
     state.sessionId = null;
     openSession("p1");
-    chk("perf openSession keeps sidebar polling",
-        state.pollTimer !== null,
+    chk("perf openSession leaves closed-sidebar polling stopped",
+        state.pollTimer === null,
         "timer=" + String(state.pollTimer));
     stopSSE();
     openSidebar();
-    chk("perf openSidebar keeps polling", state.pollTimer !== null && state.sidebar.open);
+    chk("perf openSidebar polls immediately and schedules next round",
+        state.pollTimer !== null && state.sidebar.open && shouldPollSessions());
     closeSidebar();
-    chk("perf closeSidebar keeps polling", state.pollTimer !== null && !state.sidebar.open);
+    chk("perf closeSidebar stops polling", state.pollTimer === null && !state.sidebar.open);
+    // visibility 恢复时，关闭的 sidebar 不启动 session timer；打开时立即恢复。
+    document.hidden = true;
+    stopPolling();
+    document.hidden = false;
+    document.dispatchEvent({type: "visibilitychange"});
+    chk("perf hidden-to-visible closed sidebar stays stopped",
+        state.pollTimer === null && !shouldPollSessions());
+    state.sidebar.open = true;
+    elsById["sidebar"].hidden = false;
+    document.dispatchEvent({type: "visibilitychange"});
+    chk("perf hidden-to-visible open sidebar polls", shouldPollSessions());
+    closeSidebar();
+    // 后续 task/poller 回归用例不涉及侧边栏关闭语义，恢复其可见导航上下文。
+    state.sidebar.open = true;
+    elsById["sidebar"].hidden = false;
     stopPolling();
 
     // 任务面板签名去重：元数据未变 → 第二轮 pollTasks 不重建（计数 renderTaskList）
@@ -7294,7 +7320,8 @@ async function main(){
       state.workspaceLists = {}; state.workspaceErrors = {}; state.lastList = [];
       state.deepLink = { pending: id, handled: false, probing: false, attemptEpoch: -1 };
       state.sessionId = null;
-      state.sidebar.open = false;
+      state.sidebar.open = true;
+      elsById["sidebar"].hidden = false;
       state.sse.stopped = false;
       elsById["banner"].hidden = true; elsById["bannerText"].textContent = "";
     };
