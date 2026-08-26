@@ -86,6 +86,38 @@ uv run --with playwright python regression.py --all --real     # 含真实 serve
 | `mobile_390` | 390px 聊天空状态/聊天/覆盖式侧边栏无横向溢出，遮罩关闭 |
 | `smoke_real_api`（可选） | 真实 server 侧边栏树渲染 + 打开会话（只读） |
 
+## GreptimeDB History physical paging E2E
+
+`greptime_history_physical_paging.sh` 是独立实例的端到端回归测试：它启动本次测试专用
+GreptimeDB（独立 `--data-home`，HTTP/gRPC/MySQL/PG 均为动态 `127.0.0.1` 端口）和
+本次测试专用的 token-authenticated e-agent HTTP server。fixture 只通过 `psql` 写入该
+实例，行为验收只通过 `/api/sessions/{id}/history` 的 HTTP 响应完成，并覆盖
+`ORDER BY seq DESC,event_time DESC` 的 physical-row LIMIT、最新同 seq 副本优先、页内
+best-effort dedup，以及 compaction segment 边界。
+
+调用者必须显式传入绝对路径且可执行的 `GREPTIMEDB_BIN`；脚本不会自动发现或 fallback
+到任何本机路径。可选的 `EAGENT_BIN` 也必须是绝对路径可执行文件，否则脚本使用
+`CARGO_TARGET_DIR`（或临时 target）构建。运行示例：
+
+```sh
+GREPTIMEDB_BIN=/absolute/path/to/greptime \
+CARGO_TARGET_DIR=/path/to/target \
+tests/e2e/greptime_history_physical_paging.sh
+```
+
+端口选择是一次性 `bind(0)` 后关闭 socket，再立即启动两个进程；这是一个很短但不可
+消除的 TOCTOU 窗口。启动和 readiness 任一 bind 冲突都会 fail-closed，绝不重试到默认
+端口或连接已有实例。Greptime readiness 同时要求 PID、`/health` 和 `PG SELECT 1`；
+server readiness 要求 PID、临时 token 和授权 `/api/sessions`。fixture 写入后会重启同一
+个独立 e-agent，因此历史 fixture 的查询确实经过未注册 live registry 的 historical
+fallback；验证 unknown initial/older 为 404、known historical initial 和 terminal empty
+page 为 200。cleanup 按 e-agent → GreptimeDB 顺序逐 PID 有界 TERM、必要时 KILL，只有两个进程都退出才删除临时根目录；
+失败时保留路径以便诊断。
+
+```sh
+bash -n tests/e2e/greptime_history_physical_paging.sh
+```
+
 ## 注意事项
 
 - **只测当前 checkout 的前端**：HTML 从 `src/ui/` 实时拼装，不依赖 server 内置页面

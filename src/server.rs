@@ -2348,6 +2348,15 @@ async fn session_history(
     Query(params): Query<HistoryParams>,
 ) -> Result<Json<HistoryResponse>, (StatusCode, String)> {
     let root = state.factory.root();
+    if params
+        .limit
+        .is_some_and(|limit| limit == 0 || (limit as u64) > i64::MAX as u64)
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "limit must be between 1 and i64::MAX",
+        ));
+    }
     // Live path: both variants carry a session-bound store — the live
     // registry session owns one, and a subagent's `SessionEntry` carries
     // its own (connected at spawn time) — so history reads the same rows
@@ -2356,7 +2365,7 @@ async fn session_history(
     // the same rows the live path would; a truly unknown id leaves the
     // store empty → 404, and ids that can never exist (invalid session
     // name) also 404, keeping the previous registry-miss semantics.
-    let store = resolve_session_store(&state, &id).await?;
+    let (store, historical) = resolve_session_store(&state, &id, false).await?;
     let (entries, next_before_seq) = match params.before_seq {
         None => {
             // Head segment, paged: with a `limit` the newest `limit`
@@ -2368,10 +2377,17 @@ async fn session_history(
             // whole head segment is returned and the cursor is the seq of
             // the compaction that opens it (None = the whole session is
             // one head segment).
-            store
+            let page = store
                 .load_head_page(root, &id, params.limit)
                 .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            if historical && page.0.is_empty() {
+                return Err(error(
+                    StatusCode::NOT_FOUND,
+                    format!("session {id} not found"),
+                ));
+            }
+            page
         }
         Some(before_seq) => {
             // Older entries: [prev_comp, before_seq), paged intra-segment
@@ -2381,6 +2397,18 @@ async fn session_history(
                 .load_older(root, &id, before_seq, params.limit)
                 .await
                 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            if historical && entries.is_empty() {
+                let count = store
+                    .count_entries(root, &id)
+                    .await
+                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                if count == 0 {
+                    return Err(error(
+                        StatusCode::NOT_FOUND,
+                        format!("session {id} not found"),
+                    ));
+                }
+            }
             (entries, cursor)
         }
     };
@@ -2399,11 +2427,12 @@ async fn session_history(
 async fn resolve_session_store(
     state: &AppState,
     id: &str,
-) -> Result<SessionStore, (StatusCode, String)> {
+    validate_historical: bool,
+) -> Result<(SessionStore, bool), (StatusCode, String)> {
     let root = state.factory.root();
     match live(state, id) {
-        Ok(SessionRef::Live(session)) => Ok(session.store.clone()),
-        Ok(SessionRef::Subagent { entry, .. }) => Ok(entry.store.clone()),
+        Ok(SessionRef::Live(session)) => Ok((session.store.clone(), false)),
+        Ok(SessionRef::Subagent { entry, .. }) => Ok((entry.store.clone(), false)),
         Err((StatusCode::NOT_FOUND, _)) => {
             if crate::session::validate_session_name(id).is_err() {
                 return Err(error(
@@ -2414,17 +2443,19 @@ async fn resolve_session_store(
             let store = SessionStore::connect(state.factory.backend(), root, id)
                 .await
                 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-            let loaded = store
-                .load_head(root, id)
-                .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-            if loaded.entries.is_empty() {
-                return Err(error(
-                    StatusCode::NOT_FOUND,
-                    format!("session {id} not found"),
-                ));
+            if validate_historical {
+                let (entries, _) = store
+                    .load_head_page(root, id, Some(1))
+                    .await
+                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                if entries.is_empty() {
+                    return Err(error(
+                        StatusCode::NOT_FOUND,
+                        format!("session {id} not found"),
+                    ));
+                }
             }
-            Ok(store)
+            Ok((store, true))
         }
         Err(err) => Err(err),
     }
@@ -2484,11 +2515,17 @@ async fn fork_candidates(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<ForkCandidate>>, (StatusCode, String)> {
     let root = state.factory.root();
-    let store = resolve_session_store(&state, &id).await?;
+    let (store, historical) = resolve_session_store(&state, &id, false).await?;
     let with_seq = store
         .load_with_seq(root, &id)
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if historical && with_seq.is_empty() {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!("session {id} not found"),
+        ));
+    }
     let candidates = with_seq
         .iter()
         .enumerate()
@@ -2538,7 +2575,7 @@ async fn session_fork(
     })?;
     // Resolve the source (404 before target build work); the reservation is
     // intentionally held while this awaited lookup completes.
-    resolve_session_store(&state, &id).await?;
+    resolve_session_store(&state, &id, true).await?;
     let built = state
         .factory
         .build_fork(
