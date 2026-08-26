@@ -6,10 +6,10 @@ use super::background::BackgroundTasks;
 
 /// Termination thresholds for the unchanged-snapshot poll guard on
 /// `get_background_tasks`: the `count >= threshold` poll returns the
-/// internal termination sentinel, and reminders fire from the
-/// `threshold - 2` poll (never before the second) through `threshold - 1`.
-/// Subagents terminate on the 3rd unchanged poll, the main agent on the
-/// 5th.
+/// complete rendered snapshot and warning followed by the terminal internal
+/// termination sentinel. Reminders fire from the `threshold - 2` poll (never
+/// before the second) through `threshold - 1`. Subagents terminate on the 3rd
+/// unchanged poll, the main agent on the 5th.
 pub(super) const SUBAGENT_POLL_GUARD_THRESHOLD: u8 = 3;
 pub(super) const MAIN_POLL_GUARD_THRESHOLD: u8 = 5;
 
@@ -33,10 +33,10 @@ pub(super) struct GetBackgroundTasks {
     /// consecutive `get_background_tasks` calls with an unchanged NON-EMPTY
     /// running-task snapshot within one turn return the model-facing
     /// [`crate::agent::POLL_GUARD_ERROR`] from the `threshold - 2` poll and
-    /// the internal termination sentinel ([`crate::agent::POLL_GUARD_SENTINEL`])
-    /// from the `threshold` poll onward; the batch loops map the sentinel to
-    /// POLL_GUARD_ERROR content and use it to end the turn after the full
-    /// sibling batch. Empty snapshots never escalate and clear any guard
+    /// the rendered snapshot plus warning and terminal internal sentinel
+    /// ([`crate::agent::POLL_GUARD_SENTINEL`]) from the `threshold` poll
+    /// onward; batch loops strip only that terminal sentinel for persisted
+    /// content and use it to end the turn after the full sibling batch. Empty snapshots never escalate and clear any guard
     /// state. `None` disables the guard. Subagents use threshold 3
     /// (reminder on the 2nd poll), the main agent threshold 5 (reminder on
     /// the 3rd and 4th).
@@ -114,11 +114,10 @@ impl Tool for GetBackgroundTasks {
         }
         // Poll guard: escalate on the SORTED running-task ID snapshot. Any
         // ID-set change (new task, completion, cancellation) resets the
-        // count; output growth or task ordering never does. A repeated
-        // non-empty snapshot escalates at the configured threshold: the
-        // `threshold - 2` poll (never before the second) returns the
-        // model-facing reminder, `threshold` and beyond the internal
-        // termination sentinel.
+        // count; output growth or task ordering never does. Keep rendering
+        // the snapshot even when the guard adds a warning: the task list is
+        // the useful result, and the warning is supplementary.
+        let mut guard_warning = None;
         if let Some(threshold) = self.poll_guard {
             let mut ids: Vec<u64> = tasks.iter().map(|task| task.id).collect();
             ids.sort_unstable();
@@ -131,13 +130,9 @@ impl Tool for GetBackgroundTasks {
             }
             let reminder_start = threshold.saturating_sub(2).max(2);
             if guard.count >= threshold {
-                // At or beyond the threshold: internal sentinel — the batch
-                // loops map it to POLL_GUARD_ERROR for history/UI and end
-                // the turn after the full sibling batch.
-                return Err(crate::agent::POLL_GUARD_SENTINEL.to_owned());
-            }
-            if guard.count >= reminder_start {
-                return Err(crate::agent::POLL_GUARD_ERROR.to_owned());
+                guard_warning = Some(crate::agent::POLL_GUARD_TERMINATION_NOTICE);
+            } else if guard.count >= reminder_start {
+                guard_warning = Some(crate::agent::POLL_GUARD_ERROR);
             }
         }
         let mut out = format!("{} background task(s) running:\n", tasks.len());
@@ -170,6 +165,14 @@ impl Tool for GetBackgroundTasks {
             }
         }
         out.truncate(out.trim_end().len());
+        if let Some(warning) = guard_warning {
+            out.push_str("\n\n");
+            out.push_str(warning);
+            if warning == crate::agent::POLL_GUARD_TERMINATION_NOTICE {
+                out.push_str(crate::agent::POLL_GUARD_SENTINEL);
+            }
+            return Err(out);
+        }
         Ok(ToolOutput::text(out))
     }
 }

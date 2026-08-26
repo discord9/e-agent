@@ -1753,7 +1753,7 @@ impl SessionRunner {
                     // not depend on the model — the request copy is stripped
                     // for non-vision models at send time).
                     let pending = self.apply_pending_model_switches(waited.pending);
-                    if is_poll_guard_terminate(&result) {
+                    if call.name == "get_background_tasks" && is_poll_guard_terminate(&result) {
                         poll_terminate = true;
                     }
                     // One canonical image-bearing Tool entry: the text

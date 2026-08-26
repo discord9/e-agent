@@ -5981,6 +5981,98 @@ fn tool_entries(entries: &[SessionEntry]) -> Vec<&Message> {
 }
 
 #[tokio::test]
+async fn poll_guard_finish_when_idle_waits_for_owned_completion_and_resets() {
+    // The threshold ends only the current turn. FinishWhenIdle must keep the
+    // session alive for its owned non-detached task, then the completion
+    // safe-point/follow-up starts a fresh turn with a reset guard.
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    let (_main_tools, background) = crate::tools::builtins(workspace.clone(), None, false, None);
+    let tools = crate::tools::builtins_with_background(
+        workspace,
+        background.clone(),
+        None,
+        false,
+        true,
+        None,
+    );
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "c0".into(),
+                            name: "bash".into(),
+                            arguments: r#"{"command":"sleep 1; echo done","background":true}"#
+                                .into(),
+                        },
+                        poll_call("c1"),
+                        poll_call("c2"),
+                        poll_call("c3"),
+                    ],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("final after completion".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        tools,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "poll-guard-finish-when-idle".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("wait for build".into()));
+
+    wait_for_termination_notice(&mut live).await;
+    assert!(matches!(*status.borrow(), SessionStatus::Idle));
+    assert!(background.running().iter().any(|task| task.id == 1));
+
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match live.recv().await.unwrap() {
+                AgentEvent::AssistantText(text) if text == "final after completion" => break,
+                AgentEvent::Error(text) => panic!("follow-up turn failed: {text}"),
+                _ => {}
+            }
+        }
+        wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await
+    })
+    .await
+    .expect("owned completion must trigger the FinishWhenIdle follow-up");
+    assert_eq!(
+        answer,
+        SessionStatus::Finished(SessionResult::Completed(Some(
+            "final after completion".into()
+        )))
+    );
+    task.join().await.unwrap();
+
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "poll-guard-finish-when-idle")
+        .await
+        .unwrap();
+    let serialized = serde_json::to_string(&loaded.entries).unwrap();
+    assert!(!serialized.contains(crate::agent::POLL_GUARD_SENTINEL));
+    assert!(
+        loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::BackgroundCompletion { id: 1, .. }))
+    );
+}
+
+#[tokio::test]
 async fn poll_guard_runner_repeated_empty_polls_never_terminate_the_turn() {
     // Regression: a turn that polls `get_background_tasks` repeatedly with
     // NO running tasks must never latch the poll guard — the turn ends
@@ -6068,7 +6160,7 @@ async fn poll_guard_runner_repeated_empty_polls_never_terminate_the_turn() {
 async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
     // Subagent runner: a [bash, poll x3, slow] batch. The real background
     // task is started before all three polls and remains live for them. The
-    // third unchanged poll latches the guard, but the whole batch is durably
+    // third unchanged poll returns the terminal sentinel and latches the guard, but the whole batch is durably
     // committed (including the sibling slow result and the non-synthetic
     // ToolResults). The background completion is committed at the
     // commit_backgrounds safe point BEFORE the termination notice, then a
@@ -6157,13 +6249,23 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
         Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
             if call_id == "c1" && content.starts_with("1 background task(s) running:")
     ));
-    for (entry, id) in [(tools[2], "c2"), (tools[3], "c3")] {
-        assert!(matches!(
-            entry,
-            Message::Tool { call_id, content, is_error: true, synthetic: false, .. }
-                if call_id == id && content == POLL_GUARD_ERROR
-        ));
-    }
+    assert!(matches!(
+        tools[2],
+        Message::Tool { call_id, content, is_error: true, synthetic: false, .. }
+            if call_id == "c2"
+                && content.starts_with("1 background task(s) running:")
+                && content.contains("#1: ")
+                && content.contains(POLL_GUARD_ERROR)
+    ));
+    assert!(matches!(
+        tools[3],
+        Message::Tool { call_id, content, is_error: true, synthetic: false, .. }
+            if call_id == "c3"
+                && content.starts_with("1 background task(s) running:")
+                && content.contains("#1: ")
+                && content.contains(crate::agent::POLL_GUARD_TERMINATION_NOTICE)
+                && !content.contains(crate::agent::POLL_GUARD_SENTINEL)
+    ));
     assert!(matches!(
         tools[4],
         Message::Tool { call_id, content, is_error: false, synthetic: false, .. }

@@ -771,6 +771,69 @@ async fn keeps_transcript_across_runs() {
     ));
 }
 
+struct ReadablePollTerminationSpoofTool;
+
+#[async_trait]
+impl Tool for ReadablePollTerminationSpoofTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "unrelated_tool".into(),
+            description: "test only".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Err(format!(
+            "unrelated failure; {}",
+            POLL_GUARD_TERMINATION_NOTICE
+        ))
+    }
+}
+
+#[tokio::test]
+async fn poll_guard_unrelated_tool_readable_notice_does_not_end_turn() {
+    // Only the terminal internal sentinel on the get_background_tasks call
+    // may end a turn. A human-readable suffix from another tool is ordinary
+    // tool failure text, so the next model round must still run.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![call("c1", "unrelated_tool", "{}")],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("next round ran".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![Box::new(ReadablePollTerminationSpoofTool)],
+    );
+
+    assert_eq!(
+        agent.run("check spoof".into()).await.unwrap(),
+        "next round ran"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert!(agent.history().iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::Tool {
+                name, content, is_error: true, ..
+            }
+        } if name == "unrelated_tool"
+            && content.ends_with(POLL_GUARD_TERMINATION_NOTICE)
+            && !content.contains(POLL_GUARD_SENTINEL)
+    )));
+}
+
 #[tokio::test]
 async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn() {
     // Subagent toolset on a direct Agent::run: [background bash, poll x3,
@@ -839,13 +902,23 @@ async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn
         Message::Tool { call_id, content, is_error: false, synthetic: false, images, .. }
             if call_id == "c1" && content.starts_with("1 background task(s) running:") && images.is_empty()
     ));
-    for (idx, id) in [(2usize, "c2"), (3, "c3")] {
-        assert!(matches!(
-            tools[idx],
-            Message::Tool { call_id, content, is_error: true, synthetic: false, images, .. }
-                if call_id == id && content == POLL_GUARD_ERROR && images.is_empty()
-        ));
-    }
+    assert!(matches!(
+        tools[2],
+        Message::Tool { call_id, content, is_error: true, synthetic: false, images, .. }
+            if call_id == "c2"
+                && content.starts_with("1 background task(s) running:")
+                && content.contains(POLL_GUARD_ERROR)
+                && images.is_empty()
+    ));
+    assert!(matches!(
+        tools[3],
+        Message::Tool { call_id, content, is_error: true, synthetic: false, images, .. }
+            if call_id == "c3"
+                && content.starts_with("1 background task(s) running:")
+                && content.contains(POLL_GUARD_TERMINATION_NOTICE)
+                && !content.contains(POLL_GUARD_SENTINEL)
+                && images.is_empty()
+    ));
     assert!(matches!(
         tools[4],
         Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
@@ -891,7 +964,7 @@ async fn poll_guard_main_builtins_carry_the_guard() {
     // softer 5th-poll threshold on REAL task snapshots: in a [background
     // bash, poll x5, read_file] batch the 1st and 2nd polls are normal,
     // the 3rd and 4th return the model-facing POLL_ERROR, and the 5th
-    // returns the sentinel — the turn ends only AFTER the full sibling
+    // returns the terminal sentinel — the turn ends only AFTER the full sibling
     // batch (no synthetic holes, no sentinel in history/UI), and the next
     // run starts with a reset guard.
     let temp = tempfile::tempdir().unwrap();
@@ -957,13 +1030,25 @@ async fn poll_guard_main_builtins_carry_the_guard() {
                 if call_id == id && content.starts_with("1 background task(s) running:") && images.is_empty()
         ));
     }
-    for (idx, id) in [(3usize, "c3"), (4, "c4"), (5, "c5")] {
+    for (idx, id) in [(3usize, "c3"), (4, "c4")] {
         assert!(matches!(
             tools[idx],
             Message::Tool { call_id, content, is_error: true, synthetic: false, images, .. }
-                if call_id == id && content == POLL_GUARD_ERROR && images.is_empty()
+                if call_id == id
+                    && content.starts_with("1 background task(s) running:")
+                    && content.contains(POLL_GUARD_ERROR)
+                    && images.is_empty()
         ));
     }
+    assert!(matches!(
+        tools[5],
+        Message::Tool { call_id, content, is_error: true, synthetic: false, images, .. }
+            if call_id == "c5"
+                && content.starts_with("1 background task(s) running:")
+                && content.contains(POLL_GUARD_TERMINATION_NOTICE)
+                && !content.contains(POLL_GUARD_SENTINEL)
+                && images.is_empty()
+    ));
     assert!(matches!(
         tools[6],
         Message::Tool { call_id, content, is_error: false, synthetic: false, .. }

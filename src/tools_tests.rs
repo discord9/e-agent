@@ -3999,21 +3999,22 @@ async fn subagent_poll_guard_escalates_on_unchanged_snapshot_and_resets_on_chang
         Some(SUBAGENT_POLL_GUARD_THRESHOLD),
     );
 
-    // A real task snapshot: 1st normal, 2nd POLL_ERROR, 3rd sentinel.
+    // A real task snapshot: 1st normal, 2nd reminder, 3rd termination.
     bash.execute(json!({"command": "echo hello; sleep 30", "background": true}))
         .await
         .unwrap();
     assert_eq!(background.running().len(), 1);
     let output = tool.execute(json!({})).await.unwrap().content;
     assert!(output.starts_with("1 background task(s) running:"));
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap_err(),
-        crate::agent::POLL_GUARD_ERROR
-    );
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap_err(),
-        crate::agent::POLL_GUARD_SENTINEL
-    );
+    let warning = tool.execute(json!({})).await.unwrap_err();
+    assert!(warning.starts_with("1 background task(s) running:"));
+    assert!(warning.contains("#1: "));
+    assert!(warning.contains(crate::agent::POLL_GUARD_ERROR));
+    let warning = tool.execute(json!({})).await.unwrap_err();
+    assert!(warning.starts_with("1 background task(s) running:"));
+    assert!(warning.contains("#1: "));
+    assert!(warning.ends_with(crate::agent::POLL_GUARD_SENTINEL));
+    assert!(warning.contains(crate::agent::POLL_GUARD_TERMINATION_NOTICE));
 
     // An empty poll (task cancelled) clears the guard: repeated empty
     // polls never escalate…
@@ -4037,10 +4038,9 @@ async fn subagent_poll_guard_escalates_on_unchanged_snapshot_and_resets_on_chang
         output.starts_with("1 background task(s) running:"),
         "empty poll must reset the guard: {output}"
     );
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap_err(),
-        crate::agent::POLL_GUARD_ERROR
-    );
+    let warning = tool.execute(json!({})).await.unwrap_err();
+    assert!(warning.starts_with("1 background task(s) running:"));
+    assert!(warning.contains(crate::agent::POLL_GUARD_ERROR));
 
     // Turn hook: a fresh true turn resets even with the same snapshot.
     tool.on_turn_start();
@@ -4065,16 +4065,15 @@ async fn subagent_poll_guard_escalates_on_unchanged_snapshot_and_resets_on_chang
     );
     let output = tool_a.execute(json!({})).await.unwrap().content;
     assert!(output.starts_with("1 background task(s) running:"));
-    assert_eq!(
-        tool_a.execute(json!({})).await.unwrap_err(),
-        crate::agent::POLL_GUARD_ERROR
-    );
+    let warning = tool_a.execute(json!({})).await.unwrap_err();
+    assert!(warning.starts_with("1 background task(s) running:"));
+    assert!(warning.contains(crate::agent::POLL_GUARD_ERROR));
     let output = tool_b.execute(json!({})).await.unwrap().content;
     assert!(output.starts_with("1 background task(s) running:"));
-    assert_eq!(
-        tool_a.execute(json!({})).await.unwrap_err(),
-        crate::agent::POLL_GUARD_SENTINEL
-    );
+    let warning = tool_a.execute(json!({})).await.unwrap_err();
+    assert!(warning.starts_with("1 background task(s) running:"));
+    assert!(warning.ends_with(crate::agent::POLL_GUARD_SENTINEL));
+    assert!(warning.contains(crate::agent::POLL_GUARD_TERMINATION_NOTICE));
 }
 #[tokio::test]
 async fn subagent_poll_guard_completion_resets_and_output_growth_does_not() {
@@ -4109,11 +4108,10 @@ async fn subagent_poll_guard_completion_resets_and_output_growth_does_not() {
             .is_some_and(|bytes| bytes.windows(3).any(|window| window == b"two")),
         "background task output must grow for the non-reset proof"
     );
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap_err(),
-        crate::agent::POLL_GUARD_ERROR,
-        "output growth of the same task must not reset the poll guard"
-    );
+    let warning = tool.execute(json!({})).await.unwrap_err();
+    assert!(warning.starts_with("1 background task(s) running:"));
+    assert!(warning.contains("#1: "));
+    assert!(warning.contains(crate::agent::POLL_GUARD_ERROR));
 
     // A task COMPLETING changes the ID set → reset (normal poll again).
     // A fresh SHORT task gives a fresh snapshot {2}; after it completes the
@@ -4166,7 +4164,7 @@ async fn main_poll_guard_escalates_1_2_normal_3_4_reminder_5_sentinel() {
     );
 
     // A REAL task snapshot escalates: 1st and 2nd normal, 3rd and 4th
-    // POLL_ERROR, 5th sentinel.
+    // reminder, 5th termination; every warning retains the snapshot.
     bash.execute(json!({"command": "echo hello; sleep 30", "background": true}))
         .await
         .unwrap();
@@ -4178,18 +4176,17 @@ async fn main_poll_guard_escalates_1_2_normal_3_4_reminder_5_sentinel() {
     );
     let output = tool.execute(json!({})).await.unwrap().content;
     assert!(output.starts_with("1 background task(s) running:"));
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap_err(),
-        crate::agent::POLL_GUARD_ERROR
-    );
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap_err(),
-        crate::agent::POLL_GUARD_ERROR
-    );
-    assert_eq!(
-        tool.execute(json!({})).await.unwrap_err(),
-        crate::agent::POLL_GUARD_SENTINEL
-    );
+    for _ in 0..2 {
+        let warning = tool.execute(json!({})).await.unwrap_err();
+        assert!(warning.starts_with("1 background task(s) running:"));
+        assert!(warning.contains("#1: "));
+        assert!(warning.contains(crate::agent::POLL_GUARD_ERROR));
+    }
+    let warning = tool.execute(json!({})).await.unwrap_err();
+    assert!(warning.starts_with("1 background task(s) running:"));
+    assert!(warning.contains("#1: "));
+    assert!(warning.ends_with(crate::agent::POLL_GUARD_SENTINEL));
+    assert!(warning.contains(crate::agent::POLL_GUARD_TERMINATION_NOTICE));
 
     // Turn hook: a fresh true turn resets even with the same snapshot.
     tool.on_turn_start();

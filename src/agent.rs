@@ -21,13 +21,9 @@ const INTERRUPTED: &str = "[turn interrupted before a tool result was produced]"
 /// the main agent).
 pub(crate) const POLL_GUARD_ERROR: &str = "poll guard: get_background_tasks was already called with this exact task list this turn; end the turn and wait for the automatic [background task N completed] injection instead of polling again";
 
-/// Internal termination sentinel returned at the configured termination
-/// threshold — the THIRD consecutive unchanged-snapshot poll for subagents,
-/// the FIFTH for the main agent. Never enters history, model context, or
-/// UI: the batch loops (`Agent::run_loop` and `SessionRunner`) substitute
-/// [`POLL_GUARD_ERROR`] as the committed content and use the sentinel only
-/// to set the turn-termination latch after the full sibling batch has been
-/// durably committed.
+/// Legacy internal termination sentinel retained for recognizing results
+/// from older in-process callers. New poll-guard results carry their complete
+/// human-readable snapshot and warning instead.
 pub(crate) const POLL_GUARD_SENTINEL: &str = "\u{0}poll-guard-terminate";
 
 /// Termination notice emitted after the full tool batch (and, in the runner
@@ -36,22 +32,22 @@ pub(crate) const POLL_GUARD_SENTINEL: &str = "\u{0}poll-guard-terminate";
 pub(crate) const POLL_GUARD_TERMINATION_NOTICE: &str =
     "repeated get_background_tasks calls with an unchanged task list; ending this turn";
 
-/// True when a tool result is the internal poll-guard termination sentinel
-/// (an unchanged-snapshot poll at the configured termination threshold:
-/// 3rd for subagents, 5th for the main agent). Batch loops use this to set
-/// a local latch; the sentinel itself never reaches history/UI.
+/// True when a tool result is the poll-guard termination result (an
+/// unchanged-snapshot poll at the configured termination threshold: 3rd for
+/// subagents, 5th for the main agent). Batch loops use this to set a local
+/// latch while retaining the complete result in history/UI.
 pub(crate) fn is_poll_guard_terminate(result: &Result<ToolOutput, String>) -> bool {
-    matches!(result, Err(error) if error == POLL_GUARD_SENTINEL)
+    matches!(result, Err(error) if error.ends_with(POLL_GUARD_SENTINEL))
 }
 
-/// Map a tool error to the content that may enter history/UI: the internal
-/// poll-guard sentinel becomes the model-facing [`POLL_GUARD_ERROR`] text;
-/// every other error passes through unchanged.
+/// Map a legacy sentinel to model-facing text and remove one current terminal
+/// sentinel before content is persisted or displayed. The snapshot and warning
+/// preceding a current sentinel are retained verbatim.
 pub(crate) fn tool_error_content(error: &str) -> &str {
     if error == POLL_GUARD_SENTINEL {
         POLL_GUARD_ERROR
     } else {
-        error
+        error.strip_suffix(POLL_GUARD_SENTINEL).unwrap_or(error)
     }
 }
 
@@ -2191,7 +2187,7 @@ impl Agent {
                     arguments: call.arguments.clone(),
                 });
                 let result = Self::execute_on(&self.tools, call).await;
-                if is_poll_guard_terminate(&result) {
+                if call.name == "get_background_tasks" && is_poll_guard_terminate(&result) {
                     poll_terminate = true;
                 }
                 self.after_tool_entry(call, &result)
