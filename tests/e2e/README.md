@@ -24,6 +24,25 @@ tests/e2e/
 └── README.md
 ```
 
+## GreptimeDB background restart recovery
+
+`greptime_background_restart_recovery.sh` is a real process-boundary E2E for
+GreptimeDB-backed background-task recovery. It starts an isolated GreptimeDB,
+mock OpenAI SSE provider, and server A/B with dynamically allocated listeners,
+then creates the task through the public prompt API, kills server A by its saved
+PID, resumes the same session in server B, and checks history/SSE plus the
+running-task API. It requires explicit `GREPTIMEDB_BIN` and `psql`; no existing
+GreptimeDB, provider, config, state, workspace, or secret is read. A failed
+run deliberately retains its temporary directory and reports the exact HTTP
+body; a successful run removes all child processes and temporary data.
+
+```sh
+GREPTIMEDB_BIN=/path/to/greptime bash tests/e2e/greptime_background_restart_recovery.sh
+```
+
+This test is an acceptance test, not a compatibility shim: the recovery notice
+assertion is not weakened when production behavior fails.
+
 ## 运行
 
 ```sh
