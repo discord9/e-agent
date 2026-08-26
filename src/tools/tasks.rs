@@ -25,10 +25,9 @@ pub(super) struct PollGuardState {
 
 pub(super) struct GetBackgroundTasks {
     pub(super) background: BackgroundTasks,
-    /// The calling session's own id (subagents only). A running delegate
-    /// task whose `display_meta.subagent_session_id` matches is the calling
-    /// subagent itself and is annotated as such in the output. The main
-    /// agent (and any caller without a session id) passes `None`.
+    /// The calling session's own id (subagents only). Subagent snapshots are
+    /// filtered to tasks whose owner matches this id. The main agent (and any
+    /// caller without a session id) passes `None`.
     pub(super) self_session_id: Option<String>,
     /// Unchanged-snapshot poll guard: `Some(threshold)` enables escalation —
     /// consecutive `get_background_tasks` calls with an unchanged NON-EMPTY
@@ -89,7 +88,18 @@ impl Tool for GetBackgroundTasks {
     }
 
     async fn execute(&self, _arguments: Value) -> Result<ToolOutput, String> {
-        let tasks = self.background.running();
+        // Apply subagent ownership before the poll guard sees the snapshot:
+        // hidden global tasks must not affect either visibility or polling.
+        let tasks: Vec<_> = self
+            .background
+            .running()
+            .into_iter()
+            .filter(|task| {
+                self.self_session_id
+                    .as_ref()
+                    .is_none_or(|session_id| task.owner_session.as_ref() == Some(session_id))
+            })
+            .collect();
         // Empty snapshots never escalate: with no running tasks there is
         // nothing to wait for, so repeated polls stay the plain "no tasks"
         // output and never latch the reminder/sentinel. Any observed
@@ -148,22 +158,9 @@ impl Tool for GetBackgroundTasks {
                     t
                 })
                 .unwrap_or_default();
-            // A delegate task whose subagent_session_id matches the calling
-            // subagent's own session id IS the caller (the subagent itself
-            // appears in the parent's shared registry as a delegate entry).
-            let self_marker = if task
-                .display_meta
-                .as_ref()
-                .and_then(|meta| meta.subagent_session_id.as_deref())
-                .is_some_and(|sid| self.self_session_id.as_deref() == Some(sid))
-            {
-                " [self]"
-            } else {
-                ""
-            };
             out.push_str(&format!(
-                "#{}: {} ({}){}{}\n",
-                task.id, task.label, role, tags, self_marker
+                "#{}: {} ({}){}\n",
+                task.id, task.label, role, tags
             ));
             // 完整命令原文：label 是源头截断的 100 字符预览，这里给模型
             // 未被截断的原始命令（bash 任务才有；delegate 任务无命令，
@@ -179,6 +176,7 @@ impl Tool for GetBackgroundTasks {
 
 pub(super) struct CancelBackgroundTask {
     pub(super) background: BackgroundTasks,
+    pub(super) self_session_id: Option<String>,
 }
 
 #[async_trait]
@@ -205,9 +203,11 @@ impl Tool for CancelBackgroundTask {
             .get("id")
             .and_then(Value::as_u64)
             .ok_or("`id` must be a non-negative integer")?;
-        self.background
-            .cancel(id)
-            .ok_or_else(|| format!("background task {id} is not running"))?;
+        let cancelled = match self.self_session_id.as_ref() {
+            Some(session_id) => self.background.cancel_owned(id, session_id),
+            None => self.background.cancel(id),
+        };
+        cancelled.ok_or_else(|| format!("background task {id} is not running"))?;
         Ok(ToolOutput::text(format!("cancelled background task {id}")))
     }
 }

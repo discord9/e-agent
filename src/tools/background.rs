@@ -497,9 +497,24 @@ impl BackgroundTasks {
     /// in-flight `run_bash`, which kills the process group via its guard.
     /// Returns the cancelled task's label, or `None` if no such task.
     pub fn cancel(&self, id: u64) -> Option<String> {
+        self.cancel_matching(id, |_| true)
+    }
+
+    /// Cancel a task only when its owner matches the calling subagent. The
+    /// ownership check and removal share the registry mutex, so a task cannot
+    /// change from visible to cancelled between separate operations.
+    pub fn cancel_owned(&self, id: u64, owner_session: &str) -> Option<String> {
+        self.cancel_matching(id, |task| {
+            task.owner_session.as_deref() == Some(owner_session)
+        })
+    }
+
+    fn cancel_matching(&self, id: u64, matches: impl Fn(&RunningTask) -> bool) -> Option<String> {
         let task = {
             let mut running = self.registry.running.lock().unwrap();
-            let index = running.iter().position(|task| task.id == id)?;
+            let index = running
+                .iter()
+                .position(|task| task.id == id && matches(task))?;
             running.remove(index)
         };
         task.handle.abort();

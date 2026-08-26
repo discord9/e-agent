@@ -3614,65 +3614,131 @@ async fn get_background_tasks_shows_roled_delegate_with_role_name() {
 }
 
 #[tokio::test]
-async fn get_background_tasks_marks_the_calling_subagent_itself() {
+async fn subagent_background_tasks_are_scoped_for_listing_and_cancel() {
     let temp = tempfile::tempdir().unwrap();
-    let (bash, _receiver) = background_bash(&temp, Duration::from_secs(10));
+    let (mut bash, _receiver) = background_bash(&temp, Duration::from_secs(30));
     let background = bash.background.clone();
+    let self_session_id = "sub-own";
 
-    // The subagent's own session id: its delegate entry in the parent's
-    // shared registry carries this in display_meta.subagent_session_id.
-    let self_session_id = "sub-12345";
-    let tool = GetBackgroundTasks::new(background.clone(), Some(self_session_id.into()), None);
-
-    // A delegate entry that IS the caller (matching subagent_session_id)…
+    // Parent delegate/self and a main/unknown task have no owner and are
+    // hidden from every subagent, even when the delegate metadata guesses the
+    // caller's session id.
     background
         .spawn_with_id(
-            "fix the lints".into(),
+            "parent delegate".into(),
             Some("fixer".into()),
             None,
             Some(TaskDisplayMeta {
-                background: true,
-                workspace: None,
                 subagent_session_id: Some(self_session_id.into()),
-                resume: None,
+                ..TaskDisplayMeta::default()
             }),
             new_exit_slot(),
             |_| {},
-            || async { "done".into() },
+            || async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                "done".into()
+            },
         )
         .unwrap();
-    // …plus a delegate entry that is NOT (different subagent).
     background
-        .spawn_with_id(
-            "search codebase".into(),
-            None,
-            None,
-            Some(TaskDisplayMeta {
-                background: true,
-                workspace: None,
-                subagent_session_id: Some("sub-other".into()),
-                resume: None,
-            }),
-            new_exit_slot(),
-            |_| {},
-            || async { "done".into() },
-        )
+        .spawn("main task".into(), None, None, || async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            "done".into()
+        })
         .unwrap();
 
-    let output = tool.execute(json!({})).await.unwrap().content;
+    // A sibling-owned bash task is also invisible, while this task is visible.
+    bash.owner_session = Some("sub-sibling".into());
+    bash.execute(json!({"command": "sleep 30", "background": true}))
+        .await
+        .unwrap();
+    bash.owner_session = Some(self_session_id.into());
+    bash.execute(json!({"command": "sleep 30", "background": true}))
+        .await
+        .unwrap();
+
+    let tasks = background.running();
+    assert_eq!(tasks.len(), 4);
+    let own_id = tasks[3].id;
+    let parent_id = tasks[0].id;
+    let sibling_id = tasks[2].id;
+    let main_id = tasks[1].id;
+
+    let list = GetBackgroundTasks::new(background.clone(), Some(self_session_id.into()), None);
+    let output = list.execute(json!({})).await.unwrap().content;
+    assert!(output.contains(&format!("#{own_id}: sleep 30 (bash)")));
+    assert!(!output.contains(&format!("#{parent_id}:")));
+    assert!(!output.contains(&format!("#{sibling_id}:")));
+    assert!(!output.contains(&format!("#{main_id}:")));
+
+    let cancel = CancelBackgroundTask {
+        background: background.clone(),
+        self_session_id: Some(self_session_id.into()),
+    };
+    for id in [parent_id, sibling_id, main_id] {
+        assert_eq!(
+            cancel.execute(json!({"id": id})).await.unwrap_err(),
+            format!("background task {id} is not running")
+        );
+        assert!(
+            background.running().iter().any(|task| task.id == id),
+            "denied cancellation must leave task {id} running"
+        );
+    }
+
     assert_eq!(
-        output,
-        "2 background task(s) running:\n\
-         #1: fix the lints (fixer) [background] [self]\n\
-         #2: search codebase (delegate) [background]"
+        cancel.execute(json!({"id": own_id})).await.unwrap().content,
+        format!("cancelled background task {own_id}")
     );
 
-    // The main agent (self_session_id = None) never annotates any entry,
-    // even one whose subagent_session_id would match a subagent.
-    let main_tool =
-        GetBackgroundTasks::new(background.clone(), None, Some(MAIN_POLL_GUARD_THRESHOLD));
-    let output = main_tool.execute(json!({})).await.unwrap().content;
-    assert!(!output.contains("[self]"));
+    // Main callers retain unrestricted visibility and cancellation.
+    let main_list = GetBackgroundTasks::new(background.clone(), None, None);
+    let main_output = main_list.execute(json!({})).await.unwrap().content;
+    assert!(main_output.contains(&format!("#{parent_id}: parent delegate")));
+    assert!(main_output.contains(&format!("#{sibling_id}: sleep 30")));
+    assert!(main_output.contains(&format!("#{main_id}: main task")));
+    let main_cancel = CancelBackgroundTask {
+        background: background.clone(),
+        self_session_id: None,
+    };
+    for id in [parent_id, sibling_id, main_id] {
+        assert_eq!(
+            main_cancel
+                .execute(json!({"id": id}))
+                .await
+                .unwrap()
+                .content,
+            format!("cancelled background task {id}")
+        );
+    }
+    assert!(background.running().is_empty());
+}
+
+#[tokio::test]
+async fn subagent_hidden_tasks_do_not_trigger_poll_guard() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, _receiver) = background_bash(&temp, Duration::from_secs(30));
+    let background = bash.background.clone();
+    background
+        .spawn("hidden global task".into(), None, None, || async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            "done".into()
+        })
+        .unwrap();
+    let tool = GetBackgroundTasks::new(
+        background.clone(),
+        Some("sub-no-tasks".into()),
+        Some(SUBAGENT_POLL_GUARD_THRESHOLD),
+    );
+    for _ in 0..10 {
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap().content,
+            "No background tasks running."
+        );
+    }
+    for task in background.running() {
+        background.cancel(task.id);
+    }
 }
 
 #[tokio::test]

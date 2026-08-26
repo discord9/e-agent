@@ -134,9 +134,9 @@ pub fn builtins_with_bash_timeout(
 /// `protect_git = false` is how a fixer/subagent gets a working shell under
 /// the Windows sandbox.
 ///
-/// `self_session_id` is the calling session's own id (`Some` for subagents,
-/// `None` otherwise): it lets `get_background_tasks` annotate the delegate
-/// entry that represents the caller itself.
+/// `self_session_id` identifies the calling subagent's ownership scope
+/// (`Some` for subagents, `None` otherwise) for background-task visibility
+/// and cancellation.
 pub fn builtins_with_background(
     workspace: Workspace,
     background: BackgroundTasks,
@@ -247,6 +247,7 @@ fn tools_with_background_and_exa_key(
     )));
     tools.push(Box::new(CancelBackgroundTask {
         background: background.clone(),
+        self_session_id: self_session_id.clone(),
     }));
     // Bash for read-only roles only exists inside a narrowed bwrap policy;
     // without one (sandbox disabled / bwrap unavailable) there is no bash —
