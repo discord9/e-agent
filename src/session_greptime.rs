@@ -2128,10 +2128,8 @@ impl GreptimeSession {
 
     /// Latest metadata snapshot per session, newest activity first.
     ///
-    /// The table is append-only, so one session has many rows; the list
-    /// deduplicates by primary key keeping the row with the maximum
-    /// `last_active_at` per session (explicit GROUP BY + JOIN — correct
-    /// whether or not the engine auto-dedups same-PK rows at read time).
+    /// The table is append-only, so one session has many rows; ordered selectors
+    /// avoid the aggregate self-join and its two full scans.
     pub async fn list_meta(&self) -> Result<Vec<SessionMeta>> {
         Ok(self.list_meta_diagnostic().await?.0)
     }
@@ -2143,17 +2141,27 @@ impl GreptimeSession {
         let rows = self
             .client
             .query(
-                "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
-                        s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned, \
-                        s.archived, s.writer \
-                 FROM sessions s \
-                 INNER JOIN ( \
-                     SELECT session_id, MAX(last_active_at) AS max_ts \
-                     FROM sessions WHERE workspace_id = $1 GROUP BY session_id \
-                 ) latest \
-                   ON latest.session_id = s.session_id AND latest.max_ts = s.last_active_at \
-                 WHERE s.workspace_id = $1 \
-                 ORDER BY s.last_active_at DESC",
+                "SELECT session_id, created_at, last_active_at, model, \"role\", entry_count, \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer \
+                 FROM ( \
+                     SELECT \
+                         session_id, \
+                         last_value(ARRAY[created_at] ORDER BY last_active_at)[1] AS created_at, \
+                         last_value(ARRAY[last_active_at] ORDER BY last_active_at)[1] AS last_active_at, \
+                         last_value(ARRAY[model] ORDER BY last_active_at)[1] AS model, \
+                         last_value(ARRAY[\"role\"] ORDER BY last_active_at)[1] AS \"role\", \
+                         last_value(ARRAY[entry_count] ORDER BY last_active_at)[1] AS entry_count, \
+                         last_value(ARRAY[parent_session_id] ORDER BY last_active_at)[1] AS parent_session_id, \
+                         last_value(ARRAY[parent_task_id] ORDER BY last_active_at)[1] AS parent_task_id, \
+                         last_value(ARRAY[title] ORDER BY last_active_at)[1] AS title, \
+                         last_value(ARRAY[pinned] ORDER BY last_active_at)[1] AS pinned, \
+                         last_value(ARRAY[archived] ORDER BY last_active_at)[1] AS archived, \
+                         last_value(ARRAY[writer] ORDER BY last_active_at)[1] AS writer \
+                     FROM sessions \
+                     WHERE workspace_id = $1 \
+                     GROUP BY session_id \
+                 ) current \
+                 ORDER BY current.last_active_at DESC",
                 &[&self.workspace_id],
             )
             .await
