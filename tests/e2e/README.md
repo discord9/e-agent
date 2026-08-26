@@ -59,8 +59,9 @@ uv run --with playwright python regression.py --all --real     # 含真实 serve
 
 - `uv`（Python 环境管理器）
 - playwright（`uv run --with playwright` 自动提供；已缓存时秒级就绪）
-- chromium headless shell（默认路径见 `EAGENT_CHROME` 环境变量，机器相关；本机开发时指向
-  各自的 playwright chromium 安装，可用环境变量 `EAGENT_CHROME` 覆盖）
+- chromium headless shell（默认路径
+  `/mnt/nvme_rust/cargo-home/playwright-browsers/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell`，
+  可用环境变量 `EAGENT_CHROME` 覆盖）
 
 ## 设计约定（稳定性）
 
@@ -147,3 +148,18 @@ bash -n tests/e2e/greptime_history_physical_paging.sh
   未来发现「功能未合入、写用例必然 FAIL」的新功能时，在此登记并写 TODO 说明。
 - 用例不触碰真实数据（核心用例全 mock；冒烟只读）。
 - 若浏览器二进制路径变了，设 `EAGENT_CHROME` 即可，无需改代码。
+
+## Nested subagent restart E2E
+
+`greptime_nested_background_restart.sh` runs an isolated GreptimeDB plus server A/B and
+stdlib mock provider on dynamically allocated ports (never `15403`). It creates a parent
+delegate and a child-owned background bash task, verifies both `/api/tasks` ownership and
+both durable `running_tasks` scopes, then SIGKILLs A. The child command has a unique
+per-run argv marker; the test fails before starting B if that host process survives.
+
+After containment, parent resume must consume and report only the parent delegate row.
+The child session is then resumed explicitly and must receive exactly one child-owned
+killed notice and consume its own row. No lifecycle SQL writes are used. Failures preserve
+the isolated temp root and clean up only the exact marker process/group and test services;
+success removes the root. Run with `GREPTIMEDB_BIN=/home/discord9/.local/share/e-agent/greptimedb/greptime`
+and the explicit isolated E2E binaries/target described by the script.
