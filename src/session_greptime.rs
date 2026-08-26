@@ -2126,6 +2126,31 @@ impl GreptimeSession {
         Ok(())
     }
 
+    /// Return sessions whose latest metadata snapshot points at `parent_session_id`.
+    ///
+    /// This is intentionally narrower than [`Self::list_meta`]: callers that
+    /// only need child ids must not scan and decode every workspace session.
+    /// The parent predicate is applied after selecting each session's latest
+    /// snapshot, so an older parent link cannot make a session a child.
+    pub async fn child_session_ids(&self, parent_session_id: &str) -> Result<Vec<String>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT s.session_id \
+                 FROM sessions s \
+                 INNER JOIN ( \
+                     SELECT session_id, MAX(last_active_at) AS max_ts \
+                     FROM sessions WHERE workspace_id = $1 GROUP BY session_id \
+                 ) latest \
+                   ON latest.session_id = s.session_id AND latest.max_ts = s.last_active_at \
+                 WHERE s.workspace_id = $1 AND s.parent_session_id = $2",
+                &[&self.workspace_id, &parent_session_id],
+            )
+            .await
+            .context("cannot query child session metadata")?;
+        Ok(rows.iter().map(|row| row.get("session_id")).collect())
+    }
+
     /// Latest metadata snapshot per session, newest activity first.
     ///
     /// The table is append-only, so one session has many rows; ordered selectors

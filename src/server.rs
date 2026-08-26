@@ -2923,9 +2923,9 @@ struct UsageRowJson {
 
 /// `GET /api/sessions/{id}/usage` — the web UI usage line's persisted
 /// half: token totals for the session PLUS its subagent children (sessions
-/// whose `parent_session_id` = `{id}`, found via `list_meta`), aggregated
-/// from the `usage_entries` table so the numbers survive a server restart
-/// (the live SSE `Usage` event only carries in-process counters).
+/// whose latest `parent_session_id` = `{id}`), aggregated from the
+/// `usage_entries` table so the numbers survive a server restart (the live
+/// SSE `Usage` event only carries in-process counters).
 ///
 /// Response: `{"input_tokens": N, "output_tokens": M, "rows": [...]}` with
 /// the totals summed over every returned row. The session need not be live
@@ -2938,35 +2938,41 @@ async fn session_usage(
     Path(id): Path<String>,
 ) -> Json<serde_json::Value> {
     let root = state.factory.root();
-    // 子会话集合：元数据里 parent_session_id == id 的会话（含已结束的）。
-    // list_meta 失败降级为只查本会话——用量行不应因元数据问题整体消失。
     let mut ids = vec![id.clone()];
-    match async {
-        let store = meta_store(&state).await?;
-        store.list_meta(root).await
-    }
-    .await
-    {
-        Ok(metas) => {
-            for meta in metas {
-                if meta.parent_session_id.as_deref() == Some(id.as_str()) {
-                    ids.push(meta.session_id);
+
+    // Greptime uses one request-local read-only connection; other backends
+    // use the configured metadata store. JSONL has no usage table, so its
+    // unified query below naturally returns zero rows.
+    #[cfg(feature = "greptime")]
+    let store = if matches!(
+        state.factory.backend(),
+        crate::config::SessionBackend::Greptime { .. }
+    ) {
+        SessionStore::connect_meta_read_only(state.factory.backend(), root).await
+    } else {
+        meta_store(&state).await
+    };
+    #[cfg(not(feature = "greptime"))]
+    let store = meta_store(&state).await;
+
+    let rows = match store {
+        Ok(store) => {
+            match store.child_session_ids(root, &id).await {
+                Ok(children) => ids.extend(children),
+                Err(error) => {
+                    eprintln!("e-agent: cannot list session metadata for usage: {error:#}");
+                }
+            }
+            match store.usage_for_sessions(root, &ids).await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    eprintln!("e-agent: cannot query session usage: {error:#}");
+                    Vec::new()
                 }
             }
         }
         Err(error) => {
-            eprintln!("e-agent: cannot list session metadata for usage: {error:#}");
-        }
-    }
-    let rows = match async {
-        let store = meta_store(&state).await?;
-        store.usage_for_sessions(root, &ids).await
-    }
-    .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            eprintln!("e-agent: cannot query session usage: {error:#}");
+            eprintln!("e-agent: cannot open usage store: {error:#}");
             Vec::new()
         }
     };

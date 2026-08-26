@@ -2002,6 +2002,42 @@ impl SessionStore {
         }
     }
 
+    /// Find child sessions using each session's latest metadata snapshot.
+    /// Greptime uses a targeted workspace-scoped query; other backends keep
+    /// their existing list-and-filter behavior.
+    #[allow(unused_variables)]
+    pub async fn child_session_ids(
+        &self,
+        root: &Path,
+        parent_session_id: &str,
+    ) -> Result<Vec<String>> {
+        match self {
+            SessionStore::Jsonl => Ok(jsonl_list_meta(root)?
+                .into_iter()
+                .filter(|meta| meta.parent_session_id.as_deref() == Some(parent_session_id))
+                .map(|meta| meta.session_id)
+                .collect()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session.child_session_ids(parent_session_id).await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .list_meta()
+                .await
+                .map(|metas| {
+                    metas
+                        .into_iter()
+                        .filter(|meta| meta.parent_session_id.as_deref() == Some(parent_session_id))
+                        .map(|meta| meta.session_id)
+                        .collect()
+                })
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     /// List the latest metadata snapshot per session (Greptime/SQLite:
     /// newest activity first from the audit table; JSONL: one tail-read of
     /// each transcript's sidecar), newest activity first.
