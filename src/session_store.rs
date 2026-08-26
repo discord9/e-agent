@@ -784,9 +784,11 @@ pub(crate) fn dedup_raw_entries(
 ///    (fail closed — same policy as the load path).
 ///
 /// 3. Output is ordered `event_time DESC, seq DESC` (newest logical row
-///    first). Callers MUST apply the user-visible limit AFTER this fold,
-///    so a committed-then-retried completion can never consume two limit
-///    slots and a superseded row can never appear.
+///    first). With the complete input, callers can apply a limit after this
+///    fold to preserve full fail-closed duplicate detection. SQL-bounded
+///    callers intentionally limit physical rows before the fold: conflict
+///    detection is best-effort within that window, and the result may be
+///    shorter than the physical limit.
 pub(crate) fn dedup_finished_rows(
     workspace_id: &str,
     raw: &[(String, i64, chrono::NaiveDateTime, String)],

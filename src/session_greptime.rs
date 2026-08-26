@@ -1521,7 +1521,11 @@ impl GreptimeSession {
     /// newest first, from `session_entries` rows of
     /// `entry_kind = 'background_completion'` (the authoritative record —
     /// no separate finished-task store). `finished_at` is the row's
-    /// `event_time`; `limit` caps the result (e.g. 100). The payload JSON
+    /// `event_time`; `limit` caps the physical rows read (e.g. 100). Rust
+    /// best-effort deduplication and fail-closed conflict detection happen
+    /// only within that physical-row window, so the result may contain fewer
+    /// than `limit` rows and ties outside the window are not inspected. The
+    /// payload JSON
     /// deserializes through the same serde shape as `load`, so legacy rows
     /// without the trace fields read back with them `None`.
     pub async fn finished_tasks(
@@ -1530,17 +1534,18 @@ impl GreptimeSession {
         limit: usize,
     ) -> Result<Vec<crate::session_store::FinishedTask>> {
         use crate::session_store::FinishedTask;
-        // Fetch without a SQL LIMIT: the user-visible cap must be applied
-        // AFTER the logical-row fold (append mode keeps duplicate physical
-        // rows, and a committed-then-retried completion would otherwise
-        // consume two limit slots / expose a superseded row).
+        // LIMIT applies to physical rows before the best-effort logical-row
+        // fold. A retry or duplicate may consume a slot, and a superseded
+        // row may be present in the window; this bounds the expensive query.
+        let limit_i64 =
+            i64::try_from(limit).context("finished task limit does not fit in BIGINT")?;
         let rows = self
             .client
             .query(
                 "SELECT session_id, seq, event_time, payload FROM session_entries \
                  WHERE workspace_id = $1 AND entry_kind = 'background_completion' \
-                 ORDER BY event_time DESC, seq DESC",
-                &[&workspace_id],
+                 ORDER BY event_time DESC, seq DESC LIMIT $2",
+                &[&workspace_id, &limit_i64],
             )
             .await
             .context("cannot query finished background tasks")?;
@@ -1556,8 +1561,8 @@ impl GreptimeSession {
             })
             .collect();
         let deduped = dedup_finished_rows(workspace_id, &raw).map_err(anyhow::Error::msg)?;
-        let mut out = Vec::with_capacity(deduped.len().min(limit));
-        for (session_id, seq, event_time, payload) in deduped.into_iter().take(limit) {
+        let mut out = Vec::with_capacity(deduped.len());
+        for (session_id, seq, event_time, payload) in deduped {
             let entry: crate::agent::SessionEntry = serde_json::from_str(&payload)
                 .context("cannot decode finished background task payload")?;
             let crate::agent::SessionEntry::BackgroundCompletion {
@@ -2745,6 +2750,13 @@ mod tests {
         derive_workspace_id(Path::new("/tmp/e-agent-test"))
     }
 
+    fn finished_workspace_id() -> String {
+        derive_workspace_id(Path::new(&format!(
+            "/tmp/e-agent-test-finished-{}",
+            crate::session::new_id()
+        )))
+    }
+
     fn test_entries() -> Vec<SessionEntry> {
         vec![
             Message::System {
@@ -2862,7 +2874,7 @@ mod tests {
             eprintln!("skipping: GREPTIME_PG not set");
             return;
         }
-        let wid = workspace_id();
+        let wid = finished_workspace_id();
         let sid = format!("test-gt-finished-{}", crate::session::new_id());
         let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
@@ -2913,7 +2925,7 @@ mod tests {
             eprintln!("skipping: GREPTIME_PG not set");
             return;
         }
-        let wid = workspace_id();
+        let wid = finished_workspace_id();
         let sid = format!("test-gt-finished-dedup-{}", crate::session::new_id());
         let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
 
@@ -3020,8 +3032,9 @@ mod tests {
         assert_eq!(finished[1].status.as_deref(), Some("failed"));
         assert_eq!(finished[1].exit_code, Some(3));
 
-        // The user-visible limit applies AFTER the fold: limit=1 returns
-        // only the newest LOGICAL row, never two physical versions of seq 0.
+        // The physical window contains the newest row, so limit=1 still
+        // returns the newest completion. A superseded row outside that
+        // window is not guaranteed to be discovered by this best-effort fold.
         let limited = session.finished_tasks(&wid, 1).await.unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].id, 3);

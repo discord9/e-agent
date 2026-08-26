@@ -347,6 +347,12 @@ function handleSSEBlock(block, id, wsId, epoch) {
 
   let payload = null;
   try { payload = JSON.parse(data); } catch (e) { payload = data; }
+  if (eventName === "ToolResult" || eventName === "BackgroundCompleted"
+      || eventName === "BackgroundCompletionNotice") {
+    void pollTasks().catch((err) => {
+      console.warn("[tasks] refresh after " + eventName + " failed:", err);
+    });
+  }
   applyLiveEvent(eventName, payload);
 }
 

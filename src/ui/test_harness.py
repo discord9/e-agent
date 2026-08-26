@@ -415,6 +415,9 @@ function abortable(promise, signal){
 let tasksData = [];
 // 已完成任务测试用：/api/tasks/finished 响应（newest first；测试中可变）
 let finishedData = [];
+// 已完成查询延迟测试：必须不阻塞运行中任务的 live 面板渲染
+let finishedDelayed = false;
+let finishedResolve = null;
 // 聚合模式：第二台服务器（http://b.local）的独立 /api/tasks 数据源
 let tasksDataB = [];
 // 任务轮询超时测试：B 的 /api/tasks 永不 resolve（挂起，只能被 abort 打断）
@@ -516,7 +519,10 @@ globalThis.fetch=(url,opts={})=>{
   const signal = opts && opts.signal;   // 传给 abort 感知的响应桩
   const m=(opts.method||"GET").toUpperCase();
       if(url==="/api/tasks") return resp(200, tasksData, signal);
-      if(url==="/api/tasks/finished") return resp(200, finishedData, signal);
+      if(url==="/api/tasks/finished") {
+        if (finishedDelayed) return abortable(new Promise((resolve) => { finishedResolve = resolve; }), signal);
+        return resp(200, finishedData, signal);
+      }
       if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output")) {
         if (taskOutput404) return resp(404, {}, signal);
         if (taskOutputDelayed) return abortable(new Promise((resolve) => { taskOutputResolve = resolve; }), signal);
@@ -966,6 +972,13 @@ async function main(){
     chk("live reasoning", t.includes("推理中"));
     chk("live tool call", t.includes("read_file"));
     chk("live tool result err", t.includes("文件不存在"));
+    const _toolResultSeqBefore = state.tasks.seq;
+    handleSSEBlock("event: ToolResult\ndata: {\"type\":\"tool_result\",\"session_id\":\"s1\",\"seq\":12,\"is_error\":false,\"content\":\"focused refresh result\"}\n\n",
+      state.sessionId, state.workspace.id, sessionOpenEpoch);
+    chk("live ToolResult triggers task refresh",
+        state.tasks.seq === _toolResultSeqBefore + 1,
+        "before=" + _toolResultSeqBefore + " after=" + state.tasks.seq);
+    await flush();
     chk("live assistant text", t.includes("出错了，"));
     const _asList = elsById["messages"].querySelectorAll(".msg-assistant");
     const _lastAs = _asList[_asList.length - 1];
@@ -1471,8 +1484,11 @@ async function main(){
     chk("reconnect reconnected", state.sse.ctrl!=null);
 
     // resync 追平：注入一个 resync 块，验证强制整体替换 transcript 并按事件日志重放
+    const _resyncTaskSeqBefore = state.tasks.seq;
     handleSSEBlock("event: resync\ndata: [{\"type\":\"user_prompt\",\"data\":\"重放-用户\"},{\"type\":\"assistant_delta\",\"data\":\"重放-\"},{\"type\":\"assistant_delta\",\"data\":\"增量\"}]\n\n",
       state.sessionId, state.workspace.id, sessionOpenEpoch);
+    chk("resync does not refresh tasks", state.tasks.seq === _resyncTaskSeqBefore,
+        "before=" + _resyncTaskSeqBefore + " after=" + state.tasks.seq);
     const t3 = allText();
     console.log("DBG t3=" + JSON.stringify(t3.slice(0, 200)));
     console.log("DBG msgs children=" + elsById["messages"]._children.length
@@ -3019,9 +3035,14 @@ async function main(){
         && histComp.textContent.includes("答：好")
         && histComp.querySelector("details.delegate-collapse") === null,
         "text=" + JSON.stringify(histComp.textContent));
-    // live SSE BackgroundCompleted（delegate 输出）→ 同一渲染路径
+    // live SSE BackgroundCompleted（delegate 输出）→ 同一渲染路径，并立即
+    // kick the running-task refresh without awaiting it in the SSE handler.
+    const taskSeqBeforeCompletion = state.tasks.seq;
     handleSSEBlock("event: BackgroundCompleted\ndata: {\"type\":\"background_completed\",\"session_id\":\"" + state.sessionId + "\",\"seq\":300,\"id\":11,\"label\":\"审图\",\"output\":\"subagent session: sub-11\\n搞定\\n\"}\n\n",
       state.sessionId, state.workspace.id, sessionOpenEpoch);
+    chk("live BackgroundCompleted triggers task refresh",
+        state.tasks.seq === taskSeqBeforeCompletion + 1,
+        "before=" + taskSeqBeforeCompletion + " after=" + state.tasks.seq);
     const noticesBg = elsById["messages"].querySelectorAll(".notice");
     const lastNoticeBg = noticesBg[noticesBg.length - 1];
     chk("live BackgroundCompleted delegate rendered",
@@ -7642,6 +7663,25 @@ async function main(){
     chk("finished row click expands output", finishedOutput.hidden === false
         && finishedRow.getAttribute("aria-expanded") === "true",
         "hidden=" + finishedOutput.hidden);
+    // 持久化 finished 查询可以慢，但 live 任务面板必须先显示。
+    finishedDelayed = true;
+    finishedResolve = null;
+    const delayedFinishedPoll = pollTasks();
+    await flush();
+    chk("delayed finished does not delay live task render",
+        elsById["composerTasks"].querySelectorAll(".task-row")[0].textContent.includes("cargo build"),
+        "rows=" + elsById["composerTasks"].querySelectorAll(".task-row").length);
+    finishedDelayed = false;
+    if (finishedResolve) { finishedResolve(resp(200, finishedData)); finishedResolve = null; }
+    await delayedFinishedPoll; await flush();
+    const sameFinishedRow = finishedRow;
+    const sameFinishedOutput = finishedOutput;
+    await pollTasks(); await flush();
+    chk("same finished response preserves expanded row output",
+        sameFinishedRow === elsById["composerTasks"].querySelector(".task-row-finished")
+        && sameFinishedOutput.hidden === false,
+        "same-row=" + (sameFinishedRow === elsById["composerTasks"].querySelector(".task-row-finished"))
+        + " hidden=" + sameFinishedOutput.hidden);
     finishedRow._listeners["click"][0]();
     chk("finished row click collapses output", finishedOutput.hidden === true
         && finishedRow.getAttribute("aria-expanded") === "false",

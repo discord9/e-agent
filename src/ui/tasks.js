@@ -72,19 +72,65 @@ async function fetchFinishedTasks(ws) {
    某 workspace 拉取失败 → 保留其旧缓存（stale，与单服务器语义一致），
    不参与本轮合并。
    已完成列表同轮并行拉取（state.tasks.finished + finishedByWorkspace），
-   渲染在面板底部的 finished 小节。 */
+   渲染在面板底部的 finished 小节。live 与 finished 分别应用：慢的持久化
+   查询不会阻塞运行中任务面板。 */
 async function pollTasks() {
   const seq = ++state.tasks.seq;
   const wss = (state.workspaces || []).slice();
   if (!wss.length && state.workspace) wss.push(state.workspace);   // 兜底
-  const results = await Promise.all(wss.map(async (ws) => {
-    const [tasks, finished] = await Promise.all([fetchTasks(ws), fetchFinishedTasks(ws)]);
-    return { ws, tasks, finished };
-  }));
+
+  // 启动两组请求而不互相等待；每组内部仍等待所有 workspace，保持聚合
+  // 快照和 stale-on-error 语义。
+  const liveResults = Promise.all(wss.map((ws) => fetchTasks(ws)));
+  const finishedResults = Promise.all(wss.map((ws) => fetchFinishedTasks(ws)));
+
+  const applyFinished = (results) => {
+    if (seq !== state.tasks.seq) return;   // 过期响应丢弃
+    const wsId = state.workspace ? state.workspace.id : null;
+    const oldVisibleFinishedSig = finishedListSig(
+      (state.tasks.finished || []).filter((t) => !t._ws || t._ws === wsId));
+    const allFinished = [];
+    for (let i = 0; i < wss.length; i++) {
+      const ws = wss[i];
+      const finished = results[i];
+      if (finished === null) {
+        // 拉取失败：保留该 workspace 的旧缓存（stale），避免完成记录闪烁消失
+        const old = state.tasks.finishedByWorkspace[ws.id];
+        if (old) allFinished.push(...old);
+      } else {
+        const tagged = finished.map((t) => Object.assign({}, t, { _ws: ws.id }));
+        state.tasks.finishedByWorkspace[ws.id] = tagged;
+        allFinished.push(...tagged);
+      }
+    }
+    state.tasks.finished = allFinished;
+    // Finished data is a secondary section: update it in place so a late
+    // completion query cannot rebuild live task rows or stop their output
+    // pollers. If the panel is not currently showing live rows, the next
+    // live render will include this cached section.
+    const visibleFinished = allFinished.filter((t) => !t._ws || t._ws === wsId);
+    if (finishedListSig(visibleFinished) === oldVisibleFinishedSig) return;
+    const live = (state.tasks.list || []).filter((t) => !t._ws || t._ws === wsId);
+    const panel = els.composerTasks;
+    if (panel && state.tasks.composerOpen && live.length) {
+      renderFinishedSection(panel, visibleFinished);
+      const sig = tasksRenderSig(live) + "|f" + finishedListSig(visibleFinished);
+      lastTasksSig = sig;
+      lastTasksRenderedSig = sig;
+    }
+  };
+  // Do not make the caller wait for the finished query. Its continuation is
+  // separately guarded so a newer poll cannot be overwritten by old data.
+  finishedResults.then(applyFinished).catch((err) => {
+    console.warn("[tasks] finished refresh failed:", err);
+  });
+
+  const results = await liveResults;
   if (seq !== state.tasks.seq) return;   // 过期响应丢弃
   const all = [];
-  const allFinished = [];
-  for (const { ws, tasks, finished } of results) {
+  for (let i = 0; i < wss.length; i++) {
+    const ws = wss[i];
+    const tasks = results[i];
     if (tasks === null) {
       // 拉取失败：保留该 workspace 的旧缓存（stale），避免任务闪烁消失
       const old = state.tasks.byWorkspace[ws.id];
@@ -94,17 +140,8 @@ async function pollTasks() {
       state.tasks.byWorkspace[ws.id] = tagged;
       all.push(...tagged);
     }
-    if (finished === null) {
-      const old = state.tasks.finishedByWorkspace[ws.id];
-      if (old) allFinished.push(...old);
-    } else {
-      const tagged = finished.map((t) => Object.assign({}, t, { _ws: ws.id }));
-      state.tasks.finishedByWorkspace[ws.id] = tagged;
-      allFinished.push(...tagged);
-    }
   }
   state.tasks.list = all;
-  state.tasks.finished = allFinished;
   renderComposerTasks();
   renderSidebarTree();   // 任务数据恢复后主动触发侧边栏重绘（dot 数据源变化，
                          // 不再依赖 sessionId 变化碰巧打破 sidebarTreeSig 去重）
@@ -115,6 +152,7 @@ function finishedKeySig(t) {
   return JSON.stringify([
     t.session_id || "", t.seq != null ? t.seq : "", t.id != null ? t.id : "",
     t.label || "", t.kind || "", t.status || "",
+    t.output != null ? t.output : "",
     t.exit_code != null ? t.exit_code : "", t.signal || "",
     t.duration_ms != null ? t.duration_ms : "",
   ]);
