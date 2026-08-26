@@ -1380,6 +1380,26 @@ pub(super) async fn run_bash_with_tmp_policy(
     process.env("LC_ALL", "C.UTF-8").env("LANG", "C.UTF-8");
     #[cfg(unix)]
     process.process_group(0);
+    #[cfg(target_os = "linux")]
+    if sandbox.is_none() && process_group_slot.is_some() {
+        // PDEATHSIG is set in the forked child, where the parent-death race
+        // can be closed by checking the parent again before exec.
+        let expected_parent = rustix::process::getpid();
+        // SAFETY: this closure performs only prctl and getppid syscalls before
+        // exec; both are async-signal-safe and it captures no shared state.
+        unsafe {
+            process.pre_exec(move || {
+                rustix::process::set_parent_process_death_signal(Some(
+                    rustix::process::Signal::KILL,
+                ))
+                .map_err(std::io::Error::from)?;
+                if rustix::process::getppid() != Some(expected_parent) {
+                    return Err(rustix::io::Errno::CHILD.into());
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) if sandbox.is_some() && error.kind() == std::io::ErrorKind::NotFound => {

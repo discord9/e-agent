@@ -1067,6 +1067,212 @@ async fn successful_long_bash_output_does_not_write_a_log() {
     assert!(!temp.path().join(".e-agent/logs").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn unsandboxed_background_shell_dies_with_parent() {
+    // The child test process is the helper parent. The shell uses `exec` so
+    // the marker is the directly spawned top-level process, not a descendant
+    // that would require process-tree containment.
+    if let Some(marker) = std::env::var_os("E_AGENT_PDEATH_MARKER") {
+        let marker = std::path::PathBuf::from(marker);
+        let workspace = Workspace::new(marker.parent().expect("marker parent")).unwrap();
+        let shell = Shell::detect().unwrap();
+        let slot = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let token = std::env::var("E_AGENT_PDEATH_TOKEN").expect("missing pdeath token");
+        let command = format!(
+            "echo $$ > {}; exec -a {} /bin/sleep 30",
+            marker.display(),
+            token
+        );
+        let _ = run_bash(
+            &shell,
+            &workspace,
+            &command,
+            None,
+            false,
+            Some(slot),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        return;
+    }
+
+    use std::os::fd::AsFd;
+
+    struct PdeathGuard {
+        helper: Option<std::process::Child>,
+        helper_fd: rustix::fd::OwnedFd,
+        marker_fd: Option<rustix::fd::OwnedFd>,
+    }
+
+    impl PdeathGuard {
+        fn kill_helper_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            let _ =
+                rustix::process::pidfd_send_signal(&self.helper_fd, rustix::process::Signal::KILL);
+            self.helper.take().expect("helper already reaped").wait()
+        }
+
+        fn kill_marker(&self) {
+            if let Some(fd) = &self.marker_fd {
+                let _ = rustix::process::pidfd_send_signal(fd, rustix::process::Signal::KILL);
+            }
+        }
+    }
+
+    impl Drop for PdeathGuard {
+        fn drop(&mut self) {
+            self.kill_marker();
+            let _ =
+                rustix::process::pidfd_send_signal(&self.helper_fd, rustix::process::Signal::KILL);
+            if let Some(helper) = self.helper.as_mut() {
+                let _ = helper.wait();
+            }
+        }
+    }
+
+    async fn marker_is_terminated(marker_fd: &rustix::fd::OwnedFd) {
+        // pidfds become readable when their process exits. Unlike waitid,
+        // polling a pidfd does not require the caller to be the process's
+        // parent, so this remains valid after the marker is reparented.
+        let async_fd = tokio::io::unix::AsyncFd::new(rustix::io::dup(marker_fd.as_fd()).unwrap())
+            .expect("failed to register marker pidfd for polling");
+        let mut readiness = async_fd
+            .readable()
+            .await
+            .expect("failed to poll marker pidfd");
+        readiness.clear_ready();
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("top-level.pid");
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let marker_token = format!("e-agent-pdeath-marker-{unique}");
+    let exe = std::env::current_exe().expect("cannot locate the test binary");
+    let helper = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "tools::tests::unsandboxed_background_shell_dies_with_parent",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("E_AGENT_PDEATH_MARKER", &marker)
+        .env("E_AGENT_PDEATH_TOKEN", &marker_token)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn the helper parent");
+    let helper_pid = helper.id() as i32;
+    let helper_fd = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(helper_pid).expect("invalid helper pid"),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .expect("pidfds are required for identity-safe cleanup");
+    let mut guard = PdeathGuard {
+        helper: Some(helper),
+        helper_fd,
+        marker_fd: None,
+    };
+
+    let marker_ready = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if marker.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        marker_ready.is_ok(),
+        "helper did not publish the top-level process pid"
+    );
+    let marker_pid: i32 = std::fs::read_to_string(&marker)
+        .expect("top-level pid marker disappeared")
+        .trim()
+        .parse()
+        .expect("top-level pid marker was not numeric");
+    let marker_fd = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(marker_pid).expect("invalid marker pid"),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .expect("pidfds are required for identity-safe cleanup");
+    guard.marker_fd = Some(marker_fd);
+
+    // Pin identity before accepting the published PID. The pidfd then makes
+    // all later cleanup identity-safe.
+    let stat = std::fs::read_to_string(format!("/proc/{marker_pid}/stat"))
+        .expect("marker process disappeared before identity check");
+    let fields: Vec<&str> = stat
+        .split_once(") ")
+        .expect("invalid marker stat")
+        .1
+        .split_whitespace()
+        .collect();
+    let marker_ppid: i32 = fields
+        .get(1)
+        .expect("marker stat missing ppid")
+        .parse()
+        .expect("marker ppid was not numeric");
+    assert_eq!(
+        marker_ppid, helper_pid,
+        "marker was not still owned by helper"
+    );
+    let exec_ready = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(cmdline) = std::fs::read(format!("/proc/{marker_pid}/cmdline"))
+                && cmdline.split(|byte| *byte == 0).next() == Some(marker_token.as_bytes())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        exec_ready.is_ok(),
+        "marker process did not reach its unique argv"
+    );
+    // Killing the helper exercises the parent-death path rather than the
+    // normal process-group cancellation guard.
+    let helper_status = guard
+        .kill_helper_and_wait()
+        .expect("failed to reap helper parent");
+    assert!(
+        !helper_status.success(),
+        "helper was not killed: {helper_status}"
+    );
+
+    let gone = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(marker_fd) = &guard.marker_fd {
+                marker_is_terminated(marker_fd).await;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // Cleanup is deliberately before the assertion: a failed check must not
+    // leave the directly spawned process behind.
+    if gone.is_err() {
+        guard.kill_marker();
+    }
+    assert!(
+        gone.is_ok(),
+        "top-level bash process survived helper SIGKILL"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn bash_timeout_kills_its_background_process_group() {
