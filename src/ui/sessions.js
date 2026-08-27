@@ -1717,12 +1717,12 @@ function removePinOrder(wsId, sid) {
 function allPinnedSessions() {
   const out = [];
   for (const ws of state.workspaces) {
-    // 轮询失败的 workspace（workspaceErrors 非空）其列表是 stale 缓存——
-    // 可能来自旧实例/旧连接的响应（多 workspace 误标根因）。stale 期间的
-    // pin 不进全局置顶聚合，避免把已停实例的 pin 错标到当前聚合视图；
-    // workspace 分组内 stale 列表仍显示（带「无法连接」标记），错误清除
-    // （下一次成功轮询）后 pin 自动回到置顶聚合。
-    if (state.workspaceErrors[ws.id]) continue;
+    // 网络/超时失败只表示暂时无法刷新：保留 stale 缓存中的 pin，避免一次
+    // 瞬态故障让服务器的整个置顶列表消失。认证、格式和其它 HTTP 错误仍
+    // 排除 stale pin，防止把失效服务器的内容误标到当前聚合视图；成功轮询
+    // （包括成功返回 []）会替换缓存并清除错误标记。
+    const err = state.workspaceErrors[ws.id];
+    if (err && err !== "network" && err !== "timeout") continue;
     for (const s of workspaceListFor(ws)) {
       // 归档 = 从活跃入口隐藏：pinned+archived 只出现在「归档」分组。
       if (s.pinned === true && s.archived !== true && isMainSession(s)) out.push({ ws, s });

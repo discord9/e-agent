@@ -443,6 +443,8 @@ let sessionsDataB = [
   {id:"b-orphan",parent_session_id:"missing-b",status:"Idle",entry_count:1,active:true},
 ];
 let sessionsBFail = false;
+let sessionsBListFailure = null;
+// B 会话列表故障测试：true → HTTP 500，network/timeout → 瞬态失败。
 // 会话列表瞬态故障测试：network/timeout 不应占用全局 banner，401/403 保持认证提示。
 let sessionsAListFailure = null;
 // perf 回归测试：B 的 /api/sessions GET 延迟（手动 resolve）——验证整轮
@@ -569,6 +571,8 @@ globalThis.fetch=(url,opts={})=>{
     if (bGetDelayed) return abortable(new Promise((resolve) => { bGetResolve = resolve; }), signal);
     if (sessionsPDelayed) return abortable(new Promise((resolve) => { sessionsPResolve = resolve; }), signal);
     if (sessionsBFail) return resp(500, {}, signal);
+    if (sessionsBListFailure === "network") return Promise.reject(new TypeError("network error"));
+    if (sessionsBListFailure === "timeout") return abortable(new Promise(() => {}), signal);
     return resp(200, sessionsBFormat ? {} : sessionsDataB, signal);
   }
   if(url==="http://b.local/api/sessions"&&m==="POST") {
@@ -5141,12 +5145,10 @@ async function main(){
     state.sidebar.filter = "";
 
     // =====================================================================
-    // 15d) 多 workspace 防误标加固：轮询失败（workspaceErrors 非空）的
-    //      workspace 其 stale 列表的 pin 不进全局置顶聚合；workspace 分组
-    //      内 stale 列表仍渲染（用户可看）+ 组头「无法连接」标记；错误清除
-    //      （下一次成功轮询）后 pin 自动回到聚合。另锁回归：成功响应 []
-    //      是 truthy → 覆盖旧缓存，绝不保留 stale 列表（否则被删/已停实例
-    //      的 pin 会一直显示）。
+    // 15d) 多 workspace 置顶聚合：network/timeout 仅表示瞬态刷新失败，
+    //      所属服务器的 stale pin 仍保留；其它服务器独立更新。恢复成功
+    //      替换列表并回到正常状态，成功响应 [] 清空 pin。auth/格式/其它
+    //      HTTP 错误仍排除 stale pin；workspace 分组仍显示降级标记。
     // =====================================================================
     sessionsData = [
       { id: "pa1", status: "Idle", title: "A 置顶", created_at: "2024-01-01T00:00:00Z", entry_count: 3, busy: false, active: true, pinned: true },
@@ -5178,19 +5180,22 @@ async function main(){
     chk("pinned errguard: healthy workspaces all pinned",
         pinsHealthy.includes("pa1") && pinsHealthy.includes("pb1"),
         "pins=" + JSON.stringify(pinsHealthy));
-    // B 轮询失败（模拟旧实例挂掉）：标记 workspaceErrors，保留 stale 列表。
-    sessionsBFail = true;
+    // B 网络失败：保留 stale 列表及其中的 pin；A 仍可独立更新。
+    sessionsData = [
+      { id: "pa2", status: "Idle", title: "A 更新置顶", created_at: "2024-01-03T00:00:00Z", entry_count: 4, busy: false, active: true, pinned: true },
+    ];
+    sessionsBListFailure = "network";
     await pollAllWorkspaces();
     await flush();
     await flush();
-    chk("pinned errguard: poll failure marks error and keeps stale list",
-        state.workspaceErrors["wsB"] === "http500"
+    chk("pinned errguard: network failure keeps stale pin",
+        state.workspaceErrors["wsB"] === "network"
         && state.workspaceLists["wsB"] !== undefined
         && state.workspaceLists["wsB"].some((x) => x.id === "pb1"),
         "err=" + state.workspaceErrors["wsB"]);
     const pinsErr = allPinnedSessions().map((x) => x.s.id);
-    chk("pinned errguard: stale workspace pin excluded from aggregate",
-        pinsErr.includes("pa1") && !pinsErr.includes("pb1"),
+    chk("pinned errguard: healthy workspace updates independently",
+        pinsErr.includes("pa2") && !pinsErr.includes("pa1") && pinsErr.includes("pb1"),
         "pins=" + JSON.stringify(pinsErr));
     // workspace 分组内 stale 列表仍渲染（用户可看），组头带「无法连接」。
     renderSidebarTree(true);
@@ -5198,9 +5203,35 @@ async function main(){
     chk("pinned errguard: stale workspace section still shows list + err mark",
         errSecs.length === 3
         && errSecs[2].textContent.includes("b-np")
-        && !errSecs[0].textContent.includes("pb1")   // 置顶聚合里没有 B 的 pin
-        && errSecs[2].querySelector(".ws-err") !== null,
+        && errSecs[2].querySelector(".ws-degraded") !== null,
         "secB=" + errSecs[2].textContent.slice(0, 60));
+    // 超时同样保留 stale pin（并保持 workspace 降级标记）。
+    sessionsBListFailure = "timeout";
+    const pinTimeoutStart = scheduledTimeouts.length;
+    const pinTimeoutPoll = pollAllWorkspaces();
+    await flush();
+    let pinTimeoutAbort = null;
+    for (let i = scheduledTimeouts.length - 1; i >= pinTimeoutStart; i--) {
+      if (scheduledTimeouts[i]) { pinTimeoutAbort = scheduledTimeouts[i]; break; }
+    }
+    if (pinTimeoutAbort) pinTimeoutAbort();
+    await pinTimeoutPoll;
+    await flush();
+    const pinsTimeout = allPinnedSessions().map((x) => x.s.id);
+    chk("pinned errguard: timeout retains stale pin",
+        state.workspaceErrors["wsB"] === "timeout" && pinsTimeout.includes("pb1"),
+        "err=" + state.workspaceErrors["wsB"] + " pins=" + JSON.stringify(pinsTimeout));
+    // 非瞬态 HTTP 错误仍排除 stale pin。
+    sessionsBListFailure = null;
+    sessionsBFail = true;
+    await pollAllWorkspaces();
+    await flush();
+    await flush();
+    const pinsHttp = allPinnedSessions().map((x) => x.s.id);
+    chk("pinned errguard: HTTP failure excludes stale pin",
+        state.workspaceErrors["wsB"] === "http500"
+        && pinsHttp.includes("pa2") && !pinsHttp.includes("pb1"),
+        "err=" + state.workspaceErrors["wsB"] + " pins=" + JSON.stringify(pinsHttp));
     // 错误清除（下一次成功轮询）→ pin 自动回到聚合。
     sessionsBFail = false;
     await pollAllWorkspaces();
@@ -5225,6 +5256,7 @@ async function main(){
         "len=" + state.workspaceLists["wsB"].length
         + " pins=" + JSON.stringify(pinsEmpty));
     sessionsBFail = false;
+    sessionsBListFailure = null;
 
     // =====================================================================
     // 15e) 会话列表瞬态故障：缓存仍可点击；只在 workspace 内轻提示，
