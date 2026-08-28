@@ -2221,12 +2221,13 @@ async function main(){
     chk("delegate workspace before task (card head)",
         wsIdx !== -1 && taskIdx !== -1 && wsIdx < taskIdx,
         "ws=" + wsIdx + " task=" + taskIdx + " text=" + JSON.stringify(dgText));
-    // delegate 无 background → 默认后台（后端默认 true）；background:false → 前台同步
-    const dgSync = buildToolCard("delegate", JSON.stringify({ task: "t", workspace: "/w", background: false }), "完成", "", "ok");
-    chk("delegate background defaults true, explicit false shows sync",
+    // 展示兼容：delegate 执行已仅支持后台，但历史持久化的 background:false
+    // 是当时的前台同步调用，仍按“前台同步”显示
+    const dgLegacy = buildToolCard("delegate", JSON.stringify({ task: "t", workspace: "/w", background: false }), "完成", "", "ok");
+    chk("delegate bg default true, legacy persisted false shows sync (display only)",
         argsTextOf(dgCard).includes("后台运行")
-        && argsTextOf(dgSync).includes("前台同步") && !argsTextOf(dgSync).includes("后台运行"),
-        "text=" + JSON.stringify(argsTextOf(dgSync)));
+        && argsTextOf(dgLegacy).includes("前台同步") && !argsTextOf(dgLegacy).includes("后台运行"),
+        "text=" + JSON.stringify(argsTextOf(dgLegacy)));
     // get_background_tasks：空对象 / 空串 → 参数区隐藏
     const bgtCard = buildToolCard("get_background_tasks", "{}", "完成", "", "ok");
     const bgtCard2 = buildToolCard("get_background_tasks", "", "完成", "", "ok");

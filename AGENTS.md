@@ -70,7 +70,8 @@ without an explicit user request.
   HTTP/SSE MCP, MCP OAuth, resources/prompts, notifications, `listChanged`
   refresh, server restart, or concurrent initialization.
 - Subagents (`delegate` tool) are independent `SessionRunner` tasks on the
-  shared Tokio runtime, with isolated Agent state: fresh history and builtin
+  shared Tokio runtime, always background (no foreground mode; a legacy
+  `background` argument is rejected), with isolated Agent state: fresh history and builtin
   tools only (no MCP, no nested `delegate`). They share the parent's unbounded
   running-task registry so nested background bash stays visible. No
   agent-to-agent messaging or worker/concurrency pool. Process-level isolation

@@ -662,13 +662,11 @@ tools and, when
 configured, `web_search`; no MCP tools and no `delegate` itself, so delegation
 depth is capped at 1 by construction. Tool rounds are unlimited.
 
-By default (`background` omitted or `true`) the subagent runs without blocking;
-the immediate tool result includes both the background task number and subagent
-session ID, and its completion includes that same session ID when delivered as
-a background task completion (waking an idle agent). Pass `background: false`
-for sync mode, which waits without a fixed time ceiling and returns the completed
-answer with the subagent session ID directly. Sync cancellation, failure, or
-closure returns an error beginning with `subagent session: <id>`.
+Subagents always run in the background without blocking the main agent; there
+is no foreground mode. The immediate tool result includes both the background
+task number and subagent session ID, and its completion includes that same
+session ID when delivered as a background task completion (waking an idle
+agent). Legacy calls passing a `background` parameter are rejected.
 
 A running background subagent can be watched live in the TUI: open the tasks
 panel with F2, select it with Up/Down, and press Enter to attach. The

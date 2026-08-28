@@ -823,36 +823,6 @@ impl BackgroundTasks {
         )
     }
 
-    /// Spawn a registered task that runs to completion but does NOT send a
-    /// completion event. Used by synchronous delegate: the subagent must be
-    /// visible in the task panel, but its answer is
-    /// returned as the tool result, so a completion notice would duplicate.
-    pub fn spawn_silent<F, Fut>(
-        &self,
-        label: String,
-        role: Option<String>,
-        process_group: Option<Arc<AtomicI32>>,
-        display_meta: Option<TaskDisplayMeta>,
-        on_id: impl FnOnce(u64),
-        work: F,
-    ) -> Result<String, String>
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = String> + Send + 'static,
-    {
-        self.spawn_inner(
-            label,
-            role,
-            process_group,
-            display_meta,
-            None,
-            new_exit_slot(),
-            on_id,
-            work,
-            |_, _, _| {},
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_inner<F, Fut>(
         &self,

@@ -60,18 +60,15 @@ fn delegate_label_cases() {
 
 #[test]
 fn delegate_background_variants() {
-    let cases = [
-        (true, "delegate: bg task [background]"),
-        (false, "delegate: sync task"),
-    ];
-    // background:true
+    // Display-only compatibility: delegate execution is background-only
+    // (new calls with `background` are rejected), but persisted calls
+    // render the mode they recorded at the time.
     let out = format_tool_call("delegate", r#"{"task":"bg task","background":true}"#);
-    assert_eq!(out, cases[0].1);
-    // background:false
+    assert_eq!(out, "delegate: bg task [background]");
+    // historical synchronous call: no [background] tag
     let out = format_tool_call("delegate", r#"{"task":"sync task","background":false}"#);
-    assert_eq!(out, cases[1].1);
-    // absent
-    // omitted background defaults to the effective background mode
+    assert_eq!(out, "delegate: sync task");
+    // absent: background was the default
     let out = format_tool_call("delegate", r#"{"task":"plain task"}"#);
     assert_eq!(out, "delegate: plain task [background]");
 }

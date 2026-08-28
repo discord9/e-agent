@@ -579,7 +579,9 @@ function renderSearchArgs(parsed, rawText) {
 
 /* delegate：role chip + background chip + label（有才显示）+ workspace 行 +
    resume 行（有才显示，随 workspace 位于卡片头部）+ task 正文（pre，长任务
-   可展开）。background 未提供时按 true（后端默认，delegate.rs）。全 textContent。 */
+   可展开）。执行上 delegate 已仅支持后台（新调用带 background 一律拒绝），
+   此处仅为展示兼容：历史持久化的 background:false（当时的前台同步调用）
+   显示“前台同步”，缺省/true 显示“后台运行”。全 textContent。 */
 function renderDelegateArgs(parsed, rawText) {
   if (!parsed || typeof parsed !== "object" || typeof parsed.task !== "string") return rawText;
   const wrap = el("div", "delegate-args");

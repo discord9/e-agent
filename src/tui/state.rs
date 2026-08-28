@@ -2091,22 +2091,26 @@ pub(crate) fn format_tool_call(name: &str, arguments: &str) -> String {
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty());
-            let bg = value
-                .get("background")
-                .is_none_or(|v| v.as_bool().unwrap_or(false));
-            let ws = value
-                .get("workspace")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
             let mut s = if let Some(l) = label {
                 format!("{role}: {} — {task}", preview(l, 40))
             } else {
                 format!("{role}: {task}")
             };
+            // Display-only historical accuracy: delegate execution is
+            // background-only (new calls with `background` are rejected),
+            // but persisted calls with `background:false` ran synchronously
+            // back then, so they render without the tag.
+            let bg = value
+                .get("background")
+                .is_none_or(|v| v.as_bool().unwrap_or(false));
             if bg {
                 s.push_str(" [background]");
             }
+            let ws = value
+                .get("workspace")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
             if let Some(w) = ws {
                 let _ = write!(s, " [workspace: {}]", preview(w, 40));
             }
@@ -2187,18 +2191,15 @@ mod format_tool_call_tests {
 
     #[test]
     fn delegate_background_variants() {
-        let cases = [
-            (true, "delegate: bg task [background]"),
-            (false, "delegate: sync task"),
-        ];
-        // background:true
+        // Display-only compatibility: delegate execution is background-only
+        // (new calls with `background` are rejected), but persisted calls
+        // render the mode they recorded at the time.
         let out = format_tool_call("delegate", r#"{"task":"bg task","background":true}"#);
-        assert_eq!(out, cases[0].1);
-        // background:false
+        assert_eq!(out, "delegate: bg task [background]");
+        // historical synchronous call: no [background] tag
         let out = format_tool_call("delegate", r#"{"task":"sync task","background":false}"#);
-        assert_eq!(out, cases[1].1);
-        // absent
-        // omitted background defaults to the effective background mode
+        assert_eq!(out, "delegate: sync task");
+        // absent: background was the default
         let out = format_tool_call("delegate", r#"{"task":"plain task"}"#);
         assert_eq!(out, "delegate: plain task [background]");
     }

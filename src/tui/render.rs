@@ -1023,7 +1023,9 @@ pub(crate) fn render_window(
 /// display metadata from delegate calls.
 ///
 /// Output format: `  #<id>: [<role>] <label>[background][ workspace: <ws>]`
-/// where `[background]` reflects the effective execution mode and
+/// where `[background]` reflects the recorded mode (delegates always record
+/// `background:true` now; legacy rows persisted with `background:false` keep
+/// rendering without the tag — display compatibility only) and
 /// `[workspace: …]` is only shown when explicitly set. "bash" tasks never
 /// have these tags.
 pub(crate) fn format_task_label(

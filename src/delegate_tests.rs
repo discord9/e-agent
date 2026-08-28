@@ -48,15 +48,6 @@ fn task_label_falls_back_label_then_role_then_task() {
 }
 
 #[test]
-fn sync_cancelled_is_an_error_with_session_id() {
-    let error = sync_result("sub-cancelled", SessionResult::Cancelled).unwrap_err();
-    assert_eq!(
-        error, "subagent session: sub-cancelled\nsubagent cancelled",
-        "cancelled must never be formatted as a successful sync answer"
-    );
-}
-
-#[test]
 fn registry_tracks_live_sessions() {
     let sessions = Sessions::default();
     assert!(sessions.get(1).is_none());
@@ -117,6 +108,21 @@ fn delegate_with_url(workspace: &std::path::Path, base_url: String) -> Delegate 
 
 fn delegate(workspace: &std::path::Path) -> Delegate {
     delegate_with_url(workspace, "http://localhost".into())
+}
+
+/// Await the next BackgroundCompleted event's output (background-only
+/// delegate tests extract the subagent session id and answer from it).
+async fn await_completion(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+) -> String {
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("timed out waiting for background completion")
+        .unwrap();
+    match event {
+        AgentEvent::BackgroundCompleted { output, .. } => output,
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
 }
 
 struct ProbeModel {
@@ -439,214 +445,6 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
 }
 
 #[tokio::test]
-async fn sync_cancel_cleans_session_and_closes_result_channel() {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None, false, None);
-    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
-    background.set_event_sender(sender);
-    let (handle, runner_task, signals) = probe_runner(temp.path(), false);
-    let sessions = Sessions::default();
-    let slot = Arc::new(Mutex::new(None));
-    let cleanup = DelegateCleanup::new(slot.clone(), sessions.clone(), None);
-    let hook_sessions = sessions.clone();
-    let hook_handle = handle.clone();
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    background
-        .spawn_silent(
-            "probe".into(),
-            None,
-            None,
-            None,
-            move |id| {
-                *slot.lock().unwrap() = Some(id);
-                hook_sessions.insert(id, probe_entry(hook_handle.clone()));
-            },
-            move || {
-                let cleanup = cleanup;
-                async move {
-                    let result = Delegate::runner_result(&handle, runner_task).await;
-                    cleanup.finish();
-                    let _ = done_tx.send(result.clone());
-                    result_output(result).1
-                }
-            },
-        )
-        .unwrap();
-
-    signals.entered.notified().await;
-    assert_eq!(background.cancel(1).as_deref(), Some("probe"));
-    assert_eq!(
-        done_rx.await.unwrap_err().to_string(),
-        "channel closed",
-        "sync delegate reports its existing channel-closed error"
-    );
-    signals.future_dropped.notified().await;
-    signals.model_dropped.notified().await;
-    assert!(background.running().is_empty());
-    assert!(sessions.sessions.lock().unwrap().is_empty());
-    assert!(completions.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn sync_failure_cleans_session_and_registry() {
-    // 同步 delegate（spawn_silent）的 runner 失败（模型拒绝/panic）也必须
-    // 清理：任务面板条目（sessions + registry）不得残留到进程重启。
-    // 历史上 sync-failure 分支出现过 ghost 条目（.e-agent/TODO.md
-    // "Sync-delegate failure cleanup leak"），本测试钉死该路径。
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None, false, None);
-    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
-    background.set_event_sender(sender);
-    // panicking model → runner task join 返回 Err → SessionResult::Failed
-    let (handle, runner_task, signals) = probe_runner(temp.path(), true);
-    let sessions = Sessions::default();
-    let slot = Arc::new(Mutex::new(None));
-    let cleanup = DelegateCleanup::new(slot.clone(), sessions.clone(), None);
-    let hook_sessions = sessions.clone();
-    let hook_handle = handle.clone();
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    background
-        .spawn_silent(
-            "probe".into(),
-            None,
-            None,
-            None,
-            move |id| {
-                *slot.lock().unwrap() = Some(id);
-                hook_sessions.insert(id, probe_entry(hook_handle.clone()));
-            },
-            move || {
-                let cleanup = cleanup;
-                async move {
-                    let result = Delegate::runner_result(&handle, runner_task).await;
-                    cleanup.finish();
-                    let _ = done_tx.send(result.clone());
-                    result_output(result).1
-                }
-            },
-        )
-        .unwrap();
-
-    signals.entered.notified().await;
-    let result = done_rx.await.expect("sync delegate must deliver a result");
-    assert!(
-        matches!(result, SessionResult::Failed(_)),
-        "panicking model must fail the runner, got: {result:?}"
-    );
-    // 失败后：任务面板条目（registry + sessions）必须全部清理
-    let mut tries = 0;
-    loop {
-        if background.running().is_empty() && sessions.sessions.lock().unwrap().is_empty() {
-            break;
-        }
-        tokio::task::yield_now().await;
-        tries += 1;
-        assert!(tries < 1000, "cleanup never completed");
-    }
-    assert!(
-        completions.try_recv().is_err(),
-        "sync delegate sends no completion event"
-    );
-}
-
-#[tokio::test]
-async fn sync_abandon_aborts_runner_and_cleans_session() {
-    // 主 agent 取消（POST /api/sessions/{id}/cancel）放弃正在同步等待的
-    // delegate 时（drop 主侧 done_rx），生产 sync wrapper 必须通过
-    // done_tx.closed() 感知并 abort 子 runner，且立即清理 registry/sessions。
-    // 历史 bug：主侧放弃后子 subagent 成为孤儿继续运行（跑 bash、改文件、
-    // 写 session）直到自然完成，任务面板还显示运行中（.e-agent/TODO.md
-    // "Sync delegate cancel leaks the subagent"），本测试钉死该路径。
-    //
-    // 与 sync_cancel/sync_failure 直接构造 spawn_silent 不同，本测试走真实
-    // 的 Delegate::execute(background:false)：Delegate 的子模型指向一个
-    // 读完整请求后永不响应的阻塞 stub。stub 收到请求 = 子 runner 已进入
-    // 模型调用（且 execute 已走到 done_rx.await、wrapper 已 spawn），以此
-    // 作为"已开始"信号；然后 abort 持有 execute future 的 task（等价于主
-    // runner 取消 turn 时 drop execute future → 主侧 done_rx 被 drop），
-    // 断言生产 wrapper 通过 done_tx.closed() 感知放弃并 abort 子 runner
-    // （stub 观察到 in-flight 连接被掐断），且 registry/sessions 清理干净。
-    let temp = tempfile::tempdir().unwrap();
-    let (base_url, stub) = blocking_model().await;
-    let mut tool = delegate_with_url(temp.path(), base_url);
-    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
-    tool.set_event_sender(sender);
-    // 断言阶段需要的 registry/sessions 观测句柄（tool 本体随后移入 task）。
-    let background = tool.background.clone();
-    let sessions = tool.sessions();
-
-    // 真实 execute（background:false）：spawn 后主侧持有的是 execute
-    // future（其内部 await done_rx，持有主侧 done_rx 的一端）。
-    let execute = tokio::spawn(async move {
-        tool.execute(json!({
-            "task": "block forever",
-            "workspace": temp.path().to_str().unwrap(),
-            "background": false
-        }))
-        .await
-    });
-
-    // 已开始信号：子 runner 的模型请求已被 stub 完整读取（runner 卡在
-    // 永不响应的 SSE 读取上）；再确认 sync wrapper 已注册进 background
-    // registry，保证 execute 一定已走到 done_rx.await，之后才模拟放弃。
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        stub.request_received.notified(),
-    )
-    .await
-    .expect("subagent runner must reach its model call");
-    let mut tries = 0;
-    while background.running().is_empty() {
-        tokio::task::yield_now().await;
-        tries += 1;
-        assert!(tries < 1000, "sync wrapper was never spawned");
-    }
-    assert_eq!(
-        sessions.sessions.lock().unwrap().len(),
-        1,
-        "sync delegate registers its subagent in the task panel"
-    );
-
-    // 模拟主侧放弃：abort 持有 execute future 的 task（主 runner 取消时
-    // execute future 被 drop，其持有的 done_rx 一并被 drop → 生产 wrapper
-    // 的 done_tx.closed() 分支触发）。
-    execute.abort();
-
-    // 子 runner 必须被 abort：其 in-flight 模型请求的连接被掐断（stub 的
-    // 后续 read 返回 EOF/错误），而不是自然完成（stub 从不响应）。
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        stub.connection_closed.notified(),
-    )
-    .await
-    .expect("abandoned sync delegate must abort the subagent runner mid-call");
-    // wrapper cleanup 已执行：任务面板条目（background registry + sessions）
-    // 清空（sync 路径的 recovery record 为 None，清理对象就是 registry）。
-    let mut tries = 0;
-    loop {
-        if background.running().is_empty() && sessions.sessions.lock().unwrap().is_empty() {
-            break;
-        }
-        tokio::task::yield_now().await;
-        tries += 1;
-        assert!(tries < 1000, "cleanup never completed");
-    }
-    // execute future 确实是被主侧放弃中止的（abort 的 JoinHandle 报
-    // cancelled），而不是自然返回了结果。
-    let joined = execute.await;
-    assert!(
-        matches!(&joined, Err(error) if error.is_cancelled()),
-        "execute future must be cancelled by the main-side abandon, got: {joined:?}"
-    );
-    assert!(
-        completions.try_recv().is_err(),
-        "sync delegate sends no completion event"
-    );
-}
-
-#[tokio::test]
 async fn panicking_inner_model_cleans_up_and_sends_one_failure_completion() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
@@ -789,85 +587,15 @@ async fn capturing_model() -> (String, Arc<Mutex<Vec<u8>>>) {
     (format!("http://{address}"), captured)
 }
 
-struct BlockingStub {
-    /// Fired once the subagent runner's HTTP request has been fully read
-    /// (the runner is in-flight, blocked awaiting the never-sent response).
-    request_received: Arc<Notify>,
-    /// Fired when the connection is torn down after the request (EOF or
-    /// reset) — the runner's in-flight model future was dropped/aborted.
-    connection_closed: Arc<Notify>,
-}
-
-/// A local model endpoint that reads the runner's request and then never
-/// responds. Doubles as the probe for the sync-abandon test:
-/// `request_received` proves the subagent runner reached its model call
-/// (execute has spawned the sync wrapper and is awaiting `done_rx`), and
-/// `connection_closed` proves the runner was aborted — dropping the
-/// in-flight reqwest future closes the TCP connection, which the stub's
-/// post-request read observes as EOF or a reset error.
-async fn blocking_model() -> (String, BlockingStub) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let request_received = Arc::new(Notify::new());
-    let connection_closed = Arc::new(Notify::new());
-    let hook_received = request_received.clone();
-    let hook_closed = connection_closed.clone();
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let header_end = loop {
-            let mut chunk = [0; 1024];
-            let count = stream.read(&mut chunk).await.unwrap();
-            request.extend_from_slice(&chunk[..count]);
-            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                break end + 4;
-            }
-        };
-        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().unwrap())
-            })
-            .unwrap();
-        let received_body = request.len() - header_end;
-        let mut rest = vec![0; content_length - received_body];
-        stream.read_exact(&mut rest).await.unwrap();
-        // Runner is in-flight and blocked awaiting the response we never send.
-        hook_received.notify_one();
-        // After the request the runner never writes again, so the next read
-        // returns only when the connection is torn down (clean EOF on socket
-        // close, or a reset error) — i.e. the in-flight future was aborted.
-        let mut buf = [0; 1024];
-        loop {
-            match stream.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-        hook_closed.notify_one();
-    });
-    (
-        format!("http://{address}"),
-        BlockingStub {
-            request_received,
-            connection_closed,
-        },
-    )
-}
-
 #[tokio::test]
 async fn delegate_requires_workspace_parameter() {
     let temp = tempfile::tempdir().unwrap();
-    let tool = delegate(temp.path());
+    let mut tool = delegate(temp.path());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
 
     // Missing workspace: rejected before any subagent is spawned.
-    let error = tool
-        .execute(json!({"task": "hello", "background": false}))
-        .await
-        .unwrap_err();
+    let error = tool.execute(json!({"task": "hello"})).await.unwrap_err();
     assert_eq!(
         error,
         "delegate requires a workspace parameter: path of the working directory \
@@ -876,7 +604,7 @@ async fn delegate_requires_workspace_parameter() {
 
     // An empty/whitespace workspace is equally a missing parameter.
     let error = tool
-        .execute(json!({"task": "hello", "workspace": "  ", "background": false}))
+        .execute(json!({"task": "hello", "workspace": "  "}))
         .await
         .unwrap_err();
     assert_eq!(
@@ -897,15 +625,16 @@ async fn delegate_resolves_relative_workspace_against_caller_root() {
     // caller root, accepted; the subagent only fails later on the dummy
     // model connection (never on the workspace).
     for workspace in ["custom", "custom/nested"] {
-        let tool = delegate(parent.path());
-        let error = tool
-            .execute(json!({
-                "task": "irrelevant",
-                "workspace": workspace,
-                "background": false
-            }))
-            .await
-            .unwrap_err();
+        let mut tool = delegate(parent.path());
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tool.set_event_sender(sender);
+        tool.execute(json!({
+            "task": "irrelevant",
+            "workspace": workspace
+        }))
+        .await
+        .expect("relative in-workspace path must spawn a background task");
+        let error = await_completion(&mut receiver).await;
         assert!(
             error.contains("\nsubagent failed:"),
             "relative in-workspace path {workspace:?} must resolve, got: {error}"
@@ -917,15 +646,16 @@ async fn delegate_resolves_relative_workspace_against_caller_root() {
     }
 
     // `.` resolves to the caller's own workspace root.
-    let tool = delegate(parent.path());
-    let error = tool
-        .execute(json!({
-            "task": "irrelevant",
-            "workspace": ".",
-            "background": false
-        }))
-        .await
-        .unwrap_err();
+    let mut tool = delegate(parent.path());
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+    tool.execute(json!({
+        "task": "irrelevant",
+        "workspace": "."
+    }))
+    .await
+    .expect("`.` must spawn a background task");
+    let error = await_completion(&mut receiver).await;
     assert!(
         !error.contains("invalid `workspace`"),
         "`.` must resolve to the caller's workspace root, got: {error}"
@@ -933,12 +663,13 @@ async fn delegate_resolves_relative_workspace_against_caller_root() {
 
     // Escaping the caller's workspace with `..` is rejected (reroot refuses
     // ParentDir segments outright — same as for absolute paths).
-    let tool = delegate(parent.path());
+    let mut tool = delegate(parent.path());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
     let error = tool
         .execute(json!({
             "task": "irrelevant",
-            "workspace": "../escape",
-            "background": false
+            "workspace": "../escape"
         }))
         .await
         .unwrap_err();
@@ -949,12 +680,13 @@ async fn delegate_resolves_relative_workspace_against_caller_root() {
 
     // A relative path that does not exist is rejected just like an
     // absolute one (reroot's canonicalize requires an existing directory).
-    let tool = delegate(parent.path());
+    let mut tool = delegate(parent.path());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
     let error = tool
         .execute(json!({
             "task": "irrelevant",
-            "workspace": "does-not-exist",
-            "background": false
+            "workspace": "does-not-exist"
         }))
         .await
         .unwrap_err();
@@ -985,12 +717,14 @@ async fn rejects_empty_task() {
 }
 
 #[test]
-fn spec_defaults_background_true_without_requiring_it() {
+fn spec_exposes_no_background_parameter() {
     let temp = tempfile::tempdir().unwrap();
     let spec = delegate(temp.path()).spec();
-    let background = &spec.parameters["properties"]["background"];
-    assert_eq!(background["type"], "boolean");
-    assert_eq!(background["default"], true);
+    assert!(
+        spec.parameters["properties"].get("background").is_none(),
+        "delegate is background-only: no `background` parameter, got: {}",
+        spec.parameters["properties"]
+    );
     assert_eq!(spec.parameters["required"], json!(["workspace", "task"]));
     let keys = spec.parameters["properties"]
         .as_object()
@@ -998,10 +732,7 @@ fn spec_defaults_background_true_without_requiring_it() {
         .keys()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    assert_eq!(
-        keys,
-        ["workspace", "role", "label", "background", "resume", "task"]
-    );
+    assert_eq!(keys, ["workspace", "role", "label", "resume", "task"]);
     let workspace = &spec.parameters["properties"]["workspace"];
     assert_eq!(workspace["type"], "string");
     assert!(
@@ -1013,22 +744,44 @@ fn spec_defaults_background_true_without_requiring_it() {
     );
     assert!(
         spec.description
-            .contains("By default it runs in the background")
+            .contains("It always runs in the background")
     );
-    assert!(spec.description.contains("`background: false`"));
 }
 
 #[tokio::test]
-async fn rejects_present_non_boolean_background_values() {
+async fn rejects_legacy_background_parameter() {
+    // Legacy callers passing `background` (either value, or any malformed
+    // type) get a dedicated error before the generic unknown-key check.
     let temp = tempfile::tempdir().unwrap();
     let tool = delegate(temp.path());
-    for value in [Value::Null, json!("true"), json!(1), json!({}), json!([])] {
+    for value in [
+        json!(false),
+        json!(true),
+        json!("true"),
+        Value::Null,
+        json!(1),
+        json!({}),
+        json!([]),
+    ] {
         let error = tool
             .execute(json!({"task": "hello", "background": value}))
             .await
             .unwrap_err();
-        assert_eq!(error, "`background` must be a boolean");
+        assert_eq!(
+            error,
+            "delegate no longer accepts `background`: subagents always run in the \
+             background; a foreground subagent would block the main agent"
+        );
     }
+    // Other unknown keys keep the generic validation.
+    let error = tool
+        .execute(json!({"task": "hello", "bogus": 1}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.starts_with("unknown delegate parameter `bogus`"),
+        "got: {error}"
+    );
 }
 
 #[tokio::test]
@@ -1065,10 +818,12 @@ async fn background_delivery_preflight_fails_before_later_work() {
 async fn resume_requires_persistence_and_an_existing_session() {
     // No persistence configured: nothing to resume from.
     let temp = tempfile::tempdir().unwrap();
-    let no_persist = delegate(temp.path());
+    let mut no_persist = delegate(temp.path());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    no_persist.set_event_sender(sender);
     assert!(
         no_persist
-            .execute(json!({"task": "hi", "resume": "sub-x", "background": false}))
+            .execute(json!({"task": "hi", "resume": "sub-x"}))
             .await
             .unwrap_err()
             .contains("requires subagent session persistence")
@@ -1077,9 +832,11 @@ async fn resume_requires_persistence_and_an_existing_session() {
     // Persistence configured but the session id does not exist.
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("sessions");
-    let tool: Delegate = delegate(temp.path()).persist_sessions(root);
+    let mut tool: Delegate = delegate(temp.path()).persist_sessions(root);
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
     assert!(
-        tool.execute(json!({"task": "hi", "resume": "sub-does-not-exist", "background": false}))
+        tool.execute(json!({"task": "hi", "resume": "sub-does-not-exist"}))
             .await
             .unwrap_err()
             .contains("no such subagent session")
@@ -1134,8 +891,7 @@ async fn resume_rejects_a_still_running_subagent_session() {
         .execute(json!({
             "task": "follow-up",
             "resume": "sub-still-running",
-            "workspace": temp.path().to_str().unwrap(),
-            "background": false
+            "workspace": temp.path().to_str().unwrap()
         }))
         .await
         .unwrap_err();
@@ -1155,8 +911,7 @@ async fn resume_rejects_a_still_running_subagent_session() {
         .execute(json!({
             "task": "follow-up",
             "resume": "sub-still-running",
-            "workspace": temp.path().to_str().unwrap(),
-            "background": false
+            "workspace": temp.path().to_str().unwrap()
         }))
         .await
         .unwrap()
@@ -1236,8 +991,7 @@ async fn resume_denial_reports_blocking_owner_scopes_and_reasons() {
         .execute(json!({
             "task": "follow-up",
             "resume": id,
-            "workspace": temp.path().to_str().unwrap(),
-            "background": false
+            "workspace": temp.path().to_str().unwrap()
         }))
         .await
         .unwrap_err();
@@ -1317,19 +1071,23 @@ async fn role_requires_a_roles_root_and_a_known_role() {
     unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
 
     // No roles root: any role is rejected.
-    let plain = delegate(temp.path());
+    let mut plain = delegate(temp.path());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    plain.set_event_sender(sender);
     assert!(
         plain
-            .execute(json!({"task": "hi", "role": "fixer", "background": false}))
+            .execute(json!({"task": "hi", "role": "fixer"}))
             .await
             .unwrap_err()
             .contains("roles are not configured")
     );
 
     // Roles root set, but the requested role has no template file.
-    let rooted = delegate(temp.path()).with_roles_root(temp.path().to_path_buf());
+    let mut rooted = delegate(temp.path()).with_roles_root(temp.path().to_path_buf());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    rooted.set_event_sender(sender);
     let error = rooted
-        .execute(json!({"task": "hi", "role": "fixer", "background": false}))
+        .execute(json!({"task": "hi", "role": "fixer"}))
         .await
         .unwrap_err();
     assert!(error.contains("unknown role `fixer`"), "{error}");
@@ -1383,16 +1141,16 @@ async fn role_model_source_overrides_snapshot_at_spawn() {
         .with_role_model_source(Arc::new(move |role: &str| {
             (role == "fixer").then(|| (live.clone(), None))
         }));
-    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     tool.set_event_sender(sender);
     tool.execute(json!({
         "task": "fix",
         "role": "fixer",
-        "workspace": temp.path().to_str().unwrap(),
-        "background": false
+        "workspace": temp.path().to_str().unwrap()
     }))
     .await
     .unwrap();
+    await_completion(&mut receiver).await;
     let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
     assert!(request.contains("\"model\":\"new-model\""), "{request}");
     assert!(!request.contains("\"model\":\"old-model\""), "{request}");
@@ -1426,16 +1184,16 @@ async fn role_model_snapshot_used_without_live_source() {
             "fixer".to_owned(),
             snapshot_model,
         )]));
-    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     tool.set_event_sender(sender);
     tool.execute(json!({
         "task": "fix",
         "role": "fixer",
-        "workspace": temp.path().to_str().unwrap(),
-        "background": false
+        "workspace": temp.path().to_str().unwrap()
     }))
     .await
     .unwrap();
+    await_completion(&mut receiver).await;
     let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
     assert!(
         request.contains("\"model\":\"snapshot-model\""),
@@ -1469,19 +1227,17 @@ async fn run_subagent_and_capture(
             writable_mounts: Vec::new(),
         }));
     }
-    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     tool.set_event_sender(sender);
 
-    let output = tool
-        .execute(json!({
-            "task": "audit",
-            "role": "auditor",
-            "workspace": temp.path().to_str().unwrap(),
-            "background": false
-        }))
-        .await
-        .unwrap()
-        .content;
+    tool.execute(json!({
+        "task": "audit",
+        "role": "auditor",
+        "workspace": temp.path().to_str().unwrap()
+    }))
+    .await
+    .expect("delegate spawns a background task");
+    let output = await_completion(&mut receiver).await;
     let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
     (output, request)
 }
@@ -1684,12 +1440,13 @@ async fn delegate_uses_custom_workspace() {
 
     // 1) An invalid (non-existent) workspace path is rejected at
     //    parameter-validation time, before any subagent is spawned.
-    let tool = delegate(parent.path());
+    let mut tool = delegate(parent.path());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
     let err = tool
         .execute(json!({
             "task": "irrelevant",
-            "workspace": "/nonexistent-path-that-surely-does-not-exist-12345",
-            "background": false
+            "workspace": "/nonexistent-path-that-surely-does-not-exist-12345"
         }))
         .await
         .unwrap_err();
@@ -1701,51 +1458,28 @@ async fn delegate_uses_custom_workspace() {
     // 2) A valid custom workspace is accepted; the subagent tries to
     //    contact the dummy model (localhost) and fails with a connection
     //    error — but crucially the workspace error is NOT raised.
-    let tool = delegate(parent.path());
-    let answer = tool
-        .execute(json!({
-            "task": "read sentinel.txt and report its content",
-            "workspace": custom_path.to_str().unwrap(),
-            "background": false
-        }))
-        .await
-        .unwrap_err();
+    let mut tool = delegate(parent.path());
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+    tool.execute(json!({
+        "task": "read sentinel.txt and report its content",
+        "workspace": custom_path.to_str().unwrap()
+    }))
+    .await
+    .expect("valid workspace spawns a background task");
+    let answer = await_completion(&mut receiver).await;
     assert!(
         answer.contains("\nsubagent failed:"),
         "expected model-connection failure, got: {answer}"
     );
     assert!(
         answer.starts_with("subagent session: sub-"),
-        "sync failure must identify its subagent session, got: {answer}"
+        "failure must identify its subagent session, got: {answer}"
     );
     assert!(
         !answer.contains("invalid `workspace`"),
         "valid workspace path should not produce a workspace error, got: {answer}"
     );
-}
-
-#[tokio::test]
-async fn sync_success_contains_session_id_and_answer() {
-    let temp = tempfile::tempdir().unwrap();
-    let base_url = successful_model("finished answer").await;
-    let tool = delegate_with_url(temp.path(), base_url);
-
-    let output = tool
-        .execute(json!({
-            "task": "hello",
-            "workspace": temp.path().to_str().unwrap(),
-            "background": false
-        }))
-        .await
-        .unwrap()
-        .content;
-    let mut lines = output.lines();
-    let session_id = lines
-        .next()
-        .and_then(|line| line.strip_prefix("subagent session: "))
-        .expect("sync success contains the subagent session id");
-    assert!(session_id.starts_with("sub-"));
-    assert_eq!(lines.collect::<Vec<_>>(), ["finished answer"]);
 }
 
 /// Poll the JSONL metadata store until the subagent session's row appears
@@ -1785,17 +1519,16 @@ async fn fresh_spawn_records_label_as_subagent_session_title() {
         .execute(json!({
             "task": "hello",
             "label": "my panel title",
-            "workspace": temp.path().to_str().unwrap(),
-            "background": false
+            "workspace": temp.path().to_str().unwrap()
         }))
         .await
         .unwrap()
         .content;
     let session_id = answer
         .lines()
-        .next()
+        .nth(1)
         .and_then(|line| line.strip_prefix("subagent session: "))
-        .expect("sync success contains the subagent session id");
+        .expect("immediate result contains the subagent session id");
     assert!(
         session_id.starts_with("sub-"),
         "fresh spawn must allocate a new session id, got {session_id}"
@@ -1823,17 +1556,16 @@ async fn fresh_spawn_without_label_records_the_fallback_title() {
     let answer = tool
         .execute(json!({
             "task": "hello world task",
-            "workspace": temp.path().to_str().unwrap(),
-            "background": false
+            "workspace": temp.path().to_str().unwrap()
         }))
         .await
         .unwrap()
         .content;
     let session_id = answer
         .lines()
-        .next()
+        .nth(1)
         .and_then(|line| line.strip_prefix("subagent session: "))
-        .expect("sync success contains the subagent session id");
+        .expect("immediate result contains the subagent session id");
 
     let title = subagent_meta_title(&root, session_id).await;
     assert_eq!(
@@ -1849,7 +1581,7 @@ async fn resume_keeps_the_original_subagent_session_title() {
     let root = temp.path().join("sessions");
     let base_url = successful_model_n("finished answer", 2).await;
     let mut tool = delegate_with_url(temp.path(), base_url).persist_sessions(root.clone());
-    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     tool.set_event_sender(sender);
     let workspace = temp.path().to_str().unwrap().to_owned();
 
@@ -1858,17 +1590,17 @@ async fn resume_keeps_the_original_subagent_session_title() {
         .execute(json!({
             "task": "first task",
             "label": "first title",
-            "workspace": workspace.clone(),
-            "background": false
+            "workspace": workspace.clone()
         }))
         .await
         .unwrap()
         .content;
     let session_id = answer
         .lines()
-        .next()
+        .nth(1)
         .and_then(|line| line.strip_prefix("subagent session: "))
-        .expect("sync success contains the subagent session id");
+        .expect("immediate result contains the subagent session id");
+    await_completion(&mut receiver).await;
     assert_eq!(
         subagent_meta_title(&root, session_id).await.as_deref(),
         Some("first title")
@@ -1882,18 +1614,18 @@ async fn resume_keeps_the_original_subagent_session_title() {
             "task": "follow-up",
             "label": "second title",
             "resume": session_id,
-            "workspace": workspace,
-            "background": false
+            "workspace": workspace
         }))
         .await
         .unwrap()
         .content;
     let resumed_id = answer
         .lines()
-        .next()
+        .nth(1)
         .and_then(|line| line.strip_prefix("subagent session: "))
-        .expect("sync success contains the subagent session id");
+        .expect("immediate result contains the subagent session id");
     assert_eq!(resumed_id, session_id, "resume reuses the session id");
+    await_completion(&mut receiver).await;
 
     // Let the fire-and-forget meta create run; the title must not move.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -1987,8 +1719,7 @@ async fn background_failure_completion_retains_session_id() {
     let answer = tool
         .execute(json!({
             "task": "hello",
-            "workspace": temp.path().to_str().unwrap(),
-            "background": true
+            "workspace": temp.path().to_str().unwrap()
         }))
         .await
         .unwrap()
@@ -2029,8 +1760,7 @@ async fn background_delegate_completion_carries_status_and_kind() {
     tool.set_event_sender(sender);
     tool.execute(json!({
         "task": "hello",
-        "workspace": temp.path().to_str().unwrap(),
-        "background": true
+        "workspace": temp.path().to_str().unwrap()
     }))
     .await
     .unwrap();
@@ -2074,8 +1804,7 @@ async fn background_delegate_completion_carries_status_and_kind() {
     tool.set_event_sender(sender);
     tool.execute(json!({
         "task": "hello",
-        "workspace": temp.path().to_str().unwrap(),
-        "background": true
+        "workspace": temp.path().to_str().unwrap()
     }))
     .await
     .unwrap();
@@ -2667,57 +2396,6 @@ async fn subagent_background_bash_recorded_under_its_own_session() {
         background.running().is_empty(),
         "bash cancelled and delegate wrapper finished: registry is empty"
     );
-}
-
-#[tokio::test]
-async fn sync_delegate_with_detached_daemon_returns_without_waiting_for_daemon() {
-    // The synchronous delegate (background:false) shares the same
-    // FinishWhenIdle runner: the subagent starts a detached daemon and
-    // answers, the delegate returns the final answer and session id without
-    // waiting for the daemon, and the daemon stays in the shared registry.
-    let temp = tempfile::tempdir().unwrap();
-    let base_url = scripted_chat(vec![
-        (
-            bash_tool_call_delta(
-                r#"{"command": "sleep 3600", "background": true, "detached": true}"#,
-            ),
-            "tool_calls",
-        ),
-        (json!({"content": "final answer"}), "stop"),
-    ])
-    .await;
-    let mut tool = delegate_with_url(temp.path(), base_url);
-    let background = tool.background.clone();
-    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    tool.set_event_sender(sender);
-
-    let output = tool
-        .execute(json!({
-            "task": "start the daemon and answer",
-            "workspace": temp.path().to_str().unwrap(),
-            "background": false
-        }))
-        .await
-        .unwrap()
-        .content;
-    let session_id = output
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("subagent session: "))
-        .expect("sync success contains the subagent session id");
-    assert!(session_id.starts_with("sub-"));
-    assert!(
-        output.lines().any(|line| line == "final answer"),
-        "sync delegate returns the subagent's final answer, got: {output}"
-    );
-
-    // The daemon is still alive in the shared registry after the sync
-    // delegate returned.
-    let running = background.running();
-    assert_eq!(running.len(), 1, "daemon must remain: {running:?}");
-    assert_eq!(running[0].kind, "bash");
-    background.cancel(running[0].id);
-    assert!(background.running().is_empty());
 }
 
 #[tokio::test]

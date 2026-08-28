@@ -7,7 +7,7 @@
 //!
 //! The subagent gets the builtin file/bash tools and, when configured, public
 //! web search (no MCP tools, no `delegate` itself — depth is capped at 1 by
-//! construction). In background mode the answer is delivered as a
+//! construction). The answer is delivered as a
 //! [`AgentEvent::BackgroundCompleted`] through the parent's event channel,
 //! waking an idle agent.
 //!
@@ -351,7 +351,7 @@ impl Delegate {
         self
     }
 
-    /// Live session handles (background mode only), for attach views.
+    /// Live session handles, for attach views.
     pub fn sessions(&self) -> Sessions {
         self.sessions.clone()
     }
@@ -555,16 +555,6 @@ fn spawn_subagent_meta_create(
         Err(_) => {
             tracing::warn!("e-agent: cannot record subagent session metadata: no tokio runtime");
         }
-    }
-}
-
-fn sync_result(session_id: &str, result: SessionResult) -> Result<ToolOutput, String> {
-    let (completed, output) = result_output(result);
-    let output = format!("subagent session: {session_id}\n{output}");
-    if completed {
-        Ok(ToolOutput::text(output))
-    } else {
-        Err(output)
     }
 }
 
@@ -833,9 +823,8 @@ impl Tool for Delegate {
         let model = self.subagent_model.display_name();
         description.push_str(&format!(" The subagent runs on the `{model}` model."));
         description.push_str(
-            " By default it runs in the background without blocking; the answer arrives \
-                automatically as a `[background task N completed]` message. Pass \
-                `background: false` to wait for and return the final answer directly. Do not \
+            " It always runs in the background without blocking; the answer arrives \
+                automatically as a `[background task N completed]` message. Do not \
                 poll, sleep, or re-check a background task — just dispatch it and wait; the \
                 completion arrives on its own.",
         );
@@ -871,8 +860,7 @@ impl Tool for Delegate {
                     "workspace": {"type": "string", "description": "REQUIRED — working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). May be absolute or relative: relative paths are resolved against YOUR workspace root (e.g. `.e-agent/worktrees/wt-x`) and must stay inside it or an authorized external directory."},
                     "role": role_property,
                     "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
-                    "background": {"type": "boolean", "default": true, "description": "run without blocking and deliver the answer as a background completion (default true); pass false to wait for the final answer"},
-                    "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
+                    "resume":{"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
                     "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"},
                 },
                 "required": ["workspace", "task"]
@@ -881,8 +869,18 @@ impl Tool for Delegate {
     }
 
     async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
-        const KNOWN: &[&str] = &["task", "role", "label", "background", "resume", "workspace"];
         if let Some(args) = arguments.as_object() {
+            // Legacy `background` is rejected with a dedicated error, ahead
+            // of the generic unknown-key check: `delegate` is background-only
+            // because a foreground subagent would block the main agent.
+            if args.contains_key("background") {
+                return Err(
+                    "delegate no longer accepts `background`: subagents always run in the \
+                     background; a foreground subagent would block the main agent"
+                        .into(),
+                );
+            }
+            const KNOWN: &[&str] = &["task", "role", "label", "resume", "workspace"];
             for key in args.keys() {
                 if !KNOWN.contains(&key.as_str()) {
                     return Err(format!(
@@ -901,14 +899,7 @@ impl Tool for Delegate {
         if task.trim().is_empty() {
             return Err("`task` must not be empty".into());
         }
-        let background = match arguments
-            .as_object()
-            .and_then(|args| args.get("background"))
-        {
-            None => true,
-            Some(value) => value.as_bool().ok_or("`background` must be a boolean")?,
-        };
-        if background && !self.background.completion_delivery_available() {
+        if !self.background.completion_delivery_available() {
             return Err("background task delivery is unavailable".into());
         }
         let role = arguments
@@ -1120,8 +1111,8 @@ impl Tool for Delegate {
             backend: self.persist_backend.clone(),
         };
         let session_id = persist.session_id.clone();
-        // Build structured display metadata for the F2 task panel. Background
-        // reflects the effective execution mode; workspace is always explicit
+        // Build structured display metadata for the F2 task panel. Delegates
+        // are always background tasks; workspace is always explicit
         // (required parameter). The workspace shown is the user's ORIGINAL
         // input (relative stays relative — friendlier in the panel than the
         // resolved absolute path). The subagent session id lets the web task
@@ -1129,7 +1120,7 @@ impl Tool for Delegate {
         // matching (labels are lost once the Greptime `running_tasks` row is
         // cleared at completion).
         let task_display = crate::tools::TaskDisplayMeta {
-            background,
+            background: true,
             workspace: Some(workspace_arg.clone()),
             subagent_session_id: Some(session_id.clone()),
             resume: resume_display,
@@ -1194,91 +1185,40 @@ impl Tool for Delegate {
         // Owned clone for the move closures; the outer `session_id` stays
         // usable for the return messages after the spawn.
         let hook_session_id = session_id.clone();
-        if background {
-            let record = self.record_in.clone();
-            let cleanup = DelegateCleanup::new(slot, self.sessions.clone(), record.clone());
-            let record_label = label.clone();
-            let record_session_id = session_id.clone();
-            let output_session_id = session_id.clone();
-            // The subagent's own exit metadata out-slot: `result_output`'s
-            // success bool is kept (instead of being formatted away) and
-            // mapped to status "completed"/"failed"; no exit code (delegate
-            // tasks have no process exit status), kind = "delegate" (the
-            // registry derives it from the absent shell name).
-            let exit_slot = new_exit_slot();
-            let work_exit = exit_slot.clone();
-            let started = self.background.spawn_with_id(
-                label,
-                role,
-                None,
-                Some(task_display),
-                exit_slot,
-                move |id| {
-                    match slot_in_hook.lock() {
-                        Ok(mut slot) => *slot = Some(id),
-                        Err(poisoned) => *poisoned.into_inner() = Some(id),
-                    }
-                    sessions.insert(id, entry_for_hook);
-                    if let Some(record) = &record {
-                        record.store.record_background_start(
-                            &record.root,
-                            &record.session,
-                            id,
-                            &record_label,
-                            None,
-                            Some(&record_session_id),
-                        );
-                    }
-                    spawn_subagent_meta_create(
-                        meta_store.clone(),
-                        persist_root.clone(),
-                        hook_session_id.clone(),
-                        meta_model.clone(),
-                        meta_role.as_deref(),
-                        parent_session_id.as_deref(),
-                        id,
-                        meta_label.clone(),
-                    );
-                },
-                move || {
-                    let cleanup = cleanup;
-                    async move {
-                        let (completed, output) =
-                            result_output(Self::runner_result(&handle, runner_task).await);
-                        *work_exit.lock().unwrap() = TaskExit {
-                            exit_code: None,
-                            signal: None,
-                            status: Some(if completed { "completed" } else { "failed" }.into()),
-                        };
-                        cleanup.finish();
-                        format!("subagent session: {output_session_id}\n{output}")
-                    }
-                },
-            )?;
-            return Ok(ToolOutput::text(format!(
-                "{started}\nsubagent session: {session_id}"
-            )));
-        }
-        let cleanup = DelegateCleanup::new(slot, self.sessions.clone(), None);
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        // The sync wrapper races the subagent runner against `done_tx.closed()`
-        // (fires when the main side drops `done_rx` — cancel/timeout/leave of
-        // the turn that is synchronously awaiting this delegate). On
-        // abandonment it aborts the subagent runner instead of leaving it to
-        // orphan and keep running (bash, file edits, session writes) until it
-        // finishes naturally. The abort output is discarded by `spawn_silent`.
-        let cancel_output = format!("subagent session: {session_id}\nsubagent cancelled");
-        self.background.spawn_silent(
+        let record = self.record_in.clone();
+        let cleanup = DelegateCleanup::new(slot, self.sessions.clone(), record.clone());
+        let record_label = label.clone();
+        let record_session_id = session_id.clone();
+        let output_session_id = session_id.clone();
+        // The subagent's own exit metadata out-slot: `result_output`'s
+        // success bool is kept (instead of being formatted away) and
+        // mapped to status "completed"/"failed"; no exit code (delegate
+        // tasks have no process exit status), kind = "delegate" (the
+        // registry derives it from the absent shell name).
+        let exit_slot = new_exit_slot();
+        let work_exit = exit_slot.clone();
+        let started = self.background.spawn_with_id(
             label,
             role,
             None,
             Some(task_display),
+            exit_slot,
             move |id| {
                 match slot_in_hook.lock() {
                     Ok(mut slot) => *slot = Some(id),
                     Err(poisoned) => *poisoned.into_inner() = Some(id),
                 }
                 sessions.insert(id, entry_for_hook);
+                if let Some(record) = &record {
+                    record.store.record_background_start(
+                        &record.root,
+                        &record.session,
+                        id,
+                        &record_label,
+                        None,
+                        Some(&record_session_id),
+                    );
+                }
                 spawn_subagent_meta_create(
                     meta_store.clone(),
                     persist_root.clone(),
@@ -1291,35 +1231,23 @@ impl Tool for Delegate {
                 );
             },
             move || {
-                let mut cleanup = Some(cleanup);
-                let mut done_tx = done_tx;
+                let cleanup = cleanup;
                 async move {
-                    let mut runner_task = Some(runner_task);
-                    tokio::select! {
-                        _ = done_tx.closed() => {
-                            // 主侧已放弃（取消/超时/离开）：中止子 runner，立即清理。
-                            if let Some(mut task) = runner_task.take() {
-                                task.abort();
-                            }
-                            cleanup.take().expect("cleanup taken once").finish();
-                            cancel_output
-                        }
-                        result = async {
-                            let task = runner_task.take().expect("runner task taken once");
-                            Self::runner_result(&handle, task).await
-                        } => {
-                            cleanup.take().expect("cleanup taken once").finish();
-                            let _ = done_tx.send(result.clone());
-                            result_output(result).1
-                        }
-                    }
+                    let (completed, output) =
+                        result_output(Self::runner_result(&handle, runner_task).await);
+                    *work_exit.lock().unwrap() = TaskExit {
+                        exit_code: None,
+                        signal: None,
+                        status: Some(if completed { "completed" } else { "failed" }.into()),
+                    };
+                    cleanup.finish();
+                    format!("subagent session: {output_session_id}\n{output}")
                 }
             },
         )?;
-        let result = done_rx
-            .await
-            .map_err(|_| "subagent result channel closed".to_owned())?;
-        sync_result(&session_id, result)
+        Ok(ToolOutput::text(format!(
+            "{started}\nsubagent session: {session_id}"
+        )))
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
