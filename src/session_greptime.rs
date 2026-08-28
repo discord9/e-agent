@@ -193,7 +193,7 @@ impl GreptimeSession {
             .context("cannot connect to GreptimeDB")?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
-                eprintln!("greptime session connection error: {e}");
+                tracing::warn!("greptime session connection error: {e}");
             }
         });
         Ok(client)
@@ -277,7 +277,7 @@ impl GreptimeSession {
                 Ok(_) => {}
                 Err(error) => {
                     title_available = false;
-                    eprintln!(
+                    tracing::warn!(
                         "e-agent: cannot add sessions.title column (session titles unavailable): \
                          {error:#}"
                     );
@@ -292,7 +292,7 @@ impl GreptimeSession {
                 Ok(_) => {}
                 Err(error) => {
                     pinned_available = false;
-                    eprintln!(
+                    tracing::warn!(
                         "e-agent: cannot add sessions.pinned column (session pinning unavailable): \
                          {error:#}"
                     );
@@ -307,7 +307,7 @@ impl GreptimeSession {
                 Ok(_) => {}
                 Err(error) => {
                     archived_available = false;
-                    eprintln!(
+                    tracing::warn!(
                         "e-agent: cannot add sessions.archived column (session archiving unavailable): \
                          {error:#}"
                     );
@@ -322,7 +322,7 @@ impl GreptimeSession {
                 Ok(_) => {}
                 Err(error) => {
                     writer_available = false;
-                    eprintln!(
+                    tracing::warn!(
                         "e-agent: cannot add sessions.writer column (writer audit unavailable): \
                          {error:#}"
                     );
@@ -363,7 +363,7 @@ impl GreptimeSession {
                 {
                     Ok(_) => {}
                     Err(error) => {
-                        eprintln!(
+                        tracing::warn!(
                             "e-agent: cannot add running_tasks.owner_identity column \
                              (background-task owner liveness unavailable): {error:#}"
                         );
@@ -390,7 +390,7 @@ impl GreptimeSession {
                 {
                     Ok(_) => {}
                     Err(error) => {
-                        eprintln!(
+                        tracing::warn!(
                             "e-agent: cannot add running_tasks.full_command column \
                              (background-task full-command persistence unavailable): {error:#}"
                         );
@@ -436,7 +436,7 @@ impl GreptimeSession {
                     )
                     .await
                 {
-                    eprintln!(
+                    tracing::warn!(
                         "e-agent: cannot add usage_entries.{column} column ({feature} unavailable): \
                          {error:#}"
                     );
@@ -452,7 +452,7 @@ impl GreptimeSession {
                 {
                     Ok(_) => {}
                     Err(error) => {
-                        eprintln!(
+                        tracing::warn!(
                             "e-agent: cannot add usage_entries.finish_reason column \
                              (usage finish reason unavailable): {error:#}"
                         );

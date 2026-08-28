@@ -927,6 +927,8 @@ dependencies = [
  "tokio-postgres",
  "toml",
  "tower",
+ "tracing",
+ "tracing-subscriber",
  "turso",
  "unicode-width 0.2.2",
  "url",

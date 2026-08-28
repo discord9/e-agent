@@ -9,6 +9,8 @@ description = "A minimal OpenAI-compatible Rust coding agent"
 
 [dependencies]
 anyhow = "1.0.104"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter"] }
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"

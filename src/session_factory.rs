@@ -537,7 +537,7 @@ impl SessionFactory {
                 match reload_config_at(&reloadable, &root, profile.as_deref(), &base_url, &model) {
                     ReloadResult::Reloaded => {
                         if announce {
-                            eprintln!(
+                            tracing::info!(
                                 "e-agent: config reloaded: new sessions and `/model` switches use the updated config; \
                                  [sandbox] / [session] backend / web-search key changes still need a restart"
                             );
@@ -545,7 +545,7 @@ impl SessionFactory {
                     }
                     ReloadResult::Rejected(reason) => {
                         if announce {
-                            eprintln!(
+                            tracing::warn!(
                                 "e-agent: config reload rejected (keeping the previous config): {reason}"
                             );
                         }
@@ -753,7 +753,7 @@ impl SessionFactory {
             let name = subagent_model.profile_key();
             delegate = delegate.with_subagent_model(subagent_model.clone());
             if self.announce {
-                eprintln!("e-agent: subagent model {name}");
+                tracing::info!("e-agent: subagent model {name}");
             }
         }
         let subagent_sessions = delegate.sessions();
@@ -921,7 +921,7 @@ pub(crate) fn preflight_code_mode(announce: bool) -> anyhow::Result<()> {
 pub(crate) fn preflight_code_mode_impl(bwrap_ok: impl Fn() -> bool, path_env: Option<&std::ffi::OsStr>, announce: bool) -> anyhow::Result<()> {
     if !bwrap_ok() { return Err(anyhow!("[code_mode] enabled = true but bwrap is unavailable")); }
     if crate::tools::resolve_rustc(path_env).is_none() { return Err(anyhow!("[code_mode] enabled = true but rustc is unavailable on PATH")); }
-    if announce { eprintln!("e-agent: run_rust tool enabled ([code_mode])"); }
+    if announce { tracing::info!("e-agent: run_rust tool enabled ([code_mode])"); }
     Ok(())
 }
 /// Register the experimental run_rust tool (main agent only, opt-in): the
@@ -943,7 +943,7 @@ fn preflight_sandbox(policy: &Sandbox, announce: bool) -> anyhow::Result<()> {
             ));
         }
         if announce {
-            eprintln!("e-agent: shell write-restricted with a Windows restricted token");
+            tracing::info!("e-agent: shell write-restricted with a Windows restricted token");
         }
     }
     #[cfg(not(windows))]
@@ -956,7 +956,7 @@ fn preflight_sandbox(policy: &Sandbox, announce: bool) -> anyhow::Result<()> {
             ));
         }
         if announce {
-            eprintln!("e-agent: bash sandboxed with bwrap");
+            tracing::info!("e-agent: bash sandboxed with bwrap");
         }
     }
     Ok(())

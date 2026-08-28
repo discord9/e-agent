@@ -95,31 +95,6 @@ fn tail_snapshot(mut events: Vec<AgentEvent>) -> Vec<AgentEvent> {
 // Startup
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-/// Human-readable session-backend type name for the startup log. Never
-/// Debug-prints the enum: a Greptime conn string may embed credentials.
-fn backend_name(backend: &crate::config::SessionBackend) -> &'static str {
-    match backend {
-        crate::config::SessionBackend::Jsonl => "jsonl",
-        crate::config::SessionBackend::Greptime { .. } => "greptime",
-        crate::config::SessionBackend::Sqlite { .. } => "sqlite",
-    }
-}
-
-/// Short stable hash (FNV-1a 32-bit, hex) of the canonical workspace root —
-/// a compact stand-in for the full `workspace_id` (which is the root path
-/// itself, see `session_greptime::derive_workspace_id`). Lets a startup log
-/// line cross-reference the backend's workspace_id column without repeating
-/// a long path.
-fn short_workspace_id(root: &std::path::Path) -> String {
-    let bytes = root.to_string_lossy();
-    let mut hash = 0x811c_9dc5u32;
-    for &b in bytes.as_bytes() {
-        hash ^= u32::from(b);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    format!("{hash:08x}")
-}
-
 #[cfg(test)]
 fn killed_notice_text(own: &[String], killed_subagents: &[(String, usize)]) -> Option<String> {
     if own.is_empty() && killed_subagents.is_empty() {
@@ -176,17 +151,6 @@ pub async fn run(factory: SessionFactory, host: &str, port: u16) -> anyhow::Resu
             .unwrap_or_else(|| "<no state dir>".to_owned())
     );
 
-    // 启动可观测性：canonical workspace root、backend 类型、workspace_id
-    // 短 hash、PID。workspace_id 由 canonical root 派生（见
-    // session_greptime::derive_workspace_id），短 hash 便于多实例日志对照；
-    // 排查「响应来自哪台实例」时不用再对着长路径数。
-    eprintln!(
-        "e-agent: workspace {} backend {} workspace_id {} pid {}",
-        state.factory.root().display(),
-        backend_name(state.factory.backend()),
-        short_workspace_id(state.factory.root()),
-        std::process::id()
-    );
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .with_context(|| format!("cannot bind {host}:{port}"))?;
@@ -961,7 +925,7 @@ fn apply_subagent_label(meta: &mut SessionMeta, label: Option<String>) {
 
 /// Threshold for logging slow `GET /api/sessions` requests: total handler
 /// time at or above this (or any degraded error path) emits one
-/// `eprintln!` line with per-phase durations and counts. Conservative so
+/// structured warning with per-phase durations and counts. Conservative so
 /// normal requests stay silent. Never logs session ids/titles/paths.
 const LIST_SESSIONS_SLOW_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -978,40 +942,10 @@ struct ListSessionsTiming {
     list_meta_diagnostics: Option<ListMetaDiagnostics>,
 }
 
-/// Build the slow-request log line, or `None` when the request was fast
-/// and clean. Pure so the threshold/format is unit-testable.
-#[allow(clippy::too_many_arguments)]
-fn list_sessions_slow_log(
-    timing: ListSessionsTiming,
-    degraded: bool,
-    live: usize,
-    historical: usize,
-    merged: usize,
-    subagent_labels: usize,
-) -> Option<String> {
-    if !degraded && timing.total_ms < LIST_SESSIONS_SLOW_THRESHOLD.as_millis() {
-        return None;
-    }
-    Some(format!(
-        "e-agent: GET /api/sessions {}: total={}ms connect={}ms live={}ms list_meta={}ms labels={}ms child_scan={}ms merge={}ms counts(live={} historical={} merged={} subagent_labels={}){}",
-        if degraded { "degraded" } else { "slow" },
-        timing.total_ms,
-        timing.connect_ms,
-        timing.live_ms,
-        timing.list_meta_ms,
-        timing.labels_ms,
-        timing.child_scan_ms,
-        timing.merge_ms,
-        live,
-        historical,
-        merged,
-        subagent_labels,
-        timing
-            .list_meta_diagnostics
-            .as_ref()
-            .map(|d| format!(" {}", d.format_for_log()))
-            .unwrap_or_default(),
-    ))
+/// Whether the request should emit a structured warning. Pure so the
+/// threshold/degraded predicate is unit-testable.
+fn list_sessions_is_slow(timing: ListSessionsTiming, degraded: bool) -> bool {
+    degraded || timing.total_ms >= LIST_SESSIONS_SLOW_THRESHOLD.as_millis()
 }
 
 async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMeta>> {
@@ -1036,7 +970,7 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
         match SessionStore::connect_meta_read_only(state.factory.backend(), root).await {
             Ok(store) => request_read_store = Some(store),
             Err(error) => {
-                eprintln!("e-agent: cannot open sessions read connection: {error:#}");
+                tracing::warn!("e-agent: cannot open sessions read connection: {error:#}");
                 request_read_failed = true;
             }
         }
@@ -1088,7 +1022,7 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
             list
         }
         Err(error) => {
-            eprintln!("e-agent: cannot list session metadata: {error:#}");
+            tracing::warn!("e-agent: cannot list session metadata: {error:#}");
             degraded = true;
             Vec::new()
         }
@@ -1145,7 +1079,7 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
                             labels.insert(meta.id.clone(), label);
                         }
                         Err(error) => {
-                            eprintln!("e-agent: cannot look up subagent label: {error:#}");
+                            tracing::warn!("e-agent: cannot look up subagent label: {error:#}");
                             degraded = true;
                         }
                     }
@@ -1153,7 +1087,7 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
             }
         }
         Err(error) => {
-            eprintln!("e-agent: cannot look up subagent labels: {error:#}");
+            tracing::warn!("e-agent: cannot look up subagent labels: {error:#}");
             degraded = true;
         }
     }
@@ -1213,17 +1147,58 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
     }
     timing.merge_ms = phase_start.elapsed().as_millis();
     timing.total_ms = request_start.elapsed().as_millis();
-    if let Some(message) = list_sessions_slow_log(
-        timing,
-        degraded,
-        live_count,
-        historical_count,
-        merged.len(),
-        subagent_label_count,
-    ) {
-        eprintln!("{message}");
+    if list_sessions_is_slow(timing, degraded) {
+        list_sessions_slow_event(
+            timing,
+            degraded,
+            live_count,
+            historical_count,
+            merged.len(),
+            subagent_label_count,
+        );
     }
     Json(merged)
+}
+
+/// Emit the structured slow/degraded event. The caller gates on
+/// [`list_sessions_is_slow`] so this never runs for fast, clean requests.
+/// Fields stay free of session ids/titles/workspace paths; the focused
+/// capture test calls this same helper so it cannot drift from production.
+fn list_sessions_slow_event(
+    timing: ListSessionsTiming,
+    degraded: bool,
+    live_count: usize,
+    historical_count: usize,
+    merged_count: usize,
+    subagent_label_count: usize,
+) {
+    let diagnostics = timing.list_meta_diagnostics;
+    tracing::warn!(
+        kind = if degraded { "degraded" } else { "slow" },
+        total_ms = timing.total_ms,
+        connect_ms = timing.connect_ms,
+        live_ms = timing.live_ms,
+        list_meta_ms = timing.list_meta_ms,
+        labels_ms = timing.labels_ms,
+        child_scan_ms = timing.child_scan_ms,
+        merge_ms = timing.merge_ms,
+        live_count,
+        historical_count,
+        merged_count,
+        subagent_labels_count = subagent_label_count,
+        backend = diagnostics.map(|d| d.backend),
+        facade_lock_wait_ms = diagnostics.map(|d| d.facade_lock_wait_ms),
+        connection_lock_wait_ms = diagnostics.map(|d| d.connection_lock_wait_ms),
+        backend_operation_ms = diagnostics.map(|d| d.backend_operation_ms),
+        query_ms = diagnostics.map(|d| d.query_ms),
+        query_iteration_ms = diagnostics.map(|d| d.query_iteration_ms),
+        row_decode_ms = diagnostics.map(|d| d.row_decode_ms),
+        filesystem_parse_ms = diagnostics.map(|d| d.filesystem_parse_ms),
+        sidecars_seen = diagnostics.map(|d| d.sidecars_seen),
+        sidecars_opened = diagnostics.map(|d| d.sidecars_opened),
+        logical_rows = diagnostics.map(|d| d.logical_rows),
+        "GET /api/sessions completed slowly or in degraded mode"
+    );
 }
 
 #[derive(Deserialize)]
@@ -1389,7 +1364,7 @@ async fn build_session(
             // conservative Preserve (matching the migration-failure
             // degradation style elsewhere: eprintln + keep running).
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "e-agent: cannot probe unfinished background-task owners, \
                      keeping Preserve: {e:#}"
                 );
@@ -2063,10 +2038,10 @@ async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<TaskMeta>> {
                     Ok(Some(command)) => meta.full_command = Some(command),
                     Ok(None) => {}
                     Err(error) => {
-                        eprintln!(
-                            "e-agent: cannot look up background task full command \
-                             for session {session_id} task {}: {error:#}",
-                            meta.id
+                        tracing::warn!(
+                            task_id = meta.id,
+                            error = %format_args!("{error:#}"),
+                            "e-agent: cannot look up background task full command"
                         );
                     }
                 }
@@ -2101,7 +2076,7 @@ async fn finished_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<Finished
     {
         Ok(tasks) => Json(tasks),
         Err(error) => {
-            eprintln!("e-agent: cannot query finished background tasks: {error:#}");
+            tracing::warn!("e-agent: cannot query finished background tasks: {error:#}");
             Json(Vec::new())
         }
     }
@@ -2750,7 +2725,7 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
         }
         .await
         {
-            eprintln!("e-agent: cannot record summarizer usage: {error:#}");
+            tracing::warn!("e-agent: cannot record summarizer usage: {error:#}");
         }
     }
     let Some(text) = assistant.content else {
@@ -2960,19 +2935,19 @@ async fn session_usage(
             match store.child_session_ids(root, &id).await {
                 Ok(children) => ids.extend(children),
                 Err(error) => {
-                    eprintln!("e-agent: cannot list session metadata for usage: {error:#}");
+                    tracing::warn!("e-agent: cannot list session metadata for usage: {error:#}");
                 }
             }
             match store.usage_for_sessions(root, &ids).await {
                 Ok(rows) => rows,
                 Err(error) => {
-                    eprintln!("e-agent: cannot query session usage: {error:#}");
+                    tracing::warn!("e-agent: cannot query session usage: {error:#}");
                     Vec::new()
                 }
             }
         }
         Err(error) => {
-            eprintln!("e-agent: cannot open usage store: {error:#}");
+            tracing::warn!("e-agent: cannot open usage store: {error:#}");
             Vec::new()
         }
     };
@@ -3416,99 +3391,143 @@ mod tests {
     }
 
     #[test]
-    fn list_sessions_slow_log_is_silent_below_threshold_and_clean() {
+    fn list_sessions_slow_predicate_is_silent_below_threshold_and_clean() {
         let timing = ListSessionsTiming {
             total_ms: LIST_SESSIONS_SLOW_THRESHOLD.as_millis() - 1,
             ..ListSessionsTiming::default()
         };
-        assert!(list_sessions_slow_log(timing, false, 1, 2, 3, 0).is_none());
+        assert!(!list_sessions_is_slow(timing, false));
     }
 
     #[test]
-    fn list_sessions_slow_log_fires_at_threshold() {
-        let timing = ListSessionsTiming {
-            total_ms: LIST_SESSIONS_SLOW_THRESHOLD.as_millis(),
-            ..ListSessionsTiming::default()
-        };
-        let message = list_sessions_slow_log(timing, false, 1, 2, 3, 0).unwrap();
-        assert!(message.starts_with("e-agent: GET /api/sessions slow:"));
-        assert!(message.contains("total=1000ms"));
-        assert!(message.contains("connect=0ms"));
-        assert!(message.contains("counts(live=1 historical=2 merged=3 subagent_labels=0)"));
-    }
-
-    #[test]
-    fn list_sessions_slow_log_fires_when_degraded_even_if_fast() {
-        let message =
-            list_sessions_slow_log(ListSessionsTiming::default(), true, 0, 0, 0, 0).unwrap();
-        assert!(message.starts_with("e-agent: GET /api/sessions degraded:"));
-    }
-
-    #[test]
-    fn list_meta_diagnostics_format_contains_only_safe_backend_fields() {
-        let greptime = ListMetaDiagnostics {
-            backend: "greptime",
-            facade_lock_wait_ms: 11,
-            backend_operation_ms: 22,
-            query_ms: 33,
-            row_decode_ms: 44,
-            logical_rows: 55,
-            ..Default::default()
-        };
-        assert_eq!(
-            greptime.format_for_log(),
-            "backend=greptime facade_lock_wait=11ms backend_op=22ms query=33ms decode=44ms rows=55"
-        );
-
-        let sqlite = ListMetaDiagnostics {
-            backend: "sqlite",
-            facade_lock_wait_ms: 1,
-            connection_lock_wait_ms: 2,
-            backend_operation_ms: 3,
-            query_iteration_ms: 4,
-            row_decode_ms: 5,
-            logical_rows: 6,
-            ..Default::default()
-        };
-        assert_eq!(
-            sqlite.format_for_log(),
-            "backend=sqlite facade_lock_wait=1ms conn_lock_wait=2ms backend_op=3ms query_iter=4ms decode=5ms rows=6"
-        );
-
-        let jsonl = ListMetaDiagnostics {
-            backend: "jsonl",
-            backend_operation_ms: 7,
-            filesystem_parse_ms: 8,
-            sidecars_seen: 9,
-            sidecars_opened: 10,
-            logical_rows: 11,
-            ..Default::default()
-        };
-        assert_eq!(
-            jsonl.format_for_log(),
-            "backend=jsonl facade_lock_wait=0ms backend_op=7ms fs_parse=8ms sidecars(seen=9 opened=10) rows=11"
-        );
-    }
-
-    #[test]
-    fn list_sessions_slow_log_includes_backend_diagnostics() {
-        let timing = ListSessionsTiming {
-            total_ms: LIST_SESSIONS_SLOW_THRESHOLD.as_millis(),
-            connect_ms: 7,
-            list_meta_diagnostics: Some(ListMetaDiagnostics {
-                backend: "sqlite",
-                connection_lock_wait_ms: 12,
-                logical_rows: 34,
+    fn list_sessions_slow_predicate_fires_at_threshold_or_when_degraded() {
+        assert!(list_sessions_is_slow(
+            ListSessionsTiming {
+                total_ms: LIST_SESSIONS_SLOW_THRESHOLD.as_millis(),
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let message = list_sessions_slow_log(timing, false, 0, 34, 34, 0).unwrap();
-        assert!(message.contains("backend=sqlite"));
-        assert!(message.contains("conn_lock_wait=12ms"));
-        assert!(message.contains("rows=34"));
-        assert!(!message.contains("session_id"));
-        assert!(!message.contains("SELECT"));
+            },
+            false
+        ));
+        assert!(list_sessions_is_slow(ListSessionsTiming::default(), true));
+    }
+
+    #[test]
+    fn list_sessions_slow_event_captures_only_safe_fields() {
+        use std::fmt;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Default, Clone)]
+        struct Capture {
+            inner: Arc<Mutex<Option<Captured>>>,
+        }
+
+        #[derive(Default)]
+        struct Captured {
+            kind: Option<String>,
+            total_ms: Option<u128>,
+            connect_ms: Option<u128>,
+            live_count: Option<usize>,
+            merged_count: Option<usize>,
+            backend: Option<String>,
+            connection_lock_wait_ms: Option<u128>,
+            logical_rows: Option<usize>,
+            fields: HashSet<&'static str>,
+        }
+
+        impl Visit for Captured {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "kind" => self.kind = Some(value.to_owned()),
+                    "backend" => self.backend = Some(value.to_owned()),
+                    _ => {}
+                }
+            }
+
+            fn record_u128(&mut self, field: &Field, value: u128) {
+                match field.name() {
+                    "total_ms" => self.total_ms = Some(value),
+                    "connect_ms" => self.connect_ms = Some(value),
+                    "connection_lock_wait_ms" => self.connection_lock_wait_ms = Some(value),
+                    _ => {}
+                }
+            }
+
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                match field.name() {
+                    "live_count" => self.live_count = Some(value as usize),
+                    "merged_count" => self.merged_count = Some(value as usize),
+                    "logical_rows" => self.logical_rows = Some(value as usize),
+                    _ => {}
+                }
+            }
+
+            fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+        }
+
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut captured = Captured::default();
+                event.record(&mut captured);
+                for field in event.fields() {
+                    captured.fields.insert(field.name());
+                }
+                *self.inner.lock().unwrap() = Some(captured);
+            }
+        }
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            list_sessions_slow_event(
+                ListSessionsTiming {
+                    total_ms: LIST_SESSIONS_SLOW_THRESHOLD.as_millis(),
+                    connect_ms: 7,
+                    list_meta_diagnostics: Some(ListMetaDiagnostics {
+                        backend: "sqlite",
+                        connection_lock_wait_ms: 12,
+                        logical_rows: 34,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                false,
+                2,
+                34,
+                36,
+                0,
+            );
+        });
+
+        let captured = capture.inner.lock().unwrap().take().unwrap();
+        assert_eq!(captured.kind.as_deref(), Some("slow"));
+        assert_eq!(captured.total_ms, Some(1000));
+        assert_eq!(captured.connect_ms, Some(7));
+        assert_eq!(captured.live_count, Some(2));
+        assert_eq!(captured.merged_count, Some(36));
+        assert_eq!(captured.backend.as_deref(), Some("sqlite"));
+        assert_eq!(captured.connection_lock_wait_ms, Some(12));
+        assert_eq!(captured.logical_rows, Some(34));
+        let forbidden = [
+            "session_id",
+            "session",
+            "title",
+            "prompt",
+            "header",
+            "authorization",
+            "token",
+            "api_key",
+            "credential",
+            "sql",
+            "workspace",
+        ];
+        for name in forbidden {
+            assert!(
+                !captured.fields.iter().any(|field| field.contains(name)),
+                "unexpected sensitive field {name}"
+            );
+        }
     }
 
     #[test]

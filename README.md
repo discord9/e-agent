@@ -900,6 +900,9 @@ supported — no resources, prompts, or server-initiated notifications.
 - `RUST_BACKTRACE=1` — optional; appends a backtrace to ordinary `anyhow` error
   chains (and enables their full Rust verbosity). Rust panics always print a
   forced stack regardless of this setting.
+- `RUST_LOG` — optional `tracing` filter for operational diagnostics; defaults
+  to `e_agent=info` (for example, `RUST_LOG=e_agent=debug`). Logs are compact,
+  human-readable, and written to stderr without ANSI escapes.
 
 ### Panic reports
 

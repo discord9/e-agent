@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "greptime", feature = "sqlite"))]
 use std::sync::Arc;
-#[cfg(any(feature = "greptime", feature = "sqlite"))]
+#[cfg(feature = "sqlite")]
 use tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
@@ -47,39 +47,6 @@ pub struct ListMetaDiagnostics {
     pub sidecars_seen: usize,
     pub sidecars_opened: usize,
     pub filesystem_parse_ms: u128,
-}
-
-impl ListMetaDiagnostics {
-    pub fn format_for_log(&self) -> String {
-        match self.backend {
-            "greptime" => format!(
-                "backend=greptime facade_lock_wait={}ms backend_op={}ms query={}ms decode={}ms rows={}",
-                self.facade_lock_wait_ms,
-                self.backend_operation_ms,
-                self.query_ms,
-                self.row_decode_ms,
-                self.logical_rows,
-            ),
-            "sqlite" => format!(
-                "backend=sqlite facade_lock_wait={}ms conn_lock_wait={}ms backend_op={}ms query_iter={}ms decode={}ms rows={}",
-                self.facade_lock_wait_ms,
-                self.connection_lock_wait_ms,
-                self.backend_operation_ms,
-                self.query_iteration_ms,
-                self.row_decode_ms,
-                self.logical_rows,
-            ),
-            _ => format!(
-                "backend=jsonl facade_lock_wait={}ms backend_op={}ms fs_parse={}ms sidecars(seen={} opened={}) rows={}",
-                self.facade_lock_wait_ms,
-                self.backend_operation_ms,
-                self.filesystem_parse_ms,
-                self.sidecars_seen,
-                self.sidecars_opened,
-                self.logical_rows,
-            ),
-        }
-    }
 }
 
 /// Sentinel session id for a workspace-scoped metadata store: only the
@@ -1890,7 +1857,7 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => {
                 if let Err(error) = jsonl_touch_meta(root, session) {
-                    eprintln!("e-agent: cannot touch session metadata: {error:#}");
+                    tracing::warn!("e-agent: cannot touch session metadata: {error:#}");
                 }
             }
             #[cfg(feature = "greptime")]
@@ -1903,12 +1870,12 @@ impl SessionStore {
                     Ok(handle) => {
                         handle.spawn(async move {
                             if let Err(error) = greptime.touch_meta().await {
-                                eprintln!("e-agent: cannot touch session metadata: {error:#}");
+                                tracing::warn!("e-agent: cannot touch session metadata: {error:#}");
                             }
                         });
                     }
                     Err(_) => {
-                        eprintln!("e-agent: cannot touch session metadata: no tokio runtime");
+                        tracing::warn!("e-agent: cannot touch session metadata: no tokio runtime");
                     }
                 }
             }
@@ -1922,12 +1889,12 @@ impl SessionStore {
                     Ok(handle) => {
                         handle.spawn(async move {
                             if let Err(error) = sqlite.lock().await.touch_meta().await {
-                                eprintln!("e-agent: cannot touch session metadata: {error:#}");
+                                tracing::warn!("e-agent: cannot touch session metadata: {error:#}");
                             }
                         });
                     }
                     Err(_) => {
-                        eprintln!("e-agent: cannot touch session metadata: no tokio runtime");
+                        tracing::warn!("e-agent: cannot touch session metadata: no tokio runtime");
                     }
                 }
             }
@@ -2283,7 +2250,7 @@ impl SessionStore {
                     full_command,
                     subagent_session_id,
                 ) {
-                    eprintln!("e-agent: cannot record background task: {error:#}");
+                    tracing::warn!("e-agent: cannot record background task: {error:#}");
                 }
             }
             #[cfg(feature = "greptime")]
@@ -2309,12 +2276,12 @@ impl SessionStore {
                                 )
                                 .await
                             {
-                                eprintln!("e-agent: cannot record background task: {error:#}");
+                                tracing::warn!("e-agent: cannot record background task: {error:#}");
                             }
                         });
                     }
                     Err(_) => {
-                        eprintln!("e-agent: cannot record background task: no tokio runtime");
+                        tracing::warn!("e-agent: cannot record background task: no tokio runtime");
                     }
                 }
             }
@@ -2343,12 +2310,12 @@ impl SessionStore {
                                 )
                                 .await
                             {
-                                eprintln!("e-agent: cannot record background task: {error:#}");
+                                tracing::warn!("e-agent: cannot record background task: {error:#}");
                             }
                         });
                     }
                     Err(_) => {
-                        eprintln!("e-agent: cannot record background task: no tokio runtime");
+                        tracing::warn!("e-agent: cannot record background task: no tokio runtime");
                     }
                 }
             }
@@ -2413,12 +2380,12 @@ impl SessionStore {
                     Ok(handle) => {
                         handle.spawn(async move {
                             if let Err(error) = greptime.clear_task(&session_id, id).await {
-                                eprintln!("e-agent: cannot clear background task: {error:#}");
+                                tracing::warn!("e-agent: cannot clear background task: {error:#}");
                             }
                         });
                     }
                     Err(_) => {
-                        eprintln!("e-agent: cannot clear background task: no tokio runtime");
+                        tracing::warn!("e-agent: cannot clear background task: no tokio runtime");
                     }
                 }
             }
@@ -2435,12 +2402,12 @@ impl SessionStore {
                             if let Err(error) =
                                 sqlite.lock().await.clear_task(&session_id, id).await
                             {
-                                eprintln!("e-agent: cannot clear background task: {error:#}");
+                                tracing::warn!("e-agent: cannot clear background task: {error:#}");
                             }
                         });
                     }
                     Err(_) => {
-                        eprintln!("e-agent: cannot clear background task: no tokio runtime");
+                        tracing::warn!("e-agent: cannot clear background task: no tokio runtime");
                     }
                 }
             }

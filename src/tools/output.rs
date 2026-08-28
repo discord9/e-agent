@@ -165,7 +165,7 @@ async fn resolve_page(
             // The store error may carry backend connection strings, paths,
             // or DB chains. Never expose those to the model: log the detail
             // internally only and return a fixed, pathless message.
-            eprintln!("read_output: cannot read persisted field: {error:#}");
+            tracing::error!("read_output: cannot read persisted field: {error:#}");
             return Err(ReceiptError::new(
                 crate::output_receipt::ReceiptErrorKind::Invalid,
                 "cannot read the persisted field",

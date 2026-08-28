@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Ok(false) => {}
     }
+    e_agent::init_logging()?;
     install_panic_hook();
     notify_crash_if_exists();
     if let Err(error) = run(raw_arguments).await {

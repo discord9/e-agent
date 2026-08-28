@@ -354,17 +354,17 @@ async fn connect_all_with_timeout(
                                     }));
                                     tool_count += 1;
                                 }
-                                eprintln!(
+                                tracing::info!(
                                     "e-agent: mcp server `{name}` connected ({tool_count} tools)"
                                 );
                             }
-                            Err(error) => eprintln!(
+                            Err(error) => tracing::warn!(
                                 "e-agent: warning: mcp server `{name}` tools/list failed: {error:#}"
                             ),
                         }
                     }
                     Err(error) => {
-                        eprintln!(
+                        tracing::warn!(
                             "e-agent: warning: mcp server `{name}` failed to start: {error:#}"
                         )
                     }
@@ -392,7 +392,7 @@ async fn connect_all_with_timeout(
         }
     }
     for name in pending_names {
-        eprintln!(
+        tracing::warn!(
             "e-agent: warning: mcp server `{name}` did not finish within {timeout:?}; skipping it"
         );
     }

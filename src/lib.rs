@@ -23,6 +23,21 @@ pub mod workspace;
 
 use std::path::{Path, PathBuf};
 
+/// Initialize compact human-readable operational logging for a frontend.
+/// Library users and tests are not initialized implicitly.
+pub fn init_logging() -> anyhow::Result<()> {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("e_agent=info"));
+    fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .compact()
+        .try_init()
+        .map_err(|error| anyhow::anyhow!(error))
+}
+
 /// Resolve the user's home directory. Priority: `$HOME` on every platform
 /// (Git Bash sets it on Windows too), then — only on Windows, where `HOME`
 /// is typically absent under cmd/PowerShell — `$USERPROFILE`, then

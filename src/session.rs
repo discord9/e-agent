@@ -584,7 +584,7 @@ impl Session {
     /// Forget one task: its completion arrived while the process was alive.
     pub fn clear_background_task(root: &Path, session: &str, id: u64) {
         if let Err(error) = Self::clear_background_task_checked(root, session, id) {
-            eprintln!("e-agent: cannot clear JSONL background task: {error:#}");
+            tracing::warn!("e-agent: cannot clear JSONL background task: {error:#}");
         }
     }
 

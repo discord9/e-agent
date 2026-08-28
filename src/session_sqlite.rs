@@ -361,7 +361,7 @@ impl SqliteSession {
                 let sql = format!("ALTER TABLE sessions ADD COLUMN {name} {sql_type}");
                 if let Err(error) = conn.execute(&sql, ()).await {
                     *available = false;
-                    eprintln!(
+                    tracing::warn!(
                         "e-agent: cannot add sessions.{name} column ({feature} unavailable): \
                          {error}"
                     );
@@ -412,7 +412,7 @@ impl SqliteSession {
                     )
                     .await
                 {
-                    eprintln!(
+                    tracing::warn!(
                         "e-agent: cannot add running_tasks.owner_identity column \
                          (background-task owner liveness unavailable): {error}"
                     );
@@ -435,7 +435,7 @@ impl SqliteSession {
                     .execute("ALTER TABLE running_tasks ADD COLUMN full_command TEXT", ())
                     .await
             {
-                eprintln!(
+                tracing::warn!(
                     "e-agent: cannot add running_tasks.full_command column \
                      (background-task full-command persistence unavailable): {error}"
                 );
@@ -490,7 +490,7 @@ impl SqliteSession {
                 }
                 let sql = format!("ALTER TABLE usage_entries ADD COLUMN {name} {sql_type}");
                 if let Err(error) = conn.execute(&sql, ()).await {
-                    eprintln!(
+                    tracing::warn!(
                         "e-agent: cannot add usage_entries.{name} column ({feature} unavailable): \
                          {error}"
                     );
@@ -513,7 +513,7 @@ impl SqliteSession {
             )
             .await
         {
-            eprintln!(
+            tracing::warn!(
                 "e-agent: cannot create running_tasks subagent index \
                  (batched subagent-label lookup unavailable): {error}"
             );

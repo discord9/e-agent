@@ -548,12 +548,12 @@ fn spawn_subagent_meta_create(
                     )
                     .await
                 {
-                    eprintln!("e-agent: cannot record subagent session metadata: {error:#}");
+                    tracing::warn!("e-agent: cannot record subagent session metadata: {error:#}");
                 }
             });
         }
         Err(_) => {
-            eprintln!("e-agent: cannot record subagent session metadata: no tokio runtime");
+            tracing::warn!("e-agent: cannot record subagent session metadata: no tokio runtime");
         }
     }
 }

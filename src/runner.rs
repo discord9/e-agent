@@ -736,7 +736,7 @@ impl SessionRunner {
                     .apply_entry_located(entry, locations.drain(..).next());
             }
             Err(error) => {
-                eprintln!("e-agent: cannot persist session error: {error:#}");
+                tracing::warn!("e-agent: cannot persist session error: {error:#}");
                 self.agent.apply_entry(entry);
             }
         }
@@ -1304,7 +1304,7 @@ impl SessionRunner {
                         )
                         .await
                     {
-                        eprintln!("e-agent: cannot record compaction usage: {error:#}");
+                        tracing::warn!("e-agent: cannot record compaction usage: {error:#}");
                     }
                 }
                 let steering = self.intake_after_operation(waited.pending);
@@ -1559,7 +1559,7 @@ impl SessionRunner {
                         )
                         .await
                     {
-                        eprintln!("e-agent: cannot record usage: {error:#}");
+                        tracing::warn!("e-agent: cannot record usage: {error:#}");
                     }
                 }
                 let steering = self.intake_after_operation(waited.pending);

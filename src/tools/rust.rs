@@ -213,8 +213,8 @@ impl ScratchGuard {
 impl Drop for ScratchGuard {
     fn drop(&mut self) {
         let Some(mut scratch) = self.0.take() else { return };
-        if self.1.load(Ordering::Acquire) { if let Err(error) = scratch.remove() { eprintln!("run_rust: scratch cleanup failed: {error}"); } }
-        else { eprintln!("run_rust: teardown unconfirmed; retaining scratch at {}", scratch.path.display()); }
+        if self.1.load(Ordering::Acquire) { if let Err(error) = scratch.remove() { tracing::warn!("run_rust: scratch cleanup failed: {error}"); } }
+        else { tracing::warn!("run_rust: teardown unconfirmed; retaining scratch at {}", scratch.path.display()); }
     }
 }
 // Per-stage env: compile carries the host toolchain; run gets plain /bin:/usr/bin.

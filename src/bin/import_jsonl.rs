@@ -210,6 +210,7 @@ fn parse_args() -> anyhow::Result<Args> {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    let _ = e_agent::init_logging();
     if let Err(err) = run() {
         // --help prints its own text then signals via __help__.
         let msg = format!("{err:#}");
