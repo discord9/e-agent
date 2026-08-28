@@ -623,6 +623,10 @@ globalThis.fetch=(url,opts={})=>{
   if(url.startsWith("/api/sessions/restored-test/history")) return resp(200, historyData, signal);
   if(url.startsWith("/api/sessions/restored-test2/history")) return resp(200, historyData, signal);
   if(url.startsWith("/api/sessions/restored-test3/history")) return resp(200, historyData, signal);
+  if(url.startsWith("/api/sessions/stream-switch-a/history")) return resp(200, {
+    entries: [{type:"message", message:{User:{content:"persisted A history", images:[]}}}],
+    next_before_seq: null,
+  }, signal);
   if(url==="/api/sessions/s1/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s2/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s3/events") return resp(200, streamSnapshotUsage(), signal);
@@ -633,6 +637,7 @@ globalThis.fetch=(url,opts={})=>{
   if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/restored-test3/events")) return resp(200, streamEmpty(), signal);
+  if(url.startsWith("/api/sessions/stream-switch-a/events")) return resp(200, streamEmpty(), signal);
   // 持久化用量端点（本分支新增）：usageData 命中 → 200；置 null → 404 旧后端
   const _mUsage = /^\/api\/sessions\/([^/]+)\/usage$/.exec(url);
   if (_mUsage) {
@@ -2072,6 +2077,61 @@ async function main(){
         "last=" + (last3 ? last3.className : "none")
         + " inflight=" + msgs3.textContent.includes("执行中…")
         + " stack=" + (state.acc && state.acc.toolStack ? state.acc.toolStack.length : "-"));
+
+    // ---- restored streaming tail reconciliation ----
+    // Cache A after ABC, leave it while B is active, then return. The initial
+    // snapshot repeats ABC and adds DEF; only that in-flight tail is restored,
+    // while persisted history stays in the DOM and live GHI uses one block.
+    state.sessionId = "stream-switch-a";
+    state.initSource = "history";
+    state.acc = newAccumulator();
+    elsById["messages"].innerHTML = "<div class='notice'>persisted old history</div>";
+    appendAssistantDelta("ABC", state.acc);
+    saveSessionState();
+    openSession("s2");
+    await flush();
+    openSession("stream-switch-a");
+    await flush();
+    await flush();
+    handleSSEBlock('event: snapshot\ndata: [{"type":"assistant_delta","data":"ABC"},'
+      + '{"type":"assistant_delta","data":"DEF"}]\n\n',
+      "stream-switch-a", state.workspace.id, sessionOpenEpoch);
+    chk("restored snapshot reconciles ABC+DEF without duplicate assistant block",
+        elsById["messages"].querySelectorAll(".msg-assistant").length === 1
+        && elsById["messages"].textContent.includes("ABCDEF")
+        && elsById["messages"].textContent.includes("persisted A history"),
+        "text=" + JSON.stringify(elsById["messages"].textContent));
+    handleSSEBlock('event: AssistantDelta\ndata: {"delta":"GHI"}\n\n',
+      "stream-switch-a", state.workspace.id, sessionOpenEpoch);
+    chk("restored snapshot tail continues with live GHI",
+        elsById["messages"].querySelectorAll(".msg-assistant").length === 1
+        && elsById["messages"].textContent.includes("ABCDEFGHI"),
+        "text=" + JSON.stringify(elsById["messages"].textContent));
+
+    // A stale-epoch snapshot must remain ignored, while an ordinary first-open
+    // history+snapshot still never duplicates the persisted assistant block.
+    const staleEpoch = sessionOpenEpoch - 1;
+    const beforeStale = elsById["messages"].textContent;
+    handleSSEBlock('event: snapshot\ndata: [{"type":"assistant_delta","data":{"delta":"STALE"}}]\n\n',
+      "stream-switch-a", state.workspace.id, staleEpoch);
+    chk("restored stale-epoch snapshot ignored", elsById["messages"].textContent === beforeStale);
+
+    // Completed history is authoritative even while the old cache is retained:
+    // cached ABC + history ABCDEF + snapshot ABC/DEF must stay one ABCDEF block.
+    state.acc = newAccumulator();
+    elsById["messages"].innerHTML = "";
+    renderHistory([{type:"message", message:{Assistant:{content:"ABCDEF"}}}]);
+    state.initSource = "history";
+    handleSSEBlock('event: snapshot\ndata: [{"type":"assistant_delta","data":"ABC"},'
+      + '{"type":"assistant_delta","data":"DEF"}]\n\n',
+      "stream-switch-a", state.workspace.id, sessionOpenEpoch);
+    chk("completed history snapshot does not duplicate cached assistant",
+        elsById["messages"].querySelectorAll(".msg-assistant").length === 1
+        && elsById["messages"].querySelector(".msg-assistant").querySelector(".msg-body").textContent.trim() === "ABCDEF",
+        "text=" + JSON.stringify(elsById["messages"].textContent)
+        + " body=" + JSON.stringify(elsById["messages"].querySelector(".msg-assistant")
+          .querySelector(".msg-body").textContent));
+    state.sessionId = null;
 
     // ---- A: 长内容「预览 + 展开全文」（maybeTruncateEl） ----
     // 用 MCP/未知工具名走 pretty JSON 回退路径（bash 等已改紧凑渲染）

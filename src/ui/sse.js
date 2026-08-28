@@ -242,6 +242,69 @@ function restoreUsageFromSnapshot(events) {
   }
 }
 
+/* 初始 snapshot 只补回缓存视图中仍在流式的助手尾巴。history 是已完成
+   transcript 的权威来源；snapshot 的完整事件尾部则只用于把当前 in-flight
+   accumulator 从切走前的缓存前缀接到最新位置，不能整体重放（snapshot 有界）。 */
+function snapshotAssistantDeltaTail(events) {
+  let tail = [];
+  for (const ev of events || []) {
+    const type = ev && ev.type;
+    if (type === "assistant_delta" || type === "AssistantDelta") {
+      const text = pickText(ev.data, ["delta", "text", "content"]);
+      if (typeof ev.data === "string") tail.push(ev.data);
+      else tail.push(text);
+    } else {
+      tail = [];
+    }
+  }
+  return tail.join("");
+}
+
+function cachedInFlightAssistantText(id) {
+  const cached = state.sessionStates[state.workspace.id + ":" + id];
+  if (!cached || typeof cached.html !== "string") return "";
+  const holder = document.createElement("div");
+  holder.innerHTML = cached.html;
+  const assistants = holder.querySelectorAll(".msg-assistant");
+  const last = assistants[assistants.length - 1];
+  const body = last && last.querySelector(".msg-body");
+  // A plain body is the same in-flight marker used by reattachInFlight;
+  // completed AssistantText history has markdown child elements.
+  return body && !body.querySelector("*") ? body.textContent : "";
+}
+
+function reconcileSnapshotAssistantTail(entries, id) {
+  const cachedText = cachedInFlightAssistantText(id);
+  const snapshotText = snapshotAssistantDeltaTail(entries);
+  // Require the snapshot to contain the cached prefix. This prevents an old
+  // cached stream from being resurrected after history has authoritatively
+  // recorded its completion, and makes ordinary first-open snapshots no-op.
+  if (!cachedText || !snapshotText || !snapshotText.startsWith(cachedText)) return;
+  const current = state.acc;
+  const body = current && current.assistantBody;
+  if (body && body.querySelector("*")) {
+    // History's completed AssistantText is authoritative. If it already is
+    // the complete snapshot projection, do not recreate the cached stream.
+    if (current.assistantText === snapshotText || body.textContent === snapshotText) {
+      freezeAssistant(current);
+      return;
+    }
+  }
+  // Continue only a plain in-flight body that still exactly matches the
+  // cached prefix; completed/partially different history must not be merged.
+  if (body && !body.querySelector("*") && current.assistantText === cachedText) {
+    const suffix = snapshotText.slice(cachedText.length);
+    if (suffix) appendAssistantDelta(suffix, current);
+    return;
+  }
+  // History rendering intentionally replaced only the persisted transcript, so
+  // the cached in-flight prefix is no longer in the DOM. Recreate that one
+  // streaming block from the snapshot's delta run; later live deltas then use
+  // the normal accumulator and append to it.
+  freezeAssistant(current);
+  appendAssistantDelta(snapshotText, state.acc);
+}
+
 /* 解析单个 SSE 事件块：任何分支（snapshot/status/resync/live）动手改 UI 前
    必须通过三重校验——陈旧流的块整块丢弃，绝不画进当前会话/workspace。 */
 function handleSSEBlock(block, id, wsId, epoch) {
@@ -267,6 +330,12 @@ function handleSSEBlock(block, id, wsId, epoch) {
       // 模型请求的 context_input/context_window），不等下一次模型调用；
       // 复用 applyUsage 路径（state.lastUsage + renderUsageLine）。
       restoreUsageFromSnapshot(entries);
+      // history/restored 已经拥有权威的持久化 DOM；只把缓存中仍在途的
+      // assistant delta 尾巴接回来。普通首开没有缓存前缀，因此不会重放
+      // snapshot，也不会产生重复助手块。
+      if (state.initSource === "history" || state.initSource === "restored") {
+        reconcileSnapshotAssistantTail(entries, id);
+      }
       // 已用 history 渲染过则跳过（避免重复）；恢复的会话（initSource="restored"，
       // 视图来自缓存）也跳过——缓存内容与 snapshot 等价，重放会造成重复；
       // history 加载失败时仍作为兜底
