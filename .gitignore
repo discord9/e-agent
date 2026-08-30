@@ -3,3 +3,6 @@
 .slim/
 __pycache__/
 vox_vitae_toolkit
+/.svtmp/
+/.e2e-run/
+/package-lock.json
