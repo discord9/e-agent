@@ -515,6 +515,7 @@ let forkPostResolve = null;
 let promptPostDeferred = false;
 let promptPostResolve = null;
 let promptPostStatus = 202;
+let promptPostNetFail = false;
 globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
   FETCH_HEADERS.push({ url, method: (opts.method||"GET").toUpperCase(), headers: opts.headers || {} });
@@ -655,6 +656,7 @@ globalThis.fetch=(url,opts={})=>{
   if(url==="/api/models") return resp(200, ["chatgpt/sol","chatgpt/terra","deepseek/flash","deepseek/high","deepseek/fast","kimi/k3"], signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/model")&&m==="POST") return resp(200,{ok:true,model:"sol"},signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/prompt")) {
+    if (promptPostNetFail) return Promise.reject(new TypeError("network error"));
     if (promptPostDeferred) return abortable(new Promise((resolve) => { promptPostResolve = resolve; }), signal);
     return resp(promptPostStatus, {}, signal);
   }
@@ -863,8 +865,10 @@ async function main(){
           FETCHES.length === fetchBefore,
           "before=" + fetchBefore + " after=" + FETCHES.length);
 
-      // Accepted-but-not-rendered prompts are a separate ledger from queue UI.
+      // Local submission recall is separate from both the queue UI and HTTP
+      // acceptance: it is available synchronously while the request is held.
       state.pendingPrompts.clear();
+      state.latestLocalPrompts.clear();
       state.sessionId = "s1";
       state.workspace = state.workspaces[0];
       state.status = "Idle";
@@ -874,13 +878,13 @@ async function main(){
       pin.value = "新消息";
       const deferredSend = sendPrompt();
       await flush();
-      chk("pre-202 pending is not ArrowUp-restorable",
-          keyup() && pin.value === "旧消息"
+      chk("pending local submission restores before HTTP acceptance",
+          keyup() && pin.value === "新消息"
           && state.pendingPrompts.get(state.workspace.id + ":s1")[0].accepted === false);
       promptPostResolve({ok:true, status:202, json:async()=>({}), text:async()=>""});
       await deferredSend; await flush();
       pin.value = "";
-      chk("deferred 202 restores accepted prompt before rendered history",
+      chk("deferred 202 keeps local prompt recallable",
           keyup() && pin.value === "新消息");
 
       // Durable UserPrompt consumes exactly one ledger item, but rendered
@@ -896,9 +900,23 @@ async function main(){
       pin.value = "失败新文本";
       await sendPrompt(); await flush();
       pin.value = "";
-      chk("failed POST falls back to old rendered message",
-          keyup() && pin.value === "新消息");
+      chk("failed POST keeps failed local prompt recallable",
+          keyup() && pin.value === "失败新文本");
       promptPostStatus = 202;
+      promptPostNetFail = true;
+      pin.value = "网络失败文本";
+      await sendPrompt(); await flush();
+      pin.value = "";
+      chk("network failure keeps local prompt recallable",
+          keyup() && pin.value === "网络失败文本");
+      promptPostNetFail = false;
+
+      // The latest submission replaces the previous local candidate, including
+      // when a successful response is returned immediately.
+      pin.value = "成功 202 文本";
+      await sendPrompt(); await flush();
+      pin.value = "";
+      chk("successful 202 updates local recall", keyup() && pin.value === "成功 202 文本");
 
       // Identical accepted texts are removed FIFO, one durable event at a time.
       state.pendingPrompts.clear();
@@ -915,6 +933,10 @@ async function main(){
       // discarded and cannot become the new session's ArrowUp candidate.
       state.pendingPrompts.clear();
       state.sessionId = "s1"; state.workspace = state.workspaces[0];
+      state.latestLocalPrompts.clear();
+      // A prior local submission in another session/workspace is not eligible.
+      state.latestLocalPrompts.set(state.workspace.id + ":other-session", "other session prompt");
+      state.latestLocalPrompts.set("other-workspace:s1", "other workspace prompt");
       pin.value = "stale prompt";
       promptPostDeferred = true;
       const staleSend = sendPrompt(); await flush();

@@ -1296,9 +1296,11 @@ async function sendPrompt() {
     setBanner("⚠ 会话已结束，无法发送消息。", true);
     return;
   }
-  // Keep a pre-HTTP record so every outcome has one lifecycle. It is not
-  // ArrowUp-visible until the server accepts the request with 202.
+  // Record the local submission before clearing or awaiting HTTP. This is a
+  // composer-only recall source and does not claim server acceptance.
   const sid = state.sessionId, wid = state.workspace.id, ep = sessionOpenEpoch;
+  state.latestLocalPrompts.set(pendingPromptKey(wid, sid), text);
+  // Keep a pre-HTTP record so every outcome has one lifecycle.
   const record = addPendingPrompt(wid, sid, ep, text);
   const stillCurrent = () => state.sessionId === sid
     && state.workspace.id === wid && sessionOpenEpoch === ep;
@@ -1462,6 +1464,11 @@ function acceptedPendingPromptText() {
   return null;
 }
 
+function latestLocalPromptText() {
+  if (!state.sessionId || !state.workspace) return null;
+  return state.latestLocalPrompts.get(pendingPromptKey(state.workspace.id, state.sessionId)) || null;
+}
+
 /* 当前消息视图就是现有的 session-local 用户消息投影：history、live
    UserPrompt（即使该回合随后失败）以及会话视图缓存恢复都走 appendUserMsg。
    从后往前找有文本的用户消息；不访问其它 session 缓存，也不发请求。 */
@@ -1476,7 +1483,7 @@ function latestCurrentSessionUserText() {
 }
 
 function restoreLatestUserMessage() {
-  const text = acceptedPendingPromptText() || latestCurrentSessionUserText();
+  const text = latestLocalPromptText() || acceptedPendingPromptText() || latestCurrentSessionUserText();
   if (text === null) return false;
   els.promptInput.value = text;
   refreshComposerInput();
