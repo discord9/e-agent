@@ -4282,6 +4282,7 @@ async fn panicking_on_id_removes_registration_without_work_or_completion() {
             None,
             None, // owner_session：测试不关心发起者
             new_exit_slot(),
+            None,
             |_| panic!("controlled on_id panic"),
             move || async move {
                 work_runs_in_task.fetch_add(1, Ordering::SeqCst);
@@ -4329,6 +4330,7 @@ async fn cancel_during_on_id_suppresses_work_and_completion() {
             None,
             None, // owner_session：测试不关心发起者
             crate::tools::new_exit_slot(),
+            None,
             move |_| {
                 spawn_entered.wait();
                 spawn_release.wait();
@@ -4373,7 +4375,7 @@ async fn spawn_with_id_delivers_label_in_background_completed() {
         None,
         None,
         crate::tools::new_exit_slot(),
-        |_id| {},
+        |_| {},
         || async { "output from task".into() },
     )
     .unwrap();
@@ -4869,7 +4871,7 @@ async fn background_event_sender_is_shared_across_clones() {
         None,
         None,
         new_exit_slot(),
-        |_id| {},
+        |_| {},
         || async move { String::new() },
     );
     assert!(started.is_ok(), "spawn failed: {:?}", started);
@@ -5009,6 +5011,7 @@ async fn cancel_overrides_stale_completed_trace_with_killed() {
             None,
             None,
             exit_slot,
+            None,
             |_| {},
             move || async move {
                 *slot_for_work.lock().unwrap() = TaskExit {

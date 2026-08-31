@@ -163,3 +163,12 @@ killed notice and consume its own row. No lifecycle SQL writes are used. Failure
 the isolated temp root and clean up only the exact marker process/group and test services;
 success removes the root. Run with `GREPTIMEDB_BIN=/home/discord9/.local/share/e-agent/greptimedb/greptime`
 and the explicit isolated E2E binaries/target described by the script.
+
+## Subagent owner cleanup E2E
+
+`greptime_subagent_owner_cleanup.sh` runs isolated real-process normal and cancellation
+cases against a fresh GreptimeDB and the local deterministic mock. It requires explicit
+`GREPTIMEDB_BIN` and `EAGENT_BIN`, uses a fresh data home and dynamic ports, and rejects
+port `15403`. Both cases assert parent-completion ordering, marker-process death, exact
+parent/child `running_tasks` cleanup, and removal from `/api/tasks`. Successful runs remove
+the temporary root; failures preserve it for diagnosis.
