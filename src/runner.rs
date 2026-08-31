@@ -369,6 +369,13 @@ impl SessionTask {
             task.abort();
         }
     }
+
+    pub fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.task
+            .as_ref()
+            .expect("task already joined")
+            .abort_handle()
+    }
 }
 impl Drop for SessionTask {
     fn drop(&mut self) {

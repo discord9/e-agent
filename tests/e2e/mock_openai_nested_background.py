@@ -7,6 +7,7 @@ long-lived background command.  Tool-result requests receive a normal final
 answer, which leaves the background task itself alive in the child registry.
 """
 import json
+import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -24,26 +25,51 @@ class Handler(BaseHTTPRequestHandler):
         tools = request.get("tools", [])
         names = {tool.get("function", {}).get("name") for tool in tools}
         has_tool_result = any(message.get("role") == "tool" for message in messages)
-
-        if "delegate" in names and not has_tool_result:
-            arguments = {
-                "workspace": ".",
-                "label": "parent-delegate-live",
-                "background": True,
-                "task": (
-                    "Start one long-lived background bash task with label "
-                    "child-own-long-background, then finish."
-                ),
-            }
-            payload = self.tool_call("delegate", "call-delegate-nested", arguments)
-        elif "bash" in names and not has_tool_result:
-            payload = self.tool_call(
-                "bash",
-                "call-bash-nested",
-                {"command": f"exec -a {self.server.run_marker}-child-own-background sleep 600", "background": True},
-            )
+        if os.environ.get("EAGENT_OWNER_CLEANUP_E2E") != "1":
+            if "delegate" in names and not has_tool_result:
+                arguments = {
+                    "workspace": ".",
+                    "label": "parent-delegate-live",
+                    "background": True,
+                    "task": (
+                        "Start one long-lived background bash task with label "
+                        "child-own-long-background, then finish."
+                    ),
+                }
+                payload = self.tool_call("delegate", "call-delegate-nested", arguments)
+            elif "bash" in names and not has_tool_result:
+                payload = self.tool_call(
+                    "bash",
+                    "call-bash-nested",
+                    {"command": f"exec -a {self.server.run_marker}-child-own-background sleep 600", "background": True},
+                )
+            else:
+                payload = self.text("nested E2E mock completed the tool call")
         else:
-            payload = self.text("nested E2E mock completed the tool call")
+            prompt = " ".join(
+                message.get("content", "")
+                for message in messages
+                if message.get("role") == "user" and isinstance(message.get("content"), str)
+            )
+            case = "cancel" if "cancel" in prompt else "normal"
+            label = f"owner-cleanup-{case}"
+            if "delegate" in names and not has_tool_result:
+                payload = self.tool_call(
+                    "delegate", "call-delegate-nested", {
+                        "workspace": ".", "label": label,
+                        "task": f"Start one {case} child-owned background bash task, then finish.",
+                    }
+                )
+            elif "bash" in names and not has_tool_result:
+                seconds = "30" if case == "cancel" else "3"
+                payload = self.tool_call(
+                    "bash", "call-bash-nested", {
+                        "command": f"exec -a {self.server.run_marker}-child-own-background sleep {seconds}",
+                        "background": True,
+                    }
+                )
+            else:
+                payload = self.text("nested E2E mock completed the tool call")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")

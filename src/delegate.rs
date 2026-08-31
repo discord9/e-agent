@@ -107,26 +107,21 @@ impl DelegateCleanup {
         }
     }
 
+    #[cfg(test)]
     fn finish(mut self) {
         self.cleanup();
     }
 
-    fn cleanup(&mut self) {
-        let id = match self.id.lock() {
+    fn take_id(&self) -> Option<u64> {
+        match self.id.lock() {
             Ok(mut slot) => slot.take(),
             Err(poisoned) => poisoned.into_inner().take(),
-        };
-        let Some(id) = id else {
-            return;
-        };
-        match self.sessions.sessions.lock() {
-            Ok(mut sessions) => {
-                sessions.remove(&id);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove(&id);
-            }
         }
+    }
+
+    fn cleanup(&mut self) {
+        let Some(id) = self.take_id() else { return };
+        self.sessions.remove(id);
         if let Some(record) = &self.recovery {
             record
                 .store
@@ -138,6 +133,33 @@ impl DelegateCleanup {
 impl Drop for DelegateCleanup {
     fn drop(&mut self) {
         self.cleanup();
+    }
+}
+
+async fn finish_child_cleanup(
+    cleanup: DelegateCleanup,
+    background: &BackgroundTasks,
+    child: &crate::session_store::BackgroundRecord,
+) {
+    let Some(id) = cleanup.take_id() else { return };
+    let ids = background.abort_owned_and_join(&child.session).await;
+    for task_id in ids {
+        if let Err(error) = child
+            .store
+            .clear_background_task_durable(&child.root, &child.session, task_id)
+            .await
+        {
+            tracing::warn!("e-agent: cannot clear child background task: {error:#}");
+        }
+    }
+    cleanup.sessions.remove(id);
+    if let Some(record) = &cleanup.recovery
+        && let Err(error) = record
+            .store
+            .clear_background_task_durable(&record.root, &record.session, id)
+            .await
+    {
+        tracing::warn!("e-agent: cannot clear delegate background task: {error:#}");
     }
 }
 
@@ -497,7 +519,11 @@ impl Delegate {
         task: crate::runner::SessionTask,
     ) -> SessionResult {
         if let Err(error) = task.join().await {
-            return SessionResult::Failed(error.to_string());
+            return if error.is_cancelled() {
+                SessionResult::Cancelled
+            } else {
+                SessionResult::Failed(error.to_string())
+            };
         }
         match handle.status().borrow().clone() {
             crate::runner::SessionStatus::Finished(result) => result,
@@ -750,13 +776,20 @@ pub async fn spawn_btw_subagent(
     });
     let entry_for_hook = entry.clone();
     let hook_session_id = session_id.clone();
+    let child_record = crate::session_store::BackgroundRecord {
+        root: persist_root.clone(),
+        session: session_id.clone(),
+        store: meta_store.clone(),
+    };
+    let child_abort = runner_task.abort_handle();
     let cleanup = DelegateCleanup::new(slot, sessions.clone(), record_in.clone());
-    let record = record_in.clone();
+    let child_background = background.clone();
     let record_label = label.clone();
     let meta_label = label.clone();
     let record_session_id = session_id.clone();
     let output_session_id = session_id.clone();
-    background.spawn_with_id(
+    background.spawn_with_id_target(
+        background.sender.lock().unwrap().clone(),
         label,
         None,
         None,
@@ -769,22 +802,13 @@ pub async fn spawn_btw_subagent(
         // btw subagent: no structured exit metadata (its task never
         // "completes" — it stays registered until cancelled).
         new_exit_slot(),
+        Some(child_abort.clone()),
         move |id| {
             match slot_in_hook.lock() {
                 Ok(mut slot) => *slot = Some(id),
                 Err(poisoned) => *poisoned.into_inner() = Some(id),
             }
             sessions_hook.insert(id, entry_for_hook);
-            if let Some(record) = &record {
-                record.store.record_background_start(
-                    &record.root,
-                    &record.session,
-                    id,
-                    &record_label,
-                    None,
-                    Some(&record_session_id),
-                );
-            }
             spawn_subagent_meta_create(
                 meta_store.clone(),
                 meta_persist_root.clone(),
@@ -799,9 +823,26 @@ pub async fn spawn_btw_subagent(
         move || {
             let cleanup = cleanup;
             async move {
+                let id = cleanup.id.lock().unwrap().expect("delegate id");
+                if let Some(record) = &cleanup.recovery
+                    && let Err(error) = record
+                        .store
+                        .record_background_start_durable(
+                            &record.root,
+                            &record.session,
+                            id,
+                            &record_label,
+                            None,
+                            Some(&record_session_id),
+                        )
+                        .await
+                {
+                    tracing::warn!("e-agent: cannot record background task: {error:#}");
+                    child_abort.abort();
+                }
                 let (_, output) =
                     result_output(Delegate::runner_result(&handle, runner_task).await);
-                cleanup.finish();
+                finish_child_cleanup(cleanup, &child_background, &child_record).await;
                 format!("btw session: {output_session_id}\n{output}")
             }
         },
@@ -1185,10 +1226,17 @@ impl Tool for Delegate {
         // Owned clone for the move closures; the outer `session_id` stays
         // usable for the return messages after the spawn.
         let hook_session_id = session_id.clone();
+        let child_record = crate::session_store::BackgroundRecord {
+            root: persist_root.clone(),
+            session: session_id.clone(),
+            store: meta_store.clone(),
+        };
+        let child_abort = runner_task.abort_handle();
+        let child_abort_for_cleanup = child_abort.clone();
         let record = self.record_in.clone();
         let cleanup = DelegateCleanup::new(slot, self.sessions.clone(), record.clone());
+        let child_background = self.background.clone();
         let record_label = label.clone();
-        let record_session_id = session_id.clone();
         let output_session_id = session_id.clone();
         // The subagent's own exit metadata out-slot: `result_output`'s
         // success bool is kept (instead of being formatted away) and
@@ -1197,28 +1245,20 @@ impl Tool for Delegate {
         // registry derives it from the absent shell name).
         let exit_slot = new_exit_slot();
         let work_exit = exit_slot.clone();
-        let started = self.background.spawn_with_id(
+        let started = self.background.spawn_with_id_target(
+            self.background.sender.lock().unwrap().clone(),
             label,
             role,
             None,
             Some(task_display),
             exit_slot,
+            Some(child_abort.clone()),
             move |id| {
                 match slot_in_hook.lock() {
                     Ok(mut slot) => *slot = Some(id),
                     Err(poisoned) => *poisoned.into_inner() = Some(id),
                 }
                 sessions.insert(id, entry_for_hook);
-                if let Some(record) = &record {
-                    record.store.record_background_start(
-                        &record.root,
-                        &record.session,
-                        id,
-                        &record_label,
-                        None,
-                        Some(&record_session_id),
-                    );
-                }
                 spawn_subagent_meta_create(
                     meta_store.clone(),
                     persist_root.clone(),
@@ -1233,6 +1273,23 @@ impl Tool for Delegate {
             move || {
                 let cleanup = cleanup;
                 async move {
+                    let id = cleanup.id.lock().unwrap().expect("delegate id");
+                    if let Some(record) = &cleanup.recovery
+                        && let Err(error) = record
+                            .store
+                            .record_background_start_durable(
+                                &record.root,
+                                &record.session,
+                                id,
+                                &record_label,
+                                None,
+                                Some(&child_record.session),
+                            )
+                            .await
+                    {
+                        tracing::warn!("e-agent: cannot record background task: {error:#}");
+                        child_abort_for_cleanup.abort();
+                    }
                     let (completed, output) =
                         result_output(Self::runner_result(&handle, runner_task).await);
                     *work_exit.lock().unwrap() = TaskExit {
@@ -1240,7 +1297,7 @@ impl Tool for Delegate {
                         signal: None,
                         status: Some(if completed { "completed" } else { "failed" }.into()),
                     };
-                    cleanup.finish();
+                    finish_child_cleanup(cleanup, &child_background, &child_record).await;
                     format!("subagent session: {output_session_id}\n{output}")
                 }
             },

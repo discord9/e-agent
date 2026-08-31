@@ -16,7 +16,8 @@ pub struct BackgroundTasks {
     /// Wrapped in `Arc<Mutex<Option<_>>>` so that `Agent::new`'s
     /// `set_event_sender` on one clone (the Delegate tool's) is visible to
     /// every other clone (e.g. the LiveSession's), which share the registry.
-    sender: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>>>,
+    pub(crate) sender:
+        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>>>,
     /// Background bash timeout; `None` = no timeout (run forever).
     timeout: Option<Duration>,
     sandbox: Option<crate::config::Sandbox>,
@@ -335,7 +336,6 @@ fn truncated_tail_line(bytes: &[u8], start: usize, end: usize, budget: usize) ->
     text
 }
 
-#[derive(Clone)]
 struct RunningTask {
     id: u64,
     label: String,
@@ -345,7 +345,10 @@ struct RunningTask {
     full_command: Option<String>,
     role: Option<String>,
     process_group: Arc<AtomicI32>,
-    handle: Arc<tokio::task::JoinHandle<()>>,
+    handle: tokio::task::JoinHandle<()>,
+    /// Delegate-only cancellation target; cancelling the registry entry aborts
+    /// this child runner while leaving the wrapper entry alive.
+    cancel_target: Option<tokio::task::AbortHandle>,
     /// Tool name of the shell that ran this task ("bash"/"pwsh"); `None`
     /// for delegate tasks. Drives the `kind` shown in task lists.
     shell_name: Option<String>,
@@ -510,13 +513,23 @@ impl BackgroundTasks {
     }
 
     fn cancel_matching(&self, id: u64, matches: impl Fn(&RunningTask) -> bool) -> Option<String> {
-        let task = {
+        let (label, target, task) = {
             let mut running = self.registry.running.lock().unwrap();
             let index = running
                 .iter()
                 .position(|task| task.id == id && matches(task))?;
-            running.remove(index)
+            if let Some(target) = running[index].cancel_target.clone() {
+                (running[index].label.clone(), Some(target), None)
+            } else {
+                let task = running.remove(index);
+                (task.label.clone(), None, Some(task))
+            }
         };
+        if let Some(target) = target {
+            target.abort();
+            return Some(label);
+        }
+        let task = task.expect("ordinary task was removed");
         task.handle.abort();
         if let Some(done) = task.completion.lock().unwrap().take() {
             let mut exit = task.exit.lock().unwrap();
@@ -676,6 +689,7 @@ impl BackgroundTasks {
             None, // display_meta
             owner_session,
             exit_slot.clone(),
+            None,
             move |id| {
                 let mut running = running.running.lock().unwrap();
                 if let Some(task) = running.iter_mut().find(|task| task.id == id) {
@@ -763,13 +777,14 @@ impl BackgroundTasks {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
-        self.spawn_with_id_to(
+        self.spawn_with_id_target(
             self.sender.lock().unwrap().clone(),
             label,
             role,
             process_group,
             display_meta,
             exit_slot,
+            None,
             on_id,
             work,
         )
@@ -791,6 +806,36 @@ impl BackgroundTasks {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
     {
+        self.spawn_with_id_target(
+            sender,
+            label,
+            role,
+            process_group,
+            display_meta,
+            exit_slot,
+            None,
+            on_id,
+            work,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_id_target<F, Fut>(
+        &self,
+        sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+        label: String,
+        role: Option<String>,
+        process_group: Option<Arc<AtomicI32>>,
+        display_meta: Option<TaskDisplayMeta>,
+        exit_slot: ExitSlot,
+        cancel_target: Option<tokio::task::AbortHandle>,
+        on_id: impl FnOnce(u64),
+        work: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = String> + Send + 'static,
+    {
         let sender = sender
             .filter(|sender| !sender.is_closed())
             .ok_or("background task delivery is unavailable")?;
@@ -800,11 +845,9 @@ impl BackgroundTasks {
             role,
             process_group,
             display_meta,
-            // Delegate tasks are spawned by the main session's Delegate tool
-            // (subagents never delegate); the listing session id is already
-            // the initiator, so no separate owner.
             None,
             exit_slot,
+            cancel_target,
             on_id,
             work,
             move |id, output, trace| {
@@ -823,6 +866,29 @@ impl BackgroundTasks {
         )
     }
 
+    /// Abort and join every task registered by exactly `owner`.
+    pub async fn abort_owned_and_join(&self, owner: &str) -> Vec<u64> {
+        let tasks = {
+            let mut running = self.registry.running.lock().unwrap();
+            let mut tasks = Vec::new();
+            let mut index = 0;
+            while index < running.len() {
+                if running[index].owner_session.as_deref() == Some(owner) {
+                    tasks.push(running.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            tasks
+        };
+        let ids = tasks.iter().map(|task| task.id).collect::<Vec<_>>();
+        for task in tasks {
+            task.handle.abort();
+            let _ = task.handle.await;
+        }
+        ids
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_inner<F, Fut>(
         &self,
@@ -832,6 +898,7 @@ impl BackgroundTasks {
         display_meta: Option<TaskDisplayMeta>,
         owner_session: Option<String>,
         exit_slot: ExitSlot,
+        cancel_target: Option<tokio::task::AbortHandle>,
         on_id: impl FnOnce(u64),
         work: F,
         on_complete: impl FnOnce(u64, String, BackgroundTrace) + Send + 'static,
@@ -889,7 +956,8 @@ impl BackgroundTasks {
             full_command: None,
             role,
             process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),
-            handle: Arc::new(handle),
+            handle,
+            cancel_target,
             shell_name: None,
             output: None,
             spool: None,
@@ -951,6 +1019,39 @@ mod tests {
     /// `start`（主会话便捷入口）owner 为 None；`start_with_sender` 显式传
     /// `owner_session`（subagent 的 bash）时 `running()` 原样透出——任务面板
     /// 据此显示真正的发起者，而不是 registry 所属会话。
+    #[tokio::test]
+    async fn abort_owned_and_join_preserves_other_owners() {
+        let background = BackgroundTasks::new(None, None);
+        for owner in [Some("owner-a".into()), Some("owner-b".into()), None] {
+            background
+                .spawn_inner(
+                    "pending".into(),
+                    None,
+                    None,
+                    None,
+                    owner,
+                    new_exit_slot(),
+                    None,
+                    |_| {},
+                    || async { std::future::pending::<String>().await },
+                    |_, _, _| {},
+                )
+                .unwrap();
+        }
+        assert_eq!(background.abort_owned_and_join("owner-a").await, vec![1]);
+        assert_eq!(
+            background
+                .running()
+                .iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        background.cancel(2);
+        background.cancel(3);
+        assert!(background.running().is_empty());
+    }
+
     #[tokio::test]
     async fn start_owner_session_shows_in_running() {
         let mut background = BackgroundTasks::new(None, None);

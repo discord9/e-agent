@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::{AssistantMessage, Message, Model, ModelDeltaKind, Usage};
+use crate::session::Session;
 use crate::tools::builtins;
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2206,12 +2207,111 @@ fn bash_tool_call_delta(arguments: &str) -> Value {
 }
 
 #[tokio::test]
-async fn background_delegate_with_detached_daemon_finalizes_and_keeps_daemon() {
+async fn background_delegate_cancel_aborts_child_before_wrapper_completion() {
+    // The public cancel path targets the child runner, not the wrapper. The
+    // wrapper remains until its cleanup has reaped the child's owned task.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let base_url = scripted_chat(vec![
+        (
+            bash_tool_call_delta(r#"{"command":"sleep 30","background":true}"#),
+            "tool_calls",
+        ),
+        (json!({"content":"cancelled"}), "stop"),
+    ])
+    .await;
+    let mut tool = delegate_with_url(temp.path(), base_url)
+        .persist_sessions(root.clone())
+        .record_background_tasks_in(root.clone(), "parent", SessionStore::Jsonl);
+    let background = tool.background.clone();
+    let sessions = tool.sessions.clone();
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+    let answer = tool
+        .execute(json!({"task":"run","workspace":temp.path()}))
+        .await
+        .unwrap()
+        .content;
+    let session_id = answer
+        .lines()
+        .nth(1)
+        .unwrap()
+        .strip_prefix("subagent session: ")
+        .unwrap()
+        .to_owned();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (delegate_id, bash_id) = loop {
+        let running = background.running();
+        let delegate = running.iter().find(|task| {
+            task.display_meta
+                .as_ref()
+                .and_then(|m| m.subagent_session_id.as_deref())
+                == Some(session_id.as_str())
+        });
+        let bash = running.iter().find(|task| {
+            task.kind == "bash" && task.owner_session.as_deref() == Some(session_id.as_str())
+        });
+        if let (Some(delegate), Some(bash)) = (delegate, bash) {
+            break (delegate.id, bash.id);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delegate and owned bash did not both register: {running:?}"
+        );
+        tokio::task::yield_now().await;
+    };
+    assert_ne!(delegate_id, bash_id);
+
+    // Repeated cancellation still targets the live wrapper while its child
+    // cleanup is in progress; it must not remove or publish the wrapper early.
+    assert!(background.cancel(delegate_id).is_some());
+    assert!(background.cancel(delegate_id).is_some());
+    assert!(
+        background
+            .running()
+            .iter()
+            .any(|task| task.id == delegate_id),
+        "child cancellation must leave the delegate wrapper registered"
+    );
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), completions.recv())
+        .await
+        .expect("timed out waiting for cancelled delegate completion")
+        .unwrap();
+    let output = match event {
+        AgentEvent::BackgroundCompleted { id, output, .. } => {
+            assert_eq!(id, delegate_id);
+            output
+        }
+        other => panic!("expected cancelled delegate completion, got {other:?}"),
+    };
+    assert_eq!(
+        output,
+        format!("subagent session: {session_id}\nsubagent cancelled")
+    );
+    assert!(background.running().is_empty());
+    assert!(sessions.sessions.lock().unwrap().is_empty());
+    assert!(
+        Session::take_unfinished_background(&root, &session_id).is_empty(),
+        "owned bash record must be cleared"
+    );
+    assert!(
+        Session::take_unfinished_background(&root, "parent").is_empty(),
+        "parent delegate record must be cleared"
+    );
+    assert!(
+        completions.try_recv().is_err(),
+        "exactly one completion is sent"
+    );
+}
+
+#[tokio::test]
+async fn background_delegate_with_detached_daemon_finalizes_and_reaps_daemon() {
     // The subagent starts a detached daemon and then outputs its final
-    // report. FinishWhenIdle must finalize despite the live daemon: the
-    // wrapper completes and delivers exactly one BackgroundCompleted, the
-    // subagent's Sessions entry and the delegate task are cleaned up, and
-    // the daemon stays in the shared registry.
+    // report. FinishWhenIdle finalizes after the child cleanup reaps the
+    // daemon: the wrapper completes and delivers exactly one
+    // BackgroundCompleted, and the subagent's Sessions entry and all owned
+    // tasks are cleaned up.
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     let base_url = scripted_chat(vec![
@@ -2240,7 +2340,7 @@ async fn background_delegate_with_detached_daemon_finalizes_and_keeps_daemon() {
         .await
         .unwrap()
         .content;
-    let delegate_task_id: u64 = answer
+    let _delegate_task_id: u64 = answer
         .strip_prefix("started background task ")
         .and_then(|s| s.split(':').next())
         .and_then(|s| s.trim().parse().ok())
@@ -2266,20 +2366,17 @@ async fn background_delegate_with_detached_daemon_finalizes_and_keeps_daemon() {
         "exactly one completion is sent"
     );
 
-    // Cleanup ran: the subagent's Sessions entry is gone and the delegate
-    // task left the registry. The detached daemon remains.
+    // Cleanup ran: the subagent's Sessions entry and all owned tasks are gone.
     assert!(sessions.sessions.lock().unwrap().is_empty());
     assert!(
         crate::session::Session::take_unfinished_background(&root, "parent").is_empty(),
         "the finished delegate must clear its killed-on-exit record"
     );
     let running = background.running();
-    assert_eq!(running.len(), 1, "only the daemon remains: {running:?}");
-    assert_eq!(running[0].kind, "bash");
-    assert_ne!(running[0].id, delegate_task_id);
-    // Explicit cancel so the sleep process does not leak past the test.
-    background.cancel(running[0].id);
-    assert!(background.running().is_empty());
+    assert!(
+        running.is_empty(),
+        "no child or wrapper task survives: {running:?}"
+    );
 }
 
 #[tokio::test]
