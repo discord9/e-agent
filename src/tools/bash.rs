@@ -80,9 +80,9 @@ pub(super) struct Bash {
 impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
         #[cfg(windows)]
-        let mut description = "Run a shell command with the workspace as its current directory. Without the Windows write sandbox, the command retains ambient host filesystem access; file-tool capabilities are an independent boundary.".to_owned();
+        let mut description = "Run a shell command with the workspace as its current directory. Decision rule: for async commands, prefer `background: true` without `detached`; if unsure, use `background: true` without `detached`. Without the Windows write sandbox, the command retains ambient host filesystem access; file-tool capabilities are an independent boundary.".to_owned();
         #[cfg(not(windows))]
-        let mut description = "Run a shell command with the workspace as its current directory. Without bubblewrap, the command retains ambient host filesystem access; file-tool capabilities are an independent boundary.".to_owned();
+        let mut description = "Run a shell command with the workspace as its current directory. Decision rule: for async commands, prefer `background: true` without `detached`; if unsure, use `background: true` without `detached`. Without bubblewrap, the command retains ambient host filesystem access; file-tool capabilities are an independent boundary.".to_owned();
         // Tell the model which shell syntax to use (pwsh on Windows, bash
         // elsewhere).
         description.push_str(self.shell.syntax_hint);
@@ -159,8 +159,8 @@ impl Tool for Bash {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "shell command"},
-                    "background": {"type": "boolean", "description": "run without blocking; completion is delivered as an event and injected into the next model turn"},
-                    "detached": {"type": "boolean", "description": "only with background:true — run a daemon, long-lived service, or watcher that must NOT block this session from finishing and whose completion is never delivered. Use the default non-detached background for ordinary async builds/tests/downloads whose completion you want to react to"}
+                    "background": {"type": "boolean", "description": "default for async builds, tests, downloads, translations, scripts, and long computations expected to finish; runs without blocking, completion is delivered, and the session waits/reacts"},
+                    "detached": {"type": "boolean", "description": "RARE: ONLY for intentionally persistent daemon, service, or watcher processes. Requires background:true; completion is never delivered and this does not keep the session alive. NEVER use for builds/tests/downloads/translations/scripts or any command whose result/output the agent needs"}
                 },
                 "required": ["command"]
             }),

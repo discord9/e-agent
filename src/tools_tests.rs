@@ -1447,6 +1447,53 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
 }
 
 #[test]
+fn bash_spec_explains_async_command_choice_and_preserves_schema() {
+    let temp = tempfile::tempdir().unwrap();
+    let (tool, _) = background_bash(&temp, Duration::from_secs(30));
+    let spec = tool.spec();
+    let properties = spec.parameters.get("properties").unwrap();
+    let description = spec.description;
+    let background = properties["background"]["description"].as_str().unwrap();
+    let detached = properties["detached"]["description"].as_str().unwrap();
+
+    assert!(description.contains("if unsure, use `background: true` without `detached`"));
+    assert!(
+        ["builds", "tests", "downloads", "translations", "scripts"]
+            .iter()
+            .all(|example| background.contains(example))
+            && background.contains("long computations expected to finish")
+            && background.contains("completion is delivered")
+            && background.contains("session waits/reacts")
+    );
+    assert!(
+        detached.starts_with("RARE: ONLY")
+            && detached.contains("Requires background:true")
+            && detached.contains("completion is never delivered")
+            && detached.contains("does not keep the session alive")
+            && detached.contains("NEVER use for builds/tests/downloads/translations/scripts")
+            && detached.contains("whose result/output the agent needs")
+    );
+    assert_eq!(spec.parameters["type"], json!("object"));
+    assert_eq!(spec.parameters["required"], json!(["command"]));
+    assert_eq!(properties["command"]["type"], json!("string"));
+    assert_eq!(properties["background"]["type"], json!("boolean"));
+    assert_eq!(properties["detached"]["type"], json!("boolean"));
+    assert!(properties["background"].get("default").is_none());
+    assert!(properties["detached"].get("default").is_none());
+}
+
+#[tokio::test]
+async fn bash_detached_requires_background() {
+    let temp = tempfile::tempdir().unwrap();
+    let (tool, _) = background_bash(&temp, Duration::from_secs(30));
+    let error = tool
+        .execute(json!({"command": "true", "detached": true}))
+        .await
+        .unwrap_err();
+    assert!(error.contains("detached` requires `background: true"));
+}
+
+#[test]
 fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
