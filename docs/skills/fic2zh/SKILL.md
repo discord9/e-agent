@@ -26,12 +26,13 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 2. **en 字段逐字节等于源文件**（含换行与末尾换行状态）。译文 json 的 `en` 是从 seg 文件复制出来的，不是重写的。
 3. **先建基准，再翻译**：抓取后立刻把原文固化进 `<book>_zh/segs/`，翻译前先对账，翻译后全量复检。
 4. 对话用「」，引号嵌套用『』；原文拼写错误 en 照实保留、zh 按正确含义译。
-5. 术语表按书维护（`glossary_zh-CN.csv`，格式 `source,target,zh-CN`）；新书若同 fandom 可从旧书继承，否则从高频专名扫描冷启动 + 补充。
-6. 成品命名：`<book>_zh_en.*`（中英对照）/ `<book>_zh_only.*`（纯中文）。
-7. 校对发现的术语裁定要**回写术语表**，下一本/下一轮不再犯。
-8. **译者必须亲自翻译，禁止套娃模型或机器翻译。** 交给 SubAgent 的每个翻译单元，必须由运行该任务的智能模型逐行阅读、理解并亲自完成。严禁安装、下载、调用或转交给 Argos、任何本地/更小模型、机器翻译引擎、在线翻译服务、翻译 API、浏览器翻译或生成译文的脚本；严禁把机器译文后编辑后冒充亲自翻译。程序只可用于切段、序列化和机械验证，不得生成 `zh`。无法亲自完成时必须报告未完成单元，不能走捷径。
-9. **权威格式由项目工作区决定，不得硬编码 Markdown。** 对 canonical JSON/JSONL 工作区，canonical JSON/JSONL 是唯一英文真相源，translation JSON/JSONL 是唯一中文真相源；ID、顺序、schema 和复制的 `en` 必须原样保留，只能亲自填写指定的 `zh`/摘要字段。TXT、Markdown、aggregate、context、memory 和 EPUB 均为派生产物，除非该任务明确另有声明；不得从派生产物反向覆盖权威数据。只有任务明确指定 Markdown 为权威输出时才写 Markdown。
-10. **从零重译不得参考污染译文。** 若任务声明现有译文无效、受污染或要求 from scratch，译者不得读取、复制、润色或后编辑旧 `zh`；只能依据 canonical 英文、术语表和经批准的上下文重新翻译。
+5. **注释属于正文语义和 EPUB 结构的一部分。** 原文已有的脚注、尾注、作者注、编者注、弹窗注释、注号、反向链接和注释标题必须完整翻译或按项目约定保留原文，并保持 note↔noteref 锚点、编号、顺序和跳转关系；不得因扁平化正文而漏译、吞并或移位。遇到目标读者无法从正文理解、且确有文化/语言/双关/典故解释必要时，可添加简短克制的`译者注`，但不得用注释替代准确翻译、解释显而易见内容、剧透或编造资料。新增译者注必须记录对应 unit ID、理由和注释文本，使用项目既有注释结构；若无既有结构或是否需要注释存在争议，列为 suspect/editorial decision，不得擅自发明渲染机制。
+6. 术语表按书维护（`glossary_zh-CN.csv`，格式 `source,target,zh-CN`）；新书若同 fandom 可从旧书继承，否则从高频专名扫描冷启动 + 补充。
+7. 成品命名：`<book>_zh_en.*`（中英对照）/ `<book>_zh_only.*`（纯中文）。
+8. 校对发现的术语裁定要**回写术语表**，下一本/下一轮不再犯。
+9. **译者必须亲自翻译，禁止套娃模型或机器翻译。** 交给 SubAgent 的每个翻译单元，必须由运行该任务的智能模型逐行阅读、理解并亲自完成。严禁安装、下载、调用或转交给 Argos、任何本地/更小模型、机器翻译引擎、在线翻译服务、翻译 API、浏览器翻译或生成译文的脚本；严禁把机器译文后编辑后冒充亲自翻译。程序只可用于切段、序列化和机械验证，不得生成 `zh`。无法亲自完成时必须报告未完成单元，不能走捷径。
+10. **权威格式由项目工作区决定，不得硬编码 Markdown。** 对 canonical JSON/JSONL 工作区，canonical JSON/JSONL 是唯一英文真相源，translation JSON/JSONL 是唯一中文真相源；ID、顺序、schema 和复制的 `en` 必须原样保留，只能亲自填写指定的 `zh`/摘要字段。TXT、Markdown、aggregate、context、memory 和 EPUB 均为派生产物，除非该任务明确另有声明；不得从派生产物反向覆盖权威数据。只有任务明确指定 Markdown 为权威输出时才写 Markdown。
+11. **从零重译不得参考污染译文。** 若任务声明现有译文无效、受污染或要求 from scratch，译者不得读取、复制、润色或后编辑旧 `zh`；只能依据 canonical 英文、术语表和经批准的上下文重新翻译。
 
 ## 工作流
 
@@ -229,7 +230,8 @@ translate_tool.py context --segment segs/ch13_seg0.txt --memory <book>_zh/memory
 6) 遇到缩写/异族语/高概念词/易误解译名，顺手登记进 <book>_zh/glossary_notes.csv（source,note 两列，与术语表同目录）；
 7) 你必须亲自逐单元翻译；严禁 Argos、任何本地/更小模型、机器翻译引擎、在线翻译服务、翻译 API 或脚本生成 zh，严禁后编辑机器译文冒充亲译；
 8) 严格采用本任务指定的权威格式。若输入/输出为 canonical/translation JSON(L)，不得改写为 Markdown/TXT；ID、顺序、schema、en 必须精确保留；
-9) 若标明 from scratch/旧译污染，禁止读取或参考旧 zh。
+9) 若标明 from scratch/旧译污染，禁止读取或参考旧 zh；
+10) 原文脚注、尾注、作者注、编者注和弹窗注释必须翻译并保持编号、锚点、反向链接与顺序。确有文化、双关、典故理解门槛时，可按项目既有结构提出简短克制的译者注；新增注释须报告 unit ID、理由和文本，存在争议或无既有注释结构时列为 suspect，不得擅自造渲染机制。
 【验证】python3 -c "…断言 en==源文件、结构正确…" 全部 OK 才算完成；机械验证之外，必须逐单元重读 EN↔ZH，确认无漏译、截断或擅自简化
 【返回】summary / changes / verification / 每章 zh 字数 / 新造译名清单 / 新增 notes 条目清单 / 不确定处
 ```
@@ -345,8 +347,8 @@ REPORT_PATH: <sole allowed report path>
 
 Phase 1 — authority/continuity: assert exact IDs/order/schema/en replay and read adjacent canonical/current translation.
 Phase 2 — context QA: read supplied historical contexts and directly audit their glossary hits, book summary, recent chapters, chapter recap, prior translated text, and current source against current authoritative files. Do not regenerate context in ordinary chapter QA. If this task explicitly repairs context, run only the supplied scoped repair-verification commands afterward.
-Phase 3 — exhaustive semantic QA: compare every canonical row to current zh using accurate adjacent context; partition every row exactly once into CONFIRMED / SUSPECT / CLEAN. Bad context never excuses a bad translation and must not be silently corrected in the report.
-Phase 4 — artifacts/render: verify translation truth → TXT/aggregate → rendered XHTML, navigation, anchors, CRC/XML.
+Phase 3 — exhaustive semantic QA: compare every canonical row to current zh using accurate adjacent context; partition every row exactly once into CONFIRMED / SUSPECT / CLEAN. Bad context never excuses a bad translation and must not be silently corrected in the report. 同时检查原文注释是否完整翻译，以及是否存在确有必要但缺失的译者注；新增译者注属于 editorial/suspect，除非项目已有明确裁定。
+Phase 4 — artifacts/render: verify translation truth → TXT/aggregate → rendered XHTML, navigation, notes/noteref/backlinks, anchors, CRC/XML；注释编号、目标、返回链接、顺序和弹窗/跨页语义必须保留。
 
 Path constraints: product files read-only; only REPORT_PATH may be written.
 Return: total/confirmed/suspect/clean counts and full IDs; historical-context verdict（若无历史 context 则明确 NONE）; each context defect with source evidence; artifact/render verdict; report SHA.
