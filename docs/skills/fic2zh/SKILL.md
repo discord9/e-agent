@@ -29,6 +29,9 @@ Do NOT use when: 只是零星翻译一段文本（无章/无书结构）；翻�
 5. 术语表按书维护（`glossary_zh-CN.csv`，格式 `source,target,zh-CN`）；新书若同 fandom 可从旧书继承，否则从高频专名扫描冷启动 + 补充。
 6. 成品命名：`<book>_zh_en.*`（中英对照）/ `<book>_zh_only.*`（纯中文）。
 7. 校对发现的术语裁定要**回写术语表**，下一本/下一轮不再犯。
+8. **译者必须亲自翻译，禁止套娃模型或机器翻译。** 交给 SubAgent 的每个翻译单元，必须由运行该任务的智能模型逐行阅读、理解并亲自完成。严禁安装、下载、调用或转交给 Argos、任何本地/更小模型、机器翻译引擎、在线翻译服务、翻译 API、浏览器翻译或生成译文的脚本；严禁把机器译文后编辑后冒充亲自翻译。程序只可用于切段、序列化和机械验证，不得生成 `zh`。无法亲自完成时必须报告未完成单元，不能走捷径。
+9. **权威格式由项目工作区决定，不得硬编码 Markdown。** 对 canonical JSON/JSONL 工作区，canonical JSON/JSONL 是唯一英文真相源，translation JSON/JSONL 是唯一中文真相源；ID、顺序、schema 和复制的 `en` 必须原样保留，只能亲自填写指定的 `zh`/摘要字段。TXT、Markdown、aggregate、context、memory 和 EPUB 均为派生产物，除非该任务明确另有声明；不得从派生产物反向覆盖权威数据。只有任务明确指定 Markdown 为权威输出时才写 Markdown。
+10. **从零重译不得参考污染译文。** 若任务声明现有译文无效、受污染或要求 from scratch，译者不得读取、复制、润色或后编辑旧 `zh`；只能依据 canonical 英文、术语表和经批准的上下文重新翻译。
 
 ## 工作流
 
@@ -223,10 +226,166 @@ translate_tool.py context --segment segs/ch13_seg0.txt --memory <book>_zh/memory
 【标题段】segs 首段 "Chapter N" 只作为 md/md_zh 首行「# 第N章」标题，不进入正文段落对（md_zh 非空段数 == segs 非空段数、md 的 EN 块数 == segs 段数 − 1）
 【要求】1) 术语表 <book>_zh/glossary_zh-CN.csv 先读全文，表外新词按该 fandom 通行译名+本作惯例新译并报告；
 2) 人名一律保留英文不音译；3) 对话用「」，嵌套用『』；4) en 拼写错误照实保留、zh 按正确含义译；5) 简体中文；
-6) 遇到缩写/异族语/高概念词/易误解译名，顺手登记进 <book>_zh/glossary_notes.csv（source,note 两列，与术语表同目录）
-【验证】python3 -c "…断言 en==源文件、结构正确…" 全部 OK 才算完成
+6) 遇到缩写/异族语/高概念词/易误解译名，顺手登记进 <book>_zh/glossary_notes.csv（source,note 两列，与术语表同目录）；
+7) 你必须亲自逐单元翻译；严禁 Argos、任何本地/更小模型、机器翻译引擎、在线翻译服务、翻译 API 或脚本生成 zh，严禁后编辑机器译文冒充亲译；
+8) 严格采用本任务指定的权威格式。若输入/输出为 canonical/translation JSON(L)，不得改写为 Markdown/TXT；ID、顺序、schema、en 必须精确保留；
+9) 若标明 from scratch/旧译污染，禁止读取或参考旧 zh。
+【验证】python3 -c "…断言 en==源文件、结构正确…" 全部 OK 才算完成；机械验证之外，必须逐单元重读 EN↔ZH，确认无漏译、截断或擅自简化
 【返回】summary / changes / verification / 每章 zh 字数 / 新造译名清单 / 新增 notes 条目清单 / 不确定处
 ```
+
+## SubAgent 标准委派模板（Main 必须先填完整，禁止让执行者重新发现工作区）
+
+### Main 委派前置清单
+
+任何翻译、章节 QA、摘要 QA、二次抽样、suspect 裁决或修复任务，Main 都必须先在主上下文中完成一次轻量预检，并把结果直接写入任务合同。**不得让 SubAgent 自己用 `find/grep` 猜工具、真相源、章节键或文件命名。**至少填写：
+
+1. `VOLUME_ROOT`：目标卷根目录。
+2. `CANONICAL_FILES`：本任务全部 canonical JSON/JSONL 的精确路径和顺序。
+3. `TRANSLATION_FILES`：对应 translation JSON/JSONL 的精确路径和顺序。
+4. `UNIT_SET`：章节/segment 键、预期行数、首尾 ID、分段计数。
+5. `AUTHORITY_CHAIN`：该卷 canonical → translation → derived artifacts → EPUB 的明确关系。
+6. `BOOK_SUMMARY`、`GLOSSARY`、`MEMORY`、`CHAPTERS`：精确路径；不存在时明确写 `NONE`，不能让执行者猜。
+7. `HISTORICAL_CONTEXT_FILES`：翻译时保存的 context 精确路径；不存在时写 `NONE`。
+8. `CONTEXT_TOOL`：经 Main 阅读 `--help` 确认的精确脚本路径；若该卷不兼容现有工具，明确写 `NONE`，不得让执行者临时造适配器。
+9. `CONTEXT_REPAIR_VERIFICATION_COMMANDS`：仅当本任务明确修复 context 工具、摘要、memory 或历史 context 时提供；普通章节语义 QA 填 `NOT_NEEDED`，不要求重新生成 context。
+10. `MATERIALIZATION_FILES`、`RENDERED_EPUB`、章节 XHTML/nav/NCX 目标：精确路径或成员名。
+11. `REPORT_PATH`：唯一允许写入的 QA 报告路径。
+12. `VERIFICATION_COMMANDS`：完整命令，Python 必须按项目要求指定缓存，例如 `UV_CACHE_DIR="$PWD/.uv-cache" uv run python ...`。
+
+如果以上信息缺失，Main 必须先直接读取少量文件或运行 `--help` 补齐；只有真正需要跨卷来源审计时才委派 Explorer。**不能把“发现怎样执行任务”塞给负责语义工作的 Agent。**
+
+### 固定执行资料包：每卷发现一次，所有任务复用
+
+Main 第一次处理一卷时，必须建立并维护一个该卷的固定执行资料包；后续翻译、QA、裁决、修复任务只引用并展开它，不得让每个 Agent 重复发现。资料包至少包含：
+
+```text
+VOLUME_ROOT
+AUTHORITY_CHAIN
+CANONICAL_INDEX（章节/segment → 精确路径、行数、首尾 ID）
+TRANSLATION_INDEX（对应精确路径）
+DERIVED_INDEX（TXT/aggregate/memory/context）
+BOOK_SUMMARY / GLOSSARY / MEMORY / CHAPTERS
+CONTEXT_TOOL + 已验证 CLI 版本/参数
+HISTORICAL_CONTEXT_INDEX
+CONTEXT_REPAIR_VERIFICATION_TEMPLATE（仅 context 修复任务使用）
+RENDER_TOOL / BUILD_TOOL / VALIDATION_TOOLS
+EPUB_PATH + OPF/nav/NCX/chapter member 映射
+项目环境命令（如 UV_CACHE_DIR）
+```
+
+- Main 只在资料包首次建立或工作区结构真实变化时重新发现；同卷后续 20 个章节任务复用同一份索引和命令模板。
+- 每个具体任务只填章节变量：章节键、segment 列表、行数/ID、相邻章节、报告路径、抽样规则或 finding IDs。
+- 执行 Agent 禁止 broad `find`、目录遍历、阅读工具源码、运行 `--help` 或参考邻卷来补齐委派合同。
+- 若资料包字段缺失或矛盾，Agent 返回 `TASK_PACKET_INCOMPLETE: <fields>`，不得自行探索，也不得开始语义工作。
+- Main 接收该错误后补资料包并重新委派；不得要求 Agent “自己找一下”。
+
+### Context 证据规则（按需，禁止每章重复重建）
+
+- **翻译任务**：Main 必须在每个 segment 翻译前用当前 glossary/memory/chapters 生成一次 context，译者直接读取该明确路径。这是顺序翻译的必要输入。
+- **普通章节语义 QA**：读取翻译当时保存的历史 context（若存在），用于判断译者当时是否受到错误梗概、术语或上文误导；同时直接读取当前 book summary、glossary、memory/chapters 和相邻 canonical/translation 作为事实证据。**不重新运行 context 工具。**
+- **专门 summary/context QA**：一卷一个 Agent，集中审 book summary、chapters、memory 和历史 contexts，避免每章重复同样劳动。
+- **context 修复后的专项验证**：只有在本任务实际修改了 context 工具、摘要、memory 或 context 文件时，才针对受影响 segment 重新生成并验证一次；不扩散到无关章节。
+- 历史 context 只读，不得被临时输出覆盖。对其已有区块检查 `[术语表]`、`[全书梗概]`、最近章节/全篇背景、`[本章回顾]`、`[上文]`、`[当前待译片段]`；错书、错章、陈旧、空缺、未来信息泄漏和严重失真单独记为 context defect。
+
+### 模板 A：顺序翻译一个 segment
+
+```text
+Goal: 按 fic2zh 顺序流程亲自翻译 <VOLUME>/<SEGMENT>。
+VOLUME_ROOT: <exact>
+CANONICAL_FILES: <exact ordered paths>
+TRANSLATION_FILES: <exact output paths>
+UNIT_SET: <count, first/last IDs>
+AUTHORITY_CHAIN: <exact>
+BOOK_SUMMARY: <exact or NONE>
+GLOSSARY: <exact>
+MEMORY: <exact>
+CHAPTERS: <exact>
+GENERATED_CONTEXT: <Main 已运行 context 工具生成的精确路径>
+CANON_OVERRIDES: <explicit list or NONE>
+
+先读 GENERATED_CONTEXT、canonical、全书梗概和 glossary；由当前智能模型亲自逐单元翻译。严禁 Argos、本地/更小模型、MT 引擎/API/服务/脚本生成 zh，严禁参考污染旧译。只写 TRANSLATION_FILES；保持 ID/顺序/schema/en byte-exact。
+
+完成后人工逐单元 EN↔ZH 复读，再运行：
+<exact validation commands>
+
+Return: 行数、术语裁定、≤40字 segment summary、不确定 ID、验证结果。
+```
+
+Main 接收后必须先复验，再运行任务合同中预先写好的：
+
+```text
+<MEMORY APPEND exact command>
+<CHAPTERS SUMMARIZE exact command>
+<NEXT SEGMENT CONTEXT exact command>
+```
+
+不得并行翻译依赖尚未生成的后续 context。
+
+### 模板 B：章节 exhaustive EN→ZH + context QA
+
+```text
+Goal: exhaustive QA <VOLUME>/<CHAPTER>；逐行语义/canon QA，并按需审计翻译时保存的历史 context；普通章节 QA 不重新生成 context。
+VOLUME_ROOT: <exact>
+CANONICAL_FILES: <exact ordered paths>
+TRANSLATION_FILES: <exact ordered paths>
+UNIT_SET: <segment counts, total, first/last IDs>
+AUTHORITY_CHAIN: <exact>
+BOOK_SUMMARY: <exact or NONE>
+GLOSSARY: <exact>
+MEMORY: <exact or NONE>
+CHAPTERS: <exact or NONE>
+HISTORICAL_CONTEXT_FILES: <exact ordered paths or NONE>
+CONTEXT_TOOL: <exact path or NONE; ordinary chapter QA does not run it>
+CONTEXT_REPAIR_VERIFICATION_COMMANDS: <NOT_NEEDED for ordinary QA; exact commands only when this task repairs context>
+ADJACENT_CANONICAL_FILES: <previous/next exact paths>
+MATERIALIZATION_FILES: <exact paths>
+RENDERED_EPUB: <exact path and chapter member/nav targets>
+REPORT_PATH: <sole allowed report path>
+
+Phase 1 — authority/continuity: assert exact IDs/order/schema/en replay and read adjacent canonical/current translation.
+Phase 2 — context QA: read supplied historical contexts and directly audit their glossary hits, book summary, recent chapters, chapter recap, prior translated text, and current source against current authoritative files. Do not regenerate context in ordinary chapter QA. If this task explicitly repairs context, run only the supplied scoped repair-verification commands afterward.
+Phase 3 — exhaustive semantic QA: compare every canonical row to current zh using accurate adjacent context; partition every row exactly once into CONFIRMED / SUSPECT / CLEAN. Bad context never excuses a bad translation and must not be silently corrected in the report.
+Phase 4 — artifacts/render: verify translation truth → TXT/aggregate → rendered XHTML, navigation, anchors, CRC/XML.
+
+Path constraints: product files read-only; only REPORT_PATH may be written.
+Return: total/confirmed/suspect/clean counts and full IDs; historical-context verdict（若无历史 context 则明确 NONE）; each context defect with source evidence; artifact/render verdict; report SHA.
+Verification commands: <complete commands>. No pytest unless explicitly requested.
+```
+
+### 模板 C：全书梗概 / chapters / memory 摘要 QA
+
+每次**一卷一个 Agent**，禁止一个 Agent 同时审多卷。
+
+```text
+Goal: exhaustive summary QA for <ONE VOLUME ONLY>。
+CANONICAL_INDEX: <all chapter/segment exact paths or machine-readable manifest>
+TRANSLATION_INDEX: <exact>
+BOOK_SUMMARY: <exact or NONE>
+CHAPTERS: <exact or NONE>
+MEMORY_FILES: <exact list or NONE>
+GLOSSARY: <exact>
+
+机械枚举所有 canonical segment、memory record、chapter/segment summary，随后逐条对照原文和当前译文。检查缺失/空值、错书串入、人物/行动/指代错误、时间线颠倒、无依据编造、会误导后续译者的重大遗漏、修复后陈旧、canon 冲突。普通压缩不是缺陷。
+
+Read-only；返回精确覆盖率，以及每条缺陷的 key、原摘要、建议摘要、canonical 证据；全书梗概给出 SAFE/REPAIR/REBUILD verdict。
+```
+
+### 模板 D：第二轮风险加权抽样 QA
+
+```text
+Goal: 对已完成第一轮 exhaustive QA 的 <ONE VOLUME> 做独立第二轮抽样。
+CANONICAL_INDEX / TRANSLATION_INDEX / CONTEXT inputs / exact commands: <Main 全部填好>
+SAMPLE_RULE: 至少 <N%>，跨全部章节分层；加权长句、否定/比较、指代切换、技术/canon、嵌套公文、前次修复邻域。
+
+先冻结并报告可复现 ID 样本，再逐行复核；不得把上一轮 findings 当结论照抄。按需读取历史 context 和当前权威摘要/术语/相邻文本，不重新生成 context。只写指定报告。
+```
+
+### 模板 E：suspect 二次裁决与 confirmed 修复
+
+- 裁决合同必须列出**唯一 suspect ID 集**、canonical/translation 精确路径、相邻证据、历史/当前 context 路径；不得重新审 confirmed 或扩大范围。
+- 修复合同必须列出**唯一 confirmed ID 集**、报告中的精确修复意图、所有需同步的 translation/derived/EPUB 路径和现成构建验证命令；suspect 必须保持 byte-identical。
+- 修复 Agent 不负责重新发现 renderer、aggregate 或测试入口；Main 必须提前把命令写全。
 
 ## 已验证的坑（踩过，别重踩）
 
