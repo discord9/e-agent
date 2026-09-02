@@ -36,6 +36,51 @@ sourcing, subagent frameworks, and permission systems built before a single
 working model→tool→model loop existed. Do not reintroduce these patterns
 without an explicit user request.
 
+## Reflection and evidence calibration
+
+Pause and test the task model before acting, and repeat this check whenever a
+result or user correction challenges an assumption.
+
+1. **Model the real boundary first.** Identify the actual product, authority,
+   reader/caller, and unit of independence before planning. A downstream
+   bundle, report, or dashboard is not automatically a content or policy
+   boundary.
+2. **Explain before consequential action.** When the user's correction changes
+   scope, policy, or product behavior, state the inferred rule and intended
+   action before launching edits or delegations. Do not make the user infer the
+   plan from tool calls.
+3. **Treat examples as possible rule failures.** When the user identifies one
+   bad instance, first ask whether it disproves a shared assumption or process.
+   Do not patch only the named instance until that question is answered.
+4. **Match evidence to the claim.** Hashes, counts, coverage, schemas, tests,
+   and successful builds prove integrity properties only. They do not prove
+   semantic correctness, usability, translation quality, or reader
+   comprehension. Never report a stronger conclusion than the evidence earns.
+5. **Verify the artifact people actually consume.** Inspect or sample the final
+   reader/user-facing output and its real context, not only source rows,
+   ledgers, diffs, or intermediate reports. For deliberately ambiguous content,
+   check enough before and after context to preserve the intended information
+   boundary without under- or over-explaining.
+6. **Use scripts for deterministic propagation.** Inventorying, matching,
+   first-occurrence lookup, synchronization, and validation belong in a small
+   script when the rule is already known. Delegate only genuinely judgmental,
+   bounded exceptions; do not ask many agents to independently rediscover one
+   deterministic rule.
+7. **Do not confuse activity with progress.** More agents, tables, approvals,
+   and audit artifacts can amplify a wrong premise. Before expanding work, ask
+   what decision the extra process will change.
+8. **Do not cancel unrelated work reflexively.** Committing, reporting, or
+   receiving a correction does not make compatible background work invalid.
+   Cancel only when its goal or assumptions are actually wrong, or when the
+   user asks to stop it.
+9. **Recalibrate explicitly.** If an assumption is disproved, retract affected
+   completion claims, state what evidence remains valid, and narrow the repair
+   to the failed dimension. Do not hide the correction behind a larger new
+   workflow.
+10. **Run a pre-claim check.** Before saying done, approved, complete, safe, or
+    quality-assured, ask: what exact evidence supports that adjective, what
+    does it not support, and did I personally inspect the relevant result?
+
 ## Non-negotiables (current scope)
 
 - Single crate: `src/lib.rs` core + `src/main.rs` thin frontend.
