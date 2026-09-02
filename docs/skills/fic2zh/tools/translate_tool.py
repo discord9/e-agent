@@ -354,8 +354,8 @@ def build_chapter_blocks(chapters, chapter):
 def chapter_of(seg_id):
     return seg_id.partition('-')[0]
 
-def upsert_segment(path, seg_id, en, zh):
-    """章级对照 JSON 聚合：按 id upsert 段，segments 按 id 排序后写回。"""
+def upsert_segment(path, seg_id, en, zh, status='final', uncertainties=None):
+    """写入 canonical unit record 的章级派生聚合，按 id 稳定排序。"""
     if os.path.isfile(path):
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
@@ -365,15 +365,20 @@ def upsert_segment(path, seg_id, en, zh):
     segs = data.setdefault('segments', [])
     for s in segs:
         if s.get('id') == seg_id:
-            s['en'], s['zh'] = en, zh
+            s.update({'en': en, 'zh': zh, 'status': status,
+                      'uncertainties': uncertainties or []})
             break
     else:
-        segs.append({'id': seg_id, 'en': en, 'zh': zh})
+        segs.append({'id': seg_id, 'en': en, 'zh': zh, 'status': status,
+                     'uncertainties': uncertainties or []})
     data['segments'] = sorted(segs, key=lambda s: str(s.get('id', '')))
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def cmd_append(args):
+    uncertainties = args.uncertainties or []
+    if args.status != ('needs_review' if uncertainties else 'final'):
+        return err('--status must be needs_review iff --uncertainty is supplied')
     try:
         en, zh = read_text(args.en), read_text(args.zh)
     except OSError as e:
@@ -395,7 +400,7 @@ def cmd_append(args):
                 f.write('## %s\n\n%s\n\n<!-- en: %s | terms: %s -->\n'
                         % (args.id, zh, args.en, ', '.join(terms)))
         if args.json_out:
-            upsert_segment(args.json_out, args.id, en, zh)
+            upsert_segment(args.json_out, args.id, en, zh, args.status, uncertainties)
     except (OSError, ValueError) as e:
         return err('无法写入: %s' % e)
     line = 'appended %s (en %d chars, zh %d chars, %d terms' \
@@ -470,6 +475,153 @@ def cmd_context(args):
                      '[当前待译片段] 请将以下英文翻译为简体中文：\n%s\n%s\n' % (history, segment, REQ))
     return 0
 
+def _json_object_without_duplicate_keys(pairs):
+    row = {}
+    for key, value in pairs:
+        if key in row:
+            raise ValueError("duplicate key '%s'" % key)
+        row[key] = value
+    return row
+
+
+def _read_jsonl(path, label):
+    """Read strict UTF-8 JSONL rows, retaining physical line numbers."""
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+    except OSError as e:
+        return None, '%s: cannot read %s' % (label, e)
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError as e:
+        return None, '%s: invalid UTF-8 at byte %d' % (label, e.start)
+    if (not raw.endswith(b'\n') or raw.endswith(b'\n\n') or b'\r' in raw):
+        return None, '%s: final newline must be exactly one raw LF' % label
+    rows = []
+    for line_no, line in enumerate(text.split('\n')[:-1], 1):
+        if not line.strip():
+            return None, '%s row %d: empty/whitespace physical line' % (label, line_no)
+        try:
+            value = json.loads(line, object_pairs_hook=_json_object_without_duplicate_keys)
+        except (TypeError, ValueError) as e:
+            return None, '%s row %d: invalid JSON (%s)' % (label, line_no, e)
+        if not isinstance(value, dict):
+            return None, '%s row %d: expected one JSON object' % (label, line_no)
+        rows.append((line_no, value))
+    return rows, None
+
+
+def _display_value(value):
+    return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+
+
+def cmd_validate(args):
+    schemas = {
+        'canonical': ('unit_id', 'en', 'zh', 'summary', 'status', 'uncertainties'),
+        'legacy': ('unit_id', 'en', 'zh', 'summary'),
+    }
+    schema = schemas[args.schema]
+    for field, option in ((args.id_field, '--id-field'),
+                          (args.translation_source_field, '--translation-source-field'),
+                          (args.translation_text_field, '--translation-text-field')):
+        if field not in schema:
+            return err('%s value %r is not in --schema' % (option, field))
+
+    source, failure = _read_jsonl(args.source, 'source')
+    if failure:
+        return err(failure)
+    translation, failure = _read_jsonl(args.translation, 'translation')
+    if failure:
+        return err(failure)
+
+    for label, rows in (('source', source), ('translation', translation)):
+        for line_no, row in rows:
+            required = ([args.id_field, args.source_text_field] if label == 'source'
+                        else list(schema))
+            for field in required:
+                if field not in row:
+                    return err("%s row %d field '%s': missing" % (label, line_no, field))
+            if label == 'translation' and list(row) != list(schema):
+                return err('%s row %d schema: expected %s, got %s' %
+                           (label, line_no, ','.join(schema), ','.join(row)))
+            if label == 'translation' and 'summary' in row and not isinstance(row['summary'], str):
+                return err("translation row %d field 'summary': must be a string" % line_no)
+            if label == 'translation' and args.schema == 'canonical':
+                status = row.get('status')
+                uncertainties = row.get('uncertainties')
+                if status not in ('final', 'needs_review'):
+                    return err("translation row %d field 'status': must be 'final' or 'needs_review'" % line_no)
+                if (not isinstance(uncertainties, list)
+                        or any(not isinstance(value, str) for value in uncertainties)):
+                    return err("translation row %d field 'uncertainties': must be a list of strings" % line_no)
+                if (status == 'needs_review') != bool(uncertainties):
+                    return err("translation row %d status must be needs_review iff uncertainties is nonempty" % line_no)
+
+    for label, rows in (('source', source), ('translation', translation)):
+        seen = {}
+        for line_no, row in rows:
+            value = row[args.id_field]
+            if not isinstance(value, str):
+                return err("%s row %d field '%s': expected string" %
+                           (label, line_no, args.id_field))
+            if value in seen:
+                return err("%s row %d field '%s': duplicate ID (also row %d)" %
+                           (label, line_no, args.id_field, seen[value]))
+            seen[value] = line_no
+
+    if args.expected_count is not None:
+        for label, rows in (('source', source), ('translation', translation)):
+            if len(rows) != args.expected_count:
+                return err('%s row count: expected %d, got %d' %
+                           (label, args.expected_count, len(rows)))
+    if len(source) != len(translation):
+        return err('row count: source %d, translation %d' % (len(source), len(translation)))
+
+    for label, rows in (('source', source), ('translation', translation)):
+        if args.first_id is not None:
+            if not rows:
+                return err('%s first ID: file has no rows' % label)
+            actual = rows[0][1][args.id_field]
+            if actual != args.first_id:
+                return err("%s first ID: expected %r, got %s" %
+                           (label, args.first_id, _display_value(actual)))
+        if args.last_id is not None:
+            if not rows:
+                return err('%s last ID: file has no rows' % label)
+            actual = rows[-1][1][args.id_field]
+            if actual != args.last_id:
+                return err("%s last ID: expected %r, got %s" %
+                           (label, args.last_id, _display_value(actual)))
+
+    for row_number, (source_item, translation_item) in enumerate(zip(source, translation), 1):
+        source_line, source_row = source_item
+        translation_line, translation_row = translation_item
+        source_id = source_row[args.id_field]
+        translation_id = translation_row[args.id_field]
+        if source_id != translation_id:
+            return err("row %d field '%s': ID/order mismatch (source line %d, translation line %d); source %s, translation %s" %
+                       (row_number, args.id_field, source_line, translation_line,
+                        _display_value(source_id), _display_value(translation_id)))
+        source_text = source_row[args.source_text_field]
+        translation_text = translation_row[args.translation_source_field]
+        if not isinstance(source_text, str):
+            return err("source row %d field '%s': expected string" %
+                       (source_line, args.source_text_field))
+        if not isinstance(translation_text, str):
+            return err("translation row %d field '%s': expected string" %
+                       (translation_line, args.translation_source_field))
+        if source_text != translation_text:
+            return err("row %d field '%s': does not exactly match source field '%s' (source line %d, translation line %d)" %
+                       (row_number, args.translation_source_field, args.source_text_field,
+                        source_line, translation_line))
+        zh = translation_row[args.translation_text_field]
+        if not isinstance(zh, str) or not zh.strip():
+            return err("translation row %d field '%s': must be a nonempty string" %
+                       (translation_line, args.translation_text_field))
+    sys.stdout.write('PASS: %d rows validated\n' % len(source))
+    return 0
+
+
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -491,6 +643,8 @@ def main(argv=None):
     p.add_argument('--zh', required=True); p.add_argument('--memory', default=MEM)
     p.add_argument('--glossary'); p.add_argument('--archive')
     p.add_argument('--summary'); p.add_argument('--json-out')
+    p.add_argument('--status', choices=('final', 'needs_review'), default='final')
+    p.add_argument('--uncertainty', dest='uncertainties', action='append', default=[])
     p.set_defaults(func=cmd_append)
     p = sub.add_parser('summarize', help='从 memory.jsonl 聚合生成分层记忆 chapters.json（L0/L1）')
     p.add_argument('--memory', default=MEM)
@@ -501,6 +655,21 @@ def main(argv=None):
     p.add_argument('--glossary'); p.add_argument('--history', type=int, default=3)
     p.add_argument('--chapters', default=CHAPS); p.add_argument('--chapter')
     p.set_defaults(func=cmd_context)
+    p = sub.add_parser('validate', help='校验 canonical 与译文 JSONL 对账')
+    p.add_argument('--source', required=True)
+    p.add_argument('--translation', required=True)
+    p.add_argument('--source-text-field', '--source-field', dest='source_text_field', default='exact_text')
+    p.add_argument('--translation-source-field', '--translation-en-field',
+                   dest='translation_source_field', default='en')
+    p.add_argument('--translation-text-field', '--translation-zh-field',
+                   dest='translation_text_field', default='zh')
+    p.add_argument('--id-field', default='unit_id')
+    p.add_argument('--schema', choices=('canonical', 'legacy'), default='canonical',
+                   help='translation schema; use --schema legacy for old four-field rows')
+    p.add_argument('--expected-count', type=int)
+    p.add_argument('--first-id')
+    p.add_argument('--last-id')
+    p.set_defaults(func=cmd_validate)
     p = sub.add_parser('render', help='渲染章级对照 JSON 为中英对照 Markdown')
     p.add_argument('--json', required=True); p.add_argument('--out')
     p.add_argument('--title'); p.add_argument('--pairs')

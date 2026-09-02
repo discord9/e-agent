@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "translator_notes.v1.schema.json",
+  "title": "Approved translator notes v1 JSONL row",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "note_id", "unit_id", "order", "anchor", "note", "factual_scope", "render", "provenance"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "translator_note"},
+    "note_id": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"},
+    "unit_id": {"type": "string", "minLength": 1},
+    "order": {"type": "integer", "minimum": 1},
+    "anchor": {
+      "type": "object", "additionalProperties": false,
+      "required": ["text", "occurrence", "unit_zh_sha256"],
+      "properties": {
+        "text": {"type": "string", "minLength": 1},
+        "occurrence": {"type": "integer", "minimum": 1},
+        "unit_zh_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "note": {"type": "string", "minLength": 1},
+    "factual_scope": {"type": "string", "minLength": 1},
+    "render": {"type": "boolean"},
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["adjudication", "review"],
+      "properties": {
+        "adjudication": {"$ref": "#/$defs/provenance_record"},
+        "review": {"$ref": "#/$defs/provenance_record"}
+      }
+    }
+  },
+  "$defs": {
+    "provenance_record": {
+      "type": "object", "additionalProperties": false,
+      "required": ["artifact", "sha256", "key"],
+      "properties": {
+        "artifact": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "key": {"type": "string", "minLength": 1}
+      },
+      "description": "The referenced note-specific machine artifact is LF-terminated JSONL. Each selected key occurs exactly once as an object with exactly key, note_id, unit_id, decision, subject_sha256. Adjudication decision is CONFIRMED; review decision is APPROVE. subject_sha256 is SHA-256 of the note row excluding provenance, serialized as UTF-8 JSON with ensure_ascii=false, sort_keys=true, separators=(',', ':'). General QA ledgers are not these artifacts."
+    }
+  }
+}

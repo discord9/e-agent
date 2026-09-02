@@ -10,8 +10,9 @@ ebooklib.
 
 Command-line arguments (all optional, defaults = Vox Vitae paths for backward
 compatibility): --md --out --title --author --glossary --glossary-notes.
-The term-footnote feature needs a glossary_notes.csv next to the glossary;
-when either file is missing the feature is skipped gracefully.
+Canonical approved translator notes use --translator-notes with --json and
+are validated before the EPUB is written. --glossary-notes is deprecated
+legacy CSV compatibility and cannot be combined with canonical notes.
 """
 
 import argparse
@@ -23,6 +24,10 @@ import zipfile
 from pathlib import Path
 
 from ebooklib import epub
+
+from validate_translator_notes import (
+    TranslatorNotesError, locate_literal_occurrence, validate_translator_notes,
+)
 from lxml import etree
 
 SRC = Path(__file__).resolve().parent / "vox_vitae_zh" / "vox_vitae_zh_en.md"
@@ -41,12 +46,17 @@ PREFACE_TITLE = "前言（版权声明与目录）"
 
 # Visible styling for term-footnote links (blue, underlined, superscript).
 NOTEREF_CSS = (
-    "a.noteref { color: #0066cc; text-decoration: underline; vertical-align: super;"
+    "a.noteref, a.translator-noteref { color: #0066cc; text-decoration: underline; vertical-align: super;"
     " font-size: 0.75em; line-height: 1; padding: 0 0.1em; }\n"
-    "a.noteref:hover, a.noteref:active { color: #003399; background-color: #eef4ff; }"
+    "a.noteref:hover, a.noteref:active, a.translator-noteref:hover,"
+    " a.translator-noteref:active { color: #003399; background-color: #eef4ff; }"
 )
 
 BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+SOURCE_MARKUP_RE = re.compile(
+    r"<[^>]+>|\b(?:id|href)\s*=|epub:type\s*=\s*['\"](?:noteref|footnote)['\"]",
+    re.IGNORECASE,
+)
 
 # Placeholders used while scanning for first occurrences, so that an anchor
 # inserted for one term can never become search text for another (substring
@@ -457,6 +467,122 @@ def json_blocks_to_html(blocks, gloss=None) -> str:
     return "\n".join(out)
 
 
+def _translator_inline(text, unit_id, notes, chapter_key, numbers):
+    """Escape one structured unit and insert notes at validated literal ranges.
+
+    Validation and rendering deliberately use the same locator.  The assertion
+    also makes a future document mutation fail closed rather than dropping a
+    noteref or emitting an unanchored aside.
+    """
+    rendered = [note for note in notes if note["render"]]
+    hits = []
+    for note in rendered:
+        anchor = note["anchor"]["text"]
+        occurrence = note["anchor"]["occurrence"]
+        hit = locate_literal_occurrence(text, anchor, occurrence)
+        if hit is None:
+            raise SystemExit(f"translator note anchor disappeared in {unit_id}")
+        if text[hit[0]:hit[1]] != anchor:
+            raise SystemExit(f"translator note anchor changed in {unit_id}")
+        hits.append((*hit, note))
+    if any(a[0] < b[1] and b[0] < a[1]
+           for i, a in enumerate(hits) for b in hits[i + 1:]):
+        raise SystemExit(f"translator note anchors overlap in {unit_id}")
+    hits.sort(key=lambda item: item[0])
+    out, cursor = [], 0
+    for start, end, note in hits:
+        out.append(html.escape(text[cursor:start]))
+        out.append(html.escape(text[start:end]))
+        number = numbers[note["note_id"]]
+        nid = note["note_id"]
+        out.append(f'<a epub:type="noteref" class="translator-noteref" id="tnref-{nid}" href="#tn-{nid}">[{number}]</a>')
+        cursor = end
+    out.append(html.escape(text[cursor:]))
+    return "".join(out).replace("\n", "<br/>")
+
+
+def json_blocks_to_translator_html(blocks, notes_by_unit, chapter_key, numbers):
+    """Render structured JSON with unit-addressed, already-approved notes."""
+    out = []
+    for block in blocks:
+        kind = block["type"]
+        if kind == "paragraph":
+            uid = block["unit_id"]
+            out.append(f"<p>{_translator_inline(block['text'], uid, notes_by_unit.get(uid, []), chapter_key, numbers)}</p>")
+        elif kind == "blockquote":
+            inner = "".join(
+                f"<p>{_translator_inline(p['text'], p['unit_id'], notes_by_unit.get(p['unit_id'], []), chapter_key, numbers)}</p>"
+                for p in block["blocks"]
+            )
+            out.append(f"<blockquote>{inner}</blockquote>")
+        else:
+            # Keep canonical list rendering identical to json_blocks_to_html;
+            # list items have no unit IDs and therefore cannot carry notes.
+            out.append("<ul>" + "".join(f"<li>{json_inline(item)}</li>"
+                                         for item in block["items"]) + "</ul>")
+    return "\n".join(out)
+
+
+def translator_footnotes(notes, numbers):
+    items = []
+    for note in notes:
+        if not note["render"]:
+            continue
+        nid = note["note_id"]
+        n = numbers[nid]
+        items.append(
+            f'<aside epub:type="footnote" class="translator-note" id="tn-{nid}">'
+            f'<p><a class="translator-note-backlink" href="#tnref-{nid}">[{n}]</a> '
+            f'译者注：{html.escape(note["note"])}</p></aside>'
+        )
+    return ("\n" + "\n".join(items) + "\n") if items else ""
+
+
+def _reject_structured_source_markup(preface, sections):
+    """Reject markup the v1 structured vocabulary cannot preserve safely."""
+    def visit(blocks, where):
+        for index, block in enumerate(blocks):
+            if block["type"] == "list":
+                values = block["items"]
+            elif block["type"] == "paragraph":
+                values = [block["text"]]
+            else:
+                values = [p["text"] for p in block["blocks"]]
+            for value in values:
+                if SOURCE_MARKUP_RE.search(value):
+                    raise SystemExit(
+                        f"translator notes cannot render source anchor markup in {where}[{index}]")
+            if block["type"] == "blockquote":
+                visit(block["blocks"], f"{where}[{index}].blocks")
+    visit(preface["blocks"], "preface.blocks")
+    for index, section in enumerate(sections):
+        visit(section["blocks"], f"sections[{index}].blocks")
+
+
+def _structured_units(preface, sections):
+    """Return targetable paragraph unit IDs and active Chinese text."""
+    entries = []
+    def visit(blocks):
+        for block in blocks:
+            if block["type"] == "paragraph":
+                entries.append((block.get("unit_id"), block["text"]))
+            elif block["type"] == "blockquote":
+                visit(block["blocks"])
+    visit(preface["blocks"])
+    for section in sections:
+        visit(section["blocks"])
+    ids = set()
+    active = []
+    for uid, text in entries:
+        if not isinstance(uid, str) or not uid:
+            raise SystemExit("translator notes require a unit_id on every paragraph")
+        if uid in ids:
+            raise SystemExit(f"translator notes require unique unit_id: {uid}")
+        ids.add(uid)
+        active.append({"unit_id": uid, "zh": text})
+    return active
+
+
 def _json_inline_blocks(blocks):
     """Return escaped inline values in the same order as JSON rendering."""
     result = []
@@ -496,6 +622,71 @@ def _validate_json_block(block, where):
                     or child.get("type") != "paragraph"
                     or not isinstance(child.get("text"), str)):
                 _json_error(f"{where}.blocks[{i}] must be a paragraph")
+
+
+CANONICAL_RECORD_KEYS = ("unit_id", "en", "zh", "summary", "status", "uncertainties")
+
+
+def _join_canonical_records(document, path):
+    """Replace English unit text with an exact, ordered canonical translation join."""
+    raw = Path(path).read_bytes()
+    if b"\r" in raw or (not raw.endswith(b"\n") or raw.endswith(b"\n\n")):
+        _json_error("canonical translations must be LF-terminated JSONL")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _json_error(f"canonical translations are not valid UTF-8: {exc}")
+    records = {}
+    ordered_ids = []
+    for line_no, line in enumerate(text.splitlines(), 1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            _json_error(f"canonical translation line {line_no} is invalid JSON: {exc}")
+        if (not isinstance(row, dict) or tuple(row) != CANONICAL_RECORD_KEYS
+                or not isinstance(row["unit_id"], str) or not row["unit_id"]):
+            _json_error(f"canonical translation line {line_no} has the wrong schema")
+        if row["unit_id"] in records:
+            _json_error(f"canonical translation has duplicate unit_id: {row['unit_id']}")
+        if row["status"] != "final" or row["uncertainties"]:
+            _json_error(f"canonical translation {row['unit_id']} is not final")
+        if (not isinstance(row["en"], str) or not isinstance(row["zh"], str)
+                or not isinstance(row["summary"], str)
+                or not row["zh"].strip()
+                or not isinstance(row["uncertainties"], list)
+                or any(not isinstance(value, str) for value in row["uncertainties"])):
+            _json_error(f"canonical translation {row['unit_id']} has invalid fields")
+        records[row["unit_id"]] = row
+        ordered_ids.append(row["unit_id"])
+
+    used = set()
+    encountered_ids = []
+    def visit(blocks, where):
+        for index, block in enumerate(blocks):
+            if block["type"] == "paragraph":
+                uid = block.get("unit_id")
+                if uid is None:
+                    _json_error(f"canonical mode requires unit_id for {where}[{index}]")
+                if uid not in records:
+                    _json_error(f"canonical translation missing unit_id: {uid}")
+                row = records[uid]
+                if block["text"] != row["en"]:
+                    _json_error(f"canonical translation {uid} en does not exactly match input")
+                block["text"] = row["zh"]
+                used.add(uid)
+                encountered_ids.append(uid)
+            elif block["type"] == "blockquote":
+                visit(block["blocks"], f"{where}[{index}].blocks")
+            else:
+                _json_error(f"canonical mode does not support textual {where}[{index}] block")
+    visit(document["preface"]["blocks"], "preface.blocks")
+    for index, section in enumerate(document["sections"]):
+        visit(section["blocks"], f"sections[{index}].blocks")
+    if used != set(records):
+        _json_error("canonical translations contain an unused unit_id")
+    if ordered_ids != encountered_ids:
+        _json_error("canonical translations are not in canonical unit order")
+    return document
 
 
 def _validate_json_document(document):
@@ -605,7 +796,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     input_group = ap.add_mutually_exclusive_group()
     input_group.add_argument("--md", help="输入全本 Markdown 文件（默认 Vox 全本）")
-    input_group.add_argument("--json", dest="json_path", help="输入结构化 JSON 文件")
+    input_group.add_argument("--json", dest="json_path", help="输入结构化 canonical JSON 文件")
+    ap.add_argument("--translations", help="canonical unit-record JSONL to exact-join into --json")
     ap.add_argument("--out", default=str(OUT), help="输出 EPUB 文件（默认 Vox epub）")
     ap.add_argument("--title", default=None, help="书名（显式值覆盖输入文件）")
     ap.add_argument("--author", default=None, help="作者署名（显式值覆盖输入文件）")
@@ -613,9 +805,21 @@ def main() -> None:
                     help="术语表 CSV（source,target）；缺省取 --md 同目录 glossary_zh-CN.csv"
                          "（Vox 默认即 vox_vitae_zh/glossary_zh-CN.csv）")
     ap.add_argument("--glossary-notes", default=None,
-                    help="术语注释 CSV（source,note）；缺省取 --md 同目录 glossary_notes.csv；"
-                         "文件不存在时跳过注释功能")
+                    help="已弃用的 legacy 术语注释 CSV；不得与 --translator-notes 合用")
+    ap.add_argument("--translator-notes", default=None,
+                    help="批准的 translator_notes.jsonl v1（仅结构化 JSON 输入）")
+    ap.add_argument("--approval-root", "--workspace-root", dest="approval_root", default=None,
+                    help="translator notes provenance artifact 的 workspace root")
     args = ap.parse_args()
+
+    if args.translator_notes and args.glossary_notes:
+        raise SystemExit("--translator-notes cannot be combined with deprecated --glossary-notes")
+    if args.translator_notes and not args.json_path:
+        raise SystemExit("--translator-notes requires --json structured input")
+    if args.translator_notes and not args.approval_root:
+        raise SystemExit("--translator-notes requires --approval-root")
+    if args.translator_notes and not args.translations:
+        raise SystemExit("--translator-notes requires --translations canonical unit records")
 
     json_mode = args.json_path is not None
     md_path = Path(args.md or SRC)
@@ -631,6 +835,8 @@ def main() -> None:
 
     if json_mode:
         document = json.loads(input_path.read_text(encoding="utf-8"))
+        if args.translations:
+            _join_canonical_records(document, args.translations)
         preface_data, json_sections = _validate_json_document(document)
         title = args.title if args.title is not None else document["title"]
         author = args.author if args.author is not None else document.get("author", AUTHOR)
@@ -655,91 +861,126 @@ def main() -> None:
     for idx, section in enumerate(chapters, 1):
         print(f"  {idx:3d}. {section['title'] if json_mode else section[0]}")
 
+    # Canonical notes are validated against the structured document before any
+    # EPUB object or output file is created. Legacy CSV remains opt-in only.
+    canonical_notes = []
+    notes_by_unit = {}
+    canonical_numbers = {}
+    preface_unit_ids = set()
+    if args.translator_notes:
+        _reject_structured_source_markup(preface_data, chapters)
+        active_rows = _structured_units(preface_data, chapters)
+        try:
+            canonical_notes = validate_translator_notes(
+                args.translator_notes, active_rows, args.approval_root
+            )
+        except (TranslatorNotesError, OSError) as exc:
+            raise SystemExit(f"invalid translator notes: {exc}") from exc
+        for note in canonical_notes:
+            notes_by_unit.setdefault(note["unit_id"], []).append(note)
+        # Display numbering is local to the owning chapter and follows the
+        # canonical order. A non-rendered approved row consumes no number.
+        def block_unit_ids(blocks):
+            unit_ids = set()
+            def collect(block_list):
+                for block in block_list:
+                    if block["type"] == "paragraph":
+                        unit_ids.add(block["unit_id"])
+                    elif block["type"] == "blockquote":
+                        collect(block["blocks"])
+            collect(blocks)
+            return unit_ids
+        preface_unit_ids = block_unit_ids(preface_data["blocks"])
+        chapter_unit_ids = [block_unit_ids(section["blocks"]) for section in chapters]
+        if any(note["render"] and note["unit_id"] in preface_unit_ids
+               for note in canonical_notes):
+            raise SystemExit("rendered translator notes must belong to a chapter")
+        for unit_ids in chapter_unit_ids:
+            n = 0
+            for note in canonical_notes:
+                if note["render"] and note["unit_id"] in unit_ids:
+                    n += 1
+                    canonical_numbers[note["note_id"]] = n
+        for note in canonical_notes:
+            if note["render"] and note["note_id"] not in canonical_numbers:
+                raise SystemExit("rendered translator note must belong to a rendered chapter")
+        for unit_ids in chapter_unit_ids:
+            n = 0
+            for note in canonical_notes:
+                if note["render"] and note["unit_id"] in unit_ids:
+                    n += 1
+                    canonical_numbers[note["note_id"]] = n
+    else:
+        # Deprecated migration-only behavior; existing Markdown builds retain
+        # their historical CSV output, while canonical notes never use it.
+        all_notes = load_glossary_notes(glossary_csv, glossary_notes_csv)
+        chapter_bodies = (
+            [section["blocks"] for section in chapters]
+            if json_mode else [body for _, body in chapters]
+        )
+        eligible_notes = []
+        chapter_numbers = []
+        if all_notes:
+            term_matchers = [
+                (src, tgt, note, _source_re(html.escape(src)), html.escape(tgt))
+                for src, tgt, note in all_notes
+            ]
+            chapter_blocks = [
+                (_json_inline_blocks(blocks) if json_mode
+                 else list(_iter_inline_blocks(blocks)))
+                for blocks in chapter_bodies
+            ]
+            sim_t_placeholder = "\x00GLOSS_NOTE_0_T\x00"
+            sim_s_placeholder = "\x00GLOSS_NOTE_0_S\x00"
+            target_chapter = {}
+            source_chapter = {}
+            for ci, blocks in enumerate(chapter_blocks, 1):
+                for block in blocks:
+                    for src, tgt, note, src_re, tgt_esc in term_matchers:
+                        if src in target_chapter and src in source_chapter:
+                            continue
+                        new_block, hits = _first_match_replace(
+                            block, src_re, html.escape(src), tgt_esc,
+                            sim_t_placeholder, sim_s_placeholder,
+                            skip_target=(src in target_chapter),
+                            skip_source=(src in source_chapter),
+                        )
+                        if new_block is None:
+                            continue
+                        block = new_block
+                        for marker, _word in hits:
+                            if marker == sim_t_placeholder:
+                                target_chapter.setdefault(src, ci)
+                            else:
+                                source_chapter.setdefault(src, ci)
+            anchor_chapter = {}
+            for src, tgt, note, src_re, tgt_esc in term_matchers:
+                tc = target_chapter.get(src)
+                sc = source_chapter.get(src)
+                if tc is None and sc is None:
+                    continue
+                eligible_notes.append((src, tgt, note))
+                anchor_chapter[src] = min(x for x in (tc, sc) if x is not None)
+            missing = [src for src, _, _ in all_notes if src not in anchor_chapter]
+            msg = f"术语注释: 加载 {len(all_notes)} 条，正文出现 {len(eligible_notes)} 条"
+            if missing:
+                msg += f"（未出现: {', '.join(missing)}）"
+            print(msg)
+            chapter_numbers = [{} for _ in chapter_blocks]
+            for src, tgt, note, src_re, tgt_esc in term_matchers:
+                ci = anchor_chapter.get(src)
+                if ci is not None:
+                    nums = chapter_numbers[ci - 1]
+                    nums[src] = len(nums) + 1
+        else:
+            print("术语注释: 无（legacy glossary_notes.csv 缺失或为空，跳过）")
+        gloss = GlossAnnotator(eligible_notes)
+
     book = epub.EpubBook()
     book.set_identifier(out_path.stem)
     book.set_title(title)
     book.set_language(LANG)
     book.add_author(author)
-
-    # Term footnotes: merge glossary_zh-CN.csv with glossary_notes.csv
-    # (empty when the notes file is missing -> feature skipped, no crash).
-    all_notes = load_glossary_notes(glossary_csv, glossary_notes_csv)
-    chapter_bodies = (
-        [section["blocks"] for section in chapters]
-        if json_mode else [body for _, body in chapters]
-    )
-
-    # First pass: simulate the annotation pass exactly (same chapter/block
-    # order, same first-occurrence replacement via _first_match_replace) to
-    # learn, per term, the chapter of the Chinese-side and English-side first
-    # occurrences. The term's aside goes to the earlier of the two chapters
-    # (min); within that chapter both sides are anchored (up to two anchors
-    # sharing one aside). This both filters out terms that never appear
-    # anywhere and handles nested targets (网道 inside 网道之门) identically to
-    # annotate(), so every numbered term is anchored at least once and no
-    # footnote is anchor-less.
-    eligible_notes = []
-    chapter_numbers = []  # per chapter: {source: per-chapter footnote number}
-    if all_notes:
-        term_matchers = [
-            (src, tgt, note, _source_re(html.escape(src)), html.escape(tgt))
-            for src, tgt, note in all_notes
-        ]
-        chapter_blocks = [
-            (_json_inline_blocks(blocks) if json_mode
-             else list(_iter_inline_blocks(blocks)))
-            for blocks in chapter_bodies
-        ]
-        sim_t_placeholder = "\x00GLOSS_NOTE_0_T\x00"
-        sim_s_placeholder = "\x00GLOSS_NOTE_0_S\x00"
-        target_chapter = {}  # source -> chapter of first Chinese-side hit
-        source_chapter = {}  # source -> chapter of first English-side hit
-        for ci, blocks in enumerate(chapter_blocks, 1):
-            for block in blocks:
-                for src, tgt, note, src_re, tgt_esc in term_matchers:
-                    if src in target_chapter and src in source_chapter:
-                        continue
-                    new_block, hits = _first_match_replace(
-                        block, src_re, html.escape(src), tgt_esc,
-                        sim_t_placeholder, sim_s_placeholder,
-                        skip_target=(src in target_chapter),
-                        skip_source=(src in source_chapter),
-                    )
-                    if new_block is None:
-                        continue
-                    block = new_block
-                    for marker, _word in hits:
-                        if marker == sim_t_placeholder:
-                            target_chapter.setdefault(src, ci)
-                        else:
-                            source_chapter.setdefault(src, ci)
-        anchor_chapter = {}  # source -> chapter owning the term's aside
-        for src, tgt, note, src_re, tgt_esc in term_matchers:
-            tc = target_chapter.get(src)
-            sc = source_chapter.get(src)
-            if tc is None and sc is None:
-                continue
-            eligible_notes.append((src, tgt, note))
-            # The term's aside lives in the earlier of the two first-hit
-            # chapters; a side whose own first occurrence falls there is
-            # anchored there too (both anchors share the same aside).
-            anchor_chapter[src] = min(x for x in (tc, sc) if x is not None)
-        missing = [src for src, _, _ in all_notes if src not in anchor_chapter]
-        msg = f"术语注释: 加载 {len(all_notes)} 条，正文出现 {len(eligible_notes)} 条"
-        if missing:
-            msg += f"（未出现: {', '.join(missing)}）"
-        print(msg)
-        # Per-chapter numbers: 1..K in glossary_notes.csv row order over the
-        # terms whose first in-book occurrence falls in that chapter.
-        chapter_numbers = [{} for _ in chapter_blocks]
-        for src, tgt, note, src_re, tgt_esc in term_matchers:
-            ci = anchor_chapter.get(src)
-            if ci is not None:
-                nums = chapter_numbers[ci - 1]
-                nums[src] = len(nums) + 1
-    else:
-        print("术语注释: 无（glossary_notes.csv 缺失或为空，跳过）")
-    gloss = GlossAnnotator(eligible_notes)
 
     # preface chapter
     preface = _StyledEpubHtml(
@@ -759,19 +1000,37 @@ def main() -> None:
         section_title = section["title"] if json_mode else section[0]
         section_body = section["blocks"] if json_mode else section[1]
         chap_key = f"chap_{idx:03d}"
-        gloss.begin_chapter(
-            chap_key, chapter_numbers[idx - 1] if chapter_numbers else {}
-        )
+        if not args.translator_notes:
+            gloss.begin_chapter(
+                chap_key, chapter_numbers[idx - 1] if chapter_numbers else {}
+            )
         item = _StyledEpubHtml(
             title=section_title,
             file_name=f"{chap_key}.xhtml",
             lang=LANG,
         )
-        rendered = (json_blocks_to_html(section_body, gloss) if json_mode
-                    else markdown_to_html(section_body, gloss))
-        item.content = xhtml_fragment(
-            section_title, rendered + gloss.render_footnotes()
-        )
+        if args.translator_notes:
+            rendered = json_blocks_to_translator_html(
+                section_body, notes_by_unit, chap_key, canonical_numbers
+            )
+            section_unit_ids = set()
+            def collect_section_units(blocks):
+                for block in blocks:
+                    if block["type"] == "paragraph":
+                        section_unit_ids.add(block["unit_id"])
+                    elif block["type"] == "blockquote":
+                        collect_section_units(block["blocks"])
+            collect_section_units(section_body)
+            footnotes = translator_footnotes(
+                [note for note in canonical_notes
+                 if note["unit_id"] in section_unit_ids and note["render"]],
+                canonical_numbers,
+            )
+        else:
+            rendered = (json_blocks_to_html(section_body, gloss) if json_mode
+                        else markdown_to_html(section_body, gloss))
+            footnotes = gloss.render_footnotes()
+        item.content = xhtml_fragment(section_title, rendered + footnotes)
         book.add_item(item)
         chapter_items.append(item)
         if json_mode:
