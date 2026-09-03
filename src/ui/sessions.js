@@ -425,17 +425,10 @@ function deepLinkTimeoutFor(epoch) {
     ? DEEP_LINK_HISTORY_TIMEOUT_MS : undefined;
 }
 
-function applyHistoryPaging(data) {
-  state.nextBeforeSeq = (data && data.next_before_seq !== undefined)
-    ? data.next_before_seq : null;
-  state.olderDone = (state.nextBeforeSeq === null);
-}
-
 function renderLoadedHistory(entries, data) {
-  applyHistoryPaging(data);
-  // A live snapshot owns the visible transcript, but not durable history
-  // paging.  The history response still supplies the cursor above.
   if (state.initSource === "snapshot") return;
+  state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
+  state.olderDone = (state.nextBeforeSeq === null);
   if (state.initSource === "restored") {
     const offset = els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight;
     state.acc.toolStack = [];
@@ -492,9 +485,6 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     // authoritative snapshot.  If the attach is live, the snapshot replaces
     // this response; only a no-live 404 may release it as a fallback.
     if (state.sse.historyPending && !state.sse.snapshotCommitted) {
-      // The live snapshot owns rendering, but this successful head response is
-      // still authoritative for history paging.
-      applyHistoryPaging(data);
       state.sse.pendingHistory = { entries, data };
       state.sse.historyPending = false;
       // If the 404 arrived first, release the retained durable projection now;

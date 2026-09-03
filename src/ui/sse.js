@@ -247,8 +247,9 @@ function replaceLiveProjection(events) {
   temp.innerHTML = "";
   els.messages = temp;
   state.acc = newAccumulator();
-  // The live projection is transcript-only.  Keep the durable history paging
-  // state: the head history response may have already supplied its cursor.
+  state.nextBeforeSeq = null;       // snapshots have no safe history cursor
+  state.olderDone = true;
+  state.loadingOlder = false;
   state.queue.length = 0;
   state.queueExpanded = false;
   renderQueueBar();
@@ -270,8 +271,6 @@ function replaceLiveProjection(events) {
     while (temp.firstChild) real.appendChild(temp.firstChild);
     els.messages = real;
     state.initSource = "snapshot";
-    // A retained history response has already supplied its paging cursor;
-    // discard only the DOM fallback now that the snapshot owns rendering.
     if (state.sse.pendingHistory) state.sse.pendingHistory = null;
     return true;
   } catch (e) {

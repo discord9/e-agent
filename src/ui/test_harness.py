@@ -656,20 +656,6 @@ globalThis.fetch=(url,opts={})=>{
     }
     return resp(200, historyData);   // 含 ?limit=…（loadHistory 尾部翻页）
   }
-  if(url.startsWith("/api/sessions/paging-history-first/history")) {
-    if (url.includes("before_seq=")) {
-      const seq=url.split("before_seq=")[1].split("&")[0];
-      return resp(200, seq==="701" ? historyOlderData : {entries:[], next_before_seq:null}, signal);
-    }
-    return resp(200, {entries:[{type:"message",message:{Assistant:{content:"history-first head"}}}], next_before_seq:701}, signal);
-  }
-  if(url.startsWith("/api/sessions/paging-snapshot-first/history")) {
-    if (url.includes("before_seq=")) {
-      const seq=url.split("before_seq=")[1].split("&")[0];
-      return resp(200, seq==="702" ? historyOlderData : {entries:[], next_before_seq:null}, signal);
-    }
-    return resp(200, {entries:[{type:"message",message:{Assistant:{content:"snapshot-first head"}}}], next_before_seq:702}, signal);
-  }
   if(url.startsWith("/api/sessions/s2/history")) return resp(200, historyData, signal);
   if(url.startsWith("/api/sessions/s3/history")) return resp(200, historyData, signal);
   if(url.startsWith("/api/sessions/sess-new/history")) return resp(200, {entries:[], next_before_seq:null}, signal);
@@ -683,8 +669,6 @@ globalThis.fetch=(url,opts={})=>{
     entries: [{type:"message", message:{User:{content:"persisted A history", images:[]}}}],
     next_before_seq: null,
   }, signal);
-  if(url==="/api/sessions/paging-history-first/events") return resp(200, streamSnapshotFor("paging-history-first"), signal);
-  if(url==="/api/sessions/paging-snapshot-first/events") return resp(200, streamSnapshotFor("paging-snapshot-first"), signal);
   if(url==="/api/sessions/s1/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s2/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s3/events") return resp(200, streamSnapshotUsage(), signal);
@@ -1396,8 +1380,8 @@ async function main(){
     openSession("s1");
     await flush();
     await flush();
-    chk("fork back to s1 keeps history paging cursor", state.sessionId === "s1"
-        && state.nextBeforeSeq === 100 && state.olderDone === false,
+    chk("fork back to s1 keeps snapshot paging disabled", state.sessionId === "s1"
+        && state.nextBeforeSeq === null && state.olderDone === true,
         "sid=" + state.sessionId + " next=" + state.nextBeforeSeq);
 
     // 迟到 fork-candidates：加载期间切换会话，旧响应不得重开/写入面板。
@@ -1605,10 +1589,10 @@ async function main(){
 
     // ---- 滚动分页：滚动到顶部加载更早历史 ----
     const msgEl = elsById["messages"];
-    chk("snapshot preserves history paging cursor", state.nextBeforeSeq === 100 && state.olderDone === false,
+    chk("snapshot disables paging without cursor", state.nextBeforeSeq === null && state.olderDone === true,
         "next=" + state.nextBeforeSeq + " done=" + state.olderDone);
     // Exercise the existing history paging path explicitly after the live
-    // projection has retained the durable history cursor.
+    // projection contract has disabled snapshot paging.
     state.nextBeforeSeq = 100;
     state.olderDone = false;
     const beforeCount = msgEl.children.length;
@@ -1644,59 +1628,6 @@ async function main(){
     await flush();
     chk("no fetch when olderDone", FETCHES.length === fetchAfterDone,
         "delta="+(FETCHES.length-fetchAfterDone));
-
-    // ---- Web Attach paging regression: history-first retains its cursor until
-    // the snapshot commits, and the snapshot never paints the durable head.
-    const pagingEpoch = sessionOpenEpoch;
-    state.sessionId = "paging-history-first";
-    state.initSource = null;
-    state.nextBeforeSeq = null;
-    state.olderDone = false;
-    state.sse.snapshotCommitted = false;
-    state.sse.historyPending = true;
-    state.sse.pendingHistory = null;
-    const historyFirst = loadHistory("paging-history-first", state.workspace.id, pagingEpoch);
-    await flush();
-    chk("history-first retains pending cursor", !!state.sse.pendingHistory
-        && state.nextBeforeSeq === 701 && state.olderDone === false,
-        "pending=" + !!state.sse.pendingHistory + " next=" + state.nextBeforeSeq);
-    handleSSEBlock("event: snapshot\ndata: [{\"type\":\"notice\",\"data\":{\"text\":\"history-first snapshot\"}}]\n\n",
-      state.sessionId, state.workspace.id, pagingEpoch);
-    await historyFirst;
-    chk("history-first snapshot commits cursor without head DOM",
-        state.initSource === "snapshot" && state.nextBeforeSeq === 701
-        && state.olderDone === false
-        && !allText().includes("history-first head"));
-    const historyFirstFetches = FETCHES.length;
-    await loadOlder();
-    chk("history-first loadOlder uses exact cursor", FETCHES.slice(historyFirstFetches)
-        .includes("/api/sessions/paging-history-first/history?before_seq=701&limit=" + HISTORY_PAGE));
-    chk("history-first older page is prepended", allText().includes("更早的历史消息"));
-
-    // Snapshot-first is the inverse ordering: the later durable response updates
-    // paging state but must not overwrite the authoritative snapshot DOM.
-    state.sessionId = "paging-snapshot-first";
-    state.initSource = null;
-    state.nextBeforeSeq = null;
-    state.olderDone = false;
-    state.sse.snapshotCommitted = false;
-    state.sse.historyPending = false;
-    state.sse.pendingHistory = null;
-    handleSSEBlock("event: snapshot\ndata: [{\"type\":\"notice\",\"data\":{\"text\":\"snapshot-first snapshot\"}}]\n\n",
-      state.sessionId, state.workspace.id, pagingEpoch);
-    const snapshotFirstHistory = loadHistory("paging-snapshot-first", state.workspace.id, pagingEpoch);
-    await snapshotFirstHistory;
-    chk("snapshot-first history updates cursor without head DOM",
-        state.initSource === "snapshot" && state.nextBeforeSeq === 702
-        && state.olderDone === false
-        && allText().includes("snapshot-first snapshot")
-        && !allText().includes("snapshot-first head"));
-    const snapshotFirstFetches = FETCHES.length;
-    await loadOlder();
-    chk("snapshot-first loadOlder uses exact cursor", FETCHES.slice(snapshotFirstFetches)
-        .includes("/api/sessions/paging-snapshot-first/history?before_seq=702&limit=" + HISTORY_PAGE));
-    chk("snapshot-first older page is prepended", allText().includes("更早的历史消息"));
-
     // ---- 回归：loadOlder 陈旧响应（epoch 变更，如 restartTransport 递增代次）也必须
     // 复位 loadingOlder——否则「加载更早历史」永久失效（loadingOlder 卡 true） ----
     state.nextBeforeSeq = 200;          // 恢复分页游标（paging 测试已消费到 null）
