@@ -283,7 +283,116 @@ async def run_conflict_card(c):
     c.check("现状：错误行是 .msg-error 普通行（无 .conflict 子类卡片）",
             n_err >= 1 and n_conf == 0, f"msg-error={n_err} conflict={n_conf}")
 
+DIAGRAM_FIXTURE = """┌────────────┐              ┌────────────┐              ┌────────────┐
+│    用户    │              │  Web 服务  │              │   数据库   │
+└─────┬──────┘              └─────┬──────┘              └─────┬──────┘
+      │─────────发送请求──────────>                           │
+      <──────────返回结果─────────│                           │
+      │                           │─────────查询数据──────────>
+      │                           <──────────响应数据─────────│"""
+
+
+async def run_markdown_cjk_diagram(c):
+    c.sessions = [S("diagram", "Idle", False, None, "图表排版")]
+    markdown = ("普通 **Markdown** 保持渲染；行内代码 `代码 示例 普通 文本 仍然 可以 自动 换行` "
+                "后面的正文也可正常换行。\n\n```text\n" + DIAGRAM_FIXTURE + "\n```")
+    c.history = {"entries": [{"type": "message", "message": {
+        "Assistant": {"content": markdown, "tool_calls": [], "reasoning": None}}}],
+        "next_before_seq": None}
+
+    await c.start()
+    await c.open_sidebar()
+    await c.page.locator("#sidebarTree .tree-row", has_text="diagram").first.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'diagram'")
+    await c.page.wait_for_selector(".msg-assistant pre code")
+    await c.ev("document.fonts.ready")
+
+    measure_js = """() => {
+      const code = document.querySelector('.msg-assistant pre code');
+      const pre = code.parentElement;
+      const text = code.textContent.replace(/\\n$/, '');
+      const lines = text.split('\\n');
+      const starts = []; let off = 0;
+      for (const line of lines) { starts.push(off); off += line.length + 1; }
+      function rect(line, index) {
+        const r = new Range();
+        r.setStart(code.firstChild, starts[line] + index);
+        r.setEnd(code.firstChild, starts[line] + index + 1);
+        const b = r.getBoundingClientRect();
+        return {x: b.left, width: b.width};
+      }
+      function nth(line, ch, n) {
+        let from = -1;
+        for (let i = 0; i <= n; i++) from = lines[line].indexOf(ch, from + 1);
+        return rect(line, from);
+      }
+      const spread = v => Math.max(...v) - Math.min(...v);
+      const rightBorderDelta = Math.max(
+        spread([nth(0, '┐', 0).x, nth(1, '│', 1).x, nth(2, '┘', 0).x]),
+        spread([nth(0, '┐', 1).x, nth(1, '│', 3).x, nth(2, '┘', 1).x]),
+        spread([nth(0, '┐', 2).x, nth(1, '│', 5).x, nth(2, '┘', 2).x]));
+      const endpointDelta = Math.max(
+        spread([nth(2, '┬', 0).x, nth(3, '│', 0).x, nth(4, '<', 0).x,
+                nth(5, '│', 0).x, nth(6, '│', 0).x]),
+        spread([nth(2, '┬', 1).x, nth(3, '>', 0).x, nth(4, '│', 0).x,
+                nth(5, '│', 1).x, nth(6, '<', 0).x]),
+        spread([nth(2, '┬', 2).x, nth(3, '│', 1).x, nth(4, '│', 1).x,
+                nth(5, '>', 0).x, nth(6, '│', 1).x]));
+      const cs = getComputedStyle(code), ps = getComputedStyle(pre);
+      return {
+        ascii: rect(1, lines[1].indexOf('W')).width,
+        box: rect(0, lines[0].indexOf('─')).width,
+        cjk: rect(1, lines[1].indexOf('用')).width,
+        rightBorderDelta, endpointDelta, fontFamily: cs.fontFamily,
+        whiteSpace: ps.whiteSpace, tabSize: ps.tabSize, overflowX: ps.overflowX,
+        preClientWidth: pre.clientWidth, preScrollWidth: pre.scrollWidth,
+        pageClientWidth: document.documentElement.clientWidth,
+        pageScrollWidth: document.documentElement.scrollWidth
+      };
+    }"""
+    code = c.page.locator(".msg-assistant pre code")
+    await code.evaluate("el => el.style.fontFamily = 'inherit'")
+    before = await c.page.evaluate(measure_js)
+    await code.evaluate("el => el.style.fontFamily = ''")
+    after = await c.page.evaluate(measure_js)
+    print("  [MEASURE] before=" + json.dumps(before, ensure_ascii=False, sort_keys=True))
+    print("  [MEASURE] after-desktop=" + json.dumps(after, ensure_ascii=False, sort_keys=True))
+
+    c.check("复合字体与 C/C/2C advance",
+            after["fontFamily"].lstrip().startswith('"EAgent Noto CJK Diagram"')
+            and abs(after["box"] - after["ascii"]) <= 0.25
+            and abs(after["cjk"] - 2 * after["ascii"]) <= 0.5,
+            json.dumps(after, ensure_ascii=False))
+    c.check("桌面边框与端点偏差 <=1px",
+            after["rightBorderDelta"] <= 1 and after["endpointDelta"] <= 1,
+            "right=%.3f endpoint=%.3f" % (after["rightBorderDelta"], after["endpointDelta"]))
+    c.check("pre 空白/tab/内部滚动且桌面无页面横溢",
+            after["whiteSpace"] == "pre" and after["tabSize"] == "4"
+            and after["overflowX"] == "auto"
+            and after["pageScrollWidth"] <= after["pageClientWidth"] + 1,
+            json.dumps(after))
+
+    inline = await c.page.locator(".msg-assistant code:not(pre code)").evaluate(
+        "el => { const s=getComputedStyle(el); return {display:s.display, whiteSpace:s.whiteSpace, font:s.fontFamily}; }")
+    c.check("普通 Markdown 与 inline code 未受影响",
+            await c.ev("!!document.querySelector('.msg-assistant strong')")
+            and inline["display"] == "inline" and inline["whiteSpace"] == "normal"
+            and "EAgent Noto CJK Diagram" not in inline["font"],
+            json.dumps(inline, ensure_ascii=False))
+
+    await c.page.set_viewport_size({"width": 390, "height": 844})
+    mobile = await c.page.evaluate(measure_js)
+    print("  [MEASURE] after-mobile=" + json.dumps(mobile, ensure_ascii=False, sort_keys=True))
+    c.check("手机对齐、内部滚动且无页面横溢",
+            mobile["rightBorderDelta"] <= 1 and mobile["endpointDelta"] <= 1
+            and mobile["preScrollWidth"] > mobile["preClientWidth"]
+            and mobile["pageScrollWidth"] <= mobile["pageClientWidth"] + 1,
+            json.dumps(mobile))
+
+
 CASES = [
+    {"name": "markdown_cjk_diagram", "desc": "Markdown 中文框线图本地复合字体与响应式滚动",
+     "run": run_markdown_cjk_diagram},
     {"name": "chat_open_sse", "desc": "openSession + SSE 基本流（mock 事件渲染）+ Busy 状态",
      "run": run_chat_open_sse},
     {"name": "chat_state_preserved", "desc": "切会话状态保留（草稿/滚动/缓存，不重拉历史）",

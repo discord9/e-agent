@@ -8009,6 +8009,20 @@ _empty_rule = re.search(
     r'#chatView\.no-session\s+\.composer\s*,[^\{]*\{([^}]*)\}', _css)
 _empty_ok = bool(_empty_rule and re.search(r'display:\s*none', _empty_rule.group(1)))
 print(("PASS" if _empty_ok else "FAIL") + " no-session hides messages and composer in style.css")
+# Markdown 围栏图使用 local-only unicode-range 复合字体；inline code 不受影响。
+_aliases = re.findall(r'@font-face\s*\{([^}]*)\}', _css)
+_pre_code = re.search(r'\.msg-body\s+pre\s+code\s*\{([^}]*)\}', _css)
+_pre_rules = re.findall(r'\.msg-body\s+pre\s*\{([^}]*)\}', _css)
+_pre_css = '\n'.join(_pre_rules)
+_diagram_font_ok = bool(
+    len(_aliases) == 2 and all(re.search(r'src:\s*local\(', a) for a in _aliases)
+    and not any(re.search(r'url\(', a) for a in _aliases)
+    and any('U+2190-21FF' in a and 'U+2500-257F' in a for a in _aliases)
+    and _pre_code and re.search(r'font-family:\s*["\']EAgent Noto CJK Diagram["\']', _pre_code.group(1))
+    and re.search(r'white-space:\s*pre', _pre_css)
+    and re.search(r'tab-size:\s*4', _pre_css)
+    and re.search(r'overflow-x:\s*auto', _pre_css))
+print(("PASS" if _diagram_font_ok else "FAIL") + " local composite font is scoped to fenced Markdown code")
 # 手机用量：复用既有 <=480px 段，百分比常驻，只有具备百分比时隐藏完整详情；
 # 禁止退回对整个 #usageInfo 做 ellipsis（会让末尾百分比消失）。
 _mobile = re.search(r'@media\s*\(max-width:\s*480px\)\s*\{([\s\S]*?)\n\s*\}\n\s*/\* 更窄', _css)
@@ -8115,4 +8129,4 @@ _icon_ok = bool(_icon_m and '%23' in _icon_m.group(1) and '#' not in _icon_m.gro
 print(("PASS" if _icon_ok else "FAIL") + " inline SVG favicon data URI in index.html head")
 if MODE == 'header':
     sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _header_busy_ok else 1)
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _header_busy_ok and _marker_ok and _empty_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok else 1)
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok else 1)

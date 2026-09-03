@@ -1,3 +1,17 @@
+  /* Markdown 围栏图专用本地复合字体：Noto 提供 ASCII/CJK，DejaVu 仅接管
+     arrows / box drawing。size-adjust 把两者量化到同一 1:1:2 终端网格。 */
+  @font-face {
+    font-family: "EAgent Noto CJK Diagram";
+    src: local("DejaVu Sans Mono");
+    unicode-range: U+2190-21FF, U+2500-257F;
+    size-adjust: 80%;
+  }
+  @font-face {
+    font-family: "EAgent Noto CJK Diagram";
+    src: local("Noto Sans Mono CJK SC");
+    unicode-range: U+0000-218F, U+2200-24FF, U+2580-10FFFF;
+  }
+
   /* ============ Solarized Light 主题（对齐 TUI） ============ */
   :root {
     --base3:  #fdf6e3;  /* 背景 */
@@ -453,6 +467,8 @@
     border-radius: 4px;
     padding: 8px 10px;
     overflow-x: auto;
+    white-space: pre;
+    tab-size: 4;
     line-height: 1.5;
   }
   .msg-body code {
@@ -461,7 +477,13 @@
     padding: 1px 4px;
     font-size: 13px;
   }
-  .msg-body pre code { background: none; padding: 0; }
+  .msg-body pre code {
+    background: none;
+    padding: 0;
+    font-family: "EAgent Noto CJK Diagram", "Noto Sans Mono CJK SC",
+                 "DejaVu Sans Mono", monospace;
+    font-size: 14px;
+  }
 
   .msg-user { color: var(--cyan); }
   .msg-user .who { color: var(--cyan); }
