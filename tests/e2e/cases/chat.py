@@ -404,7 +404,7 @@ async def run_markdown_cjk_diagram(c):
 
 
 CASES = [
-    {"name": "markdown_cjk_diagram", "desc": "Markdown 中文框线图本地复合字体与响应式滚动",
+    {"name": "markdown_cjk_diagram", "desc": "Markdown 中文框线图自托管 Sarasa 字体与响应式滚动",
      "run": run_markdown_cjk_diagram},
     {"name": "chat_open_sse", "desc": "openSession + SSE 基本流（mock 事件渲染）+ Busy 状态",
      "run": run_chat_open_sse},

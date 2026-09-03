@@ -1247,8 +1247,8 @@ search, or remote MCP support.
 The web UI is a single self-contained HTML page, assembled from disk on
 every request in dev builds and compiled into the binary via `include_str!`
 in release builds: deliberately no frontend bundler/build pipeline, no
-hashed asset routes, no HTTP compression, no runtime asset discovery, and no
-KaTeX font packaging.
+generic hashed-asset pipeline beyond the one bundled CJK diagram font, no HTTP
+compression, no runtime asset discovery, and no KaTeX font packaging.
 Workspace skills are deliberately flat `<skills-dir>/<name>/SKILL.md` only
 (global skills from `Config::config_dir()/skills/`, workspace skills from
 `.e-agent/skills/`): frontmatter disclosure is limited to single-line
