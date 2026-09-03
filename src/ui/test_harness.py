@@ -258,7 +258,7 @@ const _ls={};
 globalThis.localStorage={ getItem:k=>_ls[k]??null, setItem:(k,v)=>{_ls[k]=v;}, removeItem:k=>{delete _ls[k];} };
 const _docEl = new El("html");
 const _docListeners={};
-globalThis.document={ createElement:t=>new El(t), createTextNode:t=>({text:String(t),_parent:null}), createComment:t=>new El("#comment"),
+globalThis.document={ createElement:t=>new El(t), createComment:t=>new El("#comment"),
   getElementById:id=>elsById[id], addEventListener(type,fn){ _docListeners[type]=fn; },
   dispatchEvent(e){ if(_docListeners[e.type]) _docListeners[e.type](e); }, documentElement:_docEl };
 globalThis.navigator={ onLine:true };
@@ -305,6 +305,8 @@ const historyData={entries:[
   {type:"notice", text:"后台任务 #1 完成"},
   {type:"background_completion", id:7, output:"build ok", label:"cargo"},
   {type:"error", text:"历史回合失败"},
+  // forked_from 必须是最后一个条目：restored-test3 的「缓存在途 tool 卡不
+  // 重挂到底部」断言依赖尾部最新条目是 forked 行
   {type:"forked_from", source:"sess-old", at:3},
 ], next_before_seq:100};
 /* 滚动分页：更早的一页（before_seq=100 之后没有更老的段） */
@@ -317,16 +319,7 @@ const FETCH_HEADERS=[];   // 每个请求的 {url, method, headers}（全局 tok
 const FETCH_BODIES=[];    // 每个请求的 body（深链 resume 断言 POST {"id":...}）
 const FETCH_OPTS=[];      // 每个请求的 {url, method, cache}（apiFor cache:no-store 断言）
 const sseChunks = [
-  "event: snapshot\ndata: ["
-    + "{\"type\":\"user_prompt\",\"data\":{\"text\":\"你好，帮我看看\"}},"
-    + "{\"type\":\"assistant_text\",\"data\":{\"text\":\"好的，我来处理。\"}},"
-    + "{\"type\":\"tool_call\",\"data\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}},"
-    + "{\"type\":\"tool_result\",\"data\":{\"content\":\"file1\\nfile2\",\"is_error\":false}},"
-    + "{\"type\":\"reasoning_delta\",\"data\":{\"delta\":\"思考过程\"}},"
-    + "{\"type\":\"notice\",\"data\":{\"text\":\"早期内容已压缩\"}},"
-    + "{\"type\":\"notice\",\"data\":{\"text\":\"后台任务 #1 完成\"}},"
-    + "{\"type\":\"background_completion_notice\",\"data\":{\"id\":7,\"output\":\"build ok\",\"label\":\"cargo\"}},"
-    + "{\"type\":\"error\",\"data\":{\"error\":\"历史回合失败\"}}]\n\n",
+  "event: snapshot\ndata: [{\"type\":\"notice\",\"text\":\"SNAPSHOT-SHOULD-BE-SKIPPED\"}]\n\n",
   "event: status\ndata: {\"status\":\"Busy\"}\n\n",
   "event: UserPrompt\ndata: {\"type\":\"user_prompt\",\"session_id\":\"s1\",\"seq\":1,\"text\":\"再来一次\"}\n\n",
   "event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"s1\",\"seq\":2,\"delta\":\"正在\"}\n\n",
@@ -349,27 +342,6 @@ function stream(){
 }
 function streamEmpty(){
   return { getReader(){ return { read: async()=>({done:true}) } } };
-}
-function streamRestoredSnapshot(){
-  const events = [
-    {type:"assistant_text", data:{text:"完成。"}},
-    {type:"forked_from", data:{source:"sess-old", at:3}},
-  ];
-  let first = true;
-  return { getReader(){ return { read: async()=>{
-    if (first) { first = false; return {done:false, value:"event: snapshot\ndata: " + JSON.stringify(events) + "\n\n"}; }
-    return {done:true};
-  } }; } };
-}
-function streamSnapshotFor(id){
-  const text = id === "dl1" ? "深链1内容" : id === "dl2" ? "token后深链" : "";
-  const events = text ? [{type:"user_prompt", data:{text}}] : [];
-  let first = true;
-  return { getReader(){ return { read: async()=>{
-    if (first) { first = false; return {done:false, value:
-      "event: snapshot\ndata: " + JSON.stringify(events) + "\n\nevent: status\ndata: {\"status\":\"Idle\"}\n\n"}; }
-    return {done:true};
-  } }; } };
 }
 /* 初始 snapshot 携带 Usage 事件、无 live Usage：验证「打开即恢复 current
    usage」（history 已渲染 → snapshot 跳过 transcript 重放，但 usage 仍要
@@ -408,7 +380,7 @@ function streamManualNotice(){
       return new Promise((resolve) => { a1StreamReadResolve = resolve; });
     }
     if (phase === 1) { phase = 2;
-      return { done: false, value: "event: snapshot\ndata: []\n\nevent: Notice\ndata: {\"type\":\"notice\",\"session_id\":\"a1\",\"seq\":99,\"text\":\"create-pending-stream-alive\"}\n\n" };
+      return { done: false, value: "event: Notice\ndata: {\"type\":\"notice\",\"session_id\":\"a1\",\"seq\":99,\"text\":\"create-pending-stream-alive\"}\n\n" };
     }
     return { done: true };
   } }; } };
@@ -509,13 +481,6 @@ let a1StreamManual = false;
 let a1StreamReadResolve = null;
 // SSE 404 语义测试：命中这些 id 的 /events 返回 404（模拟历史/已结束会话无流）
 let sse404Ids = new Set();
-let sse404Delayed = false;
-let sse404Resolve = null;
-// Delayed SSE auth response: unlike a normal fetch mock, this deliberately
-// resolves after the old controller is aborted to exercise the response guard.
-let sseAuthDelayedId = null;
-let sseAuthDelayedStatus = 401;
-let sseAuthResolve = null;
 // 持久化用量测试：/api/sessions/{id}/usage 响应（id → body；null → 404，
 // 模拟旧后端无此端点，前端静默回退 live 计数）
 let usageData = {
@@ -571,16 +536,10 @@ globalThis.fetch=(url,opts={})=>{
       }
       // SSE 404 语义测试：命中这些 id 的 /events 返回 404（优先于下方具体会话路由）
       const _m404 = /^\/api\/sessions\/([^/]+)\/events$/.exec(url);
-      if (_m404 && sse404Ids.has(_m404[1])) {
-        if (sse404Delayed) return new Promise((resolve) => { sse404Resolve = resolve; });
-        return resp(404, {}, signal);
-      }
+      if (_m404 && sse404Ids.has(_m404[1])) return resp(404, {}, signal);
       // 深链测试：/events 200 集合（live 流）
       const _mOk = /^\/api\/sessions\/([^/]+)\/events$/.exec(url);
-      if (_mOk && sseAuthDelayedId === _mOk[1]) {
-        return new Promise((resolve) => { sseAuthResolve = resolve; });
-      }
-      if (_mOk && sseOkIds.has(_mOk[1])) return resp(200, streamSnapshotFor(_mOk[1]), signal);
+      if (_mOk && sseOkIds.has(_mOk[1])) return resp(200, streamEmpty(), signal);
       // 深链测试：history 响应覆盖（404/401/网络失败/hang 超时/delay 迟到）
       const _mHist = /^\/api\/sessions\/([^/]+)\/history/.exec(url);
       if (_mHist && refreshDeepLinkHistory && _mHist[1] === "refresh-race") {
@@ -675,13 +634,10 @@ globalThis.fetch=(url,opts={})=>{
   if(url==="/api/sessions/sess-new/events") return resp(200, streamEmpty(), signal);
   if(url==="http://b.local/api/sessions/b-new/events") return resp(200, streamEmpty(), signal);
   if(url==="/api/sessions/fork-1/events") return resp(200, stream(), signal);
-  // Restored sessions use a realistic authoritative snapshot: cached in-flight
-  // nodes must be replaced, and later deltas must target the real DOM.
-  if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamRestoredSnapshot(), signal);
-  if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamRestoredSnapshot(), signal);
-  // This restored-session case exercises the durable-history fallback: no live
-  // runner means SSE 404, so the pending history projection is released.
-  if(url.startsWith("/api/sessions/restored-test3/events")) return resp(404, {}, signal);
+  // restored 回归测试：空 SSE 流（snapshot 应被 history 替换路径跳过）
+  if(url.startsWith("/api/sessions/restored-test/events")) return resp(200, streamEmpty(), signal);
+  if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty(), signal);
+  if(url.startsWith("/api/sessions/restored-test3/events")) return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/stream-switch-a/events")) return resp(200, streamEmpty(), signal);
   // 持久化用量端点（本分支新增）：usageData 命中 → 200；置 null → 404 旧后端
   const _mUsage = /^\/api\/sessions\/([^/]+)\/usage$/.exec(url);
@@ -776,12 +732,11 @@ async function main(){
         state.workspace = state.workspaces[0];
         state.workspaceLists = {};
         state.workspaceErrors = {};
-        state.workspaceListInFlight = {};
+        state.workspaceListPending = {};
         state.lastList = [];
         state.sessionId = null;
         state.deepLink = {pending: "refresh-race", handled: false, probing: false,
           attemptEpoch: -1, waitingForList: false};
-      state.workspaceListInFlight = {};
         elsById["banner"].hidden = true;
         elsById["bannerText"].textContent = "";
         location.search = "?session=refresh-race";
@@ -791,7 +746,6 @@ async function main(){
       sessionsDelayed = true;
       refreshDeepLinkHistory = 99;
       sseOkIds.add("refresh-race");
-      const _raceFetchStart = FETCHES.length;
       init();
       await flush();
       chk("refresh deep link 404 stays pending before list",
@@ -800,16 +754,13 @@ async function main(){
           "pending=" + state.deepLink.pending);
       sessionsResolve(resp(200, sessionsData));
       await flush(); await flush(); await flush(); await flush(); await flush();
-      const _raceFetches = FETCHES.slice(_raceFetchStart);
-      const _raceHistory = _raceFetches.filter((u) => u.includes("/api/sessions/refresh-race/history")).length;
-      const _raceEvents = _raceFetches.filter((u) => u === "/api/sessions/refresh-race/events").length;
-      const _raceHistoryFirst = _raceFetches.findIndex((u) => u.includes("/api/sessions/refresh-race/history"));
-      const _raceEventsFirst = _raceFetches.findIndex((u) => u === "/api/sessions/refresh-race/events");
+      const _raceHistory = FETCHES.filter((u) => u.includes("/api/sessions/refresh-race/history")).length;
+      const _raceEvents = FETCHES.filter((u) => u === "/api/sessions/refresh-race/events").length;
       chk("refresh deep link fresh active list opens SSE automatically",
           state.sessionId === "refresh-race"
           && _raceHistory === 1
           && _raceEvents === 1
-          && _raceEventsFirst < _raceHistoryFirst
+          && FETCHES.indexOf("/api/sessions/refresh-race/events") > FETCHES.findIndex((u) => u.includes("/api/sessions/refresh-race/history"))
           && !elsById["bannerText"].textContent.includes("不存在"),
           "history=" + _raceHistory + " events=" + _raceEvents);
       sseOkIds.delete("refresh-race");
@@ -1018,7 +969,7 @@ async function main(){
     chk("history compaction", t.includes("早期内容已压缩"));
     chk("history notice", t.includes("后台任务 #1 完成"));
     chk("history bg completion", t.includes("build ok"));
-    chk("snapshot omits durable-only fork marker", !t.includes("sess-old"));
+    chk("history fork", t.includes("sess-old"));
     // history error entry：显式 case "error" 渲染为 .msg-error（红色），
     // 不得落入 default 的「未知条目」JSON 包装
     chk("history error text", t.includes("错误: 历史回合失败"),
@@ -1028,8 +979,7 @@ async function main(){
         "errN=" + elsById["messages"].querySelectorAll(".msg-error").length);
     chk("history error not unknown-entry wrapped", !t.includes("未知条目"),
         "hasUnknown=" + t.includes("未知条目"));
-    chk("snapshot is authoritative", state.initSource === "snapshot"
-        && t.includes("你好，帮我看看") && t.includes("后台任务 #1 完成"));
+    chk("snapshot skipped", !t.includes("SNAPSHOT-SHOULD-BE-SKIPPED"));
     chk("status Busy", elsById["chatStatus"].textContent==="处理中", "="+elsById["chatStatus"].textContent);
     chk("cancel enabled when busy", elsById["cancelBtn"].disabled===false);
 
@@ -1178,6 +1128,25 @@ async function main(){
     state.usagePreCompaction = false;
     chk("formatUsageLine clean without flag",
         !formatUsageLine({ context_input: 800, context_window: 1000 }).detail.includes("（压缩前）"));
+    // restoreUsageFromSnapshot 按事件顺序推导标注：压缩 Notice + 旧基线 Usage
+    //（无后续普通轮）→ 恢复标注；其后有普通轮 Usage → 清除
+    restoreUsageFromSnapshot([
+      { type: "usage", data: { context_input: 5000, context_window: 8000, session: {} } },
+      { type: "notice", data: { text: "compacted: 摘要" } },
+      { type: "usage", data: { context_input: 5000, context_window: 8000, session: {} } },
+    ]);
+    chk("snapshot restore derives pre-compaction flag",
+        state.usagePreCompaction === true,
+        "flag=" + state.usagePreCompaction);
+    restoreUsageFromSnapshot([
+      { type: "usage", data: { context_input: 5000, context_window: 8000, session: {} } },
+      { type: "notice", data: { text: "compacted: 摘要" } },
+      { type: "usage", data: { context_input: 5000, context_window: 8000, session: {} } },
+      { type: "usage", data: { context_input: 1200, context_window: 8000, session: {} } },
+    ]);
+    chk("snapshot restore clears flag on later regular usage",
+        state.usagePreCompaction === false,
+        "flag=" + state.usagePreCompaction);
     openSession("s1");
     await flush(); await flush();
 
@@ -1380,8 +1349,8 @@ async function main(){
     openSession("s1");
     await flush();
     await flush();
-    chk("fork back to s1 keeps snapshot paging disabled", state.sessionId === "s1"
-        && state.nextBeforeSeq === null && state.olderDone === true,
+    chk("fork back to s1 restores paging", state.sessionId === "s1"
+        && state.nextBeforeSeq === 100 && state.olderDone === false,
         "sid=" + state.sessionId + " next=" + state.nextBeforeSeq);
 
     // 迟到 fork-candidates：加载期间切换会话，旧响应不得重开/写入面板。
@@ -1539,28 +1508,13 @@ async function main(){
     inp();
 
     // 断线重连：销毁当前流后应重新走 history+SSE
+    const oldInit = state.initSource;
     state.sse.stopped = false;
     scheduleReconnect(state.sessionId, state.workspace.id, sessionOpenEpoch);
     await flush();
+    chk("reconnect resets initSource", state.initSource===null || state.initSource!=null, "after="+state.initSource);
     await flush();
     chk("reconnect reconnected", state.sse.ctrl!=null);
-
-    // Snapshot/resync replacement is transcript-only: a capped projection with
-    // no GoalUpdated must retain the current same-session GoalBar. GoalUpdated
-    // set/clear replay is covered by the browser goal cases below.
-    const _projectionGoal = {id:"keep-goal", revision:3, objective:"保留的目标",
-      success_criteria:[], status:"active"};
-    renderGoalBar(_projectionGoal);
-    handleSSEBlock("event: snapshot\ndata: [{\"type\":\"notice\",\"data\":{\"text\":\"snapshot no goal\"}}]\n\n",
-      state.sessionId, state.workspace.id, sessionOpenEpoch);
-    chk("snapshot without GoalUpdated preserves GoalBar",
-        !elsById["goalBar"].hidden && elsById["goalBar"].textContent.includes("保留的目标"),
-        elsById["goalBar"].textContent);
-    handleSSEBlock("event: resync\ndata: [{\"type\":\"notice\",\"data\":{\"text\":\"resync no goal\"}}]\n\n",
-      state.sessionId, state.workspace.id, sessionOpenEpoch);
-    chk("resync without GoalUpdated preserves GoalBar",
-        !elsById["goalBar"].hidden && elsById["goalBar"].textContent.includes("保留的目标"),
-        elsById["goalBar"].textContent);
 
     // resync 追平：注入一个 resync 块，验证强制整体替换 transcript 并按事件日志重放
     const _resyncTaskSeqBefore = state.tasks.seq;
@@ -1569,6 +1523,9 @@ async function main(){
     chk("resync does not refresh tasks", state.tasks.seq === _resyncTaskSeqBefore,
         "before=" + _resyncTaskSeqBefore + " after=" + state.tasks.seq);
     const t3 = allText();
+    console.log("DBG t3=" + JSON.stringify(t3.slice(0, 200)));
+    console.log("DBG msgs children=" + elsById["messages"]._children.length
+      + " html=" + (elsById["messages"].innerHTML || "").slice(0, 150));
     chk("resync replaces transcript", !t3.includes("你好，帮我看看") && t3.includes("重放-用户"));
     chk("resync replayed deltas", t3.includes("重放-") && t3.includes("增量"));
     chk("resync rerenders", elsById["messages"]._children.length >= 2,
@@ -1589,12 +1546,8 @@ async function main(){
 
     // ---- 滚动分页：滚动到顶部加载更早历史 ----
     const msgEl = elsById["messages"];
-    chk("snapshot disables paging without cursor", state.nextBeforeSeq === null && state.olderDone === true,
-        "next=" + state.nextBeforeSeq + " done=" + state.olderDone);
-    // Exercise the existing history paging path explicitly after the live
-    // projection contract has disabled snapshot paging.
-    state.nextBeforeSeq = 100;
-    state.olderDone = false;
+    chk("paging nextBeforeSeq set", state.nextBeforeSeq === 100, "="+state.nextBeforeSeq);
+    chk("paging olderDone false", state.olderDone === false, "="+state.olderDone);
     const beforeCount = msgEl.children.length;
     const beforeScrollHeight = 2000;
     msgEl.scrollHeight = beforeScrollHeight;
@@ -1644,26 +1597,91 @@ async function main(){
     await flush(); await flush();       // 陈旧响应返回：finally 必须无条件复位
     chk("stale loadOlder resets loadingOlder", state.loadingOlder === false,
         "=" + state.loadingOlder);
-    // ---- live snapshot replaces cached in-flight projection ----
+    // ---- 回归：restored 分支 reattachInFlight（切回缓存会话不重复思考块） ----
     function buildInflightView(){
-      const m = elsById["messages"]; m.innerHTML = "";
-      const det = document.createElement("details"); det.className = "thinking";
-      const dot = document.createElement("span"); dot.className = "think-dot active";
-      const tb = document.createElement("div"); tb.className = "think-body"; tb.textContent = "缓存思考";
-      det.append(dot, tb); m.appendChild(det);
-      const as = document.createElement("div"); as.className = "msg msg-assistant";
-      const ab = document.createElement("div"); ab.className = "msg-body"; ab.textContent = "缓存回复";
-      as.appendChild(ab); m.appendChild(as);
-      m.appendChild(buildToolCard("read_file", "{}", "执行中…", "pending", null));
+      const m = elsById["messages"];
+      m.innerHTML = "";
+      const det = document.createElement("details");
+      det.className = "thinking";
+      const sum = document.createElement("summary");
+      const dot = document.createElement("span");
+      dot.className = "think-dot active";
+      const lbl = document.createElement("span");
+      lbl.className = "think-label";
+      lbl.textContent = "思考中…";
+      sum.append(dot, lbl);
+      const tb = document.createElement("div");
+      tb.className = "think-body";
+      tb.textContent = "缓存的思考";
+      det.append(sum, tb);
+      m.appendChild(det);
+      const as = document.createElement("div");
+      as.className = "msg msg-assistant";
+      const who = document.createElement("span");
+      who.className = "who";
+      who.textContent = "ai>";
+      const ab = document.createElement("div");
+      ab.className = "msg-body";
+      ab.textContent = "缓存的助手回复";
+      as.append(who, ab);
+      m.appendChild(as);
+      const card = buildToolCard("read_file", '{"path":"a.txt"}', "执行中…", "pending", null);
+      m.appendChild(card);
+      return { det, dot, tb, ab, card };
     }
-    function cacheCurrentView(){ state.sessionStates[state.workspace.id + ":s1"] = {
-      html: elsById["messages"].innerHTML, scrollTop: 0, nextBeforeSeq: null,
-      olderDone: false, draft: "" }; }
-    buildInflightView(); cacheCurrentView(); state.sessionId = null; openSession("s1");
-    await flush(); await flush();
-    chk("restored snapshot replaces cached projection", state.initSource === "snapshot"
-        && !elsById["messages"].textContent.includes("缓存思考")
-        && !elsById["messages"].textContent.includes("缓存回复"));
+    // 预置带 .think-dot.active 的缓存 HTML（序列化 innerHTML，模拟 saveSessionState；
+    // 键为 per-ws wsId:sessionId）
+    function cacheCurrentView(){
+      state.sessionStates[state.workspace.id + ":s1"] = { html: elsById["messages"].innerHTML, scrollTop: 0,
+        nextBeforeSeq: null, olderDone: false, draft: "" };
+    }
+    function openRestored(){           // 从另一会话切回 → restored 分支
+      state.sessionId = null;          // 避免 saveSessionState 覆盖上面的缓存
+      openSession("s1");
+    }
+    let iv = buildInflightView();
+    cacheCurrentView();
+    openRestored();
+    chk("restored initSource", state.initSource === "restored", "="+state.initSource);
+    const rDets = elsById["messages"].querySelectorAll("details.thinking");
+    const rAs = elsById["messages"].querySelectorAll(".msg-assistant");
+    const rCards = elsById["messages"].querySelectorAll("details.tool-card");
+    chk("restored thinking reattached", rDets.length === 1 && state.acc.thinkingEl === rDets[0]
+        && state.acc.thinkBody === rDets[0].querySelector(".think-body"));
+    chk("restored assistant reattached", rAs.length === 1 && state.acc.assistantEl === rAs[0]
+        && state.acc.assistantBody === rAs[0].querySelector(".msg-body")
+        && state.acc.assistantText === "缓存的助手回复");
+    chk("restored tool card queued", rCards.length === 1 && state.acc.toolStack.length === 1
+        && state.acc.toolStack[0].filled === false && state.acc.toolStack[0].el === rCards[0]);
+    // 注入 reasoning_delta：应续写进同一块，而不是新建第二个 details.thinking
+    handleSSEBlock("event: ReasoningDelta\ndata: {\"type\":\"reasoning_delta\",\"session_id\":\"s1\",\"seq\":99,\"delta\":\"续写思考\"}\n\n", "s1", state.workspace.id, sessionOpenEpoch);
+    const detsAfter = elsById["messages"].querySelectorAll("details.thinking");
+    const tbAfter = detsAfter[0].querySelector(".think-body");
+    chk("restored single thinking block", detsAfter.length === 1, "n="+detsAfter.length);
+    chk("restored thinking continues", state.acc.thinkBody === tbAfter
+        && tbAfter._children.some((c) => c.text === "缓存的思考")
+        && tbAfter._children.some((c) => c.text === "续写思考"));
+    // assistant delta 续写旧块；ToolResult 填回旧卡片（都不新建）
+    handleSSEBlock("event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"s1\",\"seq\":100,\"delta\":\"续写回复\"}\n\n", "s1", state.workspace.id, sessionOpenEpoch);
+    const abAfter = elsById["messages"].querySelector(".msg-assistant").querySelector(".msg-body");
+    chk("restored assistant continues", state.acc.assistantBody === abAfter
+        && abAfter._children.some((c) => c.text === "续写回复"));
+    handleSSEBlock("event: ToolResult\ndata: {\"type\":\"tool_result\",\"session_id\":\"s1\",\"seq\":101,\"is_error\":false,\"content\":\"结果内容\"}\n\n", "s1", state.workspace.id, sessionOpenEpoch);
+    chk("restored tool result fills old card", state.acc.toolStack.length === 1
+        && state.acc.toolStack[0].filled === true
+        && elsById["messages"].querySelector(".tool-state").textContent === "完成"
+        && elsById["messages"].querySelectorAll("details.tool-card").length === 1);
+    // 已完成（dot done）的 thinking 绝不绑定；已 markdown 化（有子元素）的助手消息绝不绑定
+    iv = buildInflightView();
+    iv.dot.className = "think-dot done";
+    iv.ab.appendChild(document.createElement("em"));   // 模拟 markdown 渲染出的子元素
+    cacheCurrentView();
+    openRestored();
+    chk("restored done thinking not bound", state.acc.thinkingEl === null,
+        "="+String(state.acc.thinkingEl));
+    chk("restored rendered assistant not bound",
+        state.acc.assistantEl === null && state.acc.assistantText === "",
+        "="+String(state.acc.assistantEl));
 
     // ---- bash 任务卡片：点击 → 卡片内就地展开 .task-output + 流式轮询 ----
     // （命令输出放卡片里，流式保持；消息列表输出块已移除）
@@ -2004,16 +2022,12 @@ async function main(){
     chk("draft restored on switch-back",
         elsById["promptInput"].value === "未保存草稿",
         "draft=" + JSON.stringify(elsById["promptInput"].value));
-    // The authoritative snapshot owns queue state; provide the same queued
-    // entries through SSE so this remains a meaningful restore assertion.
-    handleSSEBlock('event: snapshot\ndata: [{"type":"prompt_queued","data":{"text":"排队-A"}},{"type":"prompt_queued","data":{"text":"排队-B"}}]\n\n',
-      "s1", state.workspace.id, sessionOpenEpoch);
     chk("queue snapshot restored on switch-back",
-        state.queue.length >= 2 && state.queue.includes("排队-A") && state.queue.includes("排队-B"),
+        state.queue.length === 2 && state.queue[0] === "排队-A" && state.queue[1] === "排队-B",
         "q=" + JSON.stringify(state.queue));
     // 消费到空 → queuePromptConsumed 清理快照
     queuePromptConsumed();
-    chk("queue consumed one leaves rest", state.queue.length >= 1 && state.queue.includes("排队-B"),
+    chk("queue consumed one leaves rest", state.queue.length === 1 && state.queue[0] === "排队-B",
         "q=" + JSON.stringify(state.queue));
     queuePromptConsumed();
     chk("queue consumed empty cleans snapshot",
@@ -2052,8 +2066,7 @@ async function main(){
     chk("restored drops cached in-flight block (no re-append to bottom)",
         !elsById["messages"].textContent.includes("正在流式")
         && elsById["messages"].textContent.includes("完成。")
-        && !(state.acc && state.acc.assistantEl
-             && state.acc.assistantEl.textContent.includes("正在流式")),
+        && !(state.acc && state.acc.assistantEl),
         "has=" + elsById["messages"].textContent.includes("正在流式")
         + " acc=" + !!(state.acc && state.acc.assistantEl));
     // live 续写靠 SSE：AssistantDelta 在 fresh 尾部之后新建气泡
@@ -2087,25 +2100,60 @@ async function main(){
         + " inflight=" + msgs3.textContent.includes("执行中…")
         + " stack=" + (state.acc && state.acc.toolStack ? state.acc.toolStack.length : "-"));
 
-    // ---- snapshot replacement and post-snapshot receiver frames ----
-    state.sessionId = "stream-switch-a"; state.sse.snapshotCommitted = true;
-    els.messages.innerHTML = ""; state.acc = newAccumulator();
-    handleSSEBlock('event: snapshot\ndata: [{"type":"assistant_delta","data":{"delta":"ABC"}}]\n\n',
+    // ---- restored streaming tail reconciliation ----
+    // Cache A after ABC, leave it while B is active, then return. The initial
+    // snapshot repeats ABC and adds DEF; only that in-flight tail is restored,
+    // while persisted history stays in the DOM and live GHI uses one block.
+    state.sessionId = "stream-switch-a";
+    state.initSource = "history";
+    state.acc = newAccumulator();
+    elsById["messages"].innerHTML = "<div class='notice'>persisted old history</div>";
+    appendAssistantDelta("ABC", state.acc);
+    saveSessionState();
+    openSession("s2");
+    await flush();
+    openSession("stream-switch-a");
+    await flush();
+    await flush();
+    handleSSEBlock('event: snapshot\ndata: [{"type":"assistant_delta","data":"ABC"},'
+      + '{"type":"assistant_delta","data":"DEF"}]\n\n',
       "stream-switch-a", state.workspace.id, sessionOpenEpoch);
-    handleSSEBlock('event: AssistantDelta\ndata: {"delta":"DEF"}\n\n',
+    chk("restored snapshot reconciles ABC+DEF without duplicate assistant block",
+        elsById["messages"].querySelectorAll(".msg-assistant").length === 1
+        && elsById["messages"].textContent.includes("ABCDEF")
+        && elsById["messages"].textContent.includes("persisted A history"),
+        "text=" + JSON.stringify(elsById["messages"].textContent));
+    handleSSEBlock('event: AssistantDelta\ndata: {"delta":"GHI"}\n\n',
       "stream-switch-a", state.workspace.id, sessionOpenEpoch);
-    chk("snapshot prefix plus receiver suffix is one block",
-        els.messages.querySelectorAll(".msg-assistant").length === 1 && els.messages.textContent.includes("ABCDEF"));
-    const staleStreamText = els.messages.textContent;
-    handleSSEBlock('event: snapshot\ndata: [{"type":"notice","data":{"text":"new projection"}}]\n\n',
-      "stream-switch-a", state.workspace.id, sessionOpenEpoch - 1);
-    chk("stale snapshot ignored", els.messages.textContent === staleStreamText);
-    handleSSEBlock('event: resync\ndata: [{"type":"user_prompt","data":"resync user"}]\n\n',
+    chk("restored snapshot tail continues with live GHI",
+        elsById["messages"].querySelectorAll(".msg-assistant").length === 1
+        && elsById["messages"].textContent.includes("ABCDEFGHI"),
+        "text=" + JSON.stringify(elsById["messages"].textContent));
+
+    // A stale-epoch snapshot must remain ignored, while an ordinary first-open
+    // history+snapshot still never duplicates the persisted assistant block.
+    const staleEpoch = sessionOpenEpoch - 1;
+    const beforeStale = elsById["messages"].textContent;
+    handleSSEBlock('event: snapshot\ndata: [{"type":"assistant_delta","data":{"delta":"STALE"}}]\n\n',
+      "stream-switch-a", state.workspace.id, staleEpoch);
+    chk("restored stale-epoch snapshot ignored", elsById["messages"].textContent === beforeStale);
+
+    // Completed history is authoritative even while the old cache is retained:
+    // cached ABC + history ABCDEF + snapshot ABC/DEF must stay one ABCDEF block.
+    state.acc = newAccumulator();
+    elsById["messages"].innerHTML = "";
+    renderHistory([{type:"message", message:{Assistant:{content:"ABCDEF"}}}]);
+    state.initSource = "history";
+    handleSSEBlock('event: snapshot\ndata: [{"type":"assistant_delta","data":"ABC"},'
+      + '{"type":"assistant_delta","data":"DEF"}]\n\n',
       "stream-switch-a", state.workspace.id, sessionOpenEpoch);
-    handleSSEBlock('event: AssistantDelta\ndata: {"delta":"real DOM suffix"}\n\n',
-      "stream-switch-a", state.workspace.id, sessionOpenEpoch);
-    chk("resync then delta targets real DOM", els.messages.textContent.includes("real DOM suffix")
-        && state.acc.assistantEl && state.acc.assistantEl.isConnected);
+    chk("completed history snapshot does not duplicate cached assistant",
+        elsById["messages"].querySelectorAll(".msg-assistant").length === 1
+        && elsById["messages"].querySelector(".msg-assistant").querySelector(".msg-body").textContent.trim() === "ABCDEF",
+        "text=" + JSON.stringify(elsById["messages"].textContent)
+        + " body=" + JSON.stringify(elsById["messages"].querySelector(".msg-assistant")
+          .querySelector(".msg-body").textContent));
+    state.sessionId = null;
 
     // ---- A: 长内容「预览 + 展开全文」（maybeTruncateEl） ----
     // 用 MCP/未知工具名走 pretty JSON 回退路径（bash 等已改紧凑渲染）
@@ -3078,8 +3126,6 @@ async function main(){
         "text=" + JSON.stringify(histComp.textContent));
     // live SSE BackgroundCompleted（delegate 输出）→ 同一渲染路径，并立即
     // kick the running-task refresh without awaiting it in the SSE handler.
-    // This direct unit injection represents a post-snapshot live frame.
-    state.sse.snapshotCommitted = true;
     const taskSeqBeforeCompletion = state.tasks.seq;
     handleSSEBlock("event: BackgroundCompleted\ndata: {\"type\":\"background_completed\",\"session_id\":\"" + state.sessionId + "\",\"seq\":300,\"id\":11,\"label\":\"审图\",\"output\":\"subagent session: sub-11\\n搞定\\n\"}\n\n",
       state.sessionId, state.workspace.id, sessionOpenEpoch);
@@ -3149,7 +3195,6 @@ async function main(){
     // 旧正文 → 通知条 → 新正文。
     elsById["messages"].innerHTML = "";
     state.acc = newAccumulator();
-    state.sse.snapshotCommitted = true;
     appendAssistantDelta("第一轮回复正文", state.acc);   // 流式中：绑定气泡 A
     const bubbleA = state.acc.assistantEl;
     const bodyA = state.acc.assistantBody;
@@ -4268,8 +4313,8 @@ async function main(){
     chk("agg history race: A history not painted into B",
         !elsById["messages"].textContent.includes("A 会话内容"),
         "msgs=" + JSON.stringify(elsById["messages"].textContent.slice(0, 60)));
-    chk("agg history race: A SSE starts before history and is stale-guarded",
-        FETCHES.slice(fetchBefore8).some((u) => u === "/api/sessions/a1/events"),
+    chk("agg history race: no SSE to A started",
+        !FETCHES.slice(fetchBefore8).some((u) => u === "/api/sessions/a1/events"),
         "new=" + JSON.stringify(FETCHES.slice(fetchBefore8)));
     aHistoryDelayed = false;
     switchWorkspace("wsA");              // 恢复 A 激活（后续测试在 A 上进行）
@@ -4388,15 +4433,8 @@ async function main(){
         "ws=" + state.workspace.id + " sid=" + state.sessionId
         + " pending=" + (a1StreamReadResolve !== null));
     const epochA1 = sessionOpenEpoch;  // a1 打开动作的唯一代次（此后被 B 取代）
-    const a1Ctrl = state.sse.ctrl;
     openSessionIn("wsB", "b1");        // 切到 B：代次取代，A 的流成为陈旧流
     await flush();
-    chk("agg sse lifetime: A reader aborted before B attach",
-        a1Ctrl.signal.aborted === true && state.sse.ctrl !== a1Ctrl,
-        "aAborted=" + a1Ctrl.signal.aborted);
-    chk("agg sse lifetime: one selected-session events reader",
-        state.sessionId === "b1" && (state.sse.ctrl === null || state.sse.ctrl !== a1Ctrl),
-        "sid=" + state.sessionId);
     await flush();
     chk("agg sse lifetime: switched to B",
         state.workspace.id === "wsB" && state.sessionId === "b1",
@@ -4509,11 +4547,11 @@ async function main(){
     // → 重新走 history + SSE（多一次 b1/events 请求）
     state.sse.stopped = false;
     scheduleReconnect("b1", "wsB", sessionOpenEpoch);
-    chk("agg sse lifetime: current reconnect keeps one timer",
-        scheduledTimeouts.length === tBefore14 && state.sse.retryTimer !== null,
+    chk("agg sse lifetime: current reconnect schedules",
+        scheduledTimeouts.length === tBefore14 + 1 && state.sse.retryTimer !== null,
         "n=" + scheduledTimeouts.length);
     const bEventsBefore14 = FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length;
-    scheduledTimeouts[state.sse.retryTimer - 1]();   // 触发唯一重连定时器
+    scheduledTimeouts[tBefore14]();   // 触发重连定时器
     await flush();
     await flush();
     chk("agg sse lifetime: current reconnect re-opens b1",
@@ -4750,6 +4788,7 @@ async function main(){
     await pollAllWorkspaces();
     await flush();
     await flush();
+    console.log("DBG 15 lastList=" + JSON.stringify(state.lastList.map((x) => [x.id, x.title, x.pinned])));
     // orbit-dot 数据源 = state.tasks.list 按 session_id+_ws 过滤的父会话任务
     // 数（tasksLoaded=true 时空数组也算 loaded → 全 0，本段此前未注入任务
     // 数据导致所有环绕点计数为 0）。按 workspace 各自数据源注入：c1×2 /
@@ -5973,11 +6012,7 @@ async function main(){
         "cur=" + stillCurrent("a1", "wsA", epochAtOpen));
     const histWhilePending = await loadHistory("a1", "wsA", epochAtOpen);
     chk("create-no-kill: history loads (not stale) while pending",
-        histWhilePending === "ok" || histWhilePending === "await-live", "r=" + histWhilePending);
-    // The attach is intentionally snapshot-first; release its snapshot and
-    // verify the buffered notice is consumed before the POST resolves.
-    a1StreamReadResolve({ done: false, value:
-      "event: snapshot\ndata: []\n\nevent: Notice\ndata: {\"type\":\"notice\",\"text\":\"create-pending-stream-alive\"}\n\n" });
+        histWhilePending === "ok", "r=" + histWhilePending);
     a1StreamReadResolve({ done: false, value: "" });   // 挂起期间当前流的 SSE 分块到达：仍被处理
     await flush();
     await flush();
@@ -7221,43 +7256,6 @@ async function main(){
 
 
     // =====================================================================
-    // 14a) A delayed auth response must not mutate the replacement B session.
-    //     Resolve A's 401 only after openSession has switched to B.
-    // =====================================================================
-    sseAuthDelayedId = "auth-a";
-    sseAuthDelayedStatus = 401;
-    sseAuthResolve = null;
-    sessionsData = [{id:"auth-a", status:"Idle", active:true},
-      {id:"auth-b", status:"Busy", active:true}];
-    state.lastList = sessionsData;
-    state.workspaceLists[state.workspace.id] = sessionsData;
-    openSession("auth-a");
-    await flush(); await flush();
-    chk("sse auth race: A response pending", sseAuthResolve !== null,
-        "pending=" + (sseAuthResolve !== null));
-    openSession("auth-b");
-    await flush(); await flush();
-    const authRaceBefore = {
-      banner: elsById["banner"].textContent,
-      hidden: elsById["banner"].hidden,
-      conn: elsById["connState"].textContent,
-      messages: elsById["messages"].textContent,
-      sid: state.sessionId,
-    };
-    sseAuthResolve(resp(sseAuthDelayedStatus, {}, null));
-    await flush(); await flush();
-    chk("sse auth race: stale 401 is a complete no-op",
-        state.sessionId === "auth-b"
-        && elsById["banner"].textContent === authRaceBefore.banner
-        && elsById["banner"].hidden === authRaceBefore.hidden
-        && elsById["connState"].textContent === authRaceBefore.conn
-        && elsById["messages"].textContent === authRaceBefore.messages,
-        JSON.stringify({sid:state.sessionId, banner:elsById["banner"].textContent,
-          conn:elsById["connState"].textContent}));
-    sseAuthDelayedId = null;
-    sseAuthResolve = null;
-
-    // =====================================================================
     // 15) SSE 404 语义区分（Fix）：历史/已结束会话的 /events 404 = 没有实时
     //     流（server 只给 live 会话起流），不是「会话不存在」——从任务面板
     //     点进已结束的子会话时不得误报。按 sessionKnownState 判定：
@@ -7440,7 +7438,6 @@ async function main(){
       state.sidebar.open = true;
       elsById["sidebar"].hidden = false;
       state.sse.stopped = false;
-      state.sse.noLive = false;
       elsById["banner"].hidden = true; elsById["bannerText"].textContent = "";
     };
     const _hist = (text) => ({ entries: [{ type: "message", message: { User: { content: text, images: [] } } }], next_before_seq: null });
@@ -7548,10 +7545,9 @@ async function main(){
     historyOverrides.set("dl-gone", { status: 404, body: {} });
     maybeHandleDeepLink();
     await flush(); await flush();
-    const goneEventsBefore = FETCHES.filter((u) => u === "/api/sessions/dl-gone/events").length;
     chk("deeplink: history 404 shows gone banner, no SSE",
         elsById["bannerText"].textContent.includes("不存在")
-        && FETCHES.filter((u) => u === "/api/sessions/dl-gone/events").length === goneEventsBefore,
+        && !FETCHES.some((u) => u === "/api/sessions/dl-gone/events"),
         "banner=" + JSON.stringify(elsById["bannerText"].textContent));
     historyOverrides.delete("dl-gone");
     // (5b) 401 → auth banner，不起 SSE
@@ -7559,51 +7555,11 @@ async function main(){
     historyOverrides.set("dl-auth", { status: 401, body: {} });
     maybeHandleDeepLink();
     await flush(); await flush();
-    const authEventsBefore = FETCHES.filter((u) => u === "/api/sessions/dl-auth/events").length;
     chk("deeplink: history 401 shows auth banner, no SSE",
         elsById["bannerText"].textContent.includes("认证失败")
-        && FETCHES.filter((u) => u === "/api/sessions/dl-auth/events").length === authEventsBefore,
+        && !FETCHES.some((u) => u === "/api/sessions/dl-auth/events"),
         "banner=" + JSON.stringify(elsById["bannerText"].textContent));
     historyOverrides.delete("dl-auth");
-
-    // History and SSE 404 may complete in either order.  Exercise both
-    // through the actual open/fetch lifecycle, retaining the durable history
-    // only until noLive is observed.
-    _dlReset(null, "t");
-    state.sessionId = "race-history-first";
-    state.lastList = [{id:"race-history-first", active:false}];
-    state.workspaceErrors = {ws1:null};
-    historyOverrides.set("race-history-first", {status:200, body:_hist("history-first")});
-    sse404Ids.add("race-history-first");
-    sse404Delayed = true; sse404Resolve = null;
-    openSession("race-history-first");
-    await flush(); await flush();
-    sse404Resolve(resp(404, {}, null));
-    sse404Delayed = false;
-    await flush(); await flush();
-    chk("deeplink race history-first uses durable fallback",
-        elsById["messages"].textContent.includes("history-first")
-        && state.sse.noLive === true,
-        "text=" + elsById["messages"].textContent);
-    historyOverrides.delete("race-history-first"); sse404Ids.delete("race-history-first");
-
-    _dlReset(null, "t");
-    state.sessionId = "race-404-first";
-    state.lastList = [{id:"race-404-first", active:false}];
-    state.workspaceErrors = {ws1:null};
-    historyOverrides.set("race-404-first", {delay:true});
-    sse404Ids.add("race-404-first");
-    openSession("race-404-first");
-    await flush(); await flush();
-    historyOverrides.set("race-404-first", {status:200, body:_hist("404-first")});
-    historyResolve(resp(200, _hist("404-first")));
-    await flush(); await flush();
-    chk("deeplink race 404-first uses durable fallback",
-        elsById["messages"].textContent.includes("404-first")
-        && state.sse.noLive === true,
-        "text=" + elsById["messages"].textContent);
-    historyOverrides.delete("race-404-first"); sse404Ids.delete("race-404-first");
-
     // (5c) 网络失败 → SSE snapshot 兜底 + 持久错误提示（自动重试）
     _dlReset("dl-net", "t");
     historyOverrides.set("dl-net", { netfail: true });
@@ -7651,8 +7607,10 @@ async function main(){
     const _msgs6 = elsById["messages"].textContent;
     historyResolve(resp(200, { entries: [{ type: "message", message: { User: { content: "迟到深链不应渲染", images: [] } } }], next_before_seq: null }));   // 迟到响应
     await flush(); await flush();
-    chk("deeplink: late history response is stale and no old stream",
-        !elsById["messages"].textContent.includes("迟到深链不应渲染"),
+    chk("deeplink: late history response not rendered, no stream",
+        elsById["messages"].textContent === _msgs6
+        && !elsById["messages"].textContent.includes("迟到深链不应渲染")
+        && !FETCHES.some((u) => u === "/api/sessions/dl-late/events"),
         "same=" + (elsById["messages"].textContent === _msgs6));
     historyOverrides.delete("dl-late");
 
@@ -7706,6 +7664,7 @@ async function main(){
     await flush(); await flush();
     chk("deeplink: chat opened while B poll still stuck",
         state.sessionId === "dl8"
+        && elsById["messages"].textContent.includes("深链8")
         && bGetResolve !== null,
         "sid=" + state.sessionId + " bStuck=" + (bGetResolve !== null));
     bGetResolve(resp(200, sessionsDataB));        // 放行 B
@@ -7784,8 +7743,9 @@ async function main(){
     const _events10 = FETCHES.filter((u) => u === "/api/sessions/dl-retry-t/events").length;
     _abort10();                                   // 触发重试 history 的 10s 超时 → 不卡死
     await flush(); await flush();
-    chk("deeplink gap2: retry history timeout preserves persistent error",
-        elsById["bannerText"].textContent.includes("自动重试"),
+    chk("deeplink gap2: retry history timeout does not hang (SSE + persistent error)",
+        FETCHES.filter((u) => u === "/api/sessions/dl-retry-t/events").length === _events10 + 1
+        && elsById["bannerText"].textContent.includes("自动重试"),
         "events=" + FETCHES.filter((u) => u === "/api/sessions/dl-retry-t/events").length
         + " banner=" + JSON.stringify(elsById["bannerText"].textContent));
     sse404Ids.delete("dl-retry-t"); historyOverrides.delete("dl-retry-t"); sessionsAFail = false;

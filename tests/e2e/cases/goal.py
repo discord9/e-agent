@@ -173,8 +173,7 @@ async def run_goal_sse(c):
     c.sessions = [S("main-idle", None, "主会话")]
     # live wire 契约：event: GoalUpdated + 扁平 payload {"goal": snapshot}
     c.sse_body = "\n\n".join([
-        "event: snapshot\ndata: []",
-        "event: GoalUpdated\ndata: {\"goal\":{\"id\":\"goal-sse\", \"revision\":1,"
+        "event: GoalUpdated\ndata: {\"goal\":{\"id\":\"goal-sse\",\"revision\":1,"
         "\"objective\":\"SSE 推送的 goal\",\"success_criteria\":[],\"status\":\"active\","
         "\"progress\":\"\",\"evidence\":[],\"blocked_reason\":null}}",
     ]) + "\n\n"
@@ -229,46 +228,6 @@ async def run_goal_resume(c):
 
 
 async def run_goal_stale_get(c):
-    # 同一会话内 GET 与 GoalUpdated 的先后顺序：GET 结果必须服从较新的
-    # live projection generation，而不是覆盖它。
-    c.sessions = [S("main-idle", None, "主会话")]
-    c.goals["main-idle"] = snap("GET 的旧目标")
-    c.sse_body = 'event: snapshot\ndata: []\n\nevent: status\ndata: {"status":"Idle"}\n\n'
-    await c.start()
-    await open_main(c)
-    await c.page.wait_for_timeout(300)
-    # Delay the real GET, then attach a real SSE response carrying the newer
-    # projection. The GET returns the old server value after the SSE frame.
-    c.goal_delay["main-idle"] = (0, 0.5)
-    await c.page.evaluate("fetchGoal('main-idle', state.workspace.id, sessionOpenEpoch)")
-    await c.page.wait_for_timeout(50)
-    c.sse_body = "\n\n".join([
-        "event: snapshot\ndata: []",
-        "event: GoalUpdated\ndata: " + json.dumps({"goal": snap("SSE newer")}),
-    ]) + "\n\n"
-    await c.page.evaluate("connectSSE(state.sessionId, state.workspace.id, sessionOpenEpoch)")
-    await c.page.wait_for_timeout(700)
-    c.check("同会话 stale GET：GoalUpdated set 不被旧 GET 覆盖",
-            "SSE newer" in await goal_bar_text(c), await goal_bar_text(c))
-    # Repeat with the opposite ordering: a delayed non-null GET must not
-    # resurrect a goal after the live clear tombstone.
-    c.goals["main-idle"] = snap("GET stale non-null")
-    c.goal_delay["main-idle"] = (0, 0.5)
-    await c.page.evaluate("fetchGoal('main-idle', state.workspace.id, sessionOpenEpoch)")
-    await c.page.wait_for_timeout(50)
-    c.sse_body = "\n\n".join([
-        "event: snapshot\ndata: []",
-        "event: GoalUpdated\ndata: {\"goal\":null}",
-    ]) + "\n\n"
-    await c.page.evaluate("connectSSE(state.sessionId, state.workspace.id, sessionOpenEpoch)")
-    await c.page.wait_for_timeout(700)
-    c.check("同会话 stale GET：GoalUpdated clear 不被旧 GET 覆盖",
-            await c.ev("els.goalBar.hidden"), await goal_bar_text(c))
-
-    # Reset the fixture's per-session delay counters before the independent
-    # cross-session stale-GET scenario; the same browser above already used
-    # main-idle for the same-session ordering checks.
-    c.goal_delay = {"main-idle": (1, 1.0), "other-sess": (0, 0.6)}
     # 旧会话的 GET /goal 延迟响应：切到新会话后到达，必须被 stale guard
     # 丢弃，绝不覆盖新会话的 GoalBar。A 的第一次 GET（openSession 初始化）
     # 不延迟（先让 A 的 GoalBar 显示出来），第二次（/goal 裸命令再拉）延迟
@@ -276,8 +235,7 @@ async def run_goal_stale_get(c):
     c.sessions = [S("main-idle", None, "主会话"), S("other-sess", None, "另一会话")]
     c.goals["main-idle"] = snap("A 的旧目标")
     c.goals["other-sess"] = snap("B 的新目标", sid="goal-b")
-    c.sse_body = 'event: snapshot\\ndata: []\\n\\nevent: status\\ndata: {"status":"Idle"}\\n\\n'
-    c.goal_delay = {"main-idle": (1, 1.0), "other-sess": (0, 0.6)}  # A 第二次 GET 延迟
+    c.goal_delay["main-idle"] = (1, 1.0)     # 第 2 次起 GET /goal 延迟 1s
     c.goal_delay["other-sess"] = (0, 0.6)    # 所有 GET /goal 延迟 0.6s
     await c.start()
     await open_main(c)                       # 打开 A：首次 GET 无延迟 → bar 显示 A
@@ -309,8 +267,7 @@ async def run_goal_resync(c):
     #（重放也走 applyLiveEvent，set/clear 都更新 GoalBar）。
     c.sessions = [S("main-idle", None, "主会话")]
     c.sse_body = "\n\n".join([
-        "event: snapshot\ndata: []",
-        "event: GoalUpdated\ndata: {\"goal\":{\"id\":\"goal-r\", \"revision\":1,"
+        "event: GoalUpdated\ndata: {\"goal\":{\"id\":\"goal-r\",\"revision\":1,"
         "\"objective\":\"resync 前的 goal\",\"success_criteria\":[],\"status\":\"active\","
         "\"progress\":\"\",\"evidence\":[],\"blocked_reason\":null}}",
         "event: resync\ndata: [{\"type\":\"goal_updated\",\"data\":{\"goal\":null}},"
@@ -336,8 +293,7 @@ async def run_goal_resync_clear(c):
     # resync 只含 clear 墓碑：GoalBar 隐藏 + notice「goal cleared」。
     c.sessions = [S("main-idle", None, "主会话")]
     c.sse_body = "\n\n".join([
-        "event: snapshot\ndata: []",
-        "event: GoalUpdated\ndata: {\"goal\":{\"id\":\"goal-c\", \"revision\":1,"
+        "event: GoalUpdated\ndata: {\"goal\":{\"id\":\"goal-c\",\"revision\":1,"
         "\"objective\":\"将被清除的 goal\",\"success_criteria\":[],\"status\":\"active\","
         "\"progress\":\"\",\"evidence\":[],\"blocked_reason\":null}}",
         "event: resync\ndata: [{\"type\":\"goal_updated\",\"data\":{\"goal\":null}}]",

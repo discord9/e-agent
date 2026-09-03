@@ -83,48 +83,11 @@ async function handleLive404Refresh(id, wsId, epoch) {
   handleSse404Classified(sessionKnownState(id, wsId), id, wsId, epoch);
 }
 
-function settleNoLive404(id, wsId, epoch) {
-  if (!stillCurrent(id, wsId, epoch)) return;
-  // Let the concurrent history response provide the durable fallback; its
-  // completion calls this same settlement path after retaining the result.
-  if (state.sse.historyPending) return;
-  state.sse.historyPending = false;
-  const pendingHistory = state.sse.pendingHistory;
-  if (pendingHistory) {
-    state.sse.pendingHistory = null;
-    renderLoadedHistory(pendingHistory.entries, pendingHistory.data);
-  }
-  const known = sessionKnownState(id, wsId);
-  if (state.deepLink.probing && state.deepLink.attemptEpoch === epoch) {
-    const historyOk = !!pendingHistory
-      || state.initSource === "history" || state.initSource === "restored";
-    if (historyOk && (known === "historical" || known === "unknown")) {
-      state.deepLink.probing = false;
-      state.deepLink.attemptEpoch = -1;
-      resumeSession(wsId, id, epoch, DEEP_LINK_HISTORY_TIMEOUT_MS);
-      return;
-    }
-    if (!historyOk) {
-      setBanner("⚠ 无法读取会话历史，且该会话暂无实时流；将自动重试。", true);
-      state.sse.stopped = false;
-      scheduleReconnect(id, wsId, epoch);
-      return;
-    }
-    state.deepLink.probing = false;
-    state.deepLink.attemptEpoch = -1;
-  }
-  state.sse.stopped = true;
-  if (known === "live") handleLive404Refresh(id, wsId, epoch);
-  else handleSse404Classified(known, id, wsId, epoch);
-}
-
 function connectSSE(id, wsId, epoch) {
   // 起流前三重校验：陈旧 history 响应绝不能对刚激活的服务器/会话起 SSE。
   if (!stillCurrent(id, wsId, epoch)) return;
   stopSSE();
   state.sse.stopped = false;
-  state.sse.snapshotCommitted = false;
-  state.sse.noLive = false;
   // 每次会话连接重置“（压缩前）”用量标注：标注是 per-session 状态，旧的
   // 压缩标注绝不能串到新会话（新会话的 snapshot/live 事件会重新推导）。
   state.usagePreCompaction = false;
@@ -139,37 +102,66 @@ function connectSSE(id, wsId, epoch) {
     },
     signal: ctrl.signal,
   }).then((res) => {
-    // A response can arrive after navigation even when the old fetch was
-    // already resolved. Guard before inspecting its status or mutating UI.
-    if (!stillCurrent(id, wsId, epoch)) {
-      try { ctrl.abort(); } catch (e) { /* 忽略 */ }
-      return;
-    }
     if (res.status === 401 || res.status === 403) {
       setBanner("⚠ 认证失败：请检查 Token。");
       throw new Error("auth");
     }
     if (res.status === 404) {
-      // A stale request must not stop or classify the replacement session.
-      if (!stillCurrent(id, wsId, epoch)) {
-        try { ctrl.abort(); } catch (e) { /* 忽略 */ }
-        return;
-      }
-      // The first fresh workspace list is authoritative for a deep-link probe;
-      // retain the URL until it has classified this 404.
-      const listPending = !!(state.workspaceListInFlight
-        && state.workspaceListInFlight[wsId] !== undefined);
-      if (listPending && state.deepLink.probing && state.deepLink.attemptEpoch === epoch) {
-        state.deepLink.pending = id;
-        state.deepLink.handled = false;
+      // 404 的两种含义，按会话已知状态区分（判定见 sessionKnownState）：
+      // - 已知历史/已结束（active===false）或不在任何列表（任务面板直连
+      //   刚结束的子会话）：SSE 端点只服务 live 会话，404 = 没有实时流，
+      //   会话本身存在（history 刚加载成功，transcript 可读）。静默降级：
+      //   不弹「不存在」、不重连（重连只会再次 404）；历史会话给轻量提示。
+      // - 缓存判定为 live（active!==false）却 404：可能是会话真不存在，
+      //   也可能是缓存过期——任务面板点击 subagent 时 openSession 先于
+      //   列表刷新（异步触发），subagent 已在服务端结束（live 注册被清理）
+      //   而浏览器上一轮列表仍是 active:true，/events 404 先于刷新完成。
+      //   处理：先停重连（404 一律停），live 时刷新对应 workspace 的会话
+      //   列表后重分类——刷新后 active===false → 静默 + 「会话已结束」轻
+      //   提示（同 historical 路径）；仍查不到 → 静默；仍 active → 才弹
+      //   原「不存在」banner。
+      // 先校验上下文：陈旧请求的 404 不得弹提示、不得停新会话的流。
+      if (!stillCurrent(id, wsId, epoch)) { try { ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
+      const known = sessionKnownState(id, wsId);
+      // 深链 attempt（?session=<id> 直接 probe history 打开）专属恢复：
+      // - history 已成功（transcript 可读）+ 分类 historical/unknown
+      //   （列表知其为历史，或列表还没有它——列表缺失不是权威不存在）
+      //   → 会话存在但无 live runner：resumeSession 建回活跃会话，
+      //     成功后复用现有 openSession（重连 SSE）。恢复只做一次
+      //     （resume 前清标记，防止恢复后重建的流再 404 造成循环）。
+      // - history 失败（网络/超时）→ history 与 SSE 都失败：持久提示 +
+      //   不置 stopped → 走 scheduleReconnect 自动重试，网络恢复后
+      //   history 成功 → 再次 404 → 走上面的恢复分支。
+      // - history 成功但分类 live → 清标记，落到既有 live 刷新重分类
+      //   （真 live 才报「不存在」）。
+      // 任务面板/普通路径（无 attempt 标记）保持既有三态分类不变。
+      if (state.deepLink.probing && state.deepLink.attemptEpoch === epoch) {
+        const historyOk = (state.initSource === "history" || state.initSource === "restored");
+        if (historyOk && (known === "historical" || known === "unknown")) {
+          state.deepLink.probing = false;
+          state.deepLink.attemptEpoch = -1;
+          // 恢复后的 openSession → history 同样带深链有界超时（显式透传；
+          // 标记已清防恢复循环，不能靠标记兜底）
+          resumeSession(wsId, id, epoch, DEEP_LINK_HISTORY_TIMEOUT_MS);
+          throw new Error("silent-gone");
+        }
+        if (!historyOk) {
+          setBanner("⚠ 无法读取会话历史，且该会话暂无实时流；将自动重试。", true);
+          throw new Error("deep-link-retry");
+        }
         state.deepLink.probing = false;
-        state.deepLink.waitingForList = true;
-        state.sse.stopped = true;
-        throw new Error("silent-gone");
+        state.deepLink.attemptEpoch = -1;
       }
-      state.sse.stopped = true;
-      state.sse.noLive = true;
-      settleNoLive404(id, wsId, epoch);
+      state.sse.stopped = true;                         // 404 = 无流：一律停，不重连
+      if (known === "live") {
+        // 缓存可能过期（任务面板直连刚结束的 subagent）：异步刷新列表后
+        // 在 stillCurrent 守卫下重分类；期间用户切走/开了别的会话 → 不弹、
+        // 不动状态（守卫在 handleSse404Classified 内）。
+        handleLive404Refresh(id, wsId, epoch);
+      } else {
+        // 历史/未知：缓存判定已足够，同步分类即可（无需刷新）
+        handleSse404Classified(known, id, wsId, epoch);
+      }
       throw new Error("silent-gone");
     }
     if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
@@ -215,80 +207,112 @@ async function readSSEStream(reader, id, wsId, epoch, ctrl) {
   }
 }
 
-/* AgentEvent 的服务端类型名 → 现有增量投影函数名。 */
-const LIVE_EVENT_NAMES = {
-  prompt_queued: "PromptQueued",
-  prompt_consumed: "PromptConsumed",
-  user_prompt: "UserPrompt",
-  assistant_text: "AssistantText",
-  assistant_delta: "AssistantDelta",
-  reasoning_delta: "ReasoningDelta",
-  tool_call: "ToolCall",
-  tool_result: "ToolResult",
-  notice: "Notice",
-  error: "Error",
-  background_completed: "BackgroundCompleted",
-  background_completion_notice: "BackgroundCompletionNotice",
-  goal_updated: "GoalUpdated",
-  usage: "Usage",
-};
-
-function liveEventName(type) {
-  return LIVE_EVENT_NAMES[type] || null;
-}
-
-/* Replace the visible live projection with an event snapshot.  A snapshot is
-   deliberately not merged with history: it is the capped projection supplied
-   by the attached runner, and its ordering is authoritative for this view. */
-function replaceLiveProjection(events) {
-  const real = els.messages;
-  const backup = real.innerHTML;
-  const temp = real.cloneNode(false);
-  temp.innerHTML = "";
-  els.messages = temp;
-  state.acc = newAccumulator();
-  state.nextBeforeSeq = null;       // snapshots have no safe history cursor
-  state.olderDone = true;
-  state.loadingOlder = false;
-  state.queue.length = 0;
-  state.queueExpanded = false;
-  renderQueueBar();
-  state.lastUsage = null;
-  state.usagePreCompaction = false;
-  state.compactionUsagePending = false;
-  try {
-    for (const ev of events) {
-      if (!ev) continue;
-      const name = liveEventName(ev.type);
-      if (!name) continue;
-      const payload = ev.data !== undefined ? ev.data : ev;
-      applyLiveEvent(name, payload);
+/* 从初始 snapshot 事件数组恢复 current usage：取最后一个 Usage 事件（最近
+   一次正常模型请求；compaction 不刷新它）交给 applyUsage——与 live 路径共用
+   state.lastUsage + renderUsageLine，不引入第二套状态。同时按事件顺序推导
+   “（压缩前）”标注：压缩成功 Notice（"compacted: …"）之后的 Usage 是压缩
+   自身发出的旧基线（runner 的 compact_operation 先 emit 投影再 apply_usage），
+   标注保留；其后的普通轮 Usage 才清除标注。 */
+function restoreUsageFromSnapshot(events) {
+  if (!Array.isArray(events)) return;
+  let pending = false;        // 压缩成功 Notice 之后、压缩自身旧基线 Usage 未消费
+  let preCompaction = false;  // 最近一次 Usage 是否为压缩前基线（默认：普通轮的）
+  let lastUsage;
+  for (const ev of events) {
+    if (!ev) continue;
+    if (ev.type === "notice") {
+      const text = ev.data && (ev.data.text || ev.data.message);
+      if (typeof text === "string" && text.startsWith("compacted: ")) {
+        preCompaction = true;   // 若其后无 Usage，显示的旧值同样属于压缩前
+        pending = true;
+      }
+    } else if (ev.type === "usage" && ev.data !== undefined) {
+      if (pending) {
+        pending = false;        // 压缩自身的旧基线 Usage：标注保留
+      } else {
+        preCompaction = false;  // 普通轮 fresh Usage：清除标注
+      }
+      lastUsage = ev.data;
     }
-    // Move the rendered nodes rather than serializing through innerHTML. This
-    // commits the replacement as one DOM operation while retaining the
-    // accumulator's live element references for the next delta/result.
-    real.innerHTML = "";
-    while (temp.firstChild) real.appendChild(temp.firstChild);
-    els.messages = real;
-    state.initSource = "snapshot";
-    if (state.sse.pendingHistory) state.sse.pendingHistory = null;
-    return true;
-  } catch (e) {
-    els.messages = real;
-    real.innerHTML = backup;
-    state.acc = newAccumulator();
-    return false;
+  }
+  if (lastUsage !== undefined) {
+    state.usagePreCompaction = preCompaction;
+    state.compactionUsagePending = false;
+    applyUsage(lastUsage);
   }
 }
 
-/* 解析单个 SSE 事件块：snapshot 是权威 projection；固定服务端协议
-   保证它先于其它 receiver frames，快照前的帧直接忽略。 */
+/* 初始 snapshot 只补回缓存视图中仍在流式的助手尾巴。history 是已完成
+   transcript 的权威来源；snapshot 的完整事件尾部则只用于把当前 in-flight
+   accumulator 从切走前的缓存前缀接到最新位置，不能整体重放（snapshot 有界）。 */
+function snapshotAssistantDeltaTail(events) {
+  let tail = [];
+  for (const ev of events || []) {
+    const type = ev && ev.type;
+    if (type === "assistant_delta" || type === "AssistantDelta") {
+      const text = pickText(ev.data, ["delta", "text", "content"]);
+      if (typeof ev.data === "string") tail.push(ev.data);
+      else tail.push(text);
+    } else {
+      tail = [];
+    }
+  }
+  return tail.join("");
+}
+
+function cachedInFlightAssistantText(id) {
+  const cached = state.sessionStates[state.workspace.id + ":" + id];
+  if (!cached || typeof cached.html !== "string") return "";
+  const holder = document.createElement("div");
+  holder.innerHTML = cached.html;
+  const assistants = holder.querySelectorAll(".msg-assistant");
+  const last = assistants[assistants.length - 1];
+  const body = last && last.querySelector(".msg-body");
+  // A plain body is the same in-flight marker used by reattachInFlight;
+  // completed AssistantText history has markdown child elements.
+  return body && !body.querySelector("*") ? body.textContent : "";
+}
+
+function reconcileSnapshotAssistantTail(entries, id) {
+  const cachedText = cachedInFlightAssistantText(id);
+  const snapshotText = snapshotAssistantDeltaTail(entries);
+  // Require the snapshot to contain the cached prefix. This prevents an old
+  // cached stream from being resurrected after history has authoritatively
+  // recorded its completion, and makes ordinary first-open snapshots no-op.
+  if (!cachedText || !snapshotText || !snapshotText.startsWith(cachedText)) return;
+  const current = state.acc;
+  const body = current && current.assistantBody;
+  if (body && body.querySelector("*")) {
+    // History's completed AssistantText is authoritative. If it already is
+    // the complete snapshot projection, do not recreate the cached stream.
+    if (current.assistantText === snapshotText || body.textContent === snapshotText) {
+      freezeAssistant(current);
+      return;
+    }
+  }
+  // Continue only a plain in-flight body that still exactly matches the
+  // cached prefix; completed/partially different history must not be merged.
+  if (body && !body.querySelector("*") && current.assistantText === cachedText) {
+    const suffix = snapshotText.slice(cachedText.length);
+    if (suffix) appendAssistantDelta(suffix, current);
+    return;
+  }
+  // History rendering intentionally replaced only the persisted transcript, so
+  // the cached in-flight prefix is no longer in the DOM. Recreate that one
+  // streaming block from the snapshot's delta run; later live deltas then use
+  // the normal accumulator and append to it.
+  freezeAssistant(current);
+  appendAssistantDelta(snapshotText, state.acc);
+}
+
+/* 解析单个 SSE 事件块：任何分支（snapshot/status/resync/live）动手改 UI 前
+   必须通过三重校验——陈旧流的块整块丢弃，绝不画进当前会话/workspace。 */
 function handleSSEBlock(block, id, wsId, epoch) {
   if (!stillCurrent(id, wsId, epoch)) return;
   let eventName = "message";
   const dataLines = [];
   for (const line of block.split("\n")) {
-    if (line.startsWith(":")) continue;
+    if (line.startsWith(":")) continue;               // 心跳/注释行
     if (line.startsWith("event:")) eventName = line.slice(6).trim();
     else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
   }
@@ -299,27 +323,97 @@ function handleSSEBlock(block, id, wsId, epoch) {
     let entries = null;
     try {
       const parsed = JSON.parse(data);
-      entries = Array.isArray(parsed) ? parsed : null;
+      entries = Array.isArray(parsed) ? parsed : (parsed.entries || []);
     } catch (e) { /* 忽略坏数据 */ }
-    if (!entries) return;
-    if (!replaceLiveProjection(entries)) return;
-    state.sse.snapshotCommitted = true;
+    if (entries) {
+      // 初始 snapshot 含 Usage 事件时立即恢复 current usage（最近一次正常
+      // 模型请求的 context_input/context_window），不等下一次模型调用；
+      // 复用 applyUsage 路径（state.lastUsage + renderUsageLine）。
+      restoreUsageFromSnapshot(entries);
+      // history/restored 已经拥有权威的持久化 DOM；只把缓存中仍在途的
+      // assistant delta 尾巴接回来。普通首开没有缓存前缀，因此不会重放
+      // snapshot，也不会产生重复助手块。
+      if (state.initSource === "history" || state.initSource === "restored") {
+        reconcileSnapshotAssistantTail(entries, id);
+      }
+      // 已用 history 渲染过则跳过（避免重复）；恢复的会话（initSource="restored"，
+      // 视图来自缓存）也跳过——缓存内容与 snapshot 等价，重放会造成重复；
+      // history 加载失败时仍作为兜底
+      if (state.initSource !== "history" && state.initSource !== "restored") {
+        renderHistory(entries);
+        state.initSource = "snapshot";
+      }
+      // GoalBar：snapshot 里最新的 goal_updated（set 或 clear 墓碑）折叠
+      // 出来刷新 GoalBar——history 失败走 snapshot 兜底时 GET /goal 可能
+      // 还没返回，这里保证 GoalBar 不依赖那次 GET；幂等，无 stale 风险
+      //（handleSSEBlock 顶部已校验三元组）。
+      let snapshotGoal = undefined;   // undefined = snapshot 无 goal_updated
+      for (const ev of entries) {
+        if (ev && ev.type === "goal_updated" && ev.data && "goal" in ev.data) {
+          snapshotGoal = ev.data.goal;   // null = cleared
+        }
+      }
+      if (snapshotGoal !== undefined) renderGoalBar(snapshotGoal);
+    }
     return;
   }
-  if (!state.sse.snapshotCommitted) return;
   if (eventName === "status") {
     try { applyStatus(JSON.parse(data).status); } catch (e) { /* 忽略 */ }
     return;
   }
-  if (id !== state.sessionId) return;
+  if (id !== state.sessionId) return;  // 已切换会话
   if (eventName === "resync") {
+    // Lag 追平：后端重发完整事件日志（AgentEvent 数组，{type,data} 形状）。
+    // 与 snapshot 不同，无论初始渲染来源都强制整体替换 transcript。
+    // 渲染到离屏容器，成功才一次性替换；失败回滚旧内容。避免「先清空再
+    // 重放」在手机上（可上千条事件）造成消息区空白、像消息消失一样。
+    const real = els.messages;
+    const backup = real.innerHTML;
+    const temp = real.cloneNode(false);   // 同 class/id，无子节点
+    temp.innerHTML = "";
+    els.messages = temp;
+    state.acc = newAccumulator();
+    // 排队提示是「当下」状态，重放的是过去事件：清空 queueBar 并跳过重放
+    state.queue.length = 0;
+    renderQueueBar();
+    const NAME = {
+      prompt_queued: "PromptQueued", prompt_consumed: "PromptConsumed",
+      user_prompt: "UserPrompt", assistant_text: "AssistantText",
+      assistant_delta: "AssistantDelta", reasoning_delta: "ReasoningDelta",
+      tool_call: "ToolCall", tool_result: "ToolResult",
+      notice: "Notice", error: "Error",
+      background_completed: "BackgroundCompleted",
+      background_completion_notice: "BackgroundCompletionNotice",
+      goal_updated: "GoalUpdated",   // set 与 clear（goal:null）都刷新 GoalBar
+      usage: "Usage",
+    };
     try {
       const parsed = JSON.parse(data);
-      const events = Array.isArray(parsed) ? parsed : parsed.events;
-      if (Array.isArray(events)) replaceLiveProjection(events);
-    } catch (e) { /* 忽略坏数据 */ }
+      const events = Array.isArray(parsed) ? parsed : (parsed.events || []);
+      for (const ev of events) {
+        const name = (ev && NAME[ev.type]) || "Notice";
+        // 已过去的排队事件：不重放（它们不该出现在 queueBar；已在上方清空）
+        if (name === "PromptQueued" || name === "PromptConsumed") continue;
+        const payload = (ev && ev.data !== undefined) ? ev.data : (ev || {});
+        applyLiveEvent(name, payload);
+      }
+      real.innerHTML = temp.innerHTML;
+      els.messages = real;
+      // innerHTML 会在 real 下创建全新的节点；重放时 acc 绑定的是离屏 temp
+      // 的旧节点，不能让后续 delta 继续写入孤儿 DOM。
+      state.acc = newAccumulator();
+      state.initSource = "snapshot";
+    } catch (e) {
+      els.messages = real;
+      real.innerHTML = backup;
+      // 回滚同样通过 innerHTML 重建节点，不能保留离屏重放期间的引用。
+      state.acc = newAccumulator();
+      appendNotice("⚠ 会话同步失败，已保留原内容");
+    }
     return;
   }
+  if (state.initSource === null) return;   // 初始渲染未完成前的 live 事件丢弃
+
   let payload = null;
   try { payload = JSON.parse(data); } catch (e) { payload = data; }
   if (eventName === "ToolResult" || eventName === "BackgroundCompleted"
@@ -417,7 +511,6 @@ function applyLiveEvent(name, payload) {
       // 渲染一致；不当作普通用户消息）。
       const p = (payload && typeof payload === "object") ? payload : {};
       const goal = p.goal || null;
-      state.goalProjectionGeneration++;
       renderGoalBar(goal);
       appendNotice(goal
         ? "goal [" + (goal.status || "?") + "] " + (goal.objective || "")
@@ -435,20 +528,17 @@ function applyLiveEvent(name, payload) {
    打开会话/切换 workspace 都会取代代次，陈旧流的重连绝不执行（否则会把已过期
    的会话重新加载/重画到新激活的上下文上）。 */
 function scheduleReconnect(id, wsId, epoch) {
-  if (state.sse.stopped || state.sse.retryTimer || !stillCurrent(id, wsId, epoch)) return;
+  if (state.sse.stopped || !stillCurrent(id, wsId, epoch)) return;
   setConn("retrying", "↻ 连接断开，3 秒后重连…");
   state.sse.retryTimer = setTimeout(() => {
-    state.sse.retryTimer = null;
     if (state.sse.stopped || !stillCurrent(id, wsId, epoch)) return;
     state.initSource = null;             // 允许 snapshot 兜底
-    openWith(id, true, wsId, epoch);
+    openWith(id, true, undefined, wsId, epoch);
   }, 3000);
 }
 
 function stopSSE() {
   state.sse.stopped = true;
-  state.sse.snapshotCommitted = false;
-  state.sse.historyPending = false;
   if (state.sse.ctrl) { try { state.sse.ctrl.abort(); } catch (e) { /* 忽略 */ } }
   if (state.sse.retryTimer) { clearTimeout(state.sse.retryTimer); state.sse.retryTimer = null; }
   state.sse.ctrl = null;

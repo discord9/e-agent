@@ -122,9 +122,8 @@ function pollSessions() {
    （afterPollRound）——各 workspace 响应不再各自全量重建树。 */
 async function pollWorkspaceSessions(ws) {
   if (!workspaceToken(ws)) return;   // 全局 token 也未配置：跳过（不显示错误）
-  if (!state.workspaceListInFlight) state.workspaceListInFlight = {};
-  const listGen = state.pollGen;
-  state.workspaceListInFlight[ws.id] = listGen;
+  if (!state.workspaceListPending) state.workspaceListPending = {};
+  state.workspaceListPending[ws.id] = true;
   let list = null;
   let err = null;
   try {
@@ -173,11 +172,7 @@ async function pollWorkspaceSessions(ws) {
   // 在途请求守卫：请求发出后 workspace 被删除（removeWorkspace）→ 直接丢弃，
   // 绝不写回已删 workspace 的缓存/错误标记，也不重绘（聚合视图已随删除重绘，
   // 写回会让被删服务器"复活"在侧边栏里；review 发现 2）。
-  if (!state.workspaces.includes(ws)) {
-    if (state.workspaceListInFlight[ws.id] === listGen) delete state.workspaceListInFlight[ws.id];
-    return;
-  }
-  if (state.workspaceListInFlight[ws.id] === listGen) delete state.workspaceListInFlight[ws.id];
+  if (!state.workspaces.includes(ws)) return;
   if (list) {
     state.workspaceLists[ws.id] = list;
     state.workspaceErrors[ws.id] = null;
@@ -185,6 +180,7 @@ async function pollWorkspaceSessions(ws) {
     if (state.workspaceLists[ws.id] === undefined) state.workspaceLists[ws.id] = [];
     state.workspaceErrors[ws.id] = err;   // 保留旧列表（stale），标记错误
   }
+  state.workspaceListPending[ws.id] = false;
   if (ws === state.workspace) {
     // 激活 workspace 的列表缓存 → lastList（既有单服务器路径的唯一数据源）；
     // 渲染/深链/校验统一由 pollAllWorkspaces 整轮完成后执行（afterPollRound）
@@ -209,8 +205,7 @@ function maybeHandleDeepLink() {
   const ws = state.workspace;
   if (!ws) return;
   const listFresh = state.workspaceErrors[ws.id] === null;
-  const listPending = !!(state.workspaceListInFlight
-    && state.workspaceListInFlight[ws.id] !== undefined);
+  const listPending = state.workspaceListPending && state.workspaceListPending[ws.id];
   // A history 404 that raced the first list response is not proof that the
   // session is gone. Leave the URL pending until that first fresh result
   // classifies it through the normal active/resume paths.
@@ -228,14 +223,9 @@ function maybeHandleDeepLink() {
         resumeSession(ws.id, target, claimed, DEEP_LINK_HISTORY_TIMEOUT_MS);
       } else {
         // The probe already initialized this session and its history returned
-        // 404. Fresh active evidence is authoritative. Keep the existing
-        // probe attach when it is still current; otherwise enter the live
-        // path without issuing history a second time.
-        if (state.sessionId !== target || !state.sse.ctrl || state.sse.stopped) {
-          openWith(target, false, ws.id, sessionOpenEpoch);
-        }
-        state.deepLink.handled = true;
-        state.deepLink.pending = null;
+        // 404.  Fresh active evidence is authoritative: enter the existing
+        // live SSE/snapshot path without issuing history a second time.
+        openWith(target, false, undefined, ws.id, sessionOpenEpoch);
       }
     } else {
       state.deepLink.handled = true;
@@ -261,7 +251,7 @@ function maybeHandleDeepLink() {
       state.deepLink.attemptEpoch = claimed;
       resumeSession(ws.id, target, claimed, DEEP_LINK_HISTORY_TIMEOUT_MS);
     } else {
-      openSession(target, undefined, DEEP_LINK_HISTORY_TIMEOUT_MS);
+      openSession(target, undefined, undefined, DEEP_LINK_HISTORY_TIMEOUT_MS);
     }
     return;
   }
@@ -285,7 +275,7 @@ function attemptDeepLinkProbe() {
   const claimed = ++sessionOpenEpoch;          // 入口声明一次代次（openSession 共享）
   state.deepLink.probing = true;               // attempt 标记：防重复发起 + SSE 404 恢复判定
   state.deepLink.attemptEpoch = claimed;
-  openSession(target, claimed, DEEP_LINK_HISTORY_TIMEOUT_MS);
+  openSession(target, undefined, claimed, DEEP_LINK_HISTORY_TIMEOUT_MS);
 }
 
 /* workspace 的会话列表解析：
@@ -330,7 +320,7 @@ async function resumeSession(wsId, id, epoch, timeoutMs) {
     if (state.workspace.id !== wsId) return;     // 发起恢复的服务器已不是激活的：不在这里打开
     // timeoutMs（深链恢复路径传入）透传给恢复后打开的 history：深链的
     // 有界超时覆盖整个恢复生命周期；普通恢复不传 → 无超时，语义不变。
-    openSession(s.id, claimed, timeoutMs);
+    openSession(s.id, undefined, claimed, timeoutMs);
   } catch (e) {
     setBanner("⚠ 恢复会话失败：" + e.message);
   }
@@ -344,7 +334,7 @@ async function resumeSession(wsId, id, epoch, timeoutMs) {
    - state.workspace.id 二次校验：切换期间目标又被顶掉（用户直接切了
      workspace）也丢弃。
    同 workspace 直接 openSession（同步，无切换开销）。 */
-async function openSessionIn(wsId, id, epoch) {
+async function openSessionIn(wsId, id, onReady, epoch) {
   // 入口点击：整个「（可能切 workspace）+ 打开」是一次动作，声明一次代次，
   // 嵌套的 switchWorkspace/openSession 共享它——不再各自递增。
   const claimed = (epoch === undefined) ? ++sessionOpenEpoch : epoch;
@@ -352,7 +342,7 @@ async function openSessionIn(wsId, id, epoch) {
     await switchWorkspace(wsId, claimed);
   }
   if (state.workspace.id !== wsId) return;      // 目标已被顶掉：丢弃
-  openSession(id, claimed);
+  openSession(id, onReady, claimed);
 }
 
 /* 跨 workspace 恢复历史会话：先切到目标服务器，再 POST /api/sessions {id}
@@ -425,26 +415,6 @@ function deepLinkTimeoutFor(epoch) {
     ? DEEP_LINK_HISTORY_TIMEOUT_MS : undefined;
 }
 
-function renderLoadedHistory(entries, data) {
-  if (state.initSource === "snapshot") return;
-  state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
-  state.olderDone = (state.nextBeforeSeq === null);
-  if (state.initSource === "restored") {
-    const offset = els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight;
-    state.acc.toolStack = [];
-    renderHistory(entries);
-    reattachInFlight(state.acc);
-    if (offset > 4) {
-      els.messages.scrollTop = els.messages.scrollHeight - offset - els.messages.clientHeight;
-      userScrolled = true;
-      els.jumpBottomBtn.hidden = false;
-    }
-  } else {
-    renderHistory(entries);
-  }
-  state.initSource = "history";
-}
-
 async function loadHistory(id, wsId, epoch, timeoutMs) {
   const ws = state.workspaces.find((w) => w.id === wsId) || state.workspace;
   try {
@@ -465,9 +435,11 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
       // During the initial deep-link race, history can answer before the
       // current workspace's first session list. A 404 is not authoritative
       // until that list has classified the session.
-      const listPending = !!(state.workspaceListInFlight
-        && state.workspaceListInFlight[wsId] !== undefined);
-      if (listPending && (!state.deepLink.waitingForList || state.deepLink.pending === id)) {
+      if (state.deepLink.waitingForList && state.deepLink.pending === id) {
+        return "pending";
+      }
+      if (state.deepLink.probing && state.deepLink.attemptEpoch === epoch
+          && state.workspaceErrors[wsId] !== null) {
         state.deepLink.probing = false;
         state.deepLink.attemptEpoch = -1;
         state.deepLink.pending = id;
@@ -481,29 +453,38 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     const data = await res.json();
     if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== id) return "stale";
     const entries = Array.isArray(data) ? data : (data.entries || []);
-    // Do not paint a durable head while a live attach is still waiting for its
-    // authoritative snapshot.  If the attach is live, the snapshot replaces
-    // this response; only a no-live 404 may release it as a fallback.
-    if (state.sse.historyPending && !state.sse.snapshotCommitted) {
-      state.sse.pendingHistory = { entries, data };
-      state.sse.historyPending = false;
-      // If the 404 arrived first, release the retained durable projection now;
-      // settleNoLive404 also performs the deep-link resume decision with this
-      // history available at the exact decision point.
-      if (state.sse.noLive) settleNoLive404(id, wsId, epoch);
-      return "await-live";
+    state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
+    state.olderDone = (state.nextBeforeSeq === null);
+    if (state.initSource !== "snapshot") {
+      if (state.initSource === "restored") {
+        // 缓存的视图可能过期（切走期间会话有新消息）：用最新尾部替换，
+        // 而不是追加（追加会与缓存内容重复）。缓存里的进行中增量块
+        // （thinking/assistant/tool 卡片——未落盘只活在内存/SSE 增量里，
+        // history 里没有它们）也一律不重挂：fresh 尾部已渲染已落盘的版本，
+        // live 续写靠重新连接的 SSE。重挂只会把切走瞬间还在执行的旧卡片
+        // 无条件 append 到消息区最底部——很久以前的 bash 命令突然出现在
+        // 最新位置，甚至与尾部历史重复；且该卡永不折叠（pruneMessages
+        // 跳过 in-flight）而永久残留。保留滚动位置（距底部偏移）。
+        const offset = els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight;
+        state.acc.toolStack = [];   // 防重：替换后 reattachInFlight 重新收集
+        renderHistory(entries);     // 清空 + 渲染最新尾部
+        reattachInFlight(state.acc);   // 按渲染后的 DOM 现状重绑进行中块（若
+                                       // 尾部自身含未完成条目），增量续写不中断
+        if (offset > 4) {
+          els.messages.scrollTop = els.messages.scrollHeight - offset - els.messages.clientHeight;
+          userScrolled = true;
+          els.jumpBottomBtn.hidden = false;
+        }
+      } else {
+        renderHistory(entries);
+      }
+      state.initSource = "history";
     }
-    state.sse.historyPending = false;
-    renderLoadedHistory(entries, data);
     return "ok";
   } catch (e) {
     if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== id) return "stale";
-    state.sse.historyPending = false;
-    if (state.sse.noLive) settleNoLive404(id, wsId, epoch);
-    // 网络问题：交给 SSE snapshot 兜底；两者都失败则提示。Once the
-    // transport has established no-live/retry ownership, keep that banner and
-    // do not let this late history failure replace it.
-    if (!state.sse.noLive && !state.sse.retryTimer && (!state.acc || !els.messages.children.length)) {
+    // 网络问题：交给 SSE snapshot 兜底；两者都失败则提示
+    if (!state.acc || !els.messages.children.length) {
       setBanner("⚠ 加载历史失败：" + e.message + "（等待 SSE 快照…）", true);
     }
     return "fail";
@@ -550,6 +531,8 @@ async function loadOlder() {
 }
 
 /* history 加载（可选）+ 连接 SSE；auth/gone 时不再重试连接。
+   onReady：视图就绪后的回调（历史渲染完 / 缓存恢复完，消息区可操作时
+   触发一次）。
    wsId/epoch：打开时捕获的发起上下文——响应回来时任何一项不匹配
    （新的打开/切换 workspace）→ 丢弃过期回调，不起 SSE。 */
 /* 打开会话时拉一次持久化累计用量（usage_entries 表：重启不清零，含子会话
@@ -574,7 +557,7 @@ function fetchSessionUsage(id, wsId, epoch) {
     .catch(() => {});   // 静默：旧后端无此端点 / 网络失败 → 回退 live 显示
 }
 
-function openWith(id, withHistory, wsId, epoch, timeoutMs) {
+function openWith(id, withHistory, onReady, wsId, epoch, timeoutMs) {
   // 排队条是会话级 UI：任何打开/重连路径（openSession 两分支、
   // restartTransport、scheduleReconnect）都经 openWith，一律从空队列开始，
   // 防止 A 的排队项显示在 B（state.queue 是全局单数组，切会话不重置就串）。
@@ -592,12 +575,6 @@ function openWith(id, withHistory, wsId, epoch, timeoutMs) {
     state.queue.push(...snap);
   }
   renderQueueBar();
-  state.sse.pendingHistory = null;
-  // Attach first. The atomic server attach sends the authoritative snapshot
-  // before any post-attach live frames; history is only a fallback for a
-  // historical/no-live 404 and must never win over a committed snapshot.
-  connectSSE(id, wsId, epoch);
-  state.sse.historyPending = !!withHistory;
   const step = withHistory ? loadHistory(id, wsId, epoch, timeoutMs) : Promise.resolve("ok");
   step.then((r) => {
     if (epoch !== sessionOpenEpoch) return;       // 更新的打开/切换 workspace 已发生
@@ -609,11 +586,6 @@ function openWith(id, withHistory, wsId, epoch, timeoutMs) {
       state.deepLink.attemptEpoch = -1;
       return;
     }
-    if (r === "await-live") {
-      // The live attach will either commit its snapshot or classify a 404 as
-      // no-live and render the retained durable fallback there.
-      return;
-    }
     if (r === "pending") {
       // History 404 raced the first list; the list completion will choose
       // the active live path or the inactive resume path.
@@ -621,6 +593,8 @@ function openWith(id, withHistory, wsId, epoch, timeoutMs) {
       state.deepLink.attemptEpoch = -1;
       return;
     }
+    connectSSE(id, wsId, epoch);
+    if (onReady) onReady();
   });
 }
 
@@ -722,7 +696,7 @@ function saveSessionState() {
   };
 }
 
-function openSession(id, epoch, timeoutMs) {
+function openSession(id, onReady, epoch, timeoutMs) {
   // 打开即声明新代次（入口调用）；嵌套调用（openSessionIn/resumeSession 等
   // 已声明过）传入共享的代次，不再递增——一次用户动作只有一个 action epoch。
   const claimed = (epoch === undefined) ? ++sessionOpenEpoch : epoch;
@@ -741,7 +715,6 @@ function openSession(id, epoch, timeoutMs) {
   state.renameActive = false;  // 切换会话会销毁编辑框：清标志，恢复轮询重绘
   stopSSE();
   state.sessionId = id;
-  state.goalProjectionGeneration = 0; // 每次打开从空投影开始
   renderGoalBar(null);       // 会话切换开始：立即清空旧会话的 GoalBar（防陈旧残留）
   state.sessionUsage = null;   // 旧会话的累计用量不串到新会话（openWith 会重拉）
   state.lastUsage = null;      // 旧会话的 live Usage 同样不串（防旧 context 配新累计）
@@ -784,7 +757,7 @@ function openSession(id, epoch, timeoutMs) {
     const atBottom = m.scrollHeight - m.scrollTop - m.clientHeight <= 4;
     userScrolled = !atBottom;      // 恢复到非底部位置：不自动跟随滚动
     els.jumpBottomBtn.hidden = atBottom;
-    openWith(id, true, wsId, claimed, timeoutMs);   // 拉最新尾部替换过期缓存；
+    openWith(id, true, onReady, wsId, claimed, timeoutMs);   // 拉最新尾部替换过期缓存；onReady 在替换渲染完成后触发
   } else {
     // 首次打开：走既有流程（加载历史 + SSE）
     state.initSource = null;
@@ -798,7 +771,7 @@ function openSession(id, epoch, timeoutMs) {
     els.promptInput.value = "";    // 输入框草稿跟随会话：新会话从空开始
     autosizeInput();
     userScrolled = false;          // 打开新会话：恢复自动跟随
-    openWith(id, true, wsId, claimed, timeoutMs);
+    openWith(id, true, onReady, wsId, claimed, timeoutMs);   // onReady 在 loadHistory 渲染完成后触发
   }
   if (!els.sidebar.hidden) renderSidebarTree();   // 更新 .current 高亮（侧边栏可见时）
   fetchGoal();   // 会话切换/恢复：从 GET /goal 初始化 GoalBar（只读；SSE 也会刷新）
@@ -1406,22 +1379,23 @@ function renderGoalBar(goal) {
 }
 
 async function fetchGoal(id, wsId, epoch) {
-  // In addition to the navigation triple, capture the current projection
-  // generation. A same-session GoalUpdated may arrive while this GET is in
-  // flight; its newer projection must not be overwritten by the old response.
+  // Stale guard: capture the (session, workspace, epoch) triple and verify
+  // it AFTER every await — a delayed response from an old session must
+  // never paint over the new session's GoalBar.
   const sid = (id !== undefined) ? id : state.sessionId;
   if (!sid) return false;
   const wid = (wsId !== undefined) ? wsId : state.workspace.id;
   const ep = (epoch !== undefined) ? epoch : sessionOpenEpoch;
-  const generation = state.goalProjectionGeneration;
   try {
     const res = await api("/api/sessions/" + encodeURIComponent(sid) + "/goal");
     if (!res.ok) return false;
-    if (state.sessionId !== sid || state.workspace.id !== wid || ep !== sessionOpenEpoch
-        || state.goalProjectionGeneration !== generation) return false;
+    if (state.sessionId !== sid || state.workspace.id !== wid || ep !== sessionOpenEpoch) {
+      return false;   // 会话/workspace/代次已变：丢弃陈旧响应
+    }
     const data = await res.json();
-    if (state.sessionId !== sid || state.workspace.id !== wid || ep !== sessionOpenEpoch
-        || state.goalProjectionGeneration !== generation) return false;
+    if (state.sessionId !== sid || state.workspace.id !== wid || ep !== sessionOpenEpoch) {
+      return false;
+    }
     renderGoalBar(data && data.goal);
     return true;
   } catch (e) {
@@ -1536,7 +1510,7 @@ function restartTransport() {
     const id = state.sessionId;
     stopSSE();
     state.initSource = null;
-    openWith(id, true, state.workspace.id, claimed);
+    openWith(id, true, undefined, state.workspace.id, claimed);
   }
   maybeHandleDeepLink();   // token 从空变有效：立即重试 pending 深链（不再等 poll round）
 }
@@ -1607,7 +1581,6 @@ function startPolling() {
 }
 function stopPolling() {
   state.pollGen++;   // 使在途轮询的 finally 续调度失效（stop 后不再续）
-  if (state.workspaceListInFlight) state.workspaceListInFlight = {};
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
 }
 async function pollRound() {
@@ -2239,7 +2212,6 @@ function clearCurrentSession() {
   closeForkMenu();
   stopSSE();
   state.sessionId = null;
-  state.goalProjectionGeneration = 0;
   state.sessionUsage = null;   // 关闭会话：清累计用量，防下次打开前残留
   state.lastUsage = null;      // 同步清 live Usage 缓存
   state.acc = null;
