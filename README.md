@@ -92,10 +92,17 @@ The default delegated model can be routed with `[roles] subagent`; named
 role templates can also be routed by role name. Role templates are discovered
 from `$XDG_CONFIG_HOME/e-agent/agents/<role>.md` (falling back to
 `~/.config/e-agent/agents/`) and `<workspace>/agents/<role>.md`, with the
-workspace file winning. This repository includes six role templates —
-`designer`, `explorer`, `fixer`, `main`, `oracle`, and `seer`; unrouted named
-roles fall back to the default subagent model, which itself falls back to the
-main profile:
+workspace file winning. The delegate tool dynamically discloses each discovered
+role as `name — description` when its description is present, or as plain
+`name` otherwise; the role parameter remains a simple enum of role names.
+Descriptions are package metadata for choosing a role, not additional routing
+or schema types. This repository ships templates for `designer`, `explorer`,
+`fixer`, `main`, `oracle`, `seer`, `skeptic`, and `verifier` (`main` is
+non-delegable); unrouted named roles fall back to the default subagent model,
+which itself falls back to the main profile. The `oracle` gives a comprehensive
+correctness verdict, the `skeptic` challenges a concrete claim or assumption
+from a selected adversarial lens, and the `verifier` checks risky changes
+against user-visible invariants through real product entrypoints:
 
 ```toml
 [models."kimi/k2"]
@@ -190,7 +197,13 @@ report the Shift modifier and send a bare Enter instead, so a
 `option+enter`) for the secondary key; it is the only modifier most
 terminals report alongside Enter.
 
-### Read-only roles
+### Role descriptions and read-only roles
+
+A role template may declare a short disclosure description in its leading TOML
+frontmatter with `description = "..."`. The value is trimmed; missing or blank
+values are treated as absent, and descriptions may not contain newlines or
+carriage returns. The delegate tool shows described roles as `name —
+description` while keeping the role schema as an enum of names.
 
 A role template can declare itself read-only with a leading TOML frontmatter
 block: the file's first line must be exactly `---`, the block may contain
@@ -729,7 +742,8 @@ verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
 
 Non-goals (deliberately out of scope): todo/plan/workflow stages, auto goal
 rounds / max rounds, deadlines, reminders, goal DAGs / multiple goals per
-session, and a verifier agent.
+session, and goal-specific verification (the verifier role independently
+checks risky product changes before integration).
 
 ## Session output receipts (`eout1`) and the `read_output` tool
 

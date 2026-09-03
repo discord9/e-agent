@@ -882,16 +882,27 @@ impl Tool for Delegate {
             .as_deref()
             .map(crate::roles::available_roles)
             .unwrap_or_default();
+        let role_disclosures = roles
+            .iter()
+            .map(|name| {
+                self.roles_root
+                    .as_deref()
+                    .and_then(|root| crate::roles::role_template(root, name).ok().flatten())
+                    .and_then(|template| template.description)
+                    .map(|description| format!("{name} — {description}"))
+                    .unwrap_or_else(|| name.clone())
+            })
+            .collect::<Vec<_>>();
         if !roles.is_empty() {
             description.push_str(&format!(
                 " Pass `role` to give the subagent a specialized persona/model; available roles: {}. Pass `label` to set a short (≤ 40 chars) title for the task panel; defaults to the role name or a preview of the task.",
-                roles.join(", ")
+                role_disclosures.join(", ")
             ));
         }
         let role_property = if roles.is_empty() {
             json!({"type": "string", "description": "specialized role for the subagent"})
         } else {
-            json!({"type": "string", "enum": roles, "description": "specialized role for the subagent"})
+            json!({"type": "string", "enum": roles, "description": format!("specialized role for the subagent; available roles: {}", role_disclosures.join(", "))})
         };
         ToolSpec {
             name: "delegate".into(),
@@ -941,14 +952,17 @@ impl Tool for Delegate {
         if task.trim().is_empty() {
             return Err("`task` must not be empty".into());
         }
-        if !self.background.completion_delivery_available() {
-            return Err("background task delivery is unavailable".into());
-        }
         let role = arguments
             .as_object()
             .and_then(|args| args.get("role"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        if role.as_deref() == Some(crate::roles::MAIN_ROLE) {
+            return Err("role `main` is not delegable".into());
+        }
+        if !self.background.completion_delivery_available() {
+            return Err("background task delivery is unavailable".into());
+        }
         // Resolve the role: its model ([roles] <role> > subagent > main), its
         // prompt template, read_only and protect_git declarations
         // (.e-agent/agents/<role>.md frontmatter). An unknown role is

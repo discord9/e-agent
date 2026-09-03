@@ -50,6 +50,8 @@ pub struct RoleTemplate {
     /// false). A read-only role gets no write/edit tools and its bash (when
     /// sandboxed) runs in a narrowed read-only sandbox with network disabled.
     pub read_only: bool,
+    /// Optional short description disclosed by the delegate tool.
+    pub description: Option<String>,
     /// `protect_git` declaration from the frontmatter (default true). When
     /// true, subagent bash binds `<workspace>/.git` read-only (non-Windows)
     /// — which the Windows write-sandbox MVP cannot enforce, so on Windows a
@@ -66,6 +68,7 @@ pub struct RoleTemplate {
 struct RoleMeta {
     read_only: Option<bool>,
     protect_git: Option<bool>,
+    description: Option<String>,
 }
 
 /// Read the template for `role`, including frontmatter attributes: the
@@ -112,6 +115,7 @@ fn parse_role_template(content: String) -> std::io::Result<RoleTemplate> {
     if first_line != "---" {
         return Ok(RoleTemplate {
             prompt: content,
+            description: None,
             read_only: false,
             protect_git: true,
         });
@@ -140,8 +144,23 @@ fn parse_role_template(content: String) -> std::io::Result<RoleTemplate> {
             format!("role template frontmatter is not valid TOML: {error}"),
         )
     })?;
+    if meta
+        .description
+        .as_deref()
+        .is_some_and(|description| description.contains(['\n', '\r']))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "role template description must not contain newlines",
+        ));
+    }
+    let description = meta
+        .description
+        .map(|description| description.trim().to_owned())
+        .filter(|description| !description.is_empty());
     Ok(RoleTemplate {
         prompt: after.to_owned(),
+        description,
         read_only: meta.read_only.unwrap_or(false),
         protect_git: meta.protect_git.unwrap_or(true),
     })

@@ -720,6 +720,83 @@ async fn rejects_empty_task() {
 }
 
 #[test]
+fn spec_discloses_dynamic_role_descriptions_but_keeps_name_enum() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg-empty");
+    std::fs::create_dir_all(&xdg).unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+    let agents = temp.path().join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("described.md"),
+        "---\ndescription = \"A described role\"\n---\nPrompt",
+    )
+    .unwrap();
+    std::fs::write(agents.join("legacy.md"), "Legacy prompt").unwrap();
+    std::fs::write(
+        agents.join("malformed.md"),
+        "---\ndescription = 7\n---\nPrompt",
+    )
+    .unwrap();
+
+    let spec = delegate(temp.path())
+        .with_roles_root(temp.path().to_path_buf())
+        .spec();
+    let role = &spec.parameters["properties"]["role"];
+    assert_eq!(role["enum"], json!(["described", "legacy", "malformed"]));
+    let disclosure = role["description"].as_str().unwrap();
+    assert!(disclosure.contains("described — A described role"));
+    assert!(disclosure.contains("legacy"));
+    assert!(!disclosure.contains("legacy —"));
+    assert!(disclosure.contains("malformed"));
+    assert!(!disclosure.contains("malformed —"));
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn malformed_role_is_plainly_disclosed_and_explicit_roles_fail_closed() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg-empty");
+    std::fs::create_dir_all(&xdg).unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+    let agents = temp.path().join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("broken.md"),
+        "---\ndescription = 7\n---\nPrompt",
+    )
+    .unwrap();
+    let mut rooted = delegate(temp.path()).with_roles_root(temp.path().to_path_buf());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    rooted.set_event_sender(sender);
+    let disclosure = rooted.spec().parameters["properties"]["role"]["description"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(disclosure.contains("broken"));
+    assert!(!disclosure.contains("broken —"));
+    assert!(
+        rooted
+            .execute(json!({"task": "hi", "role": "broken"}))
+            .await
+            .unwrap_err()
+            .contains("cannot read role `broken`")
+    );
+    assert_eq!(
+        rooted
+            .execute(json!({"task": "hi", "role": "main"}))
+            .await
+            .unwrap_err(),
+        "role `main` is not delegable"
+    );
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+#[test]
 fn spec_exposes_no_background_parameter() {
     let temp = tempfile::tempdir().unwrap();
     let spec = delegate(temp.path()).spec();
