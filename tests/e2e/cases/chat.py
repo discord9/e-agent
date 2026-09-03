@@ -289,7 +289,8 @@ DIAGRAM_FIXTURE = """┌────────────┐              ┌
       │─────────发送请求──────────>                           │
       <──────────返回结果─────────│                           │
       │                           │─────────查询数据──────────>
-      │                           <──────────响应数据─────────│"""
+      │                           <──────────响应数据─────────│
+ASCII W │ ─ ← → — 用"""
 
 
 async def run_markdown_cjk_diagram(c):
@@ -300,6 +301,13 @@ async def run_markdown_cjk_diagram(c):
         "Assistant": {"content": markdown, "tool_calls": [], "reasoning": None}}}],
         "next_before_seq": None}
 
+    font_path = (common.REPO_ROOT / "src/ui/fonts/"
+                 "SarasaFixedSC-Regular-0eef5142e058644f.woff2")
+    async def bundled_font(route, url, method):
+        await route.fulfill(status=200, content_type="font/woff2",
+                            body=font_path.read_bytes())
+    c.extra_handlers.append((lambda url, method: "/fonts/SarasaFixedSC-Regular-" in url,
+                             bundled_font))
     await c.start()
     await c.open_sidebar()
     await c.page.locator("#sidebarTree .tree-row", has_text="diagram").first.locator(".tree-id").click()
@@ -343,6 +351,7 @@ async def run_markdown_cjk_diagram(c):
         ascii: rect(1, lines[1].indexOf('W')).width,
         box: rect(0, lines[0].indexOf('─')).width,
         cjk: rect(1, lines[1].indexOf('用')).width,
+        arrow: rect(7, lines[7].indexOf('→')).width,
         rightBorderDelta, endpointDelta, fontFamily: cs.fontFamily,
         whiteSpace: ps.whiteSpace, tabSize: ps.tabSize, overflowX: ps.overflowX,
         preClientWidth: pre.clientWidth, preScrollWidth: pre.scrollWidth,
@@ -358,9 +367,10 @@ async def run_markdown_cjk_diagram(c):
     print("  [MEASURE] before=" + json.dumps(before, ensure_ascii=False, sort_keys=True))
     print("  [MEASURE] after-desktop=" + json.dumps(after, ensure_ascii=False, sort_keys=True))
 
-    c.check("复合字体与 C/C/2C advance",
-            after["fontFamily"].lstrip().startswith('"EAgent Noto CJK Diagram"')
+    c.check("Sarasa Fixed SC 与 ASCII/框线/CJK 1:1:2 advance",
+            after["fontFamily"].lstrip().startswith('"Sarasa Fixed SC"')
             and abs(after["box"] - after["ascii"]) <= 0.25
+            and abs(after["arrow"] - after["ascii"]) <= 0.25
             and abs(after["cjk"] - 2 * after["ascii"]) <= 0.5,
             json.dumps(after, ensure_ascii=False))
     c.check("桌面边框与端点偏差 <=1px",
@@ -377,7 +387,7 @@ async def run_markdown_cjk_diagram(c):
     c.check("普通 Markdown 与 inline code 未受影响",
             await c.ev("!!document.querySelector('.msg-assistant strong')")
             and inline["display"] == "inline" and inline["whiteSpace"] == "normal"
-            and "EAgent Noto CJK Diagram" not in inline["font"],
+            and "Sarasa Fixed SC" not in inline["font"],
             json.dumps(inline, ensure_ascii=False))
 
     await c.page.set_viewport_size({"width": 390, "height": 844})
@@ -385,6 +395,9 @@ async def run_markdown_cjk_diagram(c):
     print("  [MEASURE] after-mobile=" + json.dumps(mobile, ensure_ascii=False, sort_keys=True))
     c.check("手机对齐、内部滚动且无页面横溢",
             mobile["rightBorderDelta"] <= 1 and mobile["endpointDelta"] <= 1
+            and abs(mobile["box"] - mobile["ascii"]) <= 0.25
+            and abs(mobile["arrow"] - mobile["ascii"]) <= 0.25
+            and abs(mobile["cjk"] - 2 * mobile["ascii"]) <= 0.5
             and mobile["preScrollWidth"] > mobile["preClientWidth"]
             and mobile["pageScrollWidth"] <= mobile["pageClientWidth"] + 1,
             json.dumps(mobile))

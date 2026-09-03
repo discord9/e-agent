@@ -8009,20 +8009,24 @@ _empty_rule = re.search(
     r'#chatView\.no-session\s+\.composer\s*,[^\{]*\{([^}]*)\}', _css)
 _empty_ok = bool(_empty_rule and re.search(r'display:\s*none', _empty_rule.group(1)))
 print(("PASS" if _empty_ok else "FAIL") + " no-session hides messages and composer in style.css")
-# Markdown 围栏图使用 local-only unicode-range 复合字体；inline code 不受影响。
+# Markdown 围栏图使用同源 Sarasa Fixed SC；inline code 不受影响。
 _aliases = re.findall(r'@font-face\s*\{([^}]*)\}', _css)
 _pre_code = re.search(r'\.msg-body\s+pre\s+code\s*\{([^}]*)\}', _css)
 _pre_rules = re.findall(r'\.msg-body\s+pre\s*\{([^}]*)\}', _css)
 _pre_css = '\n'.join(_pre_rules)
 _diagram_font_ok = bool(
-    len(_aliases) == 2 and all(re.search(r'src:\s*local\(', a) for a in _aliases)
-    and not any(re.search(r'url\(', a) for a in _aliases)
-    and any('U+2190-21FF' in a and 'U+2500-257F' in a for a in _aliases)
-    and _pre_code and re.search(r'font-family:\s*["\']EAgent Noto CJK Diagram["\']', _pre_code.group(1))
+    len(_aliases) == 1
+    and re.search(r'font-family:\s*["\']Sarasa Fixed SC["\']', _aliases[0])
+    and re.search(r'src:\s*url\(["\']?/fonts/SarasaFixedSC-Regular-0eef5142e058644f\.woff2', _aliases[0])
+    and re.search(r'font-style:\s*normal', _aliases[0])
+    and re.search(r'font-weight:\s*400', _aliases[0])
+    and re.search(r'font-display:\s*swap', _aliases[0])
+    and not re.search(r'size-adjust|Noto|DejaVu|Sarasa Mono', '\n'.join(_aliases))
+    and _pre_code and re.search(r'font-family:\s*["\']Sarasa Fixed SC["\']', _pre_code.group(1))
     and re.search(r'white-space:\s*pre', _pre_css)
     and re.search(r'tab-size:\s*4', _pre_css)
     and re.search(r'overflow-x:\s*auto', _pre_css))
-print(("PASS" if _diagram_font_ok else "FAIL") + " local composite font is scoped to fenced Markdown code")
+print(("PASS" if _diagram_font_ok else "FAIL") + " same-origin Sarasa Fixed SC is scoped to fenced Markdown code")
 # 手机用量：复用既有 <=480px 段，百分比常驻，只有具备百分比时隐藏完整详情；
 # 禁止退回对整个 #usageInfo 做 ellipsis（会让末尾百分比消失）。
 _mobile = re.search(r'@media\s*\(max-width:\s*480px\)\s*\{([\s\S]*?)\n\s*\}\n\s*/\* 更窄', _css)

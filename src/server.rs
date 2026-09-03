@@ -290,6 +290,7 @@ fn router(state: Arc<AppState>) -> Router {
         .layer(from_fn(cache_control_middleware));
     Router::new()
         .route("/", get(index))
+        .route("/fonts/{name}", get(serve_font))
         .merge(api)
         .with_state(state)
         .layer(from_fn(cors_middleware))
@@ -3234,6 +3235,19 @@ async fn index() -> impl IntoResponse {
     }
 }
 
+const FONT_FILE: &str = "SarasaFixedSC-Regular-0eef5142e058644f.woff2";
+static FONT_BYTES: &[u8] = include_bytes!("ui/fonts/SarasaFixedSC-Regular-0eef5142e058644f.woff2");
+
+/// Serve the one bundled application font. Keep this deliberately explicit:
+/// there is no asset framework or filesystem fallback for user-controlled
+/// font paths.
+async fn serve_font(Path(name): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+    if name != FONT_FILE {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(([(header::CONTENT_TYPE, "font/woff2")], FONT_BYTES))
+}
+
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // Tests
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -5190,6 +5204,49 @@ model = "deepseek-chat"
             html.matches("data:font/woff2;base64,").count(),
             20,
             "expected exactly 20 inlined KaTeX font faces"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_font_route_serves_exact_woff2_bytes() {
+        use tower::util::ServiceExt;
+
+        let app = router(test_app_state("sekrit"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/fonts/{FONT_FILE}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "font/woff2"
+        );
+        let body = axum::body::to_bytes(response.into_body(), FONT_BYTES.len() + 1)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), FONT_BYTES);
+        assert_eq!(body.len(), 5_272_644);
+        assert_eq!(
+            crate::agent::image_sha256(body.as_ref()),
+            "0eef5142e058644fc4d3b3d5ff56e17b137e2717ce0b9b858362d875ae064f10"
+        );
+        assert!(
+            router(test_app_state("sekrit"))
+                .oneshot(
+                    Request::builder()
+                        .uri("/fonts/not-the-bundled-font.woff2")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+                == StatusCode::NOT_FOUND
         );
     }
 
