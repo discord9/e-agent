@@ -15,7 +15,7 @@
 //! `running_tasks` table on Greptime/SQLite) is dispatched through the same
 //! enum: [`SessionStore::record_background_start`] /
 //! [`SessionStore::clear_background_task`] /
-//! [`SessionStore::take_unfinished_background`].
+//! [`SessionStore::peek+consume].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -74,7 +74,7 @@ const META_STORE_SENTINEL: &str = "_meta";
 /// values with overwhelming probability.
 static PROCESS_IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Resolve the host name used in process identities and owner probes.
+/// Resolve the host name stored in process identity audit metadata.
 /// Environment variables are preferred because they are the established
 /// container/Windows source; Unix's OS hostname is the next shared source.
 fn resolve_hostname<E, F, C>(env: E, os_file: F, command: C) -> String
@@ -143,307 +143,6 @@ pub(crate) fn process_identity() -> &'static str {
         };
         format!("{pid}@{hostname}#{nonce}")
     })
-}
-
-/// Whether the process that wrote an `identity` string
-/// (`pid@hostname#nonce`, see [`process_identity`]) is still alive.
-///
-/// Deliberately conservative: any failure to determine liveness reports
-/// **true** ("alive"), so callers keep the safe `Preserve` behavior
-/// (leave the unfinished-task records for the owning process) instead of
-/// wrongly consuming them and injecting a "killed with the process"
-/// notice. Only a *definite* dead owner returns false:
-///
-/// - malformed identity (no `@`/`#`, unparsable pid) → true
-/// - a syntactically valid legacy identity with hostname `"unknown"` and a
-///   parseable pid → false (the explicit legacy compatibility rule)
-/// - hostname differs from the current process's → true (a record from
-///   another machine cannot be probed here)
-/// - the current hostname is `"unknown"` (all hostname sources were
-///   unavailable) → true: the machines cannot be compared, and probing a
-///   foreign pid risks a false "dead" across machines
-/// - the probe itself fails (e.g. `kill` missing) → true
-/// - unix (Linux and other /proc platforms): `kill -0 <pid>` — exit 0
-///   means alive; a non-zero exit is ESRCH (definitely dead) OR EPERM
-///   (alive but owned by another user — sudo-launched agent, systemd
-///   service, container), so it is disambiguated via the world-readable
-///   `/proc/{pid}` directory: present → alive, absent → dead. EPERM can
-///   therefore never report dead.
-/// - macOS (no /proc): the same two non-zero-exit cases are
-///   disambiguated by reading `kill -0`'s stderr, where the kernel names
-///   the reason — "Operation not permitted" (EPERM) → alive,
-///   "No such process" (ESRCH) → dead, any other message → alive
-///   (conservative, see [`classify_kill_stderr`]).
-/// - windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)` —
-///   a valid handle means alive (closed right away); NULL with
-///   `ERROR_ACCESS_DENIED` means the process exists but belongs to
-///   another user → alive, any other NULL error means truly absent.
-///
-/// The `nonce` is deliberately ignored: liveness is per pid+hostname, and
-/// a reused pid answers "some process with that pid is alive", which is
-/// exactly the conservative outcome.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OwnerLiveness {
-    MissingOwner,
-    Malformed,
-    UnknownHostname,
-    ForeignHostname,
-    CurrentHostnameUnavailable,
-    PidAlive,
-    PidAbsent,
-    ProbeUncertainty,
-}
-
-/// Safe, bounded classification for diagnostics. This is the same probe used
-/// by `owner_alive`; the enum adds only a reason for its conservative answer.
-pub(crate) fn classify_owner(identity: Option<&str>) -> OwnerLiveness {
-    let Some(identity) = identity else {
-        return OwnerLiveness::MissingOwner;
-    };
-    let Some((pid_str, rest)) = identity.split_once('@') else {
-        return OwnerLiveness::Malformed;
-    };
-    let Some((hostname, _nonce)) = rest.split_once('#') else {
-        return OwnerLiveness::Malformed;
-    };
-    // The nonce is audit metadata only. Preserve the historical probe
-    // behavior for legacy identities that omit it.
-    let Ok(pid) = pid_str.parse::<u32>() else {
-        return OwnerLiveness::Malformed;
-    };
-    if hostname == "unknown" {
-        return OwnerLiveness::UnknownHostname;
-    }
-    let hostname_now = resolve_hostname(
-        |name| std::env::var(name).ok(),
-        || {
-            #[cfg(unix)]
-            {
-                std::fs::read_to_string("/etc/hostname").ok()
-            }
-            #[cfg(not(unix))]
-            {
-                None
-            }
-        },
-        || {
-            #[cfg(not(windows))]
-            {
-                std::process::Command::new("hostname")
-                    .output()
-                    .ok()
-                    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-            }
-            #[cfg(windows)]
-            {
-                None
-            }
-        },
-    );
-    if hostname_now == "unknown" {
-        return OwnerLiveness::CurrentHostnameUnavailable;
-    }
-    if hostname != hostname_now {
-        return OwnerLiveness::ForeignHostname;
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        match std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-        {
-            Ok(status) if status.success() => OwnerLiveness::PidAlive,
-            Ok(_) => {
-                if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                    OwnerLiveness::PidAlive
-                } else {
-                    OwnerLiveness::PidAbsent
-                }
-            }
-            Err(_) => OwnerLiveness::ProbeUncertainty,
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        match std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output()
-        {
-            Ok(out) if out.status.success() => OwnerLiveness::PidAlive,
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                if stderr.contains("Operation not permitted") {
-                    OwnerLiveness::PidAlive
-                } else if stderr.contains("No such process") {
-                    OwnerLiveness::PidAbsent
-                } else {
-                    OwnerLiveness::ProbeUncertainty
-                }
-            }
-            Err(_) => OwnerLiveness::ProbeUncertainty,
-        }
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if handle.is_null() {
-            return if unsafe { GetLastError() == ERROR_ACCESS_DENIED } {
-                OwnerLiveness::PidAlive
-            } else {
-                OwnerLiveness::PidAbsent
-            };
-        }
-        unsafe { CloseHandle(handle) };
-        OwnerLiveness::PidAlive
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        OwnerLiveness::ProbeUncertainty
-    }
-}
-
-pub(crate) fn owner_alive(identity: &str) -> bool {
-    classify_owner(Some(identity)).is_alive()
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ResumeOwnerDiagnostics {
-    own: Vec<OwnerLiveness>,
-    delegate: Vec<OwnerLiveness>,
-}
-
-impl ResumeOwnerDiagnostics {
-    fn reason_list(reasons: &[OwnerLiveness]) -> String {
-        reasons
-            .iter()
-            .enumerate()
-            .map(|(index, reason)| format!("owner {}: {}", index + 1, reason.description()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    pub(crate) fn format(&self) -> String {
-        let own = if self.own.is_empty() {
-            "clear".to_owned()
-        } else {
-            format!("blocked ({})", Self::reason_list(&self.own))
-        };
-        let delegate = if self.delegate.is_empty() {
-            "clear".to_owned()
-        } else {
-            format!("blocked ({})", Self::reason_list(&self.delegate))
-        };
-        format!("own: {own}; delegate: {delegate}")
-    }
-}
-
-impl OwnerLiveness {
-    /// Exactly the pre-change `owner_alive` truth table: only the explicit
-    /// legacy unknown-host compatibility result and a definite absent PID are
-    /// dead; every malformed, foreign, unavailable, or uncertain result is
-    /// conservatively alive.
-    fn is_alive(self) -> bool {
-        !matches!(self, Self::UnknownHostname | Self::PidAbsent)
-    }
-
-    fn description(self) -> &'static str {
-        match self {
-            Self::MissingOwner => "owner missing",
-            Self::Malformed => "malformed owner identity",
-            Self::UnknownHostname => "unknown hostname",
-            Self::ForeignHostname => "foreign hostname",
-            Self::CurrentHostnameUnavailable => "current hostname unavailable",
-            Self::PidAlive => "PID alive",
-            Self::PidAbsent => "PID absent",
-            Self::ProbeUncertainty => "probe uncertainty",
-        }
-    }
-}
-
-/// Build resume-denial detail from the same owner classifications used by the
-/// existing all-dead gates. Only safe reason labels are retained; identities,
-/// task labels, commands, and storage locations never enter the report.
-fn blocked_owner_diagnostics(
-    tasks: &[crate::session::UnfinishedTask],
-    unknown_hostname_blocks: bool,
-) -> Vec<OwnerLiveness> {
-    tasks
-        .iter()
-        .filter_map(|task| {
-            let reason = classify_owner(task.owner_identity.as_deref());
-            let blocks = match task.owner_identity.as_deref() {
-                None => true,
-                Some(owner) if unknown_hostname_blocks && owner.contains("@unknown#") => true,
-                Some(_) => reason.is_alive(),
-            };
-            blocks.then_some(reason)
-        })
-        .collect()
-}
-
-impl SessionStore {
-    /// Explain a denial after the existing boolean gates have rejected resume.
-    /// A failed detail read is reported as uncertainty, without changing the
-    /// gate result or consuming any row.
-    pub(crate) async fn resume_owner_diagnostics(
-        &self,
-        root: &Path,
-        id: &str,
-        own_dead: bool,
-        delegate_dead: bool,
-    ) -> ResumeOwnerDiagnostics {
-        let own_tasks = self.peek_unfinished_background(root, id).await;
-        let delegate_tasks = self.peek_unfinished_background_for_subagent(root, id).await;
-        let mut own = own_tasks
-            .as_ref()
-            .map(|tasks| blocked_owner_diagnostics(tasks, false))
-            .unwrap_or_default();
-        // JSONL retains its historical extra guard for legacy `@unknown#`
-        // owners; DB backends use `owner_alive` directly. Match the existing
-        // backend-specific gate, rather than changing either gate here.
-        let delegate_unknown_blocks = matches!(self, SessionStore::Jsonl);
-        let mut delegate = delegate_tasks
-            .as_ref()
-            .map(|tasks| blocked_owner_diagnostics(tasks, delegate_unknown_blocks))
-            .unwrap_or_default();
-        if !own_dead && own.is_empty() {
-            own.push(OwnerLiveness::ProbeUncertainty);
-        }
-        if !delegate_dead && delegate.is_empty() {
-            delegate.push(OwnerLiveness::ProbeUncertainty);
-        }
-        ResumeOwnerDiagnostics { own, delegate }
-    }
-}
-
-/// Classify the stderr of a failed `kill -0` on platforms without /proc
-/// (macOS): the kernel names the reason, which disambiguates ESRCH
-/// (definitely dead) from EPERM (alive but owned by another user) —
-/// the exact EPERM-false-dead path `/proc` closes on Linux. Anything
-/// unclassifiable is conservative **alive**, so a weird locale or a
-/// future macOS message can never report a live process as dead.
-///
-/// Compiled on macOS (where `owner_alive` calls it) and in test builds
-/// on every platform so the pure classifier stays unit-testable.
-#[cfg(any(target_os = "macos", test))]
-fn classify_kill_stderr(stderr: &str) -> bool {
-    if stderr.contains("Operation not permitted") {
-        true // EPERM: the process exists but is owned by another user
-    } else if stderr.contains("No such process") {
-        false // ESRCH: definitely dead
-    } else {
-        true // unclassifiable: conservative alive
-    }
 }
 
 // ----------------------------------------------------------------------
@@ -2509,164 +2208,6 @@ impl SessionStore {
         }
     }
 
-    #[cfg(test)]
-    pub async fn take_unfinished_background(
-        &self,
-        root: &Path,
-        session: &str,
-    ) -> Result<Vec<String>> {
-        let tasks = self.peek_unfinished_background(root, session).await?;
-        let labels = tasks
-            .iter()
-            .map(|t| {
-                crate::session::format_unfinished(
-                    t.task_id,
-                    &t.label,
-                    t.subagent_session_id.as_deref(),
-                )
-            })
-            .collect();
-        if !tasks.is_empty() {
-            self.consume_unfinished_background(root, session, &tasks)
-                .await?;
-        }
-        Ok(labels)
-    }
-
-    /// Probe whether every unfinished background-task record for `session`
-    /// was left by a now-dead process. Server attach uses this to choose
-    /// between `Consume` (inject the "killed with the process" notice,
-    /// exactly like TUI/CLI restart) and `Preserve` (the session may still
-    /// be live in another process, which clears its own records): the
-    /// notice is only injected when the previous owner is definitely dead.
-    /// Conservative: any uncertainty (a live owner, an old record without
-    /// an owner, a probe failure) reports false → the caller keeps
-    /// `Preserve` and never misreports. No records → true (Consume is a
-    /// no-op).
-    pub async fn unfinished_owner_all_dead(&self, root: &Path, session: &str) -> Result<bool> {
-        match self {
-            SessionStore::Jsonl => Ok(Session::unfinished_owner_all_dead(root, session)),
-            #[cfg(feature = "greptime")]
-            SessionStore::Greptime {
-                session: greptime_session,
-                ..
-            } => {
-                let session_id = session.to_owned();
-                greptime_session
-                    .unfinished_owner_all_dead(&session_id)
-                    .await
-            }
-            #[cfg(feature = "sqlite")]
-            SessionStore::Sqlite {
-                session: sqlite_session,
-                ..
-            } => {
-                let session_id = session.to_owned();
-                sqlite_session
-                    .lock()
-                    .await
-                    .unfinished_owner_all_dead(&session_id)
-                    .await
-                    .map_err(anyhow::Error::msg)
-            }
-        }
-    }
-
-    pub(crate) async fn unfinished_owner_all_dead_for_subagent(
-        &self,
-        root: &Path,
-        id: &str,
-    ) -> Result<bool> {
-        match self {
-            SessionStore::Jsonl => Ok(Session::unfinished_owner_all_dead_for_subagent(root, id)),
-            #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => {
-                session.unfinished_owner_all_dead_for_subagent(id).await
-            }
-            #[cfg(feature = "sqlite")]
-            SessionStore::Sqlite { session, .. } => session
-                .lock()
-                .await
-                .unfinished_owner_all_dead_for_subagent(id)
-                .await
-                .map_err(anyhow::Error::msg),
-        }
-    }
-
-    /// Like [`Self::take_unfinished_background`] but scoped to rows whose
-    /// `subagent_session_id` matches — used when resuming a subagent
-    /// session so it learns what died with its background delegates. The
-    /// Greptime/SQLite table is global and supports the cross-session
-    /// lookup; JSONL discovers parent claim files by subagent session id.
-    pub(crate) async fn peek_unfinished_background_for_subagent(
-        &self,
-        root: &Path,
-        subagent_session_id: &str,
-    ) -> Result<Vec<UnfinishedTask>> {
-        match self {
-            SessionStore::Jsonl => {
-                Session::peek_unfinished_background_for_subagent(root, subagent_session_id)
-            }
-            #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => {
-                session
-                    .peek_unfinished_tasks_for_subagent(subagent_session_id)
-                    .await
-            }
-            #[cfg(feature = "sqlite")]
-            SessionStore::Sqlite { session, .. } => session
-                .lock()
-                .await
-                .peek_unfinished_tasks_for_subagent(subagent_session_id)
-                .await
-                .map_err(anyhow::Error::msg),
-        }
-    }
-
-    #[cfg(test)]
-    pub async fn take_unfinished_background_for_subagent(
-        &self,
-        root: &Path,
-        id: &str,
-    ) -> Result<Vec<String>> {
-        let tasks = self
-            .peek_unfinished_background_for_subagent(root, id)
-            .await?;
-        let labels = tasks
-            .iter()
-            .map(|t| crate::session::format_unfinished(t.task_id, &t.label, None))
-            .collect();
-        if !tasks.is_empty() {
-            self.consume_unfinished_background_for_subagent(root, id, &tasks)
-                .await?;
-        }
-        Ok(labels)
-    }
-
-    /// Consume subagent records after its runner commits the recovery Notice.
-    pub(crate) async fn consume_unfinished_background_for_subagent(
-        &self,
-        root: &Path,
-        id: &str,
-        tasks: &[UnfinishedTask],
-    ) -> Result<()> {
-        match self {
-            SessionStore::Jsonl => Session::consume_unfinished_background(root, id, tasks),
-            #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session
-                .consume_unfinished_tasks_for_subagent(id, tasks)
-                .await
-                .map_err(anyhow::Error::msg),
-            #[cfg(feature = "sqlite")]
-            SessionStore::Sqlite { session, .. } => session
-                .lock()
-                .await
-                .consume_unfinished_tasks_for_subagent(id, tasks)
-                .await
-                .map_err(anyhow::Error::msg),
-        }
-    }
-
     /// Look up one surviving background-task record's full command by
     /// (session, task_id) — the server's `/api/tasks` fallback when the
     /// live registry's `BackgroundTaskInfo.full_command` is `None`
@@ -3795,200 +3336,6 @@ mod shared_helpers {
 mod tests {
     use super::*;
 
-    /// `owner_alive` liveness probe: the current process's own identity is
-    /// alive; huge non-existent pids are definitely dead; anything that
-    /// cannot be judged (foreign hostname, "unknown" hostname, malformed
-    /// identity) is alive (conservative — the caller keeps Preserve
-    /// instead of misreporting).
-    #[test]
-    fn hostname_resolver_prefers_env_and_trims_values() {
-        let hostname = resolve_hostname(
-            |name| match name {
-                "HOSTNAME" => Some("  env-host  ".to_owned()),
-                _ => Some("computer-host".to_owned()),
-            },
-            || Some(" file-host\n".to_owned()),
-            || Some(" command-host\n".to_owned()),
-        );
-        assert_eq!(hostname, "env-host");
-    }
-
-    #[test]
-    fn hostname_resolver_uses_trimmed_os_file_when_env_missing() {
-        let hostname = resolve_hostname(
-            |_| None,
-            || Some("  os-host\n".to_owned()),
-            || panic!("command must not run when the OS hostname is available"),
-        );
-        assert_eq!(hostname, "os-host");
-    }
-
-    #[test]
-    fn hostname_resolver_falls_back_to_command_or_unknown() {
-        assert_eq!(
-            resolve_hostname(
-                |_| None,
-                || Some(" \n".to_owned()),
-                || { Some(" command-host\n".to_owned()) }
-            ),
-            "command-host"
-        );
-        assert_eq!(
-            resolve_hostname(|_| None, || None, || Some(" \n".to_owned())),
-            "unknown"
-        );
-        assert_eq!(resolve_hostname(|_| None, || None, || None), "unknown");
-    }
-
-    #[test]
-    fn legacy_unknown_owners_are_dead_but_missing_owner_is_preserved() {
-        let temp = tempfile::tempdir().unwrap();
-        let session = "legacy-unknown-owner";
-        let path = temp
-            .path()
-            .join(".e-agent/sessions/legacy-unknown-owner.background.jsonl");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            "{\"id\":1,\"label\":\"a\",\"owner\":\"2000000000@unknown#nonce\"}\n",
-        )
-        .unwrap();
-        assert!(crate::session::Session::unfinished_owner_all_dead(
-            temp.path(),
-            session
-        ));
-        std::fs::write(
-            &path,
-            "{\"id\":1,\"label\":\"a\",\"owner\":\"2000000000@unknown#nonce\"}\n{\"id\":2,\"label\":\"old\",\"owner\":null}\n",
-        )
-        .unwrap();
-        assert!(!crate::session::Session::unfinished_owner_all_dead(
-            temp.path(),
-            session
-        ));
-    }
-
-    #[test]
-    fn owner_identity_classification_reports_safe_reasons() {
-        assert_eq!(classify_owner(None), OwnerLiveness::MissingOwner);
-        assert_eq!(
-            classify_owner(Some("not-an-identity")),
-            OwnerLiveness::Malformed
-        );
-        assert_eq!(
-            classify_owner(Some("2000000000@unknown#nonce")),
-            OwnerLiveness::UnknownHostname
-        );
-        assert_eq!(
-            classify_owner(Some("2000000000@foreign-host#nonce")),
-            OwnerLiveness::ForeignHostname
-        );
-        assert_eq!(
-            classify_owner(Some(process_identity())),
-            OwnerLiveness::PidAlive
-        );
-        let host = probeable_hostname().expect("test host must be probeable");
-        assert_eq!(
-            classify_owner(Some(&format!("{}@{host}#", std::process::id()))),
-            OwnerLiveness::PidAlive
-        );
-        assert!(owner_alive(&format!("{}@{host}#", std::process::id())));
-        assert_eq!(
-            classify_owner(Some(&format!("2000000000@{host}#"))),
-            OwnerLiveness::PidAbsent
-        );
-        assert!(!owner_alive(&format!("2000000000@{host}#")));
-    }
-
-    #[test]
-    fn owner_alive_is_conservative_and_spot_checks_liveness() {
-        // Our own identity: pid exists, hostname matches → alive
-        // (kill -0 succeeds on the same uid).
-        let me = process_identity();
-        assert!(
-            owner_alive(me),
-            "the current process must probe as alive: {me}"
-        );
-
-        // The dead-pid probe path (`kill -0` ESRCH + no /proc entry) is
-        // reachable when the resolved hostname is real. Legacy valid
-        // `unknown` identities are handled as definitely dead below.
-        if let Some(hostname) = probeable_hostname() {
-            // Pids that cannot exist (well-formed `pid@hostname#nonce`
-            // shape, but far above any real pid_max): `kill -0` reports
-            // ESRCH and /proc has no such directory → definitely dead.
-            let dead = format!("2000000000@{hostname}#deadbeef");
-            assert!(!owner_alive(&dead), "impossible pid must probe as dead");
-            let dead2 = format!("3999999999@{hostname}#cafebabe");
-            assert!(
-                !owner_alive(&dead2),
-                "well-formed but non-existent pid must probe as dead"
-            );
-        }
-
-        // Different hostname (even with our own pid) → cannot judge → alive.
-        let foreign = format!("{}@some-other-machine#deadbeef", std::process::id());
-        assert!(
-            owner_alive(&foreign),
-            "foreign hostname must be conservative (alive)"
-        );
-
-        // Valid legacy unknown-host identities are explicitly considered
-        // dead, regardless of the current host resolution.
-        assert!(!owner_alive("2000000000@unknown#deadbeef"));
-        assert!(!owner_alive("1@unknown#nonce"));
-
-        // Malformed identities → cannot judge → alive.
-        assert!(owner_alive(""), "empty identity is conservative");
-        assert!(
-            owner_alive("not-an-identity"),
-            "no @ separator is conservative"
-        );
-        assert!(
-            owner_alive("12345@unknown"),
-            "unknown hostname without nonce is malformed"
-        );
-        assert!(
-            owner_alive("abc@unknown#nonce"),
-            "unparsable pid is conservative"
-        );
-        assert!(
-            owner_alive("12345@hostname-without-nonce"),
-            "no # separator is conservative"
-        );
-    }
-
-    /// The macOS stderr-discrimination logic (the no-/proc EPERM-vs-ESRCH
-    /// disambiguation) as a pure classifier. Exercised on Linux under
-    /// `#[cfg(test)]`; on macOS it is the live probe path. The guarantee
-    /// under test: EPERM (alive but other-uid) must never read as dead,
-    /// ESRCH is the ONLY way to get false, and any unclassifiable stderr
-    /// falls back to conservative alive.
-    #[test]
-    fn classify_kill_stderr_disambiguates_eperm_from_esrch() {
-        // EPERM — process alive but owned by another user → alive.
-        assert!(classify_kill_stderr("kill: 123: Operation not permitted"));
-        assert!(classify_kill_stderr("kill: 456: Operation not permitted\n"));
-        // ESRCH — the only definite-dead answer.
-        assert!(!classify_kill_stderr("kill: 2000000000: No such process"));
-        assert!(!classify_kill_stderr("No such process"));
-        // Unclassifiable → conservative alive, never dead.
-        assert!(classify_kill_stderr(""));
-        assert!(classify_kill_stderr("kill: 123: something else"));
-        assert!(classify_kill_stderr("zsh: killed"));
-        // EPERM is checked before the substring "permitted" could ever
-        // collide with an ESRCH message; order is fixed and conservative.
-        assert!(classify_kill_stderr(
-            "Operation not permitted and No such process"
-        ));
-    }
-
-    fn probeable_hostname() -> Option<String> {
-        let (_, rest) = process_identity().split_once('@')?;
-        let (host, _) = rest.split_once('#')?;
-        (host != "unknown").then_some(host.to_owned())
-    }
-
     /// JSONL `load_older` pages by ABSOLUTE position (there is no seq
     /// column): `before_seq` is the 0-based file position, the returned
     /// slice is `[max(0, before-limit), before)`, and the cursor is the
@@ -4357,8 +3704,8 @@ mod tests {
 
         /// Wait for the fire-and-forget background-record facade to land:
         /// `record_background_start` spawns onto the current runtime and is
-        /// never awaited, so poll `take_unfinished_background` (which
-        /// consumes) until the row appears or a deadline passes.
+        /// never awaited, so poll peek+consume until the row appears or a
+        /// deadline passes.
         async fn take_unfinished_with_retry(
             store: &SessionStore,
             root: &Path,
@@ -4366,10 +3713,26 @@ mod tests {
         ) -> Vec<String> {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                let labels = store
-                    .take_unfinished_background(root, session)
+                let tasks = store
+                    .peek_unfinished_background(root, session)
                     .await
-                    .expect("take unfinished background");
+                    .expect("peek unfinished background");
+                let labels = tasks
+                    .iter()
+                    .map(|t| {
+                        crate::session::format_unfinished(
+                            t.task_id,
+                            &t.label,
+                            t.subagent_session_id.as_deref(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if !tasks.is_empty() {
+                    store
+                        .consume_unfinished_background(root, session, &tasks)
+                        .await
+                        .expect("consume unfinished background");
+                }
                 if !labels.is_empty() || std::time::Instant::now() >= deadline {
                     return labels;
                 }
@@ -4665,16 +4028,14 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             let labels = store
-                .take_unfinished_background(&root, &session)
+                .peek_unfinished_background(&root, &session)
                 .await
                 .expect("final take");
             assert!(labels.is_empty(), "cleared task must not be reported");
 
-            // Subagent-scoped record, looked up from a DIFFERENT session's
-            // store (the running_tasks table is workspace-global): the
-            // non-consuming label_for_subagent reports it first, then the
-            // consuming take_unfinished_background_for_subagent resolves it
-            // cross-session.
+            // A subagent-scoped record is visible through the display-only
+            // label lookup, even from a different session's store because
+            // the running_tasks table is workspace-global.
             store.record_background_start(
                 &root,
                 &session,
@@ -4703,69 +4064,24 @@ mod tests {
             };
             assert_eq!(label, "delegate work");
 
-            // The subagent-scoped take keys the lookup by the
-            // subagent_session_id, so its labels carry no `(session: …)`
-            // suffix.
-            let subagent_labels = sub_store
-                .take_unfinished_background_for_subagent(&root, "sub-123")
-                .await
-                .expect("take for subagent");
-            assert_eq!(
-                subagent_labels,
-                vec![crate::session::format_unfinished(9, "delegate work", None)]
-            );
-            // Consumed: the label lookup is now empty and the by-session
-            // take has nothing left for this row either.
+            // Completing the task through the normal by-session lifecycle
+            // clears the row and removes its display label.
+            store.clear_background_task(&root, &session, 9);
+            for _ in 0..1000 {
+                tokio::task::yield_now().await;
+            }
             assert_eq!(
                 sub_store
                     .label_for_subagent(&root, "sub-123")
                     .await
-                    .expect("label after take"),
+                    .expect("label after clear"),
                 None
             );
             let labels = store
-                .take_unfinished_background(&root, &session)
+                .peek_unfinished_background(&root, &session)
                 .await
-                .expect("by-session take after subagent consume");
+                .expect("by-session take after clear");
             assert!(labels.is_empty());
-        }
-
-        /// The probe's Err contract through the facade: when the
-        /// `running_tasks` query hard-fails (table dropped behind the
-        /// store's back), `unfinished_owner_all_dead` returns Err instead
-        /// of panicking — this is exactly the error the server's
-        /// `build_session` catches and degrades to Preserve (P1-2), so the
-        /// session build never 500s over a broken probe.
-        #[tokio::test]
-        async fn sqlite_unfinished_owner_all_dead_probe_error_propagates() {
-            let (_dir, path) = temp_db();
-            let root = std::env::temp_dir();
-            let session = format!("test-store-owner-err-{}", crate::session::new_id());
-            let store = SessionStore::connect(&backend(&path), &root, &session)
-                .await
-                .expect("connect sqlite store");
-
-            // Break the running_tasks table from a second raw connection.
-            let db = turso::Builder::new_local(path.to_str().unwrap())
-                .build()
-                .await
-                .expect("open db");
-            let conn = db.connect().expect("connect raw");
-            conn.execute("DROP TABLE running_tasks", ())
-                .await
-                .expect("drop running_tasks table");
-            drop(conn);
-            drop(db);
-
-            let err = store
-                .unfinished_owner_all_dead(&root, &session)
-                .await
-                .expect_err("probe must error on a broken table");
-            let message = format!("{err:#}");
-            assert!(
-                message.contains("cannot load unfinished background task owners"),
-                "probe error must carry context: {message}"
-            );
         }
 
         /// End-to-end background-task recovery across a restart: a task
@@ -4813,7 +4129,7 @@ mod tests {
                 .await
                 .expect("reconnect bg store C");
             let labels = store_c
-                .take_unfinished_background(&root, &session)
+                .peek_unfinished_background(&root, &session)
                 .await
                 .expect("take after clear+restart");
             assert!(

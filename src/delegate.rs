@@ -23,10 +23,7 @@ use serde_json::{Value, json};
 use crate::agent::{Agent, AgentEvent, CompactionMode, Tool, ToolOutput, ToolSpec, preview};
 use crate::config::SessionBackend;
 use crate::model::ConfiguredModel;
-use crate::runner::{
-    IdlePolicy, RecoveryBatch, RecoveryScope, SessionBootstrap, SessionHandle, SessionResult,
-    SessionRunner,
-};
+use crate::runner::{IdlePolicy, SessionBootstrap, SessionHandle, SessionResult, SessionRunner};
 use crate::session_store::SessionStore;
 use crate::tools::{BackgroundTasks, TaskExit, new_exit_slot};
 use crate::workspace::Workspace;
@@ -45,6 +42,7 @@ pub struct SessionEntry {
     /// re-connecting per request; `handle` alone cannot serve history
     /// (the runner's event log is a recent tail, not the full transcript).
     pub store: SessionStore,
+    pub local_permit: Option<crate::session_factory::LocalSessionPermit>,
 }
 
 /// Registry of live session handles, keyed by background-task id (the same
@@ -208,6 +206,7 @@ pub struct Delegate {
     /// recorded alongside bash background tasks and trigger the "killed on
     /// exit" notice on restart.
     record_in: Option<crate::session_store::BackgroundRecord>,
+    local_sessions: crate::session_factory::LocalSessionRegistry,
     /// Session backend configuration for subagent persistence (not a
     /// connected store — each subagent connects its own).
     persist_backend: SessionBackend,
@@ -275,6 +274,7 @@ impl Delegate {
             roles_root: None,
             sandbox: None,
             record_in: None,
+            local_sessions: crate::session_factory::LocalSessionRegistry::default(),
             persist_backend: SessionBackend::default(),
         }
     }
@@ -373,6 +373,14 @@ impl Delegate {
         self
     }
 
+    pub fn with_local_sessions(
+        mut self,
+        registry: crate::session_factory::LocalSessionRegistry,
+    ) -> Self {
+        self.local_sessions = registry;
+        self
+    }
+
     /// Live session handles, for attach views.
     pub fn sessions(&self) -> Sessions {
         self.sessions.clone()
@@ -463,33 +471,16 @@ impl Delegate {
         let store = SessionStore::connect(&persist.backend, &persist.root, &persist.session_id)
             .await
             .map_err(|e| format!("subagent failed: {e:#}"))?;
-        let (own_recovery, delegate_recovery) = if resumed {
-            let own = store
+        let own_recovery = if resumed {
+            store
                 .peek_unfinished_background(&persist.root, &persist.session_id)
                 .await
-                .map_err(|e| format!("cannot load unfinished tasks: {e:#}"))?;
-            let delegates = store
-                .peek_unfinished_background_for_subagent(&persist.root, &persist.session_id)
-                .await
-                .map_err(|e| format!("cannot load unfinished tasks: {e:#}"))?;
-            (own, delegates)
+                .map_err(|e| format!("cannot load unfinished tasks: {e:#}"))?
         } else {
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
         let bootstrap = bootstrap.unwrap_or(SessionBootstrap {
-            recovery_batches: [
-                (!own_recovery.is_empty()).then_some(RecoveryBatch {
-                    scope: RecoveryScope::Session,
-                    tasks: own_recovery,
-                }),
-                (!delegate_recovery.is_empty()).then_some(RecoveryBatch {
-                    scope: RecoveryScope::Subagent,
-                    tasks: delegate_recovery,
-                }),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
+            recovery_tasks: own_recovery,
             legacy: false,
             initial_entries: Vec::new(),
         });
@@ -497,8 +488,7 @@ impl Delegate {
         // 借此登记 subagent 的 bash 任务（此前 background_record 为 None，subagent
         // 的 bash 任务既不进 running_tasks 重启后丢失，面板也定位不到发起者）。
         // store 是 subagent 自己的（persist 绑定 session_id），root 同 workspace；
-        // take_unfinished_background 按 session 消费（服务器僵尸扫描对子会话行组
-        // 单独消费），与主会话路径兼容。
+        // Resume 只按这个 target session 消费自己的未完成记录。
         agent.record_background_tasks_in(persist.root.clone(), &persist.session_id, store.clone());
         let (runner, handle) = SessionRunner::new_with_bootstrap(
             agent,
@@ -618,6 +608,7 @@ pub struct BtwContext {
     /// parent's store): records the btw task for the killed-on-exit notice
     /// and supplies the `parent_session_id` metadata link.
     pub record_in: Option<crate::session_store::BackgroundRecord>,
+    pub local_sessions: crate::session_factory::LocalSessionRegistry,
 }
 
 /// The initial history of a btw fork: the source session's prefix up to its
@@ -688,6 +679,7 @@ pub async fn spawn_btw_subagent(
         persist_root,
         backend,
         record_in,
+        local_sessions,
     } = context;
     let model_name = model.profile_key();
     let cwd = workspace.root().display().to_string();
@@ -704,13 +696,21 @@ pub async fn spawn_btw_subagent(
     let fork_entries = btw_fork_entries(source_session, &source_entries)
         .map_err(|e| format!("cannot fork session {source_session}: {e}"))?;
     let session_id = crate::session::new_id_prefixed("btw-");
+    let local_permit = local_sessions
+        .reserve(crate::session_factory::LocalSessionRegistry::key(
+            workspace.root(),
+            &persist_root,
+            &backend,
+            &session_id,
+        ))
+        .map_err(|_| format!("btw session `{session_id}` is already live locally"))?;
     let persist = PersistConfig {
         root: persist_root.clone(),
         session_id: session_id.clone(),
         backend: backend.clone(),
     };
     let fork_bootstrap = SessionBootstrap {
-        recovery_batches: Vec::new(),
+        recovery_tasks: Vec::new(),
         legacy: false,
         initial_entries: fork_entries,
     };
@@ -773,6 +773,7 @@ pub async fn spawn_btw_subagent(
         // `persist_root` + `session_id`); lets the web server read the
         // btw transcript without re-connecting per request.
         store: meta_store.clone(),
+        local_permit: Some(local_permit),
     });
     let entry_for_hook = entry.clone();
     let hook_session_id = session_id.clone();
@@ -1023,72 +1024,14 @@ impl Tool for Delegate {
         // Raw resume id for display metadata: the resolution match below
         // moves the string, so keep a copy before it is consumed.
         let resume_display = resume.clone();
-        // Resolve the session to continue, if any: load its transcript (the
-        // subagent's starting context) and reuse its id so new turns append
-        // to the same file. Without persistence configured there is nothing
-        // to resume from.
-        let resume = match resume {
-            Some(id) => {
-                // Resume guard (concurrent-write conflicts #46/#49): never
-                // continue a subagent whose runner is STILL live in this
-                // parent's `Sessions` registry — the resumed runner would
-                // append to the same session file concurrently. A handle
-                // exists only while the subagent is alive (DelegateCleanup
-                // removes finished ones), so a hit here always means "still
-                // running"; the subagent continues on its own and needs no
-                // resume. Cross-process rows are deliberately NOT consulted
-                // here: resume probes every persisted claim and proceeds only when all
-                // matching owners are definitely dead; otherwise it preserves
-                // the records for the live or unjudgeable owner.
-                if self
-                    .sessions
-                    .list()
-                    .iter()
-                    .any(|(_, entry)| entry.session_id == id)
-                {
-                    return Err(format!(
-                        "cannot resume session `{id}`: it is still running as a live subagent; \
-                         wait for it to finish or cancel its task first"
-                    ));
-                }
-                let root = self
-                    .persist_root
-                    .clone()
-                    .ok_or("`resume` requires subagent session persistence (disabled in tests)")?;
-                // Load the transcript first to distinguish a missing session from
-                // an existing session with recoverable claims. This is read-only.
-                let temp_store = SessionStore::connect(&self.persist_backend, &root, &id)
-                    .await
-                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
-                let located = temp_store
-                    .load_located(&root, &id)
-                    .await
-                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
-                if located.entries.is_empty() {
-                    return Err(format!("no such subagent session: `{id}`"));
-                }
-                let own_dead = temp_store
-                    .unfinished_owner_all_dead(&root, &id)
-                    .await
-                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
-                let delegate_dead = temp_store
-                    .unfinished_owner_all_dead_for_subagent(&root, &id)
-                    .await
-                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
-                if !own_dead || !delegate_dead {
-                    let diagnostics = temp_store
-                        .resume_owner_diagnostics(&root, &id, own_dead, delegate_dead)
-                        .await;
-                    return Err(format!(
-                        "cannot resume session `{id}`: unfinished task owners block resume ({}); \
-                         retry after the blocked owners finish or ownership can be judged",
-                        diagnostics.format()
-                    ));
-                }
-                Some((id, located.entries, located.locations))
-            }
-            None => None,
-        };
+        // Keep the raw id until the target workspace is canonicalized; the
+        // shared permit must be acquired before any awaited transcript load.
+        let resume_id_arg = resume.clone();
+        if resume_id_arg.is_some() && self.persist_root.is_none() {
+            return Err(
+                "`resume` requires subagent session persistence (disabled in tests)".into(),
+            );
+        }
         // Parse optional label; fallback chain: label → role → task preview.
         let raw_label = arguments
             .as_object()
@@ -1109,12 +1052,16 @@ impl Tool for Delegate {
             .and_then(Value::as_str)
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
-        let Some(workspace_arg) = workspace_arg else {
-            return Err(
-                "delegate requires a workspace parameter: path of the working directory \
-                 (absolute, or relative to this workspace's root)"
-                    .into(),
-            );
+        let workspace_arg = match workspace_arg {
+            Some(path) => path,
+            None if resume_id_arg.is_some() => ".".to_owned(),
+            None => {
+                return Err(
+                    "delegate requires a workspace parameter: path of the working directory \
+                     (absolute, or relative to this workspace's root)"
+                        .into(),
+                );
+            }
         };
         // Join relative inputs with the caller's root up front; reroot's
         // canonicalize then resolves any `.`/`..` segments while refusing
@@ -1129,6 +1076,42 @@ impl Tool for Delegate {
             .reroot(&workspace_path)
             .map_err(|error| format!("invalid `workspace` path `{workspace_arg}`: {error}"))?;
 
+        let admitted_id = resume_id_arg
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| crate::session::new_id_prefixed("sub-"));
+        let persist_root = self
+            .persist_root
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("e-agent-subagents"));
+        let key = crate::session_factory::LocalSessionRegistry::key(
+            self.workspace.root(),
+            &persist_root,
+            &self.persist_backend,
+            &admitted_id,
+        );
+        let local_permit = self.local_sessions.reserve(key).map_err(|_| {
+            format!("cannot resume session `{admitted_id}`: it is already live locally")
+        })?;
+        // Load only after admission. A live child in any parent therefore
+        // conflicts through the shared registry, without scanning parents.
+        let resume = match resume_id_arg {
+            Some(id) => {
+                let root = persist_root.clone();
+                let temp_store = SessionStore::connect(&self.persist_backend, &root, &id)
+                    .await
+                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
+                let located = temp_store
+                    .load_located(&root, &id)
+                    .await
+                    .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
+                if located.entries.is_empty() {
+                    return Err(format!("no such subagent session: `{id}`"));
+                }
+                Some((id, located.entries, located.locations))
+            }
+            None => None,
+        };
         let model_name = model.profile_key();
         let (resume_id, resume) = match resume {
             Some((id, entries, locations)) => (Some(id), Some((entries, locations))),
@@ -1148,7 +1131,7 @@ impl Tool for Delegate {
                 .persist_root
                 .clone()
                 .unwrap_or_else(|| std::env::temp_dir().join("e-agent-subagents")),
-            session_id: resume_id.unwrap_or_else(|| crate::session::new_id_prefixed("sub-")),
+            session_id: admitted_id,
             backend: self.persist_backend.clone(),
         };
         let session_id = persist.session_id.clone();
@@ -1221,6 +1204,7 @@ impl Tool for Delegate {
             // with `persist.root` + `session_id`); lets the web server read
             // the subagent's transcript without re-connecting per request.
             store: meta_store.clone(),
+            local_permit: Some(local_permit),
         });
         let entry_for_hook = entry.clone();
         // Owned clone for the move closures; the outer `session_id` stays

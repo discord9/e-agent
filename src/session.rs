@@ -116,8 +116,6 @@ pub(crate) struct UnfinishedTask {
     pub task_id: u64,
     pub label: String,
     pub subagent_session_id: Option<String>,
-    pub session_id: Option<String>,
-    pub owner_identity: Option<String>,
     pub started_at: Option<i64>,
     /// JSONL has no task timestamp column; the raw record identifies the exact line.
     pub raw: Option<String>,
@@ -500,17 +498,17 @@ impl Session {
             .with_context(|| format!("cannot replace session {}", path.display()))?;
         Ok(())
     }
-    /// Record a freshly started background task so a later launch can tell
-    /// the user what died with the previous process. One JSON line per
-    /// task; `clear_background_task` removes the line on completion, so a
-    /// surviving line always means "the process died with this running".
+    /// Record a freshly started background task for later unfinished-task
+    /// recovery. One JSON line per task; `clear_background_task` removes the
+    /// line on completion, so a surviving line is an unfinished/stale
+    /// candidate.
     /// Records are scoped per session: a task started in session A is only
     /// reported back when session A is resumed, never to another session.
     ///
     /// `label` 是源头截断的 100 字符预览（给「被杀」Notice 用）；`full_command`
     /// 是完整命令原文（bash 任务传 `Some`，delegate 任务无命令传 `None`），
     /// 持久化在 JSONL 的 `"full_command"` 字段里，旧记录没有该字段 → 读回
-    /// `None`（兼容）。`take_unfinished_background` 消费时仍只回 label
+    /// `None`（兼容）。peek+consume 消费时仍只回 label
     /// （Notice 文本不变），完整命令通过 [`Self::task_full_command`] 单独取。
     fn background_mutation_lock(root: &Path, session: &str) -> anyhow::Result<std::fs::File> {
         let path = background_record_path(root, session)?.with_extension("jsonl.lock");
@@ -548,7 +546,6 @@ impl Session {
         let mut record = serde_json::json!({
             "id": id,
             "label": label,
-            "owner": crate::session_store::process_identity(),
         });
         if let Some(command) = full_command {
             record["full_command"] = serde_json::json!(command);
@@ -632,8 +629,6 @@ impl Session {
                     task_id: record["id"].as_u64().unwrap_or(0),
                     label: record["label"].as_str().unwrap_or("?").to_owned(),
                     subagent_session_id: record["session_id"].as_str().map(str::to_owned),
-                    session_id: Some(session.to_owned()),
-                    owner_identity: record["owner"].as_str().map(str::to_owned),
                     started_at: None,
                     raw: Some(background_token(session, occurrence, &line)),
                 });
@@ -718,20 +713,9 @@ impl Session {
         Ok(())
     }
 
-    /// Compatibility wrapper retained for unit tests that exercise the old API.
-    pub fn take_unfinished_background(root: &Path, session: &str) -> Vec<String> {
-        let tasks = Self::peek_unfinished_background(root, session);
-        let labels = tasks
-            .iter()
-            .map(|t| format_unfinished(t.task_id, &t.label, t.subagent_session_id.as_deref()))
-            .collect();
-        let _ = Self::consume_unfinished_background(root, session, &tasks);
-        labels
-    }
-
     /// Look up one surviving background-task record's full command by id
     /// (the "另取" path promised by [`Self::record_background_start`]: the
-    /// consuming `take_unfinished_background` returns labels unchanged,
+    /// consuming peek+consume returns labels unchanged,
     /// this reads the persisted `"full_command"` separately). Old records
     /// written before the field shipped have no `full_command` → `None`
     /// (nothing to fill). Used by the server's `/api/tasks` fallback when
@@ -756,98 +740,6 @@ impl Session {
             }
         }
         None
-    }
-
-    /// True when every unfinished-task record for `session` was left by a
-    /// now-dead process — i.e. the tasks really were killed with their
-    /// owning process, so the caller may safely consume the records and
-    /// inject the "killed with the process" notice (the TUI/CLI restart
-    /// behavior; the server attaches lazily and may find a session that is
-    /// still live in another process, which is why it probes first).
-    ///
-    /// Conservative: any uncertainty reports false ("not all dead"), so
-    /// the caller keeps `Preserve` and never injects a false notice —
-    /// a record without an `owner` field (written by an older version), an
-    /// unparsable line, a live owner, an unreachable probe, or a read
-    /// error all count as alive. Only a record file where EVERY line
-    /// carries an owner that is definitely dead returns true. A
-    /// missing/unreadable file returns true: no records means nothing to
-    /// consume (the Consume path is a no-op).
-    pub(crate) fn peek_unfinished_background_for_subagent(
-        root: &Path,
-        subagent: &str,
-    ) -> anyhow::Result<Vec<UnfinishedTask>> {
-        let dir = root.join(".e-agent/sessions");
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
-        let mut out = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(parent) = name.strip_suffix(".background.jsonl") else {
-                continue;
-            };
-            let file = std::fs::File::open(entry.path())?;
-            for (occurrence, line) in std::io::BufReader::new(file).lines().enumerate() {
-                let line = line?;
-                let record: serde_json::Value = serde_json::from_str(&line)?;
-                if record["session_id"].as_str() != Some(subagent) {
-                    continue;
-                }
-                out.push(UnfinishedTask {
-                    task_id: record["id"].as_u64().unwrap_or(0),
-                    label: record["label"].as_str().unwrap_or("?").to_owned(),
-                    subagent_session_id: Some(subagent.to_owned()),
-                    session_id: Some(parent.to_owned()),
-                    owner_identity: record["owner"].as_str().map(str::to_owned),
-                    started_at: None,
-                    raw: Some(background_token(parent, occurrence, &line)),
-                });
-            }
-        }
-        Ok(out)
-    }
-
-    pub fn unfinished_owner_all_dead_for_subagent(root: &Path, subagent: &str) -> bool {
-        let Ok(tasks) = Self::peek_unfinished_background_for_subagent(root, subagent) else {
-            return false;
-        };
-        tasks.iter().all(|task| {
-            task.owner_identity.as_deref().is_some_and(|owner| {
-                !owner.contains("@unknown#") && !crate::session_store::owner_alive(owner)
-            })
-        })
-    }
-
-    pub fn unfinished_owner_all_dead(root: &Path, session: &str) -> bool {
-        let Ok(path) = background_record_path(root, session) else {
-            return true;
-        };
-        let Ok(file) = std::fs::File::open(&path) else {
-            return true;
-        };
-        for line in std::io::BufReader::new(file).lines() {
-            let Ok(line) = line else { return false }; // read error: cannot judge
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
-                return false; // unparsable line: cannot judge
-            };
-            match record["owner"].as_str() {
-                None => return false, // old-format line without owner: alive
-                Some(owner) => {
-                    if crate::session_store::owner_alive(owner) {
-                        return false; // owner still alive
-                    }
-                }
-            }
-        }
-        // No records, or every record's owner is dead.
-        true
     }
 }
 
@@ -1240,24 +1132,36 @@ mod tests {
         assert!(migrate_legacy(temp.path()).is_empty());
     }
 
+    fn take_unfinished_for_test(root: &Path, session: &str) -> Vec<String> {
+        let tasks = Session::peek_unfinished_background(root, session);
+        let labels = tasks
+            .iter()
+            .map(|t| format_unfinished(t.task_id, &t.label, t.subagent_session_id.as_deref()))
+            .collect();
+        if !tasks.is_empty() {
+            Session::consume_unfinished_background(root, session, &tasks).unwrap();
+        }
+        labels
+    }
+
     #[test]
     fn background_record_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
         // Nothing recorded: nothing to report.
-        assert!(Session::take_unfinished_background(temp.path(), "a").is_empty());
+        assert!(take_unfinished_for_test(temp.path(), "a").is_empty());
 
         Session::record_background_start(temp.path(), "a", 1, "sleep 100", None, None).unwrap();
         Session::record_background_start(temp.path(), "a", 2, "cargo build", None, None).unwrap();
         // Records are scoped per session: session b sees none of a's tasks.
-        assert!(Session::take_unfinished_background(temp.path(), "b").is_empty());
+        assert!(take_unfinished_for_test(temp.path(), "b").is_empty());
         // Task 1 completes while we are alive: only task 2 stays on record.
         Session::clear_background_task(temp.path(), "a", 1);
         assert_eq!(
-            Session::take_unfinished_background(temp.path(), "a"),
+            take_unfinished_for_test(temp.path(), "a"),
             vec!["task 2: cargo build".to_string()]
         );
         // take consumes the file: a second launch has nothing to report.
-        assert!(Session::take_unfinished_background(temp.path(), "a").is_empty());
+        assert!(take_unfinished_for_test(temp.path(), "a").is_empty());
         // Clearing the last recorded task removes the file entirely.
         Session::record_background_start(temp.path(), "a", 3, "x", None, None).unwrap();
         Session::clear_background_task(temp.path(), "a", 3);
@@ -1269,40 +1173,32 @@ mod tests {
         );
     }
 
-    /// Every recorded task line carries the recording process's identity
-    /// (`pid@hostname#nonce`), so a later launch can probe whether the
-    /// owner died with the task.
-    #[test]
-    fn background_record_carries_owner_identity() {
-        let temp = tempfile::tempdir().unwrap();
-        Session::record_background_start(temp.path(), "owner-test", 1, "sleep 100", None, None)
-            .unwrap();
-        let raw = std::fs::read_to_string(
-            temp.path()
-                .join(".e-agent/sessions/owner-test.background.jsonl"),
-        )
-        .unwrap();
-        let record: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
-        assert_eq!(
-            record["owner"].as_str(),
-            Some(crate::session_store::process_identity()),
-            "record must carry the recording process identity"
-        );
-        // The label/id round-trip is unchanged by the new field.
-        assert_eq!(record["id"].as_u64(), Some(1));
-        assert_eq!(record["label"].as_str(), Some("sleep 100"));
-        assert_eq!(
-            Session::take_unfinished_background(temp.path(), "owner-test"),
-            vec!["task 1: sleep 100".to_string()]
-        );
-    }
-
     /// `record_background_start` persists the FULL command (not just the
     /// truncated label) under `"full_command"`; `task_full_command` reads
-    /// it back by id. Consuming (`take_unfinished_background`) still
+    /// it back by id. Consuming (peek+consume) still
     /// returns only labels, so the "killed on exit" notice text is
     /// unchanged; the full command stays retrievable separately until the
     /// record is consumed.
+    #[test]
+    fn background_consume_old_observation_preserves_same_key_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = "jsonl-recovery-race";
+        Session::record_background_start(temp.path(), session, 7, "same label", None, None)
+            .unwrap();
+        let old = Session::peek_unfinished_background(temp.path(), session);
+        assert_eq!(old.len(), 1);
+
+        // A restart can re-record the same task key before the old peek is
+        // consumed. The raw line token must keep the replacement intact.
+        Session::record_background_start(temp.path(), session, 7, "same label", None, None)
+            .unwrap();
+        Session::consume_unfinished_background(temp.path(), session, &old).unwrap();
+        let replacement = Session::peek_unfinished_background(temp.path(), session);
+        assert_eq!(replacement.len(), 1);
+        Session::consume_unfinished_background(temp.path(), session, &replacement).unwrap();
+        assert!(Session::peek_unfinished_background(temp.path(), session).is_empty());
+    }
+
     #[test]
     fn background_record_persists_full_command() {
         let temp = tempfile::tempdir().unwrap();
@@ -1364,7 +1260,7 @@ mod tests {
 
         // The consumption path is unchanged: labels only.
         assert_eq!(
-            Session::take_unfinished_background(temp.path(), "cmd-store"),
+            take_unfinished_for_test(temp.path(), "cmd-store"),
             vec![
                 "task 1: cargo build …".to_string(),
                 "task 2: delegate work".to_string()
@@ -1375,116 +1271,6 @@ mod tests {
             Session::task_full_command(temp.path(), "cmd-store", 1),
             None
         );
-    }
-
-    /// `unfinished_owner_all_dead` is the server-attach probe: true only
-    /// when EVERY record was left by a definitely-dead process. Missing
-    /// file / no records → true (Consume is a no-op); a live owner, an
-    /// old-format line without an owner, or a malformed line → false
-    /// (conservative Preserve).
-    #[test]
-    fn unfinished_owner_all_dead_is_conservative() {
-        let temp = tempfile::tempdir().unwrap();
-
-        // No record file → nothing unfinished → all dead (vacuously).
-        assert!(Session::unfinished_owner_all_dead(
-            temp.path(),
-            "dead-probe"
-        ));
-
-        // Records written by THIS process (still alive) → not all dead.
-        Session::record_background_start(temp.path(), "dead-probe", 1, "sleep 100", None, None)
-            .unwrap();
-        assert!(!Session::unfinished_owner_all_dead(
-            temp.path(),
-            "dead-probe"
-        ));
-
-        // Rewrite the record with a definitely-dead owner → all dead.
-        // Both a known-host dead pid and the explicit legacy `unknown` host
-        // compatibility identity are accepted as definitely dead.
-        let path = temp
-            .path()
-            .join(".e-agent/sessions/dead-probe.background.jsonl");
-        let dead = "2000000000@unknown#deadbeef";
-        std::fs::write(
-            &path,
-            format!("{{\"id\":1,\"label\":\"sleep 100\",\"owner\":\"{dead}\"}}\n"),
-        )
-        .unwrap();
-        assert!(Session::unfinished_owner_all_dead(
-            temp.path(),
-            "dead-probe"
-        ));
-
-        // Mixed: one dead owner + one live owner → not all dead.
-        std::fs::write(
-            &path,
-            format!(
-                "{{\"id\":1,\"label\":\"a\",\"owner\":\"{dead}\"}}\n{{\"id\":2,\"label\":\"b\",\"owner\":\"{}\"}}\n",
-                crate::session_store::process_identity()
-            ),
-        )
-        .unwrap();
-        assert!(!Session::unfinished_owner_all_dead(
-            temp.path(),
-            "dead-probe"
-        ));
-
-        // A foreign hostname owner cannot be judged → alive → false.
-        let foreign = format!(
-            "{{\"id\":1,\"label\":\"x\",\"owner\":\"{}@elsewhere#n\"}}\n",
-            std::process::id()
-        );
-        std::fs::write(&path, foreign).unwrap();
-        assert!(!Session::unfinished_owner_all_dead(
-            temp.path(),
-            "dead-probe"
-        ));
-
-        // Old-format line WITHOUT an owner field → treated as alive.
-        std::fs::write(&path, "{\"id\":1,\"label\":\"old task\"}\n").unwrap();
-        assert!(!Session::unfinished_owner_all_dead(
-            temp.path(),
-            "dead-probe"
-        ));
-
-        // Malformed JSON line → cannot judge → false.
-        std::fs::write(&path, "not json\n").unwrap();
-        assert!(!Session::unfinished_owner_all_dead(
-            temp.path(),
-            "dead-probe"
-        ));
-
-        // Empty file (all lines consumed by a racing clear) → true.
-        std::fs::write(&path, "").unwrap();
-        assert!(Session::unfinished_owner_all_dead(
-            temp.path(),
-            "dead-probe"
-        ));
-    }
-
-    #[test]
-    fn jsonl_parent_claim_liveness_is_conservative() {
-        let temp = tempfile::tempdir().unwrap();
-        Session::record_background_start(temp.path(), "parent", 1, "delegate", None, Some("sub"))
-            .unwrap();
-        assert!(!Session::unfinished_owner_all_dead_for_subagent(
-            temp.path(),
-            "sub"
-        ));
-        let path = temp
-            .path()
-            .join(".e-agent/sessions/parent.background.jsonl");
-        std::fs::write(
-            &path,
-            "{\"id\":1,\"label\":\"delegate\",\"session_id\":\"sub\"}\n",
-        )
-        .unwrap();
-        assert!(!Session::unfinished_owner_all_dead_for_subagent(
-            temp.path(),
-            "sub"
-        ));
     }
 
     #[test]
@@ -1513,44 +1299,6 @@ mod tests {
         assert!(Session::consume_unfinished_background(temp.path(), "bad", &tasks).is_err());
         tasks[0].raw = Some("bad\099\0missing".into());
         assert!(Session::consume_unfinished_background(temp.path(), "bad", &tasks).is_err());
-    }
-    #[test]
-    fn jsonl_corrupt_parent_claim_blocks_owner_probe() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join(".e-agent/sessions");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("parent.background.jsonl"), "not-json\n").unwrap();
-        assert!(!Session::unfinished_owner_all_dead_for_subagent(
-            temp.path(),
-            "sub"
-        ));
-    }
-
-    #[test]
-    fn jsonl_later_file_token_failure_leaves_earlier_file_unchanged() {
-        let temp = tempfile::tempdir().unwrap();
-        Session::record_background_start(temp.path(), "parent-a", 1, "a", None, Some("sub"))
-            .unwrap();
-        Session::record_background_start(temp.path(), "parent-b", 2, "b", None, Some("sub"))
-            .unwrap();
-        let a_before = std::fs::read_to_string(
-            temp.path()
-                .join(".e-agent/sessions/parent-a.background.jsonl"),
-        )
-        .unwrap();
-        let mut tasks =
-            Session::peek_unfinished_background_for_subagent(temp.path(), "sub").unwrap();
-        tasks.sort_by_key(|task| task.session_id.clone());
-        tasks[1].raw = Some("parent-b\099\0changed".to_owned());
-        assert!(Session::consume_unfinished_background(temp.path(), "parent-a", &tasks).is_err());
-        assert_eq!(
-            std::fs::read_to_string(
-                temp.path()
-                    .join(".e-agent/sessions/parent-a.background.jsonl")
-            )
-            .unwrap(),
-            a_before
-        );
     }
 
     #[test]

@@ -45,12 +45,12 @@ CREATE TABLE IF NOT EXISTS session_entries (
 /// DDL for the background-task state table. Idempotent. One row per
 /// in-flight background task (bash or delegate), scoped to
 /// (workspace, session) like `session_entries`; `subagent_session_id`
-/// links delegate rows back to the subagent session they spawned, so a
-/// resumed subagent can find its own killed tasks by a global lookup.
+/// links delegate rows back to the subagent session they spawned for linkage
+/// and display.
 ///
 /// Rows are consumed (DELETE) on completion (`clear_task`) or on resume
-/// (`take_unfinished_tasks`), so a surviving row always means "the process
-/// died with this task running". Unlike `session_entries` this is a state
+/// (`take_unfinished_tasks`), so a surviving row is an unfinished/stale
+/// candidate. Unlike `session_entries` this is a state
 /// table, not a log: default (non-append) mode, because GreptimeDB forbids
 /// DELETE under `append_mode = 'true'` and last-write-wins per primary key
 /// is exactly the semantics a task registry wants (`task_id` is the
@@ -65,7 +65,6 @@ CREATE TABLE IF NOT EXISTS running_tasks (
     full_command STRING NULL,
     subagent_session_id STRING NULL,
     started_at TIMESTAMP(9) NOT NULL TIME INDEX,
-    owner_identity STRING NULL,
     PRIMARY KEY (workspace_id, session_id, task_id)
 ) WITH (
     sst_format = 'flat',
@@ -330,17 +329,6 @@ impl GreptimeSession {
             }
         }
 
-        // Same probe-then-ALTER migration for the `owner` column of the
-        // `running_tasks` table (the process identity of the process that
-        // started each background task, added after the table shipped).
-        // Pre-existing databases need the ALTER; fresh databases already
-        // have the column via CREATE_TABLE_RUNNING_TASKS above. Old rows
-        // read the column back as NULL, which the liveness probe treats
-        // as "alive" (conservative). A failed ALTER does NOT block the
-        // connection: the feature degrades — `unfinished_owner_all_dead`
-        // and `record_task_start` fail loudly with context, transcript
-        // operations are unaffected (same philosophy as the sessions
-        // migration above).
         {
             let task_columns: Vec<String> = client
                 .query(
@@ -353,23 +341,7 @@ impl GreptimeSession {
                 .iter()
                 .map(|row| row.get("column_name"))
                 .collect();
-            if !task_columns.iter().any(|c| c == "owner_identity") {
-                match client
-                    .execute(
-                        "ALTER TABLE running_tasks ADD COLUMN owner_identity STRING NULL",
-                        &[],
-                    )
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            "e-agent: cannot add running_tasks.owner_identity column \
-                             (background-task owner liveness unavailable): {error:#}"
-                        );
-                    }
-                }
-            }
+
             // Same probe-then-ALTER for the `full_command` column (the
             // full untruncated bash command, added after the table shipped
             // so the UI can show it after a restart). Pre-existing
@@ -379,7 +351,7 @@ impl GreptimeSession {
             // as `None`. A failed ALTER does NOT block the connection: the
             // feature degrades — `record_task_start` fails loudly on the
             // missing column, transcript operations are unaffected (same
-            // philosophy as the owner_identity migration above).
+            // same migration philosophy).
             if !task_columns.iter().any(|c| c == "full_command") {
                 match client
                     .execute(
@@ -2350,8 +2322,8 @@ impl GreptimeSession {
     // That is why every method takes the session id explicitly instead of
     // reusing the bound `self.session_id`.
 
-    /// Record a freshly started background task so a later launch can tell
-    /// the user what died with the previous process.
+    /// Record a freshly started background task for later unfinished-task
+    /// recovery;
     ///
     /// `full_command` 是完整命令原文（bash 任务传 `Some`，delegate 无命令传
     /// `None`），持久化到 `running_tasks.full_command`，供 `/api/tasks`
@@ -2370,8 +2342,8 @@ impl GreptimeSession {
         self.client
             .execute(
                 "INSERT INTO running_tasks \
-                 (workspace_id, session_id, task_id, label, full_command, subagent_session_id, started_at, owner_identity) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 (workspace_id, session_id, task_id, label, full_command, subagent_session_id, started_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 &[
                     &self.workspace_id,
                     &session_id,
@@ -2380,7 +2352,6 @@ impl GreptimeSession {
                     &full_command,
                     &subagent_session_id,
                     &started_at,
-                    &crate::session_store::process_identity(),
                 ],
             )
             .await
@@ -2429,25 +2400,22 @@ impl GreptimeSession {
         Ok(rows[0].get("full_command"))
     }
 
-    /// Tasks recorded by a previous process that died before their
-    /// completion arrived. Consumes (deletes) all rows for the session and
-    /// returns the labels so the caller can inject the "killed on exit"
-    /// notice. Rows scoped to another session are untouched.
+    /// Surviving unfinished/stale task candidates. Consumes (deletes) all
+    /// rows for the session and returns labels for the recovery notice.
+    /// Rows scoped to another session are untouched.
     pub(crate) async fn peek_unfinished_tasks(
         &self,
         session_id: &str,
     ) -> Result<Vec<crate::session::UnfinishedTask>> {
-        let rows = self.client.query("SELECT task_id, label, subagent_session_id, started_at, owner_identity FROM running_tasks WHERE workspace_id = $1 AND session_id = $2", &[&self.workspace_id, &session_id]).await.context("cannot load unfinished background tasks")?;
+        let rows = self.client.query("SELECT task_id, label, subagent_session_id, started_at FROM running_tasks WHERE workspace_id = $1 AND session_id = $2", &[&self.workspace_id, &session_id]).await.context("cannot load unfinished background tasks")?;
         Ok(rows
             .iter()
             .map(|row| crate::session::UnfinishedTask {
                 task_id: row.get::<_, i64>("task_id").max(0) as u64,
                 label: row.get("label"),
                 subagent_session_id: row.get("subagent_session_id"),
-                session_id: Some(session_id.to_owned()),
                 started_at: Some(crate::session_store::datetime_to_us(row.get("started_at"))),
                 raw: None,
-                owner_identity: row.get("owner_identity"),
             })
             .collect())
     }
@@ -2458,30 +2426,53 @@ impl GreptimeSession {
         tasks: &[crate::session::UnfinishedTask],
     ) -> Result<(), String> {
         for task in tasks {
-            let changed = if let Some(subagent) = task.subagent_session_id.as_deref() {
-                self.client.execute("DELETE FROM running_tasks WHERE workspace_id = $1 AND session_id = $2 AND task_id = $3 AND label = $4 AND subagent_session_id = $5 AND started_at = $6", &[&self.workspace_id, &session_id, &(task.task_id as i64), &task.label, &subagent, &crate::session_store::us_to_datetime(task.started_at.unwrap_or_default())]).await
-            } else {
-                self.client.execute("DELETE FROM running_tasks WHERE workspace_id = $1 AND session_id = $2 AND task_id = $3 AND label = $4 AND subagent_session_id IS NULL AND started_at = $5", &[&self.workspace_id, &session_id, &(task.task_id as i64), &task.label, &crate::session_store::us_to_datetime(task.started_at.unwrap_or_default())]).await
-            }.map_err(|e| format!("cannot clear unfinished background tasks: {e}"))?;
+            let started_at = crate::session_store::us_to_datetime(
+                task.started_at
+                    .ok_or("unfinished task missing started_at")?,
+            );
+            let changed = match task.subagent_session_id.as_deref() {
+                Some(subagent_session_id) => {
+                    let subagent_session_id = subagent_session_id.to_owned();
+                    self.client
+                        .execute(
+                            "DELETE FROM running_tasks \
+                             WHERE workspace_id = $1 AND session_id = $2 AND task_id = $3 \
+                             AND label = $4 \
+                             AND subagent_session_id = $5 \
+                             AND started_at = $6",
+                            &[
+                                &self.workspace_id,
+                                &session_id,
+                                &(task.task_id as i64),
+                                &task.label,
+                                &subagent_session_id,
+                                &started_at,
+                            ],
+                        )
+                        .await
+                }
+                None => {
+                    self.client
+                        .execute(
+                            "DELETE FROM running_tasks \
+                             WHERE workspace_id = $1 AND session_id = $2 AND task_id = $3 \
+                             AND label = $4 \
+                             AND subagent_session_id IS NULL \
+                             AND started_at = $5",
+                            &[
+                                &self.workspace_id,
+                                &session_id,
+                                &(task.task_id as i64),
+                                &task.label,
+                                &started_at,
+                            ],
+                        )
+                        .await
+                }
+            }
+            .map_err(|e| format!("cannot clear unfinished background tasks: {e}"))?;
             if changed == 0 {
                 return Err("unfinished background task consume matched no row".into());
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn consume_unfinished_tasks_for_subagent(
-        &self,
-        id: &str,
-        tasks: &[crate::session::UnfinishedTask],
-    ) -> Result<(), String> {
-        for task in tasks {
-            let Some(parent_session_id) = task.session_id.as_deref() else {
-                continue;
-            };
-            let changed = self.client.execute("DELETE FROM running_tasks WHERE workspace_id = $1 AND session_id = $2 AND subagent_session_id = $3 AND task_id = $4 AND label = $5 AND started_at = $6", &[&self.workspace_id, &parent_session_id, &id, &(task.task_id as i64), &task.label, &crate::session_store::us_to_datetime(task.started_at.unwrap_or_default())]).await.map_err(|e| format!("cannot clear unfinished subagent tasks: {e}"))?;
-            if changed == 0 {
-                return Err("unfinished subagent task consume matched no row".into());
             }
         }
         Ok(())
@@ -2506,93 +2497,6 @@ impl GreptimeSession {
                 .map_err(anyhow::Error::msg)?;
         }
         Ok(labels)
-    }
-
-    #[cfg(test)]
-    pub async fn take_unfinished_tasks_for_subagent(&self, id: &str) -> Result<Vec<String>> {
-        let tasks = self.peek_unfinished_tasks_for_subagent(id).await?;
-        let labels = tasks
-            .iter()
-            .map(|task| crate::session::format_unfinished(task.task_id, &task.label, None))
-            .collect();
-        if !tasks.is_empty() {
-            self.consume_unfinished_tasks_for_subagent(id, &tasks)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        }
-        Ok(labels)
-    }
-
-    /// True when every unfinished-task row for `session_id` was recorded
-    /// by a now-dead process (the server-attach probe that decides between
-    /// `Consume` — inject the "killed with the process" notice — and
-    /// `Preserve` — leave the records for a possibly-live owning process).
-    ///
-    /// Conservative: any uncertainty reports false — a NULL `owner` (an
-    /// old row written before the column shipped) counts as alive, as does
-    /// a live owner or an unjudgeable identity (see
-    /// [`crate::session_store::owner_alive`]). No rows → true (nothing to
-    /// consume; the Consume path is a no-op).
-    pub async fn unfinished_owner_all_dead(&self, session_id: &str) -> Result<bool> {
-        let rows = self
-            .client
-            .query(
-                "SELECT owner_identity FROM running_tasks \
-                 WHERE workspace_id = $1 AND session_id = $2",
-                &[&self.workspace_id, &session_id],
-            )
-            .await
-            .context("cannot load unfinished background task owners")?;
-        for row in rows.iter() {
-            let owner: Option<String> = row.get("owner_identity");
-            match owner {
-                None => return Ok(false), // old row without owner: alive
-                Some(owner) => {
-                    if crate::session_store::owner_alive(&owner) {
-                        return Ok(false); // owner still alive
-                    }
-                }
-            }
-        }
-        // No rows, or every row's owner is dead.
-        Ok(true)
-    }
-
-    pub(crate) async fn unfinished_owner_all_dead_for_subagent(&self, id: &str) -> Result<bool> {
-        let rows = self.client.query("SELECT owner_identity FROM running_tasks WHERE workspace_id = $1 AND subagent_session_id = $2", &[&self.workspace_id, &id]).await.context("cannot load unfinished subagent task owners")?;
-        for row in rows {
-            let owner: Option<String> = row.get("owner_identity");
-            match owner {
-                Some(owner) if !crate::session_store::owner_alive(&owner) => {}
-                _ => return Ok(false),
-            }
-        }
-        Ok(true)
-    }
-
-    /// Same as [`Self::take_unfinished_tasks`] but keyed by
-    /// `subagent_session_id`: the rows a killed parent left for one of its
-    /// background delegate subagents. The table is global (unlike JSONL
-    /// per-session files), so a resumed subagent can look up its own
-    /// leftovers from any parent session. The subagent session id is
-    /// implied by the lookup, so labels carry no `(session: …)` suffix.
-    pub(crate) async fn peek_unfinished_tasks_for_subagent(
-        &self,
-        subagent_session_id: &str,
-    ) -> Result<Vec<crate::session::UnfinishedTask>> {
-        let rows = self.client.query("SELECT task_id, label, session_id, started_at, owner_identity FROM running_tasks WHERE workspace_id = $1 AND subagent_session_id = $2", &[&self.workspace_id, &subagent_session_id]).await.context("cannot load unfinished subagent tasks")?;
-        Ok(rows
-            .iter()
-            .map(|row| crate::session::UnfinishedTask {
-                task_id: row.get::<_, i64>("task_id").max(0) as u64,
-                label: row.get("label"),
-                subagent_session_id: Some(subagent_session_id.to_owned()),
-                session_id: Some(row.get("session_id")),
-                started_at: Some(crate::session_store::datetime_to_us(row.get("started_at"))),
-                raw: None,
-                owner_identity: row.get("owner_identity"),
-            })
-            .collect())
     }
 
     /// The task-panel label for a subagent session: the label of the newest
@@ -5135,9 +5039,13 @@ mod tests {
         );
 
         session
-            .record_task_start(&sid, 1, "sleep 100", None, None)
+            .record_task_start(&sid, 1, "sleep 100", Some("sleep 100"), None)
             .await
             .unwrap();
+        assert_eq!(
+            session.task_full_command(&sid, 1).await.unwrap().as_deref(),
+            Some("sleep 100")
+        );
         session
             .record_task_start(&sid, 2, "cargo build", None, Some("sub-probe"))
             .await
@@ -5182,208 +5090,219 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_tasks_subagent_lookup_crosses_parent_sessions() {
+    async fn running_tasks_consume_matches_application_precision_and_replacement() {
         let conn = conn_str();
         if conn == "skipped" {
             eprintln!("skipping: GREPTIME_PG not set");
             return;
         }
         let wid = workspace_id();
-        let subagent = format!("sub-rt-{}", crate::session::new_id());
-        let session = GreptimeSession::connect(&conn, &wid, &subagent)
-            .await
-            .unwrap();
-
-        // Two different parent sessions each left a delegate row for the
-        // same subagent session id.
-        let parent_a = format!("parent-a-{}", crate::session::new_id());
-        let parent_b = format!("parent-b-{}", crate::session::new_id());
+        let child = format!("test-gt-rt-child-{}", crate::session::new_id());
+        let parent = format!("test-gt-rt-parent-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &child).await.unwrap();
+        let task_id = 901i64;
+        let started_at = us_to_datetime(next_event_time_us());
+        // The exact token covers rows emitted by the application's
+        // microsecond clock; external sub-microsecond manual rows are
+        // outside that application contract.
+        // A peek token must not consume a replacement with the same primary
+        // key; started_at is the observed-row generation comparison.
+        let race_session = format!("test-gt-rt-race-{}", crate::session::new_id());
         session
-            .record_task_start(&parent_a, 10, "probe a", None, Some(&subagent))
+            .record_task_start(&race_session, 900, "old race", None, None)
             .await
             .unwrap();
-        session
-            .record_task_start(&parent_b, 11, "probe b", None, Some(&subagent))
-            .await
-            .unwrap();
-
-        // The subagent's own session id sees no direct rows...
-        assert!(
-            session
-                .take_unfinished_tasks(&subagent)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        // ...but the subagent-scoped lookup finds both leftover delegates.
-        let labels = session
-            .take_unfinished_tasks_for_subagent(&subagent)
-            .await
-            .unwrap();
-        assert_eq!(labels.len(), 2);
-        assert!(labels.contains(&"task 10: probe a".to_string()));
-        assert!(labels.contains(&"task 11: probe b".to_string())); // Consumed: a second lookup finds nothing.
-        assert!(
-            session
-                .take_unfinished_tasks_for_subagent(&subagent)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        // The parents' own take sees nothing either (rows are gone).
-        assert!(
-            session
-                .take_unfinished_tasks(&parent_a)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            session
-                .take_unfinished_tasks(&parent_b)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    /// The `owner` column (process identity of the recording process) and
-    /// `unfinished_owner_all_dead` (the server-attach probe): true only
-    /// when EVERY surviving row was left by a definitely-dead process;
-    /// NULL owner (old row) / live owner → false. Mirrors the SQLite
-    /// backend test; requires a live GREPTIME_PG, otherwise skipped.
-    #[tokio::test]
-    async fn running_tasks_owner_column_liveness_probe() {
-        let conn = conn_str();
-        if conn == "skipped" {
-            eprintln!("skipping: GREPTIME_PG not set");
-            return;
-        }
-        let wid = workspace_id();
-        let sid = format!("test-gt-owner-{}", crate::session::new_id());
-        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
-
-        // No rows → all dead (vacuously: Consume would take nothing).
-        assert!(
-            session
-                .unfinished_owner_all_dead(&sid)
-                .await
-                .expect("probe on empty table")
-        );
-
-        // A row recorded by THIS process (still alive) → not all dead,
-        // and the owner column holds our process identity.
-        session
-            .record_task_start(&sid, 1, "sleep 100", None, None)
-            .await
-            .unwrap();
-        assert!(
-            !session
-                .unfinished_owner_all_dead(&sid)
-                .await
-                .expect("probe with live owner"),
-            "a live owner must keep the probe conservative (false)"
-        );
-        let owners: Vec<Option<String>> = session
-            .client
-            .query(
-                "SELECT owner_identity FROM running_tasks \
-                 WHERE workspace_id = $1 AND session_id = $2",
-                &[&wid, &sid],
-            )
-            .await
-            .expect("read owner column")
-            .iter()
-            .map(|row| row.get("owner_identity"))
-            .collect();
-        assert_eq!(
-            owners,
-            vec![Some(crate::session_store::process_identity().to_owned())],
-            "record must carry the recording process identity"
-        );
-
-        // Rewrite the owner to a definitely-dead pid → all rows dead →
-        // true. A known-host dead pid is probed; a valid legacy `unknown`
-        // identity is explicitly treated as dead.
-        match probeable_hostname() {
-            Some(hostname) => {
-                session
-                    .client
-                    .execute(
-                        "UPDATE running_tasks SET owner_identity = $1 \
-                         WHERE workspace_id = $2 AND session_id = $3",
-                        &[&format!("2000000000@{hostname}#deadbeef"), &wid, &sid],
-                    )
-                    .await
-                    .expect("rewrite owner to dead pid");
-                assert!(
-                    session
-                        .unfinished_owner_all_dead(&sid)
-                        .await
-                        .expect("probe with dead owner")
-                );
-            }
-            None => {
-                session
-                    .client
-                    .execute(
-                        "UPDATE running_tasks SET owner_identity = $1 \
-                         WHERE workspace_id = $2 AND session_id = $3",
-                        &[&"2000000000@unknown#deadbeef", &wid, &sid],
-                    )
-                    .await
-                    .expect("rewrite owner to legacy unknown pid");
-                assert!(
-                    session
-                        .unfinished_owner_all_dead(&sid)
-                        .await
-                        .expect("probe with legacy unknown owner")
-                );
-            }
-        }
-
-        // NULL owner (a row written before the column shipped) → alive.
+        let old_race = session.peek_unfinished_tasks(&race_session).await.unwrap();
+        assert_eq!(old_race.len(), 1);
+        let replacement_started_at = us_to_datetime(
+            old_race[0]
+                .started_at
+                .expect("Greptime peek includes started_at"),
+        )
+        .checked_add_signed(chrono::TimeDelta::seconds(1))
+        .expect("replacement timestamp is in range");
+        let replacement_label = "old race";
+        let replacement_command: Option<&str> = None;
+        let replacement_subagent: Option<&str> = None;
         session
             .client
             .execute(
-                "UPDATE running_tasks SET owner_identity = NULL \
-                 WHERE workspace_id = $1 AND session_id = $2",
-                &[&wid, &sid],
+                "INSERT INTO running_tasks \
+                 (workspace_id, session_id, task_id, label, full_command, \
+                  subagent_session_id, started_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &wid,
+                    &race_session,
+                    &900i64,
+                    &replacement_label,
+                    &replacement_command,
+                    &replacement_subagent,
+                    &replacement_started_at,
+                ],
             )
             .await
-            .expect("null out owner");
-        assert!(
-            !session
-                .unfinished_owner_all_dead(&sid)
-                .await
-                .expect("probe with NULL owner"),
-            "a NULL owner (old row) must be treated as alive"
+            .unwrap();
+        let replacement = session
+            .client
+            .query_opt(
+                "SELECT label, full_command, subagent_session_id, started_at, \
+                        task_id FROM running_tasks \
+                 WHERE workspace_id = $1 AND session_id = $2 AND task_id = $3 \
+                 ORDER BY started_at DESC LIMIT 1",
+                &[&wid, &race_session, &900i64],
+            )
+            .await
+            .unwrap()
+            .expect("replacement row is visible before consume");
+        assert_eq!(replacement.get::<_, String>("label"), replacement_label);
+        assert_eq!(
+            replacement
+                .get::<_, Option<String>>("full_command")
+                .as_deref(),
+            replacement_command
+        );
+        assert_eq!(
+            replacement
+                .get::<_, Option<String>>("subagent_session_id")
+                .as_deref(),
+            replacement_subagent
+        );
+        assert_eq!(
+            replacement.get::<_, chrono::NaiveDateTime>("started_at"),
+            replacement_started_at
+        );
+        session
+            .consume_unfinished_tasks(&race_session, &old_race)
+            .await
+            .unwrap();
+        let replacement = session
+            .client
+            .query_opt(
+                "SELECT label, started_at FROM running_tasks \
+                 WHERE workspace_id = $1 AND session_id = $2 AND task_id = $3 \
+                 ORDER BY started_at DESC LIMIT 1",
+                &[&wid, &race_session, &900i64],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.get::<_, String>("label"), replacement_label);
+        assert_eq!(
+            replacement.get::<_, chrono::NaiveDateTime>("started_at"),
+            replacement_started_at
         );
 
-        // Consuming the rows still works unchanged (take → empty table →
-        // all dead again).
-        assert_eq!(session.take_unfinished_tasks(&sid).await.unwrap().len(), 1);
+        let own_label = "own task";
+        let no_command: Option<&str> = None;
+        let no_subagent: Option<&str> = None;
+        session
+            .client
+            .execute(
+                "INSERT INTO running_tasks \
+                 (workspace_id, session_id, task_id, label, full_command, subagent_session_id, started_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &wid,
+                    &child,
+                    &task_id,
+                    &own_label,
+                    &no_command,
+                    &no_subagent,
+                    &started_at,
+                ],
+            )
+            .await
+            .unwrap();
+
+        // This inbound delegate row has the same task id but a different
+        // recording session, so consuming the child's exact primary key must
+        // leave it untouched.
+        let parent_started_at = started_at
+            .checked_add_signed(chrono::TimeDelta::microseconds(1))
+            .unwrap();
+        let parent_label = "inbound task";
+        let child_subagent = Some(child.as_str());
+        session
+            .client
+            .execute(
+                "INSERT INTO running_tasks \
+                 (workspace_id, session_id, task_id, label, full_command, subagent_session_id, started_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &wid,
+                    &parent,
+                    &task_id,
+                    &parent_label,
+                    &no_command,
+                    &child_subagent,
+                    &parent_started_at,
+                ],
+            )
+            .await
+            .unwrap();
+
+        let tasks = session.peek_unfinished_tasks(&child).await.unwrap();
+        assert_eq!(tasks.len(), 1, "peek returns only the child's own row");
+        assert_eq!(tasks[0].task_id, task_id as u64);
+        assert_eq!(tasks[0].label, own_label);
+        session
+            .consume_unfinished_tasks(&child, &tasks)
+            .await
+            .unwrap();
+
+        let own = session
+            .client
+            .query_opt(
+                "SELECT task_id FROM running_tasks \
+                 WHERE workspace_id = $1 AND session_id = $2 AND task_id = $3",
+                &[&wid, &child, &task_id],
+            )
+            .await
+            .unwrap();
+        assert!(own.is_none(), "the exact own primary-key row is gone");
+
+        // Exercise the typed Some(subagent_session_id) consume branch too.
+        session
+            .record_task_start(&child, 902, "linked task", None, Some(&parent))
+            .await
+            .unwrap();
+        let linked = session.peek_unfinished_tasks(&child).await.unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(
+            linked[0].subagent_session_id.as_deref(),
+            Some(parent.as_str())
+        );
+        session
+            .consume_unfinished_tasks(&child, &linked)
+            .await
+            .unwrap();
         assert!(
             session
-                .unfinished_owner_all_dead(&sid)
+                .peek_unfinished_tasks(&child)
                 .await
-                .expect("probe after consume")
+                .unwrap()
+                .is_empty()
         );
-    }
 
-    /// The current hostname exactly as `process_identity` computes it, for
-    /// hand-built owner identities in tests.
-    fn hostname_now() -> String {
-        std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "unknown".to_owned())
-    }
-
-    /// The currently resolved hostname, when it is known, for hand-built
-    /// owner identities that exercise the process probe path.
-    fn probeable_hostname() -> Option<String> {
-        let host = hostname_now();
-        (host != "unknown").then_some(host)
+        let inbound = session
+            .client
+            .query_opt(
+                "SELECT task_id, subagent_session_id FROM running_tasks \
+                 WHERE workspace_id = $1 AND session_id = $2 AND task_id = $3",
+                &[&wid, &parent, &task_id],
+            )
+            .await
+            .unwrap()
+            .expect("distinct inbound parent row remains");
+        let inbound_task_id: i64 = inbound.get("task_id");
+        assert_eq!(inbound_task_id, task_id);
+        assert_eq!(
+            inbound
+                .get::<_, Option<String>>("subagent_session_id")
+                .as_deref(),
+            Some(child.as_str())
+        );
     }
 
     #[tokio::test]
@@ -5428,11 +5347,9 @@ mod tests {
         let other = format!("other-label-{}", crate::session::new_id());
         assert_eq!(session.label_for_subagent(&other).await.unwrap(), None);
 
-        // Consuming the rows (task completion/resume) removes the label.
-        session
-            .take_unfinished_tasks_for_subagent(&subagent)
-            .await
-            .unwrap();
+        // Completing the delegate rows removes the display label.
+        session.clear_task(&parent, 20).await.unwrap();
+        session.clear_task(&parent, 21).await.unwrap();
         assert_eq!(session.label_for_subagent(&subagent).await.unwrap(), None);
     }
 

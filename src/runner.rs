@@ -456,18 +456,8 @@ enum PendingCommand {
     Goal(GoalCommand),
 }
 
-pub enum RecoveryScope {
-    Session,
-    Subagent,
-}
-
-pub(crate) struct RecoveryBatch {
-    pub(crate) scope: RecoveryScope,
-    pub(crate) tasks: Vec<crate::session::UnfinishedTask>,
-}
-
 pub(crate) struct SessionBootstrap {
-    pub(crate) recovery_batches: Vec<RecoveryBatch>,
+    pub(crate) recovery_tasks: Vec<crate::session::UnfinishedTask>,
     pub(crate) legacy: bool,
     pub(crate) initial_entries: Vec<SessionEntry>,
 }
@@ -570,12 +560,9 @@ impl SessionRunner {
         for entry in bootstrap.initial_entries {
             self.commit(entry).await?;
         }
-        if !bootstrap.recovery_batches.is_empty() {
-            let tasks: Vec<&crate::session::UnfinishedTask> = bootstrap
-                .recovery_batches
-                .iter()
-                .flat_map(|batch| batch.tasks.iter())
-                .collect();
+        if !bootstrap.recovery_tasks.is_empty() {
+            let tasks: Vec<&crate::session::UnfinishedTask> =
+                bootstrap.recovery_tasks.iter().collect();
             let text = format!(
                 "[e-agent exited with {} background task(s) still running; they were killed with the process. Re-run them if still needed:]\n{}",
                 tasks.len(),
@@ -590,24 +577,9 @@ impl SessionRunner {
                     .join("\n")
             );
             self.commit(SessionEntry::Notice { text }).await?;
-            for batch in &bootstrap.recovery_batches {
-                match batch.scope {
-                    RecoveryScope::Session => {
-                        self.store
-                            .consume_unfinished_background(&self.root, &self.session, &batch.tasks)
-                            .await?
-                    }
-                    RecoveryScope::Subagent => {
-                        self.store
-                            .consume_unfinished_background_for_subagent(
-                                &self.root,
-                                &self.session,
-                                &batch.tasks,
-                            )
-                            .await?
-                    }
-                }
-            }
+            self.store
+                .consume_unfinished_background(&self.root, &self.session, &bootstrap.recovery_tasks)
+                .await?;
         }
         Ok(())
     }

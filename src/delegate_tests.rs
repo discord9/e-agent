@@ -78,6 +78,7 @@ fn registry_tracks_live_sessions() {
         session_id: "sub-test".into(),
         context_window: None,
         store: SessionStore::Jsonl,
+        local_permit: None,
     });
     sessions.insert(1, entry.clone());
     assert!(sessions.get(1).is_some());
@@ -222,6 +223,7 @@ fn probe_entry(handle: SessionHandle) -> Arc<SessionEntry> {
         session_id: "sub-probe".into(),
         context_window: None,
         store: SessionStore::Jsonl,
+        local_permit: None,
     })
 }
 
@@ -307,7 +309,7 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
     tokio::task::yield_now().await;
     assert!(background.running().is_empty());
     assert!(sessions.sessions.lock().unwrap().is_empty());
-    assert!(crate::session::Session::take_unfinished_background(&root, "parent").is_empty());
+    assert!(crate::session::Session::peek_unfinished_background(&root, "parent").is_empty());
     assert_eq!(work_runs.load(Ordering::SeqCst), 0);
     assert_eq!(signals.side_effects.load(Ordering::SeqCst), 0);
     assert!(matches!(
@@ -372,7 +374,7 @@ async fn background_cancel_before_first_yield_cleans_everything() {
     tokio::task::yield_now().await;
     assert!(background.running().is_empty());
     assert!(sessions.sessions.lock().unwrap().is_empty());
-    assert!(crate::session::Session::take_unfinished_background(temp.path(), "parent").is_empty());
+    assert!(crate::session::Session::peek_unfinished_background(temp.path(), "parent").is_empty());
     assert_eq!(signals.side_effects.load(Ordering::SeqCst), 0);
     assert!(matches!(
         completions.try_recv(),
@@ -437,7 +439,7 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
     tokio::task::yield_now().await;
     assert!(background.running().is_empty());
     assert!(sessions.sessions.lock().unwrap().is_empty());
-    assert!(crate::session::Session::take_unfinished_background(temp.path(), "parent").is_empty());
+    assert!(crate::session::Session::peek_unfinished_background(temp.path(), "parent").is_empty());
     assert_eq!(signals.side_effects.load(Ordering::SeqCst), 0);
     assert!(matches!(
         completions.try_recv(),
@@ -874,6 +876,16 @@ async fn resume_rejects_a_still_running_subagent_session() {
     tool.set_event_sender(sender);
     // Register the live handle exactly like a running spawn would
     // (`sessions.insert(id, entry)` in the spawn hooks).
+    let registry = crate::session_factory::LocalSessionRegistry::default();
+    let permit = registry
+        .reserve(crate::session_factory::LocalSessionRegistry::key(
+            temp.path(),
+            &root,
+            &SessionBackend::Jsonl,
+            "sub-still-running",
+        ))
+        .unwrap();
+    tool = tool.with_local_sessions(registry);
     let (handle, _emitter, _commands) = crate::runner::session_test_channel();
     tool.sessions.insert(
         7,
@@ -885,6 +897,7 @@ async fn resume_rejects_a_still_running_subagent_session() {
             session_id: "sub-still-running".into(),
             context_window: None,
             store: SessionStore::Jsonl,
+            local_permit: Some(permit),
         }),
     );
 
@@ -896,10 +909,7 @@ async fn resume_rejects_a_still_running_subagent_session() {
         }))
         .await
         .unwrap_err();
-    assert!(
-        error.contains("still running as a live subagent"),
-        "{error}"
-    );
+    assert!(error.contains("already live locally"), "{error}");
 
     // Without the live handle the same id resumes normally: the guard
     // passes and the subagent continues on the loaded transcript.
@@ -924,21 +934,16 @@ async fn resume_rejects_a_still_running_subagent_session() {
 }
 
 #[tokio::test]
-async fn resume_denial_reports_blocking_owner_scopes_and_reasons() {
+async fn resume_recovers_own_rows_and_ignores_inbound_parent_rows() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("sessions");
     let id = "sub-owner-diagnostic";
-    const LABEL_SENTINEL: &str = "task-label-secret-sentinel";
-    const COMMAND_SENTINEL: &str = "command-secret-sentinel";
-    const TRANSCRIPT_SENTINEL: &str = "transcript-secret-sentinel";
-    const CREDENTIAL_SENTINEL: &str = "credential-secret-sentinel";
-    const PATH_SENTINEL: &str = "/private/path-secret-sentinel";
     crate::session::Session::append(
         &root,
         id,
         &[crate::agent::SessionEntry::from(
             crate::agent::Message::User {
-                content: format!("{TRANSCRIPT_SENTINEL} {CREDENTIAL_SENTINEL} {PATH_SENTINEL}"),
+                content: "earlier task".into(),
                 images: vec![],
             },
         )],
@@ -948,8 +953,8 @@ async fn resume_denial_reports_blocking_owner_scopes_and_reasons() {
         &root,
         id,
         1,
-        LABEL_SENTINEL,
-        Some(COMMAND_SENTINEL),
+        "own stale task",
+        Some("own command"),
         None,
     )
     .unwrap();
@@ -957,65 +962,44 @@ async fn resume_denial_reports_blocking_owner_scopes_and_reasons() {
         &root,
         "parent-owner-diagnostic",
         2,
-        "parent label is not reported",
+        "inbound parent task",
         None,
         Some(id),
     )
     .unwrap();
-    let own_path = root
-        .join(".e-agent/sessions")
-        .join(format!("{id}.background.jsonl"));
     let parent_path = root
         .join(".e-agent/sessions")
         .join("parent-owner-diagnostic.background.jsonl");
     std::fs::write(
-        own_path,
+        &parent_path,
         format!(
-            "{{\"id\":1,\"label\":\"private\",\"owner\":\"{}\"}}\n",
-            crate::session_store::process_identity()
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        parent_path,
-        format!(
-            "{{\"id\":2,\"label\":\"private\",\"owner\":\"{}@foreign-host#nonce\",\"session_id\":\"{id}\"}}\n",
+            "{{\"id\":2,\"label\":\"inbound parent task\",\"owner\":\"{}@foreign-host#nonce\",\"session_id\":\"{id}\"}}\n",
             std::process::id()
         ),
     )
     .unwrap();
 
-    let mut tool = delegate_with_url(temp.path(), "http://localhost".into()).persist_sessions(root);
+    let mut tool = delegate_with_url(temp.path(), successful_model("finished answer").await)
+        .persist_sessions(root);
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     tool.set_event_sender(sender);
-    let error = tool
+    let answer = tool
         .execute(json!({
             "task": "follow-up",
             "resume": id,
             "workspace": temp.path().to_str().unwrap()
         }))
         .await
-        .unwrap_err();
+        .unwrap()
+        .content;
     assert!(
-        error.contains("own: blocked (owner 1: PID alive)"),
-        "{error}"
+        answer.contains("subagent session: sub-owner-diagnostic"),
+        "{answer}"
     );
     assert!(
-        error.contains("delegate: blocked (owner 1: foreign hostname)"),
-        "{error}"
+        parent_path.exists(),
+        "inbound parent row was consumed by child resume"
     );
-    for sentinel in [
-        LABEL_SENTINEL,
-        COMMAND_SENTINEL,
-        TRANSCRIPT_SENTINEL,
-        CREDENTIAL_SENTINEL,
-        PATH_SENTINEL,
-    ] {
-        assert!(
-            !error.contains(sentinel),
-            "diagnostic leaked {sentinel}: {error}"
-        );
-    }
 }
 
 #[test]
@@ -2036,6 +2020,7 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
                 session: "web-main".into(),
                 store: crate::session_store::SessionStore::Jsonl,
             }),
+            local_sessions: crate::session_factory::LocalSessionRegistry::default(),
         },
     )
     .await
@@ -2132,7 +2117,7 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
     // killed-on-exit record).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        if crate::session::Session::take_unfinished_background(&root, "web-main").is_empty() {
+        if crate::session::Session::peek_unfinished_background(&root, "web-main").is_empty() {
             break;
         }
         assert!(
@@ -2292,11 +2277,11 @@ async fn background_delegate_cancel_aborts_child_before_wrapper_completion() {
     assert!(background.running().is_empty());
     assert!(sessions.sessions.lock().unwrap().is_empty());
     assert!(
-        Session::take_unfinished_background(&root, &session_id).is_empty(),
+        Session::peek_unfinished_background(&root, &session_id).is_empty(),
         "owned bash record must be cleared"
     );
     assert!(
-        Session::take_unfinished_background(&root, "parent").is_empty(),
+        Session::peek_unfinished_background(&root, "parent").is_empty(),
         "parent delegate record must be cleared"
     );
     assert!(
@@ -2369,7 +2354,7 @@ async fn background_delegate_with_detached_daemon_finalizes_and_reaps_daemon() {
     // Cleanup ran: the subagent's Sessions entry and all owned tasks are gone.
     assert!(sessions.sessions.lock().unwrap().is_empty());
     assert!(
-        crate::session::Session::take_unfinished_background(&root, "parent").is_empty(),
+        crate::session::Session::peek_unfinished_background(&root, "parent").is_empty(),
         "the finished delegate must clear its killed-on-exit record"
     );
     let running = background.running();
@@ -2482,11 +2467,11 @@ async fn subagent_background_bash_recorded_under_its_own_session() {
     // 两条记录都被消费/清除：subagent 自己的 bash 行（ack）与父会话的
     // delegate 行（DelegateCleanup）。
     assert!(
-        crate::session::Session::take_unfinished_background(&root, session_id).is_empty(),
+        crate::session::Session::peek_unfinished_background(&root, session_id).is_empty(),
         "subagent's own bash record is cleared on completion"
     );
     assert!(
-        crate::session::Session::take_unfinished_background(&root, "parent").is_empty(),
+        crate::session::Session::peek_unfinished_background(&root, "parent").is_empty(),
         "delegate record is cleared on completion"
     );
     assert!(
@@ -2586,4 +2571,216 @@ async fn background_delegate_with_non_detached_task_waits_for_completion() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+#[test]
+fn local_session_registry_scopes_keys_and_releases_unpublished_permits() {
+    let registry = crate::session_factory::LocalSessionRegistry::default();
+    let workspace = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let key = crate::session_factory::LocalSessionRegistry::key(
+        workspace.path(),
+        storage.path(),
+        &SessionBackend::Jsonl,
+        "same",
+    );
+    let permit = registry.reserve(key.clone()).unwrap();
+    assert!(
+        registry.reserve(key.clone()).is_err(),
+        "same key must conflict"
+    );
+    drop(permit);
+    assert!(
+        registry.reserve(key).is_ok(),
+        "dropping an unpublished permit releases it"
+    );
+
+    let other_workspace = tempfile::tempdir().unwrap();
+    let other_storage = tempfile::tempdir().unwrap();
+    let different_keys = [
+        crate::session_factory::LocalSessionRegistry::key(
+            other_workspace.path(),
+            storage.path(),
+            &SessionBackend::Jsonl,
+            "same",
+        ),
+        crate::session_factory::LocalSessionRegistry::key(
+            workspace.path(),
+            other_storage.path(),
+            &SessionBackend::Jsonl,
+            "same",
+        ),
+        crate::session_factory::LocalSessionRegistry::key(
+            workspace.path(),
+            storage.path(),
+            &SessionBackend::Jsonl,
+            "other",
+        ),
+        crate::session_factory::LocalSessionRegistry::key(
+            workspace.path(),
+            storage.path(),
+            &SessionBackend::Sqlite {
+                path: Some("different.db".into()),
+            },
+            "same",
+        ),
+    ];
+    let _permits: Vec<_> = different_keys
+        .into_iter()
+        .map(|key| registry.reserve(key).unwrap())
+        .collect();
+}
+
+#[test]
+fn local_session_registry_release_on_session_entry_drop() {
+    let registry = crate::session_factory::LocalSessionRegistry::default();
+    let workspace = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let key = crate::session_factory::LocalSessionRegistry::key(
+        workspace.path(),
+        storage.path(),
+        &SessionBackend::Jsonl,
+        "entry-owner",
+    );
+    let permit = registry.reserve(key.clone()).unwrap();
+    let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+    let entry = Arc::new(SessionEntry {
+        handle,
+        model: "test".into(),
+        role: None,
+        cwd: workspace.path().display().to_string(),
+        session_id: "entry-owner".into(),
+        context_window: None,
+        store: SessionStore::Jsonl,
+        local_permit: Some(permit),
+    });
+    assert!(registry.reserve(key.clone()).is_err());
+    drop(entry);
+    assert!(registry.reserve(key).is_ok());
+}
+
+#[test]
+fn concurrent_same_key_reservation_has_one_winner() {
+    let registry = crate::session_factory::LocalSessionRegistry::default();
+    let workspace = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let key = crate::session_factory::LocalSessionRegistry::key(
+        workspace.path(),
+        storage.path(),
+        &SessionBackend::Jsonl,
+        "concurrent",
+    );
+    let barrier = Arc::new(Barrier::new(2));
+    let first_registry = registry.clone();
+    let first_barrier = barrier.clone();
+    let first_key = key.clone();
+    let first = std::thread::spawn(move || {
+        let permit = first_registry.reserve(first_key).ok();
+        first_barrier.wait();
+        permit.is_some()
+    });
+    let second_registry = registry.clone();
+    let second_barrier = barrier;
+    let second = std::thread::spawn(move || {
+        let permit = second_registry.reserve(key).ok();
+        second_barrier.wait();
+        permit.is_some()
+    });
+    assert_ne!(first.join().unwrap(), second.join().unwrap());
+}
+
+#[tokio::test]
+async fn sibling_delegates_share_resume_admission_and_release_on_entry_drop() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("sessions");
+    let id = "sub-sibling";
+    Session::append(
+        &storage,
+        id,
+        &[crate::agent::SessionEntry::from(
+            crate::agent::Message::User {
+                content: "previous".into(),
+                images: vec![],
+            },
+        )],
+    )
+    .unwrap();
+    let registry = crate::session_factory::LocalSessionRegistry::default();
+    let first = delegate(temp.path())
+        .persist_sessions(storage.clone())
+        .with_local_sessions(registry.clone());
+    let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+    let permit = registry
+        .reserve(crate::session_factory::LocalSessionRegistry::key(
+            temp.path(),
+            &storage,
+            &SessionBackend::Jsonl,
+            id,
+        ))
+        .unwrap();
+    first.sessions.insert(
+        1,
+        Arc::new(SessionEntry {
+            handle,
+            model: "test".into(),
+            role: None,
+            cwd: temp.path().display().to_string(),
+            session_id: id.into(),
+            context_window: None,
+            store: SessionStore::Jsonl,
+            local_permit: Some(permit),
+        }),
+    );
+    let answer_url = successful_model("sibling resumed").await;
+    let mut second = delegate_with_url(temp.path(), answer_url)
+        .persist_sessions(storage.clone())
+        .with_local_sessions(registry);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    second.set_event_sender(sender);
+    let error = second
+        .execute(
+            json!({"task": "resume", "resume": id, "workspace": temp.path().to_str().unwrap()}),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("already live locally"), "{error}");
+    first.sessions.remove(1);
+    second
+        .execute(
+            json!({"task": "resume", "resume": id, "workspace": temp.path().to_str().unwrap()}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        await_completion(&mut completions)
+            .await
+            .contains("sibling resumed")
+    );
+}
+
+#[tokio::test]
+async fn delegate_failed_resume_load_releases_local_permit() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("sessions");
+    let registry = crate::session_factory::LocalSessionRegistry::default();
+    let mut delegate = delegate(temp.path())
+        .persist_sessions(storage.clone())
+        .with_local_sessions(registry.clone());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let error = delegate
+        .execute(json!({"task": "resume", "resume": "missing"}))
+        .await
+        .unwrap_err();
+    assert!(error.contains("no such subagent session"), "{error}");
+    assert!(
+        registry
+            .reserve(crate::session_factory::LocalSessionRegistry::key(
+                temp.path(),
+                &storage,
+                &SessionBackend::Jsonl,
+                "missing",
+            ))
+            .is_ok()
+    );
 }

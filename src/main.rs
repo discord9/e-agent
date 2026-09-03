@@ -313,6 +313,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             factory.backend().clone(),
             read_only,
             record_in,
+            built.local_permit,
             factory.clone(),
             factory.tui_keys()?,
         )
@@ -320,9 +321,10 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
         _tui_report.success = result.is_ok();
         return result;
     }
+    let local_permit = built.local_permit;
     let task = built.runner.start((!repl_mode).then_some(prompt));
     if repl_mode {
-        repl(built.handle, task).await
+        repl(built.handle, task, local_permit).await
     } else {
         let (_, events, status) = built.handle.attach();
         let render = tokio::spawn(consume_stderr_events(events));
@@ -601,7 +603,11 @@ async fn consume_stderr_events(mut events: tokio::sync::broadcast::Receiver<Agen
     }
 }
 
-async fn repl(handle: SessionHandle, task: SessionTask) -> anyhow::Result<()> {
+async fn repl(
+    handle: SessionHandle,
+    task: SessionTask,
+    _local_permit: e_agent::session_factory::LocalSessionPermit,
+) -> anyhow::Result<()> {
     let (_, events, mut status) = handle.attach();
     let render = tokio::spawn(consume_stderr_events(events));
     let stdin = std::io::stdin();

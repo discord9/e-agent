@@ -2821,6 +2821,39 @@ async fn running_tasks_rerecord_same_key_overwrites() {
     );
 }
 
+#[tokio::test]
+async fn running_tasks_consume_old_observation_preserves_replacement() {
+    let (_dir, session, sid) = fresh_session().await;
+    session
+        .record_task_start(&sid, 77, "same label", None, Some("same-link"))
+        .await
+        .unwrap();
+    let old = session.peek_unfinished_tasks(&sid).await.unwrap();
+    assert_eq!(old.len(), 1);
+
+    // Re-record the same key and link. The newer started_at is the row
+    // generation, so the old observation cannot consume the replacement.
+    session
+        .record_task_start(&sid, 77, "same label", None, Some("same-link"))
+        .await
+        .unwrap();
+    assert!(session.consume_unfinished_tasks(&sid, &old).await.is_err());
+    let replacement = session.peek_unfinished_tasks(&sid).await.unwrap();
+    assert_eq!(replacement.len(), 1);
+    assert_eq!(replacement[0].label, "same label");
+    session
+        .consume_unfinished_tasks(&sid, &replacement)
+        .await
+        .unwrap();
+    assert!(
+        session
+            .peek_unfinished_tasks(&sid)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// `record_task_start` 持久化完整命令（`full_command` 列，bash 任务传
 /// `Some`、delegate 传 `None`）；`task_full_command` 按 id 读回。消费路径
 /// （`take_unfinished_tasks`）仍只回 label（「被杀」Notice 文本不变），
@@ -2898,8 +2931,7 @@ async fn connect_migrates_legacy_running_tasks_table_missing_full_command() {
     let wid = workspace_id();
     let p = path.to_str().unwrap();
 
-    // 手工建一个「旧版」running_tasks 表：没有 full_command 列（也没有
-    // owner_identity——连迁移探测本身也走老路径），并写入一条旧行。
+    // 手工建一个没有 full_command 列的旧版 running_tasks 表，并写入一条旧行。
     let legacy_ddl = r#"
         CREATE TABLE running_tasks (
             workspace_id TEXT NOT NULL,
@@ -2930,7 +2962,7 @@ async fn connect_migrates_legacy_running_tasks_table_missing_full_command() {
         .expect("insert legacy running_tasks row");
     }
 
-    // connect 自动探测 + ALTER 补 full_command（和 owner_identity）列。
+    // connect 自动探测 + ALTER 补 full_command列。
     let session = SqliteSession::connect(p, &wid, "legacy-task-session")
         .await
         .expect("connect migrates the legacy table");
@@ -2973,7 +3005,6 @@ async fn connect_migrates_legacy_running_tasks_table_missing_full_command() {
         Some("cargo build"),
         "post-migration writes persist the full command"
     );
-
     // 迁移幂等：再 connect 一次，探测发现列已存在、不重复 ALTER，一切正常。
     drop(session);
     let session2 = SqliteSession::connect(p, &wid, "legacy-task-session")
@@ -2988,448 +3019,6 @@ async fn connect_migrates_legacy_running_tasks_table_missing_full_command() {
         Some("cargo build")
     );
     drop((dir, session2));
-}
-
-/// The `owner` column records the process identity of the process that
-/// started each task, and `unfinished_owner_all_dead` (the server-attach
-/// probe) only reports true when EVERY surviving row was left by a
-/// definitely-dead process.
-#[tokio::test]
-async fn running_tasks_owner_column_liveness_probe() {
-    let (_dir, session, sid) = fresh_session().await;
-
-    // No rows → all dead (vacuously: Consume would take nothing).
-    assert!(
-        session
-            .unfinished_owner_all_dead(&sid)
-            .await
-            .expect("probe on empty table")
-    );
-
-    // A row recorded by THIS process (still alive) → not all dead, and
-    // the owner column holds our process identity.
-    session
-        .record_task_start(&sid, 1, "sleep 100", None, None)
-        .await
-        .unwrap();
-    assert!(
-        !session
-            .unfinished_owner_all_dead(&sid)
-            .await
-            .expect("probe with live owner"),
-        "a live owner must keep the probe conservative (false)"
-    );
-    {
-        let conn = session.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT owner_identity FROM running_tasks \
-                 WHERE workspace_id = ?1 AND session_id = ?2 AND task_id = ?3",
-                (session.workspace_id.as_str(), sid.as_str(), 1i64),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(
-            row.get_value(0).unwrap().as_text().cloned(),
-            Some(crate::session_store::process_identity().to_owned()),
-            "record must carry the recording process identity"
-        );
-    }
-
-    // Rewrite the owner to a definitely-dead pid → all rows dead → true.
-    // A known-host dead pid is probed; a valid legacy `unknown` identity is
-    // explicitly treated as dead.
-    match probeable_hostname() {
-        Some(hostname) => {
-            {
-                let conn = session.conn.lock().await;
-                conn.execute(
-                    "UPDATE running_tasks SET owner_identity = ?1 \
-                     WHERE workspace_id = ?2 AND session_id = ?3",
-                    (
-                        format!("2000000000@{hostname}#deadbeef"),
-                        session.workspace_id.as_str(),
-                        sid.as_str(),
-                    ),
-                )
-                .await
-                .unwrap();
-            }
-            assert!(
-                session
-                    .unfinished_owner_all_dead(&sid)
-                    .await
-                    .expect("probe with dead owner")
-            );
-        }
-        None => {
-            {
-                let conn = session.conn.lock().await;
-                conn.execute(
-                    "UPDATE running_tasks SET owner_identity = ?1 \
-                     WHERE workspace_id = ?2 AND session_id = ?3",
-                    (
-                        "2000000000@unknown#deadbeef",
-                        session.workspace_id.as_str(),
-                        sid.as_str(),
-                    ),
-                )
-                .await
-                .unwrap();
-            }
-            assert!(
-                session
-                    .unfinished_owner_all_dead(&sid)
-                    .await
-                    .expect("probe with legacy unknown owner")
-            );
-        }
-    }
-
-    // NULL owner (a row written before the column shipped) → alive.
-    {
-        let conn = session.conn.lock().await;
-        conn.execute(
-            "UPDATE running_tasks SET owner_identity = NULL \
-             WHERE workspace_id = ?1 AND session_id = ?2",
-            (session.workspace_id.as_str(), sid.as_str()),
-        )
-        .await
-        .unwrap();
-    }
-    assert!(
-        !session
-            .unfinished_owner_all_dead(&sid)
-            .await
-            .expect("probe with NULL owner"),
-        "a NULL owner (old row) must be treated as alive"
-    );
-
-    // Mixed dead + live owners → not all dead.
-    session
-        .record_task_start(&sid, 2, "cargo build", None, None)
-        .await
-        .unwrap();
-    assert!(
-        !session
-            .unfinished_owner_all_dead(&sid)
-            .await
-            .expect("probe with mixed owners"),
-        "one live owner makes the whole probe false"
-    );
-
-    // Consuming the rows still works unchanged (take → empty table →
-    // all dead again).
-    let labels = session.take_unfinished_tasks(&sid).await.unwrap();
-    assert_eq!(labels.len(), 2);
-    assert!(
-        session
-            .unfinished_owner_all_dead(&sid)
-            .await
-            .expect("probe after consume")
-    );
-}
-
-/// The current hostname exactly as `process_identity` computes it, for
-/// hand-built owner identities in tests.
-fn hostname_now() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown".to_owned())
-}
-
-/// The currently resolved hostname, when it is known, for hand-built
-/// owner identities that exercise the process probe path.
-fn probeable_hostname() -> Option<String> {
-    let host = hostname_now();
-    (host != "unknown").then_some(host)
-}
-
-/// 老库迁移：一个在 `owner` 列加入之前创建的 running_tasks 表（没有
-/// owner 列）在 connect 时自动 ALTER 补列，随后记录写入与 liveness
-/// 探测全部正常；迁移幂等（再 connect 不重复 ALTER）。
-#[tokio::test]
-async fn connect_migrates_legacy_running_tasks_table_missing_owner_column() {
-    let (dir, path) = temp_db();
-    let wid = workspace_id();
-    let p = path.to_str().unwrap();
-    let sid = format!("test-sql-owner-legacy-{}", crate::session::new_id());
-
-    // 手工建一个「旧版」running_tasks 表（没有 owner 列），并写入一条
-    // 旧任务行。
-    let legacy_ddl = r#"
-        CREATE TABLE running_tasks (
-            workspace_id TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            task_id INTEGER NOT NULL,
-            label TEXT NOT NULL,
-            subagent_session_id TEXT NULL,
-            started_at_us INTEGER NOT NULL,
-            PRIMARY KEY (workspace_id, session_id, task_id)
-        )
-    "#;
-    {
-        let db = turso::Builder::new_local(p)
-            .build()
-            .await
-            .expect("open legacy db");
-        let conn = db.connect().expect("connect legacy db");
-        conn.execute(legacy_ddl, ())
-            .await
-            .expect("create legacy running_tasks table");
-        conn.execute(
-            "INSERT INTO running_tasks \
-             (workspace_id, session_id, task_id, label, started_at_us) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            (
-                wid.as_str(),
-                sid.as_str(),
-                7i64,
-                "legacy task",
-                1_700_000_000_000_000i64,
-            ),
-        )
-        .await
-        .expect("insert legacy running_tasks row");
-    }
-
-    // connect 应自动探测 + ALTER：老行 owner 读回 NULL（→ alive），
-    // 新记录写入带 owner 列。
-    let session = SqliteSession::connect(p, &wid, &sid)
-        .await
-        .expect("connect migrates the legacy table");
-    assert!(
-        !session
-            .unfinished_owner_all_dead(&sid)
-            .await
-            .expect("probe on migrated legacy table"),
-        "legacy row without owner must probe as alive"
-    );
-    session
-        .record_task_start(&sid, 8, "new task", None, None)
-        .await
-        .unwrap();
-    assert!(
-        !session
-            .unfinished_owner_all_dead(&sid)
-            .await
-            .expect("probe after new record on migrated table"),
-        "the new row's live owner keeps the probe false"
-    );
-
-    // 迁移幂等：再 connect 一次，探测发现列已存在、不重复 ALTER。
-    drop(session);
-    let session2 = SqliteSession::connect(p, &wid, &sid)
-        .await
-        .expect("reconnect on migrated db");
-    assert!(
-        !session2
-            .unfinished_owner_all_dead(&sid)
-            .await
-            .expect("probe after reconnect"),
-        "reconnect must keep working"
-    );
-    drop((dir, session2));
-}
-
-/// P1-2 的 Err 契约：probe 查询硬失败（running_tasks 表被破坏）时返回
-/// Err —— server build_session 正是靠这个 Err 降级为 Preserve（而不是
-/// 让整个 session build 500）。
-#[tokio::test]
-async fn unfinished_owner_all_dead_probe_error_is_reported() {
-    let (_dir, session, sid) = fresh_session().await;
-
-    // 破坏 running_tasks 表，使 probe 查询报 "no such table"。
-    {
-        let conn = session.conn.lock().await;
-        conn.execute("DROP TABLE running_tasks", ())
-            .await
-            .expect("drop running_tasks table");
-    }
-    let err = session
-        .unfinished_owner_all_dead(&sid)
-        .await
-        .expect_err("probe must error on a broken table");
-    assert!(
-        err.contains("cannot load unfinished background task owners"),
-        "probe error must carry context: {err}"
-    );
-}
-
-/// 端到端（真实数据库文件，走 SessionStore 门面）：record（owner = 当前
-/// 进程）→ all_dead = false；手改 owner 为不存在的 pid → all_dead = true；
-/// Consume（take）后 → all_dead = true。这正是 server build_session 在
-/// attach 时的决策路径。
-#[tokio::test]
-async fn store_facade_unfinished_owner_all_dead_e2e() {
-    use crate::session_store::SessionStore;
-
-    let (_dir, path) = temp_db();
-    let root = std::path::Path::new("/tmp/e-agent-test-sqlite");
-    let sid = format!("test-sql-store-owner-{}", crate::session::new_id());
-    let store = SessionStore::connect(
-        &crate::config::SessionBackend::Sqlite {
-            path: Some(path.to_string_lossy().into_owned()),
-        },
-        root,
-        &sid,
-    )
-    .await
-    .expect("connect sqlite store");
-
-    // 无记录：Consume 空转 → true。
-    assert!(
-        store
-            .unfinished_owner_all_dead(root, &sid)
-            .await
-            .expect("probe with no records")
-    );
-
-    // record（fire-and-forget 落到当前 runtime）：owner = 当前进程（活着）
-    // → 轮询直到记录落地，probe 为 false。
-    store.record_background_start(root, &sid, 7, "build project", None, None);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if !store
-            .unfinished_owner_all_dead(root, &sid)
-            .await
-            .expect("probe with live owner")
-        {
-            break; // 记录已落地
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "background record never landed"
-        );
-        tokio::task::yield_now().await;
-    }
-
-    // 手改 owner 为不存在的 pid（同一 hostname）→ 全部 dead → true。
-    // 仅当环境导出了 hostname 时可证明；否则 owner 侧 hostname 回退为
-    // A valid legacy `unknown` identity is explicitly considered dead.
-    match probeable_hostname() {
-        Some(hostname) => {
-            {
-                let db = turso::Builder::new_local(path.to_str().unwrap())
-                    .build()
-                    .await
-                    .expect("open db for hand edit");
-                let conn = db.connect().expect("connect for hand edit");
-                conn.execute(
-                    "UPDATE running_tasks SET owner_identity = ?1 \
-                     WHERE workspace_id = ?2 AND session_id = ?3",
-                    (
-                        format!("2000000000@{hostname}#deadbeef"),
-                        workspace_id(),
-                        sid.as_str(),
-                    ),
-                )
-                .await
-                .expect("rewrite owner to dead pid");
-            }
-            assert!(
-                store
-                    .unfinished_owner_all_dead(root, &sid)
-                    .await
-                    .expect("probe with dead owner")
-            );
-        }
-        None => {
-            let db = turso::Builder::new_local(path.to_str().unwrap())
-                .build()
-                .await
-                .expect("open db for hand edit");
-            let conn = db.connect().expect("connect for hand edit");
-            conn.execute(
-                "UPDATE running_tasks SET owner_identity = ?1 \
-                 WHERE workspace_id = ?2 AND session_id = ?3",
-                ("2000000000@unknown#deadbeef", workspace_id(), sid.as_str()),
-            )
-            .await
-            .expect("rewrite owner to legacy unknown pid");
-            assert!(
-                store
-                    .unfinished_owner_all_dead(root, &sid)
-                    .await
-                    .expect("probe with legacy unknown owner")
-            );
-        }
-    }
-
-    // Consume（take）后无剩余记录 → 又变回 true。
-    let labels = store
-        .take_unfinished_background(root, &sid)
-        .await
-        .expect("take after all owners dead");
-    assert_eq!(
-        labels,
-        vec![crate::session::format_unfinished(7, "build project", None)]
-    );
-    assert!(
-        store
-            .unfinished_owner_all_dead(root, &sid)
-            .await
-            .expect("probe after consume")
-    );
-}
-
-#[tokio::test]
-async fn running_tasks_subagent_lookup_crosses_parent_sessions() {
-    let (_dir, session, subagent) = fresh_session().await;
-
-    // Two different parent sessions each left a delegate row for the
-    // same subagent session id.
-    let parent_a = format!("parent-a-{}", crate::session::new_id());
-    let parent_b = format!("parent-b-{}", crate::session::new_id());
-    session
-        .record_task_start(&parent_a, 10, "probe a", None, Some(&subagent))
-        .await
-        .unwrap();
-    session
-        .record_task_start(&parent_b, 11, "probe b", None, Some(&subagent))
-        .await
-        .unwrap();
-
-    // The subagent's own session id sees no direct rows...
-    assert!(
-        session
-            .take_unfinished_tasks(&subagent)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    // ...but the subagent-scoped lookup finds both leftover delegates.
-    let labels = session
-        .take_unfinished_tasks_for_subagent(&subagent)
-        .await
-        .unwrap();
-    assert_eq!(labels.len(), 2);
-    assert!(labels.contains(&"task 10: probe a".to_string()));
-    assert!(labels.contains(&"task 11: probe b".to_string()));
-    // Consumed: a second lookup finds nothing.
-    assert!(
-        session
-            .take_unfinished_tasks_for_subagent(&subagent)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    // The parents' own take sees nothing either (rows are gone).
-    assert!(
-        session
-            .take_unfinished_tasks(&parent_a)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        session
-            .take_unfinished_tasks(&parent_b)
-            .await
-            .unwrap()
-            .is_empty()
-    );
 }
 
 #[tokio::test]
@@ -3465,11 +3054,9 @@ async fn running_tasks_label_for_subagent_returns_latest() {
     let other = format!("other-label-{}", crate::session::new_id());
     assert_eq!(session.label_for_subagent(&other).await.unwrap(), None);
 
-    // Consuming the rows (task completion/resume) removes the label.
-    session
-        .take_unfinished_tasks_for_subagent(&subagent)
-        .await
-        .unwrap();
+    // Completing the delegate rows removes the display label.
+    session.clear_task(&parent, 20).await.unwrap();
+    session.clear_task(&parent, 21).await.unwrap();
     assert_eq!(session.label_for_subagent(&subagent).await.unwrap(), None);
 }
 

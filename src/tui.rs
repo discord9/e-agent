@@ -277,6 +277,7 @@ pub async fn run(
     session_backend: crate::config::SessionBackend,
     read_only: bool,
     record_in: Option<crate::session_store::BackgroundRecord>,
+    _local_permit: crate::session_factory::LocalSessionPermit,
     factory: std::sync::Arc<crate::session_factory::SessionFactory>,
     input_keys: crate::config::InputKeys,
 ) -> anyhow::Result<()> {
@@ -1133,6 +1134,7 @@ fn btw_context(state: &TuiState) -> Option<crate::delegate::BtwContext> {
         persist_root: state.root.clone(),
         backend: state.backend.clone()?,
         record_in: state.record_in.clone(),
+        local_sessions: state.factory.as_ref()?.local_sessions(),
     })
 }
 

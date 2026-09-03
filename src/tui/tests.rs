@@ -2351,7 +2351,7 @@ async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
     state.cancel_selected_task();
 
     assert!(
-        crate::session::Session::take_unfinished_background(temp.path(), "cancel-store").is_empty()
+        crate::session::Session::peek_unfinished_background(temp.path(), "cancel-store").is_empty()
     );
 }
 

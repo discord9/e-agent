@@ -470,6 +470,7 @@ async fn require_auth(
 /// of truth for the id; it is not duplicated here.
 pub struct LiveSession {
     pub handle: SessionHandle,
+    pub local_permit: Option<crate::session_factory::LocalSessionPermit>,
     /// `runner.start(None)` task; dropped (aborting the runner) when the
     /// session is deleted or the process exits.
     pub task: SessionTask,
@@ -501,7 +502,6 @@ impl LiveSession {
 #[derive(Default)]
 struct RegistryInner {
     live: HashMap<String, Arc<LiveSession>>,
-    creating: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -509,27 +509,9 @@ pub struct SessionRegistry {
     inner: Mutex<RegistryInner>,
 }
 
-pub struct SessionReservation {
-    registry: Arc<SessionRegistry>,
-    id: Option<String>,
-}
-
 impl SessionRegistry {
-    pub fn reserve(self: &Arc<Self>, id: &str) -> Result<SessionReservation, bool> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.live.contains_key(id) || !inner.creating.insert(id.to_owned()) {
-            return Err(inner.live.contains_key(id));
-        }
-        Ok(SessionReservation {
-            registry: self.clone(),
-            id: Some(id.to_owned()),
-        })
-    }
-
     pub fn insert(&self, id: String, session: Arc<LiveSession>) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.creating.remove(&id);
-        inner.live.insert(id, session);
+        self.inner.lock().unwrap().live.insert(id, session);
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<LiveSession>> {
@@ -540,7 +522,7 @@ impl SessionRegistry {
         self.inner.lock().unwrap().live.remove(id)
     }
 
-    /// Snapshot of live `(id, session)` pairs; creating sessions are omitted.
+    /// Snapshot of live `(id, session)` pairs.
     pub fn list(&self) -> Vec<(String, Arc<LiveSession>)> {
         self.inner
             .lock()
@@ -549,26 +531,6 @@ impl SessionRegistry {
             .iter()
             .map(|(id, session)| (id.clone(), session.clone()))
             .collect()
-    }
-}
-
-impl SessionReservation {
-    pub fn publish(mut self, session: Arc<LiveSession>) {
-        let id = self
-            .id
-            .take()
-            .expect("session reservation already published");
-        let mut inner = self.registry.inner.lock().unwrap();
-        inner.creating.remove(&id);
-        inner.live.insert(id, session);
-    }
-}
-
-impl Drop for SessionReservation {
-    fn drop(&mut self) {
-        if let Some(id) = self.id.take() {
-            self.registry.inner.lock().unwrap().creating.remove(&id);
-        }
     }
 }
 
@@ -1216,10 +1178,10 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSessionBody>,
 ) -> Result<(StatusCode, Json<SessionMeta>), (StatusCode, String)> {
-    // The resume guard below applies only to an EXPLICIT id (a resume). A
-    // generated `web-…` id is fresh by construction and cannot collide with
-    // a running subagent, so it skips the cross-process lookup. Captured
-    // BEFORE the match moves `body.id` out.
+    // Only an explicit id is a resume. A generated `web-…` id is fresh by
+    // construction; both paths are reserved in the process-local registry
+    // before the async build begins. Captured before the match moves
+    // `body.id` out.
     let explicit_id = body.id.is_some();
     let id = match body.id {
         Some(id) => {
@@ -1229,69 +1191,13 @@ async fn create_session(
         }
         None => crate::session::new_id_prefixed("web-"),
     };
-    let reservation = match state.registry.reserve(&id) {
-        Ok(reservation) => reservation,
-        Err(live) => {
-            return Err(error(
-                StatusCode::CONFLICT,
-                if live {
-                    format!("session {id} already exists")
-                } else {
-                    format!("session {id} is currently being created")
-                },
-            ));
-        }
-    };
-    // Resume guard (concurrent-write conflicts #46/#49): resuming a
-    // subagent that is still running would build a SECOND runner over the
-    // same session file — both would append, and Greptime/SQLite reject
-    // the out-of-order seq ("database max seq is N but this writer
-    // expected …"). The owning session knows its live subagents, so block
-    // any id that is currently a live handle in some parent's `Sessions`
-    // registry. A handle exists only while the subagent is alive
-    // (DelegateCleanup removes finished ones), so a hit here always means
-    // "still running" — an Idle btw subagent counts too, it still owns
-    // the file. Finished subagents resume normally.
-    if let Some((parent, task_id)) = subagent_is_live(&state, &id) {
-        return Err(error(
-            StatusCode::CONFLICT,
-            format!(
-                "session {id} is a running subagent (spawned by session {parent}, task {task_id}); \
-                 cannot resume it while it runs — wait for it to finish or cancel the task first"
-            ),
-        ));
-    }
-    // Cross-process backstop: a surviving `running_tasks` row for this id
-    // means a delegate task in ANOTHER process still claims the session
-    // (rows are cleared at task completion, so a surviving row = "not
-    // finished yet", or a zombie row left by a dead process). Resuming
-    // would race that owner's writes, so block conservatively — the row is
-    // the only cross-process liveness signal. Zombie rows self-heal:
-    // resuming the owning parent session from the CLI/TUI
-    // (UnfinishedPolicy::Consume) or a delegate `resume` consumes them.
+    // `build_session` reserves the factory-owned permit before its store
+    // connect/history load. Metadata is read only after admission so the
+    // complete resume/build path is covered by the same permit.
     let root = state.factory.root();
-    if explicit_id
-        && meta_store(&state)
-            .await
-            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
-            .label_for_subagent(root, &id)
-            .await
-            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
-            .is_some()
-    {
-        return Err(error(
-            StatusCode::CONFLICT,
-            format!(
-                "session {id} is still claimed by a running delegate task (possibly in another \
-                 e-agent process); cannot resume it while it runs — wait for it to finish, or if \
-                 the owning process died, resume its parent session first"
-            ),
-        ));
-    }
-    // `build_session` uses the factory's current model (which is correct for
-    // execution) and idempotently creates metadata if necessary. Read an
-    // existing session's metadata first so a resumed session keeps its
-    // original model in the web-facing live registry.
+    let built = build_session(&state.factory, &id).await?;
+    // Preserve the original model in the web-facing live registry. For a
+    // resumed row, build's idempotent metadata write leaves this unchanged.
     let persisted_model = if explicit_id {
         meta_store(&state)
             .await
@@ -1305,7 +1211,6 @@ async fn create_session(
     } else {
         None
     };
-    let built = build_session(&state.factory, &id).await?;
     let initial_prompt = body.initial_prompt.filter(|p| !p.trim().is_empty());
     let session = Arc::new(LiveSession {
         handle: built.handle,
@@ -1316,8 +1221,9 @@ async fn create_session(
         model_name: Mutex::new(persisted_model.unwrap_or(built.model_name)),
         role_name: built.role_name,
         created_at: chrono::Utc::now(),
+        local_permit: Some(built.local_permit),
     });
-    reservation.publish(session.clone());
+    state.registry.insert(id.clone(), session.clone());
     // 桌宠总结：每个 turn（Busy→Idle）结束时后台生成一句话中文总结并缓存。
     // 监听任务订阅 runner 的 status watch（不改 runner.rs）；会话删除/运行器
     // 退出（watch sender drop）时自动结束。
@@ -1334,48 +1240,26 @@ async fn build_session(
     factory: &SessionFactory,
     id: &str,
 ) -> Result<SessionBuild, (StatusCode, String)> {
-    // Lazy server attach: the session may still be live in another process
-    // (the server restarts far more often than its sessions die), so the
-    // unfinished-background records are NOT blindly consumed. Probe whether
-    // every record was left by a now-dead process: only then is it safe to
-    // use Consume — take the records and inject the "killed with the
-    // process" notice, exactly like a TUI/CLI restart. Any uncertainty
-    // (a live owner, an old record without an owner, a probe failure)
-    // keeps Preserve: the owning process may still be alive and clears its
-    // own records via ack_background_entry → clear_background_task. No
-    // records → Consume is a harmless no-op, so the probe reports true.
-    let unfinished = {
-        let root = factory.root();
-        // One throwaway store for the probe (build() connects its own);
-        // JSONL is a zero-cost marker, Greptime/SQLite just open a second
-        // short-lived connection bound to the same session id.
-        let store = SessionStore::connect(factory.backend(), root, id)
-            .await
-            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-        match store.unfinished_owner_all_dead(root, id).await {
-            // Every owner dead (or no records): safe to consume and
-            // inject the "killed with the process" notice.
-            Ok(true) => UnfinishedPolicy::Consume,
-            // Some owner is alive or unjudgeable: leave the records for
-            // the owning process.
-            Ok(false) => UnfinishedPolicy::Preserve,
-            // Probe failure must not take the whole session build down —
-            // the session itself is perfectly usable. Degrade to the
-            // conservative Preserve (matching the migration-failure
-            // degradation style elsewhere: eprintln + keep running).
-            Err(e) => {
-                tracing::warn!(
-                    "e-agent: cannot probe unfinished background-task owners, \
-                     keeping Preserve: {e:#}"
-                );
-                UnfinishedPolicy::Preserve
-            }
-        }
-    };
+    // Local registry and reservation checks are the admission guards. Once
+    // they pass, Consume recovers this session's own stale background rows;
+    // rows belonging to an inbound delegate are not part of that recovery.
     factory
-        .build(id, None, None, IdlePolicy::WaitForInput, unfinished)
+        .build(
+            id,
+            None,
+            None,
+            IdlePolicy::WaitForInput,
+            UnfinishedPolicy::Consume,
+        )
         .await
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
+        .map_err(|e| {
+            let message = format!("{e:#}");
+            if message.contains("already live locally") {
+                error(StatusCode::CONFLICT, message)
+            } else {
+                error(StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
+        })
 }
 
 /// Resolve a session id to something the web can attach to: the main
@@ -1402,26 +1286,6 @@ fn live(state: &AppState, id: &str) -> Result<SessionRef, (StatusCode, String)> 
         StatusCode::NOT_FOUND,
         format!("session {id} not found"),
     ))
-}
-
-/// True when `id` is a live subagent handle in some live session's
-/// `Sessions` registry — the in-process half of the resume guard
-/// ([`create_session`]). A handle only exists while the subagent is alive
-/// (finished delegates are removed by `DelegateCleanup`), so a hit here
-/// always means "still running": the subagent's runner owns the session
-/// file and a second runner would write it concurrently (#46/#49). An Idle
-/// btw subagent is also still alive and must block resume for the same
-/// reason. Returns the owning parent session id and task id so the caller
-/// can name them in the rejection. Same bounded scan as [`live`].
-fn subagent_is_live(state: &AppState, id: &str) -> Option<(String, u64)> {
-    for (session_id, session) in state.registry.list() {
-        for (task_id, entry) in session.sessions.list() {
-            if entry.session_id == id {
-                return Some((session_id.clone(), task_id));
-            }
-        }
-    }
-    None
 }
 
 #[derive(Deserialize)]
@@ -1507,6 +1371,7 @@ async fn session_btw(
                 session: id.clone(),
                 store: session.store.clone(),
             }),
+            local_sessions: state.factory.local_sessions(),
         },
     )
     .await
@@ -2539,17 +2404,9 @@ async fn session_fork(
         Some(at) if at > 0 => at,
         _ => return Err(error(StatusCode::BAD_REQUEST, "at must be 1-based")),
     };
-    // Reserve the final target before any factory await. The reservation
-    // covers source resolution, target connect, bootstrap, and publication.
+    // The factory reserves the generated target before target connect/build.
     let target_id = crate::session::new_id_prefixed("fork-");
-    let reservation = state.registry.reserve(&target_id).map_err(|_| {
-        error(
-            StatusCode::CONFLICT,
-            format!("session {target_id} was created concurrently"),
-        )
-    })?;
-    // Resolve the source (404 before target build work); the reservation is
-    // intentionally held while this awaited lookup completes.
+    // Resolve the source before constructing the target; it is read-only.
     resolve_session_store(&state, &id, true).await?;
     let built = state
         .factory
@@ -2558,8 +2415,7 @@ async fn session_fork(
             id.clone(),
             Some(at),
             IdlePolicy::WaitForInput,
-            // Deliberately NOT the owner-liveness probe of `build_session`:
-            // this builds a brand-new `fork-…` session. Unfinished
+            // This builds a brand-new `fork-…` session. Unfinished
             // background-task records are scoped to the SOURCE session id,
             // so this fork's own record file/rows are always empty —
             // Consume would take nothing, and injecting a "killed with the
@@ -2570,7 +2426,10 @@ async fn session_fork(
         .await
         .map_err(|e| {
             let message = format!("{e:#}");
-            if message.contains("fork point") || message.contains("no completed turn") {
+            if message.contains("fork point")
+                || message.contains("no completed turn")
+                || message.contains("already live locally")
+            {
                 error(StatusCode::CONFLICT, format!("无法 fork：{message}"))
             } else {
                 error(StatusCode::INTERNAL_SERVER_ERROR, message)
@@ -2587,8 +2446,9 @@ async fn session_fork(
         model_name: Mutex::new(built.model_name),
         role_name: built.role_name,
         created_at: chrono::Utc::now(),
+        local_permit: Some(built.local_permit),
     });
-    reservation.publish(session);
+    state.registry.insert(new_id.clone(), session);
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "id": new_id })),
@@ -3381,6 +3241,7 @@ async fn index() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Tool;
     use crate::tools::TaskDisplayMeta;
 
     fn test_state_dir() -> PathBuf {
@@ -4235,13 +4096,9 @@ mod tests {
         );
     }
 
-    /// `POST /api/sessions {id}` — the web resume entry — must never build
-    /// a second live session over a subagent id that is still live in a
-    /// parent's `Sessions` registry (concurrent-write conflicts #46/#49):
-    /// the parent knows its subagents, so resuming a running subagent is
-    /// rejected with 409. A Busy delegate and an Idle btw subagent both
-    /// block (any live handle owns the session file). A finished subagent
-    /// (no handle anywhere) resumes normally; the guard must not touch it.
+    /// `POST /api/sessions {id}` — the web resume entry — rejects only a
+    /// subagent id that is still live in a parent's `Sessions` registry.
+    /// Persisted labels or task rows do not act as admission conditions.
     #[tokio::test]
     async fn create_session_rejects_resuming_live_subagents() {
         use tower::util::ServiceExt;
@@ -4270,6 +4127,11 @@ mod tests {
         ] {
             let (handle, emitter, _commands) = crate::runner::session_test_channel();
             emitter.set_status(status);
+            let permit = state
+                .factory
+                .local_sessions()
+                .reserve(state.factory.local_session_key(sid))
+                .unwrap();
             parent.sessions.insert(
                 task_id,
                 Arc::new(crate::delegate::SessionEntry {
@@ -4280,6 +4142,7 @@ mod tests {
                     session_id: sid.to_owned(),
                     context_window: None,
                     store: SessionStore::Jsonl,
+                    local_permit: Some(permit),
                 }),
             );
         }
@@ -4315,19 +4178,19 @@ mod tests {
                     .await
                     .unwrap();
                 let text = String::from_utf8(body.to_vec()).unwrap();
-                assert!(text.contains("running subagent"), "{text}");
+                assert!(
+                    text.contains("already live locally") || text.contains("running subagent"),
+                    "{text}"
+                );
             }
         }
     }
 
-    /// The cross-process half of the resume guard: a surviving
-    /// `running_tasks` record (JSONL `.background.jsonl` line whose
-    /// `session_id` matches) means a delegate task in another process still
-    /// claims the session — resume is rejected with 409 even though no live
-    /// handle exists in this process. Removing the record (task completed /
-    /// zombie cleaned) restores the normal resume path.
+    /// A surviving `running_tasks` record does not act as a cross-process
+    /// resume admission gate: without a local live handle, the session is
+    /// resumed normally and only its own recovery rows are consumed.
     #[tokio::test]
-    async fn create_session_rejects_resume_claimed_by_running_task_row() {
+    async fn create_session_resumes_despite_stale_delegate_row() {
         use std::io::Write;
         use tower::util::ServiceExt;
 
@@ -4381,23 +4244,22 @@ mod tests {
         let response = resume().await;
         assert_eq!(
             response.status(),
-            StatusCode::CONFLICT,
-            "surviving row blocks"
+            StatusCode::CREATED,
+            "a stale row must not blanket-block resume"
         );
-        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(
-            text.contains("claimed by a running delegate task"),
-            "{text}"
+            record_path.exists(),
+            "the inbound parent row is not consumed by child resume"
         );
 
-        // Row consumed (task completed / zombie cleaned): same id resumes
-        // normally through to a fresh build over the id.
-        std::fs::remove_file(&record_path).unwrap();
+        // The local registry remains the conflict mechanism once the resumed
+        // session has been published.
         let response = resume().await;
-        assert_eq!(response.status(), StatusCode::CREATED, "no row resumes");
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "local live session"
+        );
     }
 
     #[test]
@@ -4833,6 +4695,7 @@ model = "deepseek-chat"
                 model_name: Mutex::new("test-model".into()),
                 role_name: None,
                 created_at: chrono::Utc::now(),
+                local_permit: None,
             }),
         );
         let app = router(state.clone());
@@ -5029,6 +4892,7 @@ model = "deepseek-chat"
                 model_name: Mutex::new("test-model".into()),
                 role_name: None,
                 created_at: chrono::Utc::now(),
+                local_permit: None,
             }),
         );
         let app = router(state.clone());
@@ -5169,6 +5033,7 @@ model = "deepseek-chat"
                 model_name: Mutex::new("test-model".into()),
                 role_name: None,
                 created_at: chrono::Utc::now(),
+                local_permit: None,
             }),
         );
         let app = router(state.clone());
@@ -5399,6 +5264,7 @@ model = "deepseek-chat"
             model_name: Mutex::new("test-model".into()),
             role_name: None,
             created_at: chrono::Utc::now(),
+            local_permit: None,
         })
     }
 
@@ -5431,6 +5297,7 @@ model = "deepseek-chat"
                 model_name: Mutex::new("test-model".into()),
                 role_name: None,
                 created_at: chrono::Utc::now(),
+                local_permit: None,
             }),
             rx,
         )
@@ -5464,34 +5331,6 @@ model = "deepseek-chat"
             .await
             .expect("event frame fits");
         String::from_utf8(bytes.to_vec()).expect("event frame is utf-8")
-    }
-
-    #[test]
-    fn registry_reservation_is_scoped_and_invisible_until_published() {
-        let registry = Arc::new(SessionRegistry::default());
-        let reservation = registry.reserve("creating").unwrap();
-        assert!(registry.list().is_empty());
-        assert!(registry.get("creating").is_none());
-        assert!(registry.reserve("creating").is_err());
-        drop(reservation);
-        assert!(registry.reserve("creating").is_ok());
-    }
-
-    #[test]
-    fn registry_reservation_allows_only_one_builder() {
-        let registry = Arc::new(SessionRegistry::default());
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let other = registry.clone();
-        let gate = barrier.clone();
-        let thread = std::thread::spawn(move || {
-            let reservation = other.reserve("barrier").unwrap();
-            gate.wait();
-            reservation
-        });
-        barrier.wait();
-        assert!(registry.reserve("barrier").is_err());
-        drop(thread.join().unwrap());
-        assert!(registry.reserve("barrier").is_ok());
     }
 
     #[tokio::test]
@@ -5945,6 +5784,7 @@ model = "deepseek-chat"
                     session_id: sid.to_owned(),
                     context_window: None,
                     store: SessionStore::Jsonl,
+                    local_permit: None,
                 },
                 emitter,
             )
@@ -6061,6 +5901,7 @@ model = "deepseek-chat"
             session_id: "sub-abc".into(),
             context_window: None,
             store: SessionStore::Jsonl,
+            local_permit: None,
         });
         parent.sessions.insert(7, entry);
         state.registry.insert(parent_id, parent.clone());
@@ -6253,6 +6094,7 @@ model = "deepseek-chat"
             session_id: "sub-del".into(),
             context_window: None,
             store: SessionStore::Jsonl,
+            local_permit: None,
         });
         let hook_sessions = sessions.clone();
         let hook_slot = slot.clone();
@@ -6428,6 +6270,7 @@ model = "deepseek-chat"
             model_name: Mutex::new("test-model".into()),
             role_name: None,
             created_at: chrono::Utc::now(),
+            local_permit: None,
         });
         state.registry.insert("web-cancel".into(), session);
 
@@ -7813,6 +7656,7 @@ model = "deepseek-chat"
             session_id: "sub-out".into(),
             context_window: None,
             store: SessionStore::Jsonl,
+            local_permit: None,
         });
         session.sessions.insert(7, entry);
         let subagent = app
@@ -8393,5 +8237,86 @@ model = "deepseek-chat"
             session_b.background.cancel(1).is_some(),
             "delegate task is cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn web_factory_build_conflicts_with_delegate_resume_on_same_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory =
+            crate::session_factory::SessionFactory::test_factory(temp.path().to_path_buf());
+        let built = factory
+            .build(
+                "web-target",
+                None,
+                None,
+                IdlePolicy::WaitForInput,
+                crate::session_factory::UnfinishedPolicy::Consume,
+            )
+            .await
+            .unwrap();
+        let registry = factory.local_sessions();
+        let mut delegate = crate::delegate::Delegate::new(
+            factory.main_model(),
+            factory.workspace().clone(),
+            crate::tools::builtins(factory.workspace().clone(), None, false, None).1,
+        )
+        .persist_sessions(temp.path().to_path_buf())
+        .with_persist_store(crate::config::SessionBackend::Jsonl)
+        .with_local_sessions(registry);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        delegate.set_event_sender(sender);
+        let error = delegate
+            .execute(serde_json::json!({
+                "task": "resume",
+                "resume": "web-target",
+                "workspace": temp.path().to_str().unwrap()
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.contains("already live locally"), "{error}");
+        drop(built);
+        assert!(
+            factory
+                .local_sessions()
+                .reserve(factory.local_session_key("web-target"))
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn live_main_id_conflicts_with_delegate_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory =
+            crate::session_factory::SessionFactory::test_factory(temp.path().to_path_buf());
+        let built = factory
+            .build(
+                "main-live",
+                None,
+                None,
+                IdlePolicy::WaitForInput,
+                crate::session_factory::UnfinishedPolicy::Consume,
+            )
+            .await
+            .unwrap();
+        let mut delegate = crate::delegate::Delegate::new(
+            factory.main_model(),
+            factory.workspace().clone(),
+            crate::tools::builtins(factory.workspace().clone(), None, false, None).1,
+        )
+        .persist_sessions(temp.path().to_path_buf())
+        .with_persist_store(crate::config::SessionBackend::Jsonl)
+        .with_local_sessions(factory.local_sessions());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        delegate.set_event_sender(sender);
+        let error = delegate
+            .execute(serde_json::json!({
+                "task": "resume",
+                "resume": "main-live",
+                "workspace": temp.path().to_str().unwrap()
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.contains("already live locally"), "{error}");
+        drop(built);
     }
 }

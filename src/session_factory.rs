@@ -9,7 +9,7 @@
 //! runner). Behavior is identical to the old `main.rs` flow — build() is a
 //! mechanical move of the per-session block, in the same order.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -24,9 +24,7 @@ use crate::config::{AuthMode, Config, ResolvedModel, Sandbox, resolve_sandbox};
 use crate::delegate::{Delegate, Sessions};
 use crate::mcp;
 use crate::model::{ConfiguredModel, OpenAiModel};
-use crate::runner::{
-    IdlePolicy, RecoveryBatch, RecoveryScope, SessionBootstrap, SessionHandle, SessionRunner,
-};
+use crate::runner::{IdlePolicy, SessionBootstrap, SessionHandle, SessionRunner};
 use crate::session_store::SessionStore;
 use crate::tools::{BackgroundTasks, builtins_with_bash_timeout};
 use crate::workspace::Workspace;
@@ -34,48 +32,93 @@ use crate::workspace::Workspace;
 /// What to do with background-task records left behind by a previous run
 /// when building a session.
 ///
-/// The caller decides based on what it knows about the previous owner:
+/// The caller decides whether to consume the session's own unfinished
+/// background-task records:
 ///
-/// - [`UnfinishedPolicy::Consume`]: process-level startup (CLI/TUI/REPL),
-///   and server lazy attach after the owner-liveness probe
-///   ([`SessionStore::unfinished_owner_all_dead`]) proved every previous
-///   owner dead. The old process is known dead, so its tasks really were
-///   killed with it: take the running-task records and inject a "tasks
-///   were killed" notice into the resumed history.
-/// - [`UnfinishedPolicy::Preserve`]: a server lazily attaching to a session
-///   that may still be alive in another process (a live owner, an old
-///   record without an owner, or an unjudgeable identity). Do not read
-///   the records and do not inject any notice; the owning process clears
-///   them itself via `ack_background_entry` → `clear_background_task`
-///   when it finishes.
+/// - [`UnfinishedPolicy::Consume`]: take the running-task records and inject
+///   a "tasks were killed" notice into the resumed history.
+/// - [`UnfinishedPolicy::Preserve`]: leave the records untouched and do not
+///   inject a notice; the owning process may acknowledge them itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnfinishedPolicy {
-    /// The previous owner is dead; consume the records and announce that
-    /// its tasks were killed.
+    /// Consume this session's records and announce that its tasks were killed.
     Consume,
-    /// The session may still be live in another process: leave the
-    /// records untouched for the owning process to acknowledge.
+    /// Leave this session's records untouched and inject no notice.
     Preserve,
 }
 
-/// 消费一个会话的未完成后台任务记录并注入「随进程被杀」Notice。
-/// 原子消费（`take_unfinished_background`：SQLite/Greptime 是 DELETE、
-/// JSONL 是删记录文件）→ 非空则把 Notice 追加到该会话的存储并返回
-/// `Some((entry, location))`（已持久化 + 其精确物理 located key，调用方可
-/// 直接 `apply_entry_located` 让后续 provider 投影能对 Notice 文本发 receipt）；
-/// 无记录返回 `None`。build_session 的 Consume 路径使用；server 启动时的
-/// 僵尸扫描已改为两遍汇总设计（只往父会话注入、子会话只消费不注入，见
-/// server attach uses runner bootstrap instead，不再调用本函数。
-///
-/// 只写存储、不要求 live agent：Notice 是普通持久化条目，会话下次
-/// `restore_history` 时自然读到。调用方若手头有刚建好的 agent（build
-/// 路径），应把返回的 entry `apply_entry_located` 进内存历史，让首轮
-/// prompt 立即看到；启动扫描没有 live agent，直接丢弃返回值即可。
-///
-/// 幂等性：记录被消费后 take 再取为空，重复调用返回 `None`；与并发
-/// resume 的竞态由消费的原子性保证——谁先 take 谁注入。
-///
+/// Process-local admission key: the same session id in different workspaces or
+/// backend instances is a different session.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct LocalSessionKey {
+    pub workspace: String,
+    pub backend: String,
+    pub session: String,
+}
+
+/// Shared process-local admission registry. Persisted rows are deliberately
+/// not consulted; a permit only represents a live local runner.
+#[derive(Clone, Default)]
+pub struct LocalSessionRegistry {
+    live: Arc<std::sync::Mutex<HashSet<LocalSessionKey>>>,
+}
+
+pub struct LocalSessionPermit {
+    registry: LocalSessionRegistry,
+    key: Option<LocalSessionKey>,
+}
+
+impl LocalSessionRegistry {
+    #[allow(clippy::result_unit_err)]
+    pub fn reserve(&self, key: LocalSessionKey) -> Result<LocalSessionPermit, ()> {
+        let mut live = self.live.lock().unwrap();
+        if !live.insert(key.clone()) {
+            return Err(());
+        }
+        Ok(LocalSessionPermit {
+            registry: self.clone(),
+            key: Some(key),
+        })
+    }
+
+    pub fn key(
+        workspace_root: &Path,
+        storage_root: &Path,
+        backend: &crate::config::SessionBackend,
+        session: &str,
+    ) -> LocalSessionKey {
+        let workspace = crate::session_store::derive_workspace_id(workspace_root);
+        let (kind, instance) = match backend {
+            crate::config::SessionBackend::Jsonl => (
+                "jsonl",
+                crate::session_store::derive_workspace_id(storage_root),
+            ),
+            crate::config::SessionBackend::Sqlite { path } => (
+                "sqlite",
+                crate::session_store::normalize_db_path(
+                    &crate::session_store::resolve_sqlite_path(storage_root, path.as_deref()),
+                ),
+            ),
+            crate::config::SessionBackend::Greptime { conn } => ("greptime", conn.clone()),
+        };
+        LocalSessionKey {
+            workspace,
+            backend: crate::session_store::backend_instance_fingerprint(kind, &instance),
+            session: session.to_owned(),
+        }
+    }
+}
+
+impl Drop for LocalSessionPermit {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.registry.live.lock().unwrap().remove(&key);
+        }
+    }
+}
+
 /// Everything resolved once at startup and shared by every built session.
+#[derive(Clone)]
 pub struct SessionFactory {
     workspace: Workspace,
     root: PathBuf,
@@ -101,6 +144,7 @@ pub struct SessionFactory {
     /// it is for the main model at startup (the wire model replaces the
     /// profile's).
     model: Option<String>,
+    local_sessions: LocalSessionRegistry,
     /// Already-resolved bwrap policy (`None` = sandbox disabled). Fixed at
     /// startup: `[sandbox]` changes require a restart (workspace roots and
     /// file capabilities are wired at construction).
@@ -185,6 +229,7 @@ pub struct SessionBuild {
     pub session: String,
     pub model_name: String,
     pub role_name: Option<String>,
+    pub local_permit: LocalSessionPermit,
 }
 
 impl SessionFactory {
@@ -338,6 +383,7 @@ impl SessionFactory {
             profile: profile.map(str::to_owned),
             base_url: base_url_override,
             model: model_override_flag,
+            local_sessions: LocalSessionRegistry::default(),
             sandbox,
             code_mode,
             read_only,
@@ -355,6 +401,14 @@ impl SessionFactory {
     /// The session storage backend this factory builds stores for.
     pub fn backend(&self) -> &crate::config::SessionBackend {
         &self.backend
+    }
+
+    pub fn local_sessions(&self) -> LocalSessionRegistry {
+        self.local_sessions.clone()
+    }
+
+    pub fn local_session_key(&self, session: &str) -> LocalSessionKey {
+        LocalSessionRegistry::key(&self.root, &self.root, &self.backend, session)
     }
 
     /// The TUI submit/newline key mapping from `[tui]` (default
@@ -581,12 +635,9 @@ impl SessionFactory {
     /// `id` is the requested session id; `fork_from` is `(source session,
     /// optional 1-based entry index)` and replaces `id` with a fresh
     /// `fork-…` id. `unfinished` selects how leftover background-task
-    /// records are handled: `Consume` (process-level startup, or server
-    /// attach after the owner-liveness probe; see [`UnfinishedPolicy`])
-    /// takes them and injects a "killed with the process" notice,
-    /// `Preserve` (server lazy attach to a possibly-live session, or a
-    /// fork, which has no records of its own) leaves them for
-    /// the owning process. The caller still chooses when to
+    /// records are handled: `Consume` takes this session's own records and
+    /// injects a "killed with the process" notice; `Preserve` leaves them
+    /// untouched. The caller still chooses when to
     /// `runner.start(...)` with its initial prompt.
     pub async fn build(
         &self,
@@ -632,6 +683,15 @@ impl SessionFactory {
         fork_target: Option<&str>,
     ) -> anyhow::Result<SessionBuild> {
         let mut session = id.to_owned();
+        let mut local_permit = if fork_target.is_some() || fork_from.is_none() {
+            Some(
+                self.local_sessions
+                    .reserve(self.local_session_key(&session))
+                    .map_err(|_| anyhow!("session {session} is already live locally"))?,
+            )
+        } else {
+            None
+        };
         let mut store = SessionStore::connect(&self.backend, &self.root, &session).await?;
         let mut bootstrap_entries = Vec::new();
         if let Some((source, at)) = fork_from {
@@ -673,6 +733,13 @@ impl SessionFactory {
             bootstrap_entries = fork_entries;
             eprintln!("e-agent: forked session: {new_id}");
             session = new_id;
+            if local_permit.is_none() {
+                local_permit = Some(
+                    self.local_sessions
+                        .reserve(self.local_session_key(&session))
+                        .map_err(|_| anyhow!("session {session} is already live locally"))?,
+                );
+            }
         }
         // Snapshot the reloadable state once: the config watcher may swap it
         // between awaits, so everything below uses one consistent view. The
@@ -747,6 +814,7 @@ impl SessionFactory {
         .with_subagent_context_window(subagent_context_window)
         .with_roles_root(self.root.clone())
         .with_sandbox(self.sandbox.clone())
+        .with_local_sessions(self.local_sessions.clone())
         .record_background_tasks_in(self.root.clone(), &session, store.clone())
         .with_persist_store(self.backend.clone());
         if let Some(subagent_model) = &subagent_model {
@@ -798,13 +866,8 @@ impl SessionFactory {
             Vec::new()
         };
         let bootstrap = SessionBootstrap {
-            recovery_batches: if matches!(unfinished, UnfinishedPolicy::Consume)
-                && !recovery_labels.is_empty()
-            {
-                vec![RecoveryBatch {
-                    scope: RecoveryScope::Session,
-                    tasks: recovery_labels,
-                }]
+            recovery_tasks: if matches!(unfinished, UnfinishedPolicy::Consume) {
+                recovery_labels
             } else {
                 Vec::new()
             },
@@ -852,6 +915,7 @@ impl SessionFactory {
             session,
             model_name,
             role_name,
+            local_permit: local_permit.expect("session build must reserve its local id"),
         })
     }
 
@@ -897,6 +961,7 @@ impl SessionFactory {
             profile: None,
             base_url: None,
             model: None,
+            local_sessions: LocalSessionRegistry::default(),
             sandbox: None,
             code_mode: false,
             read_only: false,
