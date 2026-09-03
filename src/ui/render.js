@@ -671,6 +671,12 @@ function renderToolArgs(name, parsed, rawText) {
 marked.setOptions({ gfm: true, breaks: true });
 marked.use({
   renderer: {
+    // Marked treats tag-shaped placeholders as HTML. Escape that token once
+    // here: assigning the result to innerHTML then creates a text node, while
+    // code spans/fences continue to use Marked's normal escaping.
+    html(html) {
+      return escapeHtml(html);
+    },
     link(href, title, text) {
       // 只允许 http/https/mailto/# 链接；javascript: 等协议拒绝
       if (!/^(https?:|mailto:|#|\/)/i.test(href || "")) {
@@ -695,11 +701,6 @@ function renderMarkdown(text) {
       math.push({ display: false, body });
       return "\u0000M" + (math.length - 1) + "\u0000";
     });
-  // 不允许内嵌原始 HTML：把 < > 先转义再喂给 marked（表格/代码块不受影响）
-  s = s.replace(/<(\/?)([a-zA-Z][a-zA-Z0-9-]*)([^>]*)>/g, (m, slash, tag, rest) => {
-    // 白名单：保留代码块围栏和占位符（它们不含 <tag> 形态）
-    return "&lt;" + slash + tag + rest + "&gt;";
-  });
   let html;
   try {
     html = marked.parse(s);

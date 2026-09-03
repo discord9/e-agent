@@ -28,7 +28,7 @@ async def run_chat_open_sse(c):
     c.history = {
         "entries": [
             {"type": "message", "message": {"User": {"content": "你好，帮我看看", "images": []}}},
-            {"type": "message", "message": {"Assistant": {"content": "好的，我来处理。",
+            {"type": "message", "message": {"Assistant": {"content": "好的，`<workspace>/.e-agent/agents/*.md` 和 <workspace>。",
                 "tool_calls": [{"id": "call1", "name": "bash", "arguments": '{"command":"ls"}'}],
                 "reasoning": None}}},
             {"type": "message", "message": {"Tool": {"call_id": "call1", "name": "bash",
@@ -45,7 +45,7 @@ async def run_chat_open_sse(c):
         "event: ReasoningDelta\ndata: {\"type\":\"reasoning_delta\",\"session_id\":\"s1\",\"seq\":4,\"delta\":\"推理中\"}",
         "event: ToolCall\ndata: {\"type\":\"tool_call\",\"session_id\":\"s1\",\"seq\":5,\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}",
         "event: ToolResult\ndata: {\"type\":\"tool_result\",\"session_id\":\"s1\",\"seq\":6,\"is_error\":true,\"content\":\"文件不存在\"}",
-        "event: AssistantText\ndata: {\"type\":\"assistant_text\",\"session_id\":\"s1\",\"seq\":7,\"text\":\"出错了，**换个方式**。\"}",
+        "event: AssistantText\ndata: {\"type\":\"assistant_text\",\"session_id\":\"s1\",\"seq\":7,\"text\":\"出错了，**换个方式**，`<workspace>/.e-agent/agents/*.md` 和 <workspace>。\"}",
         "event: Notice\ndata: {\"type\":\"notice\",\"session_id\":\"s1\",\"seq\":8,\"text\":\"系统提示行\"}",
         "event: Usage\ndata: {\"type\":\"usage\",\"session_id\":\"s1\",\"seq\":9,\"context_input\":1234,\"session\":{\"input_tokens\":100,\"output_tokens\":50}}",
         "event: Error\ndata: {\"type\":\"error\",\"session_id\":\"s1\",\"seq\":10,\"error\":\"回合失败\"}",
@@ -67,7 +67,13 @@ async def run_chat_open_sse(c):
     # history 渲染
     t = await c.ev("els.messages.textContent")
     c.check("历史：用户消息", "你好，帮我看看" in t, "")
-    c.check("历史：助手消息", "好的，我来处理。" in t, "")
+    c.check("历史：助手消息", "好的，" in t and "<workspace>/.e-agent/agents/*.md" in t
+            and "<workspace>" in t, "")
+    history_body = c.page.locator("#messages .msg-assistant .msg-body").first
+    c.check("历史：占位符 DOM 文本无嵌套 HTML",
+            await history_body.locator("code").first.text_content() == "<workspace>/.e-agent/agents/*.md"
+            and await history_body.locator("code").first.locator("*").count() == 0,
+            await history_body.inner_html())
     c.check("历史：工具卡片（bash + 完成）",
             await c.ev("els.messages.querySelectorAll('.tool-card').length") >= 1
             and "bash" in t and "file1" in t, "")
@@ -82,6 +88,12 @@ async def run_chat_open_sse(c):
             and await c.ev("els.messages.querySelectorAll('.tool-result.err').length") == 1, "")
     html = await c.ev("els.messages.innerHTML")
     c.check("SSE：AssistantText markdown 渲染", "出错了，" in t and "<strong>换个方式</strong>" in html, "")
+    live_body = c.page.locator("#messages .msg-assistant .msg-body").last
+    c.check("SSE：占位符 DOM 文本无嵌套 HTML",
+            await live_body.locator("code").first.text_content() == "<workspace>/.e-agent/agents/*.md"
+            and await live_body.locator("code").first.locator("*").count() == 0
+            and "<workspace>" in await live_body.text_content(),
+            await live_body.inner_html())
     c.check("SSE：Notice 渲染", "系统提示行" in t, "")
     usage_text = await c.ev("els.usageInfo.textContent")
     c.check("SSE：Usage 无 window 回退为完整上下文（不显示累计输入/输出）",

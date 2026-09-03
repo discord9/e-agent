@@ -17,7 +17,7 @@ JS_FILES = ['app.js', 'render.js', 'sessions.js', 'tasks.js', 'sse.js']
 js = "\n".join(open(os.path.join(HERE, f), encoding='utf-8').read() for f in JS_FILES)
 vendor_js = open(os.path.join(HERE, 'vendor', 'marked.min.js'), encoding='utf-8').read()
 
-MODE = os.environ.get('MODE', 'open')   # 'open' = full suite; 'composer-history' = focused ArrowUp checks
+MODE = os.environ.get('MODE', 'open')   # 'open' = full suite; 'markdown' = focused DOM-safety/rendering checks; 'composer-history' = focused ArrowUp checks
 DEEP_LINK = os.environ.get('DEEP_LINK', '')   # 注入 ?session=<id> 到 location.search（init 启动时解析）
 TRACE = os.environ.get('TRACE') == '1'
 # gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；页面 JS 里的 new TextDecoder() 换成桩工厂。
@@ -100,7 +100,7 @@ function parseHtml(html){
               .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
               .replace(/&amp;/g, "&");
             if (an === "class") cls.push(av);
-            else if (an.startsWith("data-")) e.setAttribute(an, av);
+            else if (an.startsWith("data-") || an === "href" || an === "src") e.setAttribute(an, av);
             else if (an === "hidden") e.hidden = true;
             else if (an === "open") e.setAttribute("open", "");
           }
@@ -780,6 +780,40 @@ async function main(){
       chk("refresh deep link list failure stays pending",
           state.deepLink.pending === "refresh-race"
           && !elsById["bannerText"].textContent.includes("不存在"));
+      console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
+      imports.system.exit(0);
+    }
+
+    if (MODE === 'markdown') {
+      const markdown = [
+        "`<workspace>/.e-agent/agents/*.md`",
+        "<workspace>",
+        "<script>alert(1)</script>",
+        "<img onerror=\"alert(1)\" src=x>",
+        "[unsafe](javascript:alert(1))",
+        "**bold** and `code`",
+        "```\n<workspace>\n```",
+      ].join("\n\n");
+      const body = el("div", "msg-body");
+      body.innerHTML = renderMarkdown(markdown);
+      const code = body.querySelector("code");
+      chk("markdown placeholder code text", code && code.textContent === "<workspace>/.e-agent/agents/*.md");
+      chk("markdown placeholder code has no nested HTML", code && code.querySelector("*") === null);
+      chk("markdown plain placeholder text", body.textContent.includes("<workspace>"));
+      chk("markdown raw HTML inert in DOM", body.querySelector("script") === null
+          && body.querySelector("img") === null
+          && !body.querySelectorAll("*").some((e) => e.hasAttribute("onerror")));
+      chk("markdown unsafe href rejected", body.querySelector("a") === null);
+      const extras = el("div", "msg-body");
+      extras.innerHTML = renderMarkdown("| a | b |\n|---|---|\n| 1 | 2 |\n\n[safe](https://example.test/)\n\n$ x^2 $");
+      chk("markdown table safe link and KaTeX preserved",
+          extras.querySelector("table") !== null
+          && extras.querySelector("a") !== null
+          && extras.querySelector("a").getAttribute("href") === "https://example.test/"
+          && extras.querySelector(".katex") !== null);
+      chk("markdown ordinary syntax preserved", body.querySelector("strong") !== null
+          && body.querySelectorAll("code").length >= 2
+          && body.querySelector("pre") !== null);
       console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
       imports.system.exit(0);
     }
@@ -7913,6 +7947,7 @@ main();
 '''.replace('MODE === \'direct\'', 'true' if MODE == 'direct' else 'false') \
    .replace("MODE === 'header'", 'true' if MODE == 'header' else 'false') \
    .replace("MODE === 'composer-history'", 'true' if MODE == 'composer-history' else 'false') \
+   .replace("MODE === 'markdown'", 'true' if MODE == 'markdown' else 'false') \
    .replace("MODE === 'refresh-deep-link'", 'true' if MODE == 'refresh-deep-link' else 'false')
 
 # DEEP_LINK env → location.search 注入（init() 启动时 URL 解析入口）
