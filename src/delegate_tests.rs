@@ -724,13 +724,24 @@ fn spec_discloses_dynamic_role_descriptions_but_keeps_name_enum() {
     let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let xdg = temp.path().join("xdg-empty");
-    std::fs::create_dir_all(&xdg).unwrap();
+    std::fs::create_dir_all(xdg.join("e-agent/agents")).unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
     let agents = temp.path().join("agents");
     std::fs::create_dir_all(&agents).unwrap();
+    std::fs::create_dir_all(temp.path().join(".e-agent/agents")).unwrap();
+    std::fs::write(
+        xdg.join("e-agent/agents/described.md"),
+        "---\ndescription = \"Global description\"\n---\nGlobal prompt",
+    )
+    .unwrap();
     std::fs::write(
         agents.join("described.md"),
-        "---\ndescription = \"A described role\"\n---\nPrompt",
+        "---\ndescription = \"Legacy description\"\n---\nLegacy prompt",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join(".e-agent/agents/described.md"),
+        "---\ndescription = \"A described role\"\n---\nCanonical prompt",
     )
     .unwrap();
     std::fs::write(agents.join("legacy.md"), "Legacy prompt").unwrap();
@@ -1267,6 +1278,17 @@ async fn role_model_snapshot_used_without_live_source() {
 
 /// Run one subagent through a capturing mock model and return the wire
 /// request body (tools array + system prompt) plus the tool result.
+async fn run_canonical_subagent_and_capture(
+    temp: &tempfile::TempDir,
+    role_template: &str,
+    with_sandbox: bool,
+) -> (String, String) {
+    let directory = temp.path().join(".e-agent/agents");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("auditor.md"), role_template).unwrap();
+    run_subagent_and_capture(temp, role_template, with_sandbox).await
+}
+
 async fn run_subagent_and_capture(
     temp: &tempfile::TempDir,
     role_template: &str,
@@ -1274,7 +1296,9 @@ async fn run_subagent_and_capture(
 ) -> (String, String) {
     let directory = temp.path().join("agents");
     std::fs::create_dir_all(&directory).unwrap();
-    std::fs::write(directory.join("auditor.md"), role_template).unwrap();
+    if !temp.path().join(".e-agent/agents/auditor.md").exists() {
+        std::fs::write(directory.join("auditor.md"), role_template).unwrap();
+    }
 
     let (url, captured) = capturing_model().await;
     let mut tool = delegate_with_url(temp.path(), url).with_roles_root(temp.path().to_path_buf());
@@ -1302,6 +1326,39 @@ async fn run_subagent_and_capture(
     let output = await_completion(&mut receiver).await;
     let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
     (output, request)
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn canonical_role_wins_for_delegate_prompt_and_attributes() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg-empty");
+    std::fs::create_dir_all(xdg.join("e-agent/agents")).unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+    let legacy = temp.path().join("agents");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(
+        legacy.join("auditor.md"),
+        "---\ndescription = \"legacy\"\nread_only = false\nprotect_git = true\n---\nlegacy prompt",
+    )
+    .unwrap();
+    std::fs::write(xdg.join("e-agent/agents/auditor.md"), "global prompt").unwrap();
+
+    let (output, request) = run_canonical_subagent_and_capture(
+        &temp,
+        "---\ndescription = \"canonical\"\nread_only = true\nprotect_git = false\n---\ncanonical prompt",
+        false,
+    )
+    .await;
+    assert!(output.contains("done"), "{output}");
+    assert!(request.contains("canonical prompt"), "{request}");
+    assert!(!request.contains("legacy prompt"), "{request}");
+    assert!(!request.contains("\"write_file\""), "{request}");
+    assert!(!request.contains("\"edit_file\""), "{request}");
+    assert!(request.contains("This role is read-only"), "{request}");
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
 }
 
 #[tokio::test]

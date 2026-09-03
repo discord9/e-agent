@@ -55,27 +55,106 @@ fn workspace_overrides_global_and_unions() {
 }
 
 #[test]
+fn all_layers_are_scanned_with_canonical_precedence_and_atomic_attributes() {
+    let _guard = XDG_TEST_LOCK.lock().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (global, legacy, canonical) = isolated_layers(&workspace);
+
+    std::fs::write(
+        global.join("shared.md"),
+        "---\ndescription = \"global\"\nread_only = false\nprotect_git = true\n---\nglobal prompt",
+    )
+    .unwrap();
+    std::fs::write(
+        legacy.join("shared.md"),
+        "---\ndescription = \"legacy\"\nread_only = true\nprotect_git = false\n---\nlegacy prompt",
+    )
+    .unwrap();
+    std::fs::write(
+        canonical.join("shared.md"),
+        "---\ndescription = \"canonical\"\nread_only = false\nprotect_git = false\n---\ncanonical prompt",
+    )
+    .unwrap();
+    std::fs::write(legacy.join("legacy-only.md"), "legacy-only prompt").unwrap();
+    std::fs::write(canonical.join("canonical-only.md"), "canonical-only prompt").unwrap();
+    std::fs::write(canonical.join("main.md"), "canonical main prompt").unwrap();
+
+    assert_eq!(
+        available_roles(workspace.path()),
+        vec!["canonical-only", "legacy-only", "shared"]
+    );
+    let shared = role_template(workspace.path(), "shared").unwrap().unwrap();
+    assert_eq!(shared.prompt, "canonical prompt");
+    assert_eq!(shared.description.as_deref(), Some("canonical"));
+    assert!(!shared.read_only);
+    assert!(!shared.protect_git);
+    assert_eq!(
+        role_prompt(workspace.path(), "legacy-only")
+            .unwrap()
+            .as_deref(),
+        Some("legacy-only prompt")
+    );
+    assert_eq!(
+        role_prompt(workspace.path(), "canonical-only")
+            .unwrap()
+            .as_deref(),
+        Some("canonical-only prompt")
+    );
+    assert_eq!(
+        role_prompt(workspace.path(), MAIN_ROLE).unwrap().as_deref(),
+        Some("canonical main prompt")
+    );
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+#[test]
+fn malformed_canonical_role_fails_closed_without_global_fallback() {
+    let _guard = XDG_TEST_LOCK.lock().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (global, _, canonical) = isolated_layers(&workspace);
+    std::fs::write(global.join("broken.md"), "global fallback").unwrap();
+    std::fs::write(
+        canonical.join("broken.md"),
+        "---\ndescription = 7\n---\ncanonical prompt",
+    )
+    .unwrap();
+
+    assert_eq!(
+        role_template(workspace.path(), "broken")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+#[test]
 fn invalid_role_names_read_nothing() {
     let temp = tempfile::tempdir().unwrap();
     assert_eq!(role_prompt(temp.path(), "../etc/passwd").unwrap(), None);
     assert_eq!(role_prompt(temp.path(), "").unwrap(), None);
 }
 
-fn isolated_layers(workspace: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+fn isolated_layers(
+    workspace: &tempfile::TempDir,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let xdg = workspace.path().join("xdg");
     let global = xdg.join("e-agent/agents");
     std::fs::create_dir_all(&global).unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
-    let ws_agents = workspace.path().join(AGENTS_DIR);
-    std::fs::create_dir_all(&ws_agents).unwrap();
-    (global, ws_agents)
+    let legacy = workspace.path().join(AGENTS_DIR);
+    std::fs::create_dir_all(&legacy).unwrap();
+    let canonical = workspace.path().join(".e-agent").join(AGENTS_DIR);
+    std::fs::create_dir_all(&canonical).unwrap();
+    (global, legacy, canonical)
 }
 
 #[test]
 fn frontmatter_read_only_flag_and_prompt_stripping() {
     let _guard = XDG_TEST_LOCK.lock().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let (_, ws_agents) = isolated_layers(&workspace);
+    let (_, ws_agents, _) = isolated_layers(&workspace);
 
     std::fs::write(ws_agents.join("plain.md"), "You fix things.").unwrap();
     let template = role_template(workspace.path(), "plain").unwrap().unwrap();
@@ -132,7 +211,7 @@ fn frontmatter_read_only_flag_and_prompt_stripping() {
 fn description_is_trimmed_missing_blank_and_rejects_newlines() {
     let _guard = XDG_TEST_LOCK.lock().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let (_, ws_agents) = isolated_layers(&workspace);
+    let (_, ws_agents, _) = isolated_layers(&workspace);
 
     std::fs::write(
         ws_agents.join("described.md"),
@@ -180,7 +259,7 @@ fn description_is_trimmed_missing_blank_and_rejects_newlines() {
 fn frontmatter_flag_comes_from_the_winning_workspace_layer() {
     let _guard = XDG_TEST_LOCK.lock().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let (global, ws_agents) = isolated_layers(&workspace);
+    let (global, ws_agents, _) = isolated_layers(&workspace);
     std::fs::write(
         global.join("explorer.md"),
         "---\nread_only = true\n---\nglobal explorer",

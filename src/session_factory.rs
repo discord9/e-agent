@@ -828,9 +828,9 @@ impl SessionFactory {
         tools.push(Box::new(delegate));
         let mut agent = Agent::new(Box::new(main_model.clone()), tools);
         let mut context = Vec::new();
-        // The main agent's orchestrator template (.e-agent/agents/main.md)
-        // leads; it tells the model to decompose work and delegate to the
-        // named roles.
+        // The main agent's orchestrator template resolves through the same role
+        // layers as delegated roles; the highest-priority available template
+        // leads and tells the model to decompose work and delegate.
         let role_name = match crate::roles::role_prompt(&self.root, crate::roles::MAIN_ROLE)? {
             Some(orchestrator) => {
                 if let Some(reminder) = crate::roles::core_directive(&orchestrator) {

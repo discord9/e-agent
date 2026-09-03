@@ -2,11 +2,11 @@
 //! `<role>.md`, optionally led by a TOML frontmatter block
 //! (`---` … `---`) declaring role attributes such as `read_only = true` or
 //! `protect_git = false`.
-//! Roles come from two layers, merged with the workspace overriding the
-//! global user config:
+//! Roles come from three layers, merged from lowest to highest priority:
 //!
 //! - global:    `$XDG_CONFIG_HOME/e-agent/agents/` (or `~/.config/e-agent/agents/`)
-//! - workspace: `<workspace>/agents/`
+//! - legacy project: `<workspace>/agents/`
+//! - canonical project: `<workspace>/.e-agent/agents/`
 //!
 //! A role only exists when its file does — there are no built-in role
 //! prompts. The `delegate` tool lists the available roles and routes each
@@ -30,13 +30,14 @@ fn global_agents_dir() -> Option<PathBuf> {
     crate::config::config_dir().map(|dir| dir.join(AGENTS_DIR))
 }
 
-/// The two layer roots, lowest priority first: global, then workspace.
+/// The three layer directories, lowest priority first.
 fn layer_dirs(workspace: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(global) = global_agents_dir() {
         dirs.push(global);
     }
     dirs.push(workspace.join(AGENTS_DIR));
+    dirs.push(workspace.join(".e-agent").join(AGENTS_DIR));
     dirs
 }
 
@@ -72,14 +73,14 @@ struct RoleMeta {
 }
 
 /// Read the template for `role`, including frontmatter attributes: the
-/// workspace file wins over the global one. Returns `None` when neither
-/// exists; an error when a file exists but cannot be read, or when its
-/// frontmatter is malformed (first line `---` without a closing delimiter,
-/// or a TOML block that fails to parse — fail closed, the role is rejected).
+/// canonical project file wins over the legacy project and global ones.
+/// Returns `None` when neither exists; an error when a file exists but cannot
+/// be read, or when its frontmatter is malformed (first line `---` without a
+/// closing delimiter, or a TOML block that fails to parse — fail closed, the
+/// role is rejected).
 ///
-/// Both the prompt and the `read_only` flag always come from the SAME
-/// (winning) file: the workspace layer carries its own frontmatter, exactly
-/// like the global layer.
+/// Both the prompt and all attributes always come from the SAME (winning)
+/// file.
 pub fn role_template(workspace: &Path, role: &str) -> std::io::Result<Option<RoleTemplate>> {
     if !valid_role(role) {
         return Ok(None);
@@ -87,18 +88,19 @@ pub fn role_template(workspace: &Path, role: &str) -> std::io::Result<Option<Rol
     let file = format!("{role}.md");
     // Later layers override earlier ones, so take the LAST readable hit.
     // Empty files are skipped, matching role_prompt's historical behaviour.
+    // Parse only the winning file: a lower-priority malformed file must not
+    // affect a valid higher-priority override, while a malformed winner fails
+    // closed instead of falling back.
     let mut found = None;
     for dir in layer_dirs(workspace) {
         match std::fs::read_to_string(dir.join(&file)) {
-            Ok(content) if !content.trim().is_empty() => {
-                found = Some(parse_role_template(content)?);
-            }
+            Ok(content) if !content.trim().is_empty() => found = Some(content),
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
-    Ok(found)
+    found.map(parse_role_template).transpose()
 }
 
 /// Parse one role file. Frontmatter mode starts only when the file's FIRST
@@ -166,9 +168,10 @@ fn parse_role_template(content: String) -> std::io::Result<RoleTemplate> {
     })
 }
 
-/// Read the prompt for `role`, ignoring frontmatter attributes. The workspace
-/// file wins over the global one. Returns `None` when neither exists; an
-/// error when a file exists but cannot be read or has malformed frontmatter.
+/// Read the prompt for `role`, ignoring frontmatter attributes. The canonical
+/// project file wins over the legacy project and global ones. Returns `None`
+/// when neither exists; an error when a file exists but cannot be read or has
+/// malformed frontmatter.
 pub fn role_prompt(workspace: &Path, role: &str) -> std::io::Result<Option<String>> {
     Ok(role_template(workspace, role)?.map(|template| template.prompt))
 }
@@ -198,7 +201,7 @@ fn markdown_heading(line: &str) -> bool {
     (1..=6).contains(&hashes) && line.as_bytes().get(hashes) == Some(&b' ')
 }
 
-/// Role names available across both layers (union), sorted, excluding the
+/// Role names available across all layers (union), sorted, excluding the
 /// main-agent template (it is not a delegable role).
 pub fn available_roles(workspace: &Path) -> Vec<String> {
     let mut roles = std::collections::BTreeSet::new();

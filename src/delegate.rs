@@ -197,7 +197,8 @@ pub struct Delegate {
     /// `None` (a Delegate constructed directly, e.g. in tests) falls back to
     /// the construction-time `role_models` snapshot.
     role_model_source: Option<RoleModelSource>,
-    /// Workspace root used to read role templates (`.e-agent/agents/<role>.md`).
+    /// Workspace root used to resolve role templates across global, legacy
+    /// project (`agents/`), and canonical project (`.e-agent/agents/`) layers.
     roles_root: Option<std::path::PathBuf>,
     /// Optional bwrap sandbox inherited by every subagent's bash tool.
     sandbox: Option<crate::config::Sandbox>,
@@ -321,7 +322,7 @@ impl Delegate {
     }
 
     /// Enable role templates: the workspace root that holds
-    /// `.e-agent/agents/<role>.md`. Without this, `delegate` has no roles.
+    /// the role layers. Without this, `delegate` has no roles.
     pub fn with_roles_root(mut self, root: std::path::PathBuf) -> Self {
         self.roles_root = Some(root);
         self
@@ -964,10 +965,10 @@ impl Tool for Delegate {
             return Err("background task delivery is unavailable".into());
         }
         // Resolve the role: its model ([roles] <role> > subagent > main), its
-        // prompt template, read_only and protect_git declarations
-        // (.e-agent/agents/<role>.md frontmatter). An unknown role is
-        // rejected unless no roles are configured at all; a malformed
-        // frontmatter is an error (fail closed — the role is not spawned).
+        // prompt template, read_only and protect_git declarations from the
+        // winning role layer. An unknown role is rejected unless no roles are
+        // configured at all; malformed frontmatter is an error (fail closed —
+        // the role is not spawned).
         let (model, context_window, role_prompt, compaction_reminder, read_only, protect_git) =
             match role.as_deref() {
                 Some(role) => {

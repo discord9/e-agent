@@ -89,10 +89,12 @@ workspace session. `--model` is allowed for these profiles; `--base-url` is
 rejected because the Codex endpoint is fixed.
 
 The default delegated model can be routed with `[roles] subagent`; named
-role templates can also be routed by role name. Role templates are discovered
-from `$XDG_CONFIG_HOME/e-agent/agents/<role>.md` (falling back to
-`~/.config/e-agent/agents/`) and `<workspace>/agents/<role>.md`, with the
-workspace file winning. The delegate tool dynamically discloses each discovered
+role templates can also be routed by role name. Role templates are discovered from three layers, in increasing priority:
+`$XDG_CONFIG_HOME/e-agent/agents/<role>.md` (falling back to
+`~/.config/e-agent/agents/`), `<workspace>/agents/<role>.md` (legacy), and
+`<workspace>/.e-agent/agents/<role>.md` (canonical). All layers are scanned;
+the canonical project file wins over the legacy project file, which wins over
+the global file. The delegate tool dynamically discloses each discovered
 role as `name — description` when its description is present, or as plain
 `name` otherwise; the role parameter remains a simple enum of role names.
 Descriptions are package metadata for choosing a role, not additional routing
@@ -497,8 +499,8 @@ workspace version **fully replaces** the global one. The model opens a skill
 with the existing `read_file` tool: workspace skills through the workspace
 capability, global skills through an extra read-only capability rooted at the
 global skills directory that only the main session's file tools carry
-(subagents and btw forks never see it). The injection order is: main role
-template (`agents/main.md`) → workspace `AGENTS.md` → skills → MCP server
+(subagents and btw forks never see it). The injection order is: main role template (`.e-agent/agents/main.md`, with
+legacy and global role fallback) → workspace `AGENTS.md` → skills → MCP server
 instructions. Missing directories, non-directory entries, and symlinked skill
 directories / `SKILL.md` files are silently skipped; the global skills root
 must itself be a real directory, not a symlink.
