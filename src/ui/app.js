@@ -45,11 +45,15 @@ const state = {
   sessionId: null,           // 当前打开的会话
   status: "Idle",
   initSource: null,          // "history" | "snapshot" | null —— 初始渲染来源
+  goalProjectionGeneration: 0, // 当前打开会话的 GoalUpdated 投影代次
   pollTimer: null,
   pollGen: 0,              // 轮询代次：stopPolling 递增，使在途轮询的续调度失效
   lastValidateSig: null,     // 上一轮校验问题签名（相同则不再刷 banner）
   validateBannerUp: false,   // 当前 banner 是否由校验提示占用（恢复数据后只清自己的）
-  sse: { ctrl: null, retryTimer: null, stopped: false },
+  sse: {
+    ctrl: null, retryTimer: null, stopped: false,
+    snapshotCommitted: false, noLive: false, historyPending: false, pendingHistory: null,
+  },
   acc: null,                 // 增量渲染累积器（见 newAccumulator）
   nextBeforeSeq: null,       // 历史分页游标：下一段更早历史的 before_seq（loadHistory 响应里取；null=没有更多）
   sessionUsage: null,        // 当前会话持久化累计用量 {input_tokens, output_tokens}（含子会话，重启不清零）；
@@ -70,12 +74,13 @@ const state = {
   workspaceLists: {},        // workspaceId -> session[]：每台服务器各自的 /api/sessions 缓存
                              //（聚合侧边栏的数据源；由各自 pollWorkspaceSessions 刷新）
   workspaceErrors: {},       // workspaceId -> error string|null：轮询失败标记（侧边栏显示「无法连接」）
+  workspaceListInFlight: {},  // workspaceId -> pollGen：当前真实在途的会话列表请求
   queue: [],                 // 排队提示（FIFO；最多显示 3 条 + "+N"）
   queueExpanded: false,      // 排队条是否展开显示全部（默认收起）
   queues: {},                // wsId:sessionId -> queued prompt 快照（方案 B：切走保存、切回恢复；可能过期）
   pendingPrompts: new Map(), // wsId:sessionId -> in-flight/accepted prompt records (not queue snapshots)
   latestLocalPrompts: new Map(), // wsId:sessionId -> latest normal prompt submitted locally
-  deepLink: { pending: null, handled: false, probing: false, attemptEpoch: -1 },
+  deepLink: { pending: null, handled: false, probing: false, attemptEpoch: -1, waitingForList: false },
   // URL ?session= 深链：pending=待打开 id；handled=已消费（一次性）；
   // probing+attemptEpoch=深链 attempt 标记（防重复发起 + SSE 404 恢复判定）
   sessionStates: {},         // wsId:sessionId -> {html, scrollTop, nextBeforeSeq, olderDone, draft}：切走时保存，切回时恢复（不重新加载历史）

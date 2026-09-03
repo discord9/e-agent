@@ -13,6 +13,7 @@
                          冲突错误消息渲染为「错误: 」普通行（无 .msg-error.conflict
                          友好卡片 —— 卡片未合入，用例登记现状）。
 """
+import asyncio
 import json
 
 import common
@@ -37,7 +38,17 @@ async def run_chat_open_sse(c):
         ],
         "next_before_seq": None,
     }
+    # Live attach is SSE-first: the initial snapshot is the authoritative
+    # projection, followed by post-attach frames. Keep this realistic rather
+    # than relying on history to populate the live view.
     c.sse_body = "\n\n".join([
+        "event: snapshot\ndata: ["
+        + "{\"type\":\"user_prompt\",\"data\":{\"text\":\"你好，帮我看看\"}},"
+        + "{\"type\":\"assistant_text\",\"data\":{\"text\":\"好的，我来处理。\"}},"
+        + "{\"type\":\"tool_call\",\"data\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}},"
+        + "{\"type\":\"tool_result\",\"data\":{\"content\":\"file1\\nfile2\",\"is_error\":false}},"
+        + "{\"type\":\"notice\",\"data\":{\"text\":\"compacted: 早期内容已压缩\"}}"
+        + "]",
         "event: status\ndata: {\"status\":\"Busy\"}",
         "event: UserPrompt\ndata: {\"type\":\"user_prompt\",\"session_id\":\"s1\",\"seq\":1,\"text\":\"再来一次\"}",
         "event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"s1\",\"seq\":2,\"delta\":\"正在\"}",
@@ -65,13 +76,17 @@ async def run_chat_open_sse(c):
             await c.ev("!els.chatView.classList.contains('hidden') && !els.chatView.classList.contains('no-session')"), "")
 
     # history 渲染
+    # Read after the live attach has drained: the snapshot replaces the
+    # temporary history projection, then queued live frames are applied.
     t = await c.ev("els.messages.textContent")
     c.check("历史：用户消息", "你好，帮我看看" in t, "")
     c.check("历史：助手消息", "好的，我来处理。" in t, "")
     c.check("历史：工具卡片（bash + 完成）",
             await c.ev("els.messages.querySelectorAll('.tool-card').length") >= 1
             and "bash" in t and "file1" in t, "")
-    c.check("历史：压缩分界线", "—— 上下文已压缩 ——" in t and "早期内容已压缩" in t, "")
+    c.check("快照：server-native compaction notice",
+            t.count("早期内容已压缩") == 1
+            and "—— 上下文已压缩 ——" not in t, t)
 
     # SSE live 事件
     c.check("SSE：UserPrompt 渲染", "再来一次" in t, "")
@@ -140,15 +155,11 @@ async def run_chat_state_preserved(c):
                     "message": {"Assistant": {"content": "长内容" * 60, "tool_calls": [],
                                               "reasoning": None}}})
     c.history = {"entries": entries, "next_before_seq": None}
-
-    # 本用例不需要 SSE 事件：让 /events 流挂起（不结束），避免 app 的 3s 断线
-    # 重连触发 loadHistory，干扰「不重新加载历史」的计数断言。
-    import asyncio as _asyncio
-
-    async def hold_events(route, url, method):
-        await _asyncio.sleep(120)
-        await route.fulfill(status=200, headers={"content-type": "text/event-stream"}, body="")
-    c.extra_handlers.append((lambda url, method: url.endswith("/events"), hold_events))
+    # The server attach is authoritative and must respond immediately.  This
+    # realistic snapshot carries the same projection expected from history.
+    c.sse_body = "event: snapshot\ndata: [" + ",".join(
+        '{"type":"user_prompt","data":{"text":"历史消息 %d"}}' % i
+        for i in range(30)) + "," + '{"type":"assistant_text","data":{"text":"%s"}}' % ("长内容" * 60) + "]\n\n"
 
     await c.start()
     await c.open_sidebar()
@@ -182,6 +193,95 @@ async def run_chat_state_preserved(c):
             await c.page.locator("#messages .msg-user").count() == 30, "")
     hist_a = [u for u, _ in c.records["history"] if "/sess-a/history" in u]
     c.check("切回 sess-a：缓存先恢复并补拉最新历史", len(hist_a) == 2, f"fetches={len(hist_a)}")
+
+async def run_chat_attach_replay(c):
+    """Real-browser regression for switching into a live receiver mid-stream."""
+    c.sessions = [S("session-a", "Idle", False, None, "会话 A"),
+                  S("session-b", "Busy", True, None, "会话 B")]
+    c.history = {"entries": [], "next_before_seq": None}
+
+    # A is deliberately visible before switching. B's response is the fixed
+    # server wire: one authoritative snapshot followed by receiver frames.
+    c.sse_body = (
+        "event: snapshot\ndata: []\n\n"
+        "event: status\ndata: {\"status\":\"Busy\"}\n\n"
+        "event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"delta\":\"A-TEXT\"}\n\n"
+    )
+
+    await c.start()
+    await c.open_sidebar()
+    await c.page.locator("#sidebarTree .tree-row", has_text="session-a").first.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'session-a'")
+    await c.page.wait_for_function("() => els.messages.textContent.includes('A-TEXT')")
+    const_navigation_count = await c.ev("performance.getEntriesByType('navigation').length")
+
+    # Swap the mocked stream before opening B, keeping the same route handler.
+    c.sse_body = (
+        "event: snapshot\ndata: ["
+        "{\"type\":\"user_prompt\",\"data\":{\"text\":\"B prompt\"}},"
+        "{\"type\":\"assistant_delta\",\"data\":{\"delta\":\"PREFIX-\"}}"
+        "]\n\n"
+        "event: status\ndata: {\"status\":\"Busy\"}\n\n"
+        "event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"delta\":\"SUFFIX\"}\n\n"
+    )
+    await c.page.locator("#sidebarTree .tree-row", has_text="session-b").first.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'session-b'")
+    await c.page.wait_for_function("() => els.messages.textContent.includes('PREFIX-SUFFIX')")
+
+    text = await c.page.locator("#messages").text_content()
+    bubbles = c.page.locator("#messages .msg-assistant")
+    c.check("attach replay: B projection is one assistant bubble",
+            await bubbles.count() == 1, f"bubbles={await bubbles.count()}")
+    c.check("attach replay: prefix and suffix are ordered once",
+            text.count("PREFIX-") == 1 and text.count("SUFFIX") == 1
+            and text.index("PREFIX-") < text.index("SUFFIX"), text)
+    c.check("attach replay: exact combined assistant text",
+            text.count("PREFIX-SUFFIX") == 1, text)
+    c.check("attach replay: A text is absent after switch",
+            "A-TEXT" not in text, text)
+    c.check("attach replay: no duplicate history head",
+            text.count("B prompt") == 1, text)
+    c.check("attach replay: no document navigation",
+            await c.ev("performance.getEntriesByType('navigation').length") == const_navigation_count
+            and await c.ev("location.pathname + location.search") == "/?session=session-b",
+            await c.ev("location.pathname + location.search"))
+
+async def run_chat_sse_auth_race(c):
+    """A delayed 401/403 from the old SSE cannot mutate session B."""
+    c.sessions = [S("session-a", "Idle", False, None, "会话 A"),
+                  S("session-b", "Busy", True, None, "会话 B")]
+    c.history = {"entries": [], "next_before_seq": None}
+    c.sse_body = "event: snapshot\\ndata: []\\n\\n"
+    await c.start()
+    await c.open_sidebar()
+
+    # Delay only A's events response. Abort on navigation is intentionally
+    # disabled for this route so the delayed HTTP status still reaches JS.
+    pending = {}
+    async def delayed_auth(route, url, method):
+        if url.endswith("/session-a/events"):
+            pending["route"] = route
+            await asyncio.sleep(0.8)
+            await route.fulfill(status=401, content_type="application/json", body="{}")
+        else:
+            await route.fulfill(status=200, headers={"content-type": "text/event-stream"},
+                                body=c.sse_body)
+    c.extra_handlers.append((lambda url, method: url.endswith("/events"), delayed_auth))
+
+    await c.page.locator("#sidebarTree .tree-row", has_text="session-a").first.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'session-a'")
+    await c.page.locator("#sidebarTree .tree-row", has_text="session-b").first.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.sessionId === 'session-b'")
+    await c.page.evaluate("""() => {
+        setBanner('B banner');
+        setConn('ok', 'B connected');
+        appendNotice('B transcript');
+    }""")
+    before = await c.ev("({sid:state.sessionId, banner:els.bannerText.textContent, bannerHidden:els.banner.hidden, conn:els.connState.textContent, connClass:els.connState.className, text:els.messages.textContent})")
+    await c.page.wait_for_timeout(1100)
+    after = await c.ev("({sid:state.sessionId, banner:els.bannerText.textContent, bannerHidden:els.banner.hidden, conn:els.connState.textContent, connClass:els.connState.className, text:els.messages.textContent})")
+    c.check("stale SSE 401 after switch is a complete no-op", after == before, f"before={before} after={after}")
+
 
 async def run_chat_error_render(c):
     c.sessions = [
@@ -246,7 +346,8 @@ async def run_conflict_card(c):
         ],
         "next_before_seq": None,
     }
-    c.sse_body = ("event: status\ndata: {\"status\":\"Failed(concurrent write conflict)\"}\n\n"
+    c.sse_body = ("event: snapshot\ndata: []\n\n"
+                  "event: status\ndata: {\"status\":\"Failed(concurrent write conflict)\"}\n\n"
                   "event: Error\ndata: {\"type\":\"error\",\"session_id\":\"s1\","
                   "\"seq\":1,\"error\":\"会话被其他客户端占用，已停止写入以避免数据冲突。\"}\n\n")
 
@@ -276,6 +377,10 @@ CASES = [
      "run": run_chat_open_sse},
     {"name": "chat_state_preserved", "desc": "切会话状态保留（草稿/滚动/缓存，不重拉历史）",
      "run": run_chat_state_preserved},
+    {"name": "chat_attach_replay", "desc": "切入流式会话时 snapshot + suffix 不重复",
+     "run": run_chat_attach_replay},
+    {"name": "chat_sse_auth_race", "desc": "旧 SSE 延迟 401 不得污染切换后的会话",
+     "run": run_chat_sse_auth_race},
     {"name": "chat_error_render", "desc": "错误渲染（Failed->失败、错误行、Finished 禁输入）",
      "run": run_chat_error_render},
     {"name": "conflict_card", "desc": "并发写冲突现状：Failed->失败 chip、冲突错误消息行（无 .conflict 卡片）",
