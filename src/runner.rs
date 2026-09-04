@@ -908,6 +908,54 @@ impl SessionRunner {
         }
     }
 
+    /// Intercepted current-session history tool. The binding is entirely
+    /// runner-owned: model arguments never select a store, root, or session.
+    async fn execute_history_tool(&mut self, call: &ToolCall) -> Result<ToolOutput, String> {
+        let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
+            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
+        let text =
+            crate::tools::history::execute(&self.store, &self.root, &self.session, &arguments)
+                .await?;
+        Ok(ToolOutput::text(text))
+    }
+
+    /// Commit and publish a runner-intercepted tool result. The same result
+    /// path is used by goal, history, and read_output so their errors retain
+    /// the normal persisted tool semantics.
+    async fn finish_intercepted_tool(
+        &mut self,
+        call: &ToolCall,
+        result: Result<ToolOutput, String>,
+    ) -> anyhow::Result<Steering> {
+        let (tool_text, images) = match &result {
+            Ok(output) => (output.content.clone(), output.images.clone()),
+            Err(error) => (error.clone(), Vec::new()),
+        };
+        let is_error = result.is_err();
+        let entry = Message::Tool {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            content: tool_text.clone(),
+            images,
+            is_error,
+            synthetic: false,
+        }
+        .into();
+        self.commit(entry).await?;
+        self.agent.emit_event(AgentEvent::ToolResult {
+            is_error,
+            content: tool_text,
+        });
+        let steering = self.intake_after_operation(Vec::new());
+        if steering != Steering::None {
+            self.shared
+                .lock()
+                .unwrap()
+                .emit(AgentEvent::Notice("turn cancelled".into()));
+        }
+        Ok(steering)
+    }
+
     /// Intercepted `read_output` tool execution (the always-on read-only
     /// pager for bounded provider projections): resolve the session-local
     /// `eout1` ref (or a historical long ref), read the persisted field,
@@ -1622,39 +1670,46 @@ impl SessionRunner {
                     // plain tool cannot reach. They never create goals.
                     if call.name == "get_goal" || call.name == "update_goal" {
                         let result = self.execute_goal_tool(&call).await;
-                        let (tool_text, images) = match &result {
-                            Ok(output) => (output.content.clone(), output.images.clone()),
-                            Err(error) => (error.clone(), Vec::new()),
-                        };
-                        let is_error = result.is_err();
-                        let entry = Message::Tool {
-                            call_id: call.id.clone(),
-                            name: call.name.clone(),
-                            content: tool_text.clone(),
-                            images,
-                            is_error,
-                            synthetic: false,
-                        }
-                        .into();
-                        if let Err(error) = self.commit(entry).await {
-                            self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                        match self.finish_intercepted_tool(&call, result).await {
+                            Ok(Steering::None) => {}
+                            Ok(steering) => {
+                                if self.release_after_preempt(steering) {
+                                    return;
+                                }
+                                break 'turn;
+                            }
+                            Err(error) => {
+                                self.terminate(
+                                    SessionResult::Failed(format!("{error:#}")),
+                                    Vec::new(),
+                                )
                                 .await;
-                            return;
-                        }
-                        self.agent.emit_event(AgentEvent::ToolResult {
-                            is_error,
-                            content: tool_text,
-                        });
-                        let steering = self.intake_after_operation(Vec::new());
-                        if steering != Steering::None {
-                            self.shared
-                                .lock()
-                                .unwrap()
-                                .emit(AgentEvent::Notice("turn cancelled".into()));
-                            if self.release_after_preempt(steering) {
                                 return;
                             }
-                            break 'turn;
+                        }
+                        continue;
+                    }
+                    // history is intercepted by the runner: it is bound to
+                    // this session's store/root/session and cannot be pointed
+                    // elsewhere by model arguments.
+                    if call.name == "history" {
+                        let result = self.execute_history_tool(&call).await;
+                        match self.finish_intercepted_tool(&call, result).await {
+                            Ok(Steering::None) => {}
+                            Ok(steering) => {
+                                if self.release_after_preempt(steering) {
+                                    return;
+                                }
+                                break 'turn;
+                            }
+                            Err(error) => {
+                                self.terminate(
+                                    SessionResult::Failed(format!("{error:#}")),
+                                    Vec::new(),
+                                )
+                                .await;
+                                return;
+                            }
                         }
                         continue;
                     }
@@ -1666,39 +1721,22 @@ impl SessionRunner {
                     // bounded with its own receipt in the next request.
                     if call.name == "read_output" {
                         let result = self.execute_read_output(&call).await;
-                        let (tool_text, images) = match &result {
-                            Ok(output) => (output.content.clone(), output.images.clone()),
-                            Err(error) => (error.clone(), Vec::new()),
-                        };
-                        let is_error = result.is_err();
-                        let entry = Message::Tool {
-                            call_id: call.id.clone(),
-                            name: call.name.clone(),
-                            content: tool_text.clone(),
-                            images,
-                            is_error,
-                            synthetic: false,
-                        }
-                        .into();
-                        if let Err(error) = self.commit(entry).await {
-                            self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                        match self.finish_intercepted_tool(&call, result).await {
+                            Ok(Steering::None) => {}
+                            Ok(steering) => {
+                                if self.release_after_preempt(steering) {
+                                    return;
+                                }
+                                break 'turn;
+                            }
+                            Err(error) => {
+                                self.terminate(
+                                    SessionResult::Failed(format!("{error:#}")),
+                                    Vec::new(),
+                                )
                                 .await;
-                            return;
-                        }
-                        self.agent.emit_event(AgentEvent::ToolResult {
-                            is_error,
-                            content: tool_text,
-                        });
-                        let steering = self.intake_after_operation(Vec::new());
-                        if steering != Steering::None {
-                            self.shared
-                                .lock()
-                                .unwrap()
-                                .emit(AgentEvent::Notice("turn cancelled".into()));
-                            if self.release_after_preempt(steering) {
                                 return;
                             }
-                            break 'turn;
                         }
                         continue;
                     }

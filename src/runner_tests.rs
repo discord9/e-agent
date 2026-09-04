@@ -5295,6 +5295,96 @@ async fn goal_commands_create_actions_and_clear_persist_and_fan_out() {
 }
 
 #[tokio::test]
+async fn history_runner_binds_only_its_current_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::Jsonl;
+    store
+        .append(
+            temp.path(),
+            "current",
+            &[SessionEntry::Notice {
+                text: "current-only".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            temp.path(),
+            "other",
+            &[SessionEntry::Notice {
+                text: "other-only".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "history-current".into(),
+                        name: "history".into(),
+                        arguments: serde_json::json!({
+                            "action": "list",
+                            "limit": 100,
+                        })
+                        .to_string(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![Box::new(crate::tools::history::History)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        store.clone(),
+        temp.path().into(),
+        "current".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("inspect current".into()));
+    let mut status = handle.status();
+    assert_eq!(
+        wait_for_status(&mut status, |status| matches!(
+            status,
+            SessionStatus::Finished(_)
+        ))
+        .await,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
+    );
+    task.join().await.unwrap();
+
+    let loaded = store.load(temp.path(), "current").await.unwrap();
+    let result = loaded.entries.iter().find_map(|entry| match entry {
+        SessionEntry::Message {
+            message: Message::Tool { name, content, .. },
+        } if name == "history" => Some(content),
+        _ => None,
+    });
+    let result: Value =
+        serde_json::from_str(result.expect("history result must be persisted")).unwrap();
+    let entries = result["entries"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["entry"]["text"] == "current-only")
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["entry"]["text"] == "other-only")
+    );
+}
+
+#[tokio::test]
 async fn update_goal_tool_cas_updates_and_completes_with_evidence() {
     let temp = tempfile::tempdir().unwrap();
     let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();

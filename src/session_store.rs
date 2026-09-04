@@ -1242,8 +1242,8 @@ impl SessionStore {
     /// order. Used by `--fork` to record the source entry's seq as
     /// provenance on the `ForkedFrom` marker.
     ///
-    /// For JSONL there is no seq column; the 0-based ordinal (the JSONL line
-    /// index) is returned so the provenance is still meaningful. For
+    /// For JSONL there is no seq column; the 0-based ordinal of nonblank JSONL records
+    /// is returned so the provenance is still meaningful. For
     /// Greptime/SQLite the real `seq` column values are returned.
     pub async fn load_with_seq(&self, root: &Path, name: &str) -> Result<Vec<(i64, SessionEntry)>> {
         match self {
@@ -1293,8 +1293,8 @@ impl SessionStore {
     /// Append entries to the session log and return the exact physical
     /// located key of every appended entry (durable-append → located-key
     /// ordering: the caller must not emit a receipt ref before this
-    /// resolves). JSONL ordinals are the appended lines' 0-based positions
-    /// (the file is line-counted before appending); Greptime/SQLite return
+    /// resolves). JSONL ordinals are the appended records' 0-based nonblank
+    /// positions (the file is counted before appending); Greptime/SQLite return
     /// each row's `seq` + `event_time` as pinned at INSERT time.
     ///
     /// For JSONL, `root` and `name` locate the file. For Greptime/SQLite,

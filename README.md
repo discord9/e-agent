@@ -776,6 +776,31 @@ already discard bytes (bash/MCP output caps stay as they are — persisted
 originals are the precondition for exact retrieval). Bounding only applies
 to fields that are certainly already persisted before replay.
 
+## History tool
+
+The always-available `history` tool reads only the current runner-bound
+workspace and session. It has three actions: `list`, `read`, and `search`; it
+accepts no workspace or session selector. `list` returns the newest logical
+entries ordered by logical `seq`, using bounded `limit` (default 20, maximum
+100), with no cursor or pagination fields. `read` takes `seq` and returns that
+complete logical entry, or a plain `history entry not found` error.
+
+`search` takes a non-empty, case-sensitive literal `query` and optional bounded
+`limit`. It scans only the newest 100 logical entries and searches only User
+content, Assistant content, and Notice text. Matching complete entries are
+returned newest-first. Whitespace is significant; there is no regex or case
+folding.
+
+This reflects the existing logical transcript and current logical winner:
+physical duplicate writes and same-seq replacements are not exposed as
+physical versions. Backend failures are logged internally but sanitized to a
+plain model-facing error. There is no History-specific receipt or output
+paging behavior.
+
+Non-goals (deliberately out of scope): physical-row inspection,
+backend-specific queries, cross-workspace/session access, and a separate
+history storage or truncation layer.
+
 ## Web UI / headless server
 
 `e-agent --serve` (alias: `e-agent web`) starts a headless HTTP server that

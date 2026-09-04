@@ -8,6 +8,7 @@ use crate::workspace::Workspace;
 mod background;
 mod bash;
 mod file;
+pub(crate) mod history;
 pub mod output;
 #[cfg(target_os = "linux")]
 mod rust;
@@ -17,6 +18,7 @@ mod web;
 mod windows_sandbox;
 
 use file::*;
+use history::History;
 use output::*;
 use tasks::*;
 use web::*;
@@ -287,6 +289,9 @@ fn tools_with_background_and_exa_key(
     // read-only main, ordinary/read-only subagents, btw forks). The runner
     // intercepts it by name with the session's store.
     tools.push(Box::new(ReadOutput));
+    // History is runner-intercepted so it cannot select another workspace or
+    // session; the runner binds the current store/root/session.
+    tools.push(Box::new(History));
     tools
 }
 

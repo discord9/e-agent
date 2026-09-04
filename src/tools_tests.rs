@@ -104,9 +104,9 @@ fn web_search_spec_exposes_only_query() {
         );
 }
 
-/// The always-on `read_output` tool is registered on EVERY session: main,
-/// read-only main (with and without a sandbox), and subagent builds (the
-/// `builtins_with_background` path).
+/// The always-on `read_output` and `history` tools are registered on EVERY
+/// session: main, read-only main (with and without a sandbox), and subagent
+/// builds (the `builtins_with_background` path).
 #[test]
 fn read_output_registered_for_main_read_only_and_subagent_builds() {
     let temp = tempfile::tempdir().unwrap();
@@ -119,12 +119,15 @@ fn read_output_registered_for_main_read_only_and_subagent_builds() {
 
     // Main build (no key, no sandbox).
     let (tools, _) = builtins_with_exa_key(workspace.clone(), None, None, false, None, None);
-    assert!(names(tools).contains(&"read_output".to_string()));
+    let main_names = names(tools);
+    assert!(main_names.contains(&"read_output".to_string()));
+    assert!(main_names.contains(&"history".to_string()));
 
     // Read-only main build without a sandbox (fail-closed bash).
     let (tools, _) = builtins_with_exa_key(workspace.clone(), None, None, true, None, None);
     let n = names(tools);
     assert!(n.contains(&"read_output".to_string()), "{n:?}");
+    assert!(n.contains(&"history".to_string()), "{n:?}");
 
     // Subagent build (shared background registry).
     let background = BackgroundTasks::new(None, None);
@@ -136,7 +139,9 @@ fn read_output_registered_for_main_read_only_and_subagent_builds() {
         true,
         Some("sub-1".into()),
     );
-    assert!(names(sub).contains(&"read_output".to_string()));
+    let sub_names = names(sub);
+    assert!(sub_names.contains(&"read_output".to_string()));
+    assert!(sub_names.contains(&"history".to_string()));
 
     // Read-only subagent build.
     let sub_ro = builtins_with_background(
@@ -147,7 +152,9 @@ fn read_output_registered_for_main_read_only_and_subagent_builds() {
         true,
         Some("sub-2".into()),
     );
-    assert!(names(sub_ro).contains(&"read_output".to_string()));
+    let sub_ro_names = names(sub_ro);
+    assert!(sub_ro_names.contains(&"read_output".to_string()));
+    assert!(sub_ro_names.contains(&"history".to_string()));
 
     // The schema is CLOSED and the tool is read-only by construction: its
     // spec declares exactly ref/offset/limit with additionalProperties
@@ -188,6 +195,7 @@ fn web_search_registration_requires_a_nonempty_key() {
         "get_goal".to_string(),
         "update_goal".to_string(),
         "read_output".to_string(),
+        "history".to_string(),
     ];
     for key in [None, Some("   ".into())] {
         let (tools, _) = builtins_with_exa_key(workspace.clone(), key, None, false, None, None);
@@ -210,7 +218,8 @@ fn web_search_registration_requires_a_nonempty_key() {
             "web_search",
             "get_goal",
             "update_goal",
-            "read_output"
+            "read_output",
+            "history"
         ]
         .map(String::from)
     );
@@ -1507,7 +1516,8 @@ fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
             "cancel_background_task",
             "get_goal",
             "update_goal",
-            "read_output"
+            "read_output",
+            "history"
         ],
         "read-only without a sandbox: no write/edit and fail-closed no bash"
     );
@@ -1548,7 +1558,8 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             "web_search",
             "get_goal",
             "update_goal",
-            "read_output"
+            "read_output",
+            "history"
         ],
         "read-only with a sandbox keeps the shell and web_search"
     );
@@ -5012,6 +5023,7 @@ fn goal_specs_are_closed_and_generic_specs_stay_open() {
         // read_output is deliberately CLOSED (see its spec): the pager
         // accepts exactly ref/offset/limit and nothing else.
         "read_output",
+        "history",
     ];
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
