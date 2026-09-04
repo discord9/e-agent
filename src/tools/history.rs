@@ -428,7 +428,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let complete = notice(&"x".repeat(5_000));
         SessionStore::Jsonl
-            .append(temp.path(), "current", &[complete.clone()])
+            .append(temp.path(), "current", std::slice::from_ref(&complete))
             .await
             .unwrap();
         let read: Value = serde_json::from_str(
