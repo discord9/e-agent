@@ -26,7 +26,7 @@ use windows_sys::Win32::System::SystemServices::{
 use windows_sys::Win32::System::Threading::*;
 
 use crate::config::Sandbox;
-use crate::tools::background::{OutputSlot, TaskSpool, slot_append};
+use crate::tools::background::{OutputSlot, TaskSpool};
 use crate::workspace::Workspace;
 
 use super::OUTPUT_LIMIT;
@@ -1456,12 +1456,7 @@ fn read_pipe(
             break;
         }
         let data = &buffer[..count as usize];
-        if let Some(slot) = &slot {
-            slot_append(slot, data);
-        }
-        if let Some(spool) = &spool {
-            spool.append(data);
-        }
+        super::background::TaskSpool::capture_append(slot.as_ref(), spool.as_ref(), data);
         captured.total += count as usize;
         // Full output for potential failure persistence, capped at FULL_LIMIT.
         if captured.full.len() < FULL_LIMIT {
@@ -1521,6 +1516,7 @@ pub(super) async fn run(
     spool: Option<Arc<TaskSpool>>,
     policy: &Sandbox,
     exit_slot: Option<super::background::ExitSlot>,
+    stall_state: Option<Arc<std::sync::Mutex<super::background::MonitoredTaskState>>>,
 ) -> Result<String, String> {
     if protect_git {
         return Err(
@@ -1546,7 +1542,15 @@ pub(super) async fn run(
     });
     let stderr_task =
         tokio::task::spawn_blocking(move || read_pipe(spawned.stderr, output_slot, spool));
-    let wait_task = tokio::task::spawn_blocking(move || wait_process(process));
+    let wait_task = tokio::task::spawn_blocking({
+        move || {
+            let result = wait_process(process);
+            if let Some(state) = &stall_state {
+                state.lock().unwrap().eligible = false;
+            }
+            result
+        }
+    });
     let joined = async {
         let (stdout, stderr, code) = tokio::join!(stdout_task, stderr_task, wait_task);
         Ok::<_, String>((
@@ -1564,6 +1568,11 @@ pub(super) async fn run(
         Some(duration) => match tokio::time::timeout(duration, joined).await {
             Ok(result) => result,
             Err(_) => {
+                // Timeout wins the race with the monitor; close eligibility
+                // before the process guard kills the child on return.
+                if let Some(state) = &stall_state {
+                    state.lock().unwrap().eligible = false;
+                }
                 if let Some(slot) = &process_group_slot {
                     slot.store(0, Ordering::Release);
                 }

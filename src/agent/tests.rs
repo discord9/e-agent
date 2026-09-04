@@ -64,8 +64,11 @@ impl Tool for FailingTool {
     }
 }
 
+#[derive(Default)]
 struct ScriptedBackgroundTool {
     sender: Option<mpsc::UnboundedSender<AgentEvent>>,
+    completion_gate: Option<Arc<tokio::sync::Notify>>,
+    completion_sent: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[async_trait]
@@ -81,8 +84,12 @@ impl Tool for ScriptedBackgroundTool {
     async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         assert_eq!(arguments["background"], true);
         let sender = self.sender.clone().unwrap();
+        let completion_gate = self.completion_gate.clone();
+        let completion_sent = self.completion_sent.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if let Some(gate) = completion_gate {
+                gate.notified().await;
+            }
             let _ = sender.send(AgentEvent::BackgroundCompleted {
                 id: 1,
                 output: "exit code: 0\nstdout:\ndone\nstderr:\n".into(),
@@ -94,6 +101,9 @@ impl Tool for ScriptedBackgroundTool {
                 status: None,
                 kind: None,
             });
+            if let Some(sent) = completion_sent {
+                sent.notify_one();
+            }
         });
         Ok(ToolOutput::text("started background task 1: echo done"))
     }
@@ -101,6 +111,139 @@ impl Tool for ScriptedBackgroundTool {
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         self.sender = Some(sender);
     }
+}
+
+struct NoticeBackgroundTool {
+    sender: Option<mpsc::UnboundedSender<AgentEvent>>,
+    send_completion: bool,
+    notice_delay: Option<std::time::Duration>,
+}
+
+#[async_trait]
+impl Tool for NoticeBackgroundTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "bash".into(),
+            description: "notice background test".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        let sender = self.sender.clone().unwrap();
+        let send_completion = self.send_completion;
+        let delay = self.notice_delay;
+        tokio::spawn(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let _ = sender.send(AgentEvent::Notice("stall warning".into()));
+            if send_completion {
+                let _ = sender.send(AgentEvent::BackgroundCompleted {
+                    id: 1,
+                    output: "done".into(),
+                    label: Some("cmd".into()),
+                    started_at_ms: None,
+                    duration_ms: None,
+                    exit_code: None,
+                    signal: None,
+                    status: None,
+                    kind: None,
+                });
+            }
+        });
+        Ok(ToolOutput::text("started background task 1: cmd"))
+    }
+    fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
+        self.sender = Some(sender);
+    }
+}
+
+#[tokio::test]
+async fn direct_agent_notice_only_does_not_start_follow_up() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedModel {
+        replies: vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![call("b", "bash", r#"{"background":true}"#)],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("started".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ],
+        requests: requests.clone(),
+        delays: [None, Some(std::time::Duration::from_millis(20))]
+            .into_iter()
+            .collect(),
+    };
+    let mut agent = Agent::new(
+        Box::new(model),
+        vec![Box::new(NoticeBackgroundTool {
+            sender: None,
+            send_completion: false,
+            notice_delay: Some(std::time::Duration::from_millis(5)),
+        })],
+    );
+
+    assert_eq!(agent.run("go".into()).await.unwrap(), "started");
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert!(
+        agent
+            .history()
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Notice { text } if text == "stall warning"))
+    );
+}
+
+#[tokio::test]
+async fn direct_agent_consumes_notice_then_completion_in_order() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedModel {
+        replies: vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![call("b", "bash", r#"{"background":true}"#)],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("started".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("finished".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ],
+        requests: requests.clone(),
+        delays: Default::default(),
+    };
+    let mut agent = Agent::new(
+        Box::new(model),
+        vec![Box::new(NoticeBackgroundTool {
+            sender: None,
+            send_completion: true,
+            notice_delay: None,
+        })],
+    );
+    assert_eq!(agent.run("go".into()).await.unwrap(), "started");
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(agent.run("next".into()).await.unwrap(), "finished");
+    let history = agent.history();
+    let notice = history
+        .iter()
+        .position(|entry| matches!(entry, SessionEntry::Notice { text } if text == "stall warning"))
+        .unwrap();
+    let completion = history
+        .iter()
+        .position(|entry| matches!(entry, SessionEntry::BackgroundCompletion { id: 1, .. }))
+        .unwrap();
+    assert!(notice < completion);
+    assert!(requests.lock().unwrap().iter().any(|request| request.iter().any(|message| matches!(message, Message::User { content, .. } if content == "stall warning"))));
 }
 
 struct SlowEchoTool;
@@ -1222,16 +1365,32 @@ async fn injects_background_completion_before_the_next_prompt_and_forwards_it() 
         requests: requests.clone(),
         delays: Default::default(),
     };
+    let completion_gate = Arc::new(tokio::sync::Notify::new());
+    let completion_sent = Arc::new(tokio::sync::Notify::new());
     let mut agent = Agent::new(
         Box::new(model),
-        vec![Box::new(ScriptedBackgroundTool { sender: None })],
+        vec![Box::new(ScriptedBackgroundTool {
+            sender: None,
+            completion_gate: Some(completion_gate.clone()),
+            completion_sent: Some(completion_sent.clone()),
+        })],
     );
     assert_eq!(agent.run("first".into()).await.unwrap(), "started");
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let sent = completion_sent.notified();
+    completion_gate.notify_one();
+    sent.await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
     agent.subscribe(sender);
     assert_eq!(agent.run("second".into()).await.unwrap(), "next");
+    let completion = receiver
+        .recv()
+        .await
+        .expect("event channel closed before background completion arrived");
     assert!(matches!(
+        completion,
+        AgentEvent::BackgroundCompleted { id: 1, .. }
+    ));
+    assert!(!matches!(
         receiver.try_recv(),
         Ok(AgentEvent::BackgroundCompleted { id: 1, .. })
     ));
@@ -1283,7 +1442,7 @@ async fn injects_background_completion_mid_loop_before_the_next_model_call() {
     let mut agent = Agent::new(
         Box::new(model),
         vec![
-            Box::new(ScriptedBackgroundTool { sender: None }),
+            Box::new(ScriptedBackgroundTool::default()),
             Box::new(SlowEchoTool),
         ],
     );
@@ -1548,7 +1707,7 @@ async fn records_and_clears_background_tasks_under_the_workspace() {
     };
     let mut agent = Agent::new(
         Box::new(model),
-        vec![Box::new(ScriptedBackgroundTool { sender: None })],
+        vec![Box::new(ScriptedBackgroundTool::default())],
     );
     agent.record_background_tasks_in(
         temp.path().to_path_buf(),

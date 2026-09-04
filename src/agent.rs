@@ -1105,7 +1105,7 @@ pub struct Agent {
     event_handler: Option<Box<dyn FnMut(AgentEvent) + Send>>,
     max_tool_rounds: Option<usize>,
     background_receiver: mpsc::UnboundedReceiver<AgentEvent>,
-    pending_background: VecDeque<(u64, String, Option<String>, BackgroundTrace)>,
+    pending_background: VecDeque<SessionEntry>,
     subscriber: Option<mpsc::UnboundedSender<AgentEvent>>,
     /// Long-lived session sinks (e.g. a TUI view). Unlike
     /// `event_handler` and `subscriber` (per-turn), these survive across
@@ -1734,36 +1734,11 @@ impl Agent {
     ) -> Option<(u64, String, Option<String>, BackgroundTrace)> {
         loop {
             match self.background_receiver.recv().await {
-                Some(AgentEvent::BackgroundCompleted {
-                    id,
-                    output,
-                    label,
-                    started_at_ms,
-                    duration_ms,
-                    exit_code,
-                    signal,
-                    status,
-                    kind,
-                }) => {
-                    let trace = BackgroundTrace {
-                        started_at_ms,
-                        duration_ms,
-                        exit_code,
-                        signal: signal.clone(),
-                        status: status.clone(),
-                        kind: kind.clone(),
-                    };
-                    self.pending_background.push_back((
-                        id,
-                        output.clone(),
-                        label.clone(),
-                        trace.clone(),
-                    ));
-                    // No fanout here either: idle and mid-turn completions
-                    // both land in the session log as a user message at the
-                    // next turn boundary. The TUI prints this return value
-                    // itself; fanning out would duplicate the line.
-                    return Some((id, output, label, trace));
+                Some(event @ AgentEvent::Notice(_))
+                | Some(event @ AgentEvent::BackgroundCompleted { .. }) => {
+                    if let Some(completion) = self.apply_background_event(event, false) {
+                        return Some(completion);
+                    }
                 }
                 Some(_) => {}
                 None => return None,
@@ -1823,7 +1798,10 @@ impl Agent {
         // the history now so the finished line renders immediately instead
         // of waiting for the next prompt. run() then loops so the model
         // reacts to them right away.
-        let injected_at_end = !self.pending_background.is_empty();
+        let injected_at_end = self
+            .pending_background
+            .iter()
+            .any(|pending| matches!(pending, SessionEntry::BackgroundCompletion { .. }));
         self.inject_pending_background().await?;
         result.map(|answer| (answer, injected_at_end))
     }
@@ -2258,85 +2236,115 @@ impl Agent {
     }
 
     pub(crate) fn drain_background_ready(&mut self) {
-        while let Ok(AgentEvent::BackgroundCompleted {
-            id,
-            output,
-            label,
-            started_at_ms,
-            duration_ms,
-            exit_code,
-            signal,
-            status,
-            kind,
-        }) = self.background_receiver.try_recv()
-        {
-            self.pending_background.push_back((
+        while let Ok(event) = self.background_receiver.try_recv() {
+            let _ = self.apply_background_event(event, true);
+        }
+    }
+
+    fn apply_background_event(
+        &mut self,
+        event: AgentEvent,
+        fanout: bool,
+    ) -> Option<(u64, String, Option<String>, BackgroundTrace)> {
+        match event {
+            AgentEvent::Notice(text) => {
+                self.pending_background
+                    .push_back(SessionEntry::Notice { text });
+                None
+            }
+            AgentEvent::BackgroundCompleted {
                 id,
-                output.clone(),
-                label.clone(),
-                BackgroundTrace {
-                    started_at_ms,
-                    duration_ms,
-                    exit_code,
-                    signal: signal.clone(),
-                    status: status.clone(),
-                    kind: kind.clone(),
-                },
-            ));
-            if let Some(subscriber) = &self.subscriber {
-                let _ = subscriber.send(AgentEvent::BackgroundCompleted {
+                output,
+                label,
+                started_at_ms,
+                duration_ms,
+                exit_code,
+                signal,
+                status,
+                kind,
+            } => {
+                self.pending_background
+                    .push_back(SessionEntry::BackgroundCompletion {
+                        id,
+                        output: output.clone(),
+                        label: label.clone(),
+                        started_at_ms,
+                        duration_ms,
+                        exit_code,
+                        signal: signal.clone(),
+                        status: status.clone(),
+                        kind: kind.clone(),
+                    });
+                if fanout && let Some(subscriber) = &self.subscriber {
+                    let _ = subscriber.send(AgentEvent::BackgroundCompleted {
+                        id,
+                        output: output.clone(),
+                        label: label.clone(),
+                        started_at_ms,
+                        duration_ms,
+                        exit_code,
+                        signal: signal.clone(),
+                        status: status.clone(),
+                        kind: kind.clone(),
+                    });
+                }
+                Some((
                     id,
                     output,
                     label,
-                    started_at_ms,
-                    duration_ms,
-                    exit_code,
-                    signal,
-                    status,
-                    kind,
-                });
+                    BackgroundTrace {
+                        started_at_ms,
+                        duration_ms,
+                        exit_code,
+                        signal,
+                        status,
+                        kind,
+                    },
+                ))
             }
+            _ => None,
         }
     }
 
     pub(crate) async fn wait_background_ready(&mut self) -> bool {
-        self.next_background_completion().await.is_some()
+        loop {
+            match self.background_receiver.recv().await {
+                Some(event @ AgentEvent::Notice(_))
+                | Some(event @ AgentEvent::BackgroundCompleted { .. }) => {
+                    let _ = self.apply_background_event(event, false);
+                    return true;
+                }
+                Some(_) => {}
+                None => return false,
+            }
+        }
     }
 
     pub(crate) fn peek_background_entry(&self) -> Option<SessionEntry> {
-        self.pending_background
-            .front()
-            .map(
-                |(id, output, label, trace)| SessionEntry::BackgroundCompletion {
-                    id: *id,
-                    output: output.clone(),
-                    label: label.clone(),
-                    started_at_ms: trace.started_at_ms,
-                    duration_ms: trace.duration_ms,
-                    exit_code: trace.exit_code,
-                    signal: trace.signal.clone(),
-                    status: trace.status.clone(),
-                    kind: trace.kind.clone(),
-                },
-            )
+        self.pending_background.front().cloned()
     }
 
     pub(crate) async fn ack_background_entry(&mut self) -> Result<(), String> {
-        let Some((id, _output, _label, _trace)) = self.pending_background.front() else {
+        let Some(entry) = self.pending_background.front() else {
             return Ok(());
         };
-        if let Some(record) = &self.background_record {
+        let id = match entry {
+            SessionEntry::BackgroundCompletion { id, .. } => Some(*id),
+            SessionEntry::Notice { .. } => None,
+            _ => unreachable!("pending background queue contains only background entries"),
+        };
+        if let (Some(record), Some(id)) = (&self.background_record, id) {
             record
                 .store
-                .clear_background_task_durable(&record.root, &record.session, *id)
+                .clear_background_task_durable(&record.root, &record.session, id)
                 .await
                 .map_err(|error| format!("cannot clear background task owner: {error:#}"))?;
         }
-        let (id, _output, _label, _trace) = self
-            .pending_background
-            .pop_front()
-            .expect("background entry remains pending until durable clear");
-        self.running_background.remove(&id);
+        if let Some(entry) = self.pending_background.pop_front()
+            && let SessionEntry::BackgroundCompletion { id, .. } = entry
+        {
+            self.running_background.remove(&id);
+        }
         Ok(())
     }
 

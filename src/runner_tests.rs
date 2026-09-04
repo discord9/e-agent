@@ -6320,3 +6320,230 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
     drop(handle);
     drop(task);
 }
+#[tokio::test]
+async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_until_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![background_bash_call("cmd", false)],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("started".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("finished".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(MockBackgroundBash {
+            id: 1,
+            label: "cmd",
+            sender: sender.clone(),
+        })],
+    );
+    agent.record_background_tasks_in(temp.path().to_path_buf(), "oracle449", SessionStore::Jsonl);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle449".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+    loop {
+        if matches!(live.recv().await.unwrap(), AgentEvent::AssistantText(text) if text == "started")
+        {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    let calls_before_notice = calls.lock().unwrap().len();
+    assert_eq!(calls_before_notice, 2);
+    let owner = SessionStore::Jsonl
+        .peek_unfinished_background(temp.path(), "oracle449")
+        .await
+        .unwrap();
+    assert_eq!(owner.len(), 1);
+    assert_eq!(owner[0].task_id, 1);
+
+    let tx = sender.lock().unwrap().as_ref().unwrap().clone();
+    tx.send(AgentEvent::Notice("stalled warning".into()))
+        .unwrap();
+    loop {
+        if matches!(live.recv().await.unwrap(), AgentEvent::Notice(text) if text == "stalled warning")
+        {
+            break;
+        }
+    }
+    assert!(matches!(*status.borrow(), SessionStatus::Idle));
+    assert_eq!(calls.lock().unwrap().len(), calls_before_notice);
+    let owner = SessionStore::Jsonl
+        .peek_unfinished_background(temp.path(), "oracle449")
+        .await
+        .unwrap();
+    assert_eq!(owner.len(), 1);
+    assert_eq!(owner[0].task_id, 1);
+
+    tx.send(AgentEvent::BackgroundCompleted {
+        id: 1,
+        output: "done".into(),
+        label: Some("cmd".into()),
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
+    })
+    .unwrap();
+    loop {
+        if matches!(live.recv().await.unwrap(), AgentEvent::AssistantText(text) if text == "finished")
+        {
+            break;
+        }
+    }
+    assert_eq!(calls.lock().unwrap().len(), calls_before_notice + 1);
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "oracle449")
+        .await
+        .unwrap();
+    let notice = loaded
+        .entries
+        .iter()
+        .position(|e| matches!(e, SessionEntry::Notice { text } if text == "stalled warning"))
+        .unwrap();
+    let completion = loaded
+        .entries
+        .iter()
+        .position(|e| matches!(e, SessionEntry::BackgroundCompletion { id: 1, .. }))
+        .unwrap();
+    assert!(notice < completion);
+    assert!(
+        SessionStore::Jsonl
+            .peek_unfinished_background(temp.path(), "oracle449")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(calls.lock().unwrap().last().unwrap().iter().any(|message| {
+        matches!(
+            message,
+            Message::User { content, .. }
+                if content.contains("[background task 1 completed") && content.contains("done")
+        )
+    }));
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn oracle449_runner_notice_is_visible_once_to_attached_and_late_views() {
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("cmd", false)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("started".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        vec![Box::new(MockBackgroundBash {
+            id: 2,
+            label: "cmd",
+            sender: sender.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle449-view".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+    loop {
+        if matches!(live.recv().await.unwrap(), AgentEvent::AssistantText(text) if text == "started")
+        {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(AgentEvent::Notice("warning".into()))
+        .unwrap();
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(AgentEvent::BackgroundCompleted {
+            id: 2,
+            output: "done".into(),
+            label: None,
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
+        })
+        .unwrap();
+    let mut notices = 0;
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::Notice(text) if text == "warning" => notices += 1,
+            AgentEvent::AssistantText(text) if text == "done" => break,
+            _ => {}
+        }
+    }
+    assert_eq!(notices, 1);
+    let (snapshot, _, _) = handle.attach();
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Notice(text) if text == "warning"))
+            .count(),
+        1
+    );
+    task.join().await.unwrap();
+}

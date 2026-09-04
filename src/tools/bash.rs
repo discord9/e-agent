@@ -18,7 +18,7 @@ use tokio::process::Command;
 
 use crate::agent::AgentEvent;
 
-use super::background::{BackgroundTasks, ExitSlot, OutputSlot, TaskExit, TaskSpool, slot_append};
+use super::background::{BackgroundTasks, ExitSlot, OutputSlot, TaskExit, TaskSpool};
 
 /// A bash tool bound to a shared background-task registry.
 /// `protect_git`: on non-Windows, `<workspace>/.git` is bound read-only for
@@ -1295,7 +1295,7 @@ pub(super) async fn run_bash(
     sandbox: Option<&crate::config::Sandbox>,
     exit_slot: Option<ExitSlot>,
 ) -> Result<String, String> {
-    run_bash_with_tmp_policy(
+    run_bash_with_tmp_policy_and_stall_state(
         shell,
         workspace,
         command,
@@ -1307,10 +1307,14 @@ pub(super) async fn run_bash(
         sandbox,
         exit_slot,
         false,
+        None,
     )
     .await
 }
 
+/// Run a shell command while optionally closing a background stall monitor's
+/// eligibility at the exact child-process exit boundary. Output capture is
+/// intentionally still joined afterward so inherited pipes continue draining.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_bash_with_tmp_policy(
     shell: &Shell,
@@ -1325,6 +1329,38 @@ pub(super) async fn run_bash_with_tmp_policy(
     exit_slot: Option<ExitSlot>,
     tmp_read_only: bool,
 ) -> Result<String, String> {
+    run_bash_with_tmp_policy_and_stall_state(
+        shell,
+        workspace,
+        command,
+        timeout,
+        protect_git,
+        process_group_slot,
+        output_slot,
+        spool,
+        sandbox,
+        exit_slot,
+        tmp_read_only,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_bash_with_tmp_policy_and_stall_state(
+    shell: &Shell,
+    workspace: &Workspace,
+    command: &str,
+    timeout: Option<Duration>,
+    protect_git: bool,
+    process_group_slot: Option<Arc<AtomicI32>>,
+    output_slot: Option<OutputSlot>,
+    spool: Option<Arc<TaskSpool>>,
+    sandbox: Option<&crate::config::Sandbox>,
+    exit_slot: Option<ExitSlot>,
+    tmp_read_only: bool,
+    stall_state: Option<Arc<std::sync::Mutex<super::background::MonitoredTaskState>>>,
+) -> Result<String, String> {
     #[cfg(windows)]
     if let Some(policy) = sandbox {
         return super::windows_sandbox::run(
@@ -1338,6 +1374,7 @@ pub(super) async fn run_bash_with_tmp_policy(
             spool,
             policy,
             exit_slot,
+            stall_state,
         )
         .await;
     }
@@ -1441,10 +1478,19 @@ pub(super) async fn run_bash_with_tmp_policy(
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
     let run = async {
+        let wait = async {
+            let result = child.wait().await;
+            // Process exit ends stall-warning eligibility immediately. The
+            // capture futures below still drain inherited pipes afterward.
+            if let Some(state) = &stall_state {
+                state.lock().unwrap().eligible = false;
+            }
+            result
+        };
         let (stdout, stderr, status) = tokio::join!(
             capture(stdout, output_slot.clone(), spool.clone()),
             capture(stderr, output_slot, spool),
-            child.wait()
+            wait
         );
         Ok::<_, std::io::Error>((stdout?, stderr?, status?))
     };
@@ -1452,6 +1498,11 @@ pub(super) async fn run_bash_with_tmp_policy(
         Some(timeout) => match tokio::time::timeout(timeout, run).await {
             Ok(result) => result,
             Err(_) => {
+                // Timeout wins the race with the monitor: close the gate
+                // before any kill/wait cleanup can yield another Notice.
+                if let Some(state) = &stall_state {
+                    state.lock().unwrap().eligible = false;
+                }
                 #[cfg(unix)]
                 let kill_error = match rustix::process::kill_process_group(
                     process_group,
@@ -1593,12 +1644,7 @@ pub(super) async fn capture_with(
             break;
         }
         let data = &buffer[..count];
-        if let Some(slot) = &slot {
-            slot_append(slot, data);
-        }
-        if let Some(spool) = &spool {
-            spool.append(data);
-        }
+        super::background::TaskSpool::capture_append(slot.as_ref(), spool.as_ref(), data);
         captured.total += count;
         // Full output for potential failure persistence, capped at full_limit.
         if captured.full.len() < full_limit {

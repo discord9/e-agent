@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::agent::{AgentEvent, BackgroundTrace, preview};
 
-use super::bash::{Shell, run_bash};
+use super::bash::{Shell, run_bash_with_tmp_policy_and_stall_state};
 
 #[derive(Clone)]
 pub struct BackgroundTasks {
@@ -97,12 +97,32 @@ pub type OutputSlot = Arc<std::sync::Mutex<Vec<u8>>>;
 
 const SLOT_LIMIT: usize = 16 * 1024;
 
+/// State for the one task kind that is monitored: a subagent-owned,
+/// non-detached background shell. Activity and warning eligibility share one
+/// mutex so the final deadline check and send are linearized with exit and
+/// cancellation.
+pub(super) struct MonitoredTaskState {
+    pub(super) last_output: tokio::time::Instant,
+    pub(super) eligible: bool,
+    #[cfg(test)]
+    deadline_hook: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+}
+
+fn new_monitored_state() -> Arc<std::sync::Mutex<MonitoredTaskState>> {
+    Arc::new(std::sync::Mutex::new(MonitoredTaskState {
+        last_output: tokio::time::Instant::now(),
+        eligible: true,
+        #[cfg(test)]
+        deadline_hook: None,
+    }))
+}
+
 pub(super) fn slot_append(slot: &OutputSlot, chunk: &[u8]) {
-    let mut bytes = slot.lock().unwrap();
-    bytes.extend_from_slice(chunk);
-    if bytes.len() > SLOT_LIMIT {
-        let excess = bytes.len() - SLOT_LIMIT;
-        bytes.drain(..excess);
+    let mut output = slot.lock().unwrap();
+    output.extend_from_slice(chunk);
+    if output.len() > SLOT_LIMIT {
+        let excess = output.len() - SLOT_LIMIT;
+        output.drain(..excess);
     }
 }
 
@@ -114,6 +134,7 @@ pub(super) fn slot_append(slot: &OutputSlot, chunk: &[u8]) {
 /// task's output stays paged in the detail view.
 pub struct TaskSpool {
     state: std::sync::Mutex<SpoolState>,
+    activity: Option<Arc<std::sync::Mutex<MonitoredTaskState>>>,
 }
 
 pub(super) const FULL_SPOOL_LIMIT: usize = 16 * 1024 * 1024; // 16 MiB keep-first
@@ -139,6 +160,10 @@ impl Default for TaskSpool {
 
 impl TaskSpool {
     pub fn new() -> Self {
+        Self::with_monitor(None)
+    }
+
+    fn with_monitor(activity: Option<Arc<std::sync::Mutex<MonitoredTaskState>>>) -> Self {
         Self {
             state: std::sync::Mutex::new(SpoolState {
                 bytes: Vec::new(),
@@ -146,33 +171,70 @@ impl TaskSpool {
                 checkpoints: Vec::new(),
                 truncated: false,
             }),
+            activity,
         }
     }
 
     /// Append a chunk, maintaining the line count and sparse checkpoints.
     /// Once the cap is reached further bytes are discarded.
     pub fn append(&self, chunk: &[u8]) {
-        let mut state = self.state.lock().unwrap();
-        if state.truncated {
+        self.append_with_slot(None, chunk);
+    }
+
+    /// Capture output and update the private activity state and public tail as
+    /// one serialized operation. Both stdout and stderr of a task use this.
+    pub(super) fn append_with_slot(&self, slot: Option<&OutputSlot>, chunk: &[u8]) {
+        if chunk.is_empty() {
             return;
         }
-        let room = FULL_SPOOL_LIMIT.saturating_sub(state.bytes.len());
-        let take = chunk.len().min(room);
-        if take < chunk.len() {
-            state.truncated = true;
+        if let Some(activity) = &self.activity {
+            let mut activity = activity.lock().unwrap();
+            activity.last_output = tokio::time::Instant::now();
         }
-        let base = state.bytes.len();
-        state.bytes.extend_from_slice(&chunk[..take]);
-        let mut line = state.line_count;
-        for (index, byte) in chunk[..take].iter().enumerate() {
-            if *byte == b'\n' {
-                line += 1;
-                if line.is_multiple_of(CHECKPOINT_INTERVAL) {
-                    state.checkpoints.push((line, base + index + 1));
-                }
+        if let Some(slot) = slot {
+            let mut output = slot.lock().unwrap();
+            output.extend_from_slice(chunk);
+            if output.len() > SLOT_LIMIT {
+                let excess = output.len() - SLOT_LIMIT;
+                output.drain(..excess);
             }
         }
-        state.line_count = line;
+        let mut state = self.state.lock().unwrap();
+        if !state.truncated {
+            let room = FULL_SPOOL_LIMIT.saturating_sub(state.bytes.len());
+            let take = chunk.len().min(room);
+            if take < chunk.len() {
+                state.truncated = true;
+            }
+            let base = state.bytes.len();
+            state.bytes.extend_from_slice(&chunk[..take]);
+            let mut line = state.line_count;
+            for (index, byte) in chunk[..take].iter().enumerate() {
+                if *byte == b'\n' {
+                    line += 1;
+                    if line.is_multiple_of(CHECKPOINT_INTERVAL) {
+                        state.checkpoints.push((line, base + index + 1));
+                    }
+                }
+            }
+            state.line_count = line;
+        }
+        drop(state);
+    }
+
+    /// Update a task's private activity state and its optional public slot.
+    /// Unmonitored callers retain the old slot-only behavior when no spool is
+    /// supplied.
+    pub(super) fn capture_append(
+        slot: Option<&OutputSlot>,
+        spool: Option<&Arc<TaskSpool>>,
+        chunk: &[u8],
+    ) {
+        if let Some(spool) = spool {
+            spool.append_with_slot(slot, chunk);
+        } else if let Some(slot) = slot {
+            slot_append(slot, chunk);
+        }
     }
 
     /// Total recorded bytes (never exceeds [`FULL_SPOOL_LIMIT`]).
@@ -360,6 +422,7 @@ struct RunningTask {
     /// sessions, so the listing session id is not the initiator.
     owner_session: Option<String>,
     completion: Completion,
+    monitored: Option<Arc<std::sync::Mutex<MonitoredTaskState>>>,
     /// When the task was pushed to the registry (wall clock, epoch ms).
     started_at_ms: Option<u64>,
     /// Monotonic start instant; `elapsed()` at finish yields the duration.
@@ -518,6 +581,12 @@ impl BackgroundTasks {
             let index = running
                 .iter()
                 .position(|task| task.id == id && matches(task))?;
+            // Mark completion while the registry lock is held, before removing
+            // the row. This closes the warning-vs-cancellation gap: a monitor
+            // may never validate or publish after cancellation wins.
+            if let Some(state) = &running[index].monitored {
+                state.lock().unwrap().eligible = false;
+            }
             if let Some(target) = running[index].cancel_target.clone() {
                 (running[index].label.clone(), Some(target), None)
             } else {
@@ -604,7 +673,8 @@ impl BackgroundTasks {
             command,
             protect_git,
             sandbox,
-            owner_session,
+            owner_session.clone(),
+            owner_session.as_ref().map(|_| sender.clone()),
             move |id, output, trace| {
                 let _ = sender.send(AgentEvent::BackgroundCompleted {
                     id,
@@ -648,6 +718,7 @@ impl BackgroundTasks {
             protect_git,
             sandbox,
             owner_session,
+            None,
             // Detached: on_complete is a no-op, so no completion entry is
             // ever produced for this task.
             |_, _, _| {},
@@ -668,12 +739,20 @@ impl BackgroundTasks {
         protect_git: bool,
         sandbox: Option<crate::config::Sandbox>,
         owner_session: Option<String>,
+        stall_sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
         on_complete: impl FnOnce(u64, String, BackgroundTrace) + Send + 'static,
     ) -> Result<String, String> {
         let shell = Shell::detect()?;
         let process_group = Arc::new(AtomicI32::new(0));
+        let task_started = std::time::Instant::now();
+        let task_id = Arc::new(AtomicU64::new(0));
         let output: OutputSlot = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let spool: Arc<TaskSpool> = Arc::new(TaskSpool::new());
+        let monitored = owner_session
+            .as_ref()
+            .zip(stall_sender.as_ref())
+            .map(|_| new_monitored_state());
+        let spool: Arc<TaskSpool> = Arc::new(TaskSpool::with_monitor(monitored.clone()));
+        let output_state = monitored.clone();
         let exit_slot = new_exit_slot();
         let pg = process_group.clone();
         let slot = output.clone();
@@ -681,47 +760,69 @@ impl BackgroundTasks {
         let command_for_detail = command.clone();
         let timeout = self.timeout;
         let running = self.registry.clone();
+        let running_for_id = running.clone();
+        let task_id_for_monitor = task_id.clone();
+        let command_for_monitor = command.clone();
+        let task_started_for_monitor = task_started;
+        let output_state_for_id = output_state.clone();
+        let slot_for_monitor = output.clone();
         let shell_name = shell.tool_name.to_owned();
         self.spawn_inner(
             label,
             None,
             Some(process_group),
-            None, // display_meta
+            None,
             owner_session,
             exit_slot.clone(),
             None,
             move |id| {
-                let mut running = running.running.lock().unwrap();
+                task_id.store(id, Ordering::Release);
+                let mut running = running_for_id.running.lock().unwrap();
                 if let Some(task) = running.iter_mut().find(|task| task.id == id) {
                     task.output = Some(output);
                     task.spool = Some(spool);
                     task.full_command = Some(command_for_detail);
                     task.shell_name = Some(shell_name.clone());
+                    task.monitored = output_state_for_id.clone();
                 }
             },
             move || async move {
-                match run_bash(
+                let run = run_bash_with_tmp_policy_and_stall_state(
                     &shell,
                     &workspace,
                     &command,
                     timeout,
                     protect_git,
                     Some(pg),
-                    Some(slot),
+                    Some(slot.clone()),
                     Some(full),
                     sandbox.as_ref(),
                     Some(exit_slot.clone()),
-                )
-                .await
-                {
+                    false,
+                    output_state.clone(),
+                );
+                let result = if let Some(sender) = stall_sender {
+                    tokio::pin!(run);
+                    let monitor = monitor_stalls(
+                        slot_for_monitor,
+                        task_id_for_monitor,
+                        command_for_monitor,
+                        task_started_for_monitor,
+                        STALL_THRESHOLD,
+                        output_state.expect("monitored state for stall monitor"),
+                        sender,
+                    );
+                    tokio::pin!(monitor);
+                    tokio::select! {
+                        result = run.as_mut() => result,
+                        _ = monitor.as_mut() => run.as_mut().await,
+                    }
+                } else {
+                    run.await
+                };
+                match result {
                     Ok(output) => output,
                     Err(output) => {
-                        // Shell spawn/IO failures return BEFORE the exit
-                        // slot is populated, which would leave the trace
-                        // with start/duration/kind but no failed status.
-                        // Record a truthful "failed" only when the slot is
-                        // still empty — explicit killed metadata already
-                        // written by the timeout/cancel paths is preserved.
                         mark_failed_if_empty(&mut exit_slot.lock().unwrap());
                         output
                     }
@@ -874,6 +975,12 @@ impl BackgroundTasks {
             let mut index = 0;
             while index < running.len() {
                 if running[index].owner_session.as_deref() == Some(owner) {
+                    // Completion is part of the same registry transition as
+                    // removal, so a monitor cannot publish a late warning
+                    // after owned-task teardown wins the race.
+                    if let Some(state) = &running[index].monitored {
+                        state.lock().unwrap().eligible = false;
+                    }
                     tasks.push(running.remove(index));
                 } else {
                     index += 1;
@@ -939,6 +1046,9 @@ impl BackgroundTasks {
                 let mut running = running.running.lock().unwrap();
                 if let Some(index) = running.iter().position(|task| task.id == id) {
                     let task = running.remove(index);
+                    if let Some(state) = &task.monitored {
+                        state.lock().unwrap().eligible = false;
+                    }
                     Some(task.completion_trace())
                 } else {
                     None
@@ -964,6 +1074,7 @@ impl BackgroundTasks {
             display_meta,
             owner_session,
             completion,
+            monitored: None,
             started_at_ms,
             started_at,
             exit: exit_slot,
@@ -976,10 +1087,86 @@ impl BackgroundTasks {
     }
 }
 
+const STALL_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+async fn monitor_stalls(
+    output: OutputSlot,
+    task_id: Arc<AtomicU64>,
+    command: String,
+    started: std::time::Instant,
+    threshold: Duration,
+    state: Arc<std::sync::Mutex<MonitoredTaskState>>,
+    sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+) {
+    let mut deadline = state.lock().unwrap().last_output + threshold;
+    let mut warned_last_output = None;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {}
+            _ = sender.closed() => {
+                state.lock().unwrap().eligible = false;
+                return;
+            }
+        }
+        #[cfg(test)]
+        let hook = state.lock().unwrap().deadline_hook.clone();
+        #[cfg(test)]
+        if let Some((ready, release)) = hook {
+            ready.notify_one();
+            release.notified().await;
+        }
+        let mut state = state.lock().unwrap();
+        if !state.eligible {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        if state.last_output + threshold > now {
+            deadline = state.last_output + threshold;
+            continue;
+        }
+        if warned_last_output == Some(state.last_output) {
+            // The current silence period has already produced its one Notice.
+            // Wake once per threshold without using a past deadline.
+            deadline = now + threshold;
+            continue;
+        }
+        let tail = output.lock().unwrap().clone();
+        let tail = if tail.is_empty() {
+            "no output".to_owned()
+        } else {
+            String::from_utf8_lossy(&tail).into_owned()
+        };
+        if sender
+            .send(AgentEvent::Notice(format!(
+                "background task {} has had no output for five minutes; runtime {:?}; silence duration {:?}; full command: {}; current latest output tail: {}",
+                task_id.load(Ordering::Acquire),
+                started.elapsed(),
+                now.duration_since(state.last_output),
+                command,
+                tail,
+            )))
+            .is_err()
+        {
+            state.eligible = false;
+            return;
+        }
+        warned_last_output = Some(state.last_output);
+        deadline = now + threshold;
+    }
+}
+
 impl Drop for BackgroundRegistry {
     fn drop(&mut self) {
+        // Keep the registry transition lock while closing every gate, before
+        // any process-group kill or handle drop. This preserves registry →
+        // gate → activity ordering for monitor teardown.
+        let running = self.running.lock().unwrap();
+        for task in running.iter() {
+            if let Some(state) = &task.monitored {
+                state.lock().unwrap().eligible = false;
+            }
+        }
         #[cfg(unix)]
-        for task in self.running.lock().unwrap().iter() {
+        for task in running.iter() {
             if let Some(process_group) =
                 rustix::process::Pid::from_raw(task.process_group.load(Ordering::Acquire))
             {
@@ -990,7 +1177,7 @@ impl Drop for BackgroundRegistry {
             }
         }
         #[cfg(windows)]
-        for task in self.running.lock().unwrap().iter() {
+        for task in running.iter() {
             // Degraded kill: terminate the top-level process only. The
             // process tree is not enumerated (no Job Object yet — that is a
             // later milestone), so grandchildren may survive.
@@ -1016,75 +1203,216 @@ impl Drop for BackgroundRegistry {
 mod tests {
     use super::*;
 
-    /// `start`（主会话便捷入口）owner 为 None；`start_with_sender` 显式传
-    /// `owner_session`（subagent 的 bash）时 `running()` 原样透出——任务面板
-    /// 据此显示真正的发起者，而不是 registry 所属会话。
     #[tokio::test]
-    async fn abort_owned_and_join_preserves_other_owners() {
-        let background = BackgroundTasks::new(None, None);
-        for owner in [Some("owner-a".into()), Some("owner-b".into()), None] {
-            background
-                .spawn_inner(
-                    "pending".into(),
-                    None,
-                    None,
-                    None,
-                    owner,
-                    new_exit_slot(),
-                    None,
-                    |_| {},
-                    || async { std::future::pending::<String>().await },
-                    |_, _, _| {},
-                )
-                .unwrap();
-        }
-        assert_eq!(background.abort_owned_and_join("owner-a").await, vec![1]);
-        assert_eq!(
-            background
-                .running()
-                .iter()
-                .map(|task| task.id)
-                .collect::<Vec<_>>(),
-            vec![2, 3]
+    async fn silent_task_warns_once_and_output_resets_cadence() {
+        let state = new_monitored_state();
+        let spool = Arc::new(TaskSpool::with_monitor(Some(state.clone())));
+        let slot: OutputSlot = Arc::new(std::sync::Mutex::new(vec![b'x'; SLOT_LIMIT]));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (ready, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
         );
-        background.cancel(2);
-        background.cancel(3);
-        assert!(background.running().is_empty());
+        state.lock().unwrap().deadline_hook = Some((ready.clone(), release.clone()));
+        let cadence = Duration::from_secs(1);
+        let command = format!(
+            "printf {}",
+            "command-marker-beyond-preview-length".repeat(5)
+        );
+        let task = tokio::spawn(monitor_stalls(
+            slot.clone(),
+            Arc::new(AtomicU64::new(43)),
+            command,
+            std::time::Instant::now(),
+            cadence,
+            state.clone(),
+            sender,
+        ));
+        // The test hook pauses each deadline after the timer fires but before
+        // validation. This drives real Tokio time without wall-clock sleeps or
+        // a runtime-wide paused clock, and makes each boundary explicit.
+        // First warning marks this silence period as already reported.
+        ready.notified().await;
+        release.notify_one();
+        let event = receiver.recv().await.unwrap();
+        let AgentEvent::Notice(text) = event else {
+            panic!("expected stall Notice");
+        };
+        assert!(text.contains("background task 43 has had no output for five minutes"));
+        let runtime = text
+            .split("runtime ")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let silence = text
+            .split("silence duration ")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        assert!(!runtime.trim().is_empty());
+        assert!(!silence.trim().is_empty());
+        assert!(text.contains("command-marker-beyond-preview-length"));
+        assert!(text.contains("current latest output tail: "));
+        assert!(text.ends_with(&"x".repeat(SLOT_LIMIT)));
+        // The next threshold is still part of the same silence period, so it
+        // must not produce a second Notice.
+        ready.notified().await;
+        release.notify_one();
+        tokio::task::yield_now().await;
+        assert!(receiver.try_recv().is_err());
+        // Pause at a later unchanged-silence deadline, update output before
+        // validation, and release the monitor. It must suppress that warning
+        // and re-arm for a full cadence from the output update.
+        ready.notified().await;
+        TaskSpool::capture_append(Some(&slot), Some(&spool), &vec![b'x'; SLOT_LIMIT]);
+        release.notify_one();
+        tokio::task::yield_now().await;
+        assert!(receiver.try_recv().is_err());
+        // Only the reset deadline may produce the next Notice.
+        ready.notified().await;
+        release.notify_one();
+        let event = receiver.recv().await.unwrap();
+        assert!(
+            matches!(event, AgentEvent::Notice(text) if text.contains("background task 43 has had no output for five minutes") && text.contains("runtime ") && text.contains("silence duration ") && text.contains("command-marker-beyond-preview-length") && text.contains("current latest output tail: "))
+        );
+        task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_closes_stall_warning_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+        let shell = Shell::detect().unwrap();
+        for _ in 0..10 {
+            let state = new_monitored_state();
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            state.lock().unwrap().deadline_hook = Some((ready.clone(), release.clone()));
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let monitor = tokio::spawn(monitor_stalls(
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+                Arc::new(AtomicU64::new(101)),
+                "sleep 1".into(),
+                std::time::Instant::now(),
+                Duration::ZERO,
+                state.clone(),
+                sender,
+            ));
+            let run_shell = shell.clone();
+            let run_workspace = workspace.clone();
+            let run = tokio::spawn(async move {
+                super::bash::run_bash_with_tmp_policy_and_stall_state(
+                    &run_shell,
+                    &run_workspace,
+                    "sleep 1",
+                    Some(Duration::from_millis(20)),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Some(state),
+                )
+                .await
+            });
+            ready.notified().await;
+            let result = run.await.unwrap();
+            assert!(result.is_err());
+            release.notify_one();
+            monitor.await.unwrap();
+            assert!(receiver.try_recv().is_err());
+        }
     }
 
     #[tokio::test]
-    async fn start_owner_session_shows_in_running() {
-        let mut background = BackgroundTasks::new(None, None);
-        let (sender, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        background.set_event_sender(sender);
+    async fn process_exit_wins_at_final_warning_validation() {
+        let state = new_monitored_state();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        state.lock().unwrap().deadline_hook = Some((ready.clone(), release.clone()));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let monitor = tokio::spawn(monitor_stalls(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(AtomicU64::new(45)),
+            "completed".into(),
+            std::time::Instant::now(),
+            Duration::ZERO,
+            state.clone(),
+            sender,
+        ));
+        ready.notified().await;
+        state.lock().unwrap().eligible = false;
+        release.notify_one();
+        monitor.await.unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_exit_wins_while_inherited_pipe_drains() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+        let state = new_monitored_state();
+        let spool = Arc::new(TaskSpool::with_monitor(Some(state.clone())));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let shell = Shell::detect().unwrap();
+        let run = super::bash::run_bash_with_tmp_policy_and_stall_state(
+            &shell,
+            &workspace,
+            "(sleep 0.05; printf retained) & exit 0",
+            None,
+            false,
+            None,
+            None,
+            Some(spool),
+            None,
+            None,
+            false,
+            Some(state.clone()),
+        );
+        let monitor = monitor_stalls(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(AtomicU64::new(44)),
+            "(sleep 0.05; printf retained) & exit 0".into(),
+            std::time::Instant::now(),
+            Duration::from_millis(500),
+            state,
+            sender,
+        );
+        let (result, _) = tokio::join!(run, monitor);
+        assert!(result.unwrap().contains("retained"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn receiver_close_does_not_stop_command() {
+        let background = BackgroundTasks::new(None, None);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
-        background
-            .start(workspace.clone(), "sleep 30".to_string(), false)
-            .expect("main-session background bash task starts");
         background
             .start_with_sender(
                 workspace,
-                "sleep 30".to_string(),
+                "sleep 0.05".into(),
                 false,
-                background.sender.lock().unwrap().clone(),
+                Some(sender),
                 None,
-                Some("sub-abc".into()),
+                Some("closed".into()),
             )
-            .expect("subagent background bash task starts");
-        let running = background.running();
-        assert_eq!(running.len(), 2);
-        assert_eq!(
-            running[0].owner_session, None,
-            "main-session task has no owner"
-        );
-        assert_eq!(
-            running[1].owner_session.as_deref(),
-            Some("sub-abc"),
-            "subagent task carries its own session id"
-        );
-        for task in &running {
-            background.cancel(task.id);
-        }
-        assert!(background.running().is_empty());
+            .unwrap();
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !background.running().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

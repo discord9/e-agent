@@ -1066,6 +1066,7 @@ impl SessionRunner {
                 .await
                 .map_err(anyhow::Error::msg)?;
             let event = match &entry {
+                SessionEntry::Notice { text } => AgentEvent::Notice(text.clone()),
                 SessionEntry::BackgroundCompletion {
                     id,
                     output,
@@ -1087,11 +1088,14 @@ impl SessionRunner {
                     status: status.clone(),
                     kind: kind.clone(),
                 },
-                _ => unreachable!("peek_background_entry returns a completion"),
+                _ => unreachable!("peek_background_entry returns a background entry"),
             };
+            let completion = matches!(&entry, SessionEntry::BackgroundCompletion { .. });
             self.agent.apply_entry_located(entry, location);
             self.agent.emit_event(event);
-            any = true;
+            if completion {
+                any = true;
+            }
         }
     }
 
