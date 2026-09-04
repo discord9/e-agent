@@ -464,6 +464,16 @@ explicit label can override it with `zellij action rename-pane
 "<custom>"` at any time — Zellij's own title takes precedence.
 
 The built-in local tool set always includes the capability-relative file tools
+`read_file`, `write_file`, and `edit_file`, plus the `notes` tool rooted at
+`.e-agent/notes`. Notes provide `list`, `search`, `read`, and `write` (write is
+unavailable to read-only roles). List and search return deterministic pages and
+keep at most one process-local cursor per tool instance; starting another list
+or search replaces it. Cursors are not persisted or shared across restarts.
+`read` uses stateless UTF-8 byte-offset paging and rejects offsets inside a
+codepoint. Paths are relative to the notes root and use the existing Workspace
+capability and symlink authorization; notes do not add a second path subsystem.
+
+The built-in local tool set always includes the capability-relative file tools
 `read_file`, `write_file`, and `edit_file`, plus `bash`,
 `get_background_tasks`, and `cancel_background_task`. Main-agent sessions also
 register `delegate`; delegated subagents do not, which caps delegation depth at

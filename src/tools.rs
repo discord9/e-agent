@@ -9,6 +9,7 @@ mod background;
 mod bash;
 mod file;
 pub(crate) mod history;
+mod notes;
 pub mod output;
 #[cfg(target_os = "linux")]
 mod rust;
@@ -242,6 +243,7 @@ fn tools_with_background_and_exa_key(
     } else {
         file_tools(&workspace)
     };
+    tools.push(notes::notes_tool(&workspace, read_only));
     tools.push(Box::new(GetBackgroundTasks::new(
         background.clone(),
         self_session_id.clone(),

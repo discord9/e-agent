@@ -189,6 +189,7 @@ fn web_search_registration_requires_a_nonempty_key() {
         "read_image".to_string(),
         "write_file".to_string(),
         "edit_file".to_string(),
+        "notes".to_string(),
         "get_background_tasks".to_string(),
         "cancel_background_task".to_string(),
         "bash".to_string(),
@@ -212,6 +213,7 @@ fn web_search_registration_requires_a_nonempty_key() {
             "read_image",
             "write_file",
             "edit_file",
+            "notes",
             "get_background_tasks",
             "cancel_background_task",
             "bash",
@@ -1512,6 +1514,7 @@ fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
         names,
         [
             "read_file",
+            "notes",
             "get_background_tasks",
             "cancel_background_task",
             "get_goal",
@@ -1552,6 +1555,7 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
         names,
         [
             "read_file",
+            "notes",
             "get_background_tasks",
             "cancel_background_task",
             shell_name,

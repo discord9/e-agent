@@ -283,6 +283,37 @@ impl Workspace {
         })
     }
 
+    /// Open an authorized directory. A missing path returns `None`; an
+    /// authorized exact-file capability is not a directory.
+    pub(crate) fn try_open_dir(&self, input: &str) -> Result<Option<Dir>, String> {
+        let resolved = match self.resolve_path(input, false) {
+            Ok(resolved) => resolved,
+            Err(error) if error.contains("not found") => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match resolved {
+            Resolved::Workspace { remainder } => match self.dir.open_dir(&remainder) {
+                Ok(dir) => Ok(Some(dir)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+                    Err("authorized path is not a directory".into())
+                }
+                Err(error) => Err(format!("open directory failed: {error}")),
+            },
+            Resolved::External { root, remainder } => match &root.capability {
+                ExternalCapability::Dir(dir) => match dir.open_dir(&remainder) {
+                    Ok(dir) => Ok(Some(dir)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+                        Err("authorized path is not a directory".into())
+                    }
+                    Err(error) => Err(format!("open directory failed: {error}")),
+                },
+                ExternalCapability::File(_) => Err("authorized path is not a directory".into()),
+            },
+        }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
