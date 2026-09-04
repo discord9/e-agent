@@ -1625,6 +1625,95 @@ impl GreptimeSession {
         Ok(out)
     }
 
+    /// Dashboard aggregate: one row per session/model/kind/time bucket.
+    pub async fn usage_dashboard(
+        &self,
+        session_ids: &[String],
+        from_us: i64,
+        to_us: i64,
+        bucket_us: i64,
+    ) -> Result<Vec<crate::session_store::UsageDashboardRow>> {
+        let mut placeholders = String::new();
+        for i in 0..session_ids.len() {
+            if i > 0 {
+                placeholders.push_str(", ");
+            }
+            placeholders.push_str(&format!("${}", i + 5));
+        }
+        let from = chrono::DateTime::<chrono::Utc>::from_timestamp(
+            from_us.div_euclid(1_000_000),
+            (from_us.rem_euclid(1_000_000) * 1000) as u32,
+        )
+        .ok_or_else(|| anyhow::anyhow!("invalid usage window"))?
+        .naive_utc();
+        let to = chrono::DateTime::<chrono::Utc>::from_timestamp(
+            to_us.div_euclid(1_000_000),
+            (to_us.rem_euclid(1_000_000) * 1000) as u32,
+        )
+        .ok_or_else(|| anyhow::anyhow!("invalid usage window"))?
+        .naive_utc();
+        let scope = if session_ids.is_empty() {
+            String::new()
+        } else {
+            format!("AND session_id IN ({placeholders})")
+        };
+        let sql = format!(
+            "SELECT session_id, model, kind, \
+                    CAST(FLOOR(EXTRACT(EPOCH FROM event_time) * 1000000.0 / $4::DOUBLE PRECISION) * $4::DOUBLE PRECISION AS BIGINT) AS bucket_start, \
+                    COUNT(*)::BIGINT AS call_count, SUM(input_tokens)::BIGINT AS input_tokens, \
+                    SUM(output_tokens)::BIGINT AS output_tokens, SUM(cache_hit_tokens)::BIGINT AS cache_hit_tokens, \
+                    SUM(cache_miss_tokens)::BIGINT AS cache_miss_tokens, SUM(reasoning_tokens)::BIGINT AS reasoning_tokens, \
+                    COUNT(cache_hit_tokens)::BIGINT AS cache_hit_reported_calls, \
+                    COUNT(cache_miss_tokens)::BIGINT AS cache_miss_reported_calls, \
+                    COUNT(reasoning_tokens)::BIGINT AS reasoning_reported_calls \
+             FROM usage_entries WHERE workspace_id = $1 AND event_time >= $2 AND event_time < $3 \
+                    {scope} GROUP BY session_id, model, kind, bucket_start"
+        );
+        // Match the FLOAT8 type declared by the SQL cast (hours/days are exact).
+        let bucket_us_f64 = bucket_us as f64;
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&self.workspace_id, &from, &to, &bucket_us_f64];
+        for id in session_ids {
+            params.push(id);
+        }
+        let rows = self
+            .client
+            .query(&sql, &params)
+            .await
+            .context("cannot query usage dashboard")?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let metric = |name: &str| -> Result<u64> {
+                u64::try_from(row.get::<_, i64>(name))
+                    .context(format!("cannot query usage dashboard: {name} is negative"))
+            };
+            let optional = |name: &str| -> Result<Option<u64>> {
+                row.try_get::<_, Option<i64>>(name)
+                    .context("cannot query usage dashboard")?
+                    .map(|n| {
+                        u64::try_from(n).context("cannot query usage dashboard: negative metric")
+                    })
+                    .transpose()
+            };
+            out.push(crate::session_store::UsageDashboardRow {
+                session_id: row.get("session_id"),
+                model: row.get("model"),
+                kind: row.get("kind"),
+                bucket_start: row.get("bucket_start"),
+                call_count: metric("call_count")?,
+                input_tokens: metric("input_tokens")?,
+                output_tokens: metric("output_tokens")?,
+                cache_hit_tokens: optional("cache_hit_tokens")?,
+                cache_miss_tokens: optional("cache_miss_tokens")?,
+                reasoning_tokens: optional("reasoning_tokens")?,
+                cache_hit_reported_calls: metric("cache_hit_reported_calls")?,
+                cache_miss_reported_calls: metric("cache_miss_reported_calls")?,
+                reasoning_reported_calls: metric("reasoning_reported_calls")?,
+            });
+        }
+        Ok(out)
+    }
+
     /// Compare the DB rows already present in the overlapping seq window
     /// `[base_seq, overlap_hi]` against this batch's prepped rows for the
     /// same seqs.
@@ -2121,6 +2210,45 @@ impl GreptimeSession {
             .await
             .context("cannot query child session metadata")?;
         Ok(rows.iter().map(|row| row.get("session_id")).collect())
+    }
+
+    /// Fetch the dashboard's narrow metadata projection for selected sessions.
+    pub async fn usage_dashboard_metadata(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Vec<crate::session_store::UsageDashboardMetadata>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..session_ids.len())
+            .map(|i| format!("${}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT session_id, \"role\", title FROM (\
+                SELECT session_id,\
+                  last_value(ARRAY[\"role\"] ORDER BY last_active_at)[1] AS \"role\",\
+                  last_value(ARRAY[title] ORDER BY last_active_at)[1] AS title \
+                FROM sessions WHERE workspace_id = $1 AND session_id IN ({placeholders}) \
+                GROUP BY session_id) current"
+        );
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&self.workspace_id];
+        for id in session_ids {
+            params.push(id);
+        }
+        let rows = self
+            .client
+            .query(&sql, &params)
+            .await
+            .context("cannot query usage dashboard metadata")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::session_store::UsageDashboardMetadata {
+                session_id: row.get("session_id"),
+                role: row.get("role"),
+                title: row.get("title"),
+            })
+            .collect())
     }
 
     /// Latest metadata snapshot per session, newest activity first.

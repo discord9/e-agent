@@ -2043,3 +2043,186 @@
     .token-toggle { padding: 2px 6px; }
     #workspaceSelect { max-width: 80px; }
   }
+
+  /* =====================================================================
+   * 用量仪表盘：沿用 Solarized tokens，作为与聊天并列的独立内容视图。
+   * ===================================================================*/
+  .primary-nav { display: flex; align-items: center; flex: 0 0 auto; }
+  .nav-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 30px;
+    padding: 4px 10px;
+    background: transparent;
+    border-color: transparent;
+    color: var(--base01);
+  }
+  .nav-btn[aria-pressed="true"] {
+    color: #006da9;
+    background: color-mix(in srgb, var(--blue) 10%, var(--base3));
+    border-color: color-mix(in srgb, var(--blue) 50%, var(--base1));
+  }
+  .usage-dashboard {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 28px clamp(18px, 3vw, 44px) 48px;
+    background:
+      linear-gradient(145deg, color-mix(in srgb, var(--cyan) 5%, transparent), transparent 32%),
+      var(--base3);
+  }
+  .usage-header {
+    max-width: 1440px;
+    margin: 0 auto 20px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 24px;
+  }
+  .usage-eyebrow {
+    margin: 0 0 6px;
+    color: var(--base01);
+    font-size: 11px;
+    font-weight: bold;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+  }
+  .usage-header h1 { margin: 0; color: var(--base03); font-size: clamp(24px, 3vw, 34px); line-height: 1.15; }
+  .usage-subtitle { margin: 8px 0 0; color: var(--base01); line-height: 1.55; }
+  .usage-header-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+  .usage-updated { color: var(--base01); font-size: 12px; }
+
+  .usage-filters {
+    max-width: 1440px;
+    margin: 0 auto 18px;
+    display: grid;
+    grid-template-columns: repeat(6, minmax(120px, 1fr)) auto;
+    gap: 10px;
+    align-items: end;
+    padding: 14px;
+    background: color-mix(in srgb, var(--base2) 75%, var(--base3));
+    border: 1px solid var(--base1);
+    border-radius: 8px;
+  }
+  .usage-filters label { display: grid; gap: 5px; min-width: 0; color: var(--base01); font-size: 11px; font-weight: bold; }
+  .usage-filters input, .usage-filters select {
+    width: 100%; min-width: 0; height: 34px; padding: 5px 8px;
+    border: 1px solid var(--base1); border-radius: 4px;
+    background: var(--base3); color: var(--base02); font: inherit; font-size: 12px;
+  }
+  .usage-filter-actions { display: flex; gap: 7px; }
+  .usage-filter-actions button { min-height: 34px; }
+  .usage-filters :focus-visible, .usage-dashboard button:focus-visible, #usageTable .gridjs-input:focus-visible {
+    outline: 2px solid var(--blue); outline-offset: 2px;
+  }
+
+  .usage-state {
+    max-width: 1440px;
+    margin: 0 auto 18px;
+    min-height: 0;
+  }
+  .usage-state:empty { display: none; }
+  .usage-state-card {
+    display: flex; align-items: center; justify-content: center; gap: 12px;
+    min-height: 180px; padding: 28px; text-align: center;
+    background: var(--base2); border: 1px dashed var(--base1); border-radius: 8px; color: var(--base01);
+  }
+  .usage-state-card > div { max-width: 640px; }
+  .usage-state-card strong { display: block; margin-bottom: 7px; color: var(--base02); font-size: 16px; }
+  .usage-state-card p { margin: 0; line-height: 1.6; }
+  .usage-state-card.error { border-color: color-mix(in srgb, var(--red) 55%, var(--base1)); }
+  .usage-state-card.error strong { color: #a4202b; }
+  .usage-state-card.warning { border-color: color-mix(in srgb, var(--yellow) 65%, var(--base1)); }
+  .usage-state-card.warning strong { color: #765f00; }
+  .usage-spinner {
+    width: 18px; height: 18px; flex: 0 0 auto;
+    border: 2px solid var(--base1); border-top-color: var(--blue); border-radius: 50%;
+    animation: usage-spin .75s linear infinite;
+  }
+  @keyframes usage-spin { to { transform: rotate(360deg); } }
+
+  #usageContent { max-width: 1440px; margin: 0 auto; }
+  .usage-kpis {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(150px, 1fr));
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .usage-kpi {
+    min-width: 0; min-height: 108px; padding: 15px 16px;
+    background: color-mix(in srgb, var(--base3) 88%, white);
+    border: 1px solid var(--base1); border-top: 3px solid var(--kpi-accent, var(--blue)); border-radius: 7px;
+  }
+  .usage-kpi-label { color: var(--base01); font-size: 11px; font-weight: bold; letter-spacing: .04em; }
+  .usage-kpi-value { display: block; margin-top: 9px; color: var(--base03); font-size: clamp(20px, 2.4vw, 28px); line-height: 1.1; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .usage-kpi-hint { display: block; margin-top: 7px; color: var(--base01); font-size: 11px; }
+
+  .usage-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .usage-panel {
+    min-width: 0; padding: 16px;
+    background: color-mix(in srgb, var(--base3) 92%, white);
+    border: 1px solid var(--base1); border-radius: 7px;
+  }
+  .usage-panel-wide { grid-column: 1 / -1; }
+  .usage-panel-head { display: flex; align-items: start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .usage-panel h2 { margin: 0; color: var(--base02); font-size: 14px; }
+  .usage-panel-head p { margin: 5px 0 0; color: var(--base01); font-size: 11px; }
+  .usage-chart { width: 100%; height: 270px; min-width: 0; }
+  .usage-chart .uplot { max-width: 100%; font-family: inherit; }
+  .usage-chart .u-legend { color: var(--base01); font-size: 11px; }
+  .usage-table-panel { margin-top: 12px; }
+  .usage-table-heading { margin-bottom: 2px; }
+
+  /* Grid.js 主题覆写：保留其排序、搜索、分页和 aria grid 行为，视觉对齐现有 UI。 */
+  #usageTable .gridjs-container { color: var(--base02); font-family: inherit; font-size: 12px; }
+  #usageTable .gridjs-head { padding: 10px 0; }
+  #usageTable .gridjs-search { float: none; }
+  #usageTable .gridjs-input {
+    width: min(340px, 100%); padding: 8px 10px; border: 1px solid var(--base1);
+    border-radius: 4px; background: var(--base3); color: var(--base02); font-family: inherit;
+  }
+  #usageTable .gridjs-wrapper { border-color: var(--base1); box-shadow: none; overflow-x: auto; }
+  #usageTable .gridjs-th { background: var(--base2); border-color: var(--base1); color: var(--base02); }
+  #usageTable .gridjs-td { background: transparent; border-color: var(--base1); color: var(--base02); }
+  #usageTable .gridjs-tr:hover .gridjs-td { background: color-mix(in srgb, var(--blue) 6%, var(--base3)); }
+  #usageTable .gridjs-footer { background: transparent; border-color: var(--base1); box-shadow: none; }
+  #usageTable .gridjs-pagination .gridjs-pages button { background: var(--base3); border-color: var(--base1); color: var(--base02); }
+  #usageTable .gridjs-pagination .gridjs-pages button.gridjs-currentPage { background: var(--base2); color: var(--blue); font-weight: bold; }
+  #usageTable .gridjs-sort { color: var(--base01); }
+  .usage-table-title { display: block; max-width: 32ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--base03); font-weight: bold; }
+  .usage-table-id { display: block; margin-top: 3px; color: var(--base01); font-size: 10px; }
+  .usage-role-chip { display: inline-block; padding: 2px 6px; border: 1px solid var(--base1); border-radius: 999px; background: var(--base2); color: var(--base01); }
+
+  @media (max-width: 1080px) {
+    .usage-filters { grid-template-columns: repeat(3, minmax(140px, 1fr)); }
+    .usage-filter-actions { justify-content: flex-end; }
+  }
+  @media (max-width: 720px) {
+    .usage-dashboard { padding: 18px 12px 36px; }
+    .usage-header { align-items: flex-start; flex-direction: column; gap: 14px; }
+    .usage-header-actions { width: 100%; justify-content: flex-start; }
+    .usage-updated { flex: 1 1 100%; }
+    .usage-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 11px; }
+    .usage-filter-actions { grid-column: 1 / -1; }
+    .usage-filter-actions button { flex: 1; }
+    .usage-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .usage-charts { grid-template-columns: 1fr; }
+    .usage-panel-wide { grid-column: auto; }
+    .usage-chart { height: 240px; }
+    .usage-panel { padding: 13px; }
+  }
+  @media (max-width: 440px) {
+    .primary-nav { margin-left: auto; }
+    .nav-btn { padding: 3px 7px; }
+    .nav-btn .nav-label { display: none; }
+    .usage-filters { grid-template-columns: 1fr; }
+    .usage-filter-actions { grid-column: auto; }
+    .usage-kpis { gap: 8px; }
+    .usage-kpi { padding: 12px; min-height: 96px; }
+    .usage-kpi-value { font-size: 20px; }
+    .usage-chart { height: 220px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .usage-spinner { animation: none; border-top-color: var(--base1); }
+  }

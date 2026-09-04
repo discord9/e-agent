@@ -16,6 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 JS_FILES = ['app.js', 'render.js', 'sessions.js', 'tasks.js', 'sse.js']
 js = "\n".join(open(os.path.join(HERE, f), encoding='utf-8').read() for f in JS_FILES)
 vendor_js = open(os.path.join(HERE, 'vendor', 'marked.min.js'), encoding='utf-8').read()
+usage_dashboard_js = open(os.path.join(HERE, 'usage-dashboard.js'), encoding='utf-8').read()
 
 MODE = os.environ.get('MODE', 'open')   # 'open' = full suite; 'markdown' = focused DOM-safety/rendering checks; 'composer-history' = focused ArrowUp checks
 DEEP_LINK = os.environ.get('DEEP_LINK', '')   # 注入 ?session=<id> 到 location.search（init 启动时解析）
@@ -151,7 +152,7 @@ function matchSel(el, sel){
 class El {
   constructor(tag){ this.tag=tag; this._children=[]; this._classes=new Set();
     this._className=""; this._text=""; this._innerHTML=""; this.hidden=false;
-    this.disabled=false; this.value=""; this.title=""; this.type=""; this.style={};
+    this.disabled=false; this.value=""; this.title=""; this.type=""; this.style={ setProperty(k,v){ this[k]=v; } };
     this.scrollHeight=0; this.scrollTop=0; this.clientHeight=0; this.offsetParent=null;
     /* fake DOM 无真实布局：offsetHeight 恒 0，测试可覆写（隐藏时强制 0，
        与浏览器 hidden → offsetHeight 0 的语义一致）。 */
@@ -247,7 +248,11 @@ for(const id of ["topActions","backParentBtn","connState","banner","bannerText",
   "queueBar","goalBar","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
   "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks","forkMenu",
   "workspaceSelect","workspaceAddBtn","workspaceRemoveBtn","workspaceEditor",
-  "wsNameInput","wsUrlInput","wsTokenInput","wsSaveBtn","wsCancelBtn"]) elsById[id]=new El(id);
+  "wsNameInput","wsUrlInput","wsTokenInput","wsSaveBtn","wsCancelBtn",
+  "usageDashboardBtn","usageDashboard","usageTitle","usageScopeNote","usageUpdatedAt",
+  "usageRefreshBtn","usageCloseBtn","usageFilters","usageFrom","usageTo","usageRootSession",
+  "usageModel","usageRole","usageKind","usageBucket","usageResetBtn","usageStatus","usageContent","usageKpis",
+  "usageTrendChart","usageModelChart","usageCompositionChart","usageTable","usageTableNote"]) elsById[id]=new El(id);
 // 任务折叠条的计数徽标 span（index.html 里的 .tasks-toggle-label）——
 // 面板计数断言需要它；其余 stub 元素都是裸 El，不建子树。
 const _togLabel = new El("span");
@@ -274,6 +279,8 @@ globalThis.location={ search:"__DEEP_LINK_SEARCH__" };
    返回 null——与真实行为一致。 */
 globalThis.URLSearchParams=class{ constructor(s){ this._m=new Map(); const q=String(s||""); if(q.startsWith("?")){ for(const kv of q.slice(1).split("&")){ if(!kv) continue; const i=kv.indexOf("="); const k=i<0?kv:kv.slice(0,i); const v=i<0?"":decodeURIComponent(kv.slice(i+1)); if(k) this._m.set(k,v); } } } get(k){ return this._m.has(k)?this._m.get(k):null; } };
 globalThis.requestAnimationFrame=()=>0;
+globalThis.ResizeObserver=undefined;
+globalThis.uPlot=function(){}; globalThis.gridjs={ Grid:function(){} };
 /* abort 桩（真实语义）：abort() 置 signal.aborted 并触发 abort 监听器；
    fetch 侧对未 settle 的请求 reject AbortError（见 resp 的 signal 参数与
    abortable），模拟真实 fetch 的 AbortController——10s 超时
@@ -516,6 +523,17 @@ let promptPostDeferred = false;
 let promptPostResolve = null;
 let promptPostStatus = 202;
 let promptPostNetFail = false;
+let usageDashboardDelayed = false;
+let usageDashboardResolve = null;
+const usageDashboardBody = {
+  generated_at: "2024-01-01T00:00:00Z",
+  window: {from: "2023-12-31T00:00:00Z", to: "2024-01-01T00:00:00Z", bucket: "day"},
+  scope: "workspace", totals: {call_count: 0, input_tokens: 0, output_tokens: 0, total_tokens: 0,
+    cache_hit_tokens: null, cache_miss_tokens: null, reasoning_tokens: null,
+    cache_hit_reported_calls: 0, cache_miss_reported_calls: 0, reasoning_reported_calls: 0},
+  trend: [], by_model: [], by_role: [], by_kind: [],
+  top_sessions: {limit: 100, has_more: false, rows: []},
+};
 globalThis.fetch=(url,opts={})=>{
   FETCHES.push(url);
   FETCH_HEADERS.push({ url, method: (opts.method||"GET").toUpperCase(), headers: opts.headers || {} });
@@ -523,6 +541,10 @@ globalThis.fetch=(url,opts={})=>{
   FETCH_OPTS.push({ url, method: (opts.method||"GET").toUpperCase(), cache: opts.cache || null });
   const signal = opts && opts.signal;   // 传给 abort 感知的响应桩
   const m=(opts.method||"GET").toUpperCase();
+      if(url.startsWith("/api/usage/dashboard")) {
+        if (usageDashboardDelayed) return new Promise((resolve) => { usageDashboardResolve = resolve; });
+        return resp(200, usageDashboardBody, signal);
+      }
       if(url==="/api/tasks") return resp(200, tasksData, signal);
       if(url==="/api/tasks/finished") {
         if (finishedDelayed) return abortable(new Promise((resolve) => { finishedResolve = resolve; }), signal);
@@ -691,6 +713,36 @@ async function main(){
     state.globalToken="test-token";   // 全局回退 token（workspaceToken 的兜底）
     state.token="test-token";         // 激活 workspace 派生 token（兼容既有引用）
     await pollSessions();
+    if (MODE === 'usage-dashboard') {
+      let focusedFail=0;
+      const focusedChk=(name, ok, extra)=>{
+        if(!ok) focusedFail++;
+        console.log((ok?"PASS":"FAIL")+" "+name+(extra?"  "+extra:""));
+      };
+      state.workspaces = [{id:"wsA", name:"A", url:"", token:""},
+        {id:"wsB", name:"B", url:"", token:""}];
+      state.workspace = state.workspaces[0]; state.token = "";
+      usageDashboardState.open = true; usageDashboardState.request = 41;
+      elsById["usageDashboard"].hidden = false;
+      elsById["chatView"].classList.add("hidden");
+      usageDashboardDelayed = true;
+      loadUsageDashboard();
+      await flush();
+      switchWorkspace("wsB");
+      const staleRequest = usageDashboardState.request;
+      usageDashboardResolve(resp(200, usageDashboardBody));
+      usageDashboardDelayed = false; usageDashboardResolve = null;
+      await flush(); await flush();
+      focusedChk("dashboard-open workspace switch hides dashboard and shows chat",
+        usageDashboardState.open === false && usageDashboardState.request === staleRequest
+        && elsById["usageDashboard"].hidden === true
+        && !elsById["chatView"].classList.contains("hidden")
+        && state.workspace.id === "wsB");
+      focusedChk("stale dashboard completion cannot render",
+        elsById["usageContent"].hidden === true);
+      console.log(focusedFail===0 ? "ALL PASS" : focusedFail+" FAILURES");
+      imports.system.exit(0);
+    }
     if (MODE === 'header') {
       let focusedFail=0;
       const focusedChk=(name, ok, extra)=>{
@@ -721,7 +773,6 @@ async function main(){
         FETCH_OPTS.filter((f) => !f.url.endsWith("/events"))
           .every((f) => f.cache === "no-store"),
         "caches=" + JSON.stringify([...new Set(FETCH_OPTS.map((f) => f.cache))]));
-
     if (MODE === 'refresh-deep-link') {
       const refreshReset = (list, failure) => {
         sessionsData = list;
@@ -7946,6 +7997,7 @@ async function main(){
 main();
 '''.replace('MODE === \'direct\'', 'true' if MODE == 'direct' else 'false') \
    .replace("MODE === 'header'", 'true' if MODE == 'header' else 'false') \
+   .replace("MODE === 'usage-dashboard'", 'true' if MODE == 'usage-dashboard' else 'false') \
    .replace("MODE === 'composer-history'", 'true' if MODE == 'composer-history' else 'false') \
    .replace("MODE === 'markdown'", 'true' if MODE == 'markdown' else 'false') \
    .replace("MODE === 'refresh-deep-link'", 'true' if MODE == 'refresh-deep-link' else 'false')
@@ -7955,7 +8007,7 @@ HARNESS = HARNESS.replace('__DEEP_LINK_SEARCH__', ('?session=' + DEEP_LINK) if D
 
 out = os.path.join(HERE, '.test_harness.js')
 with open(out, 'w', encoding='utf-8') as f:
-    f.write(HARNESS + vendor_js + "\n" + js + TAIL)
+    f.write(HARNESS + vendor_js + "\n" + js + "\n" + usage_dashboard_js + TAIL)
 r = subprocess.run(['gjs', out], capture_output=True, text=True)
 print(r.stdout, end="")
 if r.stderr.strip():
@@ -8131,6 +8183,47 @@ print(("PASS" if _zoom_guard_ok else "FAIL") + " pinch zoom leaves app height to
 _icon_m = re.search(r'<link\s+rel="icon"\s+type="image/svg\+xml"\s+href="(data:image/svg\+xml,[^"]+)"', _html)
 _icon_ok = bool(_icon_m and '%23' in _icon_m.group(1) and '#' not in _icon_m.group(1))
 print(("PASS" if _icon_ok else "FAIL") + " inline SVG favicon data URI in index.html head")
+# Usage dashboard shell checks stay deterministic in the GJS harness without
+# depending on uPlot/Grid.js layout engines (their browser behavior is covered
+# by the focused browser verifier plan in the implementation report).
+_index = open(os.path.join(HERE, 'index.html'), encoding='utf-8').read()
+_usage_js = open(os.path.join(HERE, 'usage-dashboard.js'), encoding='utf-8').read()
+_usage_css = _css
+_usage_shell_ok = all(token in _index for token in [
+    'id="usageDashboardBtn"', 'id="usageDashboard"', 'id="usageFilters"',
+    'id="usageFrom"', 'id="usageTo"', 'id="usageRootSession"',
+    'id="usageModel"', 'id="usageRole"', 'id="usageKind"', 'id="usageBucket"',
+    'id="usageKpis"', 'id="usageTrendChart"', 'id="usageModelChart"',
+    'id="usageCompositionChart"', 'id="usageTable"'])
+print(("PASS" if _usage_shell_ok else "FAIL") + " usage dashboard semantic shell and required controls")
+_vendor_uplot = open(os.path.join(HERE, 'vendor', 'uPlot.iife.min.js'), encoding='utf-8').read()
+_vendor_grid = open(os.path.join(HERE, 'vendor', 'gridjs.umd.js'), encoding='utf-8').read()
+_usage_contract_ok = ('/api/usage/dashboard?' in _usage_js
+    and 'uPlot (v1.6.31)' in _vendor_uplot and 'sourceMappingURL=gridjs.umd.js.map' in _vendor_grid
+    and 'function normalizeUsagePayload' in _usage_js
+    and all(name in _usage_js for name in ['models', 'kinds', 'bucket', 'top_n', 'top_sessions',
+        'by_model', 'by_role', 'by_kind', 'cache_hit_reported_calls', 'reasoning_reported_calls'])
+    and 'usageDashboardGet' in _usage_js and 'Bearer' not in _usage_js
+    and 'Number.isSafeInteger(value)' in _usage_js
+    and 'topHasMore' in _usage_js and 'rowsTruncated' not in _usage_js
+    and 'totalsRaw' not in _usage_js and 'model_share' not in _usage_js)
+print(("PASS" if _usage_contract_ok else "FAIL") + " usage provisional API adapter and exact-vs-top-N labeling")
+_usage_states_ok = all(text in _usage_js for text in [
+    '正在汇总用量', '没有匹配的用量', '无法加载用量数据',
+    'JSONL 汇总不可用', '供应商未提供'])
+print(("PASS" if _usage_states_ok else "FAIL") + " usage loading/empty/error/JSONL-unavailable states")
+_usage_responsive_ok = ('@media (max-width: 720px)' in _usage_css
+    and '@media (max-width: 440px)' in _usage_css
+    and '.usage-filters' in _usage_css and '.usage-kpis' in _usage_css
+    and '.usage-filters :focus-visible' in _usage_css
+    and '#006da9' in _usage_css and '#a4202b' in _usage_css and '#765f00' in _usage_css
+    and 'color: var(--base01);' in _usage_css
+    and '@media (prefers-reduced-motion: reduce)' in _usage_css)
+print(("PASS" if _usage_responsive_ok else "FAIL") + " usage responsive/focus/reduced-motion rules")
+if not (_usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_responsive_ok):
+    sys.exit(1)
+
+
 if MODE == 'header':
     sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _header_busy_ok else 1)
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok else 1)
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok and _usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_responsive_ok else 1)

@@ -20,6 +20,7 @@
      均清晰可辨。 -->
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Cg%20fill%3D%22%23859900%22%20stroke%3D%22%23859900%22%20stroke-width%3D%221%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20transform%3D%22translate%2811.45%2039.99%29%20scale%280.039062%29%22%20d%3D%22M553%20-1011Q637%20-1011%20709%20-982Q781%20-953%20834%20-897.50Q887%20-842%20917.50%20-761Q948%20-680%20948%20-575Q948%20-553%20942%20-545Q936%20-537%20922%20-537H198V-518Q198%20-406%20224%20-321Q250%20-236%20298%20-178.50Q346%20-121%20414%20-92Q482%20-63%20566%20-63Q641%20-63%20696%20-79.50Q751%20-96%20788.50%20-116.50Q826%20-137%20848%20-153.50Q870%20-170%20880%20-170Q893%20-170%20900%20-160L926%20-128Q902%20-98%20862.50%20-72Q823%20-46%20774.50%20-27.50Q726%20-9%20670.50%202Q615%2013%20559%2013Q457%2013%20373%20-22.50Q289%20-58%20229%20-126Q169%20-194%20136.50%20-292.50Q104%20-391%20104%20-518Q104%20-625%20134.50%20-715.50Q165%20-806%20222.50%20-871.50Q280%20-937%20363.50%20-974Q447%20-1011%20553%20-1011ZM554%20-940Q477%20-940%20416%20-916Q355%20-892%20310.50%20-847Q266%20-802%20238.50%20-739Q211%20-676%20202%20-598H862Q862%20-678%20839.50%20-741.50Q817%20-805%20776%20-849Q735%20-893%20678.50%20-916.50Q622%20-940%20554%20-940Z%22/%3E%3C/g%3E%3Cpath%20d%3D%22M20%2052H44%22%20fill%3D%22none%22%20stroke%3D%22%23cb4b16%22%20stroke-width%3D%224%22%20stroke-linecap%3D%22round%22/%3E%3C/svg%3E">
 <style>/*__KATEX_CSS__*/
+/*__USAGE_DASHBOARD_VENDOR_CSS__*/
 /*__CSS__*/</style>
 </head>
 <body>
@@ -27,6 +28,11 @@
 <header id="topbar">
   <button id="sidebarBtn" title="会话侧边栏">☰</button>
   <div class="brand">e-agent<span class="dot">●</span></div>
+  <nav class="primary-nav" aria-label="主要视图">
+    <button id="usageDashboardBtn" type="button" class="nav-btn" aria-controls="usageDashboard" aria-pressed="false" title="打开用量仪表盘">
+      <span aria-hidden="true">▥</span><span class="nav-label">用量</span>
+    </button>
+  </nav>
   <div class="top-actions" id="topActions" hidden>
     <button id="backParentBtn" title="返回主会话" hidden>← 主会话</button>
     <select id="workspaceSelect" title="切换服务器实例"></select>
@@ -117,12 +123,72 @@
     </div>
   </div>
 </main>
+
+<!-- ============ 用量仪表盘（独立视图，不改变聊天会话状态） ============ -->
+<main id="usageDashboard" class="usage-dashboard" hidden aria-labelledby="usageTitle">
+  <header class="usage-header">
+    <div>
+      <p class="usage-eyebrow">工作区可观测性</p>
+      <h1 id="usageTitle" tabindex="-1">用量仪表盘</h1>
+      <p id="usageScopeNote" class="usage-subtitle">精确汇总当前筛选范围内的模型调用与 Token。</p>
+    </div>
+    <div class="usage-header-actions">
+      <span id="usageUpdatedAt" class="usage-updated" aria-live="polite"></span>
+      <button id="usageRefreshBtn" type="button" class="primary">刷新数据</button>
+      <button id="usageCloseBtn" type="button">返回对话</button>
+    </div>
+  </header>
+
+  <form id="usageFilters" class="usage-filters" aria-label="用量筛选条件">
+    <label><span>从</span><input id="usageFrom" name="from" type="datetime-local"></label>
+    <label><span>到</span><input id="usageTo" name="to" type="datetime-local"></label>
+    <label><span>根会话</span><select id="usageRootSession" name="root_session_id"><option value="">全部会话</option></select></label>
+    <label><span>模型</span><select id="usageModel" name="model"><option value="">全部模型</option></select></label>
+    <label><span>角色</span><select id="usageRole" name="role"><option value="">全部角色</option></select></label>
+    <label><span>类型</span><select id="usageKind" name="kind"><option value="">全部类型</option></select></label>
+    <label><span>粒度</span><select id="usageBucket" name="bucket"><option value="hour">小时</option><option value="day" selected>天</option></select></label>
+    <div class="usage-filter-actions">
+      <button id="usageResetBtn" type="button">重置</button>
+      <button type="submit" class="primary">应用筛选</button>
+    </div>
+  </form>
+
+  <div id="usageStatus" class="usage-state" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <section id="usageContent" hidden aria-busy="false">
+    <div id="usageKpis" class="usage-kpis" aria-label="完整筛选范围汇总指标"></div>
+
+    <div class="usage-charts">
+      <section class="usage-panel usage-panel-wide" aria-labelledby="usageTrendTitle">
+        <div class="usage-panel-head"><div><h2 id="usageTrendTitle">Token 趋势</h2><p>按时间桶统计；图例可切换系列</p></div></div>
+        <div id="usageTrendChart" class="usage-chart" role="img" aria-label="Token 随时间变化折线图"></div>
+      </section>
+      <section class="usage-panel" aria-labelledby="usageModelTitle">
+        <div class="usage-panel-head"><div><h2 id="usageModelTitle">模型占比</h2><p>按总 Token 统计</p></div></div>
+        <div id="usageModelChart" class="usage-chart" role="img" aria-label="模型 Token 占比图"></div>
+      </section>
+      <section class="usage-panel" aria-labelledby="usageCompositionTitle">
+        <div class="usage-panel-head"><div><h2 id="usageCompositionTitle">Token 指标对照</h2><p>推理与缓存是输入的重叠子集，不可相加</p></div></div>
+        <div id="usageCompositionChart" class="usage-chart" role="img" aria-label="Token 指标对照图；推理与缓存不可同输入相加"></div>
+      </section>
+    </div>
+
+    <section class="usage-panel usage-table-panel" aria-labelledby="usageTableTitle">
+      <div class="usage-panel-head usage-table-heading">
+        <div><h2 id="usageTableTitle">高用量会话与子代理</h2><p id="usageTableNote">当前筛选范围内，按总 Token 排序</p></div>
+      </div>
+      <div id="usageTable"></div>
+    </section>
+  </section>
+</main>
 </div><!-- /#contentWrap -->
 </div><!-- /#appBody -->
 
 <!--__PET__-->
 <script>/*__JS_VENDOR__*/</script>
+<script>/*__USAGE_DASHBOARD_VENDOR_JS__*/</script>
 
 <script>/*__JS_APP__*/</script>
+<script>/*__USAGE_DASHBOARD_JS__*/</script>
 </body>
 </html>

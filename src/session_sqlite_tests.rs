@@ -2061,6 +2061,149 @@ async fn advance_next_seq_rewind_rejected_and_toctou_refresh() {
 // ----------------------------------------------------------------------
 
 #[tokio::test]
+async fn usage_dashboard_sqlite_aggregate_preserves_null_and_zero() {
+    let (_dir, session, sid) = fresh_session().await;
+    let wid = workspace_id();
+    session
+        .create_meta(&sid, Some("m"), Some("role"), None, None, None)
+        .await
+        .unwrap();
+    session
+        .append_usage(
+            &wid,
+            &sid,
+            "m",
+            "regular",
+            None,
+            &crate::agent::Usage {
+                input_tokens: 3,
+                output_tokens: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .append_usage(
+            &wid,
+            &sid,
+            "m",
+            "regular",
+            None,
+            &crate::agent::Usage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_hit_tokens: Some(0),
+                cache_miss_tokens: Some(0),
+                reasoning_tokens: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let from = 0;
+    let rows = session
+        .usage_dashboard(&[sid], from, i64::MAX, 86_400_000_000)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(
+        (row.call_count, row.input_tokens, row.output_tokens),
+        (2, 4, 6)
+    );
+    assert_eq!(
+        (row.cache_hit_tokens, row.cache_hit_reported_calls),
+        (Some(0), 1)
+    );
+    assert_eq!(
+        (row.cache_miss_tokens, row.cache_miss_reported_calls),
+        (Some(0), 1)
+    );
+    assert_eq!(
+        (row.reasoning_tokens, row.reasoning_reported_calls),
+        (Some(0), 1)
+    );
+}
+
+#[tokio::test]
+async fn usage_dashboard_sqlite_half_open_window_and_negative_epoch_buckets() {
+    let (_dir, session, sid) = fresh_session().await;
+    let wid = workspace_id();
+    let bucket = 100i64;
+    let conn = session.conn.lock().await;
+    for (seq, event_time_us) in [(1i64, -1i64), (2, 0), (3, bucket)] {
+        conn.execute(
+            "INSERT INTO usage_entries \
+             (workspace_id, session_id, seq, event_time_us, model, kind, input_tokens, output_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (wid.as_str(), sid.as_str(), seq, event_time_us, "m", "regular", 1i64, 0i64),
+        )
+        .await
+        .unwrap();
+    }
+    drop(conn);
+
+    let rows = session
+        .usage_dashboard(std::slice::from_ref(&sid), -bucket, bucket, bucket)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "[from, to) excludes the row at exact to");
+    let mut by_bucket = rows
+        .into_iter()
+        .map(|row| (row.bucket_start, row.call_count))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        by_bucket.remove(&-bucket),
+        Some(1),
+        "-1us floors to -bucket"
+    );
+    assert_eq!(by_bucket.remove(&0), Some(1));
+    assert!(by_bucket.is_empty());
+}
+#[tokio::test]
+async fn usage_dashboard_sqlite_empty_scope_is_workspace_wide() {
+    let (_dir, session, sid) = fresh_session().await;
+    let wid = workspace_id();
+    session
+        .append_usage(&wid, &sid, "m", "regular", None, &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .usage_dashboard(&[], 0, i64::MAX, 86_400_000_000)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn usage_dashboard_sqlite_direct_child_metadata_is_available() {
+    let (_dir, session, sid) = fresh_session().await;
+    let child = format!("child-{}", crate::session::new_id());
+    session
+        .create_meta(&sid, Some("m"), Some("r"), None, None, None)
+        .await
+        .unwrap();
+    session
+        .create_meta(&child, Some("m"), Some("r"), Some(&sid), Some(1), None)
+        .await
+        .unwrap();
+    let metas = session.list_meta().await.unwrap();
+    assert_eq!(
+        metas
+            .iter()
+            .find(|m| m.session_id == child)
+            .unwrap()
+            .parent_session_id
+            .as_deref(),
+        Some(sid.as_str())
+    );
+}
+
+#[tokio::test]
 async fn usage_entries_append_and_summarize() {
     let (_dir, session, sid) = fresh_session().await;
     let wid = workspace_id();

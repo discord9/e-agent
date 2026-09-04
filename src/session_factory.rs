@@ -928,6 +928,17 @@ impl SessionFactory {
         Self::test_factory_with_config(root, None)
     }
 
+    /// Test-only factory with an explicitly selected persistence backend.
+    #[cfg(test)]
+    pub(crate) fn test_factory_with_backend(
+        root: PathBuf,
+        backend: crate::config::SessionBackend,
+    ) -> Self {
+        let mut factory = Self::test_factory(root);
+        factory.backend = backend;
+        factory
+    }
+
     /// Test-only factory carrying a config, so runtime `/model` endpoint
     /// tests can exercise real profile resolution (`resolve_profile`)
     /// without touching the user's global config.

@@ -1756,6 +1756,96 @@ impl SqliteSession {
         Ok(out)
     }
 
+    /// Dashboard aggregate: one row per session/model/kind/time bucket.
+    pub async fn usage_dashboard(
+        &self,
+        session_ids: &[String],
+        from_us: i64,
+        to_us: i64,
+        bucket_us: i64,
+    ) -> Result<Vec<crate::session_store::UsageDashboardRow>, String> {
+        let mut params: Vec<turso::Value> = vec![
+            turso::Value::Integer(bucket_us),
+            turso::Value::Text(self.workspace_id.clone()),
+            turso::Value::Integer(from_us),
+            turso::Value::Integer(to_us),
+        ];
+        let scope = if session_ids.is_empty() {
+            String::new()
+        } else {
+            let placeholders = vec!["?"; session_ids.len()].join(", ");
+            params.extend(session_ids.iter().cloned().map(turso::Value::Text));
+            format!(" AND session_id IN ({placeholders})")
+        };
+        let sql = format!(
+            "SELECT session_id, model, kind, ((event_time_us / ?1) - CASE WHEN event_time_us < 0 AND (event_time_us / ?1) * ?1 != event_time_us THEN 1 ELSE 0 END) * ?1 AS bucket_start, \
+                    COUNT(*) AS call_count, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, \
+                    SUM(cache_hit_tokens) AS cache_hit_tokens, SUM(cache_miss_tokens) AS cache_miss_tokens, SUM(reasoning_tokens) AS reasoning_tokens, \
+                    COUNT(cache_hit_tokens) AS cache_hit_reported_calls, COUNT(cache_miss_tokens) AS cache_miss_reported_calls, COUNT(reasoning_tokens) AS reasoning_reported_calls \
+             FROM usage_entries WHERE workspace_id = ?2 AND event_time_us >= ?3 \
+                    AND event_time_us < ?4{scope} \
+             GROUP BY session_id, model, kind, bucket_start"
+        );
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(&sql, turso::params_from_iter(params))
+            .await
+            .map_err(|e| format!("cannot query usage dashboard: {e}"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot query usage dashboard: {e}"))?
+        {
+            let int = |i: usize| {
+                row.get_value(i)
+                    .map_err(|e| format!("cannot query usage dashboard: {e}"))?
+                    .as_integer()
+                    .copied()
+                    .ok_or_else(|| "cannot query usage dashboard: non-integer".to_string())
+            };
+            let text = |i: usize| {
+                row.get_value(i)
+                    .map_err(|e| format!("cannot query usage dashboard: {e}"))?
+                    .as_text()
+                    .cloned()
+                    .ok_or_else(|| "cannot query usage dashboard: non-text".to_string())
+            };
+            let optional = |i: usize| {
+                row.get_value(i)
+                    .map_err(|e| format!("cannot query usage dashboard: {e}"))?
+                    .as_integer()
+                    .copied()
+                    .map(|v| {
+                        u64::try_from(v).map_err(|_| {
+                            "cannot query usage dashboard: negative metric".to_string()
+                        })
+                    })
+                    .transpose()
+            };
+            let nonnegative = |i: usize| {
+                u64::try_from(int(i)?)
+                    .map_err(|_| "cannot query usage dashboard: negative metric".to_string())
+            };
+            out.push(crate::session_store::UsageDashboardRow {
+                session_id: text(0)?,
+                model: text(1)?,
+                kind: text(2)?,
+                bucket_start: int(3)?,
+                call_count: nonnegative(4)?,
+                input_tokens: nonnegative(5)?,
+                output_tokens: nonnegative(6)?,
+                cache_hit_tokens: optional(7)?,
+                cache_miss_tokens: optional(8)?,
+                reasoning_tokens: optional(9)?,
+                cache_hit_reported_calls: nonnegative(10)?,
+                cache_miss_reported_calls: nonnegative(11)?,
+                reasoning_reported_calls: nonnegative(12)?,
+            });
+        }
+        Ok(out)
+    }
+
     // ------------------------------------------------------------------
     // sessions — metadata audit table
     // ------------------------------------------------------------------
@@ -1767,6 +1857,62 @@ impl SqliteSession {
     // and the list view deduplicates per session taking the latest
     // last_active_at. There is no partial-row rewrite, so a touch can
     // never wipe immutable columns.
+
+    /// Return direct children using one targeted metadata query.
+    pub async fn child_session_ids(&self, parent_session_id: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT s.session_id FROM sessions s INNER JOIN (SELECT session_id, MAX(last_active_at) AS max_ts FROM sessions WHERE workspace_id = ?1 GROUP BY session_id) latest ON latest.session_id = s.session_id AND latest.max_ts = s.last_active_at WHERE s.workspace_id = ?1 AND s.parent_session_id = ?2",
+            (self.workspace_id.as_str(), parent_session_id),
+        ).await.map_err(|e| format!("cannot query child session metadata: {e}"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot query child session metadata: {e}"))?
+        {
+            out.push(
+                row.get_value(0)
+                    .map_err(|e| format!("cannot query child session metadata: {e}"))?
+                    .as_text()
+                    .cloned()
+                    .ok_or_else(|| {
+                        "cannot query child session metadata: session_id is not text".to_string()
+                    })?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Fetch the dashboard's narrow metadata projection for selected sessions.
+    pub async fn usage_dashboard_metadata(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Vec<crate::session_store::UsageDashboardMetadata>, String> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; session_ids.len()].join(", ");
+        let mut params = vec![turso::Value::Text(self.workspace_id.clone())];
+        params.extend(session_ids.iter().cloned().map(turso::Value::Text));
+        let mut rows = self.conn.lock().await.query(&format!("SELECT session_id, \"role\", title FROM (SELECT session_id, \"role\", title, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY last_active_at DESC) AS rn FROM sessions WHERE workspace_id = ? AND session_id IN ({placeholders})) WHERE rn = 1",), turso::params_from_iter(params)).await.map_err(|e| format!("cannot query usage dashboard metadata: {e}"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot query usage dashboard metadata: {e}"))?
+        {
+            let text = |i| row.get_value(i).ok().and_then(|v| v.as_text().cloned());
+            out.push(crate::session_store::UsageDashboardMetadata {
+                session_id: text(0).ok_or_else(|| {
+                    "cannot query usage dashboard metadata: session_id is not text".to_string()
+                })?,
+                role: text(1),
+                title: text(2),
+            });
+        }
+        Ok(out)
+    }
 
     /// Latest metadata snapshot for one session, or `None` when the
     /// session has no row yet (brand-new session, or a subagent whose

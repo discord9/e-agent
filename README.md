@@ -788,10 +788,12 @@ e-agent web                       # http://127.0.0.1:8766
 e-agent --serve --port 9000       # http://127.0.0.1:9000
 ```
 
-Every `/api/*` request must authenticate with the server token as
-`Authorization: Bearer <token>` (or `?token=<token>`, the query fallback for
-EventSource-style clients that cannot set headers). The token is generated
-once at first start — 32 random bytes, base64url, written with mode 0600 to
+Every API route requires the server token as `Authorization: Bearer <token>`
+(or `?token=<token>`, the query fallback for EventSource-style clients),
+except the public read-only `GET /api/usage/dashboard`. That GET deliberately
+ignores missing or invalid Authorization; it accepts no token in its browser
+client. The token is generated once at first start — 32 random bytes,
+base64url, written with mode 0600 to
 `$XDG_STATE_HOME/e-agent/server.token` (falling back to
 `~/.local/state/e-agent/server.token` when `XDG_STATE_HOME` is unset) — and
 reused across restarts so browser clients keep working. The startup log
@@ -821,9 +823,26 @@ The `/api` surface (JSON except for the SSE endpoint):
 | PUT | `/api/sessions/{id}/pin` | pin a session |
 | PUT | `/api/sessions/{id}/archive` | archive a session |
 | DELETE | `/api/sessions/{id}` | cancel + remove from the registry |
+| GET | `/api/usage/dashboard` | **public** read-only usage JSON (SQLite/Greptime; JSONL returns 503) |
 | GET | `/api/tasks` | running background tasks, all sessions |
 | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task |
 | GET | `/api/sessions/{id}/tasks/{task_id}/output` | full output of a running bash task |
+
+Usage dashboard accepts `from`/`to` (default: the last 7 days, maximum 366
+days, half-open `[from,to)`), `bucket=hour|day` (UTC), optional
+`root_session_id` (the root and its direct children only; no recursion),
+`model`, `role`, and `kind` filters, and `top_n=1..100` (default 20). Totals,
+trend, and all three dimensions are complete for the filtered range; only
+`top_sessions` is bounded. Each top-session row represents one session;
+`models` and `kinds` are sorted arrays. Usage without session metadata uses
+the stable role value `unknown` (also accepted by the `role` filter). `null`
+means the provider did not report an enrichment metric, not zero; total is
+input plus output only. Dashboard fields contain no transcript/reasoning text,
+configuration, database credentials, arbitrary SQL, or write capability.
+
+```sh
+curl 'http://127.0.0.1:8766/api/usage/dashboard?bucket=day&top_n=10'
+```
 
 SSE connections are kept alive with 15-second heartbeat pings. Ctrl-C shuts
 the server down gracefully: SSE streams self-close on the shutdown signal and

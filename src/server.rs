@@ -37,7 +37,7 @@
 //! mode 0600) is required on every `/api/*` request as
 //! `Authorization: Bearer <token>` or `?token=<token>`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -61,7 +61,9 @@ use crate::agent::{AgentEvent, Message, Model, SessionEntry, preview};
 use crate::delegate::Sessions;
 use crate::runner::{IdlePolicy, SessionHandle, SessionStatus, SessionTask};
 use crate::session_factory::{SessionBuild, SessionFactory, UnfinishedPolicy};
-use crate::session_store::{FinishedTask, ListMetaDiagnostics, SessionStore};
+use crate::session_store::{
+    FinishedTask, ListMetaDiagnostics, SessionStore, UsageDashboardMetadata, UsageDashboardRow,
+};
 use crate::tools::{BackgroundTaskInfo, BackgroundTasks};
 
 /// Heartbeat interval for SSE connections (comment line `: ping`).
@@ -288,8 +290,15 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/images/{hash}", get(serve_image))
         .route_layer(from_fn_with_state(state.clone(), require_auth))
         .layer(from_fn(cache_control_middleware));
+    let public_usage = Router::new()
+        .route(
+            "/api/usage/dashboard",
+            get(usage_dashboard).head(usage_dashboard_head),
+        )
+        .layer(from_fn(cache_control_middleware));
     Router::new()
         .route("/", get(index))
+        .merge(public_usage)
         .route("/fonts/{name}", get(serve_font))
         .merge(api)
         .with_state(state)
@@ -2769,6 +2778,317 @@ struct UsageRowJson {
 /// then falls back to live-only counters) — the route answers a storage
 /// question, so an unknown id is an empty answer, not an error. JSONL
 /// backend: no usage table → always zero totals.
+#[derive(Default)]
+struct DashboardMetrics {
+    call_count: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_hit_tokens: Option<u64>,
+    cache_miss_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    cache_hit_reported_calls: u64,
+    cache_miss_reported_calls: u64,
+    reasoning_reported_calls: u64,
+}
+
+fn dashboard_metric_json(m: &DashboardMetrics) -> Option<serde_json::Value> {
+    let total_tokens = m.input_tokens.checked_add(m.output_tokens)?;
+    Some(serde_json::json!({
+        "call_count": m.call_count, "input_tokens": m.input_tokens,
+        "output_tokens": m.output_tokens, "total_tokens": total_tokens,
+        "cache_hit_tokens": m.cache_hit_tokens, "cache_miss_tokens": m.cache_miss_tokens,
+        "reasoning_tokens": m.reasoning_tokens,
+        "cache_hit_reported_calls": m.cache_hit_reported_calls,
+        "cache_miss_reported_calls": m.cache_miss_reported_calls,
+        "reasoning_reported_calls": m.reasoning_reported_calls,
+    }))
+}
+
+fn dashboard_add(m: &mut DashboardMetrics, row: &UsageDashboardRow) -> Result<(), ()> {
+    m.call_count = m.call_count.checked_add(row.call_count).ok_or(())?;
+    m.input_tokens = m.input_tokens.checked_add(row.input_tokens).ok_or(())?;
+    m.output_tokens = m.output_tokens.checked_add(row.output_tokens).ok_or(())?;
+    if let Some(v) = row.cache_hit_tokens {
+        let current = m.cache_hit_tokens.get_or_insert(0);
+        *current = current.checked_add(v).ok_or(())?;
+    }
+    if let Some(v) = row.cache_miss_tokens {
+        let current = m.cache_miss_tokens.get_or_insert(0);
+        *current = current.checked_add(v).ok_or(())?;
+    }
+    if let Some(v) = row.reasoning_tokens {
+        let current = m.reasoning_tokens.get_or_insert(0);
+        *current = current.checked_add(v).ok_or(())?;
+    }
+    m.cache_hit_reported_calls = m
+        .cache_hit_reported_calls
+        .checked_add(row.cache_hit_reported_calls)
+        .ok_or(())?;
+    m.cache_miss_reported_calls = m
+        .cache_miss_reported_calls
+        .checked_add(row.cache_miss_reported_calls)
+        .ok_or(())?;
+    m.reasoning_reported_calls = m
+        .reasoning_reported_calls
+        .checked_add(row.reasoning_reported_calls)
+        .ok_or(())?;
+    Ok(())
+}
+
+async fn usage_dashboard_head() -> StatusCode {
+    StatusCode::METHOD_NOT_ALLOWED
+}
+
+fn dashboard_error(status: StatusCode) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({"error": "usage dashboard unavailable"})),
+    )
+}
+
+async fn usage_dashboard(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    const ALLOWED: &[&str] = &[
+        "from",
+        "to",
+        "root_session_id",
+        "model",
+        "role",
+        "kind",
+        "bucket",
+        "top_n",
+    ];
+    if params.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+        return Err(dashboard_error(StatusCode::BAD_REQUEST));
+    }
+    let now = chrono::Utc::now();
+    let (from, to) = match (params.get("from"), params.get("to")) {
+        (Some(from), Some(to)) => (
+            chrono::DateTime::parse_from_rfc3339(from).map(|v| v.with_timezone(&chrono::Utc)),
+            chrono::DateTime::parse_from_rfc3339(to).map(|v| v.with_timezone(&chrono::Utc)),
+        ),
+        (None, None) => (Ok(now - chrono::Duration::days(7)), Ok(now)),
+        _ => return Err(dashboard_error(StatusCode::BAD_REQUEST)),
+    };
+    let (from, to) = match (from, to) {
+        (Ok(from), Ok(to)) if from < to => (from, to),
+        _ => return Err(dashboard_error(StatusCode::BAD_REQUEST)),
+    };
+    if to.signed_duration_since(from) > chrono::Duration::days(366) {
+        return Err(dashboard_error(StatusCode::BAD_REQUEST));
+    }
+    let bucket_name = params.get("bucket").map(String::as_str).unwrap_or("day");
+    let bucket_us = match bucket_name {
+        "hour" => 3_600_000_000,
+        "day" => 86_400_000_000,
+        _ => return Err(dashboard_error(StatusCode::BAD_REQUEST)),
+    };
+    let top_n = match params.get("top_n") {
+        Some(value) => value.parse::<usize>().ok(),
+        None => Some(20),
+    };
+    let Some(top_n) = top_n.filter(|n| (1..=100).contains(n)) else {
+        return Err(dashboard_error(StatusCode::BAD_REQUEST));
+    };
+    let root_filter = params.get("root_session_id").filter(|v| !v.is_empty());
+    let model_filter = params.get("model").filter(|v| !v.is_empty());
+    let role_filter = params.get("role").filter(|v| !v.is_empty());
+    let kind_filter = params.get("kind").filter(|v| !v.is_empty());
+    let root = state.factory.root();
+    #[cfg(feature = "greptime")]
+    let store = if matches!(
+        state.factory.backend(),
+        crate::config::SessionBackend::Greptime { .. }
+    ) {
+        SessionStore::connect_meta_read_only(state.factory.backend(), root).await
+    } else {
+        meta_store(&state).await
+    };
+    #[cfg(not(feature = "greptime"))]
+    let store = meta_store(&state).await;
+    let store = match store {
+        Ok(store) => store,
+        Err(_) => return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE)),
+    };
+    if matches!(store, SessionStore::Jsonl) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({"error":"usage dashboard requires a database backend", "backend":"jsonl"}),
+            ),
+        ));
+    }
+    let ids: Vec<String> = if let Some(root_id) = root_filter {
+        let mut ids = vec![root_id.to_owned()];
+        match store.child_session_ids(root, root_id).await {
+            Ok(children) => ids.extend(children),
+            Err(_) => return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE)),
+        }
+        ids
+    } else {
+        // Empty scope means workspace-wide to the storage adapter.
+        Vec::new()
+    };
+    let rows = match store
+        .usage_dashboard(
+            root,
+            &ids,
+            from.timestamp_micros(),
+            to.timestamp_micros(),
+            bucket_us,
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE)),
+    };
+    let represented_ids: Vec<String> = rows
+        .iter()
+        .map(|r| r.session_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let metadata = match store.usage_dashboard_metadata(root, &represented_ids).await {
+        Ok(v) => v,
+        Err(_) => return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE)),
+    };
+    let meta_by_id: HashMap<String, UsageDashboardMetadata> = metadata
+        .into_iter()
+        .map(|m| (m.session_id.clone(), m))
+        .collect();
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|r| model_filter.is_none_or(|v| r.model == *v))
+        .filter(|r| kind_filter.is_none_or(|v| r.kind == *v))
+        .filter(|r| {
+            role_filter.is_none_or(|v| {
+                meta_by_id
+                    .get(&r.session_id)
+                    .and_then(|m| m.role.as_deref())
+                    .unwrap_or("unknown")
+                    == v
+            })
+        })
+        .collect();
+    let mut totals = DashboardMetrics::default();
+    let mut trend: HashMap<i64, DashboardMetrics> = HashMap::new();
+    let mut by_model: HashMap<String, DashboardMetrics> = HashMap::new();
+    let mut by_role: HashMap<String, DashboardMetrics> = HashMap::new();
+    let mut by_kind: HashMap<String, DashboardMetrics> = HashMap::new();
+    let mut sessions: HashMap<String, (DashboardMetrics, BTreeSet<String>, BTreeSet<String>)> =
+        HashMap::new();
+    for row in &rows {
+        if dashboard_add(&mut totals, row).is_err() {
+            return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        if dashboard_add(trend.entry(row.bucket_start).or_default(), row).is_err() {
+            return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        if dashboard_add(by_model.entry(row.model.clone()).or_default(), row).is_err() {
+            return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        if dashboard_add(by_kind.entry(row.kind.clone()).or_default(), row).is_err() {
+            return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        let role = meta_by_id
+            .get(&row.session_id)
+            .and_then(|m| m.role.clone())
+            .unwrap_or_else(|| "unknown".into());
+        if dashboard_add(by_role.entry(role).or_default(), row).is_err() {
+            return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        let session = sessions.entry(row.session_id.clone()).or_default();
+        if dashboard_add(&mut session.0, row).is_err() {
+            return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        session.1.insert(row.model.clone());
+        session.2.insert(row.kind.clone());
+    }
+    let dimension = |map: HashMap<String, DashboardMetrics>, key: &str| {
+        let mut v: Vec<_> = map
+            .into_iter()
+            .map(|(k, m)| {
+                let Some(mut x) = dashboard_metric_json(&m) else {
+                    return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE));
+                };
+                x[key] = serde_json::Value::String(k);
+                Ok(x)
+            })
+            .collect::<Result<_, _>>()?;
+        v.sort_by(|a, b| {
+            b["total_tokens"]
+                .as_u64()
+                .cmp(&a["total_tokens"].as_u64())
+                .then_with(|| a[key].as_str().cmp(&b[key].as_str()))
+        });
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(v)
+    };
+    let mut trend_json: Vec<_> = trend
+        .into_iter()
+        .map(|(at, m)| {
+            let Some(mut x) = dashboard_metric_json(&m) else {
+                return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE));
+            };
+            x["bucket_start"] = serde_json::Value::String(
+                chrono::DateTime::<chrono::Utc>::from_timestamp_micros(at)
+                    .unwrap_or(now)
+                    .to_rfc3339(),
+            );
+            Ok(x)
+        })
+        .collect::<Result<_, _>>()?;
+    trend_json.sort_by(|a, b| a["bucket_start"].as_str().cmp(&b["bucket_start"].as_str()));
+    let mut top: Vec<_> = sessions
+        .into_iter()
+        .map(|(id, (m, models, kinds))| {
+            let meta = meta_by_id.get(&id);
+            let Some(mut x) = dashboard_metric_json(&m) else {
+                return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE));
+            };
+            x["session_id"] = id.into();
+            x["title"] = meta
+                .and_then(|m| m.title.clone())
+                .map_or(serde_json::Value::Null, serde_json::Value::String);
+            x["models"] = models
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect::<Vec<_>>()
+                .into();
+            x["role"] = meta
+                .and_then(|m| m.role.clone())
+                .unwrap_or_else(|| "unknown".into())
+                .into();
+            x["kinds"] = kinds
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect::<Vec<_>>()
+                .into();
+            Ok(x)
+        })
+        .collect::<Result<_, _>>()?;
+    top.sort_by(|a, b| {
+        b["total_tokens"]
+            .as_u64()
+            .cmp(&a["total_tokens"].as_u64())
+            .then_with(|| a["session_id"].as_str().cmp(&b["session_id"].as_str()))
+    });
+    let has_more = top.len() > top_n;
+    top.truncate(top_n);
+    let scope = if root_filter.is_some() {
+        "root_direct_children"
+    } else {
+        "workspace"
+    };
+    let Some(totals_json) = dashboard_metric_json(&totals) else {
+        return Err(dashboard_error(StatusCode::SERVICE_UNAVAILABLE));
+    };
+    Ok(Json(
+        serde_json::json!({"generated_at":now.to_rfc3339(), "window":{"from":from.to_rfc3339(),"to":to.to_rfc3339(),"bucket":bucket_name}, "scope":scope, "totals":totals_json, "trend":trend_json, "by_model":dimension(by_model,"model")?, "by_role":dimension(by_role,"role")?, "by_kind":dimension(by_kind,"kind")?, "top_sessions":{"limit":top_n,"has_more":has_more,"rows":top}}),
+    ))
+}
+
 async fn session_usage(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -3130,6 +3450,17 @@ fn assemble(read: impl Fn(&str) -> Result<String, String>) -> Result<String, Str
         let katex_css = read("vendor/katex.min.css")?;
         let css = read("style.css")?;
         let vendor_js = read("vendor/marked.min.js")?;
+        let usage_vendor_css = format!(
+            "{}\n{}",
+            read("vendor/uPlot.min.css")?,
+            read("vendor/gridjs.mermaid.min.css")?
+        );
+        let usage_vendor_js = format!(
+            "{}\n{}",
+            read("vendor/uPlot.iife.min.js")?,
+            read("vendor/gridjs.umd.js")?
+        );
+        let usage_js = read("usage-dashboard.js")?;
         let pet_html = read("pet.html")?;
         // app.js 已按功能域拆为多文件：同一 <script> 内按序拼接（顶层声明跨
         // 文件全局可见，函数互调无需 export/import；事件绑定与 init 在最后一个
@@ -3142,9 +3473,12 @@ fn assemble(read: impl Fn(&str) -> Result<String, String>) -> Result<String, Str
         }
         Ok(skeleton
             .replace("/*__KATEX_CSS__*/", &katex_css)
+            .replace("/*__USAGE_DASHBOARD_VENDOR_CSS__*/", &usage_vendor_css)
             .replace("/*__CSS__*/", &css)
             .replace("/*__JS_VENDOR__*/", &vendor_js)
+            .replace("/*__USAGE_DASHBOARD_VENDOR_JS__*/", &usage_vendor_js)
             .replace("/*__JS_APP__*/", &app_js)
+            .replace("/*__USAGE_DASHBOARD_JS__*/", &usage_js)
             .replace("<!--__PET__-->", &pet_html))
     })
 }
@@ -3161,6 +3495,11 @@ fn read_embedded_ui(name: &str) -> Result<String, String> {
         "vendor/katex.min.css" => include_str!("ui/vendor/katex.min.css"),
         "style.css" => include_str!("ui/style.css"),
         "vendor/marked.min.js" => include_str!("ui/vendor/marked.min.js"),
+        "vendor/uPlot.min.css" => include_str!("ui/vendor/uPlot.min.css"),
+        "vendor/gridjs.mermaid.min.css" => include_str!("ui/vendor/gridjs.mermaid.min.css"),
+        "vendor/uPlot.iife.min.js" => include_str!("ui/vendor/uPlot.iife.min.js"),
+        "vendor/gridjs.umd.js" => include_str!("ui/vendor/gridjs.umd.js"),
+        "usage-dashboard.js" => include_str!("ui/usage-dashboard.js"),
         "pet.html" => include_str!("ui/pet.html"),
         "app.js" => include_str!("ui/app.js"),
         "render.js" => include_str!("ui/render.js"),
@@ -5147,18 +5486,44 @@ model = "deepseek-chat"
         assert!(html.contains("abc"));
     }
 
+    #[test]
+    fn usage_dashboard_metrics_reject_counter_and_optional_overflow() {
+        let row = UsageDashboardRow {
+            session_id: "s".into(),
+            model: "m".into(),
+            kind: "regular".into(),
+            bucket_start: 0,
+            call_count: 1,
+            input_tokens: u64::MAX,
+            output_tokens: 1,
+            cache_hit_tokens: Some(u64::MAX),
+            cache_miss_tokens: None,
+            reasoning_tokens: None,
+            cache_hit_reported_calls: 1,
+            cache_miss_reported_calls: 0,
+            reasoning_reported_calls: 0,
+        };
+        let mut metrics = DashboardMetrics::default();
+        assert!(dashboard_add(&mut metrics, &row).is_ok());
+        assert!(dashboard_metric_json(&metrics).is_none());
+        assert!(dashboard_add(&mut metrics, &row).is_err());
+    }
+
     /// The release UI path (include_str! table) must assemble exactly like
     /// the dev disk path: all ten assets present, all five placeholders
     /// replaced, and the key frontend entry points inlined.
     #[cfg(web_ui)]
     #[test]
-    fn embedded_ui_assembles_all_assets() {
+    fn usage_dashboard_embedded_ui_assembles_all_assets() {
         let html = assemble(read_embedded_ui).unwrap();
         for placeholder in [
             "/*__KATEX_CSS__*/",
             "/*__CSS__*/",
             "/*__JS_VENDOR__*/",
             "/*__JS_APP__*/",
+            "/*__USAGE_DASHBOARD_VENDOR_CSS__*/",
+            "/*__USAGE_DASHBOARD_VENDOR_JS__*/",
+            "/*__USAGE_DASHBOARD_JS__*/",
             "<!--__PET__-->",
         ] {
             assert!(
@@ -5168,6 +5533,33 @@ model = "deepseek-chat"
         }
         assert!(html.contains("<title>e-agent · Web UI</title>"));
         assert!(html.contains("marked.setOptions"));
+        assert!(html.contains("uPlot") && html.contains("gridjs"));
+        assert!(html.contains("usageDashboardGet"));
+        for (name, expected) in [
+            (
+                "vendor/uPlot.iife.min.js",
+                "2d27e8ad3d228164525ce213f9dc716f39b4e3aee0cc773fb3491c96cf4921a2",
+            ),
+            (
+                "vendor/uPlot.min.css",
+                "df630c6a8d6f8eeaff264b50f73ce5b114f646ffd9a0bb74f049b0a00135fa04",
+            ),
+            (
+                "vendor/gridjs.umd.js",
+                "f7402f347715568c73f061781edd8e7dceeecdd7e2503c28a1012b7ccbc12509",
+            ),
+            (
+                "vendor/gridjs.mermaid.min.css",
+                "ab9585e3983a57267a8f22f708fe40ad70f8c1bd5688ebfba31d11a0c7cca331",
+            ),
+        ] {
+            let bytes = read_embedded_ui(name).unwrap();
+            assert_eq!(
+                crate::agent::image_sha256(bytes.as_bytes()),
+                expected,
+                "asset {name}"
+            );
+        }
         let pet = read_embedded_ui("pet.html").unwrap();
         for artwork in [
             "<svg",
@@ -5374,6 +5766,526 @@ model = "deepseek-chat"
             summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
             shutdown: watch::channel(()).0,
         })
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn usage_dashboard_public_sqlite_scope_filters_and_rollups() {
+        use tower::util::ServiceExt;
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("usage.db");
+        let factory = crate::session_factory::SessionFactory::test_factory_with_backend(
+            temp.path().to_path_buf(),
+            crate::config::SessionBackend::Sqlite {
+                path: Some(db.display().to_string()),
+            },
+        );
+        let root = factory.root().to_path_buf();
+        let store = SessionStore::connect_meta(factory.backend(), &root)
+            .await
+            .unwrap();
+        let root_id = "dashboard-root";
+        let child_id = "dashboard-child";
+        let unrelated_id = "dashboard-unrelated";
+        let historical_id = "dashboard-no-meta";
+        let grandchild_id = "dashboard-grandchild";
+        store
+            .create_meta(
+                &root,
+                root_id,
+                Some("m1"),
+                Some("main"),
+                None,
+                None,
+                Some("Root"),
+            )
+            .await
+            .unwrap();
+        store
+            .create_meta(
+                &root,
+                child_id,
+                Some("m2"),
+                Some("sub"),
+                Some(root_id),
+                Some(1),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .create_meta(
+                &root,
+                unrelated_id,
+                Some("m3"),
+                Some("other"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .create_meta(
+                &root,
+                grandchild_id,
+                Some("m5"),
+                Some("grandchild"),
+                Some(child_id),
+                Some(2),
+                None,
+            )
+            .await
+            .unwrap();
+        let plain = crate::agent::Usage {
+            input_tokens: 10,
+            output_tokens: 2,
+            ..Default::default()
+        };
+        let zero = crate::agent::Usage {
+            input_tokens: 3,
+            output_tokens: 4,
+            cache_hit_tokens: Some(0),
+            cache_miss_tokens: Some(0),
+            reasoning_tokens: Some(0),
+            ..Default::default()
+        };
+        let unrelated = crate::agent::Usage {
+            input_tokens: 100,
+            output_tokens: 100,
+            ..Default::default()
+        };
+        let historical = crate::agent::Usage {
+            input_tokens: 7,
+            output_tokens: 8,
+            ..Default::default()
+        };
+        let grandchild = crate::agent::Usage {
+            input_tokens: 999,
+            output_tokens: 999,
+            ..Default::default()
+        };
+        store
+            .append_usage(&root, root_id, "m1", "regular", None, &plain)
+            .await
+            .unwrap();
+        store
+            .append_usage(&root, child_id, "m2", "compact", None, &zero)
+            .await
+            .unwrap();
+        store
+            .append_usage(&root, child_id, "m1", "regular", None, &plain)
+            .await
+            .unwrap();
+        store
+            .append_usage(&root, unrelated_id, "m3", "regular", None, &unrelated)
+            .await
+            .unwrap();
+        store
+            .append_usage(&root, historical_id, "m4", "regular", None, &historical)
+            .await
+            .unwrap();
+        store
+            .append_usage(&root, grandchild_id, "m5", "regular", None, &grandchild)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            factory,
+            registry: Arc::new(SessionRegistry::default()),
+            token: "secret".into(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        let app = router(state);
+        let from = (chrono::Utc::now() - chrono::Duration::days(1))
+            .to_rfc3339()
+            .replace("+00:00", "Z");
+        let to = (chrono::Utc::now() + chrono::Duration::days(1))
+            .to_rfc3339()
+            .replace("+00:00", "Z");
+        let uri = format!(
+            "/api/usage/dashboard?from={from}&to={to}&root_session_id=dashboard-root&top_n=1"
+        );
+        for authorization in [None, Some("Bearer invalid")] {
+            let mut request = Request::builder().uri(&uri);
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["scope"], "root_direct_children");
+            assert_eq!(json["totals"]["call_count"], 3);
+            assert_eq!(json["totals"]["input_tokens"], 23);
+            assert_eq!(json["totals"]["output_tokens"], 8);
+            assert_eq!(json["totals"]["total_tokens"], 31);
+            assert_eq!(json["totals"]["cache_hit_tokens"], 0);
+            assert_eq!(json["totals"]["cache_hit_reported_calls"], 1);
+            assert_eq!(json["totals"]["reasoning_tokens"], 0);
+            assert_eq!(json["by_model"].as_array().unwrap().len(), 2);
+            assert!(
+                !json["by_model"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["model"] == "m5")
+            );
+            assert!(
+                !json["top_sessions"]["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["session_id"] == grandchild_id)
+            );
+            assert_eq!(json["by_role"].as_array().unwrap().len(), 2);
+            assert_eq!(json["by_kind"].as_array().unwrap().len(), 2);
+            assert_eq!(json["top_sessions"]["limit"], 1);
+            assert_eq!(json["top_sessions"]["has_more"], true);
+            let top_rows = json["top_sessions"]["rows"].as_array().unwrap();
+            assert_eq!(top_rows.len(), 1);
+            let child = &top_rows[0];
+            assert_eq!(child["session_id"], child_id);
+            assert_eq!(child["call_count"], 2);
+            assert_eq!(child["input_tokens"], 13);
+            assert_eq!(child["output_tokens"], 6);
+            assert_eq!(child["total_tokens"], 19);
+            assert_eq!(child["models"], serde_json::json!(["m1", "m2"]));
+            assert_eq!(child["kinds"], serde_json::json!(["compact", "regular"]));
+        }
+        let protected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+        for method in [Method::HEAD, Method::POST, Method::PUT, Method::DELETE] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/api/usage/dashboard")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        }
+        let role = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{uri}&role=sub"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let role_body = axum::body::to_bytes(role.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let role_json: serde_json::Value = serde_json::from_slice(&role_body).unwrap();
+        assert_eq!(role_json["totals"]["total_tokens"], 19);
+        assert_eq!(
+            role_json["top_sessions"]["rows"].as_array().unwrap().len(),
+            1
+        );
+
+        let workspace_uri = format!("/api/usage/dashboard?from={from}&to={to}&top_n=100");
+        let workspace_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&workspace_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(workspace_response.status(), StatusCode::OK);
+        let workspace_body = axum::body::to_bytes(workspace_response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let workspace_json: serde_json::Value = serde_json::from_slice(&workspace_body).unwrap();
+        assert_eq!(workspace_json["scope"], "workspace");
+        assert_eq!(workspace_json["totals"]["call_count"], 6);
+        assert_eq!(workspace_json["totals"]["input_tokens"], 1129);
+        assert_eq!(workspace_json["totals"]["output_tokens"], 1115);
+        assert_eq!(workspace_json["totals"]["total_tokens"], 2244);
+        assert_eq!(workspace_json["by_role"].as_array().unwrap().len(), 5);
+        for metric in [
+            "call_count",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+        ] {
+            let by_role_sum: u64 = workspace_json["by_role"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row[metric].as_u64().unwrap())
+                .sum();
+            assert_eq!(
+                by_role_sum,
+                workspace_json["totals"][metric].as_u64().unwrap(),
+                "{metric}"
+            );
+        }
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{workspace_uri}&role=unknown"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let unknown_body = axum::body::to_bytes(unknown.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let unknown_json: serde_json::Value = serde_json::from_slice(&unknown_body).unwrap();
+        assert_eq!(unknown_json["totals"]["total_tokens"], 15);
+        assert_eq!(workspace_json["top_sessions"]["limit"], 100);
+        assert_eq!(workspace_json["top_sessions"]["has_more"], false);
+        let workspace_rows = workspace_json["top_sessions"]["rows"].as_array().unwrap();
+        assert!(
+            workspace_rows
+                .iter()
+                .any(|row| row["session_id"] == grandchild_id)
+        );
+        assert!(
+            workspace_json["by_model"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["model"] == "m5")
+        );
+        let child_rows: Vec<_> = workspace_rows
+            .iter()
+            .filter(|row| row["session_id"] == child_id)
+            .collect();
+        assert_eq!(child_rows.len(), 1);
+        assert_eq!(child_rows[0]["call_count"], 2);
+        assert_eq!(child_rows[0]["input_tokens"], 13);
+        assert_eq!(child_rows[0]["output_tokens"], 6);
+        assert_eq!(child_rows[0]["total_tokens"], 19);
+        assert_eq!(child_rows[0]["models"], serde_json::json!(["m1", "m2"]));
+        assert_eq!(
+            child_rows[0]["kinds"],
+            serde_json::json!(["compact", "regular"])
+        );
+        let historical_rows: Vec<_> = workspace_rows
+            .iter()
+            .filter(|row| row["session_id"] == historical_id)
+            .collect();
+        assert_eq!(historical_rows.len(), 1);
+        assert_eq!(historical_rows[0]["role"], "unknown");
+        assert_eq!(historical_rows[0]["models"], serde_json::json!(["m4"]));
+        assert_eq!(historical_rows[0]["kinds"], serde_json::json!(["regular"]));
+        assert_eq!(historical_rows[0]["total_tokens"], 15);
+        let limited_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(workspace_uri.replace("top_n=100", "top_n=1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let limited_body = axum::body::to_bytes(limited_response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let limited_json: serde_json::Value = serde_json::from_slice(&limited_body).unwrap();
+        assert_eq!(limited_json["totals"], workspace_json["totals"]);
+        assert_eq!(limited_json["by_model"], workspace_json["by_model"]);
+        assert_eq!(limited_json["by_role"], workspace_json["by_role"]);
+        assert_eq!(limited_json["by_kind"], workspace_json["by_kind"]);
+        assert_eq!(limited_json["top_sessions"]["has_more"], true);
+        assert_eq!(
+            limited_json["top_sessions"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let top_level: std::collections::BTreeSet<_> = workspace_json
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            top_level,
+            [
+                "by_kind",
+                "by_model",
+                "by_role",
+                "generated_at",
+                "scope",
+                "top_sessions",
+                "window",
+                "totals",
+                "trend"
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect()
+        );
+        let top_row: std::collections::BTreeSet<_> = workspace_rows[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            top_row,
+            [
+                "call_count",
+                "cache_hit_reported_calls",
+                "cache_hit_tokens",
+                "cache_miss_reported_calls",
+                "cache_miss_tokens",
+                "input_tokens",
+                "kinds",
+                "models",
+                "output_tokens",
+                "reasoning_reported_calls",
+                "reasoning_tokens",
+                "role",
+                "session_id",
+                "title",
+                "total_tokens"
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect()
+        );
+        fn assert_public_keys(value: &serde_json::Value) {
+            const FORBIDDEN: &[&str] = &[
+                "backend",
+                "session_ids",
+                "writer",
+                "entry_count",
+                "parent_task_id",
+                "root_session_id",
+                "config",
+                "sql",
+                "transcript",
+                "prompt",
+                "content",
+                "reasoning",
+            ];
+            match value {
+                serde_json::Value::Object(object) => {
+                    for key in object.keys() {
+                        assert!(
+                            !FORBIDDEN.contains(&key.as_str()),
+                            "forbidden public key: {key}"
+                        );
+                    }
+                    for value in object.values() {
+                        assert_public_keys(value);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        assert_public_keys(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_public_keys(&workspace_json);
+        let serialized = serde_json::to_string(&workspace_json).unwrap();
+        for forbidden in [
+            "backend",
+            "session_ids",
+            "writer",
+            "entry_count",
+            "parent_task_id",
+            "root_session_id",
+            "config",
+            "sql",
+            "transcript",
+            "prompt",
+            "content",
+            "reasoning",
+        ] {
+            assert!(
+                !serialized.contains(&format!("\"{forbidden}\":")),
+                "forbidden serialized key: {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_dashboard_validation_and_jsonl_error_contract() {
+        use tower::util::ServiceExt;
+        let app = router(test_app_state("secret"));
+        for query in [
+            "?from=2024-01-01T00:00:00Z",
+            "?to=2024-01-02T00:00:00Z",
+            "?from=bad&to=2024-01-02T00:00:00Z",
+            "?from=2024-01-02T00:00:00Z&to=2024-01-01T00:00:00Z",
+            "?from=2024-01-01T00:00:00Z&to=2025-01-02T00:00:00Z",
+            "?bucket=week",
+            "?top_n=0",
+            "?top_n=101",
+            "?unexpected=x",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/usage/dashboard{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "query {query}");
+        }
+        for query in ["", "?bucket=hour", "?bucket=day&top_n=100"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/usage/dashboard{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["backend"], "jsonl");
+            assert!(json["error"].is_string());
+        }
     }
 
     /// Serialize one SSE `Event` to its wire text (via a one-event `Sse`

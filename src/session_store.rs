@@ -731,6 +731,33 @@ pub struct UsageRow {
     pub last_ts: i64,
 }
 
+/// One bounded aggregate row for the public usage dashboard. Enrichment
+/// fields remain nullable when no call in the group reported that metric.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageDashboardRow {
+    pub session_id: String,
+    pub model: String,
+    pub kind: String,
+    pub bucket_start: i64,
+    pub call_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_hit_tokens: Option<u64>,
+    pub cache_miss_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cache_hit_reported_calls: u64,
+    pub cache_miss_reported_calls: u64,
+    pub reasoning_reported_calls: u64,
+}
+
+/// The small metadata projection needed by the public usage dashboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageDashboardMetadata {
+    pub session_id: String,
+    pub role: Option<String>,
+    pub title: Option<String>,
+}
+
 /// Cap for background task output previews. The running-task and
 /// finished-task APIs use the same character-boundary-safe limit.
 pub(crate) const TASK_OUTPUT_LIMIT: usize = 2000;
@@ -1507,6 +1534,59 @@ impl SessionStore {
         }
     }
 
+    /// Aggregate dashboard rows in the requested half-open window. The
+    /// caller supplies the already-resolved root/direct-child scope.
+    #[allow(unused_variables)]
+    pub async fn usage_dashboard(
+        &self,
+        root: &Path,
+        session_ids: &[String],
+        from_us: i64,
+        to_us: i64,
+        bucket_us: i64,
+    ) -> Result<Vec<UsageDashboardRow>> {
+        match self {
+            SessionStore::Jsonl => Ok(Vec::new()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session
+                    .usage_dashboard(session_ids, from_us, to_us, bucket_us)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .usage_dashboard(session_ids, from_us, to_us, bucket_us)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Fetch only the metadata projection needed to enrich usage rows. This
+    /// intentionally does not expose the full workspace metadata listing.
+    #[allow(unused_variables)]
+    pub async fn usage_dashboard_metadata(
+        &self,
+        root: &Path,
+        session_ids: &[String],
+    ) -> Result<Vec<UsageDashboardMetadata>> {
+        match self {
+            SessionStore::Jsonl => Ok(Vec::new()),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session.usage_dashboard_metadata(session_ids).await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .usage_dashboard_metadata(session_ids)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     /// Rewrite the entire session log (used for legacy migration).
     ///
     /// For JSONL this replaces the file atomically. For Greptime/SQLite it
@@ -1691,15 +1771,8 @@ impl SessionStore {
             SessionStore::Sqlite { session, .. } => session
                 .lock()
                 .await
-                .list_meta()
+                .child_session_ids(parent_session_id)
                 .await
-                .map(|metas| {
-                    metas
-                        .into_iter()
-                        .filter(|meta| meta.parent_session_id.as_deref() == Some(parent_session_id))
-                        .map(|meta| meta.session_id)
-                        .collect()
-                })
                 .map_err(anyhow::Error::msg),
         }
     }

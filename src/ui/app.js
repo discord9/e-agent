@@ -134,6 +134,15 @@ const els = {
   workspaceRemoveBtn: $("workspaceRemoveBtn"), workspaceEditor: $("workspaceEditor"),
   wsNameInput: $("wsNameInput"), wsUrlInput: $("wsUrlInput"), wsTokenInput: $("wsTokenInput"),
   wsSaveBtn: $("wsSaveBtn"), wsCancelBtn: $("wsCancelBtn"),
+  usageDashboardBtn: $("usageDashboardBtn"), usageDashboard: $("usageDashboard"),
+  usageTitle: $("usageTitle"), usageScopeNote: $("usageScopeNote"), usageUpdatedAt: $("usageUpdatedAt"),
+  usageRefreshBtn: $("usageRefreshBtn"), usageCloseBtn: $("usageCloseBtn"),
+  usageFilters: $("usageFilters"), usageFrom: $("usageFrom"), usageTo: $("usageTo"),
+  usageRootSession: $("usageRootSession"), usageModel: $("usageModel"),
+  usageRole: $("usageRole"), usageKind: $("usageKind"), usageBucket: $("usageBucket"),
+  usageResetBtn: $("usageResetBtn"),
+  usageStatus: $("usageStatus"), usageContent: $("usageContent"), usageKpis: $("usageKpis"),
+  usageTable: $("usageTable"), usageTableNote: $("usageTableNote"),
 };
 
 /* =====================================================================
@@ -315,6 +324,9 @@ async function switchWorkspace(id, epoch) {
   // 恢复/历史加载失效；openSessionIn/resumeSessionIn 嵌套调用时传入共享的
   // 代次（claimed），不在此递增——一次动作只有一个 action epoch。
   const claimed = (epoch === undefined) ? ++sessionOpenEpoch : epoch;
+  // Invalidate an open dashboard before changing workspace: its response must
+  // not be allowed to paint into the newly active workspace.
+  if (usageDashboardState.open) closeUsageDashboard(false);
   stopPolling();
   stopTasksPolling();
   stopTaskRows();
