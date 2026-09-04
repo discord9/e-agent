@@ -52,6 +52,12 @@ pub struct Config {
     pet: Option<PetConfig>,
     #[serde(skip)]
     path: PathBuf,
+    /// Sanitized source snapshots retained solely for reload diagnostics.
+    /// They are produced before storage and never contain credential values.
+    #[serde(skip)]
+    diagnostic_global: Option<toml::Value>,
+    #[serde(skip)]
+    diagnostic_project: Option<toml::Value>,
 }
 
 /// Desktop pet sprite-sheet settings from `[pet]`. The section is optional:
@@ -350,6 +356,27 @@ pub enum AuthMode {
     ChatGpt,
 }
 
+#[derive(Debug)]
+pub(crate) enum ProjectSourceObservation {
+    Observed(toml::Value),
+    Absent,
+    Unavailable,
+}
+
+fn observe_project_source_best_effort(workspace: &Path) -> ProjectSourceObservation {
+    let path = workspace.join(".e-agent/config.toml");
+    match std::fs::read_to_string(path) {
+        Ok(source) => match toml::from_str(&source) {
+            Ok(value) => ProjectSourceObservation::Observed(sanitize_diagnostic_source(value)),
+            Err(_) => ProjectSourceObservation::Unavailable,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ProjectSourceObservation::Absent
+        }
+        Err(_) => ProjectSourceObservation::Unavailable,
+    }
+}
+
 impl Config {
     /// Current desktop pet section. `None` means no desktop pet is rendered.
     pub fn pet(&self) -> Option<&PetConfig> {
@@ -372,9 +399,29 @@ impl Config {
     /// there is no global config — the project file is an override layer on
     /// top of the global config, not a standalone config.
     pub fn load_for_workspace(workspace: &Path) -> anyhow::Result<Option<Self>> {
-        Self::load()?
-            .map(|config| config.merged_with_project(workspace))
-            .transpose()
+        Ok(Self::load_for_workspace_with_sources(workspace)?.0)
+    }
+
+    /// Load the effective config and the validated project diagnostic source.
+    /// The project source is retained separately only when no global runtime
+    /// config exists; it is never used to create an effective config.
+    pub(crate) fn load_for_workspace_with_sources(
+        workspace: &Path,
+    ) -> anyhow::Result<(Option<Self>, ProjectSourceObservation)> {
+        match Self::load()? {
+            Some(config) => {
+                let merged = config.merged_with_project(workspace)?;
+                let observation = if merged.diagnostic_project.is_some() {
+                    ProjectSourceObservation::Observed(
+                        merged.diagnostic_project.clone().expect("checked above"),
+                    )
+                } else {
+                    ProjectSourceObservation::Absent
+                };
+                Ok((Some(merged), observation))
+            }
+            None => Ok((None, observe_project_source_best_effort(workspace))),
+        }
     }
 
     /// Overlay the project-level overrides from
@@ -424,9 +471,12 @@ impl Config {
     /// directory.
     pub fn merged_with_project(&self, workspace: &Path) -> anyhow::Result<Self> {
         let Some(project) = project_config(workspace)? else {
-            return Ok(self.clone());
+            let mut unchanged = self.clone();
+            unchanged.diagnostic_project = None;
+            return Ok(unchanged);
         };
         let mut merged = self.clone();
+        merged.diagnostic_project = project.diagnostic_source;
         if let Some(default) = project.default {
             merged.default = Some(default);
         }
@@ -462,12 +512,22 @@ impl Config {
         Ok(merged)
     }
 
+    pub(crate) fn diagnostic_sources(&self) -> (Option<&toml::Value>, Option<&toml::Value>) {
+        (
+            self.diagnostic_global.as_ref(),
+            self.diagnostic_project.as_ref(),
+        )
+    }
+
     fn from_path(path: &Path) -> anyhow::Result<Self> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config file {}", path.display()))?;
         let mut config: Self = toml::from_str(&source)
             .with_context(|| format!("cannot parse config file {}", path.display()))?;
+        let diagnostic: toml::Value = toml::from_str(&source)
+            .with_context(|| format!("cannot parse config diagnostics {}", path.display()))?;
         config.path = path.to_path_buf();
+        config.diagnostic_global = Some(sanitize_diagnostic_source(diagnostic));
         Ok(config)
     }
 
@@ -1021,6 +1081,8 @@ struct ProjectConfig {
     web_search: Option<WebSearch>,
     #[allow(dead_code)]
     session: Option<SessionConfig>,
+    #[serde(skip)]
+    diagnostic_source: Option<toml::Value>,
 }
 
 /// Read the project-level overrides from
@@ -1036,8 +1098,11 @@ fn project_config(workspace: &Path) -> anyhow::Result<Option<ProjectConfig>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
-    let parsed: ProjectConfig = toml::from_str(&source)
+    let mut parsed: ProjectConfig = toml::from_str(&source)
         .with_context(|| format!("cannot parse project config {}", path.display()))?;
+    let diagnostic: toml::Value = toml::from_str(&source)
+        .with_context(|| format!("cannot parse project diagnostics {}", path.display()))?;
+    parsed.diagnostic_source = Some(sanitize_diagnostic_source(diagnostic));
     Ok(Some(parsed))
 }
 
@@ -1295,6 +1360,354 @@ pub fn config_watch_paths(workspace: &Path) -> Vec<PathBuf> {
         paths.push(project);
     }
     paths
+}
+
+/// Emit tracing-only diagnostics for sanitized source edits after a validated swap.
+pub(crate) fn trace_reload_source_edits(
+    old_global: Option<&toml::Value>,
+    old_project: Option<&toml::Value>,
+    new_global: Option<&toml::Value>,
+    new_project: Option<&toml::Value>,
+    profile: Option<&str>,
+) -> bool {
+    let mut emitted = false;
+    for (origin, before, after) in [
+        ("global", old_global, new_global),
+        ("project", old_project, new_project),
+    ] {
+        let mut edits = Vec::new();
+        diff_toml_source(before, after, &mut Vec::new(), &mut edits);
+        for (path, before, after) in edits {
+            emitted = true;
+            let (status, reason) = classify_source_edit_with_snapshots(
+                origin,
+                &path,
+                old_global,
+                new_global,
+                new_project,
+                profile,
+            );
+            let path = path
+                .iter()
+                .map(|key| quote_toml_key(key))
+                .collect::<Vec<_>>()
+                .join(".");
+            let values = match (before, after) {
+                (None, Some(value)) => format!("add after={}", source_value(value)),
+                (Some(value), None) => format!("remove before={}", source_value(value)),
+                (Some(before), Some(after)) => format!(
+                    "change before={} after={}",
+                    source_value(before),
+                    source_value(after)
+                ),
+                (None, None) => continue,
+            };
+            if status == "effective" {
+                tracing::info!(
+                    "config source edit: origin={origin} path={path} {values} status=effective"
+                );
+            } else if status == "unknown" {
+                tracing::warn!(
+                    "config source edit: origin={origin} path={path} {values} status=unknown; reason=source edit; effective status unknown"
+                );
+            } else {
+                tracing::warn!(
+                    "config source edit: origin={origin} path={path} {values} status=shadowed; reason={}",
+                    reason.unwrap_or("not effective")
+                );
+            }
+        }
+    }
+    emitted
+}
+
+fn diff_toml_source<'a>(
+    before: Option<&'a toml::Value>,
+    after: Option<&'a toml::Value>,
+    path: &mut Vec<String>,
+    edits: &mut Vec<(
+        Vec<String>,
+        Option<&'a toml::Value>,
+        Option<&'a toml::Value>,
+    )>,
+) {
+    match (before, after) {
+        (Some(toml::Value::Table(left)), Some(toml::Value::Table(right))) => {
+            if left.is_empty() && right.is_empty() {
+                return;
+            }
+            let mut keys = left.keys().chain(right.keys()).cloned().collect::<Vec<_>>();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                path.push(key.clone());
+                diff_toml_source(left.get(&key), right.get(&key), path, edits);
+                path.pop();
+            }
+        }
+        (Some(toml::Value::Table(left)), None) => {
+            for (key, value) in left {
+                path.push(key.clone());
+                diff_toml_source(Some(value), None, path, edits);
+                path.pop();
+            }
+        }
+        (None, Some(toml::Value::Table(right))) => {
+            for (key, value) in right {
+                path.push(key.clone());
+                diff_toml_source(None, Some(value), path, edits);
+                path.pop();
+            }
+        }
+        (Some(left), Some(right)) if left != right => {
+            edits.push((path.clone(), before, after));
+        }
+        (None, Some(_)) => edits.push((path.clone(), before, after)),
+        (Some(_), None) => edits.push((path.clone(), before, after)),
+        (None, None) => {}
+        (Some(_), Some(_)) => {}
+    }
+}
+
+fn quote_toml_key(key: &str) -> String {
+    if !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        key.to_owned()
+    } else {
+        format!("\"{}\"", escape_single_line(key).replace('"', "\\\""))
+    }
+}
+
+fn escape_single_line(value: &str) -> String {
+    let mut escaped = String::new();
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                escaped.push_str(&format!("\\u{{{:04x}}}", character as u32))
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn source_value(value: &toml::Value) -> String {
+    escape_single_line(&value.to_string())
+}
+
+fn sensitive_segment(segment: &str) -> bool {
+    let name = segment.to_ascii_lowercase();
+    if matches!(name.as_str(), "api_key_env" | "api_key_file") {
+        return false;
+    }
+    name == "conn"
+        || name == "headers"
+        || name == "extra_body"
+        || name.contains("authorization")
+        || name == "auth"
+        || name.contains("credential")
+        || name.contains("token")
+        || name.contains("secret")
+        || name.contains("password")
+        || name.contains("private_key")
+        || name.contains("access_key")
+        || name == "api_key"
+}
+
+/// Redact while the TOML is still structured. In particular, do not make a
+/// security decision from a formatted dotted path: quoted keys are data too.
+fn sanitize_diagnostic_source(value: toml::Value) -> toml::Value {
+    fn visit(value: toml::Value, path: &mut Vec<String>) -> toml::Value {
+        if path.first().is_some_and(|segment| segment == "providers") && path.len() >= 3 {
+            let known = matches!(
+                path.last().map(String::as_str),
+                Some("api_key_env" | "api_key_file")
+            );
+            if !known {
+                return toml::Value::String("<redacted>".into());
+            }
+        }
+        let known_provider_field = path.first().is_some_and(|segment| segment == "providers")
+            && path.len() == 3
+            && matches!(
+                path.last().map(String::as_str),
+                Some("auth" | "base_url" | "api_key_env" | "api_key_file")
+            );
+        if !known_provider_field && path.iter().any(|segment| sensitive_segment(segment)) {
+            return toml::Value::String("<redacted>".into());
+        }
+        if path
+            .last()
+            .is_some_and(|segment| segment.eq_ignore_ascii_case("env"))
+        {
+            if let toml::Value::Table(table) = value {
+                return toml::Value::Table(
+                    table
+                        .into_iter()
+                        .map(|(key, _)| (key, toml::Value::String("<redacted>".into())))
+                        .collect(),
+                );
+            }
+            return toml::Value::String("<redacted>".into());
+        }
+        match value {
+            toml::Value::Table(table) => toml::Value::Table(
+                table
+                    .into_iter()
+                    .map(|(key, value)| {
+                        path.push(key.clone());
+                        let value = visit(value, path);
+                        path.pop();
+                        (key, value)
+                    })
+                    .collect(),
+            ),
+            toml::Value::Array(values) => {
+                toml::Value::Array(values.into_iter().map(|value| visit(value, path)).collect())
+            }
+            value => value,
+        }
+    }
+    visit(value, &mut Vec::new())
+}
+
+#[cfg(test)]
+fn classify_source_edit(
+    origin: &str,
+    path: &[String],
+    global: Option<&toml::Value>,
+    project: Option<&toml::Value>,
+    profile: Option<&str>,
+) -> (&'static str, Option<&'static str>) {
+    classify_source_edit_with_snapshots(origin, path, None, global, project, profile)
+}
+
+fn classify_source_edit_with_snapshots(
+    origin: &str,
+    path: &[String],
+    old_global: Option<&toml::Value>,
+    global: Option<&toml::Value>,
+    project: Option<&toml::Value>,
+    profile: Option<&str>,
+) -> (&'static str, Option<&'static str>) {
+    let section = path.first().map(String::as_str).unwrap_or("");
+    let has = |root: Option<&toml::Value>, keys: &[&str]| value_at(root, keys).is_some();
+    let name = path.get(1).map(String::as_str);
+    if section == "sandbox" {
+        return ("shadowed", Some("sandbox policy and paths require restart"));
+    }
+    if origin == "project" {
+        if section == "default" {
+            return if profile.is_some() {
+                (
+                    "shadowed",
+                    Some("explicit profile overrides project default"),
+                )
+            } else {
+                ("effective", None)
+            };
+        }
+        if section == "pet" {
+            return ("effective", None);
+        }
+        if matches!(section, "models" | "roles" | "mcp" | "bash" | "background") {
+            if section == "mcp"
+                && name.is_some()
+                && has(global, &["mcp", name.unwrap(), "enabled"])
+                && value_at(global, &["mcp", name.unwrap(), "enabled"])
+                    .and_then(toml::Value::as_bool)
+                    == Some(false)
+            {
+                return (
+                    "shadowed",
+                    Some("global MCP enabled=false kill switch overrides the project server"),
+                );
+            }
+            return ("effective", None);
+        }
+        if matches!(section, "providers" | "web_search" | "session") {
+            return ("shadowed", Some("project compatibility section is ignored"));
+        }
+        if section == "tui" {
+            return ("shadowed", Some("TUI input mapping requires restart"));
+        }
+        return ("unknown", None);
+    }
+    if section == "default" {
+        return if profile.is_some() {
+            (
+                "shadowed",
+                Some("explicit profile overrides global default"),
+            )
+        } else if has(project, &["default"]) {
+            (
+                "shadowed",
+                Some("project default overrides the global default"),
+            )
+        } else {
+            ("effective", None)
+        };
+    }
+    if section == "models" && name.is_some() && has(project, &["models", name.unwrap()]) {
+        return (
+            "shadowed",
+            Some("project model table replaces the same-named global model"),
+        );
+    }
+    if section == "roles" && name.is_some() && has(project, &["roles", name.unwrap()]) {
+        return ("shadowed", Some("project role replaces global role"));
+    }
+    if section == "pet" {
+        return if has(project, &["pet"]) {
+            ("shadowed", Some("project pet replaces the global pet"))
+        } else {
+            ("effective", None)
+        };
+    }
+    if let Some(name) = name
+        && section == "mcp"
+        && has(project, &["mcp", name])
+    {
+        let old_kill = value_at(old_global, &["mcp", name, "enabled"])
+            .and_then(toml::Value::as_bool)
+            == Some(false);
+        let new_kill = value_at(global, &["mcp", name, "enabled"]).and_then(toml::Value::as_bool)
+            == Some(false);
+        if !old_kill || new_kill {
+            return (
+                "shadowed",
+                Some("project MCP server replaces global server"),
+            );
+        }
+        return ("effective", None);
+    }
+    if matches!(section, "session" | "web_search" | "code_mode" | "tui") {
+        return ("shadowed", Some("setting requires restart"));
+    }
+    if section == "providers"
+        && matches!(
+            path.get(2).map(String::as_str),
+            Some("auth" | "base_url" | "api_key_env" | "api_key_file")
+        )
+    {
+        return ("effective", None);
+    }
+    ("unknown", None)
+}
+
+fn value_at<'a>(root: Option<&'a toml::Value>, keys: &[&str]) -> Option<&'a toml::Value> {
+    let mut value = root?;
+    for key in keys {
+        value = value.as_table()?.get(*key)?;
+    }
+    Some(value)
 }
 
 #[cfg(test)]

@@ -897,25 +897,36 @@ the process exits. The transcript stays; a later resume still works.
 The headless server (`--serve` / `web`) and the TUI watch the config files
 (the global `config.toml` plus the project override
 `<workspace>/.e-agent/config.toml`) and, when a file changes, re-read and
-atomically swap the effective config. A change takes effect without
-restarting the process:
+atomically swap the effective config. After a successful swap, tracing-only
+per-source TOML leaf edits are reported separately for `origin=global` and
+`origin=project`. Each edit names its stable TOML path, add/remove or
+before/after values, and status: `effective`, `shadowed`, or `unknown`.
+`effective` means only that the source wins the existing overlay and feeds a
+reload-aware consumer for future/new sessions; it does not promise provider
+behavior or mutate existing sessions. `shadowed` warnings explain the
+overriding or restart-only rule. `unknown` warnings contain `source edit;
+effective status unknown`; this means source precedence wins but existing
+resolution, canonicalization, clamping, or defer behavior prevents a stronger
+claim. Source diagnostics use sanitized snapshots: credential values are
+never retained or compared, and MCP environment values plus provider
+compatibility fields are redacted. No-op and mtime-only reloads still validate
+and refresh runtime state but emit no source edit. Credential-file contents are
+not read for diagnostics.
+Rejected reloads keep the old runtime and emit no success diff.
 
 - `[models]` / `[providers]` / `[roles]` — new profile definitions are
   immediately available to the web `/model` autocomplete and `POST
   /api/sessions/{id}/model` / TUI `/model` switches, and newly built
-  sessions (web `POST /api/sessions`, a fresh CLI session) start with the
-  edited default and role routing.
-- `[mcp]`, `[bash]` timeout, `[background]` timeout — applied to sessions built after the reload.
-- Other sections are carried into the reloaded config but only take effect
-  where a runtime read exists.
-
-A reload that fails to parse or resolve (a typo, a missing key file, a
-`chatgpt`-routed profile without a login) is rejected and logged; the
-previous config stays, so editing the config never breaks a running server.
+  sessions start with the edited default and role routing.
+- `[mcp]`, `[bash]` timeout, `[background]` timeout — winning edits apply to
+  sessions built after the reload; existing MCP connections are unchanged.
+- Existing sessions, startup file capabilities, TUI input mapping, and the
+  session backend are unchanged.
 
 Deliberately NOT hot-reloaded (restart required):
 
-- `[sandbox]` — workspace roots and file capabilities are wired at startup.
+- `[sandbox]` scalar policy and workspace/file capabilities are wired at
+  startup (sandbox path edits are retained as unresolved source diagnostics).
 - `[session]` backend — stores are connected at startup.
 - `[web_search]` key changes — the key is injected into the process env once
   at startup (`std::env::set_var` is only safe single-threaded).
@@ -1289,8 +1300,9 @@ Config hot reload is deliberately scoped: `[models]`/`[providers]`/`[roles]`
 (and anything else read at session-build time) hot-reload in the server and
 TUI via mtime polling with validate-before-swap, but `[sandbox]`, the
 `[session]` backend, and web-search key env injection stay startup-fixed and
-require a restart; there is no reload HTTP endpoint, no config diffing, no
-watch(1)/inotify, and no per-section partial reload (a bad edit is rejected
+require a restart. Reload emits sanitized per-source TOML leaf diagnostics;
+uncertain changes are `unknown`, and credential values are never compared.
+There is no reload HTTP endpoint, no watch(1)/inotify, and no per-section partial reload (a bad edit is rejected
 wholesale and the last good config is kept).
 Reasoning-model `reasoning_content` is persisted in the session for
 display/audit; it is never sent back to the API, except by an explicit

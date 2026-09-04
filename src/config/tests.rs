@@ -2996,3 +2996,194 @@ fn config_watch_paths_covers_global_candidates_and_project_override() {
     assert!(paths.iter().any(|p| p.ends_with("e-agent/config.toml")));
     assert!(paths.windows(2).all(|w| w[0] != w[1]), "no duplicates");
 }
+
+#[test]
+fn reload_source_snapshots_are_sanitized_and_diffed_by_origin() {
+    let temp = tempfile::tempdir().unwrap();
+    let global = write_config(
+        temp.path(),
+        r#"default = "one"
+[models."quoted/name"]
+model = "old"
+[providers.p]
+api_key_file = "credentials"
+"#,
+    );
+    let config = Config::from_path(&global).unwrap();
+    let (global, project) = config.diagnostic_sources();
+    assert!(global.is_some());
+    assert!(project.is_none());
+
+    let before: toml::Value = toml::from_str(
+        r#"[models."quoted/name"]
+model = "old"
+empty = {}
+"#,
+    )
+    .unwrap();
+    let after: toml::Value = toml::from_str(
+        r#"[models."quoted/name"]
+model = "new"
+added = ["a", "b"]
+"#,
+    )
+    .unwrap();
+    let mut edits = Vec::new();
+    diff_toml_source(Some(&before), Some(&after), &mut Vec::new(), &mut edits);
+    let paths = edits
+        .iter()
+        .map(|(path, _, _)| path.join("."))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        ["models.quoted/name.added", "models.quoted/name.model"]
+    );
+}
+
+#[test]
+fn reload_source_paths_quote_and_redact_without_reading_credentials() {
+    assert_eq!(quote_toml_key("plain-key"), "plain-key");
+    assert_eq!(quote_toml_key("quoted/key"), r#""quoted/key""#);
+    let value = toml::Value::String("not inspected by this assertion".into());
+    assert_eq!(source_value(&value), "\"not inspected by this assertion\"");
+    assert_eq!(
+        source_value(&toml::Value::String("ENV_NAME".into())),
+        "\"ENV_NAME\""
+    );
+    let secret: toml::Value = toml::from_str("[mcp.server.env]\nTOKEN = \"value\"\n").unwrap();
+    let sanitized = sanitize_diagnostic_source(secret);
+    assert_eq!(
+        value_at(Some(&sanitized), &["mcp", "server", "env", "TOKEN"])
+            .unwrap()
+            .as_str(),
+        Some("<redacted>")
+    );
+    assert_eq!(
+        source_value(&toml::Value::String("https://example".into())),
+        "\"https://example\""
+    );
+}
+
+#[test]
+fn reload_source_sanitization_redacts_structured_credentials_and_escapes_lines() {
+    let source: toml::Value = toml::from_str(
+        "[providers.unused]\nauth = \"Bearer provider-secret\"\nbase_url = \"https://user:provider-secret@example.invalid/v1\"\napi_key_env = \"VISIBLE_ENV\"\napi_key_file = \"visible-file\"\ncompatibility = { bearer = \"compat-secret\" }\n[providers.unused.options]\ncookie = \"cookie-secret\"\n[mcp.server.env]\nTOKEN = \"mcp-secret\"\n[provider.headers]\nAuthorization = \"header-secret\"\n[provider.extra_body]\nitems = [{ access_token = \"array-secret\" }]\n[session]\nconn = \"postgres-secret\"\n[MixedCase]\nMiXeD_CrEdEnTiAl = \"mixed-secret\"\n\"bad\\nkey\" = \"line\\nvalue\"\n",
+    )
+    .unwrap();
+    let rendered = sanitize_diagnostic_source(source).to_string();
+    for secret in [
+        "provider-secret",
+        "compat-secret",
+        "cookie-secret",
+        "mcp-secret",
+        "header-secret",
+        "array-secret",
+        "postgres-secret",
+        "mixed-secret",
+    ] {
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+    assert!(rendered.contains("VISIBLE_ENV"));
+    assert!(rendered.contains("visible-file"));
+    assert!(rendered.contains("<redacted>"));
+    assert!(quote_toml_key("bad\nkey").contains("\\n"));
+    assert!(escape_single_line("a\n\r\t\\\u{0007}").contains("\\n\\r\\t"));
+}
+
+#[test]
+fn reload_source_classification_covers_precedence_restart_and_unknown() {
+    let global: toml::Value = toml::from_str(
+        r#"default = "global"
+[models.same]
+model = "global"
+[mcp.server]
+enabled = false
+"#,
+    )
+    .unwrap();
+    let project: toml::Value = toml::from_str(
+        r#"default = "project"
+[models.same]
+model = "project"
+[mcp.server]
+command = ["server"]
+[sandbox]
+writable_paths = ["./path"]
+[session]
+backend = "jsonl"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        classify_source_edit(
+            "global",
+            &["default".into()],
+            Some(&global),
+            Some(&project),
+            None
+        ),
+        (
+            "shadowed",
+            Some("project default overrides the global default")
+        )
+    );
+    assert_eq!(
+        classify_source_edit(
+            "global",
+            &["models".into(), "same".into(), "model".into()],
+            Some(&global),
+            Some(&project),
+            None
+        ),
+        (
+            "shadowed",
+            Some("project model table replaces the same-named global model")
+        )
+    );
+    assert_eq!(
+        classify_source_edit(
+            "project",
+            &["mcp".into(), "server".into(), "command".into()],
+            Some(&global),
+            Some(&project),
+            None
+        ),
+        (
+            "shadowed",
+            Some("global MCP enabled=false kill switch overrides the project server")
+        )
+    );
+    assert_eq!(
+        classify_source_edit(
+            "project",
+            &["sandbox".into(), "writable_paths".into()],
+            Some(&global),
+            Some(&project),
+            None
+        )
+        .0,
+        "shadowed"
+    );
+    assert_eq!(
+        classify_source_edit(
+            "project",
+            &["session".into(), "backend".into()],
+            Some(&global),
+            Some(&project),
+            None
+        )
+        .0,
+        "shadowed"
+    );
+    assert_eq!(
+        classify_source_edit(
+            "global",
+            &["unclassified".into()],
+            Some(&global),
+            Some(&project),
+            None
+        )
+        .0,
+        "unknown"
+    );
+}

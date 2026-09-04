@@ -20,7 +20,9 @@ use anyhow::{Context, anyhow};
 use crate::agent::{Agent, SessionEntry};
 use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
-use crate::config::{AuthMode, Config, ResolvedModel, Sandbox, resolve_sandbox};
+use crate::config::{
+    AuthMode, Config, ProjectSourceObservation, ResolvedModel, Sandbox, resolve_sandbox,
+};
 use crate::delegate::{Delegate, Sessions};
 use crate::mcp;
 use crate::model::{ConfiguredModel, OpenAiModel};
@@ -183,6 +185,9 @@ struct ReloadableState {
     /// instead of failing every new session build. `None` when there is no
     /// config (builds then fall back to the startup-resolved fields).
     models: Option<RuntimeModels>,
+    /// Sanitized source snapshots are independent of effective config presence.
+    source_global: Option<toml::Value>,
+    source_project: Option<toml::Value>,
 }
 
 /// Every switchable model of the effective config, resolved to wire models.
@@ -209,8 +214,10 @@ struct ProfilesResolved {
 pub enum ReloadResult {
     /// Nothing changed (watcher tick with no mtime change).
     NoChange,
-    /// The new config parsed, validated and was swapped in.
+    /// The new config parsed, validated and was swapped in, with source edits.
     Reloaded,
+    /// The validated state was refreshed, but sanitized source leaves did not change.
+    ReloadedNoSource,
     /// The new config failed to parse or resolve; the previous config is
     /// kept. Carries the reason for logging.
     Rejected(String),
@@ -259,7 +266,7 @@ impl SessionFactory {
             .map(|dir| dir.join("skills"))
             .filter(|dir| skills_root_is_dir(dir));
         let skills_instructions = read_skills_index(&root, global_skills_dir.as_deref())?;
-        let config = Config::load_for_workspace(&root)?;
+        let (config, project_source) = Config::load_for_workspace_with_sources(&root)?;
         let backend = config
             .as_ref()
             .map(|c| c.session_backend())
@@ -365,6 +372,13 @@ impl SessionFactory {
         if code_mode {
             preflight_code_mode(announce)?;
         }
+        let source_global = config
+            .as_ref()
+            .and_then(|c| c.diagnostic_sources().0.cloned());
+        let source_project = match project_source {
+            ProjectSourceObservation::Observed(source) => Some(source),
+            ProjectSourceObservation::Absent | ProjectSourceObservation::Unavailable => None,
+        };
         Ok(Self {
             workspace,
             root,
@@ -372,6 +386,8 @@ impl SessionFactory {
                 config,
                 auth,
                 models: runtime,
+                source_global,
+                source_project,
             })),
             backend,
             main_model,
@@ -554,6 +570,7 @@ impl SessionFactory {
             self.profile.as_deref(),
             &self.base_url,
             &self.model,
+            self.announce,
         )
     }
 
@@ -588,7 +605,14 @@ impl SessionFactory {
                 if !watch_paths_changed(&mut mtimes) {
                     continue;
                 }
-                match reload_config_at(&reloadable, &root, profile.as_deref(), &base_url, &model) {
+                match reload_config_at(
+                    &reloadable,
+                    &root,
+                    profile.as_deref(),
+                    &base_url,
+                    &model,
+                    announce,
+                ) {
                     ReloadResult::Reloaded => {
                         if announce {
                             tracing::info!(
@@ -597,6 +621,7 @@ impl SessionFactory {
                             );
                         }
                     }
+                    ReloadResult::ReloadedNoSource => {}
                     ReloadResult::Rejected(reason) => {
                         if announce {
                             tracing::warn!(
@@ -946,6 +971,12 @@ impl SessionFactory {
     /// without touching the user's global config.
     #[cfg(test)]
     pub(crate) fn test_factory_with_config(root: PathBuf, config: Option<Config>) -> Self {
+        let source_global = config
+            .as_ref()
+            .and_then(|c| c.diagnostic_sources().0.cloned());
+        let source_project = config
+            .as_ref()
+            .and_then(|c| c.diagnostic_sources().1.cloned());
         let workspace = Workspace::new(root.clone()).expect("temp workspace");
         let main_model = ConfiguredModel::chat(
             OpenAiModel::new(
@@ -963,6 +994,8 @@ impl SessionFactory {
                 config,
                 auth: None,
                 models: None,
+                source_global,
+                source_project,
             })),
             backend: crate::config::SessionBackend::Jsonl,
             main_model,
@@ -1425,15 +1458,43 @@ fn reload_config_at(
     profile: Option<&str>,
     base_url: &Option<String>,
     model: &Option<String>,
+    announce: bool,
 ) -> ReloadResult {
-    match Config::load_for_workspace(root) {
-        Ok(loaded) => apply_reloaded_config(
-            &mut reloadable.write().unwrap(),
-            loaded,
-            profile,
-            base_url,
-            model,
-        ),
+    match Config::load_for_workspace_with_sources(root) {
+        Ok((loaded, project_source)) => {
+            let mut state = reloadable.write().unwrap();
+            let old_global = state.source_global.clone();
+            let old_project = state.source_project.clone();
+            let result = apply_reloaded_config(&mut state, loaded, profile, base_url, model);
+            if matches!(result, ReloadResult::Reloaded) {
+                let new_global = state
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.diagnostic_sources().0.cloned());
+                let new_project = match project_source {
+                    ProjectSourceObservation::Observed(source) => Some(source),
+                    ProjectSourceObservation::Absent => None,
+                    ProjectSourceObservation::Unavailable => old_project.clone(),
+                };
+                state.source_global = new_global.clone();
+                state.source_project = new_project.clone();
+                drop(state);
+                if !announce {
+                    return result;
+                }
+                let had_edits = crate::config::trace_reload_source_edits(
+                    old_global.as_ref(),
+                    old_project.as_ref(),
+                    new_global.as_ref(),
+                    new_project.as_ref(),
+                    profile,
+                );
+                if !had_edits {
+                    return ReloadResult::ReloadedNoSource;
+                }
+            }
+            result
+        }
         Err(error) => ReloadResult::Rejected(format!("{error:#}")),
     }
 }
@@ -1481,6 +1542,215 @@ model = "m1"
 "#
         );
         toml::from_str(&source).expect("test config parses")
+    }
+
+    #[derive(Clone, Default)]
+    struct ReloadCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for ReloadCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ReloadCapture {
+        type Writer = ReloadCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_reload<F>(capture: &ReloadCapture, action: F)
+    where
+        F: FnOnce(),
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(capture.clone());
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), action);
+    }
+
+    fn write_reload_fixture(global: &std::path::Path, project: &std::path::Path) {
+        std::fs::write(
+            global,
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project,
+            r#"[models."p1/m1"]
+model = "project"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reload_global_delete_keeps_unchanged_project_source_silent() {
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let global_dir = xdg.join("e-agent");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let global = global_dir.join("config.toml");
+        let project_dir = temp.path().join(".e-agent");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = project_dir.join("config.toml");
+        write_reload_fixture(&global, &project);
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        factory.announce = true;
+        let capture = ReloadCapture::default();
+        capture_reload(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        capture.0.lock().unwrap().clear();
+
+        std::fs::remove_file(&global).unwrap();
+        capture_reload(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("origin=global"), "{output}");
+        assert!(!output.contains("origin=project"), "{output}");
+        assert!(factory.current_config().is_none());
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            if let Some(home) = old_home {
+                std::env::set_var("HOME", home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    #[test]
+    fn reload_global_recreate_same_project_source_silent() {
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let global_dir = xdg.join("e-agent");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let global = global_dir.join("config.toml");
+        let project_dir = temp.path().join(".e-agent");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = project_dir.join("config.toml");
+        write_reload_fixture(&global, &project);
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+            std::env::set_var("HOME", &home);
+        };
+
+        let mut factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        factory.announce = true;
+        let capture = ReloadCapture::default();
+        capture_reload(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        std::fs::remove_file(&global).unwrap();
+        capture_reload(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        capture.0.lock().unwrap().clear();
+
+        std::fs::write(
+            &global,
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+"#,
+        )
+        .unwrap();
+        capture_reload(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("origin=global"), "{output}");
+        assert!(!output.contains("origin=project"), "{output}");
+        assert!(factory.current_config().is_some());
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            if let Some(home) = old_home {
+                std::env::set_var("HOME", home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    #[test]
+    fn reload_malformed_project_without_global_preserves_snapshot_and_acceptance() {
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let global_dir = xdg.join("e-agent");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let global = global_dir.join("config.toml");
+        let project_dir = temp.path().join(".e-agent");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = project_dir.join("config.toml");
+        write_reload_fixture(&global, &project);
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+            std::env::set_var("HOME", &home);
+        };
+
+        let mut factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        factory.announce = true;
+        let capture = ReloadCapture::default();
+        capture_reload(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        let before = factory.reloadable.read().unwrap().source_project.clone();
+        std::fs::remove_file(&global).unwrap();
+        std::fs::write(&project, "[models.\"p1/m1\"\n").unwrap();
+        capture.0.lock().unwrap().clear();
+
+        capture_reload(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("origin=global"), "{output}");
+        assert!(!output.contains("origin=project"), "{output}");
+        assert!(factory.current_config().is_none());
+        assert_eq!(factory.reloadable.read().unwrap().source_project, before);
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            if let Some(home) = old_home {
+                std::env::set_var("HOME", home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
     }
 
     #[test]
@@ -1615,6 +1885,173 @@ api_key_env = "PATH"
             factory.resolve_profile("p2/m2").unwrap().display_name(),
             "m2"
         );
+    }
+
+    #[test]
+    fn reload_path_emits_safe_source_diagnostics_and_suppresses_noops() {
+        use std::io::Write;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        fn run_with_capture<F>(capture: &Capture, action: F)
+        where
+            F: FnOnce(),
+        {
+            use tracing_subscriber::layer::SubscriberExt;
+            let layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(capture.clone());
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), action);
+        }
+
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg");
+        let global_dir = xdg.join("e-agent");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let global = global_dir.join("config.toml");
+        let project_dir = temp.path().join(".e-agent");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = project_dir.join("config.toml");
+        let global_text = |enabled: bool| {
+            format!(
+                r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+[mcp.server]
+command = ["server"]
+enabled = {enabled}
+"#
+            )
+        };
+        std::fs::write(&global, global_text(false)).unwrap();
+        std::fs::write(
+            &project,
+            r#"[mcp.server]
+command = ["project-server"]
+[mcp.server.env]
+TOKEN = "old-secret"
+"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+        let mut factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        factory.announce = true;
+        let capture = Capture::default();
+        run_with_capture(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        capture.0.lock().unwrap().clear();
+
+        // A project edit is observed through the actual reload entry point and
+        // is classified against the global kill switch.
+        std::fs::write(
+            &project,
+            r#"[mcp.server]
+command = ["project-server-2"]
+[mcp.server.env]
+TOKEN = "new-secret"
+[pet]
+spritesheet = "pet.png"
+[sandbox]
+readable_paths = ["./read-only"]
+"#,
+        )
+        .unwrap();
+        run_with_capture(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains(" WARN"), "{output}");
+        assert!(output.contains("origin=project"), "{output}");
+        assert!(output.contains("path=mcp.server.command"), "{output}");
+        assert!(
+            output.contains("before=[\"project-server\"] after=[\"project-server-2\"]"),
+            "{output}"
+        );
+        assert!(output.contains("status=shadowed"), "{output}");
+        let pet_line = output
+            .lines()
+            .find(|line| line.contains("path=pet.spritesheet"))
+            .expect("pet diagnostic");
+        assert!(pet_line.contains("INFO"), "{pet_line}");
+        assert!(pet_line.contains("status=effective"), "{pet_line}");
+        assert!(output.contains("path=sandbox.readable_paths"), "{output}");
+        assert!(!output.contains("old-secret"), "{output}");
+        assert!(!output.contains("new-secret"), "{output}");
+        // Secret-only env value changes collapse after sanitization, so no
+        // env edit is emitted; the key-preserving shape is tested directly.
+        assert!(!output.contains("mcp.server.env.TOKEN"), "{output}");
+        assert!(output.lines().count() >= 3, "{output}");
+        capture.0.lock().unwrap().clear();
+
+        // The same validated state is refreshed without either success form.
+        run_with_capture(&capture, || {
+            assert!(matches!(
+                factory.reload_config(),
+                ReloadResult::ReloadedNoSource
+            ));
+        });
+        assert!(capture.0.lock().unwrap().is_empty());
+
+        // Removing the global kill switch is an effective global source edit,
+        // not a falsely shadowed project removal.
+        std::fs::write(&global, global_text(true)).unwrap();
+        run_with_capture(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("origin=global"), "{output}");
+        assert!(output.contains("mcp.server.enabled"), "{output}");
+        assert!(output.contains("status=effective"), "{output}");
+        capture.0.lock().unwrap().clear();
+
+        // A rejected file does not emit source-success records or replace the
+        // prior validated runtime/snapshot.
+        std::fs::write(&global, "default = \"missing/profile\"\n").unwrap();
+        run_with_capture(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Rejected(_)));
+        });
+        assert!(capture.0.lock().unwrap().is_empty());
+        assert_eq!(factory.model_profiles(), vec!["p1/m1"]);
+        let state = factory.reloadable.read().unwrap();
+        assert!(state.source_global.is_some());
+        drop(state);
+
+        // TUI mode suppresses diagnostics while still accepting the edit.
+        let mut quiet = SessionFactory::test_factory(temp.path().to_path_buf());
+        quiet.announce = false;
+        std::fs::write(&global, global_text(true)).unwrap();
+        capture.0.lock().unwrap().clear();
+        run_with_capture(&capture, || {
+            assert!(matches!(quiet.reload_config(), ReloadResult::Reloaded));
+        });
+        assert!(capture.0.lock().unwrap().is_empty());
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
     #[test]
