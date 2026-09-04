@@ -614,6 +614,37 @@ async fn repl(
     // Image attached via `/image <path>`; rides along with the next prompt.
     let mut pending_image: Option<(String, ImagePart)> = None;
     loop {
+        // WaitingInput is readable by the REPL: consume one line as the
+        // answer bound to the currently exposed request, rather than spin
+        // waiting for Idle.
+        if let SessionStatus::WaitingInput(request) = status.borrow().clone() {
+            eprintln!("{}", request.questions[0].prompt);
+            print!("answer> ");
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            match stdin.read_line(&mut answer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let answer = answer.trim();
+            if is_repl_exit(answer) {
+                break;
+            }
+            if answer.is_empty() {
+                eprintln!("e-agent: answer must not be empty");
+            } else {
+                match handle.submit_prompt_with_call_id(Some(request.call_id), answer.to_owned()) {
+                    e_agent::runner::PromptSubmission::Conflict => {
+                        eprintln!("e-agent: input request is stale")
+                    }
+                    e_agent::runner::PromptSubmission::Closed => break,
+                    e_agent::runner::PromptSubmission::Answered => {}
+                    e_agent::runner::PromptSubmission::Queued => unreachable!(),
+                }
+            }
+            continue;
+        }
         // Wait for the runner to become idle again. Finished is a terminal
         // state: the watch channel gets no further values, so waiting for
         // Idle would hang forever. Report a failure and end the REPL.
@@ -645,9 +676,11 @@ async fn repl(
             Err(error) => return Err(error.into()),
         }
         let trimmed = line.trim();
+        if is_repl_exit(trimmed) {
+            break;
+        }
         match trimmed {
             "" => {}
-            "/exit" | "/quit" => break,
             "/compact" => {
                 handle.compact();
                 status.changed().await?;
@@ -717,6 +750,10 @@ async fn repl(
     drop(task);
     render.abort();
     Ok(())
+}
+
+fn is_repl_exit(line: &str) -> bool {
+    matches!(line, "/exit" | "/quit")
 }
 
 fn next_value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<String> {

@@ -44,6 +44,10 @@ const state = {
   workspace: null,           // 当前激活的 workspace 对象（state.token 是其派生字段）
   sessionId: null,           // 当前打开的会话
   status: "Idle",
+  waitingInput: null,        // 当前展示的 {callId, questions}；回答严格绑定此 call_id
+  waitingSubmit: null,       // 在途回答的捕获快照；用于禁用/去重与 stale 防护
+  waitingDrafts: {},         // wsId:sessionId:callId -> draft；新问题绝不继承旧问题草稿
+  lastStatusPayload: {},     // wsId:sessionId -> latest SSE status payload，切回缓存时重建等待面板
   initSource: null,          // "history" | "snapshot" | null —— 初始渲染来源
   pollTimer: null,
   pollGen: 0,              // 轮询代次：stopPolling 递增，使在途轮询的续调度失效
@@ -121,6 +125,9 @@ const els = {
   chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
   messages: $("messages"), promptInput: $("promptInput"), queueBar: $("queueBar"),
   goalBar: $("goalBar"),
+  waitingInputPanel: $("waitingInputPanel"), waitingInputQuestions: $("waitingInputQuestions"),
+  waitingInputStatus: $("waitingInputStatus"), waitingInputError: $("waitingInputError"),
+  promptLabel: $("promptLabel"),
   slashMenu: $("slashMenu"), forkMenu: $("forkMenu"),
   composerMeta: $("composerMeta"),
   jumpBottomBtn: $("jumpBottomBtn"),
@@ -558,7 +565,8 @@ async function api(path, opts = {}) {
  * 会话状态标签
  * ===================================================================*/
 const STATUS_LABEL = {
-  Idle: "空闲", Busy: "处理中", Compacting: "压缩中", Finished: "已完成",
+  Idle: "空闲", Busy: "处理中", WaitingInput: "等待回答",
+  Compacting: "压缩中", Finished: "已完成",
 };
 function statusLabel(s) {
   if (s && s.startsWith("Failed")) return "失败";
@@ -566,6 +574,7 @@ function statusLabel(s) {
 }
 function statusChipClass(s) {
   if (s === "Busy") return "busy";
+  if (s === "WaitingInput") return "waiting";
   if (s === "Compacting") return "compacting";
   if (s === "Finished") return "finished";
   if (s && s.startsWith("Finished")) return "finished";

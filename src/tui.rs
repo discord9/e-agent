@@ -253,9 +253,12 @@ fn attach_to_task(
 
 /// Width of the attached steering input's content area (frame minus its
 /// borders), matching what draw() renders into.
-fn attached_input_width(
-    terminal: &Terminal<CrosstermBackend<io::Stdout>>,
-) -> anyhow::Result<usize> {
+fn attached_input_width<B: ratatui::backend::Backend>(
+    terminal: &Terminal<B>,
+) -> anyhow::Result<usize>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     Ok(usize::from(terminal.size()?.width.saturating_sub(2)).max(1))
 }
 
@@ -419,24 +422,16 @@ async fn run_inner(
     let probe = sessions.clone();
     state.attachable = Some(Box::new(move |id| probe.get(id).is_some()));
     loop {
-        state.busy = match &*status.borrow() {
-            SessionStatus::Busy => Some(BusyState::thinking()),
-            SessionStatus::Compacting => Some(BusyState::compacting()),
-            _ => None,
-        };
+        project_main_status(&mut state, &status.borrow());
         // Keep the attached view in step with its runner's real status, the
         // same way the main view refreshes above. This closes the window
         // where a finished delegate still shows "thinking" until the parent
         // agent's next commit_backgrounds round trips a BackgroundCompleted.
         if let Some(attached) = &mut state.attached {
-            match attached.status.borrow().clone() {
-                SessionStatus::Busy => attached.state.busy = Some(BusyState::thinking()),
-                SessionStatus::Compacting => attached.state.busy = Some(BusyState::compacting()),
-                SessionStatus::Idle => attached.state.busy = None,
-                SessionStatus::Finished(_) => {
-                    attached.finished = true;
-                    attached.state.busy = None;
-                }
+            let attached_status = attached.status.borrow().clone();
+            project_main_status(&mut attached.state, &attached_status);
+            if matches!(attached_status, SessionStatus::Finished(_)) {
+                attached.finished = true;
             }
         }
         // Esc-priority: service urgent keys already queued BEFORE paying
@@ -550,22 +545,42 @@ async fn peek_urgent_key(
     }
 }
 
-/// Handle one pressed key in the main loop. Shared by the pre-draw urgent
+fn project_main_status(state: &mut TuiState, status: &SessionStatus) {
+    state.busy = match status {
+        SessionStatus::Busy => Some(BusyState::thinking()),
+        SessionStatus::Compacting => Some(BusyState::compacting()),
+        SessionStatus::WaitingInput(request) => {
+            state.waiting_question = request.questions.first().map(|q| q.prompt.clone());
+            None
+        }
+        SessionStatus::Idle | SessionStatus::Finished(_) => None,
+    };
+    if !matches!(status, SessionStatus::WaitingInput(_)) {
+        state.waiting_question = None;
+    }
+}
+
+/// Handle one pressed key. Shared by the pre-draw urgent
 /// peek and the select's event branch so both paths behave identically.
 /// The branches mirror the original inline select-arm handler exactly:
 /// task detail, tasks panel, attached session, then the main view
 /// (cancel / exit / scroll / input keys).
 #[allow(clippy::too_many_arguments)]
-async fn handle_pressed_key(
+async fn handle_pressed_key<B, S>(
     state: &mut TuiState,
     key: KeyEvent,
     handle: &RunnerHandle,
     status: &tokio::sync::watch::Receiver<SessionStatus>,
     sessions: &Sessions,
     sender: &mpsc::UnboundedSender<UiEvent>,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    events: &mut futures_util::stream::Peekable<EventStream>,
-) -> anyhow::Result<KeyHandled> {
+    terminal: &mut Terminal<B>,
+    events: &mut futures_util::stream::Peekable<S>,
+) -> anyhow::Result<KeyHandled>
+where
+    B: ratatui::backend::Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    S: futures_util::Stream<Item = Result<Event, std::io::Error>> + Unpin,
+{
     if state.task_detail.is_some() {
         state.handle_task_detail_key(key);
         return Ok(KeyHandled::Continue);
@@ -591,6 +606,10 @@ async fn handle_pressed_key(
         }
         return Ok(KeyHandled::Continue);
     }
+    let waiting_call_id = match &*status.borrow() {
+        SessionStatus::WaitingInput(request) => Some(request.call_id.clone()),
+        _ => None,
+    };
     let active = matches!(
         &*status.borrow(),
         SessionStatus::Busy | SessionStatus::Compacting
@@ -602,6 +621,9 @@ async fn handle_pressed_key(
     if !active && is_exit(key) {
         return Ok(KeyHandled::Exit);
     }
+    if waiting_call_id.is_some() && is_exit(key) {
+        return Ok(KeyHandled::Exit);
+    }
     if is_scroll_key(key) {
         state.handle_scroll(key);
         drain_ready_scroll_keys(events, state).await;
@@ -611,29 +633,48 @@ async fn handle_pressed_key(
         if state.newer_pending {
             state.load_newer_history().await;
         }
-    } else if let Some(prompt) = state.handle_key(key) {
-        if prompt == "/compact" {
-            handle.compact();
-        } else if prompt == "/undo" {
-            handle_undo(state);
-        } else if let Some(command) = parse_help(&prompt) {
-            handle_help(command, state);
-        } else if let Some(command) = parse_model(&prompt) {
-            handle_model(command, state, handle);
-        } else if let Some(command) = parse_rename(&prompt) {
-            handle_rename(command, state).await;
-        } else if let Some(command) = parse_btw(&prompt) {
-            handle_btw(command, state).await;
-        } else if let Some(command) = parse_fork(&prompt) {
-            handle_fork(command, state).await;
-        } else if let Some(command) = parse_goal(&prompt) {
-            handle_goal(command, state, handle);
-        } else {
-            if !state.session_title_set {
-                set_terminal_title(&sanitize_title(&prompt));
-                state.session_title_set = true;
+    } else {
+        let input_cursor = state.input.cursor;
+        if let Some(prompt) = state.handle_key(key) {
+            if prompt == "/compact" {
+                handle.compact();
+            } else if prompt == "/undo" {
+                handle_undo(state);
+            } else if let Some(command) = parse_help(&prompt) {
+                handle_help(command, state);
+            } else if let Some(command) = parse_model(&prompt) {
+                handle_model(command, state, handle);
+            } else if let Some(command) = parse_rename(&prompt) {
+                handle_rename(command, state).await;
+            } else if let Some(command) = parse_btw(&prompt) {
+                handle_btw(command, state).await;
+            } else if let Some(command) = parse_fork(&prompt) {
+                handle_fork(command, state).await;
+            } else if let Some(command) = parse_goal(&prompt) {
+                handle_goal(command, state, handle);
+            } else {
+                if !state.session_title_set {
+                    set_terminal_title(&sanitize_title(&prompt));
+                    state.session_title_set = true;
+                }
+                if let Some(ref call_id) = waiting_call_id {
+                    let cursor = input_cursor;
+                    if !matches!(
+                        handle.submit_prompt_with_call_id(Some(call_id.clone()), prompt.clone()),
+                        crate::runner::PromptSubmission::Answered
+                    ) {
+                        state.input.text = prompt;
+                        state.input.cursor = cursor.min(state.input.text.chars().count());
+                    }
+                } else {
+                    handle.prompt(prompt);
+                }
             }
-            handle.prompt(prompt);
+            // A failed submission must preserve the cursor that preceded Enter.
+            // The accepted path intentionally clears the input via take_input.
+            if state.input.text.is_empty() && waiting_call_id.is_some() {
+                let _ = input_cursor;
+            }
         }
     }
     Ok(KeyHandled::Continue)

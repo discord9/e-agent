@@ -26,7 +26,7 @@ use crate::mcp;
 use crate::model::{ConfiguredModel, OpenAiModel};
 use crate::runner::{IdlePolicy, SessionBootstrap, SessionHandle, SessionRunner};
 use crate::session_store::SessionStore;
-use crate::tools::{BackgroundTasks, builtins_with_bash_timeout};
+use crate::tools::{BackgroundTasks, add_root_user_input_tool, builtins_with_bash_timeout};
 use crate::workspace::Workspace;
 
 /// What to do with background-task records left behind by a previous run
@@ -791,6 +791,8 @@ impl SessionFactory {
         #[cfg(target_os = "linux")]
         #[rustfmt::skip]
         register_run_rust(&mut tools, &tools_workspace, self.code_mode, self.read_only, self.sandbox.clone());
+        // Only the root/main session can pause for Web human input.
+        add_root_user_input_tool(&mut tools);
         // Read-only sessions skip MCP entirely: MCP tools carry no read-only
         // marker, so exposing them would defeat the policy. Delegation stays —
         // spawning a subagent does not mutate this session's host state, and

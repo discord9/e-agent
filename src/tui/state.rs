@@ -165,6 +165,7 @@ pub(crate) struct TuiState {
     /// Terminal height (in rows) for the output area, updated on every draw.
     pub(crate) output_height: usize,
     pub(crate) busy: Option<BusyState>,
+    pub(crate) waiting_question: Option<String>,
     pub(crate) streamed: bool,
     pub(crate) active_lane: Option<ActiveStreamLane>,
     /// Whether model reasoning ("thinking") lines render as a single
@@ -549,6 +550,7 @@ impl AttachedView {
     /// channel never moves status).
     pub(crate) fn title_status(&self) -> String {
         match &*self.status.borrow() {
+            SessionStatus::WaitingInput(_) => "waiting for input".into(),
             SessionStatus::Busy | SessionStatus::Compacting => self
                 .state
                 .busy
@@ -745,6 +747,9 @@ impl TuiState {
         if let Some(stashed) = self.stashed_input.remove(&id) {
             input.insert(&stashed);
         }
+        if let SessionStatus::WaitingInput(request) = status.borrow().clone() {
+            state.waiting_question = request.questions.first().map(|q| q.prompt.clone());
+        }
         self.attached = Some(Box::new(AttachedView {
             id,
             label,
@@ -827,6 +832,7 @@ impl TuiState {
                     }
                 } else {
                     let prompt = std::mem::take(&mut attached.input.text);
+                    let cursor = attached.input.cursor;
                     attached.input.cursor = 0;
                     if !prompt.trim().is_empty() {
                         // `/goal` commands reuse the MAIN parser/handler but
@@ -836,6 +842,20 @@ impl TuiState {
                         // (plain prompts to the attached runner).
                         if let Some(command) = super::parse_goal(&prompt) {
                             super::handle_goal(command, &mut attached.state, &attached.handle);
+                        } else if let SessionStatus::WaitingInput(request) =
+                            attached.status.borrow().clone()
+                        {
+                            if !matches!(
+                                attached.handle.submit_prompt_with_call_id(
+                                    Some(request.call_id),
+                                    prompt.clone()
+                                ),
+                                crate::runner::PromptSubmission::Answered
+                            ) {
+                                attached.input.text = prompt;
+                                attached.input.cursor =
+                                    cursor.min(attached.input.text.chars().count());
+                            }
                         } else {
                             attached.handle.prompt(prompt);
                         }

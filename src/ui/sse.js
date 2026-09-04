@@ -86,6 +86,9 @@ async function handleLive404Refresh(id, wsId, epoch) {
 function connectSSE(id, wsId, epoch) {
   // 起流前三重校验：陈旧 history 响应绝不能对刚激活的服务器/会话起 SSE。
   if (!stillCurrent(id, wsId, epoch)) return;
+  // New/reconnected streams replace this cached projection with their initial
+  // status frame; discard any pre-restart wait immediately so it cannot flash.
+  delete state.lastStatusPayload[wsId + ":" + id];
   stopSSE();
   state.sse.stopped = false;
   // 每次会话连接重置“（压缩前）”用量标注：标注是 per-session 状态，旧的
@@ -358,7 +361,11 @@ function handleSSEBlock(block, id, wsId, epoch) {
     return;
   }
   if (eventName === "status") {
-    try { applyStatus(JSON.parse(data).status); } catch (e) { /* 忽略 */ }
+    try {
+      const payload = JSON.parse(data);
+      state.lastStatusPayload[wsId + ":" + id] = payload;
+      applyStatus(payload);
+    } catch (e) { /* 忽略 */ }
     return;
   }
   if (id !== state.sessionId) return;  // 已切换会话

@@ -24,6 +24,11 @@
     --cyan:   #2aa198;
     --green:  #859900;
     --magenta: #d33682;
+    /* Small status text uses deeper variants so Solarized Light stays WCAG AA. */
+    --status-yellow: #7c6200;
+    --status-blue: #006aa6;
+    --status-green: #557000;
+    --status-red: #c5221f;
   }
 
   * { box-sizing: border-box; }
@@ -272,7 +277,8 @@
     background: var(--green);
     flex: 0 0 auto;
   }
-  .busy-dot.busy { background: var(--orange); animation: pulse 1.2s infinite; }
+  .busy-dot.busy { background: var(--blue); animation: pulse 1.2s infinite; }
+  .busy-dot.waiting { background: var(--yellow); }
   /* 子行绿点：busy:false 但存活的 subagent（活着但空闲/在等） */
   .busy-dot-green { background: var(--green); }
   @keyframes pulse { 50% { opacity: 0.3; } }
@@ -289,9 +295,10 @@
     flex: 0 0 24px;
   }
   .busy-dot-wrap > svg { display: block; }   /* 去 SVG 底部基线空隙 */
-  /* 主点：idle 绿 / busy 橙（pulse 呼吸），fill 继承现有色板 */
+  /* 主点：idle 绿 / busy 蓝（pulse 呼吸）/ waiting 黄，fill 继承现有色板 */
   .busy-dot-wrap .main-dot { fill: var(--green); }
-  .busy-dot-wrap .main-dot.busy { fill: var(--orange); animation: pulse 1.2s infinite; }
+  .busy-dot-wrap .main-dot.busy { fill: var(--blue); animation: pulse 1.2s infinite; }
+  .busy-dot-wrap .main-dot.waiting { fill: var(--yellow); }
   /* 环绕点：红（bash / busy delegate），绿（idle delegate 在等）。
      SVG circle 无盒模型，无法用 box-shadow 描边；用 stroke 给 0.5px 光环。 */
   .busy-dot-wrap .orbit-dot {
@@ -334,11 +341,12 @@
     color: var(--base01);
     white-space: nowrap;
   }
-  .status-chip.idle       { color: var(--green);  border-color: var(--green); }
-  .status-chip.busy       { color: var(--orange); border-color: var(--orange); }
-  .status-chip.compacting { color: var(--yellow); border-color: var(--yellow); }
-  .status-chip.finished   { color: var(--blue);   border-color: var(--blue); }
-  .status-chip.error      { color: var(--red);    border-color: var(--red); }
+  .status-chip.idle       { color: var(--status-green);  border-color: var(--green); }
+  .status-chip.busy       { color: var(--status-blue);   border-color: var(--blue); }
+  .status-chip.waiting    { color: var(--status-yellow); border-color: var(--yellow); }
+  .status-chip.compacting { color: var(--status-blue);   border-color: var(--blue); }
+  .status-chip.finished   { color: var(--status-blue);   border-color: var(--blue); }
+  .status-chip.error      { color: var(--status-red);    border-color: var(--red); }
 
   .hint { color: var(--base01); font-size: 13px; padding: 10px 2px; }
 
@@ -1150,9 +1158,10 @@
     font-weight: 600;
     margin-left: 2px;
   }
-  .composer-status.busy { color: var(--orange); }
-  .composer-status.compacting { color: var(--blue); }
-  .composer-status.error { color: var(--red); }
+  .composer-status.busy { color: var(--status-blue); }
+  .composer-status.waiting { color: var(--status-yellow); }
+  .composer-status.compacting { color: var(--status-blue); }
+  .composer-status.error { color: var(--status-red); }
   .composer-status.busy::before,
   .composer-status.compacting::before {
     content: "";
@@ -1178,6 +1187,50 @@
       animation: none;
     }
   }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .waiting-input {
+    border: 1px solid var(--yellow);
+    border-left-width: 4px;
+    border-radius: 4px;
+    background: var(--base2);
+    padding: 9px 11px;
+    color: var(--base02);
+    overflow-wrap: anywhere;
+  }
+  .waiting-input-head {
+    color: var(--status-yellow);
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 5px;
+  }
+  .waiting-input-question { font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
+  .waiting-input-status { color: var(--base01); font-size: 12px; margin-top: 5px; }
+  .waiting-input-error {
+    color: var(--status-red);
+    font-size: 12px;
+    font-weight: 600;
+    margin-top: 5px;
+  }
+  .tree-status {
+    flex: 0 0 auto;
+    padding: 1px 5px;
+    border: 1px solid currentColor;
+    border-radius: 8px;
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  .tree-status.waiting { color: var(--status-yellow); }
 
   /* 排队提示条（queueBar）：固定在输入区上方，不随消息滚动。 */
   .queue-bar {
@@ -2036,6 +2089,10 @@
     }
     #usageInfo.has-percent .usage-detail { display: none; }
     .compact-head { font-size: 10px; padding: 0 6px; }
+    .waiting-input { padding: 8px 9px; }
+    .waiting-input-question { font-size: 13px; }
+    .composer-foot { align-items: flex-end; }
+    .composer-actions { flex: 0 0 auto; }
   }
   /* 更窄的手机（≤360px，如 320px 的 iPhone SE）：再藏品牌名，保证单行不溢出 */
   @media (max-width: 360px) {

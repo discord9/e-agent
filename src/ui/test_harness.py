@@ -245,7 +245,7 @@ const elsById={};
 for(const id of ["topActions","backParentBtn","connState","banner","bannerText","bannerClose","tokenInput","tokenToggle","chatView","chatEmpty",
   "chatBusy","chatSessionId","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn",
-  "queueBar","goalBar","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
+  "queueBar","goalBar","waitingInputPanel","waitingInputQuestions","waitingInputStatus","waitingInputError","promptLabel","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
   "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks","forkMenu",
   "workspaceSelect","workspaceAddBtn","workspaceRemoveBtn","workspaceEditor",
   "wsNameInput","wsUrlInput","wsTokenInput","wsSaveBtn","wsCancelBtn",
@@ -253,6 +253,9 @@ for(const id of ["topActions","backParentBtn","connState","banner","bannerText",
   "usageRefreshBtn","usageCloseBtn","usageFilters","usageFrom","usageTo","usageRootSession",
   "usageModel","usageRole","usageKind","usageBucket","usageResetBtn","usageStatus","usageContent","usageKpis",
   "usageTrendChart","usageModelChart","usageCompositionChart","usageTable","usageTableNote"]) elsById[id]=new El(id);
+elsById["waitingInputPanel"].setAttribute("role", "status");
+elsById["waitingInputPanel"].setAttribute("aria-live", "polite");
+elsById["waitingInputError"].setAttribute("role", "alert");
 // 任务折叠条的计数徽标 span（index.html 里的 .tasks-toggle-label）——
 // 面板计数断言需要它；其余 stub 元素都是裸 El，不建子树。
 const _togLabel = new El("span");
@@ -880,6 +883,96 @@ async function main(){
       console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
       imports.system.exit(0);
     }
+    if (MODE === 'waiting-input') {
+      state.sessionId = "s1";
+      const pin = elsById["promptInput"];
+      const posts = () => FETCH_HEADERS.map((x, i) => ({...x, body: FETCH_BODIES[i]}))
+        .filter((x) => x.method === "POST" && x.url.endsWith("/prompt"));
+      const waitingA = {status:"WaitingInput", call_id:"call-a",
+        questions:[{id:"answer", prompt:"请选择部署区域？"}]};
+      applyStatus(waitingA);
+      chk("waiting panel renders exact question and text status",
+          !elsById["waitingInputPanel"].hidden
+          && elsById["waitingInputQuestions"].textContent === "请选择部署区域？"
+          && elsById["chatStatus"].textContent === "等待回答"
+          && elsById["chatStatus"].classList.contains("waiting"));
+      chk("waiting panel has live and labelled state",
+          elsById["waitingInputPanel"].getAttribute("role") === "status"
+          && elsById["waitingInputPanel"].getAttribute("aria-live") === "polite"
+          && elsById["chatStatus"].getAttribute("aria-label").includes("等待回答"));
+      chk("waiting affordance reuses composer", elsById["sendBtn"].textContent === "回答"
+          && elsById["promptLabel"].textContent === "回答当前问题");
+
+      pin.value = "华东";
+      promptPostDeferred = true;
+      const answerA = sendPrompt(); await flush();
+      sendPrompt(); await flush();
+      chk("waiting answer posts exact body once and dedupes in flight",
+          posts().length === 1
+          && posts()[0].body === JSON.stringify({text:"华东", call_id:"call-a"})
+          && elsById["sendBtn"].disabled && elsById["promptInput"].disabled,
+          "posts=" + JSON.stringify(posts()));
+      promptPostResolve(resp(202, {})); await answerA; await flush();
+      chk("accepted answer remains safely disabled pending status transition",
+          pin.value === "华东" && elsById["sendBtn"].textContent === "已回答"
+          && elsById["waitingInputStatus"].textContent.includes("继续处理"));
+      applyStatus({status:"Busy"});
+      chk("202 followed by Busy clears wait and restores prior ordinary draft",
+          elsById["waitingInputPanel"].hidden && elsById["chatStatus"].textContent === "处理中"
+          && pin.value === "" && state.status === "Busy");
+
+      applyStatus(waitingA);
+      promptPostDeferred = false; promptPostStatus = 409;
+      pin.value = "冲突时保留";
+      await sendPrompt(); await flush();
+      chk("409 preserves exact draft and exposes inline alert",
+          pin.value === "冲突时保留" && !elsById["waitingInputError"].hidden
+          && elsById["waitingInputError"].getAttribute("role") === "alert"
+          && elsById["waitingInputError"].textContent.includes("HTTP 409"));
+      promptPostStatus = 202; promptPostNetFail = true;
+      pin.value = "断网时保留";
+      await sendPrompt(); await flush();
+      chk("network failure preserves exact draft and inline error",
+          pin.value === "断网时保留" && elsById["waitingInputError"].textContent.includes("network error"));
+      promptPostNetFail = false;
+
+      // A is captured at submit. A later B is a distinct question and receives an empty,
+      // separately keyed draft; A's late 202 cannot mutate or answer B.
+      applyStatus(waitingA); pin.value = "只回答 A";
+      promptPostDeferred = true;
+      const staleA = sendPrompt(); await flush();
+      applyStatus({status:"WaitingInput", call_id:"call-b",
+        questions:[{id:"answer", prompt:"新的问题 B？"}]});
+      chk("new call id shows new question without carrying A draft",
+          elsById["waitingInputQuestions"].textContent === "新的问题 B？" && pin.value === "");
+      promptPostResolve(resp(202, {})); await staleA; await flush();
+      chk("stale A completion never submits or mutates displayed B",
+          posts().filter((x) => x.body === JSON.stringify({text:"只回答 A", call_id:"call-a"})).length === 1
+          && elsById["waitingInputQuestions"].textContent === "新的问题 B？"
+          && pin.value === "" && elsById["sendBtn"].textContent === "回答");
+      promptPostDeferred = false;
+
+      applyStatus({status:"Idle"}); pin.value = "普通消息";
+      await sendPrompt(); await flush();
+      const ordinary = posts()[posts().length - 1];
+      chk("idle prompt body omits call_id", ordinary.body === JSON.stringify({text:"普通消息"}), ordinary.body);
+
+      sessionsData = [{id:"s1",status:"WaitingInput",entry_count:1,active:true,busy:false}];
+      state.lastList = sessionsData; state.workspaceLists[state.workspace.id] = sessionsData;
+      renderSidebarTree(true);
+      const waitRow = elsById["sidebarTree"].querySelector(".tree-row");
+      chk("session list waiting is distinct and not model-busy",
+          waitRow.querySelector(".tree-status.waiting").textContent === "等待回答"
+          && waitRow.querySelector(".busy-dot-wrap").getAttribute("aria-label").includes("等待回答")
+          && sessionsData[0].active === true && sessionsData[0].busy === false);
+
+      applyStatus({status:"WaitingInput", call_id:"bad", questions:[]});
+      chk("invalid multi-question seam is rejected", !elsById["waitingInputError"].hidden
+          && elsById["sendBtn"].disabled && elsById["waitingInputError"].textContent.includes("仅支持一个问题"));
+      console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
+      imports.system.exit(0);
+    }
+
     openSession("s1");
     await flush();
     await flush();
@@ -8000,6 +8093,7 @@ main();
    .replace("MODE === 'usage-dashboard'", 'true' if MODE == 'usage-dashboard' else 'false') \
    .replace("MODE === 'composer-history'", 'true' if MODE == 'composer-history' else 'false') \
    .replace("MODE === 'markdown'", 'true' if MODE == 'markdown' else 'false') \
+   .replace("MODE === 'waiting-input'", 'true' if MODE == 'waiting-input' else 'false') \
    .replace("MODE === 'refresh-deep-link'", 'true' if MODE == 'refresh-deep-link' else 'false')
 
 # DEEP_LINK env → location.search 注入（init() 启动时 URL 解析入口）

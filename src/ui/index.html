@@ -118,7 +118,14 @@
     <!-- fork 面板：/fork 命令弹出的历史边界消息选择（absolute 定位在
          composer 内，与 slash 菜单同风格；选中一项 → POST /fork 建新会话） -->
     <div id="forkMenu" class="fork-menu" hidden></div>
-    <textarea id="promptInput" rows="1" placeholder="输入消息：Enter 发送，Shift+Enter 换行…" title="支持斜杠命令：/compact 压缩上下文；/rename &lt;标题&gt; 重命名（留空可清除）；/btw &lt;问题&gt; 旁路子代理；/goal set &lt;目标&gt; 设置 goal"></textarea>
+    <section id="waitingInputPanel" class="waiting-input" role="status" aria-live="polite" aria-atomic="true" hidden>
+      <div class="waiting-input-head"><span aria-hidden="true">◆</span> 需要你的回答</div>
+      <div id="waitingInputQuestions" class="waiting-input-questions"></div>
+      <div id="waitingInputStatus" class="waiting-input-status">代理已暂停，正在等待你的回答。</div>
+      <div id="waitingInputError" class="waiting-input-error" role="alert" hidden></div>
+    </section>
+    <label id="promptLabel" class="sr-only" for="promptInput">消息</label>
+    <textarea id="promptInput" rows="1" aria-labelledby="promptLabel" placeholder="输入消息：Enter 发送，Shift+Enter 换行…" title="支持斜杠命令：/compact 压缩上下文；/rename &lt;标题&gt; 重命名（留空可清除）；/btw &lt;问题&gt; 旁路子代理；/goal set &lt;目标&gt; 设置 goal"></textarea>
     <div class="composer-foot">
       <div id="composerMeta" class="composer-meta" hidden></div>
       <div class="composer-actions">

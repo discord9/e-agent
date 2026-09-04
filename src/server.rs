@@ -59,7 +59,9 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::agent::{AgentEvent, Message, Model, SessionEntry, preview};
 use crate::delegate::Sessions;
-use crate::runner::{IdlePolicy, SessionHandle, SessionStatus, SessionTask};
+use crate::runner::{
+    IdlePolicy, PromptSubmission, SessionHandle, SessionStatus, SessionTask, UserInputRequest,
+};
 use crate::session_factory::{SessionBuild, SessionFactory, UnfinishedPolicy};
 use crate::session_store::{
     FinishedTask, ListMetaDiagnostics, SessionStore, UsageDashboardMetadata, UsageDashboardRow,
@@ -600,6 +602,7 @@ fn status_string(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Idle => "Idle",
         SessionStatus::Busy => "Busy",
+        SessionStatus::WaitingInput(_) => "WaitingInput",
         SessionStatus::Compacting => "Compacting",
         SessionStatus::Finished(_) => "Finished",
     }
@@ -609,7 +612,12 @@ fn status_string(status: &SessionStatus) -> &'static str {
 /// `applyStatus(JSON.parse(data).status)`, so the frame must be an object
 /// with a `status` key carrying the CamelCase string (not a bare string).
 fn status_json(status: &SessionStatus) -> serde_json::Value {
-    serde_json::json!({ "status": status_string(status) })
+    match status {
+        SessionStatus::WaitingInput(UserInputRequest { call_id, questions }) => {
+            serde_json::json!({"status": "WaitingInput", "call_id": call_id, "questions": questions})
+        }
+        _ => serde_json::json!({ "status": status_string(status) }),
+    }
 }
 
 /// Session metadata for `GET /api/sessions` and `POST /api/sessions`.
@@ -1082,9 +1090,12 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
             let running = matches!(status, SessionStatus::Busy | SessionStatus::Compacting);
             let overwrite = match subagent_status.get(&entry.session_id) {
                 None => true,
-                Some(existing) => {
-                    !matches!(existing, SessionStatus::Busy | SessionStatus::Compacting)
-                }
+                Some(existing) => !matches!(
+                    existing,
+                    SessionStatus::Busy
+                        | SessionStatus::WaitingInput(_)
+                        | SessionStatus::Compacting
+                ),
             };
             if running || overwrite {
                 subagent_status.insert(entry.session_id.clone(), status);
@@ -1304,6 +1315,9 @@ struct PromptBody {
     /// and `prompt` so the endpoint is agnostic to the client's field name.
     #[serde(alias = "text")]
     prompt: String,
+    /// Required to bind an answer to the exact WaitingInput request.
+    #[serde(default)]
+    call_id: Option<String>,
 }
 
 async fn session_prompt(
@@ -1323,8 +1337,17 @@ async fn session_prompt(
             format!("session {id} has finished"),
         ));
     }
-    handle.prompt(body.prompt);
-    Ok(StatusCode::ACCEPTED)
+    match handle.submit_prompt_with_call_id(body.call_id, body.prompt) {
+        PromptSubmission::Answered | PromptSubmission::Queued => Ok(StatusCode::ACCEPTED),
+        PromptSubmission::Conflict => Err(error(
+            StatusCode::CONFLICT,
+            "input request already answered",
+        )),
+        PromptSubmission::Closed => Err(error(
+            StatusCode::CONFLICT,
+            format!("session {id} has finished"),
+        )),
+    }
 }
 
 #[derive(Deserialize)]
@@ -4026,6 +4049,126 @@ mod tests {
             )),
             json!({"status": "Finished"})
         );
+        let waiting = UserInputRequest {
+            call_id: "call-7".into(),
+            questions: vec![crate::runner::UserQuestion {
+                id: "confirm".into(),
+                prompt: "Continue?".into(),
+            }],
+        };
+        assert_eq!(
+            status_json(&SessionStatus::WaitingInput(waiting)),
+            json!({"status": "WaitingInput", "call_id": "call-7",
+                   "questions": [{"id": "confirm", "prompt": "Continue?"}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_endpoint_answers_waiting_and_queues_ordinary_prompt() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let state = test_app_state("sekrit");
+        let (handle, emitter, _receiver) = crate::runner::session_test_channel();
+        emitter.set_status(SessionStatus::WaitingInput(UserInputRequest {
+            call_id: "http-call".into(),
+            questions: vec![crate::runner::UserQuestion {
+                id: "q".into(),
+                prompt: "?".into(),
+            }],
+        }));
+        state.registry.insert(
+            "http-input".into(),
+            live_session_with_handle(handle.clone()),
+        );
+        let app = router(state);
+        let request = |text: &str| {
+            Request::builder()
+                .uri("/api/sessions/http-input/prompt")
+                .method("POST")
+                .header(header::AUTHORIZATION, "Bearer sekrit")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"text":"{text}"}}"#)))
+                .unwrap()
+        };
+        let request_with_id = |text: &str| {
+            Request::builder()
+                .uri("/api/sessions/http-input/prompt")
+                .method("POST")
+                .header(header::AUTHORIZATION, "Bearer sekrit")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"text":"{text}","call_id":"http-call"}}"#
+                )))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request_with_id("Ada"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("duplicate"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("duplicate-2"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        // Use a fresh non-waiting handle for the ordinary prompt control.
+        let normal_state = test_app_state("sekrit");
+        let (normal, normal_emitter, _normal_receiver) = crate::runner::session_test_channel();
+        normal_emitter.set_status(SessionStatus::Idle);
+        normal_state
+            .registry
+            .insert("http-normal".into(), live_session_with_handle(normal));
+        let normal_app = router(normal_state);
+        assert_eq!(
+            normal_app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/sessions/http-normal/prompt")
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"text":"ordinary"}"#))
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[test]
+    fn waiting_input_metadata_is_live_but_not_model_busy() {
+        assert_eq!(
+            status_string(&SessionStatus::WaitingInput(UserInputRequest {
+                call_id: "c".into(),
+                questions: vec![],
+            })),
+            "WaitingInput"
+        );
+        let status = SessionStatus::WaitingInput(UserInputRequest {
+            call_id: "c".into(),
+            questions: vec![],
+        });
+        assert!(!matches!(
+            status,
+            SessionStatus::Busy | SessionStatus::Compacting
+        ));
     }
 
     #[test]
@@ -4351,8 +4494,11 @@ mod tests {
         // The frontend sends `JSON.stringify({ text })`.
         let via_text: PromptBody = serde_json::from_str(r#"{"text": "hi"}"#).unwrap();
         assert_eq!(via_text.prompt, "hi");
-        let via_prompt: PromptBody = serde_json::from_str(r#"{"prompt": "hi"}"#).unwrap();
+        assert_eq!(via_text.call_id, None);
+        let via_prompt: PromptBody =
+            serde_json::from_str(r#"{"prompt": "hi", "call_id":"c-1"}"#).unwrap();
         assert_eq!(via_prompt.prompt, "hi");
+        assert_eq!(via_prompt.call_id.as_deref(), Some("c-1"));
     }
 
     #[test]

@@ -27,6 +27,152 @@ fn attach_test(state: &mut TuiState, id: u64, label: &str, handle: RunnerHandle)
     );
 }
 
+#[tokio::test]
+async fn main_waiting_submission_is_call_id_bound_and_preserves_conflicts() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    let request = crate::runner::UserInputRequest {
+        call_id: "main-call".into(),
+        questions: vec![crate::runner::UserQuestion {
+            id: "q".into(),
+            prompt: "?".into(),
+        }],
+    };
+    emitter.set_status(SessionStatus::WaitingInput(request));
+    let mut state = TuiState::default();
+    state.input.insert("你好");
+    state.input.cursor = 1;
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut events =
+        futures_util::stream::iter(Vec::<Result<crossterm::event::Event, std::io::Error>>::new())
+            .peekable();
+    let sessions = Sessions::default();
+    let (sender, _receiver) = mpsc::unbounded_channel();
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("main-call".into()), "claimed".into()),
+        crate::runner::PromptSubmission::Answered
+    );
+    let _ = commands.try_recv();
+    assert!(matches!(
+        handle_pressed_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &handle,
+            &handle.status(),
+            &sessions,
+            &sender,
+            &mut terminal,
+            &mut events
+        )
+        .await
+        .unwrap(),
+        KeyHandled::Continue
+    ));
+    assert_eq!(state.input.text, "你好");
+    assert_eq!(state.input.cursor, 1);
+    assert!(commands.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn main_waiting_submission_routes_matching_answer_through_key_handler() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    emitter.set_status(SessionStatus::WaitingInput(
+        crate::runner::UserInputRequest {
+            call_id: "main-call".into(),
+            questions: vec![crate::runner::UserQuestion {
+                id: "q".into(),
+                prompt: "?".into(),
+            }],
+        },
+    ));
+    let mut state = TuiState::default();
+    state.input.insert("answer");
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut events =
+        futures_util::stream::iter(Vec::<Result<crossterm::event::Event, std::io::Error>>::new())
+            .peekable();
+    let sessions = Sessions::default();
+    let (sender, _receiver) = mpsc::unbounded_channel();
+    handle_pressed_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        &handle,
+        &handle.status(),
+        &sessions,
+        &sender,
+        &mut terminal,
+        &mut events,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(commands.try_recv(), Ok(crate::runner::SessionCommand::Answer { call_id, .. }) if call_id == "main-call")
+    );
+}
+
+#[test]
+fn main_status_projection_clears_waiting_question_for_all_non_waiting_states() {
+    let mut state = TuiState {
+        waiting_question: Some("?".into()),
+        ..Default::default()
+    };
+    for status in [
+        SessionStatus::Idle,
+        SessionStatus::Compacting,
+        SessionStatus::Finished(crate::runner::SessionResult::Cancelled),
+    ] {
+        project_main_status(&mut state, &status);
+        assert!(state.waiting_question.is_none());
+    }
+    project_main_status(&mut state, &SessionStatus::Busy);
+    assert!(state.waiting_question.is_none());
+    assert!(matches!(
+        state.busy,
+        Some(BusyState {
+            kind: BusyKind::Thinking,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn attached_waiting_submission_routes_and_restores_unicode_cursor_on_conflict() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    emitter.set_status(SessionStatus::WaitingInput(
+        crate::runner::UserInputRequest {
+            call_id: "attached-call".into(),
+            questions: vec![crate::runner::UserQuestion {
+                id: "q".into(),
+                prompt: "?".into(),
+            }],
+        },
+    ));
+    let mut state = TuiState::default();
+    attach_test(&mut state, 7, "input", handle.clone());
+    let attached = state.attached.as_mut().unwrap();
+    attached.input.insert("你好");
+    attached.input.cursor = 1;
+    assert_eq!(attached.state.waiting_question.as_deref(), Some("?"));
+    attached
+        .handle
+        .submit_prompt_with_call_id(Some("attached-call".into()), "claimed".into());
+    let _ = commands.try_recv();
+    let _ = attached;
+    state.handle_attached_key(
+        KeyEvent::new(crossterm::event::KeyCode::Enter, KeyModifiers::empty()),
+        80,
+    );
+    let attached = state.attached.as_ref().unwrap();
+    assert_eq!(attached.input.text, "你好");
+    assert_eq!(attached.input.cursor, 1);
+    let mut attached_status = attached.status.borrow().clone();
+    let _ = attached;
+    emitter.set_status(SessionStatus::Idle);
+    attached_status = handle.status().borrow().clone();
+    let attached = state.attached.as_mut().unwrap();
+    project_main_status(&mut attached.state, &attached_status);
+    assert!(attached.state.waiting_question.is_none());
+}
+
 /// Verify that the lookbehind used by render_window is bounded even
 /// when the full scrollback contains 10k preceding lines.
 #[test]

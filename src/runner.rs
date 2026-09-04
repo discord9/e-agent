@@ -18,6 +18,26 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct UserQuestion {
+    pub id: String,
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct UserInputRequest {
+    pub call_id: String,
+    pub questions: Vec<UserQuestion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptSubmission {
+    Answered,
+    Queued,
+    Conflict,
+    Closed,
+}
+
 const EVENT_CAPACITY: usize = 256;
 
 /// Outcome of polling an in-flight operation against the command channel.
@@ -116,6 +136,11 @@ pub enum SessionCommand {
     /// never creates goals; its `update_goal` tool is intercepted by the
     /// runner with the same transition rules under an id + revision CAS.
     Goal(GoalCommand),
+    /// Structured answer to the currently waiting root input request.
+    Answer {
+        call_id: String,
+        answers: Vec<(String, String)>,
+    },
 }
 
 /// Human goal operations (creation is human-only; the model's
@@ -140,6 +165,8 @@ pub enum IdlePolicy {
 pub enum SessionStatus {
     Idle,
     Busy,
+    /// Root-only process-local request; never persisted or recovered.
+    WaitingInput(UserInputRequest),
     Compacting,
     Finished(SessionResult),
 }
@@ -155,6 +182,11 @@ struct Shared {
     log: Vec<AgentEvent>,
     events: broadcast::Sender<AgentEvent>,
     status: watch::Sender<SessionStatus>,
+    /// Process-local pending root human-input request. It is claimed under
+    /// the same mutex as command admission, so answer/cancel cannot race
+    /// into two winners.
+    waiting_input: Option<UserInputRequest>,
+    input_claimed: bool,
     compaction_streaming: bool,
     commands_open: bool,
     /// Latest goal snapshot, mirrored from the runner for UI reads
@@ -196,6 +228,59 @@ impl SessionHandle {
         self.prompt_inner(prompt.into(), None);
     }
 
+    /// Submit a web prompt atomically. While waiting for root user input the
+    /// prompt is claimed as that answer; otherwise it is queued normally.
+    pub fn submit_prompt(&self, prompt: String) -> PromptSubmission {
+        self.submit_prompt_with_call_id(None, prompt)
+    }
+
+    /// Submit text with an optional call-id binding. A provided id must match
+    /// the currently open request; absence is never allowed to infer a wait.
+    pub fn submit_prompt_with_call_id(
+        &self,
+        call_id: Option<String>,
+        prompt: String,
+    ) -> PromptSubmission {
+        let mut shared = self.shared.lock().unwrap();
+        if !shared.commands_open || self.commands.is_closed() {
+            return PromptSubmission::Closed;
+        }
+        if let Some(request) = shared.waiting_input.as_ref() {
+            if call_id.as_deref() != Some(request.call_id.as_str()) || shared.input_claimed {
+                return PromptSubmission::Conflict;
+            }
+            let id = request.questions[0].id.clone();
+            if self
+                .commands
+                .send(SessionCommand::Answer {
+                    call_id: request.call_id.clone(),
+                    answers: vec![(id, prompt)],
+                })
+                .is_err()
+            {
+                shared.commands_open = false;
+                return PromptSubmission::Closed;
+            }
+            shared.input_claimed = true;
+            return PromptSubmission::Answered;
+        }
+        if call_id.is_some() {
+            return PromptSubmission::Conflict;
+        }
+        let command = SessionCommand::Prompt(prompt.clone());
+        if self.commands.send(command).is_err() {
+            shared.commands_open = false;
+            return PromptSubmission::Closed;
+        }
+        if matches!(
+            *shared.status.borrow(),
+            SessionStatus::Busy | SessionStatus::Compacting
+        ) {
+            shared.emit(AgentEvent::PromptQueued(prompt));
+        }
+        PromptSubmission::Queued
+    }
+
     /// Queue a prompt with an image attached; the image rides along as a
     /// reference on the resulting `Message::User`.
     pub fn prompt_with_image(&self, prompt: impl Into<String>, image: ImagePart) {
@@ -204,6 +289,11 @@ impl SessionHandle {
 
     fn prompt_inner(&self, prompt: String, image: Option<ImagePart>) {
         let mut shared = self.shared.lock().unwrap();
+        // A waiting request is answerable only through the structured Web
+        // entrance; never let another frontend turn it into a normal prompt.
+        if shared.waiting_input.is_some() {
+            return;
+        }
         if !shared.commands_open || self.commands.is_closed() {
             return;
         }
@@ -238,6 +328,11 @@ impl SessionHandle {
     /// background-task registry); `cancel` never ends the session.
     pub fn cancel(&self) {
         let mut shared = self.shared.lock().unwrap();
+        // Claim a waiting request before enqueueing cancel. A concurrent Web
+        // answer then deterministically loses (and cannot become a prompt).
+        if shared.waiting_input.is_some() {
+            shared.input_claimed = true;
+        }
         if shared.commands_open
             && !self.commands.is_closed()
             && self.commands.send(SessionCommand::Cancel).is_err()
@@ -328,7 +423,13 @@ impl TestSessionEmitter {
     /// tests can simulate a Busy/Compacting/Finished subagent handle
     /// without a live runner task.
     pub(crate) fn set_status(&self, status: SessionStatus) {
-        self.shared.lock().unwrap().status.send_replace(status);
+        let mut shared = self.shared.lock().unwrap();
+        shared.waiting_input = match &status {
+            SessionStatus::WaitingInput(request) => Some(request.clone()),
+            _ => None,
+        };
+        shared.input_claimed = false;
+        shared.status.send_replace(status);
     }
 }
 #[cfg(test)]
@@ -345,6 +446,8 @@ pub(crate) fn session_test_channel() -> (
         status,
         compaction_streaming: false,
         commands_open: true,
+        waiting_input: None,
+        input_claimed: false,
         goal: None,
     }));
     let (commands, receiver) = mpsc::unbounded_channel();
@@ -504,6 +607,8 @@ impl SessionRunner {
             status,
             compaction_streaming: false,
             commands_open: true,
+            waiting_input: None,
+            input_claimed: false,
             goal,
         }));
         let handler_shared = shared.clone();
@@ -976,6 +1081,52 @@ impl SessionRunner {
         Ok(ToolOutput::text(text))
     }
 
+    fn begin_waiting_input(&mut self, request: UserInputRequest) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.input_claimed = false;
+        shared.waiting_input = Some(request.clone());
+        shared
+            .status
+            .send_replace(SessionStatus::WaitingInput(request));
+    }
+
+    fn clear_waiting_input(&mut self, status: SessionStatus) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.waiting_input = None;
+        shared.input_claimed = false;
+        shared.status.send_replace(status);
+    }
+
+    async fn await_input_answer(
+        &mut self,
+        call: &ToolCall,
+    ) -> WaitResult<Result<Vec<(String, String)>, String>> {
+        let mut pending = Vec::new();
+        loop {
+            match self.commands.recv().await {
+                Some(SessionCommand::Answer { call_id, answers }) if call_id == call.id => {
+                    return WaitResult {
+                        outcome: WaitOutcome::Completed(Ok(answers)),
+                        pending,
+                    };
+                }
+                Some(SessionCommand::Cancel) => {
+                    return WaitResult {
+                        outcome: WaitOutcome::Released,
+                        pending,
+                    };
+                }
+                Some(command) => pending.push(command),
+                None => {
+                    return WaitResult {
+                        outcome: WaitOutcome::Closed,
+                        pending,
+                    };
+                }
+            }
+        }
+    }
+
     fn status(&self, status: SessionStatus) {
         // Turn-boundary metadata touch (R4): the sessions audit table is
         // appended once per return to Idle — not per event (double-write
@@ -1088,6 +1239,7 @@ impl SessionRunner {
                 Steering::None
             }
             SessionCommand::Cancel => self.release_steering(),
+            SessionCommand::Answer { .. } => Steering::None,
         }
     }
     async fn commit_backgrounds(&mut self) -> anyhow::Result<bool> {
@@ -1665,6 +1817,105 @@ impl SessionRunner {
                         name: call.name.clone(),
                         arguments: call.arguments.clone(),
                     });
+                    // Root-only marker: persist the assistant ToolCall first,
+                    // then pause this same model/tool turn for the Web answer.
+                    if call.name == "request_user_input" {
+                        let questions = match crate::tools::parse_questions(&call.arguments) {
+                            Ok(questions) => questions,
+                            Err(error) => {
+                                let entry = Message::Tool {
+                                    call_id: call.id.clone(),
+                                    name: call.name.clone(),
+                                    content: error.clone(),
+                                    images: Vec::new(),
+                                    is_error: true,
+                                    synthetic: false,
+                                }
+                                .into();
+                                if let Err(error) = self.commit(entry).await {
+                                    self.terminate(
+                                        SessionResult::Failed(format!("{error:#}")),
+                                        Vec::new(),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                self.agent.emit_event(AgentEvent::ToolResult {
+                                    is_error: true,
+                                    content: error,
+                                });
+                                continue;
+                            }
+                        };
+                        self.begin_waiting_input(UserInputRequest {
+                            call_id: call.id.clone(),
+                            questions: questions.clone(),
+                        });
+                        let waited = self.await_input_answer(&call).await;
+                        match waited.outcome {
+                            WaitOutcome::Completed(Ok(answers)) => {
+                                let answer = answers.into_iter().next();
+                                let Some((id, value)) = answer else {
+                                    self.clear_waiting_input(SessionStatus::Busy);
+                                    continue;
+                                };
+                                let expected = questions[0].id.clone();
+                                if id != expected || value.trim().is_empty() {
+                                    self.clear_waiting_input(SessionStatus::Busy);
+                                    continue;
+                                }
+                                let content =
+                                    serde_json::json!({"answers": [{"id": id, "value": value}]})
+                                        .to_string();
+                                let entry = Message::Tool {
+                                    call_id: call.id.clone(),
+                                    name: call.name.clone(),
+                                    content: content.clone(),
+                                    images: Vec::new(),
+                                    is_error: false,
+                                    synthetic: false,
+                                }
+                                .into();
+                                if let Err(error) = self.commit(entry).await {
+                                    self.terminate(
+                                        SessionResult::Failed(format!("{error:#}")),
+                                        waited.pending,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                self.clear_waiting_input(SessionStatus::Busy);
+                                self.agent.emit_event(AgentEvent::ToolResult {
+                                    is_error: false,
+                                    content,
+                                });
+                                let steering = self.intake_after_operation(waited.pending);
+                                if steering != Steering::None {
+                                    break 'turn;
+                                }
+                                continue;
+                            }
+                            WaitOutcome::Released => {
+                                self.clear_waiting_input(SessionStatus::Idle);
+                                self.intake_after_operation(waited.pending);
+                                self.shared
+                                    .lock()
+                                    .unwrap()
+                                    .emit(AgentEvent::Notice("turn cancelled".into()));
+                                break 'turn;
+                            }
+                            WaitOutcome::Closed => {
+                                self.clear_waiting_input(SessionStatus::Idle);
+                                self.terminate(SessionResult::Closed, waited.pending).await;
+                                return;
+                            }
+                            WaitOutcome::Completed(Err(error)) => {
+                                self.clear_waiting_input(SessionStatus::Busy);
+                                self.shared.lock().unwrap().emit(AgentEvent::Error(error));
+                                break 'turn;
+                            }
+                        }
+                    }
                     // Goal tools are intercepted by the runner: they need
                     // the session's goal state + durable commit, which a
                     // plain tool cannot reach. They never create goals.

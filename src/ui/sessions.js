@@ -668,7 +668,7 @@ function updateComposerMeta() {
   const st = s && s.status ? String(s.status) : "";
   const showSt = st !== "" && st !== "Idle";
   const stCls = !showSt ? "" : (st.startsWith("Failed") ? "error"
-    : st === "Compacting" ? "compacting" : "busy");
+    : st === "WaitingInput" ? "waiting" : st === "Compacting" ? "compacting" : "busy");
   const full = showSt ? text + " · " + statusLabel(st) : text;
   const curSt = meta.querySelector(".composer-status");
   const curCls = curSt ? curSt.className : "";
@@ -687,12 +687,16 @@ function updateComposerMeta() {
    同款约定）：跨 workspace 同名 sessionId 互不串用各自的缓存槽。 */
 function saveSessionState() {
   if (!state.sessionId) return;
+  if (state.waitingInput) {
+    state.waitingDrafts[waitingDraftKey(state.waitingInput.callId)] = els.promptInput.value;
+  }
   state.sessionStates[state.workspace.id + ":" + state.sessionId] = {
     html: els.messages.innerHTML,
     scrollTop: els.messages.scrollTop,
     nextBeforeSeq: state.nextBeforeSeq,
     olderDone: state.olderDone,
-    draft: els.promptInput.value,
+    // The answer draft is call-bound above; the ordinary composer draft stays separate.
+    draft: state.waitingInput ? state.waitingInput.priorDraft : els.promptInput.value,
   };
 }
 
@@ -714,6 +718,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
   }
   state.renameActive = false;  // 切换会话会销毁编辑框：清标志，恢复轮询重绘
   stopSSE();
+  clearWaitingInput(false);
   state.sessionId = id;
   renderGoalBar(null);       // 会话切换开始：立即清空旧会话的 GoalBar（防陈旧残留）
   state.sessionUsage = null;   // 旧会话的累计用量不串到新会话（openWith 会重拉）
@@ -753,6 +758,8 @@ function openSession(id, onReady, epoch, timeoutMs) {
     els.messages.scrollTop = cached.scrollTop;
     els.promptInput.value = cached.draft || "";
     autosizeInput();
+    const cachedStatus = state.lastStatusPayload[wsId + ":" + id];
+    if (cachedStatus && cachedStatus.status === "WaitingInput") applyStatus(cachedStatus);
     const m = els.messages;
     const atBottom = m.scrollHeight - m.scrollTop - m.clientHeight <= 4;
     userScrolled = !atBottom;      // 恢复到非底部位置：不自动跟随滚动
@@ -1099,11 +1106,57 @@ async function selectForkItem(i) {
   }
 }
 
+async function submitWaitingAnswer() {
+  const waiting = state.waitingInput;
+  const text = els.promptInput.value.trim();
+  if (!waiting || !waiting.valid || !text || !state.sessionId || state.waitingSubmit) return;
+  const captured = {
+    callId: waiting.callId, text, sid: state.sessionId,
+    wid: state.workspace.id, epoch: sessionOpenEpoch,
+  };
+  state.waitingSubmit = captured;
+  renderWaitingInput({ status: "WaitingInput", call_id: waiting.callId, questions: waiting.questions });
+  els.waitingInputStatus.textContent = "正在提交回答…";
+  const stillDisplayed = () => state.sessionId === captured.sid
+    && state.workspace.id === captured.wid && sessionOpenEpoch === captured.epoch
+    && state.waitingInput && state.waitingInput.callId === captured.callId;
+  try {
+    const ws = state.workspaces.find((w) => w.id === captured.wid) || state.workspace;
+    const res = await apiFor(ws, "/api/sessions/" + encodeURIComponent(captured.sid) + "/prompt",
+      { method: "POST", body: JSON.stringify({ text: captured.text, call_id: captured.callId }) });
+    if (!stillDisplayed()) return; // call A 的迟到结果绝不改写或回答 call B
+    if (res.status !== 202) {
+      const detail = await res.text().catch(() => "");
+      if (!stillDisplayed()) return;
+      throw new Error("HTTP " + res.status + (detail ? "：" + detail : ""));
+    }
+    // 保留文本到服务器通过 status 帧确认 Busy/下一次 WaitingInput；不臆造新状态。
+    captured.accepted = true;
+    els.waitingInputStatus.textContent = "回答已接收，正在继续处理…";
+  } catch (e) {
+    if (!stillDisplayed()) return;
+    els.waitingInputError.textContent = "回答未发送：" + e.message + "。请确认当前问题后重试。";
+    els.waitingInputError.hidden = false;
+    els.waitingInputStatus.textContent = "仍在等待你的回答。";
+  } finally {
+    if (!captured.accepted && state.waitingSubmit === captured) state.waitingSubmit = null;
+    if (stillDisplayed()) {
+      els.promptInput.disabled = !!captured.accepted;
+      els.sendBtn.disabled = !!captured.accepted;
+      els.sendBtn.textContent = captured.accepted ? "已回答" : "回答";
+    }
+  }
+}
+
 async function sendPrompt() {
   closeSlashMenu();                    // 发送（按钮/回车）时关闭菜单
   const raw = els.promptInput.value;   // 命令解析用原始输入（/rename 空标题=清除需区分尾部空格）
   const text = raw.trim();
   if (!text || !state.sessionId) return;
+  if (state.status === "WaitingInput") {
+    await submitWaitingAnswer();
+    return; // 回答必须携带 call_id，失败时也绝不降级成普通 prompt
+  }
   // 斜杠命令：只拦截已知命令（与 TUI 语义一致），未知 /xxx 当普通消息发给模型。
   // 命中命令一律不 POST /prompt。
   if (text === "/compact") {
@@ -1415,9 +1468,12 @@ function autosizeInput() {
    自动增高、per-session 草稿和斜杠菜单状态不会因程序赋值而不同步。 */
 function refreshComposerInput() {
   autosizeInput();
+  if (state.waitingInput) {
+    state.waitingDrafts[waitingDraftKey(state.waitingInput.callId)] = els.promptInput.value;
+  }
   if (state.sessionId) {
     const st = state.sessionStates[state.workspace.id + ":" + state.sessionId];
-    if (st) st.draft = els.promptInput.value;
+    if (st && !state.waitingInput) st.draft = els.promptInput.value;
   }
   if (forkMenu.open) return;
   updateSlashMenu();
@@ -2234,6 +2290,7 @@ function clearCurrentSession() {
    表达该 workspace、该父会话的活动任务。调用方负责自身可见性；SVG 的尺寸、
    class、几何、徽章和 aria 语义只有这一处来源，避免标题退化成简化静态点。 */
 function renderSessionBusyDot(target, s, kids, wsId) {
+  const waiting = s.status === "WaitingInput";
   // 环绕点数量 = 该父会话的全部后台任务数（/api/tasks：bash 后台任务 +
   // delegate subagent 任务）；任务快照未加载时回退 running 子会话计数。
   const wsTasks = tasksForWorkspace(wsId);
@@ -2245,7 +2302,7 @@ function renderSessionBusyDot(target, s, kids, wsId) {
     : parentTasks.length;
   const hasRunningKids = runningKidCount > 0;
   target.setAttribute("role", "img");
-  target.setAttribute("aria-label", (s.busy ? "会话处理中" : "会话空闲")
+  target.setAttribute("aria-label", (waiting ? "会话等待回答" : s.busy ? "会话处理中" : "会话空闲")
     + (hasRunningKids ? "，" + runningKidCount + " 个任务处理中" : ""));
 
   // 24px SVG 中心点与轨道点共享坐标系，在任意 DPR 下保持严格同心。
@@ -2279,7 +2336,7 @@ function renderSessionBusyDot(target, s, kids, wsId) {
   }
   target.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">` +
     circles +
-    `<circle class="main-dot${s.busy ? " busy" : ""}" cx="12" cy="12" r="3" aria-hidden="true"></circle>` +
+    `<circle class="main-dot${waiting ? " waiting" : s.busy ? " busy" : ""}" cx="12" cy="12" r="3" aria-hidden="true"></circle>` +
     `</svg>`;
   return runningKidCount;
 }
@@ -2317,6 +2374,9 @@ function buildTreeRoot(s, kids, wsId) {
     );
   }
   const count = el("span", "tree-count", (s.entry_count ?? 0) + " 条");
+  const statusBadge = s.status === "WaitingInput"
+    ? el("span", "tree-status waiting", "等待回答") : null;
+  if (statusBadge) statusBadge.setAttribute("aria-label", "会话状态：等待回答");
   // 📌 置顶按钮（仅主会话根节点）：放行尾 count 后。subagent 子节点不加——
   // pin 是会话级操作，subagent 的置顶语义后续需要时再单独支持。
   const pin = el("button", "pin-btn" + (s.pinned === true ? " on" : ""));
@@ -2343,9 +2403,11 @@ function buildTreeRoot(s, kids, wsId) {
     const ws = state.workspaces.find((w) => w.id === wsId);
     toggleArchived(s, () => renderSidebarTree(true), ws);
   });
-  row.append(toggle, dot, titleEl, count, pin, archive);
+  row.append(toggle, dot, titleEl);
+  if (statusBadge) row.append(statusBadge);
+  row.append(count, pin, archive);
   row.title = (s.title || s.id) + (s.model ? " · " + s.model : "")
-    + (s.busy ? "（处理中）" : "")
+    + (s.status === "WaitingInput" ? "（等待回答）" : s.busy ? "（处理中）" : "")
     + (hasRunningKids ? "（任务处理中）" : "");
   row.addEventListener("click", (ev) => {
     if (row.classList.contains("pin-drag-click-block")) {
@@ -2404,6 +2466,7 @@ function renderTreeChildren(container, kids, wsId, parentSid) {
 function renderSubagentRows(container, kids, hist, wsId) {
   for (const k of kids) {
     const running = isSubagentRunning(k);
+    const waiting = k.status === "WaitingInput";
     const row = el("div", "tree-row tree-row-child" + (hist ? " tree-hist" : "") +
       (state.workspace.id === wsId && state.sessionId === k.id ? " current" : ""));
     // 子行状态点：running → 橙红 busy 点；busy:false 但活着（active !==
@@ -2412,7 +2475,9 @@ function renderSubagentRows(container, kids, hist, wsId) {
     // 行（无任务、无 live）不点亮（现状）。
     const idleAlive = !running && k.busy === false
       && (isSessionLive(k) || hasDelegateTask(k, wsId));
-    const dot = el("span", "busy-dot" + (running ? " busy" : idleAlive ? " busy-dot-green" : ""));
+    const dot = el("span", "busy-dot" + (waiting ? " waiting" : running ? " busy" : idleAlive ? " busy-dot-green" : ""));
+    dot.setAttribute("role", "img");
+    dot.setAttribute("aria-label", waiting ? "会话等待回答" : running ? "会话处理中" : "会话空闲");
     // label 优先：subagent 的任务面板标题最友好；旧 server 无 label → 回退 title/id
     // 有 label/title：两行（label/title 行 + 完整 id 行）；无则一行完整 id。
     const hasTitle = !!(k.label || k.title);
@@ -2426,11 +2491,15 @@ function renderSubagentRows(container, kids, hist, wsId) {
       );
     }
     const badge = el("span", "child-badge", "子");
-    row.append(dot, titleEl, badge);
+    const waitBadge = waiting ? el("span", "tree-status waiting", "等待回答") : null;
+    row.append(dot, titleEl);
+    if (waitBadge) row.append(waitBadge);
+    row.append(badge);
     // running 的 subagent：title 提示可发送消息（点击行 openSession 是现有行为，
     // 保持不变）。Idle 但存活的 live 子行显示「空闲 · 可发送消息」（oracle Low#8）；
     // inactive 历史子行不带状态后缀。
-    row.title = (k.label || k.title || k.id) + (running ? "（处理中）· 可发送消息"
+    row.title = (k.label || k.title || k.id) + (waiting ? "（等待回答）· 可回答"
+      : running ? "（处理中）· 可发送消息"
       : isSessionLive(k) ? "（空闲）· 可发送消息" : "");
     row.addEventListener("click", () => {
       if (!isSessionLive(k)) { resumeSessionIn(wsId, k.id); return; }

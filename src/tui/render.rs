@@ -416,6 +416,7 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
                 SessionStatus::Busy | SessionStatus::Compacting => {
                     format!("Esc detach  {submit_key} steer  Ctrl-C interrupt")
                 }
+                SessionStatus::WaitingInput(_) => "Esc detach  answer in Web".to_owned(),
                 SessionStatus::Idle => {
                     if attached.finished {
                         "Esc detach".to_owned()
@@ -517,7 +518,10 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
         // Input-box chrome: top-left = status, top-right = session id,
         // bottom-left = model (agent role goes here later), bottom-right =
         // cwd + context tokens.
-        let title = state.busy.map_or(String::new(), BusyState::title);
+        let title = state.waiting_question.as_deref().map_or_else(
+            || state.busy.map_or(String::new(), BusyState::title),
+            |question| format!("waiting: {question}"),
+        );
         let input_block = SOLARIZED_LIGHT
             .block(title)
             .title_top(

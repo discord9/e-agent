@@ -2,6 +2,14 @@ use super::*;
 use std::fs;
 
 #[test]
+fn repl_waiting_input_treats_exit_as_command_and_empty_as_retry() {
+    assert!(is_repl_exit("/exit"));
+    assert!(is_repl_exit("/quit"));
+    assert!(!is_repl_exit(""));
+    assert!(!is_repl_exit("answer"));
+}
+
+#[test]
 fn test_version_requested() {
     assert!(version_requested(&["--version".into()]).unwrap());
     assert!(version_requested(&["-V".into()]).unwrap());

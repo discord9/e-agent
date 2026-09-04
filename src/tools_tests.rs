@@ -83,6 +83,52 @@ async fn web_server(
 }
 
 #[test]
+fn request_user_input_schema_and_validation_are_strict() {
+    let tool = RequestUserInput;
+    let spec = tool.spec();
+    assert_eq!(spec.name, "request_user_input");
+    assert_eq!(spec.parameters["properties"]["questions"]["type"], "array");
+    assert_eq!(spec.parameters["properties"]["questions"]["maxItems"], 1);
+    for args in [
+        "{}",
+        r#"{"questions":[]}"#,
+        r#"{"questions":[{"id":"","prompt":"ok"}]}"#,
+        r#"{"questions":[{"id":"a/b","prompt":"ok"}]}"#,
+        r#"{"questions":[{"id":"a","prompt":""}]}"#,
+        r#"{"questions":[{"id":"a","prompt":"ok"},{"id":"b","prompt":"no"}]}"#,
+    ] {
+        assert!(
+            parse_questions(args).is_err(),
+            "accepted invalid arguments: {args}"
+        );
+    }
+    let questions =
+        parse_questions(r#"{"questions":[{"id":"ask_1","prompt":"Need it?"}]}"#).unwrap();
+    assert_eq!(questions[0].id, "ask_1");
+    assert_eq!(questions[0].prompt, "Need it?");
+}
+
+#[test]
+fn request_user_input_is_not_in_common_builtins() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let (tools, _) = builtins_with_exa_key(workspace.clone(), None, None, false, None, None);
+    assert!(
+        !tools
+            .iter()
+            .any(|tool| tool.spec().name == "request_user_input")
+    );
+    let background = BackgroundTasks::new(None, None);
+    let tools =
+        builtins_with_background(workspace, background, None, false, true, Some("sub".into()));
+    assert!(
+        !tools
+            .iter()
+            .any(|tool| tool.spec().name == "request_user_input")
+    );
+}
+
+#[test]
 fn web_search_spec_exposes_only_query() {
     assert_eq!(
             WebSearch::new("key".into()).spec(),

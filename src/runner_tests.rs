@@ -92,6 +92,126 @@ struct ScriptedAssistantModel {
     replies: VecDeque<AssistantMessage>,
 }
 
+struct InputRecordingModel {
+    calls: usize,
+    saw_result: Arc<Mutex<bool>>,
+}
+
+#[async_trait]
+impl Model for InputRecordingModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        if self.calls > 0 {
+            *self.saw_result.lock().unwrap() = messages.iter().any(|message| {
+                matches!(message, Message::Tool { call_id, content, .. }
+                    if call_id == "call-input" && content.contains("answers"))
+            });
+        }
+        self.calls += 1;
+        let reply = if self.calls == 1 {
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-input".into(),
+                    name: "request_user_input".into(),
+                    arguments: r#"{"questions":[{"id":"name","prompt":"Your name?"}]}"#.into(),
+                }],
+                reasoning: None,
+            }
+        } else {
+            AssistantMessage {
+                content: Some("final answer".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }
+        };
+        Ok((reply, None))
+    }
+}
+
+/// Purpose-built model for the consecutive WaitingInput call-id test. It
+/// refuses to advance unless the preceding structured answer is visible in
+/// the next same-turn provider context.
+struct TwoWaitModel {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Model for TwoWaitModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        let turn = self.calls.fetch_add(1, Ordering::SeqCst);
+        if turn > 0 {
+            let (call_id, answer_id, answer_value) = if turn == 1 {
+                ("call-a", "a", "answer-a")
+            } else if turn == 2 {
+                ("call-b", "b", "answer-b")
+            } else {
+                anyhow::bail!("unexpected model call {turn}")
+            };
+            let result_seen = messages.iter().any(|message| {
+                let Message::Tool {
+                    call_id: result_call_id,
+                    content,
+                    ..
+                } = message
+                else {
+                    return false;
+                };
+                let Ok(value) = serde_json::from_str::<Value>(content) else {
+                    return false;
+                };
+                let Some(answer) = value["answers"]
+                    .as_array()
+                    .and_then(|answers| answers.first())
+                else {
+                    return false;
+                };
+                result_call_id == call_id
+                    && answer["id"] == answer_id
+                    && answer["value"] == answer_value
+            });
+            if !result_seen {
+                anyhow::bail!("model context omitted answer for {call_id}")
+            }
+        }
+        let tool_call = |id: &str, question_id: &str| ToolCall {
+            id: id.into(),
+            name: "request_user_input".into(),
+            arguments: format!(
+                r#"{{"questions":[{{"id":"{question_id}","prompt":"question {question_id}"}}]}}"#
+            ),
+        };
+        let reply = match turn {
+            0 => AssistantMessage {
+                content: None,
+                tool_calls: vec![tool_call("call-a", "a")],
+                reasoning: None,
+            },
+            1 => AssistantMessage {
+                content: None,
+                tool_calls: vec![tool_call("call-b", "b")],
+                reasoning: None,
+            },
+            2 => AssistantMessage {
+                content: Some("finished after two answers".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            },
+            _ => anyhow::bail!("unexpected model call {turn}"),
+        };
+        Ok((reply, None))
+    }
+}
+
 /// Mock model that records its own name on every call, so a test can prove
 /// which model served which turn (runtime `/model` switch).
 struct NamedRecordingModel {
@@ -161,6 +281,368 @@ impl Model for RecoveringModel {
         }
         Ok((reply?, None))
     }
+}
+
+#[tokio::test]
+async fn request_user_input_waits_answers_and_resumes_same_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let saw_result = Arc::new(Mutex::new(false));
+    let agent = Agent::new(
+        Box::new(InputRecordingModel {
+            calls: 0,
+            saw_result: saw_result.clone(),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "input".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+    loop {
+        status.changed().await.unwrap();
+        if matches!(&*status.borrow(), SessionStatus::WaitingInput(_)) {
+            break;
+        }
+    }
+    loop {
+        if matches!(events.recv().await.unwrap(), AgentEvent::ToolCall { name, .. } if name == "request_user_input")
+        {
+            break;
+        }
+    }
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        PromptSubmission::Answered
+    ));
+    assert_eq!(
+        handle.submit_prompt("duplicate".into()),
+        PromptSubmission::Conflict
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(&*status.borrow(), SessionStatus::Idle) {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "status={:?} events={:?}",
+            *status.borrow(),
+            handle.snapshot()
+        )
+    });
+    assert!(*saw_result.lock().unwrap());
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "input")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(tool_entries(&entries).len(), 1);
+    match tool_entries(&entries)[0] {
+        Message::Tool {
+            call_id, content, ..
+        } => {
+            assert_eq!(call_id, "call-input");
+            assert!(content.contains("Ada"));
+        }
+        _ => unreachable!(),
+    }
+    assert!(!entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message { message: Message::User { content, .. } } if content == "Ada"
+    )));
+    drop(task);
+}
+
+#[tokio::test]
+async fn request_user_input_twice_rejects_stale_first_call_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new(
+        Box::new(TwoWaitModel { calls }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "two-waits".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    let mut status = handle.status();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == "call-a") {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-a".into()), "answer-a".into()),
+        PromptSubmission::Answered
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == "call-b") {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-a".into()), "stale-answer".into()),
+        PromptSubmission::Conflict
+    );
+    assert!(matches!(
+        &*status.borrow(),
+        SessionStatus::WaitingInput(request) if request.call_id == "call-b"
+    ));
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-b".into()), "answer-b".into()),
+        PromptSubmission::Answered
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(&*status.borrow(), SessionStatus::Idle) {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "two-waits")
+        .await
+        .unwrap()
+        .entries;
+    let results: Vec<&Message> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Message {
+                message:
+                    message @ Message::Tool {
+                        name,
+                        synthetic: false,
+                        ..
+                    },
+            } if name == "request_user_input" => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    for (message, (call_id, answer_id, answer_value)) in results
+        .iter()
+        .zip([("call-a", "a", "answer-a"), ("call-b", "b", "answer-b")])
+    {
+        let Message::Tool {
+            call_id: actual_call_id,
+            content,
+            ..
+        } = message
+        else {
+            unreachable!()
+        };
+        assert_eq!(actual_call_id, call_id);
+        let value: Value = serde_json::from_str(content).unwrap();
+        assert_eq!(value["answers"][0]["id"], answer_id);
+        assert_eq!(value["answers"][0]["value"], answer_value);
+    }
+    assert!(!entries.iter().any(|entry| match entry {
+        SessionEntry::Message {
+            message: Message::User { content, .. },
+        }
+        | SessionEntry::Message {
+            message: Message::Tool { content, .. },
+        } => content.contains("stale-answer"),
+        _ => false,
+    }));
+    drop(task);
+}
+
+#[tokio::test]
+async fn request_user_input_answer_claim_wins_then_cancel_commits_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(InputRecordingModel {
+            calls: 0,
+            saw_result: Arc::new(Mutex::new(false)),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "answer-first".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    let mut status = handle.status();
+    loop {
+        if matches!(&*status.borrow(), SessionStatus::WaitingInput(_)) {
+            break;
+        }
+        status.changed().await.unwrap();
+    }
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        PromptSubmission::Answered
+    );
+    handle.cancel();
+    loop {
+        if matches!(&*status.borrow(), SessionStatus::Idle) {
+            break;
+        }
+        status.changed().await.unwrap();
+    }
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "answer-first")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(tool_entries(&entries).iter().filter(|message| matches!(message, Message::Tool { content, .. } if content.contains("Ada"))).count(), 1);
+    drop(task);
+}
+
+#[tokio::test]
+async fn request_user_input_cancel_claim_wins_then_answer_conflicts() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(InputRecordingModel {
+            calls: 0,
+            saw_result: Arc::new(Mutex::new(false)),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "cancel-first".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    let mut status = handle.status();
+    loop {
+        if matches!(&*status.borrow(), SessionStatus::WaitingInput(_)) {
+            break;
+        }
+        status.changed().await.unwrap();
+    }
+    handle.cancel();
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-input".into()), "late".into()),
+        PromptSubmission::Conflict
+    );
+    loop {
+        if matches!(&*status.borrow(), SessionStatus::Idle) {
+            break;
+        }
+        status.changed().await.unwrap();
+    }
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "cancel-first")
+        .await
+        .unwrap()
+        .entries;
+    assert!(tool_entries(&entries).iter().all(
+        |message| !matches!(message, Message::Tool { content, .. } if content.contains("late"))
+    ));
+    drop(task);
+}
+
+#[tokio::test]
+async fn request_user_input_channel_close_exits_without_answer() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(InputRecordingModel {
+            calls: 0,
+            saw_result: Arc::new(Mutex::new(false)),
+        }),
+        vec![Box::new(crate::tools::user_input::RequestUserInput)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "close-input".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    let mut status = handle.status();
+    loop {
+        if matches!(&*status.borrow(), SessionStatus::WaitingInput(_)) {
+            break;
+        }
+        status.changed().await.unwrap();
+    }
+    drop(handle);
+    task.join().await.unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "close-input")
+        .await
+        .unwrap()
+        .entries;
+    assert!(tool_entries(&entries).is_empty());
+}
+
+#[test]
+fn persisted_request_user_input_call_is_repaired_on_resume_not_waiting() {
+    let call = ToolCall {
+        id: "resume-call".into(),
+        name: "request_user_input".into(),
+        arguments: r#"{"questions":[{"id":"x","prompt":"x"}]}"#.into(),
+    };
+    let mut agent = Agent::new(
+        Box::new(NamedRecordingModel {
+            name: "resume".into(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![SessionEntry::Message {
+        message: Message::Assistant(AssistantMessage {
+            content: None,
+            tool_calls: vec![call],
+            reasoning: None,
+        }),
+    }]);
+    let context = agent.context();
+    assert!(matches!(
+        context.last(),
+        Some(Message::Tool {
+            synthetic: true,
+            is_error: true,
+            ..
+        })
+    ));
 }
 
 #[test]

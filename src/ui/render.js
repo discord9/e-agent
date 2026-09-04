@@ -1438,23 +1438,101 @@ function renderHistory(entries) {
 /* =====================================================================
  * 会话状态（status 事件 / 列表 busy 字段）
  * ===================================================================*/
-function applyStatus(status) {
-  state.status = status || "Idle";
+function waitingDraftKey(callId, sid, wid) {
+  const wsId = wid !== undefined ? wid
+    : state.workspace && state.workspace.id ? state.workspace.id : "";
+  return wsId + ":" + (sid !== undefined ? sid : state.sessionId || "") + ":" + callId;
+}
+
+function renderWaitingInput(payload) {
+  const previous = state.waitingInput;
+  const callId = typeof payload.call_id === "string" ? payload.call_id : "";
+  const questions = Array.isArray(payload.questions) ? payload.questions : [];
+  const valid = !!callId && questions.length === 1
+    && questions.every((q) => q && typeof q.id === "string" && typeof q.prompt === "string");
+  const changed = previous && previous.callId !== callId;
+  if (changed) state.waitingDrafts[waitingDraftKey(previous.callId)] = els.promptInput.value;
+  if (state.waitingSubmit && state.waitingSubmit.callId !== callId) state.waitingSubmit = null;
+  const priorDraft = previous ? previous.priorDraft : els.promptInput.value;
+  state.waitingInput = {
+    callId, questions, valid, priorDraft, sid: state.sessionId,
+    wid: state.workspace && state.workspace.id,
+  };
+  els.waitingInputQuestions.textContent = "";
+  for (const question of questions) {
+    const item = el("div", "waiting-input-question", question && question.prompt ? question.prompt : "");
+    els.waitingInputQuestions.appendChild(item);
+  }
+  els.waitingInputPanel.hidden = false;
+  els.waitingInputError.hidden = true;
+  els.waitingInputError.textContent = "";
+  els.waitingInputStatus.textContent = changed
+    ? "问题已更新；上一问题的草稿已保留且未发送。"
+    : "代理已暂停，正在等待你的回答。";
+  if (!valid) {
+    els.waitingInputError.textContent = "无法回答：服务器返回的问题格式无效（当前仅支持一个问题）。";
+    els.waitingInputError.hidden = false;
+  }
+  if (!previous || changed) {
+    els.promptInput.value = state.waitingDrafts[waitingDraftKey(callId)] || "";
+    autosizeInput();
+  }
+  els.promptLabel.textContent = "回答当前问题";
+  els.promptInput.placeholder = "输入回答：Enter 提交，Shift+Enter 换行…";
+  els.sendBtn.textContent = state.waitingSubmit
+    ? state.waitingSubmit.accepted ? "已回答" : "提交中…"
+    : "回答";
+  els.sendBtn.disabled = !valid || !!state.waitingSubmit;
+  els.promptInput.disabled = !valid || !!state.waitingSubmit;
+}
+
+function clearWaitingInput(restoreDraft = true) {
+  const previous = state.waitingInput;
+  if (previous) {
+    state.waitingDrafts[waitingDraftKey(previous.callId, previous.sid, previous.wid)] = els.promptInput.value;
+    if (restoreDraft && previous.sid === state.sessionId
+        && previous.wid === (state.workspace && state.workspace.id)) {
+      els.promptInput.value = previous.priorDraft || "";
+      autosizeInput();
+    }
+  }
+  state.waitingInput = null;
+  state.waitingSubmit = null;
+  els.waitingInputPanel.hidden = true;
+  els.waitingInputQuestions.textContent = "";
+  els.waitingInputStatus.textContent = "";
+  els.waitingInputError.hidden = true;
+  els.waitingInputError.textContent = "";
+  els.promptLabel.textContent = "消息";
+  els.sendBtn.textContent = "发送";
+}
+
+function applyStatus(statusPayload) {
+  const payload = statusPayload && typeof statusPayload === "object"
+    ? statusPayload : { status: statusPayload };
+  state.status = payload.status || "Idle";
+  if (state.status === "WaitingInput") renderWaitingInput(payload);
+  else clearWaitingInput();
   els.chatStatus.textContent = statusLabel(state.status);
   els.chatStatus.className = "status-chip " + statusChipClass(state.status);
+  els.chatStatus.setAttribute("role", "status");
+  els.chatStatus.setAttribute("aria-live", "polite");
+  els.chatStatus.setAttribute("aria-label", "当前会话状态：" + statusLabel(state.status));
   const busy = isRunningStatus(state.status);
   els.cancelBtn.disabled = !busy;         // Busy/Compacting 时可取消
-  els.compactBtn.disabled = busy;         // 空闲时才压缩
+  els.compactBtn.disabled = busy || state.status === "WaitingInput";
   // Finished：会话不再接受输入，禁用输入区（busy 的 subagent 仍可排队输入）
   const finished = !!state.status && state.status.startsWith("Finished");
-  els.sendBtn.disabled = finished;
-  els.promptInput.disabled = finished;
+  if (state.status !== "WaitingInput") {
+    els.sendBtn.disabled = finished || !!state.waitingSubmit;
+    els.promptInput.disabled = finished || !!state.waitingSubmit;
+  }
   if (finished) {
     const s = (state.lastList || []).find((x) => x.id === state.sessionId);
     els.promptInput.placeholder = s && s.parent_session_id
       ? "子任务已结束，无法继续发送"
       : "会话已结束";
-  } else {
+  } else if (state.status !== "WaitingInput") {
     els.promptInput.placeholder = PROMPT_PLACEHOLDER;  // 恢复默认（openSession 每次 applyStatus("Idle") 已重置）
   }
   // 回合结束（回到 Idle）：流式 delta 期间是纯文本（快），此刻用完整

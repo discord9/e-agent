@@ -14,6 +14,7 @@ pub mod output;
 #[cfg(target_os = "linux")]
 mod rust;
 mod tasks;
+pub(crate) mod user_input;
 mod web;
 #[cfg(windows)]
 mod windows_sandbox;
@@ -22,6 +23,8 @@ use file::*;
 use history::History;
 use output::*;
 use tasks::*;
+use user_input::RequestUserInput;
+pub(crate) use user_input::parse_questions;
 use web::*;
 
 pub use background::{
@@ -295,6 +298,12 @@ fn tools_with_background_and_exa_key(
     // session; the runner binds the current store/root/session.
     tools.push(Box::new(History));
     tools
+}
+
+/// Root-session-only human input marker. The runner supplies the answer;
+/// subagents and btw forks intentionally use the common builtins above.
+pub fn add_root_user_input_tool(tools: &mut Vec<Box<dyn Tool>>) {
+    tools.push(Box::new(RequestUserInput));
 }
 
 fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> ToolSpec {

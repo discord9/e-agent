@@ -403,9 +403,163 @@ async def run_markdown_cjk_diagram(c):
             json.dumps(mobile))
 
 
+async def run_waiting_input(c):
+    """WaitingInput composer contract, stale-call safety, a11y, and mobile layout."""
+    import asyncio
+
+    c.sessions = [
+        {"id": "wait-1", "title": "等待输入会话", "status": "WaitingInput",
+         "entry_count": 1, "active": True, "busy": False},
+    ]
+    c.sse_body = (
+        'event: status\ndata: {"status":"WaitingInput","call_id":"call-a",'
+        '"questions":[{"id":"region","prompt":"请选择部署区域？"}]}\n\n'
+    )
+
+    async def prompt_handler(route, url, method):
+        body = route.request.post_data or ""
+        c.records["prompt"].append((url, body))
+        parsed = json.loads(body)
+        if parsed.get("text") in ("华东", "只回答 A"):
+            await asyncio.sleep(0.25)
+            return await route.fulfill(status=202, content_type="application/json", body="{}")
+        if parsed.get("text") == "冲突时保留":
+            return await route.fulfill(status=409, content_type="text/plain", body="stale call_id")
+        if parsed.get("text") == "断网时保留":
+            return await route.abort("failed")
+        return await route.fulfill(status=202, content_type="application/json", body="{}")
+
+    c.extra_handlers.append((
+        lambda url, method: method == "POST" and url.endswith("/prompt"),
+        prompt_handler,
+    ))
+    await c.start()
+    await c.open_sidebar()
+    row = c.page.locator("#sidebarTree .tree-row", has_text="等待输入会话").first
+    row_text = await row.text_content()
+    c.check("列表 WaitingInput 独立显示", "等待回答" in row_text,
+            row_text)
+    c.check("列表 WaitingInput 保持 active=true busy=false",
+            await c.ev("state.lastList[0].active === true && state.lastList[0].busy === false"), "")
+    await row.locator(".tree-id").click()
+    await c.page.wait_for_function("() => state.status === 'WaitingInput'")
+
+    c.check("SSE 初始状态重建回答面板",
+            await c.page.locator("#waitingInputPanel").is_visible()
+            and await c.page.locator("#waitingInputQuestions").text_content() == "请选择部署区域？", "")
+    c.check("WaitingInput amber + visible text",
+            await c.page.locator("#chatStatus").text_content() == "等待回答"
+            and await c.ev("getComputedStyle(els.chatStatus).borderColor === 'rgb(181, 137, 0)'"),
+            await c.ev("getComputedStyle(els.chatStatus).cssText"))
+    c.check("回答面板和错误区 ARIA 语义",
+            await c.ev("els.waitingInputPanel.getAttribute('role') === 'status'"
+                       " && els.waitingInputPanel.getAttribute('aria-live') === 'polite'"
+                       " && els.waitingInputError.getAttribute('role') === 'alert'"), "")
+    c.check("等待状态不是模型 busy",
+            await c.ev("isRunningStatus(state.status) === false && els.cancelBtn.disabled"), "")
+    # A reconnect/snapshot begins with a fresh stream but must rebuild the same panel
+    # from its authoritative initial status payload.
+    await c.ev("clearWaitingInput()")
+    await c.ev("handleSSEBlock('event: status\\ndata: {\"status\":\"WaitingInput\","
+               "\"call_id\":\"call-a\",\"questions\":[{\"id\":\"region\","
+               "\"prompt\":\"请选择部署区域？\"}]}\\n\\n', state.sessionId,"
+               " state.workspace.id, sessionOpenEpoch)")
+    c.check("SSE reconnect status payload reconstructs panel",
+            await c.page.locator("#waitingInputPanel").is_visible()
+            and await c.page.locator("#waitingInputQuestions").text_content() == "请选择部署区域？", "")
+
+    textarea = c.page.locator("#promptInput")
+    await textarea.focus()
+    c.check("composer keyboard focus is visible",
+            await c.ev("document.activeElement === els.promptInput"
+                       " && getComputedStyle(els.promptInput).outlineStyle !== 'none'"), "")
+    await textarea.fill("华东")
+    await textarea.press("Enter")
+    await c.page.locator("#sendBtn").click(force=True)  # disabled while first POST is in flight
+    await c.page.wait_for_timeout(350)
+    first_bodies = [body for _, body in c.records["prompt"]]
+    c.check("Enter/重复点击仅提交一次 exact call_id",
+            first_bodies == ['{"text":"华东","call_id":"call-a"}'],
+            repr(first_bodies))
+    c.check("202 后安全等待 Busy 状态帧",
+            await c.page.locator("#sendBtn").text_content() == "已回答"
+            and await c.page.locator("#sendBtn").is_disabled(), "")
+    await c.ev("handleSSEBlock('event: status\\ndata: {\"status\":\"Busy\"}\\n\\n',"
+               " state.sessionId, state.workspace.id, sessionOpenEpoch)")
+    c.check("Busy 为蓝色且回答面板收起",
+            not await c.page.locator("#waitingInputPanel").is_visible()
+            and await c.ev("getComputedStyle(els.chatStatus).borderColor === 'rgb(38, 139, 210)'"), "")
+
+    async def show_wait(call_id, prompt):
+        await c.page.evaluate("([callId,prompt]) => handleSSEBlock('event: status\\ndata: '"
+                              "+ JSON.stringify({status:'WaitingInput',call_id:callId,questions:[{id:'answer',prompt}]})"
+                              "+ '\\n\\n', state.sessionId, state.workspace.id, sessionOpenEpoch)",
+                              [call_id, prompt])
+
+    await show_wait("call-a", "请选择部署区域？")
+    await textarea.fill("冲突时保留")
+    await c.page.locator("#sendBtn").click()
+    await c.page.wait_for_function("() => !els.waitingInputError.hidden")
+    c.check("409 保留原文并显示 inline alert",
+            await textarea.input_value() == "冲突时保留"
+            and "HTTP 409" in await c.page.locator("#waitingInputError").text_content(), "")
+
+    await textarea.fill("断网时保留")
+    await c.page.locator("#sendBtn").click()
+    await c.page.wait_for_function("() => els.waitingInputError.textContent.includes('回答未发送')")
+    c.check("网络失败保留原文且不降级普通 prompt",
+            await textarea.input_value() == "断网时保留"
+            and json.loads(c.records["prompt"][-1][1]) == {"text": "断网时保留", "call_id": "call-a"},
+            c.records["prompt"][-1][1])
+
+    await show_wait("call-a", "请选择部署区域？")
+    await textarea.fill("只回答 A")
+    async with c.page.expect_request(
+            lambda req: req.url.endswith("/prompt") and "只回答 A" in (req.post_data or "")):
+        stale_task = asyncio.create_task(c.page.locator("#sendBtn").click())
+    await show_wait("call-b", "新的问题 B？")
+    await stale_task
+    await c.page.wait_for_timeout(300)
+    c.check("A 迟到完成不改写 B 且 B 不继承 A 草稿",
+            await c.page.locator("#waitingInputQuestions").text_content() == "新的问题 B？"
+            and await textarea.input_value() == ""
+            and await c.page.locator("#sendBtn").text_content() == "回答", "")
+    stale_body = c.records["prompt"][-1][1]
+    c.check("stale A POST 仍只绑定显示时捕获的 call-a",
+            json.loads(stale_body) == {"text": "只回答 A", "call_id": "call-a"}, stale_body)
+
+    await c.ev("handleSSEBlock('event: status\\ndata: {\"status\":\"Idle\"}\\n\\n',"
+               " state.sessionId, state.workspace.id, sessionOpenEpoch)")
+    await textarea.fill("普通消息")
+    await c.page.locator("#sendBtn").click()
+    ordinary_body = c.records["prompt"][-1][1]
+    c.check("Idle 普通消息不含 call_id",
+            json.loads(ordinary_body) == {"text": "普通消息"}, ordinary_body)
+    c.check("Idle 为绿色",
+            await c.ev("getComputedStyle(els.chatStatus).borderColor === 'rgb(133, 153, 0)'"), "")
+    await c.ev("applyStatus('Failed(test)')")
+    c.check("Error 为红色并有可见文字",
+            await c.page.locator("#chatStatus").text_content() == "失败"
+            and await c.ev("getComputedStyle(els.chatStatus).borderColor === 'rgb(220, 50, 47)'"), "")
+
+    await c.page.set_viewport_size({"width": 390, "height": 844})
+    await show_wait("call-mobile", "手机上仍可阅读并回答这个问题吗？")
+    await c.page.wait_for_timeout(100)
+    c.check("390px 无页面横向溢出",
+            await c.ev("document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+                       " && document.body.scrollWidth <= document.body.clientWidth"), "")
+    box = await textarea.bounding_box()
+    send_box = await c.page.locator("#sendBtn").bounding_box()
+    c.check("移动端 composer 输入与回答按钮可用",
+            bool(box and send_box and box["width"] > 250 and send_box["width"] >= 44)
+            and await textarea.is_editable(), f"textarea={box} send={send_box}")
+
+
 CASES = [
     {"name": "markdown_cjk_diagram", "desc": "Markdown 中文框线图自托管 Sarasa 字体与响应式滚动",
      "run": run_markdown_cjk_diagram},
+    {"name": "waiting_input", "desc": "WaitingInput 回答面板、call_id 安全、错误保稿与移动端",
+     "run": run_waiting_input},
     {"name": "chat_open_sse", "desc": "openSession + SSE 基本流（mock 事件渲染）+ Busy 状态",
      "run": run_chat_open_sse},
     {"name": "chat_state_preserved", "desc": "切会话状态保留（草稿/滚动/缓存，不重拉历史）",
