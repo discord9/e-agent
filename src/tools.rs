@@ -290,6 +290,10 @@ fn tools_with_background_and_exa_key(
     // runner executes them against ITS OWN goal state, so a subagent can
     // never touch its parent's goal.
     tools.extend(goal_tools());
+    // Model-requested compaction is runner-intercepted, but is available in
+    // every builtin set so main and subagent sessions share the same contract.
+    tools.push(Box::new(RequestCompaction));
+    tools.push(Box::new(GetContextUsage));
     // The always-on, read-only `read_output` tool (every session: main,
     // read-only main, ordinary/read-only subagents, btw forks). The runner
     // intercepts it by name with the session's store.
@@ -314,10 +318,9 @@ fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     }
 }
 
-/// Goal-only spec builder: the Goal schemas are CLOSED
-/// (`additionalProperties: false`) so misspelled/unknown fields are
-/// rejected by the provider's schema validation AND by the runner at
-/// runtime. Generic tool schemas stay open.
+/// Closed-schema builder for runner-intercepted zero-argument/context tools
+/// and Goal tools. Unknown fields are rejected by provider validation and
+/// by the runner where arguments are parsed.
 fn goal_spec(name: &str, description: &str, properties: Value, required: &[&str]) -> ToolSpec {
     ToolSpec {
         name: name.into(),
@@ -373,9 +376,43 @@ fn optional_bool(arguments: &Value, name: &str) -> Result<bool, String> {
 /// the fallback `execute` only fires on direct `Agent::run` paths (tests).
 pub struct GetGoal;
 pub struct UpdateGoal;
+pub struct RequestCompaction;
+pub struct GetContextUsage;
 
 pub fn goal_tools() -> Vec<Box<dyn Tool>> {
     vec![Box::new(GetGoal), Box::new(UpdateGoal)]
+}
+
+#[async_trait::async_trait]
+impl Tool for GetContextUsage {
+    fn spec(&self) -> ToolSpec {
+        goal_spec(
+            "get_context_usage",
+            "Report the most recent successfully completed regular provider request's context input and configured context window to inform compaction timing. This is historical, not an exact next-request forecast.",
+            json!({}),
+            &[],
+        )
+    }
+
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Err("get_context_usage is executed by the session runner".into())
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for RequestCompaction {
+    fn spec(&self) -> ToolSpec {
+        goal_spec(
+            "request_compaction",
+            "Request compaction only at a meaningful semantic phase boundary (for example after investigation, implementation, or verification is complete and before moving to the next phase), when earlier detailed context can safely be summarized. Do not call mechanically every round or promise exact remaining tokens. Existing 80% auto-compaction remains a fallback.",
+            json!({}),
+            &[],
+        )
+    }
+
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Err("request_compaction is executed by the session runner".into())
+    }
 }
 
 #[async_trait::async_trait]

@@ -5537,6 +5537,97 @@ fn fork_tombstone_inheritance_follows_boundary() {
 }
 
 #[test]
+fn usage_event_keeps_legacy_baseline_when_strict_context_observation_clears() {
+    // Compatibility: Usage events retain their last actually reported
+    // regular baseline; this is not a current exact context measurement.
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.set_event_handler(Box::new(move |event| sink.lock().unwrap().push(event)));
+    agent.set_context_window(100);
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 80,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert!(agent.take_auto_compact_request());
+    agent.apply_usage(None, true);
+    assert_eq!(agent.context_usage(), (Some(100), None));
+    assert!(!agent.take_auto_compact_request());
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 5,
+            ..Default::default()
+        }),
+        false,
+    );
+    let usage: Vec<_> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Usage { context_input, .. } => Some(*context_input),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usage,
+        vec![80, 80],
+        "compaction must retain the legacy UI baseline"
+    );
+}
+
+#[test]
+fn context_usage_is_explicitly_fresh_and_compaction_does_not_replace_it() {
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    assert_eq!(agent.context_usage(), (None, None));
+    agent.set_context_window(100);
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 0,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert_eq!(agent.context_usage(), (Some(100), Some(0)));
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 90,
+            ..Default::default()
+        }),
+        false,
+    );
+    assert_eq!(agent.context_usage(), (Some(100), Some(0)));
+    agent.apply_usage(None, true);
+    assert_eq!(agent.context_usage(), (Some(100), None));
+    agent.set_model(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        Some(200),
+    );
+    assert_eq!(agent.context_usage(), (Some(200), None));
+}
+
+#[test]
 fn auto_compacted_resets_after_successful_compaction_and_retriggers_on_next_big_round() {
     // Regression for the permanent auto-compact lockout: a SUCCESSFUL
     // compaction keeps the pre-compaction baseline (refresh_context=false),
@@ -5757,7 +5848,7 @@ fn runtime_model_switch_replaces_window_and_invalidates_context_baseline() {
 
     // A 128k baseline must not immediately trigger under a 32k profile.
     agent.set_model(new_model(), Some(32_000));
-    assert_eq!(agent.last_context_input, 0);
+    assert_eq!(agent.last_context_input, None);
     assert_eq!(agent.session_input_tokens, cumulative_input);
     assert!(!agent.take_auto_compact_request());
     agent.apply_usage(
@@ -5780,7 +5871,7 @@ fn runtime_model_switch_replaces_window_and_invalidates_context_baseline() {
     // Likewise a 32k baseline cannot trigger under 128k; the new threshold
     // is evaluated only from usage reported by the new model.
     agent.set_model(new_model(), Some(128_000));
-    assert_eq!(agent.last_context_input, 0);
+    assert_eq!(agent.last_context_input, None);
     assert!(!agent.take_auto_compact_request());
     agent.apply_usage(
         Some(Usage {
@@ -5803,7 +5894,7 @@ fn runtime_model_switch_replaces_window_and_invalidates_context_baseline() {
     // changing the session's cumulative accounting.
     let cumulative_input = agent.session_input_tokens;
     agent.set_model(new_model(), None);
-    assert_eq!(agent.last_context_input, 0);
+    assert_eq!(agent.last_context_input, None);
     assert_eq!(agent.session_input_tokens, cumulative_input);
     assert!(!agent.take_auto_compact_request());
     agent.apply_usage(

@@ -239,6 +239,34 @@ impl Model for NamedRecordingModel {
     }
 }
 
+struct BlockOnCallModel {
+    replies: VecDeque<AssistantMessage>,
+    call: usize,
+    block: usize,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for BlockOnCallModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.call += 1;
+        if self.call == self.block {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok((
+            self.replies.pop_front().expect("unexpected model call"),
+            None,
+        ))
+    }
+}
+
 #[async_trait]
 impl Model for ScriptedAssistantModel {
     async fn complete(
@@ -2008,6 +2036,583 @@ async fn prompt_and_compact_pending_order_is_fifo() {
         assert_eq!(prompt < compact, prompt_first);
         task.join().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn get_context_usage_saturates_extreme_utilization() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "usage".into(),
+                            name: "get_context_usage".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: u64::MAX,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+        vec![Box::new(crate::tools::GetContextUsage)],
+    );
+    let (mut runner, _) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "usage-extreme".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    runner.agent.set_context_window(1);
+    runner.start(Some("start".into())).join().await.unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "usage-extreme")
+        .await
+        .unwrap()
+        .entries;
+    let usage: serde_json::Value = entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Message {
+                message: Message::Tool { name, content, .. },
+            } if name == "get_context_usage" => serde_json::from_str(content).ok(),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(usage["observed_headroom_tokens"], 0);
+    assert_eq!(usage["utilization_percent"], u64::MAX);
+}
+
+#[tokio::test]
+async fn get_context_usage_reports_previous_regular_usage_in_a_mixed_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "usage".into(),
+                                name: "get_context_usage".into(),
+                                arguments: "{}".into(),
+                            },
+                            ToolCall {
+                                id: "request".into(),
+                                name: "request_compaction".into(),
+                                arguments: "{}".into(),
+                            },
+                        ],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 150,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 10,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+        vec![
+            Box::new(crate::tools::GetContextUsage),
+            Box::new(crate::tools::RequestCompaction),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (mut runner, _) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "context-usage".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    runner.agent.set_context_window(100);
+    runner.start(Some("start".into())).join().await.unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "context-usage")
+        .await
+        .unwrap()
+        .entries;
+    let usage: serde_json::Value = entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Message {
+                message: Message::Tool { name, content, .. },
+            } if name == "get_context_usage" => serde_json::from_str(content).ok(),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        usage,
+        serde_json::json!({
+            "context_window": 100, "last_reported_input_tokens": 150,
+            "observed_headroom_tokens": 0, "utilization_percent": 150,
+            "measurement": "previous_regular_request", "exact_for_next_request": false
+        })
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn auto_compaction_satisfies_request_compaction_without_a_second_summary() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "request".into(),
+                            name: "request_compaction".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 80,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 1,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(crate::tools::RequestCompaction)],
+    );
+    agent.set_context_window(100);
+    history_for_compaction(&mut agent);
+    let (runner, _) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "auto-request".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    runner.start(Some("start".into())).join().await.unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "auto-request")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+            .count(),
+        1
+    );
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { name, content, is_error: false, synthetic: false, .. } } if name == "request_compaction" && content == "compaction request already satisfied by automatic compaction.")));
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "round, one auto summary, next round"
+    );
+}
+
+#[tokio::test]
+async fn request_compaction_pairs_every_call_then_compacts_once_after_the_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "first".into(),
+                            name: "keep_alive".into(),
+                            arguments: "{}".into(),
+                        },
+                        ToolCall {
+                            id: "request-1".into(),
+                            name: "request_compaction".into(),
+                            arguments: "{}".into(),
+                        },
+                        ToolCall {
+                            id: "middle".into(),
+                            name: "keep_alive".into(),
+                            arguments: "{}".into(),
+                        },
+                        ToolCall {
+                            id: "request-2".into(),
+                            name: "request_compaction".into(),
+                            arguments: "{}".into(),
+                        },
+                        ToolCall {
+                            id: "last".into(),
+                            name: "keep_alive".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some(
+                        "Earlier work is summarized; continue with the next phase.".into(),
+                    ),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        vec![
+            Box::new(KeepAliveTool { sender: None }),
+            Box::new(crate::tools::RequestCompaction),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, _handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "request-batch".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    runner.start(Some("start".into())).join().await.unwrap();
+
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "request-batch")
+        .await
+        .unwrap()
+        .entries;
+    let compact = entries
+        .iter()
+        .position(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+        .unwrap();
+    let results: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| match entry {
+            SessionEntry::Message {
+                message:
+                    Message::Tool {
+                        call_id,
+                        name,
+                        synthetic,
+                        ..
+                    },
+            } => Some((index, call_id.as_str(), name.as_str(), *synthetic)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 5);
+    assert!(
+        results
+            .iter()
+            .all(|(index, _, _, synthetic)| *index < compact && !synthetic)
+    );
+    assert_eq!(
+        results.iter().map(|(_, id, _, _)| *id).collect::<Vec<_>>(),
+        vec!["first", "request-1", "middle", "request-2", "last"]
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn requested_compaction_singletask_resume_keeps_pair_and_summary_constraint() {
+    let temp = tempfile::tempdir().unwrap();
+    let summary =
+        "Early constraint: preserve the required safety invariant. Tool work was summarized.";
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "request".into(),
+                        name: "request_compaction".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some(summary.into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        vec![Box::new(crate::tools::RequestCompaction)],
+    )
+    .with_compaction_mode(crate::agent::CompactionMode::SingleTask);
+    let mut history = vec![
+        Message::User {
+            content: "Early constraint: preserve the required safety invariant.".into(),
+            images: vec![],
+        }
+        .into(),
+    ];
+    for index in 0..22 {
+        history.push(
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("tool-{index}"),
+                    name: "keep_alive".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning: None,
+            })
+            .into(),
+        );
+        history.push(
+            Message::Tool {
+                call_id: format!("tool-{index}"),
+                name: "keep_alive".into(),
+                content: "ok".into(),
+                images: vec![],
+                is_error: false,
+                synthetic: false,
+            }
+            .into(),
+        );
+    }
+    agent.restore_history(history);
+    let (runner, _) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "requested-single-task".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    runner.start(Some("".into())).join().await.unwrap();
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "requested-single-task")
+        .await
+        .unwrap()
+        .entries;
+    assert!(loaded.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { name, synthetic: false, .. } } if name == "request_compaction")));
+    assert!(loaded.iter().any(
+        |entry| matches!(entry, SessionEntry::Compaction { summary: got, .. } if got == summary)
+    ));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut resumed = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("next".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![],
+    )
+    .with_compaction_mode(crate::agent::CompactionMode::SingleTask);
+    resumed.restore_history(loaded);
+    resumed.complete_round(&[]).await.unwrap();
+    let context = calls.lock().unwrap().pop().unwrap();
+    assert!(context.iter().any(
+        |message| matches!(message, Message::User { content, .. } if content.contains(summary))
+    ));
+    assert!(context.iter().any(|message| matches!(message, Message::Tool { call_id, name, synthetic: false, .. } if call_id == "request" && name == "request_compaction")));
+    assert_eq!(repair_tool_pairs(context.clone()), context);
+}
+
+#[tokio::test]
+async fn cancel_during_requested_compaction_keeps_request_result_and_queued_prompt() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut agent = Agent::new(
+        Box::new(BlockOnCallModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "request".into(),
+                        name: "request_compaction".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("summary".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("queued done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            call: 0,
+            block: 2,
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        vec![Box::new(crate::tools::RequestCompaction)],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "request-cancel".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("start".into()));
+    entered.notified().await;
+    handle.prompt("queued");
+    handle.cancel();
+    let mut status = handle.status();
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    task.join().await.unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "request-cancel")
+        .await
+        .unwrap()
+        .entries;
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { name, synthetic: false, .. } } if name == "request_compaction")));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+    );
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::User { content, .. } } if content == "queued")));
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { name, .. } } if name == "request_compaction"))
+            .count(),
+        1,
+        "the cancelled requested compaction must not be retried"
+    );
+    drop(release);
+}
+
+#[tokio::test]
+async fn invalid_request_compaction_arguments_pair_an_error_without_compacting() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "bad-request".into(),
+                        name: "request_compaction".into(),
+                        arguments: r#"{"tokens": 12}"#.into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        vec![Box::new(crate::tools::RequestCompaction)],
+    );
+    let (runner, _) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "invalid-request".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    runner.start(Some("start".into())).join().await.unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "invalid-request")
+        .await
+        .unwrap()
+        .entries;
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { name, content, is_error: true, synthetic: false, .. } } if name == "request_compaction" && content == "request_compaction accepts no arguments")));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+    );
 }
 
 #[tokio::test]

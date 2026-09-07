@@ -506,18 +506,19 @@ impl SessionTask {
 enum CompactionSource {
     Manual,
     Auto,
+    Requested,
 }
 impl CompactionSource {
     fn prefix(self) -> &'static str {
         match self {
-            Self::Manual => "",
+            Self::Manual | Self::Requested => "",
             Self::Auto => "auto-",
         }
     }
     fn resume_status(self) -> SessionStatus {
         match self {
             Self::Manual => SessionStatus::Idle,
-            Self::Auto => SessionStatus::Busy,
+            Self::Auto | Self::Requested => SessionStatus::Busy,
         }
     }
 }
@@ -542,7 +543,7 @@ enum Steering {
 }
 
 enum OperationFlow {
-    Done(Steering),
+    Done(Steering, bool),
     Released(Steering),
     Finished,
 }
@@ -1010,6 +1011,57 @@ impl SessionRunner {
                 }
             }
             other => Err(format!("unknown goal tool: {other}")),
+        }
+    }
+
+    fn execute_context_usage(&mut self, call: &ToolCall) -> Result<ToolOutput, String> {
+        let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
+            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
+        let object = arguments
+            .as_object()
+            .ok_or("get_context_usage arguments must be a JSON object")?;
+        if !object.is_empty() {
+            return Err("get_context_usage accepts no arguments".into());
+        }
+        let (context_window, input) = self.agent.context_usage();
+        let headroom = match (context_window, input) {
+            (Some(window), Some(input)) => Some(window.saturating_sub(input)),
+            _ => None,
+        };
+        let utilization = match (context_window, input) {
+            (Some(window), Some(input)) if window > 0 => {
+                Some(((input as u128 * 100) / window as u128).min(u64::MAX as u128) as u64)
+            }
+            _ => None,
+        };
+        Ok(ToolOutput::text(
+            serde_json::json!({
+                "context_window": context_window,
+                "last_reported_input_tokens": input,
+                "observed_headroom_tokens": headroom,
+                "utilization_percent": utilization,
+                "measurement": if input.is_some() { "previous_regular_request" } else { "unavailable" },
+                "exact_for_next_request": false,
+            })
+            .to_string(),
+        ))
+    }
+
+    async fn execute_request_compaction(
+        &mut self,
+        call: &ToolCall,
+        already_compacted: bool,
+    ) -> Result<ToolOutput, String> {
+        let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
+            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
+        match arguments.as_object() {
+            Some(object) if object.is_empty() => Ok(ToolOutput::text(if already_compacted {
+                "compaction request already satisfied by automatic compaction."
+            } else {
+                "compaction request accepted for this tool batch."
+            })),
+            Some(_) => Err("request_compaction accepts no arguments".into()),
+            None => Err("request_compaction arguments must be a JSON object".into()),
         }
     }
 
@@ -1494,7 +1546,7 @@ impl SessionRunner {
                 }
                 let steering = self.intake_after_operation(waited.pending);
                 self.status(source.resume_status());
-                OperationFlow::Done(steering)
+                OperationFlow::Done(steering, true)
             }
             WaitOutcome::Completed(Err(error)) => {
                 self.agent.reset_auto_compact_request();
@@ -1504,9 +1556,9 @@ impl SessionRunner {
                 // `AgentEvent::Error` (audit-visible on resume/late attach).
                 // A cancel stays a Notice and never lands as an Error entry.
                 self.commit_error(text).await;
-                self.intake_after_operation(waited.pending);
+                let steering = self.intake_after_operation(waited.pending);
                 self.status(source.resume_status());
-                OperationFlow::Done(Steering::None)
+                OperationFlow::Done(steering, false)
             }
             WaitOutcome::Released => {
                 // The in-flight compaction future was dropped: no entry, no
@@ -1562,7 +1614,7 @@ impl SessionRunner {
             if matches!(self.pending.front(), Some(PendingCommand::Compact)) {
                 self.pending.pop_front();
                 match self.compact_operation(CompactionSource::Manual).await {
-                    OperationFlow::Done(steering) => {
+                    OperationFlow::Done(steering, _) => {
                         if steering != Steering::None && self.release_after_preempt(steering) {
                             return;
                         }
@@ -1730,9 +1782,9 @@ impl SessionRunner {
                 };
                 // 正常轮用量落盘（kind="regular"）；持久化失败只告警，不影响会话。
                 // seq = the assistant entry's ACTUAL session_entries.seq.
-                if let Some(usage) = usage {
-                    self.agent.apply_usage(Some(usage.clone()), true);
-                    if let Err(error) = self
+                self.agent.apply_usage(usage.clone(), true);
+                if let Some(usage) = usage
+                    && let Err(error) = self
                         .store
                         .append_usage(
                             &self.root,
@@ -1743,9 +1795,8 @@ impl SessionRunner {
                             &usage,
                         )
                         .await
-                    {
-                        tracing::warn!("e-agent: cannot record usage: {error:#}");
-                    }
+                {
+                    tracing::warn!("e-agent: cannot record usage: {error:#}");
                 }
                 let steering = self.intake_after_operation(waited.pending);
                 if !streamed && let Some(text) = content.filter(|text| !text.is_empty()) {
@@ -1770,13 +1821,15 @@ impl SessionRunner {
                     }
                     break 'turn;
                 }
+                let mut auto_compacted = false;
                 if self.agent.take_auto_compact_request() {
                     self.shared
                         .lock()
                         .unwrap()
                         .emit(AgentEvent::Notice("──── auto-compacting… ────".into()));
                     match self.compact_operation(CompactionSource::Auto).await {
-                        OperationFlow::Done(steering) => {
+                        OperationFlow::Done(steering, committed) => {
+                            auto_compacted = committed;
                             if steering != Steering::None {
                                 // The compaction completed (its projection was
                                 // committed), but the release still stops the
@@ -1814,6 +1867,7 @@ impl SessionRunner {
                 // repair_tool_pairs never has to patch a hole) and the
                 // commit_backgrounds safe point.
                 let mut poll_terminate = false;
+                let mut requested_compaction = false;
                 for call in calls {
                     self.agent.emit_event(AgentEvent::ToolCall {
                         name: call.name.clone(),
@@ -1917,6 +1971,51 @@ impl SessionRunner {
                                 break 'turn;
                             }
                         }
+                    }
+                    if call.name == "get_context_usage" {
+                        let result = self.execute_context_usage(&call);
+                        match self.finish_intercepted_tool(&call, result).await {
+                            Ok(Steering::None) => {}
+                            Ok(steering) => {
+                                if self.release_after_preempt(steering) {
+                                    return;
+                                }
+                                break 'turn;
+                            }
+                            Err(error) => {
+                                self.terminate(
+                                    SessionResult::Failed(format!("{error:#}")),
+                                    Vec::new(),
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    if call.name == "request_compaction" {
+                        let result = self.execute_request_compaction(&call, auto_compacted).await;
+                        if result.is_ok() {
+                            requested_compaction = true;
+                        }
+                        match self.finish_intercepted_tool(&call, result).await {
+                            Ok(Steering::None) => {}
+                            Ok(steering) => {
+                                if self.release_after_preempt(steering) {
+                                    return;
+                                }
+                                break 'turn;
+                            }
+                            Err(error) => {
+                                self.terminate(
+                                    SessionResult::Failed(format!("{error:#}")),
+                                    Vec::new(),
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                        continue;
                     }
                     // Goal tools are intercepted by the runner: they need
                     // the session's goal state + durable commit, which a
@@ -2109,6 +2208,35 @@ impl SessionRunner {
                         .unwrap()
                         .emit(AgentEvent::Notice(POLL_GUARD_TERMINATION_NOTICE.into()));
                     break 'turn;
+                }
+                if requested_compaction && !auto_compacted {
+                    match self.compact_operation(CompactionSource::Requested).await {
+                        OperationFlow::Done(steering, _) => {
+                            if steering != Steering::None {
+                                if self.release_after_preempt(steering) {
+                                    return;
+                                }
+                                break 'turn;
+                            }
+                            // Completion may arrive while compaction was in
+                            // flight; commit it before the next provider call.
+                            if let Err(error) = self.commit_backgrounds().await {
+                                self.terminate(
+                                    SessionResult::Failed(format!("{error:#}")),
+                                    Vec::new(),
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                        OperationFlow::Released(steering) => {
+                            if self.release_after_preempt(steering) {
+                                return;
+                            }
+                            break 'turn;
+                        }
+                        OperationFlow::Finished => return,
+                    }
                 }
             }
         }

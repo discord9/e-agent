@@ -150,11 +150,10 @@ fn web_search_spec_exposes_only_query() {
         );
 }
 
-/// The always-on `read_output` and `history` tools are registered on EVERY
-/// session: main, read-only main (with and without a sandbox), and subagent
-/// builds (the `builtins_with_background` path).
+/// The always-on runner-intercepted tools are registered on EVERY session:
+/// main, read-only main (with and without a sandbox), and subagent builds.
 #[test]
-fn read_output_registered_for_main_read_only_and_subagent_builds() {
+fn request_compaction_registered_for_main_read_only_and_subagent_builds() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
     let names = |tools: Vec<Box<dyn Tool>>| -> Vec<String> {
@@ -166,12 +165,16 @@ fn read_output_registered_for_main_read_only_and_subagent_builds() {
     // Main build (no key, no sandbox).
     let (tools, _) = builtins_with_exa_key(workspace.clone(), None, None, false, None, None);
     let main_names = names(tools);
+    assert!(main_names.contains(&"request_compaction".to_string()));
+    assert!(main_names.contains(&"get_context_usage".to_string()));
     assert!(main_names.contains(&"read_output".to_string()));
     assert!(main_names.contains(&"history".to_string()));
 
     // Read-only main build without a sandbox (fail-closed bash).
     let (tools, _) = builtins_with_exa_key(workspace.clone(), None, None, true, None, None);
     let n = names(tools);
+    assert!(n.contains(&"request_compaction".to_string()), "{n:?}");
+    assert!(n.contains(&"get_context_usage".to_string()), "{n:?}");
     assert!(n.contains(&"read_output".to_string()), "{n:?}");
     assert!(n.contains(&"history".to_string()), "{n:?}");
 
@@ -186,6 +189,8 @@ fn read_output_registered_for_main_read_only_and_subagent_builds() {
         Some("sub-1".into()),
     );
     let sub_names = names(sub);
+    assert!(sub_names.contains(&"request_compaction".to_string()));
+    assert!(sub_names.contains(&"get_context_usage".to_string()));
     assert!(sub_names.contains(&"read_output".to_string()));
     assert!(sub_names.contains(&"history".to_string()));
 
@@ -199,6 +204,8 @@ fn read_output_registered_for_main_read_only_and_subagent_builds() {
         Some("sub-2".into()),
     );
     let sub_ro_names = names(sub_ro);
+    assert!(sub_ro_names.contains(&"request_compaction".to_string()));
+    assert!(sub_ro_names.contains(&"get_context_usage".to_string()));
     assert!(sub_ro_names.contains(&"read_output".to_string()));
     assert!(sub_ro_names.contains(&"history".to_string()));
 
@@ -241,6 +248,8 @@ fn web_search_registration_requires_a_nonempty_key() {
         "bash".to_string(),
         "get_goal".to_string(),
         "update_goal".to_string(),
+        "request_compaction".to_string(),
+        "get_context_usage".to_string(),
         "read_output".to_string(),
         "history".to_string(),
     ];
@@ -266,6 +275,8 @@ fn web_search_registration_requires_a_nonempty_key() {
             "web_search",
             "get_goal",
             "update_goal",
+            "request_compaction",
+            "get_context_usage",
             "read_output",
             "history"
         ]
@@ -1565,6 +1576,8 @@ fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
             "cancel_background_task",
             "get_goal",
             "update_goal",
+            "request_compaction",
+            "get_context_usage",
             "read_output",
             "history"
         ],
@@ -1608,6 +1621,8 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             "web_search",
             "get_goal",
             "update_goal",
+            "request_compaction",
+            "get_context_usage",
             "read_output",
             "history"
         ],
@@ -5030,6 +5045,60 @@ fn sandbox_bash_does_not_apply_git_command_scope_config() {
     }
 }
 
+#[tokio::test]
+async fn get_context_usage_spec_is_closed_and_direct_execution_is_intercepted() {
+    let tool = GetContextUsage;
+    let spec = tool.spec();
+    assert_eq!(spec.name, "get_context_usage");
+    assert_eq!(
+        spec.parameters,
+        json!({
+            "type": "object", "properties": {}, "required": [], "additionalProperties": false
+        })
+    );
+    assert!(
+        spec.description
+            .contains("most recent successfully completed regular provider request")
+    );
+    assert!(
+        spec.description
+            .contains("historical, not an exact next-request forecast")
+    );
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap_err(),
+        "get_context_usage is executed by the session runner"
+    );
+}
+
+#[tokio::test]
+async fn request_compaction_spec_is_closed_and_direct_execution_is_intercepted() {
+    let tool = RequestCompaction;
+    let spec = tool.spec();
+    assert_eq!(spec.name, "request_compaction");
+    assert_eq!(
+        spec.parameters,
+        json!({
+            "type": "object", "properties": {}, "required": [], "additionalProperties": false
+        })
+    );
+    assert!(
+        spec.description
+            .contains("meaningful semantic phase boundary")
+    );
+    assert!(
+        spec.description
+            .contains("Do not call mechanically every round")
+    );
+    assert!(
+        spec.description
+            .contains("80% auto-compaction remains a fallback")
+    );
+    assert_eq!(
+        tool.execute(json!({})).await.unwrap_err(),
+        "request_compaction is executed by the session runner"
+    );
+}
+
 #[test]
 fn goal_specs_are_closed_and_generic_specs_stay_open() {
     // Review finding: the Goal tool schemas must reject unknown fields at
@@ -5070,6 +5139,8 @@ fn goal_specs_are_closed_and_generic_specs_stay_open() {
         "web_search",
         "get_background_tasks",
         "cancel_background_task",
+        "request_compaction",
+        "get_context_usage",
         // read_output is deliberately CLOSED (see its spec): the pager
         // accepts exactly ref/offset/limit and nothing else.
         "read_output",

@@ -1118,9 +1118,14 @@ pub struct Agent {
     background_record: Option<crate::session_store::BackgroundRecord>,
     session_input_tokens: u64,
     session_output_tokens: u64,
-    last_context_input: u64,
+    /// Input tokens reported by the most recent successfully completed
+    /// regular provider request. `None` is distinct from a real zero.
+    last_context_input: Option<u64>,
+    /// Legacy/UI baseline for Usage events. Unlike the strict observation,
+    /// a missing regular usage report does not erase the displayed baseline.
+    last_observed_context_input: u64,
     /// Maximum context window in tokens. When set, triggers auto-compaction
-    /// whenever `last_context_input` exceeds 80% of this value.
+    /// whenever the known regular context input exceeds 80% of this value.
     context_window: Option<u64>,
     /// Set to true when auto-compact fires. Reset to false when
     /// record_usage reports context below 80% of the window.
@@ -1173,7 +1178,8 @@ impl Agent {
             background_record: None,
             session_input_tokens: 0,
             session_output_tokens: 0,
-            last_context_input: 0,
+            last_context_input: None,
+            last_observed_context_input: 0,
             context_window: None,
             auto_compacted: false,
             context_prefix: None,
@@ -1241,8 +1247,15 @@ impl Agent {
     pub fn set_model(&mut self, model: Box<dyn Model>, context_window: Option<u64>) {
         self.model = model;
         self.context_window = context_window;
-        self.last_context_input = 0;
+        self.last_context_input = None;
+        self.last_observed_context_input = 0;
         self.auto_compacted = false;
+    }
+
+    /// Context usage from the most recent completed regular provider request.
+    /// This is intentionally transient: resume begins unknown.
+    pub(crate) fn context_usage(&self) -> (Option<u64>, Option<u64>) {
+        (self.context_window, self.last_context_input)
     }
 
     /// The current model's wire name ([`Model::name`]; the display name is
@@ -2034,23 +2047,26 @@ impl Agent {
     }
 
     fn record_usage(&mut self, usage: Option<Usage>, refresh_context: bool) {
+        if refresh_context {
+            self.last_context_input = usage.as_ref().map(|usage| usage.input_tokens);
+            if let Some(usage) = &usage {
+                self.last_observed_context_input = usage.input_tokens;
+            }
+        }
         if let Some(usage) = usage {
             self.session_input_tokens += usage.input_tokens;
             self.session_output_tokens += usage.output_tokens;
-            if refresh_context {
-                self.last_context_input = usage.input_tokens;
-            }
-            // Reset auto-compacted flag when context drops below 80% of the
-            // window (compaction succeeded and usage decreased).
+            // Reset auto-compacted flag when a known regular context drops
+            // below 80% of the window. Unknown usage never triggers a reset.
             if self.auto_compacted
-                && let Some(window) = self.context_window
+                && let (Some(window), Some(input)) = (self.context_window, self.last_context_input)
                 && window > 0
-                && (self.last_context_input as u128) * 100 < (window as u128) * 80
+                && (input as u128) * 100 < (window as u128) * 80
             {
                 self.auto_compacted = false;
             }
             self.emit(AgentEvent::Usage {
-                context_input: self.last_context_input,
+                context_input: self.last_observed_context_input,
                 context_window: self.context_window,
                 session: Usage {
                     input_tokens: self.session_input_tokens,
@@ -2121,10 +2137,10 @@ impl Agent {
             } = round;
             self.record_usage(usage, true);
             // Auto-compact when usage exceeds 80% of the configured context window.
-            if let Some(window) = self.context_window
+            if let (Some(window), Some(input)) = (self.context_window, self.last_context_input)
                 && window > 0
                 && !self.auto_compacted
-                && (self.last_context_input as u128) * 100 >= (window as u128) * 80
+                && (input as u128) * 100 >= (window as u128) * 80
             {
                 self.auto_compacted = true;
                 self.emit(AgentEvent::Notice("──── auto-compacting… ────".into()));
@@ -2350,11 +2366,13 @@ impl Agent {
     }
 
     pub(crate) fn take_auto_compact_request(&mut self) -> bool {
-        let requested = self.context_window.is_some_and(|window| {
-            window > 0
-                && !self.auto_compacted
-                && (self.last_context_input as u128) * 100 >= (window as u128) * 80
-        });
+        let requested = matches!(
+            (self.context_window, self.last_context_input),
+            (Some(window), Some(input))
+                if window > 0
+                    && !self.auto_compacted
+                    && (input as u128) * 100 >= (window as u128) * 80
+        );
         if requested {
             self.auto_compacted = true;
         }
