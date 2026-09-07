@@ -165,6 +165,7 @@ class El {
         if (on) this._classes.add(c); else this._classes.delete(c); return on; } }; }
   get children(){ return this._children; }
   get parentNode(){ return this._parent ?? null; }
+  contains(node){ for(let n=node; n; n=n.parentNode ?? n._parent ?? null) if(n===this) return true; return false; }
   get firstChild(){ return this._children[0] ?? null; }
   get nextSibling(){ if(!this._parent) return null;
     const i=this._parent._children.indexOf(this);
@@ -271,7 +272,9 @@ globalThis.document={ createElement:t=>new El(t), createComment:t=>new El("#comm
   dispatchEvent(e){ if(_docListeners[e.type]) _docListeners[e.type](e); }, documentElement:_docEl };
 globalThis.navigator={ onLine:true };
 globalThis.confirm=()=>true;
+let testSelection={ isCollapsed:true, anchorNode:null, focusNode:null };
 // gjs 自带 window 全局（不可整体替换）：就地补上页面需要的属性
+window.getSelection=()=>testSelection;
 window.visualViewport=null; window.innerHeight=800;
 window.addEventListener=()=>{}; window.confirm=()=>true; window.setTimeout=()=>0; window.clearTimeout=()=>{};
 globalThis.history={ replaceState(){} };
@@ -8133,6 +8136,86 @@ async function main(){
         && elsById["composerTasks"].querySelectorAll(".task-row").length === 21,
         "rows=" + elsById["composerTasks"].querySelectorAll(".task-row").length
         + " collapsed=" + state.tasks.finishedCollapsed);
+    // Text selection is scoped to the clicked card: pointer release after a
+    // noncollapsed selection must not toggle output, start a poller, or navigate.
+    const selectionPanel = el("div", "selection-test-panel");
+    const selectionClick = (row, detail) => row._listeners["click"][0]({ detail });
+    const selectionTextNode = (parent) => ({ parentNode: parent });
+    const bashSelectionTask = (id) => ({ session_id: "selection", id, kind: "bash",
+      label: "selection-" + id, full_command: "echo selection-" + id, output: "selected output" });
+    const bashSelectionRow = buildTaskRow(bashSelectionTask(1), "selection:1", false, 0);
+    selectionPanel.appendChild(bashSelectionRow);
+    const bashCommand = bashSelectionRow.querySelector(".task-command");
+    const bashOutput = bashSelectionRow.querySelector(".task-output");
+    testSelection = { isCollapsed: false, anchorNode: selectionTextNode(bashCommand), focusNode: null };
+    selectionClick(bashSelectionRow, 1);
+    chk("task command selection pointer release does not toggle or poll",
+        bashOutput.hidden === true && !state.tasks.pollers.has("selection:1"),
+        "hidden=" + bashOutput.hidden + " poller=" + state.tasks.pollers.has("selection:1"));
+    // Keep this case independent when running against a baseline without the guard.
+    bashOutput.hidden = true;
+    stopTaskPoller("selection:1");
+    testSelection = { isCollapsed: false, anchorNode: null, focusNode: selectionTextNode(bashOutput) };
+    selectionClick(bashSelectionRow, 1);
+    chk("task output selection pointer release does not toggle or poll",
+        bashOutput.hidden === true && !state.tasks.pollers.has("selection:1"),
+        "hidden=" + bashOutput.hidden + " poller=" + state.tasks.pollers.has("selection:1"));
+    // Keep the ordinary-click control independent when the guard is absent.
+    bashOutput.hidden = true;
+    stopTaskPoller("selection:1");
+
+    const delegateSelectionRow = buildTaskRow({ session_id: "selection-parent", id: 2,
+      kind: "delegate", label: "selection delegate", subagent_session_id: "selection-sub" },
+      "selection-parent:2", false, 0);
+    selectionPanel.appendChild(delegateSelectionRow);
+    const delegateStream = delegateSelectionRow.querySelector(".task-stream");
+    const sessionBeforeDelegateSelection = state.sessionId;
+    testSelection = { isCollapsed: false, anchorNode: selectionTextNode(delegateStream), focusNode: null };
+    selectionClick(delegateSelectionRow, 1);
+    chk("delegate stream selection pointer release does not navigate or toggle fallback",
+        state.sessionId === sessionBeforeDelegateSelection && delegateStream.hidden === true
+        && !state.tasks.streams.has("selection-parent:2"),
+        "session=" + state.sessionId + " hidden=" + delegateStream.hidden);
+
+    const finishedSelectionRow = buildFinishedRow({ session_id: "selection", seq: 1, id: 3,
+      kind: "bash", label: "finished selection", output: "finished selected output" });
+    selectionPanel.appendChild(finishedSelectionRow);
+    const finishedSelectionOutput = finishedSelectionRow.querySelector(".task-output");
+    testSelection = { isCollapsed: false, anchorNode: selectionTextNode(finishedSelectionOutput), focusNode: null };
+    selectionClick(finishedSelectionRow, 1);
+    chk("finished output selection pointer release does not toggle",
+        finishedSelectionOutput.hidden === true && finishedSelectionRow.getAttribute("aria-expanded") === "false",
+        "hidden=" + finishedSelectionOutput.hidden);
+
+    testSelection = { isCollapsed: true, anchorNode: selectionTextNode(bashOutput), focusNode: null };
+    selectionClick(bashSelectionRow, 1);
+    chk("collapsed selection ordinary pointer click still toggles",
+        bashOutput.hidden === false && state.tasks.pollers.has("selection:1"),
+        "hidden=" + bashOutput.hidden + " poller=" + state.tasks.pollers.has("selection:1"));
+    stopTaskPoller("selection:1");
+
+    const rowA = buildTaskRow(bashSelectionTask(4), "selection:4", false, 0);
+    const rowB = buildTaskRow(bashSelectionTask(5), "selection:5", false, 0);
+    selectionPanel.appendChild(rowA); selectionPanel.appendChild(rowB);
+    testSelection = { isCollapsed: false,
+      anchorNode: selectionTextNode(rowA.querySelector(".task-output")), focusNode: null };
+    selectionClick(rowB, 1);
+    chk("selection in another row does not suppress pointer click",
+        rowB.querySelector(".task-output").hidden === false && state.tasks.pollers.has("selection:5"),
+        "hidden=" + rowB.querySelector(".task-output").hidden);
+    stopTaskPoller("selection:5");
+
+    const keyboardRow = buildTaskRow(bashSelectionTask(6), "selection:6", false, 0);
+    selectionPanel.appendChild(keyboardRow);
+    testSelection = { isCollapsed: false,
+      anchorNode: selectionTextNode(keyboardRow.querySelector(".task-output")), focusNode: null };
+    selectionClick(keyboardRow, 0);
+    chk("keyboard detail 0 activation remains allowed with selection",
+        keyboardRow.querySelector(".task-output").hidden === false && state.tasks.pollers.has("selection:6"),
+        "hidden=" + keyboardRow.querySelector(".task-output").hidden);
+    stopTaskPoller("selection:6");
+    testSelection = { isCollapsed: true, anchorNode: null, focusNode: null };
+
     tasksData = []; tasksDataB = []; finishedData = [];
     state.tasks.byWorkspace = fcSave.byWs; state.tasks.list = fcSave.list;
     state.tasks.finished = fcSave.finished; state.tasks.finishedByWorkspace = fcSave.fByWs;

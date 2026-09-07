@@ -147,6 +147,15 @@ async function pollTasks() {
                          // 不再依赖 sessionId 变化碰巧打破 sidebarTreeSig 去重）
 }
 
+/* Pointer activation after selecting text must leave that exact card alone. Keyboard
+   activation (detail 0) is intentionally unaffected, as is a selection elsewhere. */
+function clickHasSelectionIn(row, ev) {
+  if (!ev || ev.detail <= 0) return false;
+  const selection = window.getSelection && window.getSelection();
+  return !!(selection && !selection.isCollapsed
+    && (row.contains(selection.anchorNode) || row.contains(selection.focusNode)));
+}
+
 /* 已完成任务行签名（finished 小节去重用） */
 function finishedKeySig(t) {
   return JSON.stringify([
@@ -195,7 +204,8 @@ function buildFinishedRow(t) {
     pre.hidden = true;
     row.appendChild(pre);
     row.setAttribute("aria-expanded", "false");
-    row.addEventListener("click", () => {
+    row.addEventListener("click", (ev) => {
+      if (clickHasSelectionIn(row, ev)) return;
       pre.hidden = !pre.hidden;
       row.setAttribute("aria-expanded", String(!pre.hidden));
       updateJumpBottomPosition();
@@ -953,7 +963,8 @@ function buildTaskRow(t, key, restoreExpanded, depth) {
       }
       updateJumpBottomPosition();   // 行展开/收起改变面板高度：同步移动按钮
     };
-    row.addEventListener("click", () => {
+    row.addEventListener("click", (ev) => {
+      if (clickHasSelectionIn(row, ev)) return;
       if (isDelegate) {
         // 新行为：切到该 subagent 的会话（完整消息/工具卡片/思考块渲染）
         const subId = resolveSubagentSessionId(t);
