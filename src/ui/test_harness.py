@@ -7944,6 +7944,62 @@ async function main(){
     stopSSE();
 
     // =====================================================================
+    // Live delegate ownership is visual-only: preserve API/DOM order while
+    // indenting exactly one uniquely-owned child in its own workspace.
+    // =====================================================================
+    const depthPanel = elsById["composerTasks"];
+    const depthDelegate = { session_id: "depth-main", id: 1, kind: "delegate",
+      label: "delegate", subagent_session_id: "depth-sub", _ws: "depth-a" };
+    const depthChild = { session_id: "depth-sub", id: 2, kind: "bash", label: "child",
+      full_command: "child", output: "running", owner_session: "depth-sub", _ws: "depth-a" };
+    const depthMain = { session_id: "depth-main", id: 3, kind: "bash", label: "main",
+      full_command: "main", output: "running", owner_session: "depth-main", _ws: "depth-a" };
+    const depthOrphan = { session_id: "depth-orphan", id: 4, kind: "bash", label: "orphan",
+      full_command: "orphan", output: "running", owner_session: "missing", _ws: "depth-a" };
+    const depthInitial = [depthDelegate, depthChild, depthMain, depthOrphan];
+    renderTaskList(depthInitial, depthPanel);
+    let depthRows = [...depthPanel.querySelectorAll(".task-row")];
+    chk("task depth preserves initial array and DOM order",
+        depthRows.map((row) => row.getAttribute("data-task")).join("|")
+          === depthInitial.map((task) => taskKey(task)).join("|"),
+        depthRows.map((row) => row.getAttribute("data-task")).join("|"));
+    chk("unique same-workspace delegate gives child depth only",
+        depthRows.map((row) => row.getAttribute("data-task-depth")).join("|") === "0|1|0|0",
+        depthRows.map((row) => row.getAttribute("data-task-depth")).join("|"));
+    const depthDuplicate = Object.assign({}, depthDelegate, { id: 5 });
+    renderTaskList([depthDelegate, depthDuplicate, depthChild], depthPanel);
+    depthRows = [...depthPanel.querySelectorAll(".task-row")];
+    chk("ambiguous delegates leave child at depth zero",
+        depthRows[2].getAttribute("data-task-depth") === "0",
+        "depth=" + depthRows[2].getAttribute("data-task-depth"));
+    const depthCrossChild = Object.assign({}, depthChild, { id: 6, _ws: "depth-b" });
+    renderTaskList([depthDelegate, depthCrossChild], depthPanel);
+    depthRows = [...depthPanel.querySelectorAll(".task-row")];
+    chk("cross-workspace delegate cannot parent child",
+        depthRows[1].getAttribute("data-task-depth") === "0",
+        "depth=" + depthRows[1].getAttribute("data-task-depth"));
+    renderTaskList([depthDelegate, depthChild], depthPanel);
+    const retainedDepthChild = depthPanel.querySelectorAll(".task-row")[1];
+    retainedDepthChild._listeners["click"][0]();
+    const retainedDepthOutput = retainedDepthChild.querySelector(".task-output");
+    renderTaskList([depthChild], depthPanel);
+    const depthOrphanedRow = depthPanel.querySelectorAll(".task-row")[0];
+    const orphanedDepth = depthOrphanedRow.getAttribute("data-task-depth");
+    const stayedExpanded = retainedDepthOutput.hidden === false;
+    renderTaskList([depthDelegate, depthChild], depthPanel);
+    const depthRestoredRow = depthPanel.querySelectorAll(".task-row")[1];
+    chk("task depth updates on parent disappearance and return without replacing expanded child",
+        depthOrphanedRow === retainedDepthChild
+        && orphanedDepth === "0"
+        && stayedExpanded && depthRestoredRow === retainedDepthChild
+        && depthRestoredRow.getAttribute("data-task-depth") === "1"
+        && retainedDepthOutput.hidden === false,
+        "same=" + (depthRestoredRow === retainedDepthChild)
+        + " depth=" + depthRestoredRow.getAttribute("data-task-depth")
+        + " expanded=" + (!retainedDepthOutput.hidden));
+    renderTaskList([], depthPanel);
+
+    // =====================================================================
     // 已完成分组：默认折叠、真 button/ARIA、点击切换、重绘/重开保持、20 条
     // 上限、标题不显示数量；组件只在有运行中任务时显示（running=0 → 整个
     // 面板隐藏，无论是否有 finished 数据；finished 缓存与折叠状态保留，
@@ -7981,8 +8037,10 @@ async function main(){
     const finishedOutput = finishedRow.querySelector(".task-output");
     finishedRow._listeners["click"][0]();
     chk("finished row click expands output", finishedOutput.hidden === false
-        && finishedRow.getAttribute("aria-expanded") === "true",
-        "hidden=" + finishedOutput.hidden);
+        && finishedRow.getAttribute("aria-expanded") === "true"
+        && finishedRow.getAttribute("data-task-depth") === null,
+        "hidden=" + finishedOutput.hidden
+        + " depth=" + String(finishedRow.getAttribute("data-task-depth")));
     // 持久化 finished 查询可以慢，但 live 任务面板必须先显示。
     finishedDelayed = true;
     finishedResolve = null;

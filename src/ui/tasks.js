@@ -232,6 +232,29 @@ function taskKey(t) {
   return (t.session_id || "") + ":" + (t.id != null ? t.id : "");
 }
 
+/* Visual-only live-task depth. A non-delegate child is indented only when one
+   currently listed delegate in its own workspace uniquely owns its session. */
+function liveTaskDepths(tasks) {
+  const candidates = new Map();
+  for (const t of tasks || []) {
+    const subId = t && t.subagent_session_id;
+    if (t && t.kind === "delegate" && typeof subId === "string" && subId.trim() !== "") {
+      const inWorkspace = candidates.get(t._ws) || new Map();
+      inWorkspace.set(subId, (inWorkspace.get(subId) || 0) + 1);
+      candidates.set(t._ws, inWorkspace);
+    }
+  }
+  const depths = new Map();
+  for (const t of tasks || []) {
+    const inWorkspace = t && candidates.get(t._ws);
+    if (t && t.kind !== "delegate" && typeof t.owner_session === "string"
+        && inWorkspace && inWorkspace.get(t.owner_session) === 1) {
+      depths.set(t, 1);
+    }
+  }
+  return depths;
+}
+
 function tasksListSig(list) {
   return JSON.stringify((list || []).map((t) => taskKeySig(t)));
 }
@@ -694,9 +717,11 @@ function renderTaskList(tasks, container) {
     for (const [key, row] of byKey) { stopTaskPoller(key); stopTaskStream(key); row.remove(); }
     return;   // 组件已由 renderComposerTasks 在 n===0 时整体隐藏，不再渲染空态
   }
+  const depths = liveTaskDepths(tasks);
   let prev = null;   // 前一个已处理的行（插入锚点，保持 tasks 数组顺序）
   for (const t of tasks) {
     const key = taskKey(t);
+    const depth = depths.get(t) || 0;
     const sig = taskKeySig(t);
     let row = byKey.get(key) || null;
     if (row) byKey.delete(key);
@@ -708,6 +733,7 @@ function renderTaskList(tasks, container) {
         if (anchor) list.insertBefore(row, anchor);
         else list.appendChild(row);
       }
+      row.setAttribute("data-task-depth", String(depth));
       updateRetainedTaskRow(row, t, key);   // 静态输出就地更新（不重建）
       prev = row;
       continue;
@@ -717,7 +743,7 @@ function renderTaskList(tasks, container) {
       stopTaskStream(key);
       row.remove();
     }
-    const nrow = buildTaskRow(t, key, prevExpanded.has(key));
+    const nrow = buildTaskRow(t, key, prevExpanded.has(key), depth);
     if (prev && prev.nextSibling) list.insertBefore(nrow, prev.nextSibling);
     else list.appendChild(nrow);
     prev = nrow;
@@ -750,7 +776,7 @@ function updateRetainedTaskRow(row, t, key) {
 /* 单个任务卡片行（keyed 更新用）：data-task = key、data-key-sig = 元数据
    签名。restoreExpanded=true 时按展开态启动 500ms output 轮询 / delegate
    SSE 流（与旧 renderTaskList 的「重绘恢复展开态」语义一致）。 */
-function buildTaskRow(t, key, restoreExpanded) {
+function buildTaskRow(t, key, restoreExpanded, depth) {
   // 当前会话发起的任务（bash 的 session_id / delegate 的父 session_id 等于
   // 正在查看的会话）→ 行加 current 标记：左侧 cyan accent bar + 「本会话」
   // 标签，任务面板里一眼可辨哪些属于当前会话。
@@ -758,6 +784,7 @@ function buildTaskRow(t, key, restoreExpanded) {
   const row = el("div", "task-row" + (isCurrentSession ? " task-row-current" : ""));
   row.setAttribute("data-task", key);
   row.setAttribute("data-key-sig", taskKeySig(t));
+  row.setAttribute("data-task-depth", String(depth || 0));
     const isDelegate = t.kind === "delegate";
     row.title = isDelegate ? "点击切换到该子代理的会话" : "点击展开/收起输出（流式更新）";
     const line = el("div", "task-line");

@@ -1930,6 +1930,7 @@
     cursor: pointer;
   }
   .task-row:hover { border-color: var(--blue); }
+  .task-row[data-task-depth="1"] > * { margin-inline-start: 8px; }
   /* 当前会话发起的任务：左侧 cyan accent bar + hover 同色，扫一眼可辨 */
   .task-row.task-row-current {
     border-left: 3px solid var(--cyan);
