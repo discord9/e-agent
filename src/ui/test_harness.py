@@ -7947,51 +7947,72 @@ async function main(){
     stopSSE();
 
     // =====================================================================
-    // Live delegate ownership is visual-only: preserve API/DOM order while
-    // indenting exactly one uniquely-owned child in its own workspace.
+    // Live delegate ownership projects an exact, same-workspace relation:
+    // roots keep their stable input order; every uniquely owned direct child
+    // follows its delegate parent, including when input is interleaved.
     // =====================================================================
     const depthPanel = elsById["composerTasks"];
-    const depthDelegate = { session_id: "depth-main", id: 1, kind: "delegate",
-      label: "delegate", subagent_session_id: "depth-sub", _ws: "depth-a" };
-    const depthChild = { session_id: "depth-sub", id: 2, kind: "bash", label: "child",
-      full_command: "child", output: "running", owner_session: "depth-sub", _ws: "depth-a" };
-    const depthMain = { session_id: "depth-main", id: 3, kind: "bash", label: "main",
+    const depthParentA = { session_id: "depth-main", id: 1, kind: "delegate",
+      label: "parent A", subagent_session_id: "depth-sub-a", _ws: "depth-a" };
+    const depthParentB = { session_id: "depth-main", id: 2, kind: "delegate",
+      label: "parent B", subagent_session_id: "depth-sub-b", _ws: "depth-a" };
+    const depthChildA1 = { session_id: "depth-sub-a", id: 3, kind: "bash", label: "child A1",
+      full_command: "child-a1", output: "running", owner_session: "depth-sub-a", _ws: "depth-a" };
+    const depthChildA2 = { session_id: "depth-sub-a", id: 4, kind: "bash", label: "child A2",
+      full_command: "child-a2", output: "running", owner_session: "depth-sub-a", _ws: "depth-a" };
+    const depthChildB = { session_id: "depth-sub-b", id: 5, kind: "bash", label: "child B",
+      full_command: "child-b", output: "running", owner_session: "depth-sub-b", _ws: "depth-a" };
+    const depthMain = { session_id: "depth-main", id: 6, kind: "bash", label: "main",
       full_command: "main", output: "running", owner_session: "depth-main", _ws: "depth-a" };
-    const depthOrphan = { session_id: "depth-orphan", id: 4, kind: "bash", label: "orphan",
+    const depthOrphan = { session_id: "depth-orphan", id: 7, kind: "bash", label: "orphan",
       full_command: "orphan", output: "running", owner_session: "missing", _ws: "depth-a" };
-    const depthInitial = [depthDelegate, depthChild, depthMain, depthOrphan];
+    // Children appear before/interleaved with their parents in the API snapshot.
+    const depthInitial = [depthChildB, depthMain, depthChildA2, depthParentA,
+      depthOrphan, depthParentB, depthChildA1];
     renderTaskList(depthInitial, depthPanel);
     let depthRows = [...depthPanel.querySelectorAll(".task-row")];
-    chk("task depth preserves initial array and DOM order",
-        depthRows.map((row) => row.getAttribute("data-task")).join("|")
-          === depthInitial.map((task) => taskKey(task)).join("|"),
-        depthRows.map((row) => row.getAttribute("data-task")).join("|"));
-    chk("unique same-workspace delegate gives child depth only",
-        depthRows.map((row) => row.getAttribute("data-task-depth")).join("|") === "0|1|0|0",
-        depthRows.map((row) => row.getAttribute("data-task-depth")).join("|"));
-    const depthDuplicate = Object.assign({}, depthDelegate, { id: 5 });
-    renderTaskList([depthDelegate, depthDuplicate, depthChild], depthPanel);
+    const depthOrder = depthRows.map((row) => row.getAttribute("data-task"));
+    const depthExpected = [depthMain, depthParentA, depthChildA2, depthChildA1,
+      depthOrphan, depthParentB, depthChildB].map((task) => taskKey(task));
+    chk("task ownership projection makes interleaved children contiguous while roots and siblings stay stable",
+        depthOrder.join("|") === depthExpected.join("|")
+        && depthRows.map((row) => row.getAttribute("data-task-depth")).join("|") === "0|0|1|1|0|0|1",
+        depthOrder.join("|") + " depths="
+        + depthRows.map((row) => row.getAttribute("data-task-depth")).join("|"));
+    chk("task ownership projection loses or duplicates no live tasks",
+        depthOrder.length === depthInitial.length
+        && new Set(depthOrder).size === depthInitial.length
+        && depthInitial.every((task) => depthOrder.includes(taskKey(task))),
+        "count=" + depthOrder.length + " unique=" + new Set(depthOrder).size);
+
+    const depthDuplicate = Object.assign({}, depthParentA, { id: 8 });
+    renderTaskList([depthChildA1, depthParentA, depthDuplicate], depthPanel);
     depthRows = [...depthPanel.querySelectorAll(".task-row")];
-    chk("ambiguous delegates leave child at depth zero",
-        depthRows[2].getAttribute("data-task-depth") === "0",
-        "depth=" + depthRows[2].getAttribute("data-task-depth"));
-    const depthCrossChild = Object.assign({}, depthChild, { id: 6, _ws: "depth-b" });
-    renderTaskList([depthDelegate, depthCrossChild], depthPanel);
+    chk("ambiguous duplicate delegate parents leave child top-level",
+        depthRows.map((row) => row.getAttribute("data-task")).join("|")
+          === [depthChildA1, depthParentA, depthDuplicate].map(taskKey).join("|")
+        && depthRows[0].getAttribute("data-task-depth") === "0",
+        depthRows.map((row) => row.getAttribute("data-task")).join("|"));
+    const depthCrossChild = Object.assign({}, depthChildA1, { id: 9, _ws: "depth-b" });
+    renderTaskList([depthCrossChild, depthParentA], depthPanel);
     depthRows = [...depthPanel.querySelectorAll(".task-row")];
     chk("cross-workspace delegate cannot parent child",
-        depthRows[1].getAttribute("data-task-depth") === "0",
-        "depth=" + depthRows[1].getAttribute("data-task-depth"));
-    renderTaskList([depthDelegate, depthChild], depthPanel);
+        depthRows.map((row) => row.getAttribute("data-task")).join("|")
+          === [depthCrossChild, depthParentA].map(taskKey).join("|")
+        && depthRows[0].getAttribute("data-task-depth") === "0",
+        "order=" + depthRows.map((row) => row.getAttribute("data-task")).join("|"));
+
+    renderTaskList([depthParentA, depthChildA1], depthPanel);
     const retainedDepthChild = depthPanel.querySelectorAll(".task-row")[1];
     retainedDepthChild._listeners["click"][0]();
     const retainedDepthOutput = retainedDepthChild.querySelector(".task-output");
-    renderTaskList([depthChild], depthPanel);
+    renderTaskList([depthChildA1], depthPanel);
     const depthOrphanedRow = depthPanel.querySelectorAll(".task-row")[0];
     const orphanedDepth = depthOrphanedRow.getAttribute("data-task-depth");
     const stayedExpanded = retainedDepthOutput.hidden === false;
-    renderTaskList([depthDelegate, depthChild], depthPanel);
+    renderTaskList([depthChildA1, depthParentA], depthPanel);
     const depthRestoredRow = depthPanel.querySelectorAll(".task-row")[1];
-    chk("task depth updates on parent disappearance and return without replacing expanded child",
+    chk("parent disappearance and return move the same child DOM while preserving expanded output",
         depthOrphanedRow === retainedDepthChild
         && orphanedDepth === "0"
         && stayedExpanded && depthRestoredRow === retainedDepthChild
@@ -8260,6 +8281,22 @@ if os.environ.get('KEEP') != '1':
 # 带 margin-left:auto，meta 隐藏时按钮仍靠右（不依赖 meta 占位）。
 import re
 _css = open(os.path.join(HERE, 'style.css'), encoding='utf-8').read()
+# Child-task hierarchy must shift the full card (not just its descendants), with
+# a visible desktop/mobile inset and a reduced width that cannot overflow.
+_task_child_rule = re.search(r'\.task-row\[data-task-depth="1"\]\s*\{([^}]*)\}', _css)
+_task_child_css = _task_child_rule.group(1) if _task_child_rule else ''
+_task_mobile_rule = re.search(r'@media\s*\(max-width:\s*640px\)\s*\{\s*'
+                              r'\.task-row\[data-task-depth="1"\]\s*\{([^}]*)\}', _css)
+_task_mobile_css = _task_mobile_rule.group(1) if _task_mobile_rule else ''
+_task_card_indent_ok = bool(
+    _task_child_rule
+    and re.search(r'margin-inline-start:\s*24px', _task_child_css)
+    and re.search(r'width:\s*calc\(100%\s*-\s*24px\)', _task_child_css)
+    and _task_mobile_rule
+    and re.search(r'margin-inline-start:\s*16px', _task_mobile_css)
+    and re.search(r'width:\s*calc\(100%\s*-\s*16px\)', _task_mobile_css)
+    and not re.search(r'\.task-row\[data-task-depth="1"\]\s*>', _css))
+print(("PASS" if _task_card_indent_ok else "FAIL") + " task child whole-card desktop/mobile indentation in style.css")
 _m = re.search(r'\.composer-actions\s*\{([^}]*)\}', _css)
 _css_ok = bool(_m and re.search(r'margin-left:\s*auto', _m.group(1)))
 print(("PASS" if _css_ok else "FAIL") + " composer-actions margin-left:auto in style.css")
