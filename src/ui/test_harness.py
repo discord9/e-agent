@@ -3856,6 +3856,48 @@ async function main(){
         && elsById["chatBusy"].querySelectorAll(".orbit-dot").length === 5,
         "header=" + elsById["chatBusy"].innerHTML + " sidebar=" + _sidebarDot.innerHTML);
 
+    // A delegate becomes cyan only when its actual subagent session reports
+    // WaitingInput; busy:false Idle remains green and absent status is not guessed.
+    state.lastList = [
+      { id: "current-busy", busy: false, status: "Idle", active: true },
+      { id: "current-child", parent_session_id: "current-busy", busy: false,
+        status: "WaitingInput", active: true },
+    ];
+    state.tasks.byWorkspace[_activeWsId] = [{ session_id: "current-busy", id: 1,
+      kind: "delegate", subagent_session_id: "current-child" }];
+    state.tasks.list = state.tasks.byWorkspace[_activeWsId];
+    updateCurrentSessionBusy();
+    chk("header waiting delegate uses actual child waiting status",
+        elsById["chatBusy"].querySelectorAll(".orbit-dot.waiting").length === 1
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot.green").length === 0,
+        "html=" + elsById["chatBusy"].innerHTML);
+    state.lastList[1].status = "Failed: child";
+    updateCurrentSessionBusy();
+    chk("header failed delegate uses child error status",
+        elsById["chatBusy"].querySelectorAll(".orbit-dot.error").length === 1,
+        "html=" + elsById["chatBusy"].innerHTML);
+    state.lastList[0].status = "WaitingInput";
+    updateCurrentSessionBusy();
+    chk("header main waiting uses waiting status",
+        !elsById["chatBusy"].hidden
+        && elsById["chatBusy"].querySelector(".main-dot.waiting") !== null,
+        "html=" + elsById["chatBusy"].innerHTML);
+    state.lastList[0].status = "Failed: main";
+    updateCurrentSessionBusy();
+    chk("header main failed uses error status",
+        !elsById["chatBusy"].hidden
+        && elsById["chatBusy"].querySelector(".main-dot.error") !== null,
+        "html=" + elsById["chatBusy"].innerHTML);
+    state.lastList[0] = { id: "current-busy", busy: false, status: "Finished", active: false };
+    state.lastList[1] = { id: "current-child", parent_session_id: "current-busy", busy: false,
+      status: "Finished", active: false };
+    updateCurrentSessionBusy();
+    chk("header finished main and child use inactive status",
+        !elsById["chatBusy"].hidden
+        && elsById["chatBusy"].querySelector(".main-dot.inactive") !== null
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot.inactive").length === 1,
+        "html=" + elsById["chatBusy"].innerHTML);
+
     state.tasks.byWorkspace[_activeWsId] = [];
     state.tasks.list = [];
     state.lastList = [
@@ -8268,6 +8310,56 @@ _spin_ok = bool(re.search(r'\.composer-status\.busy::before[^{]*\{[^}]*animation
                 and re.search(r'@keyframes\s+composer-status-spin', _css)
                 and re.search(r'prefers-reduced-motion: reduce', _css))
 print(("PASS" if _spin_ok else "FAIL") + " composer-status spinner + reduced-motion in style.css")
+# Approved status colors apply only to status UI: busy/compacting red, waiting cyan,
+# errors yellow; idle is green and finished/inactive is gray.  Status text uses the
+# deeper Solarized variants, each checked against the app background for WCAG AA.
+_status_rules_ok = bool(
+    all(token in _css for token in [
+        '--status-red: #c5221f', '--status-cyan: #006d69',
+        '--status-yellow: #7c6200', '--status-inactive: #526870',
+        '.busy-dot.busy { background: var(--red)',
+        '.busy-dot.waiting { background: var(--cyan)',
+        '.busy-dot.error { background: var(--yellow)',
+        '.busy-dot.inactive { background: var(--base1)',
+        '.busy-dot-wrap .main-dot.busy { fill: var(--red)',
+        '.busy-dot-wrap .main-dot.waiting { fill: var(--cyan)',
+        '.busy-dot-wrap .main-dot.error { fill: var(--yellow)',
+        '.busy-dot-wrap .orbit-dot.waiting { fill: var(--cyan)',
+        '.busy-dot-wrap .orbit-dot.error { fill: var(--yellow)',
+        '.busy-dot-wrap .orbit-dot.inactive { fill: var(--base1)',
+        '.status-chip.busy       { color: var(--status-red)',
+        '.status-chip.waiting    { color: var(--status-cyan)',
+        '.status-chip.compacting { color: var(--status-red)',
+        '.status-chip.error      { color: var(--status-yellow)',
+        '.status-chip.finished   { color: var(--status-inactive)',
+        '.busy-dot-wrap .orbit-badge text {',
+        'fill: var(--base01);',
+    ])
+    and re.search(r'\.composer-status\.finished\s*\{\s*color:\s*var\(--status-inactive\)', _css)
+    and re.search(r'\.tree-status\.waiting\s*\{\s*color:\s*var\(--status-cyan\)', _css)
+    and re.search(r'\.conn-state\.err\s*\{\s*color:\s*var\(--status-yellow\)', _css)
+    and re.search(r'\.msg-error\s*\{[^}]*color:\s*var\(--status-yellow\)', _css)
+    and re.search(r'\.tool-card\s+\.tool-result\.err\s*\{[^}]*color:\s*var\(--status-yellow\)', _css)
+    and re.search(r'\.usage-state-card\.error\s+strong\s*\{\s*color:\s*var\(--status-yellow\)', _css))
+def _status_rel_lum(hexc):
+    rgb = [int(hexc[i:i+2], 16) / 255 for i in (1, 3, 5)]
+    linear = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+def _status_contrast(a, b):
+    hi, lo = sorted((_status_rel_lum(a), _status_rel_lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+_status_contrast_ok = all(_status_contrast(color, '#fdf6e3') >= 4.5 for color in
+    ['#c5221f', '#006d69', '#7c6200', '#557000', '#526870'])
+print(("PASS" if _status_rules_ok else "FAIL") + " approved status colors cover main, child, chips, and errors")
+print(("PASS" if _status_contrast_ok else "FAIL") + " status text contrast against Solarized Light is >=4.5:1")
+# Status recoloring must not leak into destructive controls, diffs, links, or high-usage telemetry.
+_status_scope_ok = bool(
+    re.search(r'button\.danger:hover:not\(:disabled\)\s*\{[^}]*var\(--red\)', _css)
+    and re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-row\.diff-add\s*\{[^}]*#eef5e3', _css)
+    and re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-row\.diff-del\s*\{[^}]*#fbe3e4', _css)
+    and re.search(r'\.msg-body\s+a\s*\{[^}]*color:\s*var\(--blue\)', _css)
+    and re.search(r'#usageInfo\.usage-high\s*\{[^}]*color:\s*var\(--red\)', _css))
+print(("PASS" if _status_scope_ok else "FAIL") + " status colors do not alter danger, diff, link, or usage-high colors")
 # 标题只保留共享 helper 的挂载点，不再内置简化静态 SVG；主点和轨道动画
 # 均由 busy-dot-wrap 现有 class 驱动，并在 reduced-motion 下完整关闭。
 _header_html = open(os.path.join(HERE, 'index.html'), encoding='utf-8').read()
@@ -8451,7 +8543,8 @@ _usage_responsive_ok = ('@media (max-width: 720px)' in _usage_css
     and '@media (max-width: 440px)' in _usage_css
     and '.usage-filters' in _usage_css and '.usage-kpis' in _usage_css
     and '.usage-filters :focus-visible' in _usage_css
-    and '#006da9' in _usage_css and '#a4202b' in _usage_css and '#765f00' in _usage_css
+    and '#006da9' in _usage_css and '#765f00' in _usage_css
+    and 'color: var(--status-yellow);' in _usage_css
     and 'color: var(--base01);' in _usage_css
     and '@media (prefers-reduced-motion: reduce)' in _usage_css)
 print(("PASS" if _usage_responsive_ok else "FAIL") + " usage responsive/focus/reduced-motion rules")
@@ -8461,4 +8554,4 @@ if not (_usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_r
 
 if MODE == 'header':
     sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _header_busy_ok else 1)
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok and _usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_responsive_ok else 1)
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _status_rules_ok and _status_contrast_ok and _status_scope_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok and _usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_responsive_ok else 1)

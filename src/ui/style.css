@@ -29,6 +29,8 @@
     --status-blue: #006aa6;
     --status-green: #557000;
     --status-red: #c5221f;
+    --status-cyan: #006d69;
+    --status-inactive: #526870;
   }
 
   * { box-sizing: border-box; }
@@ -116,8 +118,8 @@
   .top-actions { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
   .conn-state { font-size: 12px; color: var(--base01); }
   .conn-state.ok  { color: var(--green); }
-  .conn-state.retrying { color: var(--yellow); }
-  .conn-state.err { color: var(--red); }
+  .conn-state.retrying { color: var(--status-yellow); }
+  .conn-state.err { color: var(--status-yellow); }
 
   .token-box { display: flex; align-items: center; gap: 6px; }
   .token-toggle {
@@ -197,15 +199,15 @@
     align-items: center;
     gap: 10px;
     padding: 6px 14px;
-    background: #fbe3e4;      /* 浅红底 */
-    color: var(--red);
-    border-bottom: 1px solid var(--red);
+    background: #fdf3d7;      /* 提示横幅 */
+    color: var(--status-yellow);
+    border-bottom: 1px solid var(--yellow);
     font-size: 13px;
     flex: 0 0 auto;
   }
   .banner.warn {
     background: #fdf3d7;      /* 浅黄底 */
-    color: var(--yellow);
+    color: var(--status-yellow);
     border-bottom-color: var(--yellow);
   }
   .banner-text { flex: 1 1 auto; min-width: 0; }
@@ -277,9 +279,11 @@
     background: var(--green);
     flex: 0 0 auto;
   }
-  .busy-dot.busy { background: var(--blue); animation: pulse 1.2s infinite; }
-  .busy-dot.waiting { background: var(--yellow); }
-  /* 子行绿点：busy:false 但存活的 subagent（活着但空闲/在等） */
+  .busy-dot.busy { background: var(--red); animation: pulse 1.2s infinite; }
+  .busy-dot.waiting { background: var(--cyan); }
+  .busy-dot.error { background: var(--yellow); }
+  .busy-dot.inactive { background: var(--base1); }
+  /* 子行绿点：明确 busy:false 且仍存活的 idle subagent。 */
   .busy-dot-green { background: var(--green); }
   @keyframes pulse { 50% { opacity: 0.3; } }
 
@@ -295,11 +299,14 @@
     flex: 0 0 24px;
   }
   .busy-dot-wrap > svg { display: block; }   /* 去 SVG 底部基线空隙 */
-  /* 主点：idle 绿 / busy 蓝（pulse 呼吸）/ waiting 黄，fill 继承现有色板 */
+  /* 主点：idle 绿 / busy red（pulse 呼吸）/ waiting cyan / error yellow。 */
   .busy-dot-wrap .main-dot { fill: var(--green); }
-  .busy-dot-wrap .main-dot.busy { fill: var(--blue); animation: pulse 1.2s infinite; }
-  .busy-dot-wrap .main-dot.waiting { fill: var(--yellow); }
-  /* 环绕点：红（bash / busy delegate），绿（idle delegate 在等）。
+  .busy-dot-wrap .main-dot.busy { fill: var(--red); animation: pulse 1.2s infinite; }
+  .busy-dot-wrap .main-dot.waiting { fill: var(--cyan); }
+  .busy-dot-wrap .main-dot.error { fill: var(--yellow); }
+  .busy-dot-wrap .main-dot.inactive { fill: var(--base1); }
+  /* 环绕点：red（bash / busy delegate），cyan（waiting delegate），
+     yellow（failed delegate），green（idle delegate）。
      SVG circle 无盒模型，无法用 box-shadow 描边；用 stroke 给 0.5px 光环。 */
   .busy-dot-wrap .orbit-dot {
     fill: var(--red);
@@ -308,6 +315,9 @@
     animation: subagent-pulse 1.45s ease-in-out infinite;
   }
   .busy-dot-wrap .orbit-dot.green { fill: var(--green); }
+  .busy-dot-wrap .orbit-dot.waiting { fill: var(--cyan); }
+  .busy-dot-wrap .orbit-dot.error { fill: var(--yellow); }
+  .busy-dot-wrap .orbit-dot.inactive { fill: var(--base1); }
   /* 环绕点错峰呼吸（circle 是 SVG 子元素，nth-of-type 按元素类型计数——
      同为 circle 类型含主点，故主点也占用序号；用 nth-of-type 仍可从 1 起
      给环绕点错峰，主点在列表最后、动画不同不影响视觉错峰） */
@@ -317,16 +327,14 @@
   /* 「+N」溢出徽章：SVG 圆形，放在右上 60° 环绕槽位（N>6 时环绕点只画 5
      个、空出此位），作为环的「第 6 个节点」。圆形 + 与圆点同一 viewBox
      坐标系，比旧 HTML 矩形徽章更协调，且不再压正上/右上环绕点。 */
-  /* 描边式（浅底 + 红描边 + 红字）而非实心红底：徽章是「计数角标」不是
-     状态点，实心红底会让它视觉上像第二个主点、喧宾夺主。浅底红字更低调，
-     与环绕小红点形成「点 vs 标签」的层级区分。 */
+  /* 描边式中性计数角标，不把 aggregate count 误作错误状态。 */
   .busy-dot-wrap .orbit-badge circle {
     fill: var(--base3);
-    stroke: var(--red);
+    stroke: var(--base01);
     stroke-width: 0.75px;
   }
   .busy-dot-wrap .orbit-badge text {
-    fill: var(--red);
+    fill: var(--base01);
     font-size: 5.5px;
     font-weight: bold;
     text-anchor: middle;           /* 水平居中于 x */
@@ -342,11 +350,11 @@
     white-space: nowrap;
   }
   .status-chip.idle       { color: var(--status-green);  border-color: var(--green); }
-  .status-chip.busy       { color: var(--status-blue);   border-color: var(--blue); }
-  .status-chip.waiting    { color: var(--status-yellow); border-color: var(--yellow); }
-  .status-chip.compacting { color: var(--status-blue);   border-color: var(--blue); }
-  .status-chip.finished   { color: var(--status-blue);   border-color: var(--blue); }
-  .status-chip.error      { color: var(--status-red);    border-color: var(--red); }
+  .status-chip.busy       { color: var(--status-red);    border-color: var(--red); }
+  .status-chip.waiting    { color: var(--status-cyan);   border-color: var(--cyan); }
+  .status-chip.compacting { color: var(--status-red);    border-color: var(--red); }
+  .status-chip.finished   { color: var(--status-inactive); border-color: var(--base1); }
+  .status-chip.error      { color: var(--status-yellow); border-color: var(--yellow); }
 
   .hint { color: var(--base01); font-size: 13px; padding: 10px 2px; }
 
@@ -627,8 +635,8 @@
     color: var(--base02);
   }
   .tool-card .tool-result.err {
-    background: #fbe3e4;  /* 浅红底 */
-    color: var(--red);
+    background: #fdf3d7;  /* 浅黄底 */
+    color: var(--status-yellow);
   }
   .tool-card .tool-result.pending {
     background: var(--base2);
@@ -928,8 +936,8 @@
     overflow-wrap: break-word;
   }
   .msg-error {
-    color: var(--red);
-    border-left: 2px solid var(--red);
+    color: var(--status-yellow);
+    border-left: 2px solid var(--yellow);
     padding-left: 8px;
     white-space: pre-wrap;
     overflow-wrap: break-word;
@@ -1057,7 +1065,7 @@
   /* 复制反馈（图标按钮无文字）：成功绿 / 失败红变色 + title/aria 提示
      （copyTextToClipboard 加 class，1.2s 后撤掉） */
   .copy-toggle.icon-btn.copied { color: var(--green); border-color: var(--green); }
-  .copy-toggle.icon-btn.copy-err { color: var(--red); border-color: var(--red); }
+  .copy-toggle.icon-btn.copy-err { color: var(--status-yellow); border-color: var(--yellow); }
 
   /* 消息上限占位（app.js pruneMessages）：折叠最早的一批已完成块；
      summary 点击展开原位查看，另附「加载更早历史」链接（无更早时隐藏） */
@@ -1152,16 +1160,17 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* meta 尾部的会话状态：处理中（橙）、压缩中（蓝）、失败（红）；
+  /* meta 尾部的会话状态：处理中/压缩中 red、等待 cyan、失败 yellow；
      busy/compacting 前置转圈动画（纯 CSS 伪元素，不依赖 JS） */
   .composer-meta .composer-status {
     font-weight: 600;
     margin-left: 2px;
   }
-  .composer-status.busy { color: var(--status-blue); }
-  .composer-status.waiting { color: var(--status-yellow); }
-  .composer-status.compacting { color: var(--status-blue); }
-  .composer-status.error { color: var(--status-red); }
+  .composer-status.busy { color: var(--status-red); }
+  .composer-status.waiting { color: var(--status-cyan); }
+  .composer-status.compacting { color: var(--status-red); }
+  .composer-status.error { color: var(--status-yellow); }
+  .composer-status.finished { color: var(--status-inactive); }
   .composer-status.busy::before,
   .composer-status.compacting::before {
     content: "";
@@ -1200,7 +1209,7 @@
     border: 0;
   }
   .waiting-input {
-    border: 1px solid var(--yellow);
+    border: 1px solid var(--cyan);
     border-left-width: 4px;
     border-radius: 4px;
     background: var(--base2);
@@ -1209,7 +1218,7 @@
     overflow-wrap: anywhere;
   }
   .waiting-input-head {
-    color: var(--status-yellow);
+    color: var(--status-cyan);
     font-size: 12px;
     font-weight: 700;
     margin-bottom: 5px;
@@ -1217,7 +1226,7 @@
   .waiting-input-question { font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
   .waiting-input-status { color: var(--base01); font-size: 12px; margin-top: 5px; }
   .waiting-input-error {
-    color: var(--status-red);
+    color: var(--status-yellow);
     font-size: 12px;
     font-weight: 600;
     margin-top: 5px;
@@ -1230,7 +1239,7 @@
     font-size: 10px;
     white-space: nowrap;
   }
-  .tree-status.waiting { color: var(--status-yellow); }
+  .tree-status.waiting { color: var(--status-cyan); }
 
   /* 排队提示条（queueBar）：固定在输入区上方，不随消息滚动。 */
   .queue-bar {
@@ -1753,7 +1762,7 @@
     margin-left: 4px;   /* 与标题文字之间空一格 */
   }
   /* 分组头错误标记：muted 红字（服务器轮询失败，列表保留为 stale） */
-  .ws-err { color: var(--red); font-size: 11px; opacity: 0.8; }
+  .ws-err { color: var(--status-yellow); font-size: 11px; opacity: 0.8; }
   /* 瞬时网络/超时只提示列表正在重试，不把可用的 stale 会话当作致命错误。 */
   .ws-degraded { color: var(--base01); font-size: 11px; opacity: 0.8; }
   /* 「当前」标记：激活 workspace 分组头右侧 */
@@ -2189,8 +2198,8 @@
   .usage-state-card > div { max-width: 640px; }
   .usage-state-card strong { display: block; margin-bottom: 7px; color: var(--base02); font-size: 16px; }
   .usage-state-card p { margin: 0; line-height: 1.6; }
-  .usage-state-card.error { border-color: color-mix(in srgb, var(--red) 55%, var(--base1)); }
-  .usage-state-card.error strong { color: #a4202b; }
+  .usage-state-card.error { border-color: color-mix(in srgb, var(--yellow) 65%, var(--base1)); }
+  .usage-state-card.error strong { color: var(--status-yellow); }
   .usage-state-card.warning { border-color: color-mix(in srgb, var(--yellow) 65%, var(--base1)); }
   .usage-state-card.warning strong { color: #765f00; }
   .usage-spinner {

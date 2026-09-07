@@ -617,9 +617,13 @@ function updateCurrentSessionBusy() {
   // 归属于当前会话的任务。其它 workspace / 父会话即使 busy 也不能渗入标题。
   const kids = list.filter((s) => s.parent_session_id === current.id);
   const runningKidCount = renderSessionBusyDot(els.chatBusy, current, kids, state.workspace.id);
-  // 标题状态标记在主会话与子任务都空闲时保持安静；主会话空闲但仍有存活
-  // 子任务时必须显示绿色中心点和环绕点，不能只按 current.busy 门控。
-  els.chatBusy.hidden = current.busy !== true && runningKidCount === 0;
+  // 标题状态标记在主会话与子任务都空闲时保持安静；WaitingInput / Failed
+  // 是服务器明确报告的状态，仍须显示其各自的状态点，不能把它们藏成 idle。
+  const mainRunning = current.busy === true
+    || (current.busy === undefined && isRunningStatus(current.status));
+  const waiting = current.status === "WaitingInput";
+  const errored = !!current.status && current.status.startsWith("Failed");
+  els.chatBusy.hidden = !mainRunning && !waiting && !errored && runningKidCount === 0;
 }
 
 function renderChatSessionId(id) {
@@ -668,7 +672,8 @@ function updateComposerMeta() {
   const st = s && s.status ? String(s.status) : "";
   const showSt = st !== "" && st !== "Idle";
   const stCls = !showSt ? "" : (st.startsWith("Failed") ? "error"
-    : st === "WaitingInput" ? "waiting" : st === "Compacting" ? "compacting" : "busy");
+    : st === "WaitingInput" ? "waiting" : st === "Compacting" ? "compacting"
+    : st.startsWith("Finished") ? "finished" : "busy");
   const full = showSt ? text + " · " + statusLabel(st) : text;
   const curSt = meta.querySelector(".composer-status");
   const curCls = curSt ? curSt.className : "";
@@ -2125,17 +2130,36 @@ function isSubagentRunning(s) {
     && (s.busy === true || (s.busy === undefined && isRunningStatus(s.status)));
 }
 
-/* delegate 任务是否「在等」→ 环绕绿点：对应 subagent 会话 busy:false
-   （权威否定，活着但空闲/在等）；bash 任务 / busy:true / 找不到会话 →
-   红点。kids 优先（当前父节点的子会话），miss 时回退 state.lastList
-   （旧后端 label 匹配解析出的 id 可能在列表缓存里）。 */
-function taskIsWaitingGreen(t, kids) {
-  if (!t || t.kind !== "delegate") return false;
+/* delegate 任务的环绕点只依据其已知 subagent 会话状态分类：
+   WaitingInput → cyan，Failed → yellow，明确 busy:false 的 Idle → green。
+   bash、busy delegate 和找不到会话的 delegate 仍保留 red；缺失状态绝不猜成
+   waiting/error。kids 优先，miss 时回退 state.lastList（旧后端 label 匹配
+   解析出的 id 可能在列表缓存里）。 */
+function taskSubagentSession(t, kids) {
+  if (!t || t.kind !== "delegate") return null;
   const subId = resolveSubagentSessionId(t);
-  if (!subId) return false;
-  const sub = (kids || []).find((k) => k.id === subId)
-    || (state.lastList || []).find((k) => k.id === subId);
-  return !!sub && sub.busy === false;
+  if (!subId) return null;
+  return (kids || []).find((k) => k.id === subId)
+    || (state.lastList || []).find((k) => k.id === subId)
+    || null;
+}
+function taskIsInactive(t, kids) {
+  const sub = taskSubagentSession(t, kids);
+  return !!sub && (sub.active === false
+    || (sub.status && sub.status.startsWith("Finished")));
+}
+function taskIsWaitingGreen(t, kids) {
+  const sub = taskSubagentSession(t, kids);
+  return !!sub && !taskIsInactive(t, kids) && sub.status !== "WaitingInput"
+    && !(sub.status && sub.status.startsWith("Failed")) && sub.busy === false;
+}
+function taskIsWaitingInput(t, kids) {
+  const sub = taskSubagentSession(t, kids);
+  return !!sub && sub.status === "WaitingInput";
+}
+function taskHasError(t, kids) {
+  const sub = taskSubagentSession(t, kids);
+  return !!sub && !!sub.status && sub.status.startsWith("Failed");
 }
 
 /* 某 workspace 的任务数组：优先用该 ws 的 byWorkspace 缓存（pollTasks 每轮
@@ -2291,6 +2315,10 @@ function clearCurrentSession() {
    class、几何、徽章和 aria 语义只有这一处来源，避免标题退化成简化静态点。 */
 function renderSessionBusyDot(target, s, kids, wsId) {
   const waiting = s.status === "WaitingInput";
+  const errored = !!s.status && s.status.startsWith("Failed");
+  const running = s.busy === true || (s.busy === undefined && isRunningStatus(s.status));
+  const inactive = !waiting && !errored && !running
+    && (s.active === false || (s.status && s.status.startsWith("Finished")));
   // 环绕点数量 = 该父会话的全部后台任务数（/api/tasks：bash 后台任务 +
   // delegate subagent 任务）；任务快照未加载时回退 running 子会话计数。
   const wsTasks = tasksForWorkspace(wsId);
@@ -2302,7 +2330,7 @@ function renderSessionBusyDot(target, s, kids, wsId) {
     : parentTasks.length;
   const hasRunningKids = runningKidCount > 0;
   target.setAttribute("role", "img");
-  target.setAttribute("aria-label", (waiting ? "会话等待回答" : s.busy ? "会话处理中" : "会话空闲")
+  target.setAttribute("aria-label", (waiting ? "会话等待回答" : errored ? "会话失败" : running ? "会话处理中" : inactive ? "会话已结束" : "会话空闲")
     + (hasRunningKids ? "，" + runningKidCount + " 个任务处理中" : ""));
 
   // 24px SVG 中心点与轨道点共享坐标系，在任意 DPR 下保持严格同心。
@@ -2314,11 +2342,14 @@ function renderSessionBusyDot(target, s, kids, wsId) {
   for (let i = 0; i < visibleKidDots; i++) {
     const t = parentTasks ? parentTasks[i] : null;
     const green = t !== null && taskIsWaitingGreen(t, kids);
+    const taskWaiting = t !== null && taskIsWaitingInput(t, kids);
+    const taskError = t !== null && taskHasError(t, kids);
+    const taskInactive = t !== null && taskIsInactive(t, kids);
     const slotDeg = hasOverflow ? [0, 120, 180, 240, 300][i] : (360 * i) / visibleKidDots;
     const title = parentTasks
       ? taskDotTitle(t, i + 1, runningKidCount)
       : "子任务 " + (i + 1) + "/" + runningKidCount;
-    circles += `<circle class="orbit-dot${green ? " green" : ""}" cx="12" cy="12" r="2"` +
+    circles += `<circle class="orbit-dot${taskWaiting ? " waiting" : taskError ? " error" : taskInactive ? " inactive" : green ? " green" : ""}" cx="12" cy="12" r="2"` +
       ` transform="rotate(${slotDeg} 12 12) translate(0 ${-R})"` +
       ` aria-hidden="true"><title>${escapeHtml(title)}</title></circle>`;
   }
@@ -2336,7 +2367,7 @@ function renderSessionBusyDot(target, s, kids, wsId) {
   }
   target.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">` +
     circles +
-    `<circle class="main-dot${waiting ? " waiting" : s.busy ? " busy" : ""}" cx="12" cy="12" r="3" aria-hidden="true"></circle>` +
+    `<circle class="main-dot${waiting ? " waiting" : errored ? " error" : running ? " busy" : inactive ? " inactive" : ""}" cx="12" cy="12" r="3" aria-hidden="true"></circle>` +
     `</svg>`;
   return runningKidCount;
 }
@@ -2467,17 +2498,18 @@ function renderSubagentRows(container, kids, hist, wsId) {
   for (const k of kids) {
     const running = isSubagentRunning(k);
     const waiting = k.status === "WaitingInput";
+    const errored = !!k.status && k.status.startsWith("Failed");
     const row = el("div", "tree-row tree-row-child" + (hist ? " tree-hist" : "") +
       (state.workspace.id === wsId && state.sessionId === k.id ? " current" : ""));
-    // 子行状态点：running → 橙红 busy 点；busy:false 但活着（active !==
-    // false，或任务面板里还有对应 delegate 任务——delegate 在等后台任务
-    // 时条目仍在）→ 绿色 busy-dot-green（活着但空闲/在等）；inactive 历史
-    // 行（无任务、无 live）不点亮（现状）。
-    const idleAlive = !running && k.busy === false
+    // 子行状态点：Busy/Compacting → red，WaitingInput → cyan，Failed → yellow；
+    // 明确 busy:false 且 live 的 idle 保持 green，inactive 历史保持 gray。
+    const idleAlive = !running && !waiting && !errored && k.busy === false
       && (isSessionLive(k) || hasDelegateTask(k, wsId));
-    const dot = el("span", "busy-dot" + (waiting ? " waiting" : running ? " busy" : idleAlive ? " busy-dot-green" : ""));
+    const inactive = !waiting && !errored && !running && !idleAlive
+      && (k.active === false || (k.status && k.status.startsWith("Finished")));
+    const dot = el("span", "busy-dot" + (waiting ? " waiting" : errored ? " error" : running ? " busy" : idleAlive ? " busy-dot-green" : inactive ? " inactive" : ""));
     dot.setAttribute("role", "img");
-    dot.setAttribute("aria-label", waiting ? "会话等待回答" : running ? "会话处理中" : "会话空闲");
+    dot.setAttribute("aria-label", waiting ? "会话等待回答" : errored ? "会话失败" : running ? "会话处理中" : inactive ? "会话已结束" : "会话空闲");
     // label 优先：subagent 的任务面板标题最友好；旧 server 无 label → 回退 title/id
     // 有 label/title：两行（label/title 行 + 完整 id 行）；无则一行完整 id。
     const hasTitle = !!(k.label || k.title);
