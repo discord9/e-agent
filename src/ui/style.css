@@ -1939,17 +1939,47 @@
     cursor: pointer;
   }
   .task-row:hover { border-color: var(--blue); }
-  /* Indent the complete child card, including its border and background. The
-     reduced width stays inside the scrolling panel, so no horizontal overflow. */
+  /* Direct background children form a compact task tree. The complete card is
+     inset; decorative pseudo-elements draw a dashed trunk and elbow without
+     entering the accessibility or pointer-event trees. Last-child markers stop
+     beside the card header instead of connecting to the next unrelated root. */
   .task-row[data-task-depth="1"] {
+    position: relative;
     margin-inline-start: 24px;
     width: calc(100% - 24px);
+  }
+  .task-row[data-task-depth="1"]::before,
+  .task-row[data-task-depth="1"]::after {
+    content: "";
+    position: absolute;
+    pointer-events: none;
+    border-color: var(--base01);
+  }
+  .task-row[data-task-depth="1"]::before {
+    inset-inline-start: -14px;
+    top: -9px;
+    bottom: -9px;
+    border-inline-start: 1px dashed var(--base01);
+  }
+  .task-row[data-task-depth="1"]::after {
+    inset-inline-start: -14px;
+    top: 16px;
+    width: 13px;
+    border-top: 1px dashed var(--base01);
+  }
+  .task-row[data-task-connector="last"]::before,
+  .task-row[data-task-connector="only"]::before {
+    bottom: auto;
+    height: 25px;
   }
   @media (max-width: 640px) {
     .task-row[data-task-depth="1"] {
       margin-inline-start: 16px;
       width: calc(100% - 16px);
     }
+    .task-row[data-task-depth="1"]::before,
+    .task-row[data-task-depth="1"]::after { inset-inline-start: -10px; }
+    .task-row[data-task-depth="1"]::after { width: 9px; }
   }
   /* 当前会话发起的任务：左侧 cyan accent bar + hover 同色，扫一眼可辨 */
   .task-row.task-row-current {

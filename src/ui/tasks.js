@@ -285,7 +285,14 @@ function projectLiveTasks(tasks) {
       depths.set(child, 1);
     }
   }
-  return { ordered, depths };
+  const connectors = new Map();
+  for (let i = 0; i < ordered.length; i++) {
+    if (depths.get(ordered[i]) !== 1) continue;
+    const first = i === 0 || depths.get(ordered[i - 1]) !== 1;
+    const last = i === ordered.length - 1 || depths.get(ordered[i + 1]) !== 1;
+    connectors.set(ordered[i], first && last ? "only" : first ? "first" : last ? "last" : "middle");
+  }
+  return { ordered, depths, connectors };
 }
 
 function tasksListSig(list) {
@@ -725,6 +732,7 @@ function renderTaskList(tasks, container) {
   const projection = projectLiveTasks(tasks);
   const orderedTasks = projection.ordered;
   const depths = projection.depths;
+  const connectors = projection.connectors;
   if (!list) return;
   const rows = [...list.querySelectorAll(".task-row")];
   const byKey = new Map();
@@ -758,6 +766,7 @@ function renderTaskList(tasks, container) {
   for (const t of orderedTasks) {
     const key = taskKey(t);
     const depth = depths.get(t) || 0;
+    const connector = connectors.get(t) || "";
     const sig = taskKeySig(t);
     let row = byKey.get(key) || null;
     if (row) byKey.delete(key);
@@ -770,6 +779,8 @@ function renderTaskList(tasks, container) {
         else list.appendChild(row);
       }
       row.setAttribute("data-task-depth", String(depth));
+      if (connector) row.setAttribute("data-task-connector", connector);
+      else row.removeAttribute("data-task-connector");
       updateRetainedTaskRow(row, t, key);   // 静态输出就地更新（不重建）
       prev = row;
       continue;
@@ -779,7 +790,7 @@ function renderTaskList(tasks, container) {
       stopTaskStream(key);
       row.remove();
     }
-    const nrow = buildTaskRow(t, key, prevExpanded.has(key), depth);
+    const nrow = buildTaskRow(t, key, prevExpanded.has(key), depth, connector);
     if (prev && prev.nextSibling) list.insertBefore(nrow, prev.nextSibling);
     else list.appendChild(nrow);
     prev = nrow;
@@ -812,7 +823,7 @@ function updateRetainedTaskRow(row, t, key) {
 /* 单个任务卡片行（keyed 更新用）：data-task = key、data-key-sig = 元数据
    签名。restoreExpanded=true 时按展开态启动 500ms output 轮询 / delegate
    SSE 流（与旧 renderTaskList 的「重绘恢复展开态」语义一致）。 */
-function buildTaskRow(t, key, restoreExpanded, depth) {
+function buildTaskRow(t, key, restoreExpanded, depth, connector) {
   // 当前会话发起的任务（bash 的 session_id / delegate 的父 session_id 等于
   // 正在查看的会话）→ 行加 current 标记：左侧 cyan accent bar + 「本会话」
   // 标签，任务面板里一眼可辨哪些属于当前会话。
@@ -821,6 +832,7 @@ function buildTaskRow(t, key, restoreExpanded, depth) {
   row.setAttribute("data-task", key);
   row.setAttribute("data-key-sig", taskKeySig(t));
   row.setAttribute("data-task-depth", String(depth || 0));
+  if (connector) row.setAttribute("data-task-connector", connector);
     const isDelegate = t.kind === "delegate";
     row.title = isDelegate ? "点击切换到该子代理的会话" : "点击展开/收起输出（流式更新）";
     const line = el("div", "task-line");

@@ -826,6 +826,42 @@ async function main(){
       console.log(focusedFail===0 ? "ALL PASS" : focusedFail+" FAILURES");
       imports.system.exit(0);
     }
+    if (MODE === 'connector') {
+      let focusedFail=0;
+      const focusedChk=(name, ok, extra)=>{
+        if(!ok) focusedFail++;
+        console.log((ok?"PASS":"FAIL")+" "+name+(extra?"  "+extra:""));
+      };
+      const panel=elsById["composerTasks"];
+      panel.innerHTML="";
+      const parent={session_id:"root",id:201,kind:"delegate",label:"delegate",
+        subagent_session_id:"sub",_ws:"ws"};
+      const c1={session_id:"sub",id:202,kind:"bash",label:"one",owner_session:"sub",_ws:"ws",output:"one"};
+      const c2={session_id:"sub",id:203,kind:"bash",label:"two",owner_session:"sub",_ws:"ws",output:"two"};
+      const next={session_id:"root",id:204,kind:"bash",label:"next",owner_session:"root",_ws:"ws",output:"next"};
+      renderTaskList([c2,parent,c1,next],panel);
+      let rows=[...panel.querySelectorAll(".task-row")];
+      focusedChk("connector projection is parent, direct children, unrelated root",
+        rows.map(r=>r.getAttribute("data-task")).join("|") === [parent,c2,c1,next].map(taskKey).join("|"));
+      focusedChk("connector run has first/last and no marker on next root",
+        rows.map(r=>r.getAttribute("data-task-connector")||"-").join("|") === "-|first|last|-",
+        rows.map(r=>r.getAttribute("data-task-connector")||"-").join("|"));
+      const retained=rows[1]; retained._listeners["click"][0]();
+      const output=retained.querySelector(".task-output");
+      renderTaskList([c2,next],panel);
+      focusedChk("retained orphan loses connector without DOM rebuild",
+        panel.querySelectorAll(".task-row")[0] === retained
+        && retained.getAttribute("data-task-depth") === "0"
+        && retained.getAttribute("data-task-connector") === null && output.hidden === false);
+      const duplicate=Object.assign({},parent,{id:205});
+      renderTaskList([c1,parent,duplicate],panel);
+      rows=[...panel.querySelectorAll(".task-row")];
+      focusedChk("ambiguous ownership draws no false connector",
+        rows[0].getAttribute("data-task-depth") === "0"
+        && rows[0].getAttribute("data-task-connector") === null);
+      console.log(focusedFail===0 ? "ALL PASS" : focusedFail+" FAILURES");
+      imports.system.exit(focusedFail===0 ? 0 : 1);
+    }
     if (MODE === 'header') {
       let focusedFail=0;
       const focusedChk=(name, ok, extra)=>{
@@ -8137,6 +8173,10 @@ async function main(){
         && new Set(depthOrder).size === depthInitial.length
         && depthInitial.every((task) => depthOrder.includes(taskKey(task))),
         "count=" + depthOrder.length + " unique=" + new Set(depthOrder).size);
+    chk("direct-child connector markers identify first/middle/last runs",
+        depthRows.map((row) => row.getAttribute("data-task-connector") || "-").join("|")
+          === "-|-|first|last|-|-|only",
+        depthRows.map((row) => row.getAttribute("data-task-connector") || "-").join("|"));
 
     const depthDuplicate = Object.assign({}, depthParentA, { id: 8 });
     renderTaskList([depthChildA1, depthParentA, depthDuplicate], depthPanel);
@@ -8144,7 +8184,8 @@ async function main(){
     chk("ambiguous duplicate delegate parents leave child top-level",
         depthRows.map((row) => row.getAttribute("data-task")).join("|")
           === [depthChildA1, depthParentA, depthDuplicate].map(taskKey).join("|")
-        && depthRows[0].getAttribute("data-task-depth") === "0",
+        && depthRows[0].getAttribute("data-task-depth") === "0"
+        && depthRows[0].getAttribute("data-task-connector") === null,
         depthRows.map((row) => row.getAttribute("data-task")).join("|"));
     const depthCrossChild = Object.assign({}, depthChildA1, { id: 9, _ws: "depth-b" });
     renderTaskList([depthCrossChild, depthParentA], depthPanel);
@@ -8162,14 +8203,16 @@ async function main(){
     renderTaskList([depthChildA1], depthPanel);
     const depthOrphanedRow = depthPanel.querySelectorAll(".task-row")[0];
     const orphanedDepth = depthOrphanedRow.getAttribute("data-task-depth");
+    const orphanedConnector = depthOrphanedRow.getAttribute("data-task-connector");
     const stayedExpanded = retainedDepthOutput.hidden === false;
     renderTaskList([depthChildA1, depthParentA], depthPanel);
     const depthRestoredRow = depthPanel.querySelectorAll(".task-row")[1];
     chk("parent disappearance and return move the same child DOM while preserving expanded output",
         depthOrphanedRow === retainedDepthChild
-        && orphanedDepth === "0"
+        && orphanedDepth === "0" && orphanedConnector === null
         && stayedExpanded && depthRestoredRow === retainedDepthChild
         && depthRestoredRow.getAttribute("data-task-depth") === "1"
+        && depthRestoredRow.getAttribute("data-task-connector") === "only"
         && retainedDepthOutput.hidden === false,
         "same=" + (depthRestoredRow === retainedDepthChild)
         + " depth=" + depthRestoredRow.getAttribute("data-task-depth")
@@ -8405,6 +8448,7 @@ async function main(){
 main();
 '''.replace('MODE === \'direct\'', 'true' if MODE == 'direct' else 'false') \
    .replace("MODE === 'header'", 'true' if MODE == 'header' else 'false') \
+   .replace("MODE === 'connector'", 'true' if MODE == 'connector' else 'false') \
    .replace("MODE === 'usage-dashboard'", 'true' if MODE == 'usage-dashboard' else 'false') \
    .replace("MODE === 'composer-history'", 'true' if MODE == 'composer-history' else 'false') \
    .replace("MODE === 'markdown'", 'true' if MODE == 'markdown' else 'false') \
@@ -8453,6 +8497,12 @@ _task_card_indent_ok = bool(
     and re.search(r'width:\s*calc\(100%\s*-\s*16px\)', _task_mobile_css)
     and not re.search(r'\.task-row\[data-task-depth="1"\]\s*>', _css))
 print(("PASS" if _task_card_indent_ok else "FAIL") + " task child whole-card desktop/mobile indentation in style.css")
+_task_connector_ok = bool(
+    re.search(r'\.task-row\[data-task-depth="1"\]::before\s*,\s*\n\s*\.task-row\[data-task-depth="1"\]::after\s*\{[^}]*pointer-events:\s*none', _css)
+    and re.search(r'\.task-row\[data-task-depth="1"\]::before\s*\{[^}]*border-inline-start:\s*1px dashed', _css)
+    and re.search(r'\.task-row\[data-task-depth="1"\]::after\s*\{[^}]*border-top:\s*1px dashed', _css)
+    and re.search(r'\.task-row\[data-task-connector="last"\]::before\s*,\s*\n\s*\.task-row\[data-task-connector="only"\]::before\s*\{[^}]*height:', _css))
+print(("PASS" if _task_connector_ok else "FAIL") + " task child dashed trunk/elbow truncation is decorative")
 _m = re.search(r'\.composer-actions\s*\{([^}]*)\}', _css)
 _css_ok = bool(_m and re.search(r'margin-left:\s*auto', _m.group(1)))
 print(("PASS" if _css_ok else "FAIL") + " composer-actions margin-left:auto in style.css")
@@ -8703,6 +8753,8 @@ if not (_usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_r
     sys.exit(1)
 
 
+if MODE == 'connector':
+    sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _task_card_indent_ok and _task_connector_ok else 1)
 if MODE == 'header':
     sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _header_busy_ok else 1)
 sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _status_rules_ok and _status_contrast_ok and _status_scope_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok and _usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_responsive_ok else 1)
