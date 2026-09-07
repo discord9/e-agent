@@ -429,16 +429,16 @@ async fn reused_token_recovers_from_disk_rotation() {
 }
 
 #[tokio::test]
-async fn disk_auth_with_different_account_is_not_adopted() {
-    // The disk copy belongs to a different ChatGPT account: it must never be
-    // adopted silently — the exchange proceeds with the in-memory token.
+async fn disk_login_with_different_account_is_adopted() {
+    // A completed login is authoritative at the next request boundary, even
+    // when it intentionally switched ChatGPT accounts.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = [0; 4096];
         let count = stream.read(&mut request).await.unwrap();
-        assert!(String::from_utf8_lossy(&request[..count]).contains("memory-refresh"));
+        assert!(String::from_utf8_lossy(&request[..count]).contains("other-refresh"));
         let body = r#"{"access_token":"next-access","refresh_token":"next-refresh"}"#;
         stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
     });
@@ -469,8 +469,8 @@ async fn disk_auth_with_different_account_is_not_adopted() {
     auth.refresh_if_needed(false, None).await.unwrap();
     server.await.unwrap();
     assert_eq!(
-        auth.current_access_token_and_account().await.unwrap().0,
-        "next-access"
+        auth.current_access_token_and_account().await.unwrap(),
+        ("next-access".into(), "account-b".into())
     );
 }
 
@@ -514,4 +514,397 @@ async fn missing_or_corrupt_disk_auth_keeps_memory_logic() {
             "case: {label}"
         );
     }
+}
+
+#[tokio::test]
+async fn request_boundary_adopts_same_and_different_account_logins_for_clones() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("auth.json");
+    let old = AuthFile {
+        tokens: Tokens {
+            id_token: "old-id".into(),
+            access_token: "old-access".into(),
+            refresh_token: "old-refresh".into(),
+            account_id: Some("old-account".into()),
+        },
+        last_refresh: Utc::now(),
+    };
+    save_file(&path, &old).unwrap();
+    let auth = CodexAuth::from_file(path.clone(), old).unwrap();
+    let clone = auth.clone();
+
+    let same_account = AuthFile {
+        tokens: Tokens {
+            id_token: "same-id".into(),
+            access_token: "same-access".into(),
+            refresh_token: "same-refresh".into(),
+            account_id: Some("old-account".into()),
+        },
+        last_refresh: Utc::now(),
+    };
+    save_file(&path, &same_account).unwrap();
+    assert_eq!(
+        auth.access_token_and_account().await.unwrap(),
+        ("same-access".into(), "old-account".into())
+    );
+
+    let different_account = AuthFile {
+        tokens: Tokens {
+            id_token: "new-id".into(),
+            access_token: "new-access".into(),
+            refresh_token: "new-refresh".into(),
+            account_id: Some("new-account".into()),
+        },
+        last_refresh: Utc::now(),
+    };
+    save_file(&path, &different_account).unwrap();
+    assert_eq!(
+        clone.access_token_and_account().await.unwrap(),
+        ("new-access".into(), "new-account".into())
+    );
+}
+
+#[tokio::test]
+async fn invalid_disk_credentials_keep_nonexpired_memory_login() {
+    for content in [
+        None,
+        Some("not-json"),
+        Some(""),
+        Some(
+            r#"{"tokens":{"id_token":"id","access_token":"","refresh_token":"refresh","account_id":"other"},"last_refresh":"2020-01-01T00:00:00Z"}"#,
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.json");
+        let memory = AuthFile {
+            tokens: Tokens {
+                id_token: "memory-id".into(),
+                access_token: "memory-access".into(),
+                refresh_token: "memory-refresh".into(),
+                account_id: Some("memory-account".into()),
+            },
+            last_refresh: Utc::now(),
+        };
+        if let Some(content) = content {
+            std::fs::write(&path, content).unwrap();
+        }
+        let auth = CodexAuth::from_file(path, memory).unwrap();
+        assert_eq!(
+            auth.access_token_and_account().await.unwrap(),
+            ("memory-access".into(), "memory-account".into())
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_response_does_not_overwrite_login_observed_during_exchange() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("auth.json");
+    let disk_path = path.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let count = stream.read(&mut request).await.unwrap();
+        assert!(String::from_utf8_lossy(&request[..count]).contains("old-refresh"));
+        let login = AuthFile {
+            tokens: Tokens {
+                id_token: "login-id".into(),
+                access_token: "login-access".into(),
+                refresh_token: "login-refresh".into(),
+                account_id: Some("login-account".into()),
+            },
+            last_refresh: Utc::now(),
+        };
+        save_file(&disk_path, &login).unwrap();
+        let body =
+            r#"{"access_token":"stale-response-access","refresh_token":"stale-response-refresh"}"#;
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+    });
+    let old = AuthFile {
+        tokens: Tokens {
+            id_token: "old-id".into(),
+            access_token: "old-access".into(),
+            refresh_token: "old-refresh".into(),
+            account_id: Some("old-account".into()),
+        },
+        last_refresh: Utc::now() - ChronoDuration::days(9),
+    };
+    save_file(&path, &old).unwrap();
+    let auth = CodexAuth::from_file(path.clone(), old)
+        .unwrap()
+        .with_token_endpoint(endpoint);
+    auth.refresh_if_needed(false, None).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        auth.current_access_token_and_account().await.unwrap(),
+        ("login-access".into(), "login-account".into())
+    );
+    assert!(
+        std::fs::read_to_string(path)
+            .unwrap()
+            .contains("login-refresh")
+    );
+}
+
+#[tokio::test]
+async fn unauthorized_old_token_after_new_login_never_refreshes_old_account() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "a replaced login must not submit the rejected token's refresh token"
+        );
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("auth.json");
+    let old = AuthFile {
+        tokens: Tokens {
+            id_token: "old-id".into(),
+            access_token: "old-access".into(),
+            refresh_token: "old-refresh".into(),
+            account_id: Some("old-account".into()),
+        },
+        last_refresh: Utc::now(),
+    };
+    let auth = CodexAuth::from_file(path.clone(), old)
+        .unwrap()
+        .with_token_endpoint(endpoint);
+    let login = AuthFile {
+        tokens: Tokens {
+            id_token: "new-id".into(),
+            access_token: "new-access".into(),
+            refresh_token: "new-refresh".into(),
+            account_id: Some("new-account".into()),
+        },
+        last_refresh: Utc::now(),
+    };
+    save_file(&path, &login).unwrap();
+    auth.refresh_after_unauthorized("old-access").await.unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        auth.current_access_token_and_account().await.unwrap(),
+        ("new-access".into(), "new-account".into())
+    );
+}
+
+#[tokio::test]
+async fn expired_disk_login_after_401_refreshes_adopted_account() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let count = stream.read(&mut request).await.unwrap();
+        let request = String::from_utf8_lossy(&request[..count]);
+        assert!(request.contains("new-account-refresh"));
+        assert!(!request.contains("old-account-refresh"));
+        let body = r#"{"access_token":"recovered-access","refresh_token":"recovered-refresh"}"#;
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("auth.json");
+    let old = AuthFile {
+        tokens: Tokens {
+            id_token: "old-id".into(),
+            access_token: "old-access".into(),
+            refresh_token: "old-account-refresh".into(),
+            account_id: Some("old-account".into()),
+        },
+        last_refresh: Utc::now(),
+    };
+    let auth = CodexAuth::from_file(path.clone(), old)
+        .unwrap()
+        .with_token_endpoint(endpoint);
+    let expired_login = AuthFile {
+        tokens: Tokens {
+            id_token: "new-id".into(),
+            access_token: jwt(serde_json::json!({"exp": 0})),
+            refresh_token: "new-account-refresh".into(),
+            account_id: Some("new-account".into()),
+        },
+        last_refresh: Utc::now(),
+    };
+    save_file(&path, &expired_login).unwrap();
+    auth.refresh_after_unauthorized("old-access").await.unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        auth.current_access_token_and_account().await.unwrap(),
+        ("recovered-access".into(), "new-account".into())
+    );
+}
+
+#[tokio::test]
+async fn expired_login_arriving_during_refresh_uses_remaining_exchange_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("auth.json");
+    let disk_path = path.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut request = [0; 4096];
+        let (mut first, _) = listener.accept().await.unwrap();
+        let count = first.read(&mut request).await.unwrap();
+        assert!(String::from_utf8_lossy(&request[..count]).contains("old-refresh"));
+        let expired_login = AuthFile {
+            tokens: Tokens {
+                id_token: "new-id".into(),
+                access_token: jwt(serde_json::json!({"exp": 0})),
+                refresh_token: "new-refresh".into(),
+                account_id: Some("new-account".into()),
+            },
+            last_refresh: Utc::now(),
+        };
+        save_file(&disk_path, &expired_login).unwrap();
+        let stale = r#"{"access_token":"stale-access","refresh_token":"stale-refresh"}"#;
+        first.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", stale.len(), stale).as_bytes()).await.unwrap();
+        let (mut second, _) = listener.accept().await.unwrap();
+        let count = second.read(&mut request).await.unwrap();
+        let request = String::from_utf8_lossy(&request[..count]);
+        assert!(request.contains("new-refresh"));
+        assert!(!request.contains("old-refresh"));
+        let fresh = r#"{"access_token":"fresh-access","refresh_token":"fresh-refresh"}"#;
+        second.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", fresh.len(), fresh).as_bytes()).await.unwrap();
+    });
+    let old = AuthFile {
+        tokens: Tokens {
+            id_token: "old-id".into(),
+            access_token: jwt(serde_json::json!({"exp": 0})),
+            refresh_token: "old-refresh".into(),
+            account_id: Some("old-account".into()),
+        },
+        last_refresh: Utc::now(),
+    };
+    save_file(&path, &old).unwrap();
+    let auth = CodexAuth::from_file(path.clone(), old)
+        .unwrap()
+        .with_token_endpoint(endpoint);
+    auth.refresh_if_needed(false, None).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        auth.current_access_token_and_account().await.unwrap(),
+        ("fresh-access".into(), "new-account".into())
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_save_does_not_readopt_unchanged_predecessor_disk_snapshot() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let count = stream.read(&mut request).await.unwrap();
+        assert!(String::from_utf8_lossy(&request[..count]).contains("old-refresh"));
+        let body = r#"{"access_token":"rotated-access","refresh_token":"rotated-refresh"}"#;
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("auth.json");
+    let old = AuthFile {
+        tokens: Tokens {
+            id_token: "old-id".into(),
+            access_token: "old-access".into(),
+            refresh_token: "old-refresh".into(),
+            account_id: Some("account".into()),
+        },
+        last_refresh: Utc::now() - ChronoDuration::days(9),
+    };
+    save_file(&path, &old).unwrap();
+    let auth = CodexAuth::from_file(path.clone(), old)
+        .unwrap()
+        .with_token_endpoint(endpoint);
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(auth.refresh_if_needed(false, None).await.is_err());
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        auth.access_token_and_account().await.unwrap(),
+        ("rotated-access".into(), "account".into())
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn final_failed_exchange_adopts_fresh_login_without_a_third_exchange() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("auth.json");
+    let disk_path = path.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut request = [0; 4096];
+        // Exchange one uses A. Its response arrives after expired B replaced
+        // disk, causing exchange two to use B.
+        let (mut first, _) = listener.accept().await.unwrap();
+        let count = first.read(&mut request).await.unwrap();
+        assert!(String::from_utf8_lossy(&request[..count]).contains("a-refresh"));
+        let expired_b = AuthFile {
+            tokens: Tokens {
+                id_token: "b-id".into(),
+                access_token: jwt(serde_json::json!({"exp": 0})),
+                refresh_token: "b-refresh".into(),
+                account_id: Some("b-account".into()),
+            },
+            last_refresh: Utc::now(),
+        };
+        save_file(&disk_path, &expired_b).unwrap();
+        let stale = r#"{"access_token":"stale-access","refresh_token":"stale-refresh"}"#;
+        first.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", stale.len(), stale).as_bytes()).await.unwrap();
+
+        // During B's final allowed exchange, a fresh C login wins even though
+        // B's refresh fails. There must be no third exchange.
+        let (mut second, _) = listener.accept().await.unwrap();
+        let count = second.read(&mut request).await.unwrap();
+        let request = String::from_utf8_lossy(&request[..count]);
+        assert!(request.contains("b-refresh"));
+        assert!(!request.contains("a-refresh"));
+        let fresh_c = AuthFile {
+            tokens: Tokens {
+                id_token: "c-id".into(),
+                access_token: "c-access".into(),
+                refresh_token: "c-refresh".into(),
+                account_id: Some("c-account".into()),
+            },
+            last_refresh: Utc::now(),
+        };
+        save_file(&disk_path, &fresh_c).unwrap();
+        let body = r#"{"error":"refresh_token_reused"}"#;
+        second.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let expired_a = AuthFile {
+        tokens: Tokens {
+            id_token: "a-id".into(),
+            access_token: jwt(serde_json::json!({"exp": 0})),
+            refresh_token: "a-refresh".into(),
+            account_id: Some("a-account".into()),
+        },
+        last_refresh: Utc::now(),
+    };
+    save_file(&path, &expired_a).unwrap();
+    let auth = CodexAuth::from_file(path, expired_a)
+        .unwrap()
+        .with_token_endpoint(endpoint);
+    auth.refresh_if_needed(false, None).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        auth.current_access_token_and_account().await.unwrap(),
+        ("c-access".into(), "c-account".into())
+    );
 }
