@@ -238,6 +238,108 @@ function normalizeWorkspaceUrl(url) {
   return String(url || "").trim().replace(/\/+$/, "");
 }
 
+/* Launcher bootstrap is a bounded, credential-free JSON fragment.  It is
+   consumed once before transport startup; it is never fetched or watched. */
+const MULTI_MANIFEST_VERSION = 1;
+const MULTI_FRAGMENT_PREFIX = "#eagent-workspaces=";
+const MULTI_MAX_BYTES = 16 * 1024;
+const MULTI_MAX_RECORDS = 32;
+const MULTI_BAD_IDS = new Set(["__proto__", "prototype", "constructor"]);
+
+function launcherOwnedId(source, id) {
+  // A source-bound namespace means a launcher cannot overwrite manual IDs.
+  return "launcher-" + source.replace(/[^A-Za-z0-9]/g, "_") + "-" + id;
+}
+function safeLauncherId(id) {
+  return typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id)
+    && !MULTI_BAD_IDS.has(id.toLowerCase());
+}
+function safeLauncherName(name) {
+  return typeof name === "string" && name === name.trim() && Array.from(name).length > 0
+    && Array.from(name).length <= 120
+    && !/[\x00-\x1f\x7f]/.test(name);
+}
+function strictLoopbackOrigin(text) {
+  // Exact grammar avoids URL parser normalization (localhost, path, userinfo,
+  // whitespace, IPv6 and leading-zero ports are all rejected).
+  if (typeof text !== "string" || /[\\\s]/.test(text)) return null;
+  const match = /^http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})$/.exec(text);
+  if (!match) return null;
+  const port = Number(match[1]);
+  return Number.isInteger(port) && port <= 65535 && port !== 80 ? { origin: text, port } : null;
+}
+
+function readLauncherPayload() {
+  const hash = String(location.hash || "");
+  if (!hash.startsWith(MULTI_FRAGMENT_PREFIX)) return null;
+  // Always consume the fragment before validation/prompting, preserving deep link query.
+  history.replaceState(null, "", (location.pathname || "/") + (location.search || ""));
+  let bytes, value;
+  try {
+    bytes = decodeURIComponent(hash.slice(MULTI_FRAGMENT_PREFIX.length));
+    if (new TextEncoder().encode(bytes).length > MULTI_MAX_BYTES) return null;
+    value = JSON.parse(bytes);
+  } catch (e) { return null; }
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== 4 || Object.keys(value).some(k => !["version", "source", "primary", "workspaces"].includes(k))
+      || value.version !== MULTI_MANIFEST_VERSION || !safeLauncherId(value.primary)
+      || !Array.isArray(value.workspaces) || !value.workspaces.length || value.workspaces.length > MULTI_MAX_RECORDS) return null;
+  const source = strictLoopbackOrigin(value.source);
+  if (!source || source.origin !== value.source) return null;
+  const ids = new Set(), ports = new Set(), workspaces = [];
+  for (const item of value.workspaces) {
+    if (!item || typeof item !== "object" || Array.isArray(item) || Object.keys(item).length !== 3
+      || Object.keys(item).some(k => !["id", "name", "url"].includes(k)) || !safeLauncherId(item.id)
+      || !safeLauncherName(item.name) || ids.has(item.id)) return null;
+    const endpoint = strictLoopbackOrigin(item.url);
+    if (!endpoint || endpoint.port === source.port || ports.has(endpoint.port)) return null;
+    ids.add(item.id); ports.add(endpoint.port);
+    workspaces.push({ id: item.id, name: item.name, url: endpoint.origin });
+  }
+  if (!ids.has(value.primary) || !workspaces.some(w => w.url === location.origin)) return null;
+  return { source: source.origin, primary: value.primary, workspaces };
+}
+function launcherImportPlan(payload) {
+  const additions = [], changes = [], skips = [];
+  for (const incoming of payload.workspaces) {
+    const ownedId = launcherOwnedId(payload.source, incoming.id);
+    // Empty manual URLs are this UI's same-origin endpoint; compare the
+    // effective normalized endpoint before deciding whether to import.
+    const sameEndpoint = state.workspaces.find(ws =>
+      normalizeWorkspaceUrl(ws.url || location.origin) === incoming.url);
+    const existing = state.workspaces.find(ws => ws.id === ownedId);
+    if (sameEndpoint && (!existing || existing !== sameEndpoint)) { skips.push(incoming); continue; }
+    if (existing && (!existing.launcherSource || existing.launcherSource !== payload.source)) return null;
+    if (existing) {
+      if (existing.name !== incoming.name || existing.url !== incoming.url) changes.push({ existing, incoming });
+      else skips.push(incoming);
+    } else additions.push({ id: ownedId, name: incoming.name, url: incoming.url, token: "", launcherSource: payload.source });
+  }
+  return { additions, changes, skips };
+}
+function importLauncherWorkspaces() {
+  const payload = readLauncherPayload();
+  if (!payload) return;
+  const plan = launcherImportPlan(payload);
+  if (!plan) { setBanner("无法导入启动器工作区；现有工作区仍可使用", true); return; }
+  if (plan.additions.length || plan.changes.length) {
+    const details = plan.additions.map(w => "新增: " + w.name + " " + w.url)
+      .concat(plan.changes.map(c => "更新: " + c.existing.name + " → " + c.incoming.name + " " + c.incoming.url))
+      .concat(plan.skips.map(w => "跳过现有端点: " + w.name)).join("\n");
+    if (!window.confirm("导入自 " + payload.source + " 的工作区？\n" + details
+        + "\n警告：现有全局或每工作区凭据将发送到导入的端点。")) return;
+  }
+  const oldActive = state.workspace && state.workspace.id;
+  for (const change of plan.changes) { change.existing.name = change.incoming.name; change.existing.url = change.incoming.url; }
+  state.workspaces.push(...plan.additions);
+  const primary = launcherOwnedId(payload.source, payload.primary);
+  state.workspace = state.workspaces.find(ws => ws.id === oldActive)
+    || state.workspaces.find(ws => ws.id === primary) || state.workspaces[0];
+  state.token = state.workspace.token || state.globalToken;
+  if (plan.additions.length || plan.changes.length) saveWorkspaces();
+  renderWorkspaceSelect();
+}
+
 function saveWorkspaces() {
   try {
     localStorage.setItem("eagent.workspaces", JSON.stringify(state.workspaces));
