@@ -715,6 +715,9 @@ function init() {
   // 桌宠点击时从这里读当前 sessionId / token / 运行中任务。
   window.state = state;
   refreshBanner();
+  // A launcher-only fragment may merge loopback workspaces.  It never sends
+  // authorization data and starts before transport polling reads the active ws.
+  importLauncherWorkspaces();
   // 软键盘适配：初始同步高度；visualViewport.resize 同时覆盖键盘与缩放，
   // syncAppHeight 会用 scale 区分两者；window.resize 是旧浏览器兜底。
   syncAppHeight();

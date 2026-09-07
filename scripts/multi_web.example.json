@@ -1,0 +1,10 @@
+{
+  "landing_port": 8765,
+  "open_browser": true,
+  "primary": "repo-a",
+  "command": "e-agent",
+  "servers": [
+    {"id":"repo-a","label":"Repo A","cwd":"../repo-a","port":8766,"enabled":true,"profile":"provider/model","args":["--read-only"]},
+    {"id":"repo-b","label":"Repo B","cwd":"../repo-b","port":8767,"enabled":true,"args":[]}
+  ]
+}

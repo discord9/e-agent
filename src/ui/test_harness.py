@@ -7,7 +7,7 @@ fire in this mode, so the harness flushes microtasks instead of sleeping.
 
 Not part of the product; safe to delete.
 """
-import os, re, subprocess, sys
+import json, os, re, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # index.html 的 <script> 是构建期占位符（/*__JS_APP__*/ 等由 server.rs 替换），
@@ -19,13 +19,15 @@ vendor_js = open(os.path.join(HERE, 'vendor', 'marked.min.js'), encoding='utf-8'
 usage_dashboard_js = open(os.path.join(HERE, 'usage-dashboard.js'), encoding='utf-8').read()
 
 MODE = os.environ.get('MODE', 'open')   # 'open' = full suite; 'markdown' = focused DOM-safety/rendering checks; 'composer-history' = focused ArrowUp checks
-DEEP_LINK = os.environ.get('DEEP_LINK', '')   # 注入 ?session=<id> 到 location.search（init 启动时解析）
+DEEP_LINK = os.environ.get('DEEP_LINK', '')
+CROSS_PAYLOAD = os.environ.get('CROSS_PAYLOAD', '')   # 注入 ?session=<id> 到 location.search（init 启动时解析）
 TRACE = os.environ.get('TRACE') == '1'
 # gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；页面 JS 里的 new TextDecoder() 换成桩工厂。
 # 注意：拆分后 tasks.js（startTaskStream）在 sse.js 之前拼接，无缩进的搜索串会先命中
 # startTaskStream 里的同名行；这里带 2 空格缩进精确匹配 readSSEStream（唯一 2 空格缩进的
 # 那处），保持与拆分前一致的注入目标（startTaskStream 的 TextDecoder 在 harness 中从不执行）。
 js = js.replace('  const decoder = new TextDecoder();', '  const decoder = makeTextDecoder();')
+if MODE == 'fragment': js = js.replace('init();\n', 'if (!globalThis.__fragmentHarness) init();\n')
 if TRACE:
     js = js.replace('async function readSSEStream(reader, id, wsId, epoch, ctrl) {',
         'async function readSSEStream(reader, id) {\n  console.log("SSE: stream start");')
@@ -270,12 +272,13 @@ globalThis.document={ createElement:t=>new El(t), createComment:t=>new El("#comm
   getElementById:id=>elsById[id], addEventListener(type,fn){ _docListeners[type]=fn; },
   dispatchEvent(e){ if(_docListeners[e.type]) _docListeners[e.type](e); }, documentElement:_docEl };
 globalThis.navigator={ onLine:true };
+globalThis.TextEncoder=class { encode(s){ return new Uint8Array(Array.from(unescape(encodeURIComponent(String(s)))).map(c=>c.charCodeAt(0))); } };
 globalThis.confirm=()=>true;
 // gjs 自带 window 全局（不可整体替换）：就地补上页面需要的属性
 window.visualViewport=null; window.innerHeight=800;
 window.addEventListener=()=>{}; window.confirm=()=>true; window.setTimeout=()=>0; window.clearTimeout=()=>{};
 globalThis.history={ replaceState(){} };
-globalThis.location={ search:"__DEEP_LINK_SEARCH__" };
+globalThis.location={ pathname:"/", search:"__DEEP_LINK_SEARCH__", hash:"", origin:"http://127.0.0.1:19002" };
 /* URL 解析入口可配置：DEEP_LINK env → location.search（?session=<id>），
    init() 在页面加载时读它；测试也可直接改 location.search 后重跑 init()。
    URLSearchParams 桩做最小解析（?a=b&c=d，支持 URL 解码），键不存在 get
@@ -712,6 +715,80 @@ async function flush(){ for(let i=0;i<200;i++) await Promise.resolve(); }
 async function main(){
   let fail=0;
   const chk=(name, ok, extra)=>{ if(!ok) fail++; console.log((ok?"PASS":"FAIL")+" "+name+(extra?"  "+extra:"")); };
+  if (MODE === 'fragment') {
+    const crossPayload = "__CROSS_PAYLOAD__";
+    const payload = {version:1, source:"http://127.0.0.1:19001", primary:"a", workspaces:[
+      {id:"a",name:"A",url:"http://127.0.0.1:19002"}, {id:"b",name:"B",url:"http://127.0.0.1:19003"}]};
+    let replaced = "", confirms = 0, fetched = 0;
+    history.replaceState = (_a,_b,url) => { replaced=url; location.hash=""; };
+    globalThis.fetch = () => { fetched++; throw new Error("must not fetch"); };
+    window.confirm = globalThis.confirm = text => { confirms++; return text.includes("http://127.0.0.1:19001") && text.includes("全局或每工作区凭据"); };
+    location.pathname="/deep"; location.search="?session=s1";
+    location.hash="#eagent-workspaces=" + encodeURIComponent(JSON.stringify(payload));
+    state.workspaces=[{id:"manual",name:"Manual",url:"http://127.0.0.1:19999",token:"manual-token"}];
+    state.workspace=state.workspaces[0]; state.globalToken="global-token"; state.token="manual-token";
+    location.hash="#eagent-workspaces=" + encodeURIComponent(JSON.stringify(payload)); importLauncherWorkspaces();
+    chk("fragment removed preserves path/query", replaced === "/deep?session=s1");
+    if (crossPayload) { const originalOrigin = location.origin;
+      location.origin = JSON.parse(crossPayload).workspaces[0].url;
+      location.hash="#eagent-workspaces=" + encodeURIComponent(crossPayload);
+      const cross = readLauncherPayload(); location.origin = originalOrigin;
+      chk("Python UTF-8 payload parses with codepoint names", cross !== null && cross.workspaces[0].name === "😀".repeat(90)); }
+    chk("fragment no fetch or listener", fetched === 0 && !String(importLauncherWorkspaces).includes("fragmentchange"));
+    chk("fragment confirms and source-bound imports", confirms === 1 && state.workspaces.length === 3
+      && state.workspaces[1].launcherSource === payload.source && state.workspaces[1].token === "");
+    chk("manual order token and active preserved", state.workspaces[0].token === "manual-token" && state.workspace.id === "manual");
+    // An empty manual URL is the current origin and wins over a launcher record.
+    const defaultManual={id:"default",name:"Default",url:"",token:"default-token"};
+    state.workspaces=[defaultManual]; state.workspace=defaultManual; state.token="default-token";
+    const same={...payload, primary:"a", workspaces:[{id:"a",name:"A",url:"http://127.0.0.1:19002"}]};
+    location.hash="#eagent-workspaces="+encodeURIComponent(JSON.stringify(same)); importLauncherWorkspaces();
+    chk("default manual same-origin wins without global fallback", state.workspaces.length === 1 && state.workspaces[0] === defaultManual && state.token === "default-token");
+    state.workspaces=[{id:"manual",name:"Manual",url:"http://127.0.0.1:19999",token:"manual-token"}]; state.workspace=state.workspaces[0]; state.token="manual-token";
+    const saved = JSON.stringify(state.workspaces), active = state.workspace;
+    const stored = JSON.stringify(_ls);
+    let hashAtConfirm = "not-cleared";
+    window.confirm = globalThis.confirm = () => { hashAtConfirm = location.hash; return false; };
+    payload.workspaces[0].name="A changed"; location.hash="#eagent-workspaces=" + encodeURIComponent(JSON.stringify(payload));
+    importLauncherWorkspaces();
+    chk("cancel clears before confirm and leaves state/storage unchanged", hashAtConfirm === "" && JSON.stringify(state.workspaces) === saved && state.workspace === active && JSON.stringify(_ls) === stored);
+    window.confirm = globalThis.confirm = () => { confirms++; return true; };
+    location.hash="#eagent-workspaces=" + encodeURIComponent(JSON.stringify(payload)); try { importLauncherWorkspaces(); } catch(e) { console.log("fragment exception", String(e)); }
+    chk("owned update preserves token and confirms", state.workspaces[1].name === "A changed" && confirms >= 2);
+    const before = JSON.stringify(state.workspaces); location.hash="#eagent-workspaces=" + encodeURIComponent(JSON.stringify(payload)); importLauncherWorkspaces();
+    chk("identical import is no-op", JSON.stringify(state.workspaces) === before);
+    // Structural rejection: unknown token-shaped keys and every unsafe origin form.
+    const bads = [
+      '{"version":1,"version":1,"source":"http://127.0.0.1:19001","primary":"a","workspaces":[]}',
+      JSON.stringify({...payload, token:"x"}), JSON.stringify({...payload, version:"1"}),
+      JSON.stringify({...payload, primary:1}), JSON.stringify({...payload, workspaces:[{id:"a",name:"A",url:"http://127.0.0.1:19002",token:"x"}]}),
+      ...["http://127.0.0.1:1/x","http://u@127.0.0.1:1","http://127.0.0.1:1?x","http://127.0.0.1:1#x","http://[::1]:1"," http://127.0.0.1:1"].map(source => JSON.stringify({...payload,source})),
+      ...["http://127.0.0.1:19002/x","http://u@127.0.0.1:19002","http://127.0.0.1:19002?x","http://[::1]:1"].map(url => JSON.stringify({...payload,workspaces:[{id:"a",name:"A",url}]})),
+      JSON.stringify({...payload,workspaces:[payload.workspaces[0],payload.workspaces[0]]}),
+      JSON.stringify({...payload,workspaces:[{id:"a",name:"A",url:"http://127.0.0.1:19002"},{id:"b",name:"B",url:"http://127.0.0.1:19002"}]}),
+      JSON.stringify({...payload,workspaces:[{id:"a",name:"A",url:"http://127.0.0.1:19003"}]}),
+      JSON.stringify({...payload, source:"http://localhost:19001"}),
+      JSON.stringify({...payload, workspaces:[{id:"__proto__",name:"A",url:"http://127.0.0.1:19002"}]}),
+      JSON.stringify({...payload, workspaces:[{id:"a",name:" <b>",url:"http://127.0.0.1:19002"}]}),
+      JSON.stringify({...payload, source:"http://127.0.0.1:80"}),
+      JSON.stringify({...payload, workspaces:[{id:"a",name:"A",url:"http://127.0.0.1:19001"}]}),
+      JSON.stringify({...payload, workspaces:[{id:"a",name:"A",url:"http://127.0.0.1:80"}]}),
+      JSON.stringify({...payload, primary:"w0", workspaces:Array.from({length:33}, (_,i)=>({id:"w"+i,name:"A",url:"http://127.0.0.1:"+(20000+i)}))})];
+    const byteValid={...payload, workspaces:Array.from({length:32}, (_,i)=>({id:"u"+i,name:"😀".repeat(90),url:"http://127.0.0.1:"+(21000+i)})),primary:"u0"};
+    location.origin=byteValid.workspaces[0].url; location.hash="#eagent-workspaces="+encodeURIComponent(JSON.stringify(byteValid));
+    chk("valid byte-bounded distinct 32 records parse", readLauncherPayload() !== null); location.origin="http://127.0.0.1:19002";
+    const stale={id:"launcher-http___127_0_0_1_19001-old",name:"old",url:"http://127.0.0.1:19004",token:"keep",launcherSource:payload.source}; state.workspaces.push(stale);
+    state.workspaces[1].token="owned-token"; state.workspace={id:"gone",token:""};
+    location.hash="#eagent-workspaces="+encodeURIComponent(JSON.stringify(payload)); importLauncherWorkspaces();
+    chk("owned token stale retention and primary fallback", state.workspaces[1].token === "owned-token" && state.workspaces.includes(stale) && state.workspace.id.includes("-a"));
+    state.workspaces.unshift({id:"launcher-http___127_0_0_1_19001-z",name:"manual collision",url:"http://127.0.0.1:19998",token:"m"}); const collision=JSON.stringify(state.workspaces);
+    const z={...payload,workspaces:[{id:"z",name:"Z",url:"http://127.0.0.1:19005"}]}; location.hash="#eagent-workspaces="+encodeURIComponent(JSON.stringify(z)); importLauncherWorkspaces();
+    chk("owned manual ID collision rejects", JSON.stringify(state.workspaces) === collision);
+    const snap=JSON.stringify(state.workspaces); for (const raw of bads) { location.hash="#eagent-workspaces="+encodeURIComponent(raw); importLauncherWorkspaces(); }
+    location.hash="#eagent-workspaces=" + "x".repeat(16385); importLauncherWorkspaces();
+    chk("strict malformed rejection leaves state unchanged", JSON.stringify(state.workspaces) === snap);
+    console.log(fail===0 ? "ALL PASS" : fail+" FAILURES"); imports.system.exit(0);
+  }
   try {
     state.globalToken="test-token";   // 全局回退 token（workspaceToken 的兜底）
     state.token="test-token";         // 激活 workspace 派生 token（兼容既有引用）
@@ -8094,9 +8171,12 @@ main();
    .replace("MODE === 'composer-history'", 'true' if MODE == 'composer-history' else 'false') \
    .replace("MODE === 'markdown'", 'true' if MODE == 'markdown' else 'false') \
    .replace("MODE === 'waiting-input'", 'true' if MODE == 'waiting-input' else 'false') \
-   .replace("MODE === 'refresh-deep-link'", 'true' if MODE == 'refresh-deep-link' else 'false')
+   .replace("MODE === 'refresh-deep-link'", 'true' if MODE == 'refresh-deep-link' else 'false') \
+   .replace("MODE === 'fragment'", 'true' if MODE == 'fragment' else 'false')
 
 # DEEP_LINK env → location.search 注入（init() 启动时 URL 解析入口）
+HARNESS = HARNESS.replace('globalThis.location={ pathname:', 'globalThis.__fragmentHarness=' + ('true' if MODE == 'fragment' else 'false') + '; globalThis.location={ pathname:')
+TAIL = TAIL.replace('__CROSS_PAYLOAD__', json.dumps(CROSS_PAYLOAD)[1:-1])
 HARNESS = HARNESS.replace('__DEEP_LINK_SEARCH__', ('?session=' + DEEP_LINK) if DEEP_LINK else '')
 
 out = os.path.join(HERE, '.test_harness.js')
