@@ -755,3 +755,40 @@ async fn stream_decode_error_is_retried_then_succeeds() {
         })
     );
 }
+
+#[tokio::test]
+async fn responses_request_hot_reloads_disk_login_headers() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for (access, account) in [("access", "account"), ("new-access", "new-account")] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
+            assert!(request.contains(&format!("authorization: bearer {access}")));
+            assert!(request.contains(&format!("chatgpt-account-id: {account}")));
+            let body = "data: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("auth.json");
+    let auth = crate::codex_auth::CodexAuth::test_auth(path.clone());
+    let mut model = CodexModel::with_endpoint(auth, endpoint);
+    let messages = [Message::User {
+        content: "hello".into(),
+        images: vec![],
+    }];
+    model.complete(&messages, &[], None).await.unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"tokens":{{"id_token":"new-id","access_token":"new-access","refresh_token":"new-refresh","account_id":"new-account"}},"last_refresh":"{}"}}"#,
+            chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .unwrap();
+    model.complete(&messages, &[], None).await.unwrap();
+    server.await.unwrap();
+}

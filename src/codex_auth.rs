@@ -23,6 +23,7 @@ const ACCOUNT_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 const ACCOUNT_CLAIM_FIELD: &str = "chatgpt_account_id";
 const REFRESH_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
 const UNKNOWN_EXPIRY_REFRESH: ChronoDuration = ChronoDuration::days(8);
+const MAX_REFRESH_EXCHANGES: u8 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Tokens {
@@ -33,7 +34,7 @@ pub struct Tokens {
     pub account_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct AuthFile {
     tokens: Tokens,
     last_refresh: DateTime<Utc>,
@@ -41,10 +42,18 @@ struct AuthFile {
 
 #[derive(Clone)]
 pub struct CodexAuth {
-    inner: Arc<Mutex<AuthFile>>,
+    inner: Arc<Mutex<AuthState>>,
     path: Arc<PathBuf>,
     client: reqwest::Client,
     token_endpoint: Arc<String>,
+}
+
+/// In-memory credentials plus the last valid disk snapshot we observed.
+/// Keeping the snapshot with the credentials prevents a failed local save
+/// from making its unchanged predecessor look like a new login next request.
+struct AuthState {
+    data: AuthFile,
+    observed_disk: Option<AuthFile>,
 }
 
 impl CodexAuth {
@@ -59,7 +68,10 @@ impl CodexAuth {
 
     fn from_file(path: PathBuf, data: AuthFile) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: Arc::new(Mutex::new(data)),
+            inner: Arc::new(Mutex::new(AuthState {
+                observed_disk: Some(data.clone()),
+                data,
+            })),
             path: Arc::new(path),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(600))
@@ -79,8 +91,8 @@ impl CodexAuth {
     /// refresh, so that retry cannot itself trigger a second refresh.
     pub async fn current_access_token_and_account(&self) -> anyhow::Result<(String, String)> {
         let state = self.inner.lock().await;
-        let account = usable_account(&state.tokens)?;
-        Ok((state.tokens.access_token.clone(), account))
+        let account = usable_account(&state.data.tokens)?;
+        Ok((state.data.tokens.access_token.clone(), account))
     }
 
     pub async fn refresh_after_unauthorized(
@@ -99,47 +111,35 @@ impl CodexAuth {
         // The mutex is intentionally held over the exchange: cloned models,
         // including models on subagent runtimes, must serialize token rotation.
         let mut state = self.inner.lock().await;
+        // Every new provider request crosses this boundary through
+        // access_token_and_account. A completed login replaces the complete
+        // credential/account pair, including when it switched accounts.
+        // Invalid, partial, or absent disk data is ignored so the last valid
+        // in-memory login remains usable.
+        reload_from_disk(&self.path, &mut state);
         if let Some(rejected) = rejected_access_token
-            && state.tokens.access_token != rejected
+            && state.data.tokens.access_token != rejected
+            && !needs_refresh(&state.data)
         {
+            // A fresh login that arrived after the rejected request has
+            // already recovered it; never refresh the rejected account.
             return Ok(());
         }
-        if !force && !needs_refresh(&state) {
+        if !force && !needs_refresh(&state.data) {
             return Ok(());
         }
-        // Refresh boundary: re-read the auth file before submitting a refresh
-        // token. `e-agent login` (or another e-agent process that rotated
-        // credentials) may have replaced it on disk since we loaded it, and
-        // submitting our stale refresh token would be rejected as reused.
-        // Adopt newer credentials for the same account; a different account
-        // is never adopted silently.
-        if let Some(disk) = read_auth_file(&self.path)
-            && tokens_differ(&disk.tokens, &state.tokens)
-            && same_account(&disk.tokens, &state.tokens)
-        {
-            *state = disk;
-            // Re-evaluate after adoption: the disk copy may already carry a
-            // fresh access token (e.g. a completed `e-agent login`), so no
-            // exchange is needed; a forced refresh whose rejected token no
-            // longer matches was already recovered by another process.
-            if let Some(rejected) = rejected_access_token
-                && state.tokens.access_token != rejected
-            {
-                return Ok(());
-            }
-            if !force && !needs_refresh(&state) {
-                return Ok(());
-            }
-        }
-        // Exchange, with one guarded retry: when the provider reports the
-        // submitted refresh token as expired/reused/revoked (or a 401),
-        // another process may have rotated credentials between the reload
-        // above and this exchange. Re-read the file and adopt the disk
-        // version; only bail out when the disk carries the same token that
-        // just failed.
-        let mut retry = true;
+
+        // A request can exchange at most twice: the normal attempt and one
+        // attempt for credentials observed while that exchange was in flight.
+        // This preserves the one bounded 401 recovery while ensuring a known
+        // expired disk login is never returned as successful recovery.
+        let mut exchanges = 0;
         loop {
-            let refresh_token = state.tokens.refresh_token.clone();
+            if exchanges == MAX_REFRESH_EXCHANGES {
+                return Err(refresh_budget_exhausted_error());
+            }
+            exchanges += 1;
+            let refresh_token = state.data.tokens.refresh_token.clone();
             let response = self
                 .client
                 .post(self.token_endpoint.as_str())
@@ -155,18 +155,12 @@ impl CodexAuth {
             let body = response.text().await.unwrap_or_default();
             if !status.is_success() {
                 if status == reqwest::StatusCode::UNAUTHORIZED || permanent_refresh_error(&body) {
-                    if retry
-                        && let Some(disk) = read_auth_file(&self.path)
-                        && tokens_differ(&disk.tokens, &state.tokens)
-                        && same_account(&disk.tokens, &state.tokens)
-                    {
-                        *state = disk;
-                        if !needs_refresh(&state) {
+                    if reload_from_disk(&self.path, &mut state) {
+                        if !needs_refresh(&state.data) {
                             // The disk copy already carries a fresh access
                             // token; the caller retries the request with it.
                             return Ok(());
                         }
-                        retry = false;
                         continue;
                     }
                     return Err(login_expired_error(&body));
@@ -175,17 +169,33 @@ impl CodexAuth {
             }
             let returned: TokenResponse = serde_json::from_str(&body)
                 .context("cannot decode ChatGPT token refresh response")?;
+            // A login may have replaced the file while this exchange was in
+            // flight. Prefer that complete, validated disk pair over saving a
+            // response derived from stale credentials. If it is expired, use
+            // the remaining bounded exchange budget for that new account.
+            if reload_from_disk(&self.path, &mut state) {
+                if !needs_refresh(&state.data) {
+                    return Ok(());
+                }
+                continue;
+            }
             if let Some(value) = returned.id_token.filter(|value| !value.is_empty()) {
-                state.tokens.id_token = value;
+                state.data.tokens.id_token = value;
             }
             if let Some(value) = returned.access_token.filter(|value| !value.is_empty()) {
-                state.tokens.access_token = value;
+                state.data.tokens.access_token = value;
             }
             if let Some(value) = returned.refresh_token.filter(|value| !value.is_empty()) {
-                state.tokens.refresh_token = value;
+                state.data.tokens.refresh_token = value;
             }
-            state.last_refresh = Utc::now();
-            save_file(&self.path, &state)?;
+            state.data.last_refresh = Utc::now();
+            if needs_refresh(&state.data) {
+                // A refresh response must not turn a known expired token into
+                // a successful recovery. The loop's explicit budget bounds it.
+                continue;
+            }
+            save_file(&self.path, &state.data)?;
+            state.observed_disk = Some(state.data.clone());
             return Ok(());
         }
     }
@@ -510,20 +520,29 @@ fn read_auth_file(path: &Path) -> Option<AuthFile> {
     serde_json::from_slice(&source).ok()
 }
 
-/// True when the disk copy carries different credentials than memory (either
-/// token changed), i.e. another process or a login rewrote the file.
-fn tokens_differ(disk: &Tokens, memory: &Tokens) -> bool {
-    disk.access_token != memory.access_token || disk.refresh_token != memory.refresh_token
+/// Replace memory only with a complete credential/account pair from disk.
+/// This is intentionally a request-boundary reload, not a file watcher.
+fn reload_from_disk(path: &Path, state: &mut AuthState) -> bool {
+    let Some(disk) = read_auth_file(path) else {
+        return false;
+    };
+    if !valid_auth_file(&disk) || state.observed_disk.as_ref() == Some(&disk) {
+        return false;
+    }
+    state.observed_disk = Some(disk.clone());
+    state.data = disk;
+    true
 }
 
-/// True when both copies resolve to the same ChatGPT account (stored or
-/// JWT-derived account id). Different or undeterminable accounts are never
-/// adopted from disk, so a running process cannot silently switch accounts.
-fn same_account(disk: &Tokens, memory: &Tokens) -> bool {
-    match (usable_account(disk), usable_account(memory)) {
-        (Ok(disk_account), Ok(memory_account)) => disk_account == memory_account,
-        _ => false,
-    }
+fn valid_auth_file(data: &AuthFile) -> bool {
+    !data.tokens.id_token.is_empty()
+        && !data.tokens.access_token.is_empty()
+        && !data.tokens.refresh_token.is_empty()
+        && usable_account(&data.tokens).is_ok()
+}
+
+fn refresh_budget_exhausted_error() -> anyhow::Error {
+    anyhow!("ChatGPT login refresh did not produce a fresh access token; run `e-agent login`")
 }
 
 fn permanent_refresh_kind(body: &str) -> Option<&'static str> {
