@@ -3923,6 +3923,40 @@ async function main(){
         elsById["chatBusy"].hidden === true && elsById["chatBusy"].innerHTML === "",
         "hidden=" + elsById["chatBusy"].hidden + " html=" + elsById["chatBusy"].innerHTML);
 
+    // The actual child-row renderer must not let a lingering delegate make a
+    // finished or inactive session look live. A live Idle child still remains green.
+    const _childRows = new El("div");
+    state.tasks.byWorkspace[_activeWsId] = [{ session_id: "parent", id: 1,
+      kind: "delegate", subagent_session_id: "finished-child" }];
+    state.tasks.list = state.tasks.byWorkspace[_activeWsId];
+    renderSubagentRows(_childRows, [{ id: "finished-child", parent_session_id: "parent",
+      busy: false, active: false, status: "Finished" }], true, _activeWsId);
+    let _childDot = _childRows.querySelector(".busy-dot");
+    chk("finished child with lingering delegate stays inactive",
+        _childDot.classList.contains("inactive")
+        && !_childDot.classList.contains("busy-dot-green")
+        && _childDot.getAttribute("aria-label") === "会话已结束",
+        "cls=" + _childDot.className + " aria=" + _childDot.getAttribute("aria-label"));
+    _childRows.innerHTML = "";
+    renderSubagentRows(_childRows, [{ id: "inactive-idle-child", parent_session_id: "parent",
+      busy: false, active: false, status: "Idle" }], true, _activeWsId);
+    _childDot = _childRows.querySelector(".busy-dot");
+    chk("inactive Idle child stays inactive without a task",
+        _childDot.classList.contains("inactive")
+        && _childDot.getAttribute("aria-label") === "会话已结束",
+        "cls=" + _childDot.className + " aria=" + _childDot.getAttribute("aria-label"));
+    state.tasks.byWorkspace[_activeWsId] = [{ session_id: "parent", id: 2,
+      kind: "delegate", subagent_session_id: "live-idle-child" }];
+    state.tasks.list = state.tasks.byWorkspace[_activeWsId];
+    renderSubagentRows(_childRows, [{ id: "live-idle-child", parent_session_id: "parent",
+      busy: false, active: true, status: "Idle" }], false, _activeWsId);
+    _childDot = _childRows.querySelectorAll(".busy-dot").slice(-1)[0];
+    chk("live Idle child with matching delegate remains green",
+        _childDot.classList.contains("busy-dot-green")
+        && !_childDot.classList.contains("inactive")
+        && _childDot.getAttribute("aria-label") === "会话空闲",
+        "cls=" + _childDot.className + " aria=" + _childDot.getAttribute("aria-label"));
+
     state.tasks.list = _savedTaskList;
     state.tasks.byWorkspace = _savedTaskByWs;
 

@@ -2503,10 +2503,10 @@ function renderSubagentRows(container, kids, hist, wsId) {
       (state.workspace.id === wsId && state.sessionId === k.id ? " current" : ""));
     // 子行状态点：Busy/Compacting → red，WaitingInput → cyan，Failed → yellow；
     // 明确 busy:false 且 live 的 idle 保持 green，inactive 历史保持 gray。
-    const idleAlive = !running && !waiting && !errored && k.busy === false
-      && (isSessionLive(k) || hasDelegateTask(k, wsId));
-    const inactive = !waiting && !errored && !running && !idleAlive
+    const inactive = !waiting && !errored && !running
       && (k.active === false || (k.status && k.status.startsWith("Finished")));
+    const idleAlive = !inactive && !running && !waiting && !errored && k.busy === false
+      && (isSessionLive(k) || hasDelegateTask(k, wsId));
     const dot = el("span", "busy-dot" + (waiting ? " waiting" : errored ? " error" : running ? " busy" : idleAlive ? " busy-dot-green" : inactive ? " inactive" : ""));
     dot.setAttribute("role", "img");
     dot.setAttribute("aria-label", waiting ? "会话等待回答" : errored ? "会话失败" : running ? "会话处理中" : inactive ? "会话已结束" : "会话空闲");
