@@ -1630,6 +1630,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#);
                 signal,
                 status,
                 kind,
+                cancellation_source,
                 ..
             } = entry
             else {
@@ -1648,6 +1649,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#);
                 signal,
                 status,
                 kind,
+                cancellation_source,
             });
         }
         Ok(out)
@@ -3041,6 +3043,7 @@ mod tests {
                 signal: None,
                 status: None,
                 kind: None,
+                cancellation_source: None,
             },
             // Entry with a label to verify serde roundtrip with label.
             SessionEntry::BackgroundCompletion {
@@ -3053,6 +3056,7 @@ mod tests {
                 signal: None,
                 status: None,
                 kind: None,
+                cancellation_source: None,
             },
             Message::User {
                 content: "你好世界👋\n多行".into(),
@@ -3109,6 +3113,7 @@ mod tests {
                 signal: None,
                 status: None,
                 kind: None,
+                cancellation_source: None,
             },
             SessionEntry::BackgroundCompletion {
                 id: 2,
@@ -3120,6 +3125,7 @@ mod tests {
                 signal: None,
                 status: Some("failed".into()),
                 kind: Some("bash".into()),
+                cancellation_source: None,
             },
         ];
         session.append(&entries).await.unwrap();
@@ -3163,6 +3169,7 @@ mod tests {
             signal: None,
             status: Some("completed".into()),
             kind: Some("bash".into()),
+            cancellation_source: None,
         })
         .unwrap();
         let retried = serde_json::to_string(&SessionEntry::BackgroundCompletion {
@@ -3175,6 +3182,7 @@ mod tests {
             signal: None,
             status: Some("failed".into()),
             kind: Some("bash".into()),
+            cancellation_source: None,
         })
         .unwrap();
         let second = serde_json::to_string(&SessionEntry::BackgroundCompletion {
@@ -3187,6 +3195,7 @@ mod tests {
             signal: None,
             status: Some("completed".into()),
             kind: Some("bash".into()),
+            cancellation_source: None,
         })
         .unwrap();
         let _ = &first;

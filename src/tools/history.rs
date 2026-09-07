@@ -664,6 +664,7 @@ mod tests {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         });
         entries.push(SessionEntry::Error {
             text: "needle excluded".into(),

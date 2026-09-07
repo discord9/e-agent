@@ -3,6 +3,7 @@ use super::*;
 use async_trait::async_trait;
 
 use super::background::BackgroundTasks;
+use crate::agent::CancellationSource;
 
 /// Termination thresholds for the unchanged-snapshot poll guard on
 /// `get_background_tasks`: the `count >= threshold` poll returns the
@@ -207,8 +208,13 @@ impl Tool for CancelBackgroundTask {
             .and_then(Value::as_u64)
             .ok_or("`id` must be a non-negative integer")?;
         let cancelled = match self.self_session_id.as_ref() {
-            Some(session_id) => self.background.cancel_owned(id, session_id),
-            None => self.background.cancel(id),
+            Some(session_id) => {
+                self.background
+                    .cancel_owned_with_source(id, session_id, CancellationSource::Agent)
+            }
+            None => self
+                .background
+                .cancel_with_source(id, CancellationSource::Agent),
         };
         cancelled.ok_or_else(|| format!("background task {id} is not running"))?;
         Ok(ToolOutput::text(format!("cancelled background task {id}")))

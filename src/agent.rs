@@ -741,6 +741,8 @@ pub enum AgentEvent {
         status: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancellation_source: Option<CancellationSource>,
     },
     /// A structured background completion notice for TUI scrollback display.
     /// Unlike `BackgroundCompleted` (the transient arrival/drain signal),
@@ -763,6 +765,8 @@ pub enum AgentEvent {
         status: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancellation_source: Option<CancellationSource>,
     },
     Usage {
         /// Input tokens of the most recent regular turn, approximating the
@@ -821,6 +825,16 @@ pub struct Usage {
 /// and providers that don't report a field stay `None`, and serialization
 /// omits them (serde default + skip), so old persisted JSON and the SSE
 /// wire stay valid.
+/// Who explicitly cancelled a background task. Absent means the task did not
+/// have a recorded explicit cancellation (including all legacy entries).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationSource {
+    User,
+    Agent,
+    System,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundTrace {
     /// Epoch milliseconds at task start (`None` on legacy events/rows).
@@ -835,6 +849,10 @@ pub struct BackgroundTrace {
     pub status: Option<String>,
     /// "bash" | "delegate".
     pub kind: Option<String>,
+    /// Who explicitly cancelled the task; absent for normal exits, startup
+    /// failures, and legacy persisted entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_source: Option<CancellationSource>,
 }
 
 /// One entry in the append-only session history. The model context is
@@ -910,6 +928,10 @@ pub enum SessionEntry {
         status: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        /// Who explicitly cancelled the task; absent for normal exits and
+        /// entries persisted before cancellation provenance existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancellation_source: Option<CancellationSource>,
     },
     /// A new session forked from an existing one: source session id, the
     /// 1-based entry index it was forked at, and the source's event_time +
@@ -2352,6 +2374,7 @@ impl Agent {
                 signal,
                 status,
                 kind,
+                cancellation_source,
             } => {
                 self.pending_background
                     .push_back(SessionEntry::BackgroundCompletion {
@@ -2364,6 +2387,7 @@ impl Agent {
                         signal: signal.clone(),
                         status: status.clone(),
                         kind: kind.clone(),
+                        cancellation_source,
                     });
                 if fanout && let Some(subscriber) = &self.subscriber {
                     let _ = subscriber.send(AgentEvent::BackgroundCompleted {
@@ -2376,6 +2400,7 @@ impl Agent {
                         signal: signal.clone(),
                         status: status.clone(),
                         kind: kind.clone(),
+                        cancellation_source,
                     });
                 }
                 Some((
@@ -2389,6 +2414,7 @@ impl Agent {
                         signal,
                         status,
                         kind,
+                        cancellation_source,
                     },
                 ))
             }

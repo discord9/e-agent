@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthStr;
 
-use crate::agent::{AgentEvent, Message, SessionEntry, preview};
+use crate::agent::{AgentEvent, CancellationSource, Message, SessionEntry, preview};
 use crate::config::InputKeys;
 use crate::runner::{SessionHandle as RunnerHandle, SessionResult, SessionStatus};
 
@@ -131,6 +131,7 @@ pub(crate) struct FinishedTask {
     pub(crate) exit_code: Option<i32>,
     pub(crate) signal: Option<String>,
     pub(crate) duration_ms: Option<u64>,
+    pub(crate) cancellation_source: Option<crate::agent::CancellationSource>,
 }
 
 /// Cap on the F2 finished list. A display projection, not a store: the
@@ -1170,7 +1171,7 @@ impl TuiState {
         if let Some(label) = self
             .background
             .as_ref()
-            .and_then(|background| background.cancel(id))
+            .and_then(|background| background.cancel_with_source(id, CancellationSource::User))
         {
             match &self.store {
                 Some(store) => store.clear_background_task(
@@ -1795,6 +1796,7 @@ impl TuiState {
                 signal,
                 status,
                 kind,
+                cancellation_source,
                 ..
             } => {
                 // End the streaming lane BEFORE the aside lines: a
@@ -1817,6 +1819,7 @@ impl TuiState {
                         exit_code,
                         signal: signal.clone(),
                         duration_ms,
+                        cancellation_source,
                     },
                 );
                 self.finished_tasks.truncate(FINISHED_TASKS_CAP);

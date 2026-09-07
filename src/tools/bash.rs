@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, CancellationSource};
 
 use super::background::{BackgroundTasks, ExitSlot, OutputSlot, TaskExit, TaskSpool};
 
@@ -1523,6 +1523,7 @@ pub(super) async fn run_bash_with_stall_state(
                         exit_code: None,
                         signal: Some("SIGKILL".into()),
                         status: Some("killed".into()),
+                        cancellation_source: Some(CancellationSource::System),
                     };
                 }
                 #[cfg(unix)]
@@ -1551,6 +1552,7 @@ pub(super) async fn run_bash_with_stall_state(
             exit_code: status.code(),
             signal: exit_signal_name(&status),
             status: Some(exit_status_label(&status).to_owned()),
+            cancellation_source: None,
         };
     }
     let text = format_output(status.code(), &stdout, &stderr);

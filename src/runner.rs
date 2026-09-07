@@ -993,6 +993,7 @@ impl SessionRunner {
                 signal,
                 status,
                 kind,
+                cancellation_source,
             } => Some(AgentEvent::BackgroundCompletionNotice {
                 id: *id,
                 output: output.clone(),
@@ -1003,6 +1004,7 @@ impl SessionRunner {
                 signal: signal.clone(),
                 status: status.clone(),
                 kind: kind.clone(),
+                cancellation_source: *cancellation_source,
             }),
             SessionEntry::Notice { text } => Some(AgentEvent::Notice(text.clone())),
             // Goal updates fan out as one live event after durable commit
@@ -1802,6 +1804,7 @@ impl SessionRunner {
                     signal,
                     status,
                     kind,
+                    cancellation_source,
                 } => AgentEvent::BackgroundCompletionNotice {
                     id: *id,
                     output: output.clone(),
@@ -1812,6 +1815,7 @@ impl SessionRunner {
                     signal: signal.clone(),
                     status: status.clone(),
                     kind: kind.clone(),
+                    cancellation_source: *cancellation_source,
                 },
                 _ => unreachable!("peek_background_entry returns a background entry"),
             };
@@ -3287,6 +3291,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             signal,
             status,
             kind,
+            cancellation_source,
         } => Some(AgentEvent::BackgroundCompletionNotice {
             id: *id,
             output: output.clone(),
@@ -3297,6 +3302,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             signal: signal.clone(),
             status: status.clone(),
             kind: kind.clone(),
+            cancellation_source: *cancellation_source,
         }),
         SessionEntry::ForkedFrom { source, at, .. } => Some(AgentEvent::Display(format!(
             "forked from {source} at entry {at}"

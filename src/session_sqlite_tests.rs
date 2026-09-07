@@ -93,6 +93,7 @@ fn test_entries() -> Vec<SessionEntry> {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         },
         // Entry with a label to verify serde roundtrip with label.
         SessionEntry::BackgroundCompletion {
@@ -105,6 +106,7 @@ fn test_entries() -> Vec<SessionEntry> {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         },
         Message::User {
             content: "你好世界👋\n多行".into(),
@@ -2917,6 +2919,7 @@ async fn finished_tasks_reads_background_completion_entries_newest_first() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         },
         SessionEntry::BackgroundCompletion {
             id: 2,
@@ -2928,6 +2931,7 @@ async fn finished_tasks_reads_background_completion_entries_newest_first() {
             signal: None,
             status: Some("failed".into()),
             kind: Some("bash".into()),
+            cancellation_source: None,
         },
         SessionEntry::BackgroundCompletion {
             id: 3,
@@ -2939,6 +2943,7 @@ async fn finished_tasks_reads_background_completion_entries_newest_first() {
             signal: None,
             status: Some("completed".into()),
             kind: Some("delegate".into()),
+            cancellation_source: None,
         },
     ];
     session

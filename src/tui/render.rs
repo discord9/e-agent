@@ -1071,6 +1071,16 @@ pub(crate) fn format_finished_task(task: &FinishedTask, max_chars: usize) -> Str
     } else if task.signal.is_some() {
         parts.push("signal".into());
     }
+    if let Some(source) = task.cancellation_source {
+        parts.push(format!(
+            "by {}",
+            match source {
+                crate::agent::CancellationSource::User => "user",
+                crate::agent::CancellationSource::Agent => "agent",
+                crate::agent::CancellationSource::System => "system",
+            }
+        ));
+    }
     if let Some(ms) = task.duration_ms {
         parts.push(format_duration(ms));
     }

@@ -367,8 +367,8 @@ async fn tasks_panel_selection_routes_bash_to_detail_and_delegate_to_attach() {
         state.handle_tasks_panel_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())),
         TaskSelection::Attach(running[1].id)
     );
-    background.cancel(running[0].id);
-    background.cancel(running[1].id);
+    background.cancel_with_source(running[0].id, crate::agent::CancellationSource::System);
+    background.cancel_with_source(running[1].id, crate::agent::CancellationSource::System);
     tokio::task::yield_now().await;
 }
 
@@ -439,7 +439,7 @@ async fn open_task_detail_clears_attached_and_remembers_panel_state() {
     assert!(state.task_detail.is_none());
     assert!(!state.show_tasks, "F2 closes the detail and the panel");
 
-    background.cancel(id);
+    background.cancel_with_source(id, crate::agent::CancellationSource::System);
     tokio::task::yield_now().await;
 }
 
@@ -489,7 +489,7 @@ async fn open_task_detail_from_main_view_esc_returns_to_main_view() {
     assert!(state.task_detail.is_none());
     assert!(!state.show_tasks, "Esc returns to the main view");
 
-    background.cancel(id);
+    background.cancel_with_source(id, crate::agent::CancellationSource::System);
     tokio::task::yield_now().await;
 }
 
@@ -1098,6 +1098,7 @@ fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         },
     });
     assert!(state.attached.as_ref().unwrap().finished);
@@ -1144,6 +1145,7 @@ fn attached_view_clears_spinner_on_background_completed_from_bridge() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         },
     });
     let attached = state.attached.as_ref().unwrap();
@@ -1167,6 +1169,7 @@ fn attach_after_completion_marks_finished_from_the_snapshot() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     });
     let mut state = TuiState::default();
     attach_test(&mut state, 3, "demo task", handle);
@@ -1239,6 +1242,7 @@ fn background_completion_notice_populates_finished_task_section() {
         signal: None,
         status: Some("completed".into()),
         kind: Some("bash".into()),
+        cancellation_source: None,
     });
     assert_eq!(state.finished_tasks.len(), 1);
     assert_eq!(state.finished_tasks[0].id, 1);
@@ -1259,6 +1263,7 @@ fn background_completion_notice_populates_finished_task_section() {
         signal: None,
         status: Some("failed".into()),
         kind: Some("delegate".into()),
+        cancellation_source: None,
     });
     assert_eq!(state.finished_tasks.len(), 2);
     assert_eq!(state.finished_tasks[0].id, 2, "newest first");
@@ -1277,6 +1282,7 @@ fn finished_task_row_format_renders_metadata() {
         exit_code: Some(3),
         signal: None,
         duration_ms: Some(1234),
+        cancellation_source: None,
     };
     let text = format_finished_task(&task, 60);
     assert!(text.starts_with("#7 bash failed exit 3 1.23s"), "{text}");
@@ -1291,6 +1297,7 @@ fn finished_task_row_format_renders_metadata() {
         exit_code: None,
         signal: Some("SIGTERM".into()),
         duration_ms: Some(42),
+        cancellation_source: None,
     };
     let text = format_finished_task(&killed, 60);
     assert_eq!(text, "#8 bash killed signal 42ms", "{text}");
@@ -1328,6 +1335,7 @@ fn attached_enter_steers_and_ctrl_c_cancels_through_the_handle() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         },
     });
     state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
@@ -1354,6 +1362,7 @@ fn attached_enter_on_finished_keeps_input_and_sends_nothing() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         },
     });
     {
@@ -1403,6 +1412,7 @@ fn finish_with_queued_prompts_notes_them_as_unanswered() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         },
     });
     let attached = state.attached.as_ref().unwrap();
@@ -2226,6 +2236,7 @@ fn attached_title_shows_finished_before_subagent_label() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     });
     let mut state = TuiState::default();
     let snapshot = _handle.snapshot();
@@ -2908,6 +2919,7 @@ fn background_completion_ends_stream_lane_so_next_delta_starts_fresh_line() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     });
     state.push_agent_event(AgentEvent::AssistantDelta("\nlet y = 2;\n```".into()));
 
@@ -4085,6 +4097,7 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     });
     assert_eq!(out.len(), 3);
     assert_eq!(out[0].text, "[background task 7 completed: demo]");

@@ -304,7 +304,12 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
 
     entered.wait();
     assert!(sessions.get(1).is_some());
-    assert_eq!(background.cancel(1).as_deref(), Some("probe"));
+    assert_eq!(
+        background
+            .cancel_with_source(1, crate::agent::CancellationSource::System)
+            .as_deref(),
+        Some("probe")
+    );
     release.wait();
     assert!(spawn.await.unwrap().is_ok(), "spawn must not panic or fail");
     signals.model_dropped.notified().await;
@@ -371,7 +376,12 @@ async fn background_cancel_before_first_yield_cleans_everything() {
         )
         .unwrap();
 
-    assert_eq!(background.cancel(1).as_deref(), Some("probe"));
+    assert_eq!(
+        background
+            .cancel_with_source(1, crate::agent::CancellationSource::System)
+            .as_deref(),
+        Some("probe")
+    );
     signals.model_dropped.notified().await;
     signals.release.notify_one();
     tokio::task::yield_now().await;
@@ -435,7 +445,12 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
         .unwrap();
 
     signals.entered.notified().await;
-    assert_eq!(background.cancel(1).as_deref(), Some("probe"));
+    assert_eq!(
+        background
+            .cancel_with_source(1, crate::agent::CancellationSource::System)
+            .as_deref(),
+        Some("probe")
+    );
     signals.future_dropped.notified().await;
     signals.model_dropped.notified().await;
     signals.release.notify_one();
@@ -2239,7 +2254,11 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
     // Cancelling the task (the current close path for a btw subagent)
     // aborts the runner and cleans up the registration + the parent's
     // background record.
-    assert!(background.cancel(task_id).is_some());
+    assert!(
+        background
+            .cancel_with_source(task_id, crate::agent::CancellationSource::System)
+            .is_some()
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         let sessions_empty = sessions.sessions.lock().unwrap().is_empty();
@@ -2393,8 +2412,16 @@ async fn background_delegate_cancel_aborts_child_before_wrapper_completion() {
 
     // Repeated cancellation still targets the live wrapper while its child
     // cleanup is in progress; it must not remove or publish the wrapper early.
-    assert!(background.cancel(delegate_id).is_some());
-    assert!(background.cancel(delegate_id).is_some());
+    assert!(
+        background
+            .cancel_with_source(delegate_id, crate::agent::CancellationSource::System)
+            .is_some()
+    );
+    assert!(
+        background
+            .cancel_with_source(delegate_id, crate::agent::CancellationSource::System)
+            .is_some()
+    );
     assert!(
         background
             .running()
@@ -2595,7 +2622,7 @@ async fn subagent_background_bash_recorded_under_its_own_session() {
 
     // 取消阻塞的 bash → completion 注入 subagent → FinishWhenIdle finalize →
     // wrapper 完成并发送一次 BackgroundCompleted。
-    background.cancel(bash_task.id);
+    background.cancel_with_source(bash_task.id, crate::agent::CancellationSource::System);
     let event = tokio::time::timeout(std::time::Duration::from_secs(10), completions.recv())
         .await
         .expect("timed out waiting for the background completion")
